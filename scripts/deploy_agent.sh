@@ -190,12 +190,17 @@ except Exception: print('')" 2>/dev/null || echo "")
 done
 if [ -n "$CUR" ]; then
   UPD_JSON="${TMPDIR:-/tmp}/notiops-rt-idle-update.json"
+  SRC_JSON="${TMPDIR:-/tmp}/notiops-rt-current.json"
   # 把 §3 算好的 4 个 env 真值传进去强制回填(空串保留空串 = 该功能未启用,不是占位符)。
-  printf '%s' "$CUR" | python3 - "$UPD_JSON" \
+  # 注意:程序经 `python3 -` 从 stdin(heredoc)读入,故当前 runtime 配置【不能】也走
+  # stdin(会被 heredoc 抢占 → sys.stdin 为空 → json.load 报 "Expecting value: line 1
+  # column 1")。改为把 $CUR 落到 $SRC_JSON,Python 从 argv[1] 指定的文件读,跨 shell 稳定。
+  printf '%s' "$CUR" > "$SRC_JSON"
+  python3 - "$SRC_JSON" "$UPD_JSON" \
       "$SKILLS_BUCKET" "$REPORTS_CDN_DOMAIN" "$DEVOPS_AGENT_SPACE_ID" "$GATEWAY_URL" <<'PY'
 import json, sys
-d = json.load(sys.stdin)
-skills_bucket, reports_cdn, da_space, gw_url = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+d = json.load(open(sys.argv[1]))
+skills_bucket, reports_cdn, da_space, gw_url = sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
 env = dict(d.get("environmentVariables") or {})
 # 强制回填部署真值(覆盖 deploy 可能漏注入的占位符);MEMORY_* 等框架注入的 env 原样保留。
 env["SKILLS_BUCKET"] = skills_bucket
@@ -214,7 +219,7 @@ out = {
     "maxLifetime": d.get("lifecycleConfiguration", {}).get("maxLifetime", 28800),
   },
 }
-json.dump(out, open(sys.argv[1], "w"))
+json.dump(out, open(sys.argv[2], "w"))
 PY
   IDLE_OK=false
   for j in 1 2 3; do
@@ -229,7 +234,7 @@ PY
   else
     echo "  ⚠ env 回填/idle 设置失败(不阻断);可稍后手动 update-agent-runtime 回填 env 真值 + idle=3600。" >&2
   fi
-  rm -f "$UPD_JSON"
+  rm -f "$UPD_JSON" "$SRC_JSON"
 
   # ── 部署后核验:runtime env 不得残留 __占位符__(漏注入的最后一道闸)──
   # 等 update 落定后重新 get,发现任何 __FOO__ 值就告警(不阻断,但明确暴露)。

@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+.venv/
+
+# CDK
+cdk.out/
+infra/cdk.context.json
+
+# Build artifacts
+lambda_layer/
+
+# AgentCore CLI local state
+agent-build/NotiOpsWebChat/agentcore/.cli/
+agent-build/NotiOpsWebChat/agentcore/aws-targets.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.swp
+*.swo

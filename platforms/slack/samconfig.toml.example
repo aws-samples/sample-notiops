@@ -1,0 +1,36 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "notiops-devops-slack"
+resolve_s3 = true
+s3_prefix = "notiops-devops-slack"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+disable_rollback = true
+image_repositories = []
+
+# Replace placeholders below with values from:
+#   - your Slack App config (Bot Token + App-Level Token in Secrets Manager)
+#   - your DevOps Agent webhook (URL + secret ARN, both shared with feishubot)
+#   - the report-handler stack outputs (Conversations table name + ARN)
+#   - your VPC / subnets where Fargate tasks run
+parameter_overrides = """\
+SlackBotTokenSecretArn=\"<arn:aws:secretsmanager:...:secret:notiops-devops/slack-bot-token-XXXXXX>\" \
+SlackAppTokenSecretArn=\"<arn:aws:secretsmanager:...:secret:notiops-devops/slack-app-token-XXXXXX>\" \
+WebhookSecretArn=\"<arn:aws:secretsmanager:...:secret:devops-agent/webhook-secret-XXXXXX>\" \
+WebhookUrl=\"<https://event-ai.<region>.api.aws/webhook/generic/<uuid>>\" \
+ConversationsTableName=\"notiops-conversations\" \
+ConversationsTableArn=\"<arn:aws:dynamodb:<region>:<account>:table/notiops-conversations>\" \
+BedrockModelId=\"us.anthropic.claude-sonnet-4-6\" \
+BedrockRegion=\"us-east-1\" \
+AgenticChatMode=\"qa_only\" \
+AwsMcpMode=\"docs_only\" \
+DefaultLocale=\"en\" \
+AllowedChannelIds=\"\" \
+DesiredCount=\"1\" \
+VpcId=\"<vpc-xxxxxxxx>\" \
+SubnetIds=\"<subnet-aaaa,subnet-bbbb,subnet-cccc>\"\
+"""
+
+[default.global.parameters]
+region = "us-east-1"

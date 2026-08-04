@@ -1,0 +1,13 @@
+{
+  "skill_id": "whats-new-report",
+  "name": "AWS What's New Report",
+  "description": "For a given time window (optionally filtered by service/keyword), summarize AWS new releases: list inline when 20 or fewer; when more than 20, auto-generate the full markdown list, save it to S3, and provide a download link.",
+  "status": "active",
+  "latest_version": "1.0.0",
+  "author": "NotiOps",
+  "created_at": "2026-01-01T00:00:00Z",
+  "updated_at": "2026-01-01T00:00:00Z",
+  "versions": [
+    { "version": "1.0.0", "changelog": "Preset skill: AWS What's New report for a time window; >20 items saved to S3 + download link.", "created_at": "2026-01-01T00:00:00Z", "created_by": "NotiOps" }
+  ]
+}

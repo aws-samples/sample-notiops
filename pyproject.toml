@@ -1,0 +1,10 @@
+[project]
+name = "notiops"
+version = "1.0.0"
+description = "AWS DevOps Agent IM 集成 + 资源闲置检测与优化系统"
+requires-python = ">=3.14"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]

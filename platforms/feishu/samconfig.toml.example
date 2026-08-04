@@ -1,0 +1,42 @@
+# ============================================================
+# Feishu platform stack (ECS Fargate + ECR + IAM)
+# ============================================================
+#
+# Copy to `samconfig.toml`, fill in account-specific ARNs.
+# `samconfig.toml` is gitignored.
+#
+#     cd platforms/feishu
+#     sam deploy
+#
+# All ARN values come from §6 of docs/DEPLOYMENT.md after running
+# `aws secretsmanager create-secret ...`.
+# ============================================================
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "notiops-devops-feishubot"
+resolve_s3 = true
+s3_prefix = "notiops-devops-feishubot"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+disable_rollback = true
+image_repositories = []
+parameter_overrides = """\
+FeishuAppIdSecretArn=\"<arn:aws:secretsmanager:...:secret:notiops-devops/feishu-app-id-XXXXXX>\" \
+FeishuAppSecretSecretArn=\"<arn:aws:secretsmanager:...:secret:notiops-devops/feishu-app-secret-XXXXXX>\" \
+WebhookSecretArn=\"<arn:aws:secretsmanager:...:secret:devops-agent/webhook-secret-XXXXXX>\" \
+WebhookUrl=\"<https://event-ai.<region>.api.aws/webhook/generic/<uuid>>\" \
+ConversationsTableName=\"notiops-conversations\" \
+ConversationsTableArn=\"<arn:aws:dynamodb:<region>:<account>:table/notiops-conversations>\" \
+BedrockModelId=\"us.anthropic.claude-sonnet-4-6\" \
+BedrockRegion=\"us-east-1\" \
+AgenticChatMode=\"qa_only\" \
+AwsMcpMode=\"docs_only\" \
+DefaultLocale=\"zh\" \
+AllowedChatIds=\"\" \
+DesiredCount=\"1\"\
+"""
+
+[default.global.parameters]
+region = "us-east-1"

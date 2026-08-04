@@ -1,0 +1,15 @@
+[project]
+name = "notiops-web-chat-agent"
+version = "0.1.0"
+description = "NotiOps Web Chat agent on Bedrock AgentCore Runtime (Strands)"
+requires-python = ">=3.10"
+dependencies = [
+    "strands-agents>=0.1.0",
+    "bedrock-agentcore>=0.1.0",
+    "boto3>=1.35.0",
+    # core/aws_docs_mcp 通过 HTTP 调 AWS Knowledge MCP，仅用标准库 + boto3，无额外依赖
+]
+
+[tool.notiops]
+# 部署打包时需把仓库根的 core/ 一并带入镜像（aws_qa.py 会 sys.path 注入 repo root）。
+# 见 agent/README.md 的部署说明。

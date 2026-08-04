@@ -1,0 +1,95 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "NotiOpsWebChat",
+  "version": 1,
+  "managedBy": "CDK",
+  "tags": {
+    "agentcore:created-by": "agentcore-cli",
+    "agentcore:project-name": "NotiOpsWebChat",
+    "auto-delete": "no",
+    "project": "notiops"
+  },
+  "runtimes": [
+    {
+      "name": "NotiOpsWebChat",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/NotiOpsWebChat/",
+      "runtimeVersion": "PYTHON_3_13",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP",
+      "lifecycleConfig": {
+        "idleRuntimeSessionTimeout": 3600,
+        "maxLifetime": 28800
+      },
+      "envVars": [
+        {
+          "name": "AGENTCORE_WEBSEARCH_GATEWAY_URL",
+          "value": "__WEBSEARCH_GATEWAY_URL__"
+        },
+        {
+          "name": "SKILLS_BUCKET",
+          "value": "__SKILLS_BUCKET__"
+        },
+        {
+          "name": "DEVOPS_AGENT_SPACE_ID",
+          "value": "__DEVOPS_AGENT_SPACE_ID__"
+        },
+        {
+          "name": "REPORTS_CDN_DOMAIN",
+          "value": "__REPORTS_CDN_DOMAIN__"
+        },
+        {
+          "name": "NOTIOPS_ALLOW_CROSS_ACCOUNT",
+          "value": ""
+        }
+      ]
+    }
+  ],
+  "memories": [
+    {
+      "name": "NotiOpsWebChatMemory",
+      "eventExpiryDuration": 30,
+      "strategies": [
+        {
+          "type": "SEMANTIC",
+          "namespaceTemplates": [
+            "/users/{actorId}/facts"
+          ]
+        },
+        {
+          "type": "USER_PREFERENCE",
+          "namespaceTemplates": [
+            "/users/{actorId}/preferences"
+          ]
+        },
+        {
+          "type": "SUMMARIZATION",
+          "namespaceTemplates": [
+            "/summaries/{actorId}/{sessionId}"
+          ]
+        },
+        {
+          "type": "EPISODIC",
+          "namespaceTemplates": [
+            "/episodes/{actorId}/{sessionId}"
+          ],
+          "reflectionNamespaceTemplates": [
+            "/episodes/{actorId}"
+          ]
+        }
+      ]
+    }
+  ],
+  "knowledgeBases": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [],
+  "policyEngines": [],
+  "configBundles": [],
+  "abTests": [],
+  "harnesses": [],
+  "datasets": [],
+  "payments": []
+}

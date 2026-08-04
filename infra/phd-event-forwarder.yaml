@@ -1,0 +1,47 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PHD 事件跨账号转发 — Linked Account 部署。
+  在当前账号创建 EventBridge Rule + IAM Role，将 PHD 事件跨账号发布到系统账号的 SNS Topic。
+
+Parameters:
+  PhdSnsTopicArn:
+    Type: String
+    Description: System Account PHD SNS Topic ARN (e.g. arn:aws:sns:ap-northeast-1:123456789012:phd-events)
+    AllowedPattern: "arn:aws:sns:[a-z0-9-]+:[0-9]{12}:.+"
+    ConstraintDescription: Must be a valid SNS Topic ARN
+
+Resources:
+  EventBridgeSnsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "phd-event-forwarder-role-${AWS::AccountId}"
+      Description: "Allow EventBridge to publish PHD events to cross-account SNS Topic"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: sns-publish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref PhdSnsTopicArn
+
+  PHDEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Forward PHD events to System Account SNS Topic"
+      EventPattern:
+        source:
+          - aws.health
+        detail-type:
+          - "AWS Health Event"
+      Targets:
+        - Arn: !Ref PhdSnsTopicArn
+          Id: phd-sns-target
+          RoleArn: !GetAtt EventBridgeSnsRole.Arn

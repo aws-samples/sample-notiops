@@ -1,0 +1,276 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  NotiOps member account onboarding (StackSet payload).
+  在业务账号内创建 NotiOps 多账号接入所需的全部资源：
+  1. notiops-idle-detection-role — 系统账号跨账号只读采集角色（RDS/ElastiCache/CW/TA/CE/COH 等）
+  2. DevOps Agent 事件转发 — EventBridge Rule + Role，把 aws.aidevops 调查事件转发到系统账号 Custom Bus
+  3. (可选) PHD 事件转发 — EventBridge Rule + Role，把 AWS Health 事件转发到系统账号 SNS Topic
+  通过 CloudFormation StackSets (service-managed) 从管理账号批量下发；
+  也可在单个业务账号手动部署（aws cloudformation deploy）。
+
+Parameters:
+  SystemAccountId:
+    Type: String
+    Description: NotiOps 系统部署账号 ID（12 位数字）
+    AllowedPattern: "[0-9]{12}"
+    ConstraintDescription: Must be a 12-digit AWS account ID
+
+  OrganizationId:
+    Type: String
+    Default: ""
+    Description: >
+      (可选但强烈建议) AWS Organizations ID (o-xxxx)。非空时给跨账号信任策略加
+      aws:PrincipalOrgID 条件做纵深防御：即便信任了系统账号 root，也只有本组织内的
+      principal 能 AssumeRole，杜绝跨组织混淆代理（confused deputy）。
+    AllowedPattern: "^(o-[a-z0-9]{10,32})?$"
+    ConstraintDescription: Must be an AWS Organizations ID (o-xxxx) or empty
+
+  DevOpsEventBusArn:
+    Type: String
+    Description: >
+      系统账号 Custom Event Bus ARN
+      (e.g. arn:aws:events:us-east-1:123456789012:event-bus/notiops-devops-events)
+    AllowedPattern: "arn:aws:events:[a-z0-9-]+:[0-9]{12}:event-bus/.+"
+    ConstraintDescription: Must be a valid EventBridge event bus ARN
+
+  PhdSnsTopicArn:
+    Type: String
+    Default: ""
+    Description: >
+      (可选) 系统账号 PHD SNS Topic ARN (e.g. arn:aws:sns:us-east-1:123456789012:phd-events)。
+      留空则不部署 PHD 转发。
+
+  ObservabilitySinkArn:
+    Type: String
+    Default: ""
+    Description: >
+      (可选) 管理账号 CloudWatch OAM Sink ARN。非空时创建 oam:Link，把本账号
+      metrics/logs/traces 共享给管理账号（跨账号 observability / 调查关联分析）。
+
+  PrimaryRegion:
+    Type: String
+    Default: "us-east-1"
+    Description: >
+      主 Region（=系统部署 Region）。IAM 角色是全局资源，只在主 Region 的 stack instance
+      创建；其余 Region 的 instance 只创建 EventBridge 转发规则（引用同名角色 ARN）。
+      借此同一 StackSet 可按账号多 Region 下发（跨 Region 事件也能转发回系统总线）。
+
+Conditions:
+  EnableOamLink: !And
+    - !Not [!Equals [!Ref ObservabilitySinkArn, ""]]
+    - !Condition IsPrimaryRegion  # v1 先主 Region；如需多 Region link 去掉本条件逐区下发
+  EnablePhdForwarding: !And
+    - !Not [!Equals [!Ref PhdSnsTopicArn, ""]]
+    - !Condition IsPrimaryRegion  # EventBridge→SNS Target 仅支持同 Region，PHD 转发只在主 Region
+  IsPrimaryRegion: !Equals [!Ref "AWS::Region", !Ref PrimaryRegion]
+  HasOrgId: !Not [!Equals [!Ref OrganizationId, ""]]
+
+Resources:
+  # ─── 1. 跨账号只读采集角色 ───
+  # 权限与系统账号 notiops-backend-stack.ts 的 IdleDetectionRole 保持一致。
+  # 信任系统账号的 notiops-lambda-execution-role（lambda1/5、API、Web Chat BFF 共用）。
+  # RoleName 带 SystemAccountId 后缀：与目标账号内可能存在的【独立 NotiOps 部署】
+  # （其 NotiOpsBackendStack 拥有无后缀的 notiops-idle-detection-role）解耦共存，
+  # 也支持同一成员账号被多个管理部署纳管。
+  IdleDetectionRole:
+    Type: AWS::IAM::Role
+    Condition: IsPrimaryRegion
+    Properties:
+      RoleName: !Sub "notiops-idle-detection-role-${SystemAccountId}"
+      Description: "Allows NotiOps system account read-only access to this member account (RDS/EC2/CloudWatch/Cost/Support/Security etc.)"
+      # 挂 AWS 托管 ReadOnlyAccess：与部署账号自身 agent 的广只读范围对齐，
+      # 让跨账号调查(EC2/成本/任意只读 API)与单账号体验一致。纯只读、无任何写权限。
+      # 下方 inline notiops-readonly 保留：明确列出核心用到的 action(文档用途 + 兜底)。
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              # 信任管理账号 root：由管理账号侧 IAM 精确控制哪些角色能 AssumeRole
+              # （lambda 执行角色 + Web Chat BFF 角色均有显式 sts:AssumeRole 授权）。
+              # 只信任单一角色名会漏掉 BFF（其 roleName 由 CDK 自动生成）。
+              AWS: !Sub "arn:aws:iam::${SystemAccountId}:root"
+            Action: sts:AssumeRole
+            # 纵深防御：传入 OrganizationId 时，附加 aws:PrincipalOrgID 条件——
+            # 即便信任 root，也只有本组织内的 principal 能 assume，杜绝跨组织混淆代理。
+            Condition: !If
+              - HasOrgId
+              - StringEquals:
+                  aws:PrincipalOrgID: !Ref OrganizationId
+              - !Ref "AWS::NoValue"
+      Policies:
+        - PolicyName: notiops-readonly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:ListTagsForResource
+                  - elasticache:DescribeCacheClusters
+                  - elasticache:DescribeReplicationGroups
+                  - elasticache:ListTagsForResource
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - support:DescribeTrustedAdvisorCheckResult
+                  - support:DescribeTrustedAdvisorChecks
+                  # 仪表盘跨账号视角（Security / Cases / Health / Investigate）——
+                  # 新增仪表盘需要的只读动作统一加在这里，StackSet 更新自动滚到全部成员账号
+                  - securityhub:GetFindings
+                  - securityhub:DescribeHub
+                  - support:DescribeCases
+                  - support:DescribeCommunications
+                  - support:DescribeServices
+                  - health:Describe*
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:DescribeAlarmHistory
+                  # ④ GuardDuty / Backup 仪表盘（只读）
+                  - guardduty:ListDetectors
+                  - guardduty:GetFindingsStatistics
+                  - guardduty:ListFindings
+                  - guardduty:GetFindings
+                  - backup:ListBackupJobs
+                  - backup:ListBackupVaults
+                  - backup:ListProtectedResources
+                  # Phase 2: 管理侧自动回填 DevOps Agent payload —— 读成员账号内
+                  # notiops-member-devops-agent StackSet 实例的 outputs
+                  - cloudformation:DescribeStacks
+                  # Lifecycle/EOS 仪表盘跨账号扫描（版本生命周期盘点，全部只读）
+                  - ec2:DescribeRegions
+                  - rds:DescribeDBClusters
+                  - rds:DescribeDBEngineVersions
+                  - eks:ListClusters
+                  - eks:DescribeCluster
+                  - eks:DescribeClusterVersions
+                  - lambda:ListFunctions
+                  - es:ListDomainNames
+                  - es:DescribeDomains
+                  - elasticmapreduce:ListClusters
+                  - elasticmapreduce:DescribeCluster
+                  - ce:Get*
+                  - ce:List*
+                  - ce:Describe*
+                  - cost-optimization-hub:ListRecommendations
+                  - cost-optimization-hub:GetRecommendation
+                  - cost-optimization-hub:ListEnrollmentStatuses
+                  - cost-optimization-hub:GetPreferences
+                  - compute-optimizer:Get*
+                  - compute-optimizer:Describe*
+                  - budgets:ViewBudget
+                  - budgets:DescribeBudgets
+                  - pricing:GetProducts
+                  - pricing:DescribeServices
+                  - pricing:GetAttributeValues
+                  - pricing:ListPriceLists
+                  - pricing:GetPriceListFileUrl
+                  - freetier:GetFreeTierUsage
+                  - storagelens:Get*
+                  - storagelens:List*
+                  - s3:GetStorageLensConfiguration
+                  - s3:ListStorageLensConfigurations
+                  - cur:DescribeReportDefinitions
+                Resource: "*"
+
+  # ─── 2. DevOps Agent 调查事件转发 ───
+  DevOpsEventsForwardRole:
+    Type: AWS::IAM::Role
+    Condition: IsPrimaryRegion
+    Properties:
+      RoleName: !Sub "notiops-devops-forwarder-role-${AWS::AccountId}"
+      Description: "Allow EventBridge to forward aws.aidevops events to NotiOps system account custom bus"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: put-events
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Ref DevOpsEventBusArn
+
+  DevOpsEventsForwardRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: notiops-devops-events-forward
+      Description: "Forward DevOps Agent investigation events to NotiOps system account"
+      EventPattern:
+        source:
+          - aws.aidevops
+        detail-type:
+          - "Investigation Created"
+          - "Investigation Completed"
+          - "Investigation Failed"
+          - "Investigation Timed Out"
+          - "Investigation Cancelled"
+          - "Investigation Linked"
+      Targets:
+        - Arn: !Ref DevOpsEventBusArn
+          Id: notiops-devops-bus-target
+          # 构造 ARN 而非 GetAtt：角色只在主 Region 创建，非主 Region 的规则按固定命名引用
+          RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/notiops-devops-forwarder-role-${AWS::AccountId}"
+
+  # ─── 3. (可选) PHD 事件转发 ───
+  # 与 infra/phd-event-forwarder.yaml 等价；RoleName 保持同一约定,
+  # 便于系统账号 SNS Topic Policy 按 ArnLike phd-event-forwarder-role-* 放行。
+  PhdEventsForwardRole:
+    Type: AWS::IAM::Role
+    Condition: EnablePhdForwarding
+    Properties:
+      RoleName: !Sub "phd-event-forwarder-role-${AWS::AccountId}"
+      Description: "Allow EventBridge to publish PHD events to cross-account SNS Topic"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: sns-publish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref PhdSnsTopicArn
+
+  PhdEventsForwardRule:
+    Type: AWS::Events::Rule
+    Condition: EnablePhdForwarding
+    Properties:
+      Name: notiops-phd-events-forward
+      Description: "Forward PHD events to NotiOps system account SNS Topic"
+      EventPattern:
+        source:
+          - aws.health
+        detail-type:
+          - "AWS Health Event"
+      Targets:
+        - Arn: !Ref PhdSnsTopicArn
+          Id: phd-sns-target
+          RoleArn: !GetAtt PhdEventsForwardRole.Arn
+
+  ObservabilityLink:
+    Type: AWS::Oam::Link
+    Condition: EnableOamLink
+    Properties:
+      SinkIdentifier: !Ref ObservabilitySinkArn
+      ResourceTypes:
+        - AWS::CloudWatch::Metric
+        - AWS::Logs::LogGroup
+        - AWS::XRay::Trace
+      LabelTemplate: "$AccountName"
+
+Outputs:
+  IdleDetectionRoleArn:
+    Condition: IsPrimaryRegion
+    Description: 跨账号只读角色 ARN（登记到系统账号目标账户配置的 role_arn）
+    Value: !GetAtt IdleDetectionRole.Arn

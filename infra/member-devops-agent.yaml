@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  NotiOps member account DevOps Agent onboarding (StackSet payload, Phase 2).
+  在成员账号创建独立 Agent Space + Primary/Trigger Role + Association
+  （per-member-space 架构；对齐 notiops-backend-stack.ts 部署账号自建逻辑）。
+  资源命名带 SystemAccountId 后缀 —— 与成员账号内可能存在的【独立 NotiOps 部署】
+  （拥有无后缀的 notiops-agent-primary/trigger-<acct> 与同名 space）解耦共存。
+  Outputs 暴露 AgentSpaceId/Arn + TriggerRoleArn，管理侧跨账号读回自动完成
+  payload 登记（da#<account>）→ 测试 → 启用，实现一键到底。
+
+Parameters:
+  SystemAccountId:
+    Type: String
+    AllowedPattern: "[0-9]{12}"
+    Description: NotiOps 系统部署账号 ID（trigger 角色信任它来触发调查）
+
+  OrganizationId:
+    Type: String
+    Default: ""
+    Description: >
+      (可选但强烈建议) AWS Organizations ID (o-xxxx)。非空时给 TriggerRole 信任策略加
+      aws:PrincipalOrgID 条件做纵深防御：即便信任系统账号 root，也只有本组织内 principal
+      能 AssumeRole，杜绝跨组织混淆代理。
+    AllowedPattern: "^(o-[a-z0-9]{10,32})?$"
+    ConstraintDescription: Must be an AWS Organizations ID (o-xxxx) or empty
+
+Conditions:
+  HasOrgId: !Not [!Equals [!Ref OrganizationId, ""]]
+
+Resources:
+  AgentSpace:
+    Type: AWS::DevOpsAgent::AgentSpace
+    Properties:
+      Name: !Sub "notiops-devops-${AWS::AccountId}-m${SystemAccountId}"
+      Description: !Sub "NotiOps managed member agent space (management account ${SystemAccountId})"
+
+  # DevOps Agent 服务读本账号资源的角色（与部署账号 PrimaryRole 权限一致）
+  PrimaryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "notiops-agent-primary-${AWS::AccountId}-m${SystemAccountId}"
+      Description: "Primary role assumed by DevOps Agent service to investigate this member account"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsAgentAccessPolicy
+      Policies:
+        - PolicyName: resource-explorer-slr
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/resource-explorer-2.amazonaws.com/AWSServiceRoleForResourceExplorer"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: resource-explorer-2.amazonaws.com
+        # cur-deep-dive-readonly：只读查询本账号 CUR（Athena/Glue/S3）。
+        # ⚠️ 安全说明（Checkov CKV_AWS_108/111 + IAM wildcard）：这些是**只读** action
+        # （athena/glue Get*/Query + s3 Get/List），不含删改；但 CUR 的 Glue database、
+        # Athena workgroup、S3 桶名由**客户既有 CUR 集成决定、模板部署期不可预知**，无法按
+        # 具体 ARN 收窄，故 Resource 用 "*"。已按能收窄的收窄：写权限（PutObject）单独一条、
+        # 且仅限 athena-results 结果前缀（不给通配写）。该角色只被 aidevops 服务在本账号内
+        # assume（见上 AssumeRolePolicy 的 SourceAccount/SourceArn 约束），不跨账号。
+        - PolicyName: cur-deep-dive-readonly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Sid: CurReadOnlyQueryWildcardByDesign
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                  - s3:GetObject
+                  - s3:ListBucket
+                # 只读 CUR 查询；CUR 资源名客户侧决定、部署期未知，无法按 ARN 收窄（见上注释）。
+                Resource: "*"
+              - Effect: Allow
+                Sid: AthenaResultsWriteScopedToResultsPrefix
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                # 写权限仅限 athena 查询结果前缀，不给通配写。
+                Resource: "arn:aws:s3:::*/athena-results/*"
+
+  Association:
+    Type: AWS::DevOpsAgent::Association
+    DependsOn: [AgentSpace, PrimaryRole]
+    Properties:
+      AgentSpaceId: !GetAtt AgentSpace.AgentSpaceId
+      ServiceId: aws
+      Configuration:
+        Aws:
+          AccountId: !Ref "AWS::AccountId"
+          AccountType: monitor
+          AssumableRoleArn: !GetAtt PrimaryRole.Arn
+
+  # 管理账号（Lambda4/Callback/BFF）AssumeRole 进来触发调查/读结果
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "notiops-agent-trigger-${AWS::AccountId}-m${SystemAccountId}"
+      Description: "Assumed by NotiOps management account to call DevOps Agent API in this member account"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${SystemAccountId}:root"
+            Action: sts:AssumeRole
+            # 纵深防御：传入 OrganizationId 时附加 aws:PrincipalOrgID 条件，
+            # 只有本组织内 principal 能 assume（杜绝跨组织混淆代理）。
+            Condition: !If
+              - HasOrgId
+              - StringEquals:
+                  aws:PrincipalOrgID: !Ref OrganizationId
+              - !Ref "AWS::NoValue"
+      Policies:
+        - PolicyName: devops-agent-trigger
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aidevops:CreateBacklogTask
+                  - aidevops:GetBacklogTask      # poll_investigation 轮询任务状态需要（缺它→status 永远 IN_PROGRESS→前端拿不到最终报告）
+                  - aidevops:GetAgentSpace
+                  - aidevops:ListJournalRecords
+                  - aidevops:GetJournalRecord
+                  - aidevops:CreateChat          # generate_mitigation（生成缓解方案）需要
+                  - aidevops:SendMessage         # generate_mitigation 发消息需要
+                  # Skill 发布（NotiOps 把文档型 skill zip 装进本成员账号的 Agent Space）——
+                  # 管理账号 AssumeRole 进本角色后调 Asset API（见 devops_agent_skills.mjs）。
+                  - aidevops:CreateAsset
+                  - aidevops:UpdateAsset
+                  - aidevops:DeleteAsset
+                  - aidevops:ListAssets
+                Resource: !GetAtt AgentSpace.Arn
+
+Outputs:
+  AgentSpaceId:
+    Value: !GetAtt AgentSpace.AgentSpaceId
+  AgentSpaceArn:
+    Value: !GetAtt AgentSpace.Arn
+  TriggerRoleArn:
+    Value: !GetAtt TriggerRole.Arn

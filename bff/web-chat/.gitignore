@@ -1,0 +1,6 @@
+node_modules
+*.log
+# capabilities.json 现在提交入库：它必须随 Lambda bundle 一起打包，否则 capabilities.mjs
+# 在 INIT 阶段读不到文件会抛异常导致整个 BFF 起不来（见 2026-07-09 事故）。
+# 编辑源仍是 config/capabilities.json；setup.sh 会在部署前 cp 过来保持同步，
+# 提交的这份是"部署安全网"，保证任何情况下 bundle 里都有它。

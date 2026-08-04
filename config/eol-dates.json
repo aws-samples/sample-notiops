@@ -1,0 +1,25 @@
+{
+  "_note": "EOS/EOL 兜底表 —— 仅用于【没有实时 EOL API】的服务(Lambda / ElastiCache / OpenSearch / EMR)。RDS/Aurora 与 EKS 走实时 API(describeDBEngineVersions.SupportedEngineLifecycle / describeClusterVersions.endOfStandardSupportDate)，不读此表。这 4 个服务的数据优先级：AWS Health 'end of standard support' 事件(权威, 账号级, 自动) > 本表(兜底) > admin 覆盖(存 DDB, 最高优先, 见 Admin 控制台)。日期为 end of standard support，ISO YYYY-MM-DD。key = 运行时/引擎版本标识。只收录官方文档已核实的日期；未知的留空，交给 Health/admin 补。",
+  "asOf": "2026-07-10",
+  "sources": {
+    "lambda": "https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html",
+    "elasticache": "https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/deprecated-engine-versions.html",
+    "opensearch": "https://docs.aws.amazon.com/opensearch-service/latest/developerguide/what-is.html",
+    "emr": "https://docs.aws.amazon.com/emr/latest/ReleaseGuide/emr-release-app-versions-6.x.html"
+  },
+  "lambda": {
+    "nodejs24.x": "2028-04-30",
+    "nodejs22.x": "2027-04-30",
+    "python3.14": "2029-06-30",
+    "python3.13": "2029-06-30",
+    "java8.al2": "2026-06-30",
+    "java11": "2026-06-30",
+    "java17": "2026-06-30",
+    "python3.10": "2026-06-30",
+    "python3.11": "2026-06-30",
+    "provided.al2": "2026-06-30"
+  },
+  "elasticache": {},
+  "opensearch": {},
+  "emr": {}
+}

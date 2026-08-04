@@ -1,0 +1,231 @@
+import { useState } from "react";
+import { getConfig } from "../config";
+import Logo from "./Logo";
+import { useT, useLocale } from "../i18n";
+import type { Conversation, TopicKey } from "../types";
+import { TOPICS } from "../types";
+import {
+  IconNewChat, IconInvestigate, IconFinOps, IconCases, IconSecurity,
+  IconReports, IconMore, IconExternal, IconSkill, IconCustomize, IconWhatsNew, IconChevronRight, IconBell,
+} from "./icons";
+import ConvItem from "./ConvItem";
+import UserMenu from "./UserMenu";
+
+interface Props {
+  conversations: Conversation[];
+  activeId: string | null;
+  busyIds?: Set<string>;    // 正在生成(思考/流式输出)的会话 id 集合 → 列表显活跃状态点
+  unreadIds?: Set<string>;  // 后台完成、未读的会话 id 集合 → 列表显未读红点
+  onSelect: (id: string) => void;
+  onNew: (topic?: TopicKey) => void;
+  onRename: (id: string, title: string) => void;
+  onTogglePin: (id: string) => void;
+  onDelete: (id: string) => void;
+  collapsed: boolean;
+  onToggle: () => void;
+  username: string;
+  onSignOut: () => void;
+  width?: number;
+  onSkills?: () => void;        // 打开独立 Skills 页（一级入口）
+  skillsActive?: boolean;       // Skills 页当前是否激活（高亮）
+  onCustomize?: () => void;     // 打开 Customize（定制）页（收进「更多」）
+  customizeActive?: boolean;    // Customize 页当前是否激活（高亮）
+  onWhatsNew?: () => void;      // 打开 What's New（AWS 新发布学习空间）
+  onNotifications?: () => void; // 打开「通知」收件箱
+  notificationsActive?: boolean;// 通知页当前是否激活（高亮）
+  notifUnread?: number;         // 未读通知数（>0 显示红点角标）
+  onFinops?: () => void;        // 打开「FinOps」仪表盘独立页（不再走聊天主题）
+  finopsActive?: boolean;       // FinOps 页当前是否激活（高亮）
+  onCases?: () => void;         // 打开「Cases」仪表盘独立页（不再走聊天主题）
+  casesActive?: boolean;        // Cases 页当前是否激活（高亮）
+  onAdmin?: () => void;         // 打开「管理」页（角色/用户/模块）
+  adminActive?: boolean;        // 管理页当前是否激活（高亮）
+  onSecurity?: () => void;      // 打开「安全」仪表盘独立页
+  securityActive?: boolean;     // 安全页当前是否激活（高亮）
+  onInvestigate?: () => void;   // 打开「调查」告警仪表盘独立页
+  investigateActive?: boolean;  // 调查页当前是否激活（高亮）
+  showFinops?: boolean;         // 能力门禁：是否显示 FinOps 入口（默认 true）
+  showCases?: boolean;          // 能力门禁：是否显示 Cases 入口（默认 true）
+  showAdmin?: boolean;          // 能力门禁：是否显示 管理 入口（默认 false，仅 admin 可见）
+  showNotifications?: boolean;  // 能力门禁：Notifications（默认 true）
+  showInvestigation?: boolean;  // 能力门禁：Investigation（默认 true）
+  showSkills?: boolean;         // 能力门禁：Skills（默认 true）
+  showCustomize?: boolean;      // 能力门禁：Customize（默认 true）
+  showSecurity?: boolean;       // 能力门禁：Security（默认 false，需 nav:security）
+}
+
+const PanelIcon = () => (
+  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
+    <rect x="3" y="4" width="18" height="16" rx="2.5" />
+    <line x1="9" y1="4" x2="9" y2="20" />
+  </svg>
+);
+
+export default function Sidebar({ conversations, activeId, busyIds, unreadIds, onSelect, onNew, onRename, onTogglePin, onDelete, collapsed, onToggle, username, onSignOut, width = 264, onSkills, skillsActive, onCustomize, customizeActive, onWhatsNew, onNotifications, notificationsActive, notifUnread = 0, onFinops, finopsActive, onCases, casesActive, onAdmin, adminActive, showFinops = true, showCases = true, showAdmin = false, showNotifications = true, showInvestigation = true, showSkills = true, showCustomize = true, onSecurity, securityActive, showSecurity = false, onInvestigate, investigateActive }: Props) {
+  const t = useT();
+  const { locale } = useLocale();
+  // "更多"子菜单展开态（收纳 安全 / 巡检&报告 等非高频入口）
+  const [moreOpen, setMoreOpen] = useState(false);
+
+  // 主题会话分组的收起态：记录**已收起**的组 key（默认全部展开）。持久化到 localStorage，跨刷新保留。
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
+    try {
+      const raw = localStorage.getItem("notiops.collapsedGroups");
+      return raw ? new Set<string>(JSON.parse(raw)) : new Set<string>();
+    } catch { return new Set<string>(); }
+  });
+  const toggleGroup = (key: string) =>
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      try { localStorage.setItem("notiops.collapsedGroups", JSON.stringify([...next])); } catch { /* 忽略：隐私模式等 */ }
+      return next;
+    });
+
+  // 会话列表按"最近活动时间"(updatedAt)降序——发过消息/刚打开的排在最前，
+  // 而不是固定的创建顺序。置顶组同样按活动时间排。
+  const byRecent = (a: Conversation, b: Conversation) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
+  const pinned = conversations.filter((c) => c.pinned).sort(byRecent);
+  const recent = conversations.filter((c) => !c.pinned).sort(byRecent);
+
+  // 非置顶会话按主题分组：分组顺序与上方主题导航一致（TOPICS 顺序），
+  // 通用会话（general/未设主题）归到最后一组。组内按最近活动时间降序。
+  // 空组不渲染标题。置顶组独立在最上，不参与主题分组。
+  const groups: { key: string; labelKey: string; items: Conversation[] }[] = [
+    ...TOPICS.map((tp) => ({ key: tp.key, labelKey: tp.labelKey, items: [] as Conversation[] })),
+    { key: "general", labelKey: "topic.general", items: [] as Conversation[] },
+  ];
+  const groupIndex = new Map(groups.map((g, i) => [g.key, i]));
+  for (const c of recent) {
+    const gi = groupIndex.get(c.topic ?? "general") ?? groupIndex.get("general")!;
+    groups[gi].items.push(c);
+  }
+
+  // idle 控制台：扩展区第一个链接（同一套登录，深链到现有控制台）
+  const openConsole = () => {
+    // config.json 注入的 idle 控制台 CloudFront 地址（web-chat-stack 从 NotiOpsBackendStack.consoleUrl 透传）
+    let url = "";
+    try { url = getConfig().idleConsoleUrl || ""; } catch { /* config 未加载 */ }
+    if (url) window.open(url, "_blank", "noopener");
+  };
+
+  // 点主题入口 = 新建一个带该主题 tag 的会话（通用能力 + 主题上下文/分类）。
+  // 后续每个主题可在 agent 侧按 topic 做特定微调；当前共享同一通用 agent。
+
+  return (
+    <aside className={"sidebar" + (collapsed ? " collapsed" : "")} style={collapsed ? undefined : { width }}>
+      <div className="sb-brand">
+        <span className="sb-brandname">
+          <Logo /> NotiOps
+        </span>
+        <button className="panel-btn" title={t("sidebar.collapse")} onClick={onToggle}>
+          <PanelIcon />
+        </button>
+      </div>
+
+      <button className="sb-new" onClick={() => onNew()}><span className="ni-ic"><IconNewChat /></span>{t("app.newChat")}</button>
+
+      <nav className="sb-nav">
+        {/* 通知（主动观察 push）：置顶一级入口，未读时右侧红点角标 —— 运维最先关心的信息流。 */}
+        {showNotifications && (
+          <button className={"navitem" + (notificationsActive ? " active" : "")} onClick={() => onNotifications?.()}>
+            <span className="ni-ic"><IconBell /></span>{t("topic.notifications")}
+            {notifUnread > 0 && <span className="ni-badge">{notifUnread > 99 ? "99+" : notifUnread}</span>}
+          </button>
+        )}
+        {/* 主题入口（②）：点击将在右侧打开该主题的定制 chat 页。 */}
+        {showInvestigation && <button className={"navitem" + (investigateActive ? " active" : "")} onClick={() => onInvestigate?.()}><span className="ni-ic"><IconInvestigate /></span>{t("topic.investigate")}</button>}
+        {showFinops && <button className={"navitem" + (finopsActive ? " active" : "")} onClick={onFinops}><span className="ni-ic"><IconFinOps /></span>{t("topic.cost")}</button>}
+        {showSecurity && <button className={"navitem" + (securityActive ? " active" : "")} onClick={() => onSecurity?.()}><span className="ni-ic"><IconSecurity /></span>{t("topic.security")}</button>}
+        {showCases && <button className={"navitem" + (casesActive ? " active" : "")} onClick={onCases}><span className="ni-ic"><IconCases /></span>{t("topic.cases")}</button>}
+        {/* Skills：独立一级入口。点开进独立 Skills 管理页（非「定制」外壳）。 */}
+        {showSkills && (
+          <button className={"navitem" + (skillsActive ? " active" : "")} onClick={() => onSkills?.()}>
+            <span className="ni-ic"><IconSkill /></span>{t("cz.nav.skills")}
+          </button>
+        )}
+        {/* 「更多」：可展开子菜单，收纳非高频入口（巡检&报告 / 管理 / 定制）。 */}
+        <button className={"navitem" + (moreOpen ? " expanded" : "")} onClick={() => setMoreOpen((v) => !v)}>
+          <span className="ni-ic"><IconMore /></span>{t("nav.more")}
+          <span className={"ni-caret" + (moreOpen ? " open" : "")}><IconChevronRight size={15} /></span>
+        </button>
+        {moreOpen && (
+          <div className="sb-submenu">
+            {/* 外链：idle 控制台，新标签打开 */}
+            <button className="navitem subitem" onClick={openConsole}>
+              <span className="ni-ic"><IconReports /></span>{t("nav.inspections")}
+              <span className="ni-tag">{locale === "zh" ? "控制台" : "Console"} <IconExternal /></span>
+            </button>
+            {/* 管理：仅 admin 可见（后端 nav:admin 门禁 + 前端能力过滤）。角色/用户/模块。从一级收进「更多」。 */}
+            {showAdmin && (
+              <button className={"navitem subitem" + (adminActive ? " active" : "")} onClick={() => onAdmin?.()}>
+                <span className="ni-ic"><IconCustomize /></span>{t("nav.admin")}
+              </button>
+            )}
+            {/* 定制（连接器/插件等）：从一级收进「更多」。 */}
+            {showCustomize && (
+              <button className={"navitem subitem" + (customizeActive ? " active" : "")} onClick={() => onCustomize?.()}>
+                <span className="ni-ic"><IconCustomize /></span>{t("nav.customize")}
+              </button>
+            )}
+          </div>
+        )}
+      </nav>
+
+      <div className="sb-divider" />
+      <div className="sb-list">
+        {pinned.length > 0 && (
+          <>
+            <div className="sb-sec">{t("sidebar.pinned")}</div>
+            {/* 置顶组混合各主题 → 保留主题 tag（showTag 默认 true）便于区分 */}
+            {pinned.map((c) => (
+              <ConvItem key={c.id} conv={c} active={c.id === activeId}
+                busy={busyIds?.has(c.id)} unread={unreadIds?.has(c.id)}
+                onSelect={() => onSelect(c.id)}
+                onRename={(title) => onRename(c.id, title)}
+                onTogglePin={() => onTogglePin(c.id)}
+                onDelete={() => onDelete(c.id)} />
+            ))}
+          </>
+        )}
+        {/* 主题分组：组标题已标明主题，组内会话不再重复显示 tag（showTag=false）。
+            标题可点击收起/展开该组（caret 指示，收起态持久化）。 */}
+        {groups.map((g) => {
+          if (g.items.length === 0) return null;
+          const isCollapsed = collapsedGroups.has(g.key);
+          return (
+            <div key={g.key}>
+              <button className={"sb-sec sb-sec-btn" + (isCollapsed ? " collapsed" : "")}
+                onClick={() => toggleGroup(g.key)}
+                title={isCollapsed ? (locale === "en" ? "Expand" : "展开") : (locale === "en" ? "Collapse" : "收起")}>
+                <span className={"sb-sec-caret" + (isCollapsed ? "" : " open")}><IconChevronRight size={13} /></span>
+                <span className="sb-sec-label">{t(g.labelKey)}</span>
+              </button>
+              {!isCollapsed && g.items.map((c) => (
+                <ConvItem key={c.id} conv={c} active={c.id === activeId}
+                  busy={busyIds?.has(c.id)} unread={unreadIds?.has(c.id)}
+                  showTag={false}
+                  onSelect={() => onSelect(c.id)}
+                  onRename={(title) => onRename(c.id, title)}
+                  onTogglePin={() => onTogglePin(c.id)}
+                  onDelete={() => onDelete(c.id)} />
+              ))}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* What's New 卡片入口（仿 Claude Cowork 左下角卡片）：点开进入 AWS 新发布学习空间 */}
+      <button className="sb-whatsnew" onClick={() => onWhatsNew?.()}>
+        <span className="wn-ic"><IconWhatsNew size={20} /></span>
+        <span className="wn-tx">
+          <span className="wn-title">{t("whatsnew.card")}</span>
+          <span className="wn-sub">{t("whatsnew.cardSub")}</span>
+        </span>
+        <span className="wn-arrow"><IconChevronRight size={18} /></span>
+      </button>
+
+      <UserMenu username={username} onSignOut={onSignOut} />
+    </aside>
+  );
+}

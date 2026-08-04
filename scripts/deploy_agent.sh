@@ -38,6 +38,7 @@ if ! command -v agentcore >/dev/null 2>&1; then
 fi
 
 export AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" CDK_DEFAULT_REGION="$REGION"
+[ -n "${AWS_PROFILE:-}" ] && export AWS_PROFILE
 
 # ── 2. Web Search Gateway（可选）──
 # AgentCore web search 仅 us-east-1。非该区时自动跳过（不阻断；agent 用 Exa 兜底）。
@@ -188,7 +189,7 @@ except Exception: print('')" 2>/dev/null || echo "")
   fi
   [ "$i" -lt 12 ] && sleep 6
 done
-if [ -n "$CUR" ]; then
+if [ -n "$CUR" ] && printf '%s' "$CUR" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
   UPD_JSON="${TMPDIR:-/tmp}/notiops-rt-idle-update.json"
   # 把 §3 算好的 4 个 env 真值传进去强制回填(空串保留空串 = 该功能未启用,不是占位符)。
   printf '%s' "$CUR" | python3 - "$UPD_JSON" \

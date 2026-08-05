@@ -1,0 +1,13 @@
+# Exclude from Docker build context (repo root)
+# Prevents fromAsset("../") from scanning irrelevant files
+.venv
+.git
+infra/node_modules
+infra/cdk.out
+lambda_layer
+agent-build
+bff/web-chat/node_modules
+web-chat/node_modules
+idle-console/node_modules
+cdk.out
+*.log

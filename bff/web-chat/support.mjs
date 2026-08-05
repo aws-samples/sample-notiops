@@ -326,7 +326,14 @@ export async function executeAction(action) {
   const type = action?.type;
   const p = action?.params || {};
   // 目标账号：action.account_id（agent 提议时写入），缺省=部署账号
-  const cli = await supportClientFor(action?.account_id);
+  const reqAcct = (action?.account_id || "").toString().trim();
+  // 审计（防御性可观测）：写操作明确记录落到哪个账号。空 account_id = 部署账号(单账号
+  // 常态,合法),不作硬失败——但若前端漏传(历史 bug: confirmAction 重建 toExec 丢 account_id)
+  // 导致 linked-account 写操作误落部署账号,这行日志能第一时间暴露,便于回归定位。
+  const deploy = await deployAccountId();
+  const effAcct = reqAcct || deploy || "(deploy)";
+  console.log(`[executeAction] type=${type} requestedAccount=${reqAcct || "(empty→deploy)"} effectiveAccount=${effAcct}`);
+  const cli = await supportClientFor(reqAcct);
   if (!cli) return { ok: false, code: "cross_account_unavailable",
                      message: "无法访问目标 AWS 账号（未注册/角色未部署/单账号锁定）。" };
   try {

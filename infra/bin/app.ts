@@ -47,18 +47,24 @@ const main = new NotiOpsBackendStack(app, "NotiOpsBackendStack", {
   description: "AWS resource idle-detection & optimization system (fully automated deployment)",
 });
 
-const botStack = new BotStack(app, "BotStack", {
-  env,
-  description: "NotiOps ECS Bot (Feishu + Slack)",
-  metricsTableName: "notiops-metrics",
-  configTableName: "notiops-config",
-  conversationsTableName: "notiops-conversations",
-  skillsBucketName: main.dataBucketName,
-});
+// BotStack 条件实例化：enabledPlatforms=none 时跳过 BotStack，
+// 避免 fromAsset("../") 扫描整个 repo root 计算 asset hash（594s → 12s）。
+// setup.sh 选"暂不部署 IM"时传 -c enabledPlatforms=none。
+const enabledPlatforms = app.node.tryGetContext("enabledPlatforms") || "feishu";
+if (enabledPlatforms !== "none") {
+  const botStack = new BotStack(app, "BotStack", {
+    env,
+    description: "NotiOps ECS Bot (Feishu + Slack)",
+    metricsTableName: "notiops-metrics",
+    configTableName: "notiops-config",
+    conversationsTableName: "notiops-conversations",
+    skillsBucketName: main.dataBucketName,
+  });
 
-// BotStack consumes the DynamoDB tables created by NotiOpsBackendStack
-// (by name), so the main stack must be deployed first.
-botStack.addDependency(main);
+  // BotStack consumes the DynamoDB tables created by NotiOpsBackendStack
+  // (by name), so the main stack must be deployed first.
+  botStack.addDependency(main);
+}
 
 // WebChatStack：面向客户的 agentic Web Chat。
 // 复用 NotiOpsBackendStack 的 Cognito 池（认证统一），故依赖 main。

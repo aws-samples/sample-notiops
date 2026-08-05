@@ -9,6 +9,9 @@ export interface ProposedAction {
   type: "create_case" | "create_case_form" | "create_case_review" | "add_communication" | "resolve_case";
   summary?: string;
   params?: Record<string, unknown>;
+  // 目标 AWS 账号（agent 提议时按本轮 _acct() 写入；空=部署账号）。执行时必须原样带回
+  // BFF，否则跨账号(linked account)的写操作会误落到部署账号。见 confirmAction 的 toExec。
+  account_id?: string;
   // 前端本地状态：执行结果（确认后回填，用于卡片显示已执行/失败）
   done?: boolean;
   result?: { ok: boolean; verified?: boolean; status?: string; message?: string; caseId?: string; displayId?: string };

@@ -29,6 +29,9 @@ if [ "$UI_LANG" != "en" ] && [ "$UI_LANG" != "zh" ]; then
 fi
 # t "<中文>" "<English>" —— 按 UI_LANG 输出对应语言(echo 时用 "$(t ... ...)")。
 t() { if [ "$UI_LANG" = "zh" ]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+# 导出 UI_LANG,让被本脚本调用的子脚本(deploy_agent.sh / provision_websearch_gateway.sh /
+# check-iam-consistency.py)继承同一语言,输出一致的中/英文(子脚本各自 default en 兜底)。
+export UI_LANG
 
 if [ "$PHD_MODE" = true ]; then
   # PHD 模式依赖检查(仅需 python3 + aws)

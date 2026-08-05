@@ -29,6 +29,18 @@ from pathlib import Path
 
 
 # ============================================================
+# UI 语言（双语输出）
+# 继承 setup.sh 导出的 UI_LANG（zh/en）；单独跑时默认英文，面向全球客户。
+# L("<中文>", "<English>") 按 UI_LANG 返回对应语言（仅影响提示文案，数据/逻辑不变）。
+# ============================================================
+_ZH = os.environ.get("UI_LANG", "en") == "zh"
+
+
+def L(zh: str, en: str) -> str:
+    return zh if _ZH else en
+
+
+# ============================================================
 # 结果收集器
 # ============================================================
 @dataclass
@@ -83,8 +95,8 @@ def get_template_path() -> str:
 
 def load_template(path: str) -> dict:
     if not os.path.exists(path):
-        red(f"❌ 模板文件不存在: {path}")
-        red("   请先运行: npx cdk synth --quiet")
+        red(L(f"❌ 模板文件不存在: {path}", f"❌ Template file not found: {path}"))
+        red(L("   请先运行: npx cdk synth --quiet", "   Run first: npx cdk synth --quiet"))
         sys.exit(1)
     with open(path) as f:
         return json.load(f)
@@ -229,13 +241,17 @@ def check_assume_role_consistency(template: dict) -> CheckResult:
             trusted_refs = extract_trust_refs(trust_doc)
 
             if rid in trusted_refs:
-                r.ok(f"{rn} → AssumeRole → {target_name}（Trust Policy 已配置）")
+                r.ok(L(f"{rn} → AssumeRole → {target_name}（Trust Policy 已配置）",
+                       f"{rn} → AssumeRole → {target_name} (Trust Policy configured)"))
             else:
-                r.err(
+                r.err(L(
                     f"权限断裂: {rn} 的 Policy 允许 AssumeRole {target_name}，"
                     f"但 {target_name} 的 Trust Policy 不信任 {rn}。"
-                    f"修复: {target_name}.assumeRolePolicy.addStatements(...)"
-                )
+                    f"修复: {target_name}.assumeRolePolicy.addStatements(...)",
+                    f"Broken permission: {rn}'s policy allows AssumeRole {target_name}, "
+                    f"but {target_name}'s Trust Policy does not trust {rn}. "
+                    f"Fix: {target_name}.assumeRolePolicy.addStatements(...)"
+                ))
     return r
 
 
@@ -246,7 +262,7 @@ def check_agent_no_direct_db() -> CheckResult:
     r = CheckResult()
     agent_dir = Path("..") / "agent"
     if not agent_dir.exists():
-        r.warn("agent/ 目录不存在，跳过")
+        r.warn(L("agent/ 目录不存在，跳过", "agent/ directory not found, skipping"))
         return r
 
     # 精确匹配 from shared.db — 不误报 from shared.config 等
@@ -278,7 +294,8 @@ def check_agent_no_direct_db() -> CheckResult:
                         break
 
     if not found:
-        r.ok("agent/ 目录无直连数据库导入（shared.db / psycopg）")
+        r.ok(L("agent/ 目录无直连数据库导入（shared.db / psycopg）",
+               "No direct DB imports in agent/ (shared.db / psycopg)"))
     return r
 
 
@@ -333,7 +350,8 @@ def check_runtime_role_permissions(template: dict) -> CheckResult:
             break
 
     if not runtime_role_id:
-        r.warn("未找到 AgentCore Runtime Role（可能 skipRuntime=true）")
+        r.warn(L("未找到 AgentCore Runtime Role（可能 skipRuntime=true）",
+                 "AgentCore Runtime Role not found (possibly skipRuntime=true)"))
         return r
 
     stmts = collect_policy_statements(runtime_role_id, roles[runtime_role_id], policies)
@@ -343,14 +361,17 @@ def check_runtime_role_permissions(template: dict) -> CheckResult:
         if action in all_actions:
             r.ok(action)
         else:
-            r.err(f"AgentCore Runtime Role 缺少 {action}")
+            r.err(L(f"AgentCore Runtime Role 缺少 {action}",
+                    f"AgentCore Runtime Role is missing {action}"))
 
     # 检查 AssumeRole 目标是否包含 notiops-idle-detection-role
     targets = extract_assume_target_role_names(stmts)
     if any("notiops-idle-detection-role" in t for t in targets):
-        r.ok("AssumeRole 目标包含 notiops-idle-detection-role")
+        r.ok(L("AssumeRole 目标包含 notiops-idle-detection-role",
+               "AssumeRole targets include notiops-idle-detection-role"))
     else:
-        r.err("AssumeRole 目标不包含 notiops-idle-detection-role（cost_explorer_query 将失败）")
+        r.err(L("AssumeRole 目标不包含 notiops-idle-detection-role（cost_explorer_query 将失败）",
+                "AssumeRole targets do not include notiops-idle-detection-role (cost_explorer_query will fail)"))
 
     return r
 
@@ -407,7 +428,8 @@ def _check_sql_field_in_context(
     # 检查 SQL 是否引用了 table_set 中的表
     for table in table_set:
         if table in sql_lower:
-            return f"SQL 查询 {table} 时使用了 '{wrong_field}'（应为 '{correct_field}'）"
+            return L(f"SQL 查询 {table} 时使用了 '{wrong_field}'（应为 '{correct_field}'）",
+                     f"SQL query on {table} uses '{wrong_field}' (should be '{correct_field}')")
     return None
 
 
@@ -440,10 +462,11 @@ def check_sql_consistency() -> CheckResult:
                     continue
                 for line_no, sql in _extract_sql_strings(py_file):
                     if wrong in sql.lower():
-                        r.err(f"{py_file}:{line_no}: 表名 '{wrong}' 应为 '{correct}'")
+                        r.err(L(f"{py_file}:{line_no}: 表名 '{wrong}' 应为 '{correct}'",
+                                f"{py_file}:{line_no}: table name '{wrong}' should be '{correct}'"))
                         found = True
         if not found:
-            r.ok(f"无错误表名 '{wrong}'")
+            r.ok(L(f"无错误表名 '{wrong}'", f"No wrong table name '{wrong}'"))
 
     # 2. 上下文感知的字段名检查
     # 在查 report_date 表时不应出现 monitoring_date
@@ -467,7 +490,8 @@ def check_sql_consistency() -> CheckResult:
                         r.err(f"{py_file}:{line_no}: {err_msg}")
                         found = True
         if not found:
-            r.ok(f"无上下文错误的 '{wrong_field}'")
+            r.ok(L(f"无上下文错误的 '{wrong_field}'",
+                   f"No context-wrong '{wrong_field}'"))
 
     return r
 
@@ -476,22 +500,29 @@ def check_sql_consistency() -> CheckResult:
 # Main
 # ============================================================
 CHECKS = {
-    1: ("AssumeRole Policy ↔ Trust Policy 一致性", None),  # needs template
-    2: ("Agent 容器禁止直连数据库", check_agent_no_direct_db),
-    3: ("AgentCore Runtime Role 关键权限", None),  # needs template
-    4: ("SQL 表名/字段名一致性", check_sql_consistency),
+    1: (L("AssumeRole Policy ↔ Trust Policy 一致性",
+          "AssumeRole Policy ↔ Trust Policy consistency"), None),  # needs template
+    2: (L("Agent 容器禁止直连数据库",
+          "Agent container must not connect directly to the DB"), check_agent_no_direct_db),
+    3: (L("AgentCore Runtime Role 关键权限",
+          "AgentCore Runtime Role critical permissions"), None),  # needs template
+    4: (L("SQL 表名/字段名一致性",
+          "SQL table/column name consistency"), check_sql_consistency),
 }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="IAM 权限一致性检查")
-    parser.add_argument("--check", type=int, help="只运行指定编号的检查（1-4）")
-    parser.add_argument("--json", action="store_true", help="JSON 输出（CI 友好）")
+    parser = argparse.ArgumentParser(
+        description=L("IAM 权限一致性检查", "IAM permission consistency check"))
+    parser.add_argument("--check", type=int,
+                        help=L("只运行指定编号的检查（1-4）", "run only the numbered check (1-4)"))
+    parser.add_argument("--json", action="store_true",
+                        help=L("JSON 输出（CI 友好）", "JSON output (CI-friendly)"))
     args = parser.parse_args()
 
     template_path = get_template_path()
-    print("🔍 IAM 权限一致性检查")
-    print(f"   模板: {template_path}")
+    print(L("🔍 IAM 权限一致性检查", "🔍 IAM permission consistency check"))
+    print(L(f"   模板: {template_path}", f"   Template: {template_path}"))
     print()
 
     template = load_template(template_path)
@@ -502,11 +533,11 @@ def main() -> None:
 
     for check_num in checks_to_run:
         if check_num not in CHECKS:
-            red(f"❌ 未知检查编号: {check_num}")
+            red(L(f"❌ 未知检查编号: {check_num}", f"❌ Unknown check number: {check_num}"))
             sys.exit(1)
 
         name, fn = CHECKS[check_num]
-        print(f"── 检查 {check_num}: {name} ──")
+        print(L(f"── 检查 {check_num}: {name} ──", f"── Check {check_num}: {name} ──"))
 
         if check_num == 1:
             result = check_assume_role_consistency(template)
@@ -533,9 +564,10 @@ def main() -> None:
     else:
         print("════════════════════════════════════════")
         if total_errors > 0:
-            red(f"❌ 发现 {total_errors} 个问题，请修复后再部署")
+            red(L(f"❌ 发现 {total_errors} 个问题，请修复后再部署",
+                  f"❌ Found {total_errors} issue(s); fix before deploying"))
         else:
-            green("✅ 所有检查通过")
+            green(L("✅ 所有检查通过", "✅ All checks passed"))
 
     sys.exit(1 if total_errors > 0 else 0)
 

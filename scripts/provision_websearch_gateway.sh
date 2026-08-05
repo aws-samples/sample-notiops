@@ -8,6 +8,13 @@
 # 详见 memory web-chat-phase1-deploy 的 "AgentCore Web Search" 段。
 set -euo pipefail
 
+# ─── UI 语言（双语输出）───
+# 继承调用方（deploy_agent.sh / setup.sh）导出的 UI_LANG（zh/en）；单独跑时默认英文。
+# t "<中文>" "<English>"：按 UI_LANG 输出对应语言。
+# export：让内嵌的 python3 heredoc 子进程也能读到 UI_LANG。
+export UI_LANG="${UI_LANG:-en}"
+t() { if [ "$UI_LANG" = "zh" ]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 GW_NAME="${GW_NAME:-notiops-websearch-gw}"
@@ -15,7 +22,7 @@ SVC_ROLE="${SVC_ROLE:-notiops-websearch-gateway-role}"
 TARGET_NAME="web-search-tool"
 
 if [ "$REGION" != "us-east-1" ]; then
-  echo "⚠️  AgentCore Web Search 目前仅 us-east-1 可用，你设的是 $REGION。继续可能失败。" >&2
+  echo "$(t "⚠️  AgentCore Web Search 目前仅 us-east-1 可用，你设的是 $REGION。继续可能失败。" "⚠️  AgentCore Web Search is currently only available in us-east-1; you set $REGION. Continuing may fail.")" >&2
 fi
 
 # ── 1. Gateway 服务角色（信任 bedrock-agentcore + InvokeGateway/InvokeWebSearch）──
@@ -30,7 +37,7 @@ EOF
   aws iam create-role --role-name "$SVC_ROLE" --assume-role-policy-document "$TRUST" \
     --description "NotiOps AgentCore Gateway service role for Web Search" \
     --tags Key=auto-delete,Value=no Key=project,Value=notiops >/dev/null
-  echo "✓ 创建服务角色 $SVC_ROLE"
+  echo "$(t "✓ 创建服务角色 $SVC_ROLE" "✓ Created service role $SVC_ROLE")"
 fi
 # 幂等补标签：既有角色（老部署重跑）也补齐项目标签，与 CDK 资源(auto-delete=no + project=notiops)对齐。
 aws iam tag-role --role-name "$SVC_ROLE" \
@@ -45,7 +52,7 @@ EOF
 )
 aws iam put-role-policy --role-name "$SVC_ROLE" --policy-name NotiOpsWebSearchGateway --policy-document "$PERMS"
 ROLE_ARN="arn:aws:iam::${ACCOUNT}:role/${SVC_ROLE}"
-echo "✓ 服务角色权限就绪：$ROLE_ARN"
+echo "$(t "✓ 服务角色权限就绪：$ROLE_ARN" "✓ Service role permissions ready: $ROLE_ARN")"
 
 # ── 2. Gateway（AWS_IAM 鉴权，MCP 协议）。已存在则复用。──
 GW_ID="$(aws bedrock-agentcore-control list-gateways --region "$REGION" \
@@ -55,13 +62,13 @@ if [ -z "$GW_ID" ] || [ "$GW_ID" = "None" ]; then
     --name "$GW_NAME" --role-arn "$ROLE_ARN" --protocol-type MCP --authorizer-type AWS_IAM \
     --description "NotiOps web search (us-east-1)" --tags auto-delete=no,project=notiops \
     --query gatewayId --output text)"
-  echo "✓ 创建 Gateway $GW_ID（等待 READY…）"
+  echo "$(t "✓ 创建 Gateway $GW_ID（等待 READY…）" "✓ Created Gateway $GW_ID (waiting for READY…)")"
   for _ in $(seq 1 30); do
     S="$(aws bedrock-agentcore-control get-gateway --region "$REGION" --gateway-identifier "$GW_ID" --query status --output text)"
     [ "$S" = "READY" ] && break; sleep 3
   done
 else
-  echo "✓ 复用已有 Gateway $GW_ID"
+  echo "$(t "✓ 复用已有 Gateway $GW_ID" "✓ Reusing existing Gateway $GW_ID")"
 fi
 # 幂等补标签：既有 Gateway（老部署重跑）也补齐项目标签，与 CDK 资源(auto-delete=no + project=notiops)对齐。
 GW_ARN="arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT}:gateway/${GW_ID}"
@@ -94,11 +101,12 @@ def ensure_botocore():
 
 ensure_botocore()
 import boto3
+_zh = os.environ.get("UI_LANG") == "zh"
 region = os.environ["REGION"]; gw = os.environ["GW_ID"]; name = os.environ["TARGET_NAME"]
 c = boto3.client("bedrock-agentcore-control", region_name=region)
 existing = c.list_gateway_targets(gatewayIdentifier=gw).get("items", [])
 if any(t.get("name") == name for t in existing):
-    print(f"✓ 复用已有 target {name}")
+    print(f"✓ 复用已有 target {name}" if _zh else f"✓ Reusing existing target {name}")
 else:
     r = c.create_gateway_target(
         gatewayIdentifier=gw, name=name,
@@ -107,7 +115,7 @@ else:
             "configurations": [{"name": "WebSearch", "parameterValues": {}}]}}},
         credentialProviderConfigurations=[{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
     )
-    print(f"✓ 创建 web-search target {r.get('targetId')}")
+    print(f"✓ 创建 web-search target {r.get('targetId')}" if _zh else f"✓ Created web-search target {r.get('targetId')}")
 PY
 
 # gatewayUrl 可能已含 /mcp 后缀（实测含）；幂等补：缺了才加，避免 /mcp/mcp。
@@ -117,8 +125,8 @@ case "$MCP_URL" in
   *) MCP_URL="$MCP_URL/mcp" ;;
 esac
 echo ""
-echo "================ 完成 ================"
-echo "Gateway URL（填进 agentcore.json 的 envVars.AGENTCORE_WEBSEARCH_GATEWAY_URL）："
+echo "$(t "================ 完成 ================" "================ Done ================")"
+echo "$(t "Gateway URL（填进 agentcore.json 的 envVars.AGENTCORE_WEBSEARCH_GATEWAY_URL）：" "Gateway URL (set into agentcore.json envVars.AGENTCORE_WEBSEARCH_GATEWAY_URL):")"
 echo "  $MCP_URL"
-echo "然后重新 agentcore deploy。"
-echo "agent 执行角色的 InvokeGateway 权限已在 agentcore 的 CDK(cdk-stack.ts)里授予，无需手动。"
+echo "$(t "然后重新 agentcore deploy。" "Then re-run agentcore deploy.")"
+echo "$(t "agent 执行角色的 InvokeGateway 权限已在 agentcore 的 CDK(cdk-stack.ts)里授予，无需手动。" "The agent execution role's InvokeGateway permission is already granted in agentcore's CDK (cdk-stack.ts); no manual step needed.")"

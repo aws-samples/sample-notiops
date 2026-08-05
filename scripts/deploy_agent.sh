@@ -17,6 +17,13 @@
 # 退出码非 0 表示失败；setup.sh 据此决定是否回退 echo BFF。
 set -euo pipefail
 
+# ─── UI 语言（双语输出）───
+# 继承 setup.sh 导出的 UI_LANG（zh/en）；单独跑本脚本时默认英文，面向全球客户。
+# t "<中文>" "<English>"：按 UI_LANG 输出对应语言。
+# export：让内嵌的 python3 heredoc 子进程也能读到 UI_LANG（standalone 跑时也生效）。
+export UI_LANG="${UI_LANG:-en}"
+t() { if [ "$UI_LANG" = "zh" ]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 AGENT_DIR="$PROJECT_ROOT/agent-build/NotiOpsWebChat"
 REGION="${DEPLOY_REGION:?DEPLOY_REGION required}"
@@ -24,15 +31,15 @@ ENABLE_WEBSEARCH="${ENABLE_WEBSEARCH:-true}"
 STACK="AgentCore-NotiOpsWebChat-default"
 
 if [ ! -d "$AGENT_DIR" ]; then
-  echo "  ⚠ 未找到 agent 工程目录 $AGENT_DIR，跳过 agent 部署。" >&2
+  echo "  $(t "⚠ 未找到 agent 工程目录 $AGENT_DIR，跳过 agent 部署。" "⚠ Agent project dir $AGENT_DIR not found; skipping agent deployment.")" >&2
   exit 1
 fi
 
 # ── 1. agentcore CLI ──
 if ! command -v agentcore >/dev/null 2>&1; then
-  echo "  安装 AgentCore CLI（@aws/agentcore）..."
+  echo "  $(t "安装 AgentCore CLI（@aws/agentcore）..." "Installing AgentCore CLI (@aws/agentcore)...")"
   npm install -g @aws/agentcore >/dev/null 2>&1 || {
-    echo "  ❌ 无法安装 agentcore CLI；请手动 'npm install -g @aws/agentcore' 后重试。" >&2
+    echo "  $(t "❌ 无法安装 agentcore CLI；请手动 'npm install -g @aws/agentcore' 后重试。" "❌ Failed to install agentcore CLI; run 'npm install -g @aws/agentcore' manually and retry.")" >&2
     exit 1
   }
 fi
@@ -43,17 +50,17 @@ export AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" CDK_DEFAULT_REGION="$RE
 # AgentCore web search 仅 us-east-1。非该区时自动跳过（不阻断；agent 用 Exa 兜底）。
 GATEWAY_URL=""
 if [ "$ENABLE_WEBSEARCH" = "true" ] && [ "$REGION" = "us-east-1" ]; then
-  echo "  provision AgentCore Web Search Gateway..."
+  echo "  $(t "正在 provision AgentCore Web Search Gateway…" "Provisioning AgentCore Web Search Gateway...")"
   # 脚本打印形如 "  <url>/mcp"；抓最后一个 https://...mcp。
   if GW_OUT=$(AWS_REGION="$REGION" bash "$PROJECT_ROOT/scripts/provision_websearch_gateway.sh" 2>&1); then
     GATEWAY_URL=$(printf '%s\n' "$GW_OUT" | grep -oE 'https://[^ ]+/mcp' | tail -1)
     echo "$GW_OUT" | sed 's/^/    /'
   else
     echo "$GW_OUT" | sed 's/^/    /'
-    echo "  ⚠ Gateway provision 失败 —— agent 仍会用 Exa 兜底联网搜索，不阻断部署。" >&2
+    echo "  $(t "⚠ Gateway provision 失败 —— agent 仍会用 Exa 兜底联网搜索，不阻断部署。" "⚠ Gateway provisioning failed — the agent still falls back to Exa web search; deployment continues.")" >&2
   fi
 elif [ "$ENABLE_WEBSEARCH" = "true" ]; then
-  echo "  （AgentCore Web Search 仅 us-east-1 可用，当前 $REGION 跳过；agent 用 Exa 兜底。）"
+  echo "  $(t "（AgentCore Web Search 仅 us-east-1 可用，当前 $REGION 跳过；agent 用 Exa 兜底。）" "(AgentCore Web Search is only available in us-east-1; skipping in $REGION — the agent falls back to Exa.)")"
 fi
 
 # 注入 env 占位符到 agentcore.json：
@@ -97,10 +104,18 @@ for rt in d.get("runtimes", []):
             import os as _os
             ev["value"] = _os.environ.get("NOTIOPS_ALLOW_CROSS_ACCOUNT", "")  # org 模式传 1 = 放开跨账号闸门
 json.dump(d, open(path, "w"), indent=2, ensure_ascii=False)
-print(f"    agentcore.json 已写入 gateway URL: {url or '(空，用 Exa 兜底)'}; "
-      f"SKILLS_BUCKET: {skills_bucket or '(空)'}; "
-      f"DEVOPS_AGENT_SPACE_ID: {da_space or '(空，运行时自动发现)'}; "
-      f"REPORTS_CDN_DOMAIN: {reports_cdn or '(空，回退 presigned)'}")
+import os as _os
+_zh = _os.environ.get("UI_LANG") == "zh"
+if _zh:
+    print(f"    agentcore.json 已写入 gateway URL: {url or '(空，用 Exa 兜底)'}; "
+          f"SKILLS_BUCKET: {skills_bucket or '(空)'}; "
+          f"DEVOPS_AGENT_SPACE_ID: {da_space or '(空，运行时自动发现)'}; "
+          f"REPORTS_CDN_DOMAIN: {reports_cdn or '(空，回退 presigned)'}")
+else:
+    print(f"    agentcore.json written — gateway URL: {url or '(empty, Exa fallback)'}; "
+          f"SKILLS_BUCKET: {skills_bucket or '(empty)'}; "
+          f"DEVOPS_AGENT_SPACE_ID: {da_space or '(empty, auto-discovered at runtime)'}; "
+          f"REPORTS_CDN_DOMAIN: {reports_cdn or '(empty, presigned fallback)'}")
 PY
 
 # ── 3. 部署 ──
@@ -111,7 +126,7 @@ if [ -n "$ACCT" ]; then
   npx --yes cdk bootstrap "aws://$ACCT/$REGION" >/dev/null 2>&1 || true
 fi
 
-echo "  agentcore deploy（CodeZip，约 5-10 分钟）..."
+echo "  $(t "agentcore deploy（CodeZip，约 5-10 分钟）..." "agentcore deploy (CodeZip, ~5-10 min)...")"
 # agentcore deploy 内部调 tsc 编译 CDK TypeScript，但不走 npx，要求 PATH 里有 tsc。
 # 这里确保 cdk/ 已装依赖，再把其 node_modules/.bin 临时加入 PATH（不污染用户全局环境）。
 ( cd "$AGENT_DIR/agentcore/cdk" && npm install --silent 2>/dev/null )
@@ -142,7 +157,11 @@ for rt in d.get("runtimes", []):
         elif ev.get("name") == "REPORTS_CDN_DOMAIN":
             ev["value"] = "__REPORTS_CDN_DOMAIN__"
 json.dump(d, open(path, "w"), indent=2, ensure_ascii=False)
-print("    agentcore.json 已还原为占位符（git 跟踪文件保持干净）")
+import os as _os
+if _os.environ.get("UI_LANG") == "zh":
+    print("    agentcore.json 已还原为占位符（git 跟踪文件保持干净）")
+else:
+    print("    agentcore.json restored to placeholders (keeps the git-tracked file clean)")
 PY
 
 # ── 4. 捕获 Runtime ARN（CloudFormation 输出最稳）──
@@ -150,10 +169,10 @@ ARN=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK
   --query "Stacks[0].Outputs[?contains(OutputKey,'RuntimeArn')].OutputValue | [0]" \
   --output text 2>/dev/null || echo "")
 if [ -z "$ARN" ] || [ "$ARN" = "None" ]; then
-  echo "  ❌ 未能从 $STACK 捕获 Runtime ARN。" >&2
+  echo "  $(t "❌ 未能从 $STACK 捕获 Runtime ARN。" "❌ Failed to capture Runtime ARN from $STACK.")" >&2
   exit 1
 fi
-echo "  ✓ Agent Runtime ARN: $ARN"
+echo "  $(t "✓ Agent Runtime ARN:" "✓ Agent Runtime ARN:") $ARN"
 [ -n "${AGENT_ARN_OUT:-}" ] && printf '%s' "$ARN" > "$AGENT_ARN_OUT"
 
 # ── 5. 强制回填 env 真值 + idle 超时(部署后确定性纠偏,防"占位符上线"回归)──
@@ -171,7 +190,7 @@ echo "  ✓ Agent Runtime ARN: $ARN"
 # get/update-agent-runtime --agent-runtime-id <ARN> 全部失败 → 轮询超时跳过 idle 回填 → idle 回落 900
 # (冷启动"无响应"回归)。这里同时接受 :runtime/ 与 /runtime/，只取末段 RuntimeId。
 RT_ID="${ARN##*/}"
-echo "  回填 runtime env 真值 + idleRuntimeSessionTimeout=3600s(runtime=$RT_ID)…"
+echo "  $(t "回填 runtime env 真值 + idleRuntimeSessionTimeout=3600s(runtime=$RT_ID)…" "Backfilling runtime env values + idleRuntimeSessionTimeout=3600s (runtime=$RT_ID)…")"
 # 时序修复:agentcore deploy 刚结束时 runtime 可能还在 CREATING/UPDATING,get 会取不到配置
 # 或 update 被拒。轮询等 runtime 就绪(拿到配置且状态非过渡态)最多 ~1 分钟,再 update;
 # update 若因状态过渡失败,再重试几次。避免"未取到配置→跳过→idle 回落 900"的老坑。
@@ -230,9 +249,9 @@ PY
     [ "$j" -lt 3 ] && sleep 8   # 可能 runtime 又进入 UPDATING,等一下重试
   done
   if [ "$IDLE_OK" = true ]; then
-    echo "  ✓ env 真值已回填 + idle 超时已设为 1 小时"
+    echo "  $(t "✓ env 真值已回填 + idle 超时已设为 1 小时" "✓ env values backfilled + idle timeout set to 1 hour")"
   else
-    echo "  ⚠ env 回填/idle 设置失败(不阻断);可稍后手动 update-agent-runtime 回填 env 真值 + idle=3600。" >&2
+    echo "  $(t "⚠ env 回填/idle 设置失败(不阻断);可稍后手动 update-agent-runtime 回填 env 真值 + idle=3600。" "⚠ env backfill / idle setting failed (non-blocking); you can later run update-agent-runtime manually to backfill env values + idle=3600.")" >&2
   fi
   rm -f "$UPD_JSON" "$SRC_JSON"
 
@@ -253,11 +272,11 @@ d=json.load(sys.stdin); env=d.get('environmentVariables') or {}
 bad=[k for k,v in env.items() if isinstance(v,str) and v.startswith('__') and v.endswith('__')]
 print(','.join(sorted(bad)))" 2>/dev/null || echo "")
     if [ -n "$LEFT" ]; then
-      echo "  ⚠ 部署后核验:runtime env 仍有占位符未替换 → $LEFT(报告/skills/联网搜索可能不可用)。" >&2
+      echo "  $(t "⚠ 部署后核验:runtime env 仍有占位符未替换 → $LEFT(报告/skills/联网搜索可能不可用)。" "⚠ Post-deploy check: runtime env still has unreplaced placeholders → $LEFT (reports/skills/web search may be unavailable).")" >&2
     else
-      echo "  ✓ 部署后核验:runtime env 无残留占位符"
+      echo "  $(t "✓ 部署后核验:runtime env 无残留占位符" "✓ Post-deploy check: no leftover placeholders in runtime env")"
     fi
   fi
 else
-  echo "  ⚠ 未取到 runtime 当前配置(等待超时),跳过 env 回填/idle 设置(不阻断);可稍后手动设置。" >&2
+  echo "  $(t "⚠ 未取到 runtime 当前配置(等待超时),跳过 env 回填/idle 设置(不阻断);可稍后手动设置。" "⚠ Could not fetch current runtime config (wait timed out); skipping env backfill / idle setting (non-blocking); set manually later.")" >&2
 fi

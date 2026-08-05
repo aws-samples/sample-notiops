@@ -709,8 +709,11 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     const action = msg?.actions?.[idx];
     if (!action || action.done) return;
     // create_case_form(可编辑) / create_case_review(只读预览) → 都转成 create_case 执行。
+    // 关键：必须带上 action.account_id —— 否则跨账号(linked account)建案会丢目标账号，
+    // BFF 回退到部署账号,case 误落到部署账号(而非用户选中的账号)。见 support.mjs 的
+    // supportClientFor(缺省=部署账号)。account_id 由 agent _propose 按本轮 _acct() 写入。
     const toExec = (action.type === "create_case_form" || action.type === "create_case_review")
-      ? { type: "create_case" as const, params: editedParams ?? action.params }
+      ? { type: "create_case" as const, params: editedParams ?? action.params, account_id: action.account_id }
       : action;
     const result = await executeActionApi(toExec);
     patchMsgIn(convId, msgId, {

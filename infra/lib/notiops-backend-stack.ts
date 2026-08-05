@@ -390,7 +390,7 @@ export class NotiOpsBackendStack extends cdk.Stack {
     // is the robust fix; the excludes below keep the package lean (~few MB).
     const lambdaCode = lambda.Code.fromAsset("../", {
       exclude: [
-        "frontend/**", "infra/**", ".venv/**", "**/node_modules/**",
+        "frontend/**", "infra/**", ".venv*/**", "**/node_modules/**",
         "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
         ".git/**", "tests/**", "docs/**", ".kiro/**",
         "lambda_layer/**", "cdk.out/**", "**/__pycache__/**",
@@ -1233,7 +1233,7 @@ def handler(event, context):
     // GLOB exclude; requires --output outside repo root (see lambdaCode note).
     const devopsCallbackCode = lambda.Code.fromAsset("../", {
       exclude: [
-        "frontend/**", "infra/**", "tests/**", ".venv/**",
+        "frontend/**", "infra/**", "tests/**", ".venv*/**",
         "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
         "**/node_modules/**", ".git/**", ".hypothesis/**",
         "*.md", ".pytest_cache/**", ".kiro/**",
@@ -1421,7 +1421,7 @@ def handler(event, context):
     // 每个事件源独立 Rule,可单独 enable/disable。
     const pushLambdaCode = lambda.Code.fromAsset("../", {
       exclude: [
-        "frontend/**", "infra/**", ".venv/**", "**/node_modules/**",
+        "frontend/**", "infra/**", ".venv*/**", "**/node_modules/**",
         "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
         ".git/**", "tests/**", "docs/**", ".kiro/**",
         "lambda_layer/**", "cdk.out/**", "**/__pycache__/**",
@@ -1589,7 +1589,7 @@ def handler(event, context):
       // GLOB exclude; requires --output outside repo root (see lambdaCode note).
       const phdLambdaCode = lambda.Code.fromAsset("../", {
         exclude: [
-          "frontend/**", "infra/**", "tests/**", ".venv/**",
+          "frontend/**", "infra/**", "tests/**", ".venv*/**",
           "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
           "**/node_modules/**", ".git/**", ".hypothesis/**",
           "*.md", ".pytest_cache/**", ".kiro/**",

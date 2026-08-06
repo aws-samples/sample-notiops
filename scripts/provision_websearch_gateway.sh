@@ -22,7 +22,7 @@ SVC_ROLE="${SVC_ROLE:-notiops-websearch-gateway-role}"
 TARGET_NAME="web-search-tool"
 
 if [ "$REGION" != "us-east-1" ]; then
-  echo "$(t "⚠️  AgentCore Web Search 目前仅 us-east-1 可用，你设的是 $REGION。继续可能失败。" "⚠️  AgentCore Web Search is currently only available in us-east-1; you set $REGION. Continuing may fail.")" >&2
+  echo "$(t "⚠️  AgentCore Web Search 目前仅 us-east-1 可用，你设的是 ${REGION}。继续可能失败。" "⚠️  AgentCore Web Search is currently only available in us-east-1; you set ${REGION}. Continuing may fail.")" >&2
 fi
 
 # ── 1. Gateway 服务角色（信任 bedrock-agentcore + InvokeGateway/InvokeWebSearch）──
@@ -62,7 +62,7 @@ if [ -z "$GW_ID" ] || [ "$GW_ID" = "None" ]; then
     --name "$GW_NAME" --role-arn "$ROLE_ARN" --protocol-type MCP --authorizer-type AWS_IAM \
     --description "NotiOps web search (us-east-1)" --tags auto-delete=no,project=notiops \
     --query gatewayId --output text)"
-  echo "$(t "✓ 创建 Gateway $GW_ID（等待 READY…）" "✓ Created Gateway $GW_ID (waiting for READY…)")"
+  echo "$(t "✓ 创建 Gateway ${GW_ID}（等待 READY…）" "✓ Created Gateway ${GW_ID} (waiting for READY…)")"
   for _ in $(seq 1 30); do
     S="$(aws bedrock-agentcore-control get-gateway --region "$REGION" --gateway-identifier "$GW_ID" --query status --output text)"
     [ "$S" = "READY" ] && break; sleep 3
@@ -81,26 +81,13 @@ GW_URL="$(aws bedrock-agentcore-control get-gateway --region "$REGION" --gateway
 # 自带的）会报 "Unknown parameter ... connector"。这里用 Python boto3 创建，并在 botocore
 # 过旧时自动 pip 安装到一个临时目录（不污染系统环境），保证客户机器上也能成功。
 GW_ID="$GW_ID" REGION="$REGION" TARGET_NAME="$TARGET_NAME" python3 - <<'PY'
-import os, sys, subprocess
-def ensure_botocore():
-    try:
-        import botocore
-        v = tuple(int(x) for x in botocore.__version__.split(".")[:3])
-        if v >= (1, 43, 36):
-            return
-    except Exception:
-        pass
-    # 装到临时目录并前置到 sys.path（不改系统环境）
-    tgt = os.path.join(os.environ.get("TMPDIR", "/tmp"), "notiops-botocore-newer")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
-                           "--target", tgt, "botocore>=1.43.36", "boto3>=1.40.36"])
-    sys.path.insert(0, tgt)
-    for m in list(sys.modules):
-        if m.startswith(("botocore", "boto3")):
-            del sys.modules[m]
+import os, sys, subprocess, tempfile
 
-ensure_botocore()
-import boto3
+# 实际建 target 的逻辑。始终在【全新子进程】里跑（见下），这样 botocore 需要升级时，
+# 干净进程会从头 import 新版 boto3/botocore；绝不在本进程删 sys.modules 再 import
+# （旧写法那样会拿到半初始化模块，报 "module 'boto3' has no attribute 'client'"）。
+WORK = r'''
+import os, boto3
 _zh = os.environ.get("UI_LANG") == "zh"
 region = os.environ["REGION"]; gw = os.environ["GW_ID"]; name = os.environ["TARGET_NAME"]
 c = boto3.client("bedrock-agentcore-control", region_name=region)
@@ -116,6 +103,36 @@ else:
         credentialProviderConfigurations=[{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
     )
     print(f"✓ 创建 web-search target {r.get('targetId')}" if _zh else f"✓ Created web-search target {r.get('targetId')}")
+'''
+
+# web-search connector 是很新的 target 类型，需 botocore>=1.43.36；过旧就装到临时目录
+# （不污染系统环境）并把它前置到子进程的 PYTHONPATH。
+env = dict(os.environ)
+need_upgrade = True
+try:
+    import botocore
+    v = tuple(int(x) for x in botocore.__version__.split(".")[:3])
+    need_upgrade = v < (1, 43, 36)
+except Exception:
+    need_upgrade = True
+
+if need_upgrade:
+    tgt = os.path.join(os.environ.get("TMPDIR", "/tmp"), "notiops-botocore-newer")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                           "--target", tgt, "botocore>=1.43.36", "boto3>=1.40.36"])
+    env["PYTHONPATH"] = tgt + os.pathsep + env.get("PYTHONPATH", "")
+
+# 用临时文件承载 WORK（UTF-8 写入，编码安全），交给全新解释器执行。
+with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as f:
+    f.write(WORK)
+    work_path = f.name
+try:
+    subprocess.check_call([sys.executable, work_path], env=env)
+finally:
+    try:
+        os.unlink(work_path)
+    except OSError:
+        pass
 PY
 
 # gatewayUrl 可能已含 /mcp 后缀（实测含）；幂等补：缺了才加，避免 /mcp/mcp。

@@ -70,6 +70,24 @@
 
 > 一句话:**只用 Web Chat 聊天 → 登录就能用,什么都不用配**;要用**闲置/成本自动巡检**(或将来的主动化哨兵跨账号定时巡检)→ 才需要在「目标账户管理」加账户。跨账号巡检还需目标账号预建只读 `notiops-idle-detection-role` —— Organizations 场景用 `./setup.sh --multi-account` 经 StackSets 自动下发(含 DevOps/PHD 事件转发),或在控制台「账户接入 (Organizations)」页一键接入;非组织场景在目标账号手动部署 [`infra/member-account-onboarding.yaml`](../infra/member-account-onboarding.yaml)。
 
+### 0.1.2 部署模式:单账号(默认) vs 多账号 `--multi-account`
+
+**先决定用哪种模式再跑 `setup.sh`** —— 这决定 CDK 在部署时如何写死跨账号闸门,**部署后要切换必须重新部署**(不是运行时开关)。
+
+| | **单账号模式(默认)** | **多账号模式** `./setup.sh --multi-account` |
+|---|---|---|
+| **怎么触发** | 直接 `./setup.sh` | `./setup.sh --multi-account`,且需在**组织管理账号**,或已在管理账号注册为 **CloudFormation StackSets 委派管理员**的成员账号上运行 |
+| **面向谁** | 只在**本账号**用 NotiOps(绝大多数试用 / 单账号客户) | 用 Organizations 管理一堆账号,想**跨成员账号**巡检 / 调查 / 转发事件 |
+| **跨账号闸门** | 锁定到部署账号(`LOCKED_ACCOUNT_ID` = 本账号);Web 控制台的多账号选择器只列本账号 | 解锁闸门(`LOCKED_ACCOUNT_ID` 置空,改用 `aws:PrincipalOrgID` 整组放行);控制台可接入 / 切换成员账号 |
+| **成员账号资源** | 不下发 | 经 **StackSets** 自动向成员账号下发只读 role + DevOps/PHD 事件转发 |
+| **影响的功能** | Web Chat 全部功能对**本账号**开箱即用 | 额外解锁:跨账号**闲置/成本巡检**、跨账号**故障调查**、跨账号 **PHD/DevOps 事件转发**、控制台「账户接入 (Organizations)」页 |
+
+**为什么不默认开多账号?** 多账号模式要求当前身份是 **Organizations 管理账号**(或其 **StackSets 委派管理员**)、要动 StackSets 并向成员账号下发资源 —— 对只想在单账号里试用的绝大多数用户是多余且更高权限的操作。默认单账号是最小权限、最快跑通的路径,所以**默认关**;需要时显式加 `--multi-account` 才启用。
+
+**已经单账号部署过、后来想要多账号怎么办?** 在 Organizations 管理账号(或 StackSets 委派管理员账号)重跑 `./setup.sh --multi-account` 即可(CDK 增量更新会重写闸门 + 补下发成员账号资源)。若你在 Web 控制台看到「当前部署未启用 Organizations 多账号模式。请在组织管理账号(或 StackSets 委派管理员账号)用 `./setup.sh --multi-account` 重新部署」——正是提示你当前是单账号部署,需要用管理账号(或委派管理员)加 `--multi-account` 重跑,**这一步无法在控制台里点开关切换**。
+
+> 不确定选哪个?**先按默认单账号跑通**,验证 Web Chat 能用;之后确有跨账号需求再用管理账号(或委派管理员)重跑 `--multi-account`。两者不冲突,后者是前者的超集。
+
 ### 0.2 验证
 
 **主验证 —— 打开 Web Chat(唯一主入口)**:部署结束时脚本会打印 Web Chat 地址 + `admin` 用户和临时密码(称其为"唯一主入口")。浏览器打开该地址,用 `admin` / 临时密码登录(首次登录需改密码),随便问一句(例:"列出本账号 EC2")能得到回复即成功。

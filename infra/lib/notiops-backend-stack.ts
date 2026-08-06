@@ -1147,8 +1147,9 @@ def handler(event, context):
     const seedDataResource = new cdk.CustomResource(this, "SeedDataResource", {
       serviceToken: seedDataFn.functionArn,
       properties: {
-        // 版本号变更会触发 CustomResource 在部署时重跑(用于 seed 新增内容,如预制 skill)。
-        version: "4-skills-en",
+        // 版本号变更会触发 CustomResource 在部署时重跑(用于 seed 新增内容)。
+        // v5:移除本 Lambda 的 skill seed(改由 BFF seedPresetSkills 统一负责,消除双写分叉)。
+        version: "5-no-skill-seed",
       },
     });
 
@@ -1216,10 +1217,12 @@ def handler(event, context):
     }
 
     new cdk.CfnOutput(this, "DevOpsAgentBusinessAccountsWhitelist", {
+      // 值保持纯 ASCII：它会被 setup.sh 用 jq 取出后直接 echo，含中文/em-dash 会在部分终端显示为乱码。
+      // 中文说明放在双语标签(setup.sh 的 t())与本 output 的 description 里，不进入 value 本身。
       value:
         devopsAgentBusinessAccounts.length > 0
           ? devopsAgentBusinessAccounts.join(",")
-          : "(empty — 未配置业务账户白名单，Custom Bus 仅接受同账户 IAM 授权主体)",
+          : "(none configured; Custom Bus accepts only same-account IAM principals)",
       description: "Custom Event Bus 允许跨账户 PutEvents 的业务账户白名单（来自 CDK context devopsAgentBusinessAccounts）",
     });
 
@@ -1394,12 +1397,9 @@ def handler(event, context):
     // SKILLS_BUCKET，三者均指向同一数据桶。
     apiLambda.addEnvironment("DATA_BUCKET", dataBucket.bucketName);
 
-    // Seed Lambda 预制 skill 写入 dataBucket 的 skills/ 前缀(部署时幂等 seed)。
-    // dataBucket 在此才创建,故 env/权限/依赖在这里补齐(seedDataFn 定义在前)。
-    seedDataFn.addEnvironment("SKILLS_BUCKET", dataBucket.bucketName);
-    dataBucket.grantReadWrite(seedDataFn);
-    // 确保 seed 时桶已就绪(CustomResource 依赖 dataBucket)。
-    seedDataResource.node.addDependency(dataBucket);
+    // 注:seedDataFn 不再写 S3 skill(预置 skill 改由 BFF 运行时 seedPresetSkills 统一 seed),
+    // 故此处不再给它注入 SKILLS_BUCKET / 授予 dataBucket 读写 / 加 dataBucket 依赖(最小权限)。
+    // 它只写 DynamoDB 配置(阈值/prompt/模型),权限在 seedDataFn 定义处已用 configTable.grantWriteData 授予。
 
     // Callback Lambda 读写报告(HTML report + trace 上传到 reports/ 前缀)
     dataBucket.grantReadWrite(devopsCallbackLambda);

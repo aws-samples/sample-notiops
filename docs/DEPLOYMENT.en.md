@@ -69,6 +69,24 @@ Once `setup.sh` finishes, split features into two buckets — **don't mistake "o
 
 > In one line: **just chatting in Web Chat → log in and go, nothing to configure**; to use **idle / automatic cost inspection** (or the future proactive-sentinel cross-account scheduled scans) → you then add accounts under "Target Accounts". Cross-account inspection also needs a read-only `notiops-idle-detection-role` pre-created in the target account — for Organizations, use `./setup.sh --multi-account` to roll it out via StackSets (including DevOps/PHD event forwarding), or onboard in one click from the console "Account Onboarding (Organizations)" page; for non-org setups, manually deploy [`infra/member-account-onboarding.yaml`](../infra/member-account-onboarding.yaml) in the target account.
 
+### 0.1.2 Deploy mode: single-account (default) vs multi-account `--multi-account`
+
+**Decide the mode before running `setup.sh`** — it determines how CDK bakes the cross-account gate at deploy time. **Switching after deploy requires a redeploy** (it is not a runtime toggle).
+
+| | **Single-account (default)** | **Multi-account** `./setup.sh --multi-account` |
+|---|---|---|
+| **How to trigger** | Just `./setup.sh` | `./setup.sh --multi-account`, run in the **Organizations management account** — or in a member account registered as a **CloudFormation StackSets delegated administrator** |
+| **Who it's for** | Using NotiOps in **this account only** (most trials / single-account customers) | Managing many accounts under Organizations and wanting **cross-member-account** inspection / investigation / event forwarding |
+| **Cross-account gate** | Locked to the deploy account (`LOCKED_ACCOUNT_ID` = this account); the Web console's multi-account selector lists only this account | Gate unlocked (`LOCKED_ACCOUNT_ID` empty, using `aws:PrincipalOrgID` to allow the whole org); console can onboard / switch member accounts |
+| **Member-account resources** | Not rolled out | Rolled out automatically to member accounts via **StackSets** (read-only role + DevOps/PHD event forwarding) |
+| **Features affected** | All Web Chat features work out of the box for **this account** | Additionally unlocks: cross-account **idle/cost inspection**, cross-account **incident investigation**, cross-account **PHD/DevOps event forwarding**, and the console "Account Onboarding (Organizations)" page |
+
+**Why isn't multi-account the default?** Multi-account mode requires the current identity to be the **Organizations management account** (or its **StackSets delegated administrator**), touches StackSets, and rolls out resources to member accounts — unnecessary and higher-privilege for the vast majority who just want to try it in a single account. Single-account is the least-privilege, fastest path to a working deployment, so it is **off by default**; add `--multi-account` explicitly when you need it.
+
+**Already deployed single-account and now want multi-account?** Re-run `./setup.sh --multi-account` in the Organizations management account (or a StackSets delegated-admin account) — the incremental CDK update rewrites the gate and rolls out member-account resources. If the Web console shows "This deployment does not have Organizations multi-account mode enabled. Redeploy with `./setup.sh --multi-account` from the management account (or a StackSets delegated-admin account)", that is exactly this signal — you are on a single-account deployment and need to re-run with `--multi-account` from the management account (or delegated admin). **This cannot be toggled from the console.**
+
+> Not sure which to pick? **Get single-account working first**, confirm Web Chat is usable, then re-run `--multi-account` from the management account (or delegated admin) once you actually have a cross-account need. The two don't conflict — multi-account is a superset.
+
 ### 0.2 Verify
 
 **Primary verification — open Web Chat (the single main entry)**: when the script finishes it prints the Web Chat URL plus the `admin` user and a temporary password (and calls it "the single main entry"). Open that URL in a browser, log in as `admin` with the temp password (change it on first login), ask anything (e.g. "list EC2 in this account") and you should get a reply.

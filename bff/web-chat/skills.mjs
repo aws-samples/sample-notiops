@@ -204,7 +204,7 @@ export async function skillExists(skillId) {
 
 /** 新建或更新（按 skill_id upsert，写一个新版本 + 更新 meta）。返回保存后的精简对象。
  * mode='create' 时若 id 已存在则报错（防止覆盖别人的 skill）；mode='update' 才允许覆盖。 */
-export async function saveSkill({ skill_id, name, description, body, author = "web", mode = "", i18n, body_i18n }) {
+export async function saveSkill({ skill_id, name, description, body, author = "web", mode = "", i18n, body_i18n, forceAuthor = false }) {
   if (!BUCKET) throw new Error("SKILLS_BUCKET not configured");
   const id = (skill_id && ID_RE.test(skill_id)) ? skill_id : slugify(name);
   if (!ID_RE.test(id)) throw new Error("invalid skill_id (need lowercase a-z, 0-9, -)");
@@ -242,6 +242,9 @@ export async function saveSkill({ skill_id, name, description, body, author = "w
     skill_id: id, parameters: [], tags: [], status: "active",
     author, created_channel: "web", created_at: _now(), versions: [],
   };
+  // 更新已有 skill 时默认保留原 author（尊重创建者）；仅当 forceAuthor=true 才改写——
+  // 用于预置 seed 归一化：把历史 seed 误写的 author 纠正为 PRESET_AUTHOR。普通编辑不传此参。
+  if (forceAuthor && author) meta.author = author;
   meta.name = (name || id).trim();
   meta.description = (description || "").trim();
   meta.format = SKILL_FORMAT;          // 标记为 Agent Skills 开放标准
@@ -543,6 +546,15 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // 预置 skill 的 SKILL.md 源目录：bff/web-chat/preset-skills/<id>/SKILL.md（+ 可选 references/）。
 const PRESET_DIR = process.env.PRESET_SKILLS_DIR || join(__dirname, "preset-skills");
 export const PRESET_AUTHOR = "notiops-system";
+// 历史（已废弃）的 CDK seed-data Lambda 曾把预置 skill 的 author 误写为 "NotiOps"，
+// 导致前端按 author 判定时把官方 skill 当成「客户自建」。这些是唯一由旧 seed 写入的 author 值，
+// 真正的客户自建用 Cognito sub / "web"。seed 时遇到这些历史值即夺回为 PRESET_AUTHOR（自愈已部署环境）。
+const LEGACY_PRESET_AUTHORS = new Set(["NotiOps"]);
+// 旧 CDK seed 曾发布、但新的 preset-skills/ 目录已不再包含的预置 skill id。这些是「孤儿」：
+// 没有源目录，seedPresetSkills 主循环永远遇不到它们，既无法归一化 author 也无法删除，
+// 于是在已部署环境里以 author="NotiOps" 长期显示为「客户自建」。reconcile 阶段将其归档（软删）。
+// 只归档 author 仍属 LEGACY_PRESET_AUTHORS 的记录——绝不动客户自建（author=Cognito sub / "web"）。
+const LEGACY_ORPHAN_PRESET_IDS = new Set(["cost-usage-analysis"]);
 
 // SKILL.md 与本地化 SKILL.<loc>.md（如 SKILL.zh.md）都是「正文源」，不当作附属文件。
 const _isSkillMdName = (name) => /^SKILL(\.[a-z]{2})?\.md$/i.test(name);
@@ -600,11 +612,27 @@ export async function seedPresetSkills({ force = false } = {}) {
     }
     const bodyLocaleKeys = Object.keys(bodyI18n).sort();
     const existing = await _getJson(metaKey(id));
-    // 客户自建的同名 skill 不动（尊重客户内容），也不覆盖。
-    if (existing && existing.author && existing.author !== PRESET_AUTHOR) {
-      kept++; details.push({ id, action: "kept-customer" }); continue;
+    // 客户是否已通过 Web 编辑过它：updated_by 由 saveSkill 写入（= Cognito sub / "web"）；
+    // 旧 CDK seed 从不写 updated_by，故其【缺失】= 从未被客户改动的原始 seed 拷贝。
+    const _ub = existing && existing.updated_by;
+    const customerEdited = !!(_ub && _ub !== PRESET_AUTHOR && !LEGACY_PRESET_AUTHORS.has(_ub));
+    // 历史 seed 误写了 author（如 "NotiOps"）→ 把 author 夺回为 PRESET_AUTHOR。
+    // 但【仅当客户从未编辑过它】时才夺回：客户改过（updated_by=其 sub）= 已接管为自有内容，
+    // 此时保持 author 不变 → 落到下面 kept-customer 分支，正文与归属都不动（绝不覆盖客户编辑）。
+    // 反之（pristine 旧拷贝）：这不是客户自建，故不走 kept-customer，也不能被 unchanged 跳过
+    // （下方 contentUnchanged 分支单独处理原地归一化）。
+    const needsAuthorFix = !!(existing && LEGACY_PRESET_AUTHORS.has(existing.author) && !customerEdited);
+    // 客户自建 / 客户已接管的同名 skill 不动（尊重客户内容），也不覆盖。这里涵盖两类：
+    //   ① 真·客户自建（author=Cognito sub / "web"）；
+    //   ② 历史 seed 拷贝但客户改过（author 仍是 legacy 值，但 customerEdited=true → needsAuthorFix=false）。
+    // needsAuthorFix=true 时（pristine 旧拷贝）author 虽 != PRESET_AUTHOR，但那是历史 seed 遗留、
+    // 客户从未动过，故放行到下面做原地归一化。
+    if (existing && existing.author && existing.author !== PRESET_AUTHOR && !needsAuthorFix) {
+      kept++; details.push({ id, action: customerEdited ? "kept-customer-edited" : "kept-customer" }); continue;
     }
-    // 内容无变化则跳过（避免每次部署都 bump 版本）。i18n 译文 / 本地化正文变化都算变化。
+    // 内容是否无变化（i18n 译文 / 本地化正文变化都算变化）。needsAuthorFix 不再绕过此判断——
+    // 否则历史 author 误写的 skill 每次 seed 都会被打包正文无条件覆盖（回滚客户对它的编辑）并空 bump 版本。
+    let contentUnchanged = false;
     if (existing && !force) {
       const lv = existing.latest_version || "1.0.0";
       const cur = await _getText(verKey(id, lv));
@@ -616,20 +644,63 @@ export async function seedPresetSkills({ force = false } = {}) {
           if (curLoc !== (bodyI18n[loc] || "").trim()) { zhSame = false; break; }
         }
       }
-      if (cur.trim() === parsed.body.trim()
-          && (existing.description || "") === (parsed.description || "")
-          && JSON.stringify(existing.i18n || null) === JSON.stringify(parsed.i18n || null)
-          && zhSame) {
-        skipped++; details.push({ id, action: "unchanged" }); continue;
-      }
+      contentUnchanged = cur.trim() === parsed.body.trim()
+        && (existing.description || "") === (parsed.description || "")
+        && JSON.stringify(existing.i18n || null) === JSON.stringify(parsed.i18n || null)
+        && zhSame;
     }
-    await saveSkill({ skill_id: id, name, description: parsed.description, body: parsed.body, author: PRESET_AUTHOR, mode: existing ? "update" : "create", i18n: parsed.i18n, body_i18n: bodyI18n });
+    // 内容无变化：正文与版本一律不动。仅当 author 需归一化时【原地 patch】meta.author（不 bump 版本、
+    // 不重写正文），从而保留客户对该 skill 的任何正文编辑；否则直接跳过。
+    if (contentUnchanged) {
+      if (needsAuthorFix) {
+        existing.author = PRESET_AUTHOR;
+        existing.updated_at = _now();
+        await s3.send(new PutObjectCommand({
+          Bucket: BUCKET, Key: metaKey(id),
+          Body: Buffer.from(JSON.stringify(existing), "utf-8"), ContentType: "application/json",
+        }));
+        seeded++; details.push({ id, action: "author-normalized" });
+      } else {
+        skipped++; details.push({ id, action: "unchanged" });
+      }
+      continue;
+    }
+    // 内容确有变化（预置正文随版本更新等）：写新版本 + 更新 meta。forceAuthor 顺带纠正历史误写的 author。
+    // mode 用 ""（非 "create"）：并发冷启动下两个容器可能都看到 existing=null 并各自 create，
+    // "create" 会让后到者抛「skill_id 已存在」；"" 则退化为 upsert，幂等且不抛。
+    await saveSkill({ skill_id: id, name, description: parsed.description, body: parsed.body, author: PRESET_AUTHOR, mode: existing ? "update" : "", i18n: parsed.i18n, body_i18n: bodyI18n, forceAuthor: true });
     // 附属文件（references/ 等）随之注入。
     const rels = _walk(join(PRESET_DIR, id));
     const assets = rels.filter((r) => !isScriptPath(r) && ASSET_EXT_RE.test(r))
       .map((r) => ({ path: r, buf: readFileSync(join(PRESET_DIR, id, r)) }));
     if (assets.length) await _replaceSkillFiles(id, assets);
-    seeded++; details.push({ id, action: existing ? "updated" : "created", references: assets.length });
+    // 此处内容确有变化（author-normalized-only 的场景已在上面 contentUnchanged 分支提前返回）。
+    seeded++; details.push({ id, action: existing ? (needsAuthorFix ? "updated+author-normalized" : "updated") : "created", references: assets.length });
   }
-  return { seeded, skipped, kept, details };
+  // ── reconcile：归档「孤儿」预置 skill（旧 seed 发布过、新 preset-skills/ 已移除的 id）──
+  // 主循环只遍历 preset-skills/ 下现存目录，遇不到孤儿，故单独处理。仅软删（status=archived）
+  // 且仅当【author 仍是历史 seed 值 且 客户从未编辑过】时才动——绝不误删客户自建 / 客户已接管的同名 skill。
+  let archived = 0;
+  for (const id of LEGACY_ORPHAN_PRESET_IDS) {
+    const meta = await _getJson(metaKey(id));
+    if (!meta || meta.status === "archived") continue;
+    if (!LEGACY_PRESET_AUTHORS.has(meta.author)) {
+      // author 已不是历史 seed 值：客户接手改写了它，尊重之，不归档。
+      details.push({ id, action: "orphan-kept-customer" }); continue;
+    }
+    // author 仍是 legacy 值，但客户可能已通过 Web 编辑过它（普通编辑不改 author，只写 updated_by）。
+    // updated_by 存在且非 preset/legacy 值 = 客户已接管为自有内容，绝不软删（否则其编辑会从列表消失）。
+    const _ub = meta.updated_by;
+    if (_ub && _ub !== PRESET_AUTHOR && !LEGACY_PRESET_AUTHORS.has(_ub)) {
+      details.push({ id, action: "orphan-kept-customer-edited" }); continue;
+    }
+    meta.status = "archived";
+    meta.updated_at = _now();
+    await s3.send(new PutObjectCommand({
+      Bucket: BUCKET, Key: metaKey(id),
+      Body: Buffer.from(JSON.stringify(meta), "utf-8"), ContentType: "application/json",
+    }));
+    archived++; details.push({ id, action: "orphan-archived" });
+  }
+  return { seeded, skipped, kept, archived, details };
 }

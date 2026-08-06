@@ -53,7 +53,7 @@ export const STRINGS: Dict = {
   "admin.xpayer.testOk": { zh: "✅ 连接成功", en: "✅ Connection successful" },
   "admin.accounts.onboardTitle": { zh: "成员账号接入", en: "Member account onboarding" },
   "admin.accounts.onboardDesc": { zh: "组织内账号一键接入：自动下发只读采集角色 + DevOps/PHD 事件转发（CloudFormation StackSets），完成后自动登记并启用。", en: "One-click onboarding for organization accounts: provisions the read-only role + DevOps/PHD event forwarding via CloudFormation StackSets, then registers and enables the account." },
-  "admin.accounts.orgDisabled": { zh: "当前部署未启用 Organizations 多账号模式。请在组织管理账号用 ./setup.sh --multi-account 重新部署；非组织场景请在目标账号手动部署 infra/member-account-onboarding.yaml。", en: "This deployment does not have Organizations multi-account mode enabled. Redeploy with ./setup.sh --multi-account from the management account, or manually deploy infra/member-account-onboarding.yaml in target accounts." },
+  "admin.accounts.orgDisabled": { zh: "当前部署未启用 Organizations 多账号模式。请在组织管理账号(或 StackSets 委派管理员账号)用 ./setup.sh --multi-account 重新部署；非组织场景请在目标账号手动部署 infra/member-account-onboarding.yaml。", en: "This deployment does not have Organizations multi-account mode enabled. Redeploy with ./setup.sh --multi-account from the management account (or a StackSets delegated-admin account), or manually deploy infra/member-account-onboarding.yaml in target accounts." },
   "admin.accounts.colAccount": { zh: "账号", en: "Account" },
   "admin.accounts.colStatus": { zh: "接入状态", en: "Status" },
   "admin.accounts.colRegions": { zh: "采集 Region", en: "Regions" },

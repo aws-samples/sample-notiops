@@ -321,17 +321,22 @@ if [ -z "$ENABLE_PHD" ]; then
       *) ENABLE_PHD="true" ;;
     esac
   else
-    # 未部署 PHD — 询问是否部署
+    # 未部署 PHD — 询问是否【额外】把 Health 事件推送到飞书 IM。
+    # 说明:AWS Health 事件默认【已经】进入 Web Chat 通知收件箱(见 notiops-backend-stack.ts
+    # 的 webNotif Health source, on:true, 不受此开关控制)。此开关只额外增加一条【飞书 IM 推送】——
+    # PHD 转发器目前仅支持飞书(phd_event_forwarder/notifier.py 走 shared.feishu_sender)。
+    # 因此:不用飞书 IM 就没必要开(Web 收件箱不受影响);故默认跳过(N)。IM 平台在稍后步骤选择。
     echo ""
-    echo "$(t "是否部署 AWS Health 事件转发功能？" "Deploy AWS Health event forwarding?")"
-    echo "  $(t "该功能监听 AWS Health Dashboard 事件(服务中断、维护通知等), " "This feature listens to AWS Health Dashboard events (outages, maintenance notices, etc.),")"
-    echo "  $(t "通过 Bedrock 自动翻译为中文摘要, 推送到飞书群. " "auto-summarizes them via Bedrock, and pushes to your IM group.")"
-    echo "  $(t "如果您已有完善的告警机制, 可以跳过. " "If you already have a solid alerting mechanism, you can skip this.")"
+    echo "$(t "是否额外把 AWS Health 事件推送到飞书 IM 群？" "Also push AWS Health events to your Feishu IM group?")"
+    echo "  $(t "说明:AWS Health 事件(服务中断、计划维护等)默认【已经】进入 Web Chat 通知收件箱, " "Note: AWS Health events (outages, planned maintenance, etc.) already land in the Web Chat notification inbox")"
+    echo "  $(t "无论此项是否开启。此项【仅】额外经 Bedrock 生成摘要并推送到你的飞书群。 " "regardless of this choice. This option ONLY adds an extra Bedrock-summarized push to your Feishu group.")"
+    echo "  $(t "生效前提:在稍后的『IM 平台选择』步骤启用飞书,并在部署后回填飞书凭据。 " "It only takes effect if you enable Feishu in the later 'IM Platform Selection' step and fill Feishu credentials after deploy.")"
+    echo "  $(t "如果你不使用飞书 IM,或已有完善的告警机制,直接跳过即可(Web 收件箱不受影响)。 " "If you don't use Feishu IM, or already have solid alerting, just skip it (the web inbox is unaffected).")"
     echo ""
-    read -p "$(t "部署 PHD 事件转发？[Y/n]: " "Deploy PHD event forwarding? [Y/n]: ")" PHD_CHOICE
-    case "${PHD_CHOICE:-Y}" in
-      [nN]*) ENABLE_PHD="false" ;;
-      *) ENABLE_PHD="true" ;;
+    read -p "$(t "推送 Health 到飞书 IM？[y/N]: " "Push Health events to Feishu IM? [y/N]: ")" PHD_CHOICE
+    case "${PHD_CHOICE:-N}" in
+      [yY]*) ENABLE_PHD="true" ;;
+      *) ENABLE_PHD="false" ;;
     esac
   fi
 fi
@@ -1395,6 +1400,15 @@ echo "    $(t "• 跨 region / 跨账号资源访问" "• Cross-region / cross
 echo "  $(t "这些配置 不会自动继承, 需要在新 space 里手动重配." "these are NOT inherited automatically — reconfigure them in the new space manually.")"
 echo ""
 echo "  $(t "详见 docs/DEPLOYMENT.md §5.3 部署后必读 — Agent Space 重新配置." "See docs/DEPLOYMENT.md §5.3 Post-deploy must-read — Agent Space reconfiguration.")"
+
+echo ""
+echo "  $(t "── ⚠️ 必做一步:在 DevOps Agent 控制台注册 Web 应用域名 ──" "── ⚠️ Required step: register the web app domain in the DevOps Agent console ──")"
+echo "  $(t "否则在 Web Chat 里点『发起调查/连接调查』会报错:" "Otherwise clicking 'investigate / connect investigation' in Web Chat will error with:")"
+echo "    \"Invalid or unregistered domain\""
+echo "  $(t "步骤:进 DevOps Agent 控制台 → 你的 space(notiops-devops-${CDK_ACCOUNT:-<account>}) → Configure web app" "Steps: open the DevOps Agent console → your space (notiops-devops-${CDK_ACCOUNT:-<account>}) → Configure web app")"
+echo "        https://console.aws.amazon.com/aidevops/home#/agent-spaces"
+echo "  $(t "把下面这个 Web Chat 域名登记为允许的 web app 域名(注册后即可正常发起调查):" "and register the Web Chat domain below as an allowed web app domain (investigations work once registered):")"
+echo "    ${CHAT_URL}"
 
 echo ""
 echo "  $(t "── DevOps Agent 多账户集成 ──" "── DevOps Agent Multi-Account Integration ──")"

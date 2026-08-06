@@ -41,6 +41,17 @@ def _safe_err(e: Exception) -> str:
     return f"{type(e).__name__}/{code}" if code else type(e).__name__
 
 
+def _is_unregistered_domain(e: Exception) -> bool:
+    """服务端在 Web 应用域名未在 DevOps Agent 控制台『Configure web app』注册时，
+    create_backlog_task 会返回 "Invalid or unregistered domain"。这里仅【就地分类】该错误
+    以便给出可操作提示——不返回、不记录原始 message（遵守 docs/LOGGING_STANDARD.md：
+    原文可能含请求负载/用户数据）。判定后调用方只输出固定的引导文案。"""
+    resp = getattr(e, "response", None)
+    msg = (resp.get("Error", {}) or {}).get("Message", "") if isinstance(resp, dict) else ""
+    low = (msg or "").lower()
+    return "unregistered domain" in low or ("invalid" in low and "domain" in low)
+
+
 _REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
 _CONFIG_TABLE = os.environ.get("CONFIG_TABLE", "notiops-config")
 _LOCKED = os.environ.get("LOCKED_ACCOUNT_ID", "").strip()
@@ -215,6 +226,13 @@ def start_investigation(title: str, description: str, account_id: str | None = N
                 "console_url": _urls["deep_link"], "console_home": _urls["home"],
                 "note": "调查已发起，通常需几分钟。稍后用 get_investigation_result 凭 execution_id 查结果。"}
     except (ClientError, BotoCoreError, Exception) as e:  # noqa: BLE001
+        if _is_unregistered_domain(e):
+            logger.warning("devops_agent start failed: unregistered_domain")
+            return {"error": "unregistered_domain",
+                    "message": ("DevOps Agent 尚未注册本 Web 应用域名，暂时无法发起调查。"
+                                "请到 DevOps Agent 控制台（https://console.aws.amazon.com/aidevops/home#/agent-spaces）"
+                                "→ 你的 space → Configure web app，把本 Web Chat 的域名登记为允许的 web app 域名后重试。"
+                                "（详见 docs/DEPLOYMENT.md §5.3。）")}
         logger.warning("devops_agent start failed: %s", _safe_err(e))
         return {"error": "start_failed", "message": f"发起调查失败：{_safe_err(e)}"}
 

@@ -43,55 +43,11 @@ def _put_if_absent(table, item):
         return False
 
 
-def _seed_skills(bucket):
-    """把预制 skill 写入 SKILLS_BUCKET 的 skills/ 前缀(与 bff/web-chat/skills.mjs、
-    core/skills.py 同构:skills/<id>/meta.json + skills/<id>/versions/<ver>.md)。
-    幂等:只在 meta.json 不存在时写(不覆盖客户已改的 skill)。返回写入的 skill 数。"""
-    if not bucket:
-        logger.warning("SKILLS_BUCKET not set — skipping skill seed")
-        return 0
-    s3 = boto3.client("s3")
-    base = os.path.join(os.path.dirname(__file__), "seed-skills")
-    seeded = 0
-    if not os.path.isdir(base):
-        return 0
-    for skill_id in sorted(os.listdir(base)):
-        sdir = os.path.join(base, skill_id)
-        meta_path = os.path.join(sdir, "meta.json")
-        if not os.path.isfile(meta_path):
-            continue
-        meta_key = f"skills/{skill_id}/meta.json"
-        # 幂等:meta.json 已存在则跳过(保护客户自定义)
-        try:
-            s3.head_object(Bucket=bucket, Key=meta_key)
-            logger.info("skill %s already exists — skip", skill_id)
-            continue
-        except s3.exceptions.ClientError as e:
-            if e.response.get("Error", {}).get("Code") not in ("404", "NoSuchKey", "NotFound"):
-                logger.warning("skill %s head_object error: %s", skill_id, e)
-                continue
-        # 写各版本正文
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.loads(f.read())
-        vdir = os.path.join(sdir, "versions")
-        for vfile in os.listdir(vdir):
-            if not vfile.endswith(".md"):
-                continue
-            with open(os.path.join(vdir, vfile), "r", encoding="utf-8") as f:
-                body = f.read()
-            s3.put_object(
-                Bucket=bucket, Key=f"skills/{skill_id}/versions/{vfile}",
-                Body=body.encode("utf-8"), ContentType="text/markdown; charset=utf-8",
-            )
-        # 最后写 meta.json(作为"已就绪"标志,放最后避免半写)
-        s3.put_object(
-            Bucket=bucket, Key=meta_key,
-            Body=json.dumps(meta, ensure_ascii=False).encode("utf-8"),
-            ContentType="application/json",
-        )
-        seeded += 1
-        logger.info("seeded skill: %s", skill_id)
-    return seeded
+# 注:预置 skill 的 seed 已【统一】由 BFF 运行时 seedPresetSkills()(bff/web-chat/skills.mjs)负责——
+# 它随代码打包 bff/web-chat/preset-skills/ 下全部官方 skill,首次访问幂等注入,author=notiops-system。
+# 此 Lambda 曾另有一套 _seed_skills() 写 S3,但只覆盖少数 skill 且把 author 误写为 "NotiOps",
+# 导致前端按 author 判定时把官方 skill 当成「客户自建」。为消除双写分叉,这里【不再】seed skill,
+# 只保留 DynamoDB 配置(阈值 / prompt / 模型)的幂等写入。
 
 
 def handler(event, context):
@@ -130,11 +86,9 @@ def handler(event, context):
                 }):
                     seeded += 1
 
-        # 预制 skill 写入 S3(SKILLS_BUCKET,幂等)
-        skills_seeded = _seed_skills(os.environ.get("SKILLS_BUCKET", ""))
-
-        logger.info("Seed data: %d config items + %d skills written (others already existed)", seeded, skills_seeded)
-        send_cfn(event, context, "SUCCESS", {"Seeded": str(seeded), "Skills": str(skills_seeded)})
+        # 预置 skill 不在此 seed(改由 BFF 运行时 seedPresetSkills 统一负责,见上方注释)。
+        logger.info("Seed data: %d config items written (others already existed)", seeded)
+        send_cfn(event, context, "SUCCESS", {"Seeded": str(seeded)})
 
     except Exception as e:
         logger.error("Seed data failed: %s", e)

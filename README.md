@@ -80,7 +80,23 @@ cd sample-notiops
 # container build → cdk deploy --all. Re-runs only patch deltas.
 ```
 
-For the full deployment walkthrough into your own AWS account see
+### Deploy modes: single-account (default) vs multi-account
+
+Decide before you run `setup.sh` — the mode is baked in at deploy time and
+switching later requires a redeploy.
+
+- **Single-account (default)** — `./setup.sh`. NotiOps operates in the deploy
+  account only. Least privilege, fastest path to a working install; right for
+  most trials and single-account users.
+- **Multi-account** — `./setup.sh --multi-account`. Adds cross-member-account
+  inspection / investigation / event forwarding across an AWS Organization. Run
+  it in the **Organizations management account**, or in a member account
+  registered as a **CloudFormation StackSets delegated administrator** (you do
+  **not** have to be the management account). Member-account resources are
+  rolled out automatically via StackSets.
+
+For the full deployment walkthrough into your own AWS account — including the
+mode comparison and how to switch — see
 [docs/DEPLOYMENT.en.md](docs/DEPLOYMENT.en.md).
 
 ---

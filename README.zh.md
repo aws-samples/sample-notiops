@@ -68,7 +68,18 @@ cd sample-notiops
 # 容器构建 → cdk deploy --all。重复运行只增量更新。
 ```
 
-完整的部署到你自己 AWS 账号的步骤见
+### 部署模式:单账号(默认) vs 多账号
+
+在跑 `setup.sh` 前先定 —— 模式在部署时写死,之后切换需要重新部署。
+
+- **单账号(默认)** —— `./setup.sh`。NotiOps 只在部署账号内运行。最小权限、
+  最快跑通,适合绝大多数试用与单账号用户。
+- **多账号** —— `./setup.sh --multi-account`。在 AWS Organizations 内增加跨成员
+  账号的巡检 / 调查 / 事件转发。在**组织管理账号**,或已注册为
+  **CloudFormation StackSets 委派管理员**的成员账号上运行即可(**不必**是管理
+  账号)。成员账号资源经 StackSets 自动下发。
+
+完整的部署到你自己 AWS 账号的步骤(含模式对比与如何切换)见
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
 
 ---

@@ -185,98 +185,17 @@ echo "  $(t "✓ Agent Runtime ARN:" "✓ Agent Runtime ARN:") $ARN"
 # 根治:部署后用一次幂等的 update-agent-runtime **强制回填** §3 算好的 4 个 env 真值 + idle=3600,
 # 再核验无残留占位符。这样即便 deploy 漏注入,占位符也永远上不了线。
 # (代码侧 reports.py/skills.py 的 _env() 还会把漏网占位符降级成"未配置"兜底,双保险。)
-# ARN 形如 arn:aws:bedrock-agentcore:<region>:<acct>:runtime/<RuntimeId>；runtime 前是**冒号**不是斜杠。
-# 老写法 's#.*/runtime/##' 要求 runtime 前有 /，匹配不到 → RT_ID 残留为完整 ARN → 后续
-# get/update-agent-runtime --agent-runtime-id <ARN> 全部失败 → 轮询超时跳过 idle 回填 → idle 回落 900
-# (冷启动"无响应"回归)。这里同时接受 :runtime/ 与 /runtime/，只取末段 RuntimeId。
-RT_ID="${ARN##*/}"
-echo "  $(t "回填 runtime env 真值 + idleRuntimeSessionTimeout=3600s(runtime=$RT_ID)…" "Backfilling runtime env values + idleRuntimeSessionTimeout=3600s (runtime=$RT_ID)…")"
-# 时序修复:agentcore deploy 刚结束时 runtime 可能还在 CREATING/UPDATING,get 会取不到配置
-# 或 update 被拒。轮询等 runtime 就绪(拿到配置且状态非过渡态)最多 ~1 分钟,再 update;
-# update 若因状态过渡失败,再重试几次。避免"未取到配置→跳过→idle 回落 900"的老坑。
-CUR=""
-for i in $(seq 1 12); do
-  CUR=$(aws bedrock-agentcore-control get-agent-runtime --region "$REGION" \
-    --agent-runtime-id "$RT_ID" --output json 2>/dev/null || echo "")
-  ST=$(printf '%s' "$CUR" | python3 -c "import sys,json;
-try: print(json.load(sys.stdin).get('status',''))
-except Exception: print('')" 2>/dev/null || echo "")
-  # 拿到配置且不在过渡态(CREATING/UPDATING)→ 可以 update
-  if [ -n "$CUR" ] && [ "$ST" != "CREATING" ] && [ "$ST" != "UPDATING" ] && [ -n "$ST" ]; then
-    break
-  fi
-  [ "$i" -lt 12 ] && sleep 6
-done
-if [ -n "$CUR" ]; then
-  UPD_JSON="${TMPDIR:-/tmp}/notiops-rt-idle-update.json"
-  SRC_JSON="${TMPDIR:-/tmp}/notiops-rt-current.json"
-  # 把 §3 算好的 4 个 env 真值传进去强制回填(空串保留空串 = 该功能未启用,不是占位符)。
-  # 注意:程序经 `python3 -` 从 stdin(heredoc)读入,故当前 runtime 配置【不能】也走
-  # stdin(会被 heredoc 抢占 → sys.stdin 为空 → json.load 报 "Expecting value: line 1
-  # column 1")。改为把 $CUR 落到 $SRC_JSON,Python 从 argv[1] 指定的文件读,跨 shell 稳定。
-  printf '%s' "$CUR" > "$SRC_JSON"
-  python3 - "$SRC_JSON" "$UPD_JSON" \
-      "$SKILLS_BUCKET" "$REPORTS_CDN_DOMAIN" "$DEVOPS_AGENT_SPACE_ID" "$GATEWAY_URL" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1]))
-skills_bucket, reports_cdn, da_space, gw_url = sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
-env = dict(d.get("environmentVariables") or {})
-# 强制回填部署真值(覆盖 deploy 可能漏注入的占位符);MEMORY_* 等框架注入的 env 原样保留。
-env["SKILLS_BUCKET"] = skills_bucket
-env["REPORTS_CDN_DOMAIN"] = reports_cdn
-env["DEVOPS_AGENT_SPACE_ID"] = da_space
-env["AGENTCORE_WEBSEARCH_GATEWAY_URL"] = gw_url
-out = {
-  "agentRuntimeId": d["agentRuntimeId"],
-  "agentRuntimeArtifact": d["agentRuntimeArtifact"],
-  "roleArn": d["roleArn"],
-  "networkConfiguration": d["networkConfiguration"],
-  "environmentVariables": env,
-  "metadataConfiguration": d.get("metadataConfiguration", {}),
-  "lifecycleConfiguration": {
-    "idleRuntimeSessionTimeout": 3600,
-    "maxLifetime": d.get("lifecycleConfiguration", {}).get("maxLifetime", 28800),
-  },
-}
-json.dump(out, open(sys.argv[2], "w"))
-PY
-  IDLE_OK=false
-  for j in 1 2 3; do
-    if aws bedrock-agentcore-control update-agent-runtime --region "$REGION" \
-         --cli-input-json "file://$UPD_JSON" >/dev/null 2>&1; then
-      IDLE_OK=true; break
-    fi
-    [ "$j" -lt 3 ] && sleep 8   # 可能 runtime 又进入 UPDATING,等一下重试
-  done
-  if [ "$IDLE_OK" = true ]; then
-    echo "  $(t "✓ env 真值已回填 + idle 超时已设为 1 小时" "✓ env values backfilled + idle timeout set to 1 hour")"
-  else
-    echo "  $(t "⚠ env 回填/idle 设置失败(不阻断);可稍后手动 update-agent-runtime 回填 env 真值 + idle=3600。" "⚠ env backfill / idle setting failed (non-blocking); you can later run update-agent-runtime manually to backfill env values + idle=3600.")" >&2
-  fi
-  rm -f "$UPD_JSON" "$SRC_JSON"
-
-  # ── 部署后核验:runtime env 不得残留 __占位符__(漏注入的最后一道闸)──
-  # 等 update 落定后重新 get,发现任何 __FOO__ 值就告警(不阻断,但明确暴露)。
-  for j in 1 2 3 4 5; do
-    VCUR=$(aws bedrock-agentcore-control get-agent-runtime --region "$REGION" \
-      --agent-runtime-id "$RT_ID" --output json 2>/dev/null || echo "")
-    VST=$(printf '%s' "$VCUR" | python3 -c "import sys,json
-try: print(json.load(sys.stdin).get('status',''))
-except Exception: print('')" 2>/dev/null || echo "")
-    [ "$VST" = "READY" ] && break
-    sleep 6
-  done
-  if [ -n "$VCUR" ]; then
-    LEFT=$(printf '%s' "$VCUR" | python3 -c "import sys,json
-d=json.load(sys.stdin); env=d.get('environmentVariables') or {}
-bad=[k for k,v in env.items() if isinstance(v,str) and v.startswith('__') and v.endswith('__')]
-print(','.join(sorted(bad)))" 2>/dev/null || echo "")
-    if [ -n "$LEFT" ]; then
-      echo "  $(t "⚠ 部署后核验:runtime env 仍有占位符未替换 → $LEFT(报告/skills/联网搜索可能不可用)。" "⚠ Post-deploy check: runtime env still has unreplaced placeholders → $LEFT (reports/skills/web search may be unavailable).")" >&2
-    else
-      echo "  $(t "✓ 部署后核验:runtime env 无残留占位符" "✓ Post-deploy check: no leftover placeholders in runtime env")"
-    fi
-  fi
-else
-  echo "  $(t "⚠ 未取到 runtime 当前配置(等待超时),跳过 env 回填/idle 设置(不阻断);可稍后手动设置。" "⚠ Could not fetch current runtime config (wait timed out); skipping env backfill / idle setting (non-blocking); set manually later.")" >&2
-fi
+#
+# 回填/轮询/核验的实现统一收敛到 scripts/backfill_runtime_env.sh(单一权威,避免与
+# setup.sh 里"部署后补 AgentSpaceId/ReportsCdnDomain"那处各写一份而漂移)。
+# 这里传全部 4 个 env 真值 + idle=3600。注意:此刻 NotiOpsBackendStack 通常尚未部署
+# (setup.sh 里 CDK 部署在本脚本之后),故 DEVOPS_AGENT_SPACE_ID / REPORTS_CDN_DOMAIN
+# 此时多半为空 → 由 setup.sh 在 `cdk deploy --all` 之后再 merge-patch 补齐(不覆盖此处
+# 已设的 gateway/桶)。单独跑本脚本(栈已存在)时,这里就能一次拿到全部真值。
+REGION="$REGION" RT_ARN="$ARN" SET_IDLE=3600 UI_LANG="$UI_LANG" \
+  bash "$PROJECT_ROOT/scripts/backfill_runtime_env.sh" \
+    "SKILLS_BUCKET=$SKILLS_BUCKET" \
+    "REPORTS_CDN_DOMAIN=$REPORTS_CDN_DOMAIN" \
+    "DEVOPS_AGENT_SPACE_ID=$DEVOPS_AGENT_SPACE_ID" \
+    "AGENTCORE_WEBSEARCH_GATEWAY_URL=$GATEWAY_URL" \
+  || echo "  $(t "⚠ env 回填/idle 设置未完成(不阻断);可稍后重跑。" "⚠ env backfill / idle setting did not complete (non-blocking); re-run later.")" >&2

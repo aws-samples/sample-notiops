@@ -1045,6 +1045,25 @@ echo "  $(t "执行完整部署..." "Running full deployment...")"
 npx cdk deploy --all --require-approval never --output "$CDK_OUT_DIR" --outputs-file cdk-outputs.json $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG $PLATFORM_FLAG $AGENT_ARN_FLAG $ORG_FLAG
 echo "  $(t "✓ CDK 部署完成" "✓ CDK deployment complete")"
 
+# ── 部署后回填:补齐【只有 NotiOpsBackendStack 部署完才拿得到】的两个 runtime env ──
+# deploy_agent.sh 跑在本脚本早处(agent 必须先建,WebChatStack 才能注入其 ARN),那时
+# NotiOpsBackendStack 尚未部署 → AgentSpaceId / ReportsCdnDomain 只能取到空串,退化成
+# 运行时 ListAgentSpaces 自动发现 + reports 12h presigned。此刻两个栈都已就绪,读真值,
+# merge-patch 回填到 runtime(只覆盖这两个 key,不动 deploy_agent.sh 已设的 gateway/桶)。
+# 幂等、不阻断:失败仅告警,运行时兜底逻辑仍在。
+if [ -n "$AGENT_RUNTIME_ARN" ]; then
+  # STACK_NAME 变量在下面 [4/4] 段才赋值,这里用字面栈名(cdk-outputs.json 的顶层 key)。
+  DA_SPACE_ID=$(jq -r '.NotiOpsBackendStack.AgentSpaceId // empty' cdk-outputs.json 2>/dev/null || echo "")
+  RPT_CDN=$(jq -r '.NotiOpsBackendStack.ReportsCdnDomain // empty' cdk-outputs.json 2>/dev/null || echo "")
+  if [ -n "$DA_SPACE_ID" ] || [ -n "$RPT_CDN" ]; then
+    echo "  $(t "回填部署后才可得的 runtime env(Agent Space / 报告 CDN)…" "Backfilling post-deploy runtime env (Agent Space / reports CDN)…")"
+    REGION="$DEPLOY_REGION" RT_ARN="$AGENT_RUNTIME_ARN" SET_IDLE="" UI_LANG="$UI_LANG" \
+      bash "$PROJECT_ROOT/scripts/backfill_runtime_env.sh" \
+        "DEVOPS_AGENT_SPACE_ID=$DA_SPACE_ID" "REPORTS_CDN_DOMAIN=$RPT_CDN" \
+      || echo "  $(t "⚠ 部署后 env 回填未完成(不阻断);运行时兜底仍生效,可稍后重跑 setup.sh。" "⚠ Post-deploy env backfill did not complete (non-blocking); runtime fallbacks still apply, you can re-run setup.sh later.")"
+  fi
+fi
+
 # 4. 部署摘要
 echo ""
 echo "$(t "[4/4] 提取部署信息..." "[4/4] Extracting deployment info...")"

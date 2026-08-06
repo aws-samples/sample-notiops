@@ -81,7 +81,7 @@ GW_URL="$(aws bedrock-agentcore-control get-gateway --region "$REGION" --gateway
 # 自带的）会报 "Unknown parameter ... connector"。这里用 Python boto3 创建，并在 botocore
 # 过旧时自动 pip 安装到一个临时目录（不污染系统环境），保证客户机器上也能成功。
 GW_ID="$GW_ID" REGION="$REGION" TARGET_NAME="$TARGET_NAME" python3 - <<'PY'
-import os, sys, subprocess, tempfile
+import os, sys, subprocess, tempfile, shutil
 
 # 实际建 target 的逻辑。始终在【全新子进程】里跑（见下），这样 botocore 需要升级时，
 # 干净进程会从头 import 新版 boto3/botocore；绝不在本进程删 sys.modules 再 import
@@ -116,10 +116,34 @@ try:
 except Exception:
     need_upgrade = True
 
-if need_upgrade:
-    tgt = os.path.join(os.environ.get("TMPDIR", "/tmp"), "notiops-botocore-newer")
+def _install_newer_boto(tgt):
+    """把新版 boto3/botocore 装进一个【全新的空目录】 tgt。
+    关键：安装前先 rm -rf 掉旧内容——固定路径复用 + pip --target 不带 --upgrade 时，
+    pip 见目录已存在会整包跳过（"Target directory ... already exists"），旧/半装/层叠
+    的坏包永远不会被修，最终子进程 import 到一个残缺的 namespace 包（boto3 无 .client）。
+    每次装进干净目录，杜绝历史脏状态。"""
+    shutil.rmtree(tgt, ignore_errors=True)
+    os.makedirs(tgt, exist_ok=True)
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
                            "--target", tgt, "botocore>=1.43.36", "boto3>=1.40.36"])
+
+def _boto_is_healthy(tgt):
+    """在【全新子进程】里从 tgt 验证 boto3 真能用（有 .client）。绝不在本进程 import，
+    避免污染/半初始化。健康返回 True。"""
+    probe = ("import boto3, sys; "
+             "sys.exit(0 if hasattr(boto3, 'client') else 1)")
+    e = dict(os.environ)
+    e["PYTHONPATH"] = tgt + os.pathsep + e.get("PYTHONPATH", "")
+    return subprocess.call([sys.executable, "-c", probe], env=e) == 0
+
+if need_upgrade:
+    tgt = os.path.join(os.environ.get("TMPDIR", "/tmp"), "notiops-botocore-newer")
+    _install_newer_boto(tgt)
+    # 自愈：万一装出来仍不健康（网络中断/并发/磁盘满等半成品），再清一次重装；仍不行才报错。
+    if not _boto_is_healthy(tgt):
+        _install_newer_boto(tgt)
+        if not _boto_is_healthy(tgt):
+            sys.exit("boto3/botocore install into %s is unusable (no boto3.client) after retry" % tgt)
     env["PYTHONPATH"] = tgt + os.pathsep + env.get("PYTHONPATH", "")
 
 # 用临时文件承载 WORK（UTF-8 写入，编码安全），交给全新解释器执行。

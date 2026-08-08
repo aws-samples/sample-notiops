@@ -735,8 +735,23 @@ cd infra && npx cdk deploy WebChatStack -c agentRuntimeArn=<上一步的 ARN>
 
 Web Chat「通知」主题的**持久化收件箱**由 EventBridge → `notiops-web-notif-handler`(复用 `core/push_event` 归一化,5 分钟去重)→ 写 `notiops-web-chat` 表 `notif#` 段。事件源开关:
 
-- **默认开**:CloudWatch Alarm / AWS Health / Backup
-- **默认关**:GuardDuty / Cost Anomaly / Trusted Advisor / RDS / Config
+- **默认开**(5 个,运维价值最高、噪音可控):AWS Health / CloudWatch Alarm / Cost Anomaly / Trusted Advisor / GuardDuty
+- **默认关**(5 个,按需 `-c webNotif<Id>=on` 打开):Backup / EC2 Spot / Auto Scaling / RDS / Config
+  - 关的原因:要么量大易刷屏(Backup 每次作业、Spot、RDS),要么需先开通付费服务且合规类噪音大(Config)
+
+> ⚠️ **默认开的 5 个里有 3 个还依赖客户侧前置条件** —— 规则是开的,但缺前置条件时收不到事件,前端空态会明确说明原因,不会让人误判成 NotiOps 坏了:
+>
+> | 源 | 前置条件 |
+> |---|---|
+> | GuardDuty | 账号需已**启用 GuardDuty**(付费)。未启用时没有 detector、不产生任何 finding;规则开着零成本,一旦启用立即生效,无需重新部署 |
+> | Cost Anomaly | 需先在 Cost Explorer 建**成本异常监控器**(免费);且只在 `us-east-1` 发事件 |
+> | Trusted Advisor | 需 **Business+ / Enterprise / Unified Operations** 支持计划;且只在 `us-east-1` 发事件 |
+
+> ⚠️ **Cost Anomaly 与 Trusted Advisor 是全局服务,只在 `us-east-1` 发 EventBridge 事件**
+> (TA 见[官方文档](https://docs.aws.amazon.com/awssupport/latest/user/cloudwatch-events-ta.html);Cost Anomaly 事件在其 home region,通常 `us-east-1`)。
+> 若把 NotiOps 部署在别的 region,这两条规则建了也**永不触发** —— `cdk synth/deploy` 会打出明确警告。
+> 想收到这两类通知:把 NotiOps 部署在 `us-east-1`,或在 `us-east-1` 建一条跨 region 转发规则把事件送到部署 region。
+> 不需要就 `-c webNotifCostAnomaly=off -c webNotifTrustedAdvisor=off` 关掉,警告随之消失。
 
 > 通知近实时,靠前端 **60s 轮询**(非 WebSocket,最长约 60s 延迟);左侧红点只统计**收件箱未读**。「通知」主题另有一块 **AWS Health Dashboard 实时视图**,由 BFF 实时查 Health API(不落库),需 **Business+ / Enterprise Support** 计划;无该计划时优雅降级为控制台链接,且 Health 未处理数**不叠进**红点。
 

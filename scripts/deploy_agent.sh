@@ -13,9 +13,17 @@
 #   ENABLE_WEBSEARCH      "true"(默认) 则 provision web-search Gateway 并注入 URL；
 #                         "false" 则跳过（agent 仍可用 Exa 兜底联网搜索）。
 #   AGENT_ARN_OUT         可选，把捕获到的 Runtime ARN 写到这个文件路径。
+#   NOTIOPS_ALLOW_CROSS_ACCOUNT
+#                         跨账号闸门（默认安全）。"1" = 放开多账号（setup.sh --multi-account
+#                         时传入）；空/未设 = 仅部署账号。**必须显式传空**而非省略，因为
+#                         §5 的回填是 merge-patch：不传就保留 runtime 上的旧值，会让
+#                         org→单账号回退时闸门一直留在开启态（fail-open）。
 #
 # 退出码非 0 表示失败；setup.sh 据此决定是否回退 echo BFF。
 set -euo pipefail
+
+# 跨账号闸门取值：单独跑本脚本时可能未设（set -u 下需给默认值）。空串 = 默认关闭。
+ALLOW_CROSS_ACCOUNT="${NOTIOPS_ALLOW_CROSS_ACCOUNT:-}"
 
 # ─── UI 语言（双语输出）───
 # 继承 setup.sh 导出的 UI_LANG（zh/en）；单独跑本脚本时默认英文，面向全球客户。
@@ -85,10 +93,11 @@ REPORTS_CDN_DOMAIN="$(aws cloudformation describe-stacks --region "$REGION" \
   --output text 2>/dev/null || echo '')"
 [ "$REPORTS_CDN_DOMAIN" = "None" ] && REPORTS_CDN_DOMAIN=""
 AGENTCORE_JSON="$AGENT_DIR/agentcore/agentcore.json"
-python3 - "$AGENTCORE_JSON" "$GATEWAY_URL" "$SKILLS_BUCKET" "$DEVOPS_AGENT_SPACE_ID" "$REPORTS_CDN_DOMAIN" <<'PY'
+python3 - "$AGENTCORE_JSON" "$GATEWAY_URL" "$SKILLS_BUCKET" "$DEVOPS_AGENT_SPACE_ID" "$REPORTS_CDN_DOMAIN" "$ALLOW_CROSS_ACCOUNT" <<'PY'
 import json, sys
 path, url, skills_bucket, da_space = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 reports_cdn = sys.argv[5] if len(sys.argv) > 5 else ""
+allow_cross = sys.argv[6] if len(sys.argv) > 6 else ""
 d = json.load(open(path))
 for rt in d.get("runtimes", []):
     for ev in rt.get("envVars", []):
@@ -101,8 +110,7 @@ for rt in d.get("runtimes", []):
         elif ev.get("name") == "REPORTS_CDN_DOMAIN":
             ev["value"] = reports_cdn  # 空串=reports.py 回退 presigned(12h)
         elif ev.get("name") == "NOTIOPS_ALLOW_CROSS_ACCOUNT":
-            import os as _os
-            ev["value"] = _os.environ.get("NOTIOPS_ALLOW_CROSS_ACCOUNT", "")  # org 模式传 1 = 放开跨账号闸门
+            ev["value"] = allow_cross  # org 模式传 1 = 放开跨账号闸门；空 = 仅部署账号
 json.dump(d, open(path, "w"), indent=2, ensure_ascii=False)
 import os as _os
 _zh = _os.environ.get("UI_LANG") == "zh"
@@ -110,12 +118,14 @@ if _zh:
     print(f"    agentcore.json 已写入 gateway URL: {url or '(空，用 Exa 兜底)'}; "
           f"SKILLS_BUCKET: {skills_bucket or '(空)'}; "
           f"DEVOPS_AGENT_SPACE_ID: {da_space or '(空，运行时自动发现)'}; "
-          f"REPORTS_CDN_DOMAIN: {reports_cdn or '(空，回退 presigned)'}")
+          f"REPORTS_CDN_DOMAIN: {reports_cdn or '(空，回退 presigned)'}; "
+          f"跨账号闸门: {'开启（多账号模式）' if allow_cross else '关闭（仅部署账号）'}")
 else:
     print(f"    agentcore.json written — gateway URL: {url or '(empty, Exa fallback)'}; "
           f"SKILLS_BUCKET: {skills_bucket or '(empty)'}; "
           f"DEVOPS_AGENT_SPACE_ID: {da_space or '(empty, auto-discovered at runtime)'}; "
-          f"REPORTS_CDN_DOMAIN: {reports_cdn or '(empty, presigned fallback)'}")
+          f"REPORTS_CDN_DOMAIN: {reports_cdn or '(empty, presigned fallback)'}; "
+          f"cross-account gate: {'ON (multi-account mode)' if allow_cross else 'OFF (deploy account only)'}")
 PY
 
 # ── 3. 部署 ──
@@ -140,22 +150,29 @@ json.dump(targets, open(path, 'w'), indent=2)
 " "$AGENT_DIR/agentcore/aws-targets.json" "$ACCT" "$REGION"
 ( cd "$AGENT_DIR" && agentcore deploy -y )
 
-# 部署已读取注入后的 agentcore.json；这里**还原为占位符**，保持 git 跟踪文件干净
+# 部署已读取注入后的 agentcore.json；这里**还原为出厂值**，保持 git 跟踪文件干净
 # （避免把本部署账号的 gateway URL / 桶名提交进仓库；客户每次部署时脚本会重新注入）。
+#
+# 注意：还原表必须覆盖 §3 注入的【全部】key，否则该 key 会带着本次部署的真值留在
+# git 跟踪文件里 —— 历史上漏了 NOTIOPS_ALLOW_CROSS_ACCOUNT，org 模式部署后它被留成 "1"，
+# 一旦误提交，后续任何客户 clone 出来的默认闸门就是【开启】的（安全默认被破坏）。
+# NOTIOPS_ALLOW_CROSS_ACCOUNT 出厂值是空串（= 仅部署账号）而非 __占位符__：backfill 脚本
+# 的核验会把 __X__ 形态当"未替换"告警，而空串正是这个 key 的合法默认值。
 python3 - "$AGENTCORE_JSON" <<'PY'
 import json, sys
 path = sys.argv[1]
+FACTORY = {
+    "AGENTCORE_WEBSEARCH_GATEWAY_URL": "__WEBSEARCH_GATEWAY_URL__",
+    "SKILLS_BUCKET": "__SKILLS_BUCKET__",
+    "DEVOPS_AGENT_SPACE_ID": "__DEVOPS_AGENT_SPACE_ID__",
+    "REPORTS_CDN_DOMAIN": "__REPORTS_CDN_DOMAIN__",
+    "NOTIOPS_ALLOW_CROSS_ACCOUNT": "",   # 出厂 = 关闭（安全默认）
+}
 d = json.load(open(path))
 for rt in d.get("runtimes", []):
     for ev in rt.get("envVars", []):
-        if ev.get("name") == "AGENTCORE_WEBSEARCH_GATEWAY_URL":
-            ev["value"] = "__WEBSEARCH_GATEWAY_URL__"
-        elif ev.get("name") == "SKILLS_BUCKET":
-            ev["value"] = "__SKILLS_BUCKET__"
-        elif ev.get("name") == "DEVOPS_AGENT_SPACE_ID":
-            ev["value"] = "__DEVOPS_AGENT_SPACE_ID__"
-        elif ev.get("name") == "REPORTS_CDN_DOMAIN":
-            ev["value"] = "__REPORTS_CDN_DOMAIN__"
+        if ev.get("name") in FACTORY:
+            ev["value"] = FACTORY[ev["name"]]
 json.dump(d, open(path, "w"), indent=2, ensure_ascii=False)
 import os as _os
 if _os.environ.get("UI_LANG") == "zh":
@@ -188,14 +205,22 @@ echo "  $(t "✓ Agent Runtime ARN:" "✓ Agent Runtime ARN:") $ARN"
 #
 # 回填/轮询/核验的实现统一收敛到 scripts/backfill_runtime_env.sh(单一权威,避免与
 # setup.sh 里"部署后补 AgentSpaceId/ReportsCdnDomain"那处各写一份而漂移)。
-# 这里传全部 4 个 env 真值 + idle=3600。注意:此刻 NotiOpsBackendStack 通常尚未部署
+# 这里传全部 5 个 env 真值 + idle=3600。注意:此刻 NotiOpsBackendStack 通常尚未部署
 # (setup.sh 里 CDK 部署在本脚本之后),故 DEVOPS_AGENT_SPACE_ID / REPORTS_CDN_DOMAIN
 # 此时多半为空 → 由 setup.sh 在 `cdk deploy --all` 之后再 merge-patch 补齐(不覆盖此处
 # 已设的 gateway/桶)。单独跑本脚本(栈已存在)时,这里就能一次拿到全部真值。
+#
+# NOTIOPS_ALLOW_CROSS_ACCOUNT **必须**在这里显式回填(哪怕是空串),原因和上面那 4 个一样:
+# `agentcore deploy` 有时不落 envVars,而 backfill 是 merge-patch —— 不传这个 key 就等于
+# "保留 runtime 上的旧值",于是两个方向都会错:
+#   · org 模式首次安装 → 闸门从未被设上 → 跨账号被默认拒绝(功能坏,静默)。
+#   · 从 org 模式回退成单账号重跑 → 闸门仍是上次的 "1" → 跨账号一直开着(fail-open,更糟)。
+# 显式传值把闸门变成部署模式的确定性函数:--multi-account → "1",否则 → ""。
 REGION="$REGION" RT_ARN="$ARN" SET_IDLE=3600 UI_LANG="$UI_LANG" \
   bash "$PROJECT_ROOT/scripts/backfill_runtime_env.sh" \
     "SKILLS_BUCKET=$SKILLS_BUCKET" \
     "REPORTS_CDN_DOMAIN=$REPORTS_CDN_DOMAIN" \
     "DEVOPS_AGENT_SPACE_ID=$DEVOPS_AGENT_SPACE_ID" \
     "AGENTCORE_WEBSEARCH_GATEWAY_URL=$GATEWAY_URL" \
+    "NOTIOPS_ALLOW_CROSS_ACCOUNT=$ALLOW_CROSS_ACCOUNT" \
   || echo "  $(t "⚠ env 回填/idle 设置未完成(不阻断);可稍后重跑。" "⚠ env backfill / idle setting did not complete (non-blocking); re-run later.")" >&2

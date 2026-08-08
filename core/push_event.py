@@ -290,7 +290,18 @@ def from_guardduty(event: dict, min_severity: float = 7.0) -> PushEvent | None:
 # 5. Cost Anomaly Detection
 # ---------------------------------------------------------------------------
 def from_cost_anomaly(event: dict) -> PushEvent | None:
-    """`aws.costexplorer` source, 'AWS Anomaly Detection' or similar."""
+    """`aws.ce` source, 'Anomaly Detected' detail-type.
+
+    NOTE(source string): the wire source is `aws.ce`, NOT `aws.costexplorer`
+    (which is not a real EventBridge source at all — the schema registry has
+    zero schemas under that name). See the sample event in
+    https://docs.aws.amazon.com/cost-management/latest/userguide/cad-eventbridge.html
+
+    Cost Anomaly Detection is a global service whose events are emitted in the
+    Cost Anomaly Detection home region (us-east-1 for most accounts), so an
+    EventBridge rule in another region will never match — see the region note
+    on webNotifSources in infra/lib/notiops-backend-stack.ts.
+    """
     detail = event.get("detail") or {}
     impact = (detail.get("impact") or {})
     total_cost = impact.get("totalImpact", 0)
@@ -316,7 +327,9 @@ def from_cost_anomaly(event: dict) -> PushEvent | None:
         title=title[:120],
         severity="warn",
         resource=anomaly_id,
-        region="",
+        # 事件自带 region = Cost Anomaly 的 home region;透传而非硬编码空串,
+        # 前端「区域」列才有值可显示。
+        region=event.get("region", ""),
         account=account,
         description=body,
         dedupe_key=_hash_key("costanom", account, anomaly_id),
@@ -341,37 +354,59 @@ TA_INCLUDE_STATUSES = {"ERROR"}
 def from_trusted_advisor(event: dict,
                          include_categories: set[str] | None = None
                          ) -> PushEvent | None:
-    """`aws.trustedadvisor` source.
+    """`aws.trustedadvisor` source, 'Trusted Advisor Check Item Refresh Notification'.
 
-    We deliberately filter out:
-      - 'Trusted Advisor Check Item Refresh Notification' (refresh w/o status change)
-      - WARNING / OK statuses (only ERROR push-worthy)
-      - cost_optimizing / performance categories by default (too chatty,
-        also better surfaced via Cost Anomaly + CW alarms respectively)
+    NOTE(detail-type): 'Trusted Advisor Check Item Refresh Notification' is the
+    ONLY detail-type Trusted Advisor actually emits (console labels it
+    "Check Item Refresh Status"; the schema registry has exactly one
+    non-CloudTrail schema: aws.trustedadvisor@TrustedAdvisorCheckItemRefreshNotification).
+    There is no '...Status Changed' detail-type — matching on that string
+    silently matched nothing.
+
+    Trusted Advisor is a global service: events are emitted to EventBridge in
+    us-east-1 ONLY, and require a Business+ / Enterprise / Unified Operations
+    support plan. See
+    https://docs.aws.amazon.com/awssupport/latest/user/cloudwatch-events-ta.html
+
+    We still filter out:
+      - WARN / OK / INFO statuses (only ERROR is push-worthy)
+      - cost_optimizing / performance categories (too chatty, and already
+        covered by Cost Anomaly + CW alarms respectively) — but ONLY when the
+        event actually carries a category, see below.
 
     Customers can override include_categories to widen the net.
     """
     detail_type = event.get("detail-type", "")
-    if "Status Changed" not in detail_type:
+    if "Trusted Advisor" not in detail_type:
         return None
     detail = event.get("detail") or {}
     status = (detail.get("status") or "").upper()
     if status not in TA_INCLUDE_STATUSES:
         return None
+    # 真实事件的 detail 只有 check-name / status / uuid / resource_id /
+    # check-item-detail —— **没有** category 字段。所以这里只在事件真带了
+    # category 时才按白名单过滤;缺失时放行(否则白名单会把所有事件都吃掉,
+    # 这正是之前 TA 通知一条都进不来的第二道暗坑)。
     category = (detail.get("check-category") or detail.get("category") or "").lower()
-    cats = include_categories or TA_INCLUDE_CATEGORIES_DEFAULT
-    if category not in cats:
-        return None
+    if category:
+        cats = include_categories or TA_INCLUDE_CATEGORIES_DEFAULT
+        if category not in cats:
+            return None
     check_name = detail.get("check-name") or detail.get("checkName") or "(unknown check)"
     flagged = detail.get("flagged-resources") or detail.get("resourcesFlagged") or 0
+    # 真实事件是**按被标记的资源**逐条发的(detail.resource_id 必填),不是每个
+    # check 一条聚合事件;dedupe_key 带上 resource_id,否则同一 check 下多个资源
+    # 会在 5 分钟去重窗口里被压成一条,只剩第一个资源进收件箱。
+    resource_id = detail.get("resource_id") or detail.get("resourceId") or ""
     account = event.get("account", "")
     region = event.get("region", "")
 
     title = f"🛡️ Trusted Advisor · {check_name}"
     body = (
-        f"**Category** · {category}\n"
+        f"**Category** · {category or '(not provided)'}\n"
         f"**Status** · {status}\n"
         f"**Flagged resources** · {flagged}\n"
+        f"**Resource** · {resource_id or '(account-level)'}\n"
         f"**Account** · {account}\n"
     )
     console_url = "https://console.aws.amazon.com/trustedadvisor/home"
@@ -380,20 +415,23 @@ def from_trusted_advisor(event: dict,
         source="Trusted Advisor",
         title=title[:120],
         severity="warn",
-        resource=check_name,
+        resource=resource_id or check_name,
         region=region,
         account=account,
         description=body,
-        dedupe_key=_hash_key("ta", account, check_name, status),
+        dedupe_key=_hash_key("ta", account, check_name, status, resource_id),
         dispatch_query=(
-            f"Trusted Advisor check '{check_name}' (category={category}) "
-            f"transitioned to {status}, flagging {flagged} resources. "
-            f"Identify what those resources are, what the risk is, and "
-            f"how to fix them."
+            f"Trusted Advisor check '{check_name}'"
+            + (f" (category={category})" if category else "")
+            + f" reported status {status}"
+            + (f" for resource {resource_id}" if resource_id else "")
+            + ". Identify what the affected resources are, what the risk is, "
+              "and how to fix them."
         ),
         console_url=console_url,
         raw_event_excerpt={"checkName": check_name, "category": category,
-                           "status": status, "flagged": flagged},
+                           "status": status, "flagged": flagged,
+                           "resourceId": resource_id},
     )
 
 
@@ -612,6 +650,10 @@ NORMALIZERS: dict[str, Callable[[dict], PushEvent | None]] = {
     "aws.health": from_aws_health,
     "aws.backup": from_aws_backup,
     "aws.guardduty": from_guardduty,
+    # Cost Anomaly Detection 的 EventBridge source 是 `aws.ce`。
+    # `aws.costexplorer` 保留为别名:历史规则里写的是它,升级期间可能还有
+    # 旧规则在投事件;多一个 key 零成本,少一个 key 就丢事件。
+    "aws.ce": from_cost_anomaly,
     "aws.costexplorer": from_cost_anomaly,
     "aws.trustedadvisor": from_trusted_advisor,
     "aws.ec2": from_ec2_spot,

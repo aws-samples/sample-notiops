@@ -4,7 +4,10 @@ import {
   listNotifications, markRead, getHealthDashboard, getHealthEventDetail,
   type NotificationItem, type Severity, type HealthDashboard, type HealthEvent, type HealthBucket, type HealthEventDetail,
 } from "../api/notifications";
-import { IconBell, IconInvestigate, IconExternal, IconWhatsNew, IconSecurity, IconReports, IconCases, IconChevronRight } from "./icons";
+import {
+  IconBell, IconInvestigate, IconExternal, IconWhatsNew, IconSecurity, IconReports, IconCases, IconChevronRight,
+  IconGauge, IconHeartPulse, IconFileText, IconIdle, IconCluster, IconCostSpike, IconLifebuoy, IconDatabase, IconCheck,
+} from "./icons";
 import { getEosDashboard, getEosOrgSummary, type EosDashboardData, type EosOrgRow } from "../api/eos";
 
 /**
@@ -15,11 +18,42 @@ import { getEosDashboard, getEosOrgSummary, type EosDashboardData, type EosOrgRo
  *     · 您的账户运行状况(账户 issue)
  *     · 计划的更改(scheduledChange)
  *   事件通知:
- *     · 其他事件(CloudWatch/Backup/GuardDuty 等 push 落库的收件箱)
+ *     · 每种事件类型一个分组(CloudWatch 告警 / Health 推送 / Backup / GuardDuty …),
+ *       见 EVENT_TYPES。不再把所有 push 事件塞进一个"其他事件通知"。
  * 每个子项标题带计数徽章;挂载即把收件箱已读游标推到最新(markRead)清红点。
  */
-type SectionKey = "service" | "account" | "scheduled" | "eos" | "other";
+type SectionKey = "service" | "account" | "scheduled" | "eos" | `evt:${string}`;
 const RED = "#d13212";
+
+/**
+ * 收件箱支持的事件类型 —— 每种一个左侧分组。
+ *
+ * source 必须与 core/push_event.py 里各 normalizer 写入的 `pe.source` 人类标签**逐字**
+ * 一致(那是落库字段,也是这里的分组键)。新增 normalizer 时要同步往这里加一项,
+ * 否则该类型的事件会落到末尾的 evt:other 兜底组(不会丢,但没有专属分组)。
+ *
+ * defaultOn 对应 infra/lib/notiops-backend-stack.ts 中 webNotifSources 的 on 字段
+ * (即 EventBridge 规则出厂是 ENABLED 还是 DISABLED)。仅用于空态文案:默认关的源
+ * 空着是"没开",默认开的源空着是"真没发生过" —— 两者对用户的含义完全不同。
+ *
+ * prereqKey:默认开、但**还依赖客户侧前置条件**的源(GuardDuty 要先启用服务、
+ * TA 要 Business+ 支持计划、Cost Anomaly 要先建监控器)。空着时既不是"没开"也不
+ * 一定是"没发生",所以给一条专属文案指出要先做什么,避免用户以为 NotiOps 坏了。
+ */
+const EVENT_TYPES: { key: string; source: string; labelKey: string; subKey: string; defaultOn: boolean; prereqKey?: string; icon: React.ReactNode }[] = [
+  // 顺序 = 侧栏展示顺序,与 CDK webNotifSources 一致:默认开的 5 个在前。
+  { key: "health",      source: "AWS Health",       labelKey: "notif.evt.health",      subKey: "notif.evt.health.sub",      defaultOn: true,  icon: <IconHeartPulse size={16} /> },
+  { key: "cloudwatch",  source: "CloudWatch Alarm", labelKey: "notif.evt.cloudwatch",  subKey: "notif.evt.cloudwatch.sub",  defaultOn: true,  icon: <IconGauge size={16} /> },
+  { key: "cost",        source: "Cost Anomaly",     labelKey: "notif.evt.cost",        subKey: "notif.evt.cost.sub",        defaultOn: true,  prereqKey: "notif.evt.emptyPrereq.cost",      icon: <IconCostSpike size={16} /> },
+  { key: "ta",          source: "Trusted Advisor",  labelKey: "notif.evt.ta",          subKey: "notif.evt.ta.sub",          defaultOn: true,  prereqKey: "notif.evt.emptyPrereq.ta",        icon: <IconLifebuoy size={16} /> },
+  { key: "guardduty",   source: "GuardDuty",        labelKey: "notif.evt.guardduty",   subKey: "notif.evt.guardduty.sub",   defaultOn: true,  prereqKey: "notif.evt.emptyPrereq.guardduty", icon: <IconSecurity size={16} /> },
+  { key: "backup",      source: "AWS Backup",       labelKey: "notif.evt.backup",      subKey: "notif.evt.backup.sub",      defaultOn: false, icon: <IconFileText size={16} /> },
+  { key: "spot",        source: "EC2 Spot",         labelKey: "notif.evt.spot",        subKey: "notif.evt.spot.sub",        defaultOn: false, icon: <IconIdle size={16} /> },
+  { key: "autoscaling", source: "Auto Scaling",     labelKey: "notif.evt.autoscaling", subKey: "notif.evt.autoscaling.sub", defaultOn: false, icon: <IconCluster size={16} /> },
+  { key: "rds",         source: "RDS",              labelKey: "notif.evt.rds",         subKey: "notif.evt.rds.sub",         defaultOn: false, icon: <IconDatabase size={16} /> },
+  { key: "config",      source: "AWS Config",       labelKey: "notif.evt.config",      subKey: "notif.evt.config.sub",      defaultOn: false, icon: <IconCheck size={16} /> },
+];
+const KNOWN_SOURCES = new Set(EVENT_TYPES.map((e) => e.source));
 
 const fmtTime = (ts: number, locale: string) => {
   const d = new Date(ts);
@@ -283,6 +317,12 @@ export default function NotificationsPanel({
   const { locale } = useLocale();
   const [items, setItems] = useState<NotificationItem[]>([]);
   const [lastReadTs, setLastReadTs] = useState(0);
+  // 收件箱是累积的(TTL 90 天)，而后端只取最新一页。truncated + bySource 让界面能如实说
+  // "显示最新 N 条，共 M 条"，而不是静默截断让用户以为就这些。
+  const [inboxTruncated, setInboxTruncated] = useState(false);
+  // 各事件类型在**整个**收件箱里的真实条数(后端聚合)。null = 未知(聚合失败/老后端)，
+  // 此时徽章退回本页条数、截断提示退化成不带总数的版本 —— 宁可说"未知"也不编数字。
+  const [inboxBySource, setInboxBySource] = useState<Record<string, number> | null>(null);
   const [loading, setLoading] = useState(true);
   const [health, setHealth] = useState<HealthDashboard | null>(null);
   const [healthLoading, setHealthLoading] = useState(true);
@@ -301,7 +341,11 @@ export default function NotificationsPanel({
   const load = () => {
     setLoading(true);
     listNotifications().then((r) => {
-      setItems(r.items); setLastReadTs(r.lastReadTs); setLoading(false);
+      setItems(r.items); setLastReadTs(r.lastReadTs);
+      // bySource 可能是 null(后端聚合失败)；?? null 把 undefined(老后端)也归一成"未知"
+      setInboxTruncated(!!r.truncated);
+      setInboxBySource(r.bySource ?? null);
+      setLoading(false);
     }).catch(() => setLoading(false));
     setHealthLoading(true);
     getHealthDashboard(accountId).then((h) => { setHealth(h); setHealthLoading(false); }).catch(() => setHealthLoading(false));
@@ -316,14 +360,28 @@ export default function NotificationsPanel({
   const tpl = (key: string, vars: Record<string, string | number>) =>
     Object.entries(vars).reduce((s, [k, v]) => s.replace(`{${k}}`, String(v)), t(key));
 
+  // 收件箱按事件类型分桶（本页已加载的条目）。分组键 = 落库的 source 字段。
+  // 不在 EVENT_TYPES 里的 source（新增了 normalizer 但没登记）归到 "" 兜底组，不丢事件。
+  const bucketed: Record<string, NotificationItem[]> = {};
+  for (const n of items) {
+    const k = KNOWN_SOURCES.has(n.source) ? n.source : "";
+    (bucketed[k] ||= []).push(n);
+  }
+  // 出现在收件箱里但未登记的 source（兜底组只在真的有这类事件时才显示）
+  const unknownItems = bucketed[""] || [];
+
   // 各子项计数(徽章)。bucket 计数含 moreCount(反映真实总数)。
   const cnt = (b?: HealthBucket) => b ? b.items.length + b.moreCount : 0;
+  // 事件类型徽章优先用后端聚合的全库条数；聚合未知时退回本页条数（截断时会偏小，
+  // 但此时列表顶部已有"还有更早的通知未显示"提示，不会让人误判成全部）。
+  const evtCount = (source: string) => inboxBySource?.[source] ?? (bucketed[source]?.length ?? 0);
   const counts: Record<SectionKey, number> = {
     service: cnt(health?.serviceIssues),
     account: cnt(health?.accountIssues),
     scheduled: cnt(health?.scheduledChanges),
     eos: eosData?.atRisk ?? 0,
-    other: items.length,
+    ...Object.fromEntries(EVENT_TYPES.map((e) => [`evt:${e.key}`, evtCount(e.source)])),
+    "evt:other": unknownItems.length,
   };
 
   // section 切到 EOS 时懒加载(多 region 扫描较慢，只在需要时拉)；账号切换即失效重取
@@ -730,35 +788,61 @@ export default function NotificationsPanel({
         return renderScheduled();
       case "eos":
         return renderEos();
-      case "other":
-      default:
-        return (
-          <div className="notif-pane">
-            <div className="notif-pane-head">
-              <div className="notif-pane-title">{t("notif.section.other")}</div>
-              <div className="notif-pane-sub">{t("notif.section.otherSub")}</div>
+      default: {
+        // 事件通知：每种类型一个分组。section 形如 "evt:<key>"。
+        const key = section.startsWith("evt:") ? section.slice(4) : "";
+        const et = EVENT_TYPES.find((e) => e.key === key);
+        return renderInboxGroup(et);
+      }
+    }
+  };
+
+  /** 渲染一个事件类型分组。et=undefined 表示 evt:other 兜底组（未登记 source）。 */
+  const renderInboxGroup = (et?: typeof EVENT_TYPES[number]) => {
+    const group = et ? (bucketed[et.source] || []) : unknownItems;
+    // 该类型的全库真实条数（聚合可用时）；用于判断"本组是否被截断"
+    const groupTotal = et ? inboxBySource?.[et.source] : undefined;
+    const groupTruncated = inboxTruncated && (groupTotal == null || groupTotal > group.length);
+    return (
+      <div className="notif-pane">
+        <div className="notif-pane-head">
+          <div className="notif-pane-title">{t(et ? et.labelKey : "notif.evt.other")}</div>
+          <div className="notif-pane-sub">{t(et ? et.subKey : "notif.evt.other.sub")}</div>
+        </div>
+        {loading ? (
+          <div className="notif-health-empty">…</div>
+        ) : group.length === 0 ? (
+          <div className="notif-empty">
+            <div className="notif-empty-ic"><IconBell size={36} /></div>
+            {/* 空态要分清三种情况:没开这个源 / 开了但缺客户侧前置条件 / 开着且真没事件 */}
+            <div className="notif-empty-sub">
+              {t(
+                et && !et.defaultOn
+                  ? "notif.evt.emptyOptIn"
+                  : et?.prereqKey
+                    ? et.prereqKey
+                    : "notif.evt.empty",
+              )}
             </div>
-            {loading ? (
-              <div className="notif-health-empty">…</div>
-            ) : items.length === 0 ? (
-              <div className="notif-empty">
-                <div className="notif-empty-ic"><IconBell size={36} /></div>
-                <div className="notif-empty-sub">{t("notif.empty")}</div>
-              </div>
-            ) : (
-              <div className="notif-list">
-                {items.map((n) => {
-                  const isNew = n.ts > lastReadTs;
-                  return (
-                    <InboxEventCard key={n.id} n={n} isNew={isNew} locale={locale} t={t}
-                      onInvestigate={onInvestigate} onAsk={onAsk} />
-                  );
-                })}
+          </div>
+        ) : (
+          <div className="notif-list">
+            {/* 被 limit 截断时如实说明(超出的是更早的通知，会随 TTL 90 天自然过期) */}
+            {groupTruncated && (
+              <div className="notif-inbox-trunc">
+                {groupTotal == null
+                  ? tpl("notif.inbox.truncatedUnknown", { n: group.length })
+                  : tpl("notif.inbox.truncated", { n: group.length, total: groupTotal })}
               </div>
             )}
+            {group.map((n) => (
+              <InboxEventCard key={n.id} n={n} isNew={n.ts > lastReadTs} locale={locale} t={t}
+                onInvestigate={onInvestigate} onAsk={onAsk} />
+            ))}
           </div>
-        );
-    }
+        )}
+      </div>
+    );
   };
 
   const NavItem = ({ k, icon, label }: { k: SectionKey; icon: React.ReactNode; label: string }) => (
@@ -784,7 +868,16 @@ export default function NotificationsPanel({
         <NavItem k="scheduled" icon={<IconCases size={16} />} label={t("notif.health.scheduledChanges")} />
         {can("nav:notifications:eos") && <NavItem k="eos" icon={<IconReports size={16} />} label={t("notif.eos.title")} />}
         <div className="notif-side-group">{t("notif.nav.group.events")}</div>
-        <NavItem k="other" icon={<IconBell size={16} />} label={t("notif.section.other")} />
+        {/* 每种事件类型一个入口。默认关的源(GuardDuty/Cost Anomaly/TA/RDS/Config)在
+            没有任何事件时不占位 —— 客户没开就别让侧栏一直挂着 5 个空分组；一旦开了
+            并收到事件，分组自动出现。默认开的源始终显示(空着也要能点进去看"暂无")。 */}
+        {EVENT_TYPES.filter((e) => e.defaultOn || counts[`evt:${e.key}`] > 0).map((e) => (
+          <NavItem key={e.key} k={`evt:${e.key}`} icon={e.icon} label={t(e.labelKey)} />
+        ))}
+        {/* 兜底组：只在真的收到未登记 source 的事件时才出现 */}
+        {unknownItems.length > 0 && (
+          <NavItem k="evt:other" icon={<IconBell size={16} />} label={t("notif.evt.other")} />
+        )}
       </div>
 
       {/* 右侧内容 */}

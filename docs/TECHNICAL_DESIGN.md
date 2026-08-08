@@ -366,9 +366,10 @@ Web Chat 的「通知」主题分两块。
 
 ```
 AWS 事件源(EventBridge)
-  · CloudWatch Alarm / Health / Backup      —— 默认开
-  · GuardDuty / Cost Anomaly /
-    Trusted Advisor / RDS / Config          —— 默认关
+  · Health / CloudWatch Alarm / Cost Anomaly /
+    Trusted Advisor / GuardDuty              —— 默认开(5 个)
+  · Backup / EC2 Spot / Auto Scaling /
+    RDS / Config                             —— 默认关(-c webNotif<Id>=on 打开)
         │
         ▼ EventBridge 规则
 notiops-web-notif-handler(Lambda)

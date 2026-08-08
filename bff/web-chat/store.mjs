@@ -138,8 +138,23 @@ export async function setConversationPinned(sub, conversationId, pinned) {
  */
 const NOTIF_KEY = process.env.NOTIF_INBOX_KEY || "account";
 
-/** 列出通知（倒序，最新在前）。limit 默认 100。返回 {items, lastReadTs}。 */
-export async function listNotifications(limit = 100) {
+/** 列出通知（倒序，最新在前）。返回 {items, lastReadTs, total, truncated, bySource}。
+ *
+ * 【为什么要返回 total/truncated】收件箱是累积的（TTL 90 天，见 web_push_handler.py 的
+ * NOTIF_TTL_DAYS），而这里只取最新 limit 条。稳态条数 ≈ 日均新增 × 90，一旦超过 limit，
+ * 旧实现会**静默截断**：徽章永远顶在 limit、更老的通知看不到，且界面上没有任何提示
+ * （对比 Health 那几栏有 moreCount + "更多去控制台"）。用户会以为"就这些"。
+ * 故这里显式回传真实总数 + 是否被截断，由前端如实展示"显示最新 N 条，共 M 条"。
+ *
+ * 【为什么要返回 bySource】前端按事件类型分组展示（CloudWatch 告警 / AWS Health /
+ * Backup / GuardDuty …），每组的徽章要是**该类型在整个收件箱里的真实条数**，而不是
+ * "本页碰巧取到的条数" —— 否则一截断，各组徽章就一起变成谎报的小数字。
+ *
+ * 【成本】未截断（常态）时 items 就是全量，total/bySource 直接本地算，零额外查询。
+ * 只有确实被截断才多发一次投影聚合（只读 source 属性，见 aggregateBySource）。
+ * withTotal=false 则完全跳过聚合 —— 60s 轮询的 unread 路径用它，避免热路径涨成本。
+ */
+export async function listNotifications(limit = 200, withTotal = true) {
   const [evts, cursor] = await Promise.all([
     ddb.send(new QueryCommand({
       TableName: TABLE,
@@ -161,12 +176,57 @@ export async function listNotifications(limit = 100) {
     description: i.description, consoleUrl: i.console_url,
     dispatchQuery: i.dispatch_query, read: i.ts <= lastReadTs,
   }));
-  return { items, lastReadTs };
+  // 判据用 LastEvaluatedKey 而非 items.length === limit：后者在"恰好 limit 条"时会误报截断。
+  const truncated = !!evts.LastEvaluatedKey;
+  if (!truncated) {
+    // 常态：本页即全量，总数/分类数直接本地算，不发额外查询。
+    return { items, lastReadTs, total: items.length, truncated, bySource: tally(items) };
+  }
+  const agg = withTotal ? await aggregateBySource() : null;
+  // agg 为 null（聚合失败或 withTotal=false）→ 如实回 null，让前端说"未知总数"而不是编一个。
+  return { items, lastReadTs, total: agg?.total ?? null, truncated, bySource: agg?.bySource ?? null };
 }
 
-/** 未读数 = ts > lastReadTs 的通知条数（前端红点用；只查键投影，省流量）。 */
+/** 按 source 计数：{"CloudWatch Alarm": 16, "AWS Health": 28} */
+const tally = (items) => items.reduce((m, i) => { const k = i.source || "?"; m[k] = (m[k] || 0) + 1; return m; }, {});
+
+/** 全收件箱按 source 聚合（真实总数 + 每类条数），分页累加。
+ *  用 ProjectionExpression 只取 source —— 单条 ~1.4KB，投影后每条几十字节，
+ *  1MB 上限下一次就能扫上万条；不投影则 700 条就要翻页。
+ *  #s 转义：source 不是 DynamoDB 保留字，但 SDK 侧统一用 ExpressionAttributeNames 更稳。
+ *  仅在列表被截断时调用。失败 → null（调用方降级成"未知总数"，不谎报）。 */
+async function aggregateBySource() {
+  const bySource = {};
+  let total = 0, lastKey;
+  try {
+    do {
+      const r = await ddb.send(new QueryCommand({
+        TableName: TABLE,
+        KeyConditionExpression: "PK = :pk AND begins_with(SK, :sk)",
+        ExpressionAttributeValues: { ":pk": `notif#${NOTIF_KEY}`, ":sk": "evt#" },
+        ExpressionAttributeNames: { "#s": "source" },
+        ProjectionExpression: "#s",
+        ExclusiveStartKey: lastKey,
+      }));
+      for (const it of r.Items || []) {
+        const k = it.source || "?";
+        bySource[k] = (bySource[k] || 0) + 1;
+        total++;
+      }
+      lastKey = r.LastEvaluatedKey;
+    } while (lastKey);
+  } catch {
+    return null;
+  }
+  return { total, bySource };
+}
+
+/** 未读数 = ts > lastReadTs 的通知条数（前端红点用，60s 轮询）。
+ *  取 200 条窗口：未读数只在"用户没进过页面"时才可能大，200 足够；且显式 withTotal=false
+ *  跳过聚合分页 —— 这是每 60s 打一次的热路径，不能让它随收件箱增长而涨成本。
+ *  total 这里只是本次窗口内条数，红点逻辑不依赖它。 */
 export async function unreadNotifications() {
-  const { items } = await listNotifications(200);
+  const { items } = await listNotifications(200, false);
   const unread = items.filter((i) => !i.read).length;
   const latestTs = items.length ? items[0].ts : 0;
   return { unread, latestTs, total: items.length };

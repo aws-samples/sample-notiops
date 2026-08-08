@@ -1452,12 +1452,19 @@ def handler(event, context):
     }));
 
     // EventBridge Rules — 默认 DISABLED(需显式启用)
+    // source / detailType 必须逐字匹配 AWS 实际发出的事件,写错了规则永不触发、
+    // 且没有任何报错。判据:EventBridge schema registry(aws.events 注册表)里
+    // 存在 `<source>@<DetailTypeWithoutSpaces>` 这个 schema。
     const pushRuleSources = [
       { id: "CloudWatchAlarm", source: "aws.cloudwatch", detailType: "CloudWatch Alarm State Change" },
       { id: "BackupJob", source: "aws.backup", detailType: "Backup Job State Change" },
       { id: "GuardDuty", source: "aws.guardduty", detailType: "GuardDuty Finding" },
-      { id: "CostAnomaly", source: "aws.costexplorer", detailType: "Cost Anomaly Detection Alert" },
-      { id: "TrustedAdvisor", source: "aws.trustedadvisor", detailType: "Trusted Advisor Check Item Status Changed" },
+      // Cost Anomaly:source 是 aws.ce(不是 aws.costexplorer —— 那个 source 不存在),
+      // detail-type 是 "Anomaly Detected"。见 core/push_event.py from_cost_anomaly 的注释。
+      { id: "CostAnomaly", source: "aws.ce", detailType: "Anomaly Detected" },
+      // Trusted Advisor:唯一真实存在的 detail-type 是 "...Refresh Notification"
+      // (控制台标签写作 "Check Item Refresh Status")。
+      { id: "TrustedAdvisor", source: "aws.trustedadvisor", detailType: "Trusted Advisor Check Item Refresh Notification" },
     ];
 
     for (const src of pushRuleSources) {
@@ -1486,7 +1493,7 @@ def handler(event, context):
         NOTIF_INBOX_KEY: "account", // 一期:账号级共享一份收件箱
         NOTIF_TTL_DAYS: "90",
       },
-      description: "多源 AWS 事件 → Web Chat 通知收件箱(CloudWatch Alarm / Health / Backup / GuardDuty / Cost Anomaly / Trusted Advisor)",
+      description: "多源 AWS 事件 → Web Chat 通知收件箱(默认开:Health / CloudWatch Alarm / Cost Anomaly / Trusted Advisor / GuardDuty;可选:Backup / Spot / Auto Scaling / RDS / Config)",
     } as lambda.FunctionProps);
 
     // 授权写 notiops-web-chat 表(表在 WebChatStack;用固定名拼 ARN,避免跨 stack 依赖)。
@@ -1495,20 +1502,32 @@ def handler(event, context):
       resources: [`arn:aws:dynamodb:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:table/notiops-web-chat`],
     }));
 
-    // Web 通知的 EventBridge 规则。默认开的源(零配置即用):CloudWatch Alarm /
-    // AWS Health / Backup;需客户先启用对应服务的源默认关(避免噪音):GuardDuty /
-    // Cost Anomaly / Trusted Advisor。可用 -c webNotif<Id>=on/off 覆盖。
+    // Web 通知的 EventBridge 规则。
+    //
+    // 默认开这 5 个(运维价值最高、噪音可控):
+    //   AWS Health · CloudWatch 告警 · Cost Anomaly · Trusted Advisor · GuardDuty
+    // 其余 5 个默认关:Backup / EC2 Spot / Auto Scaling / RDS / Config
+    //   —— 要么量大易刷屏(Backup 每次作业、Spot、RDS),要么需客户先开通付费服务
+    //   且合规类噪音大(Config)。需要时 -c webNotif<Id>=on 单独打开。
+    //
+    // GuardDuty 默认开但**需客户先启用 GuardDuty**(付费服务)。没启用时
+    // 没有 detector、不会有任何 finding,规则处于"开着但收不到事件"的状态 ——
+    // 无害且零成本,一旦客户启用就立刻生效,不用再回来改部署。
+    //
+    // globalOnly 标记:这两个是**全局服务**,只在 us-east-1 发 EventBridge 事件
+    // (TA 见 https://docs.aws.amazon.com/awssupport/latest/user/cloudwatch-events-ta.html;
+    //  Cost Anomaly 事件的 region = 其 home region,通常 us-east-1)。
+    // 部署在别的 region 时规则建了也永不触发,所以下面会 addWarning 明确告知,
+    // 而不是让用户以为"开了就有"。
     const webNotifSources = [
-      { id: "CloudWatchAlarm", source: "aws.cloudwatch", detailType: "CloudWatch Alarm State Change", on: true },
       { id: "Health", source: "aws.health", detailType: "AWS Health Event", on: true },
-      { id: "BackupJob", source: "aws.backup", detailType: "Backup Job State Change", on: true },
-      { id: "GuardDuty", source: "aws.guardduty", detailType: "GuardDuty Finding", on: false },
-      { id: "CostAnomaly", source: "aws.costexplorer", detailType: "Cost Anomaly Detection Alert", on: false },
-      { id: "TrustedAdvisor", source: "aws.trustedadvisor", detailType: "Trusted Advisor Check Item Status Changed", on: false },
-      // 扩展源(方案 A):EC2 Spot 中断 / Auto Scaling 启动失败默认开(开箱即用、自动产生);
-      // RDS 事件 / Config 不合规默认关(RDS 量可能大;Config 需客户先配规则)。normalizer 见 core/push_event.py。
-      { id: "Ec2Spot", source: "aws.ec2", detailType: "EC2 Spot Instance Interruption Warning", on: true },
-      { id: "AutoScalingFail", source: "aws.autoscaling", detailType: "EC2 Instance Launch Unsuccessful", on: true },
+      { id: "CloudWatchAlarm", source: "aws.cloudwatch", detailType: "CloudWatch Alarm State Change", on: true },
+      { id: "CostAnomaly", source: "aws.ce", detailType: "Anomaly Detected", on: true, globalOnly: true },
+      { id: "TrustedAdvisor", source: "aws.trustedadvisor", detailType: "Trusted Advisor Check Item Refresh Notification", on: true, globalOnly: true },
+      { id: "GuardDuty", source: "aws.guardduty", detailType: "GuardDuty Finding", on: true },
+      { id: "BackupJob", source: "aws.backup", detailType: "Backup Job State Change", on: false },
+      { id: "Ec2Spot", source: "aws.ec2", detailType: "EC2 Spot Instance Interruption Warning", on: false },
+      { id: "AutoScalingFail", source: "aws.autoscaling", detailType: "EC2 Instance Launch Unsuccessful", on: false },
       { id: "Rds", source: "aws.rds", detailType: "RDS DB Instance Event", on: false },
       { id: "Config", source: "aws.config", detailType: "Config Rules Compliance Change", on: false },
     ];
@@ -1516,12 +1535,25 @@ def handler(event, context):
     for (const src of webNotifSources) {
       const override = this.node.tryGetContext(`webNotif${src.id}`) as string | undefined;
       const enabled = override ? override === "on" : src.on;
-      new events.Rule(this, `WebNotifRule${src.id}`, {
+      const rule = new events.Rule(this, `WebNotifRule${src.id}`, {
         ruleName: `notiops-web-notif-${src.id.toLowerCase()}`,
         eventPattern: { source: [src.source], detailType: [src.detailType] },
         targets: [new targets.LambdaFunction(webNotifLambda)],
         enabled,
       });
+      // 全局服务源部署到非 us-east-1:规则永不触发。合成期就喊出来,
+      // 免得客户开了开关却等不到通知,还以为是 NotiOps 坏了。
+      if (enabled && src.globalOnly && this.region !== "us-east-1") {
+        cdk.Annotations.of(rule).addWarning(
+          `${src.id} is a global service that only emits EventBridge events in ` +
+          `us-east-1; this stack is in ${this.region}, so rule ` +
+          `notiops-web-notif-${src.id.toLowerCase()} will never fire. ` +
+          `To receive these notifications, deploy NotiOps in us-east-1, or ` +
+          `forward the events from us-east-1 to this region via a cross-region ` +
+          `EventBridge rule. Silence this by deploying with ` +
+          `-c webNotif${src.id}=off.`
+        );
+      }
     }
 
 

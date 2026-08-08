@@ -84,20 +84,6 @@ cd sample-notiops
 
 ---
 
-## 技术栈
-
-| 层 | 技术 |
-|---|---|
-| 运行时 | ECS Fargate(IM 机器人)+ AWS Lambda(report / push handler + notiops Lambdas) |
-| 状态 | DynamoDB(单表多前缀)+ S3(报告,短 TTL) |
-| LLM | Amazon Bedrock —— 按会话切换,按模型限制输出 token |
-| MCP | AWS Knowledge MCP(托管)+ Pricing / Cost MCP |
-| IM SDK | `lark-oapi`(飞书)+ `slack_bolt`(Slack) |
-| IaC | AWS CDK |
-| 容器 | Docker(linux/amd64,兼容 Fargate) |
-
----
-
 ## 架构(高层)
 
 ```

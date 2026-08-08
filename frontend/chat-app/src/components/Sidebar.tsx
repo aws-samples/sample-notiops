@@ -61,11 +61,24 @@ const PanelIcon = () => (
   </svg>
 );
 
+/**
+ * 「巡检 & 报告」入口的显示开关。
+ *
+ * 当前置 false = **只隐藏，不删代码**：按钮、图标、openConsole()、i18n 的
+ * nav.inspections 文案全部原样保留，要恢复只需把这里改回 true，无需重写任何东西。
+ *
+ * 这一项本质是外链到 idle 控制台（config.json 里的 idleConsoleUrl），不是站内页面，
+ * 所以隐藏它不影响任何站内路由或状态。
+ */
+const SHOW_INSPECTIONS = false;
+
 export default function Sidebar({ conversations, activeId, busyIds, unreadIds, onSelect, onNew, onRename, onTogglePin, onDelete, collapsed, onToggle, username, onSignOut, width = 264, onSkills, skillsActive, onCustomize, customizeActive, onWhatsNew, onNotifications, notificationsActive, notifUnread = 0, onFinops, finopsActive, onCases, casesActive, onAdmin, adminActive, showFinops = true, showCases = true, showAdmin = false, showNotifications = true, showInvestigation = true, showSkills = true, showCustomize = true, onSecurity, securityActive, showSecurity = false, onInvestigate, investigateActive }: Props) {
   const t = useT();
   const { locale } = useLocale();
   // "更多"子菜单展开态（收纳 安全 / 巡检&报告 等非高频入口）
   const [moreOpen, setMoreOpen] = useState(false);
+  // 子菜单里到底还剩没剩东西：都没了就连「更多」按钮一起藏，别让用户点开一个空菜单
+  const hasMoreItems = SHOW_INSPECTIONS || showAdmin || showCustomize;
 
   // 主题会话分组的收起态：记录**已收起**的组 key（默认全部展开）。持久化到 localStorage，跨刷新保留。
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
@@ -144,18 +157,24 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
             <span className="ni-ic"><IconSkill /></span>{t("cz.nav.skills")}
           </button>
         )}
-        {/* 「更多」：可展开子菜单，收纳非高频入口（巡检&报告 / 管理 / 定制）。 */}
-        <button className={"navitem" + (moreOpen ? " expanded" : "")} onClick={() => setMoreOpen((v) => !v)}>
-          <span className="ni-ic"><IconMore /></span>{t("nav.more")}
-          <span className={"ni-caret" + (moreOpen ? " open" : "")}><IconChevronRight size={15} /></span>
-        </button>
-        {moreOpen && (
+        {/* 「更多」：可展开子菜单，收纳非高频入口（巡检&报告 / 管理 / 定制）。
+            子菜单三项全被门禁挡掉时不渲染「更多」本身 —— 否则用户点开是个空盒子。
+            （隐藏巡检&报告后，非 admin 且无 nav:customize 的用户就会撞上这种情况。） */}
+        {hasMoreItems && (
+          <button className={"navitem" + (moreOpen ? " expanded" : "")} onClick={() => setMoreOpen((v) => !v)}>
+            <span className="ni-ic"><IconMore /></span>{t("nav.more")}
+            <span className={"ni-caret" + (moreOpen ? " open" : "")}><IconChevronRight size={15} /></span>
+          </button>
+        )}
+        {hasMoreItems && moreOpen && (
           <div className="sb-submenu">
-            {/* 外链：idle 控制台，新标签打开 */}
-            <button className="navitem subitem" onClick={openConsole}>
-              <span className="ni-ic"><IconReports /></span>{t("nav.inspections")}
-              <span className="ni-tag">{locale === "zh" ? "控制台" : "Console"} <IconExternal /></span>
-            </button>
+            {/* 外链：idle 控制台，新标签打开。当前由 SHOW_INSPECTIONS 关掉显示（代码保留）。 */}
+            {SHOW_INSPECTIONS && (
+              <button className="navitem subitem" onClick={openConsole}>
+                <span className="ni-ic"><IconReports /></span>{t("nav.inspections")}
+                <span className="ni-tag">{locale === "zh" ? "控制台" : "Console"} <IconExternal /></span>
+              </button>
+            )}
             {/* 管理：仅 admin 可见（后端 nav:admin 门禁 + 前端能力过滤）。角色/用户/模块。从一级收进「更多」。 */}
             {showAdmin && (
               <button className={"navitem subitem" + (adminActive ? " active" : "")} onClick={() => onAdmin?.()}>

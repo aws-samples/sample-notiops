@@ -3,7 +3,27 @@ import { useT, useLocale, useTheme, type Locale, type ThemePref } from "../i18n"
 import {
   IconSettings, IconLanguage, IconChangelog,
   IconInfo, IconSignout, IconChevronRight, IconCheck, IconAppearance, IconReport,
+  IconExternal,
 } from "./icons";
+
+/**
+ * 菜单里三个外链的目标 —— 都指向公开仓库 aws-samples/sample-notiops。
+ *
+ * 为什么用 <a target="_blank"> 而不是 button + window.open()：
+ *  1. window.open 会被浏览器弹窗拦截器拦掉，用户只看到"点了没反应"；<a> 不会。
+ *  2. rel="noopener noreferrer" 断掉新页面的 window.opener 引用，否则打开的
+ *     页面能反向导航/操作本控制台页面（reverse tabnabbing）。
+ *
+ * ⚠️ 这三个 URL 一律**不带任何查询参数**：GitHub issue 页是公开的,预填内容会
+ * 被客户在不知情的情况下公开。account ID / 用户名 / ARN / region 等环境信息
+ * 绝不能拼进 URL —— 由客户自己决定在 issue 正文里写什么。
+ */
+const GH_REPO = "https://github.com/aws-samples/sample-notiops";
+const LINKS = {
+  changelog: `${GH_REPO}/releases`,
+  learnmore: GH_REPO,
+  report: `${GH_REPO}/issues`,
+} as const;
 
 /** 左下角用户区 → 向上弹出的设置菜单（参考 Bedrock/Claude）。 */
 export default function UserMenu({ username, onSignOut }: { username: string; onSignOut: () => void }) {
@@ -79,16 +99,42 @@ export default function UserMenu({ username, onSignOut }: { username: string; on
           </div>
 
           <div className="um-sep" />
-          <button className="um-item" onClick={() => soon(t("menu.changelog"))}>
+          {/* 三个外链：更新日志 / 了解更多 / 反馈问题 —— 都跳公开仓库。
+              title 里说明会新开标签页,内网打不开 github.com 的用户至少能看到
+              完整 URL,而不是"点了没反应"。 */}
+          <a
+            className="um-item"
+            href={LINKS.changelog}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={`${t("menu.changelog")} — ${LINKS.changelog}`}
+            onClick={() => setOpen(false)}
+          >
             <IconChangelog /> <span>{t("menu.changelog")}</span>
-          </button>
-          <button className="um-item" onClick={() => soon(t("menu.learnmore"))}>
+            <span className="um-extlink"><IconExternal /></span>
+          </a>
+          <a
+            className="um-item"
+            href={LINKS.learnmore}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={`${t("menu.learnmore")} — ${LINKS.learnmore}`}
+            onClick={() => setOpen(false)}
+          >
             <IconInfo /> <span>{t("menu.learnmore")}</span>
-            <IconChevronRight />
-          </button>
-          <button className="um-item" onClick={() => soon(t("menu.report"))}>
+            <span className="um-extlink"><IconExternal /></span>
+          </a>
+          <a
+            className="um-item"
+            href={LINKS.report}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={t("menu.report.hint")}
+            onClick={() => setOpen(false)}
+          >
             <IconReport /> <span>{t("menu.report")}</span>
-          </button>
+            <span className="um-extlink"><IconExternal /></span>
+          </a>
 
           <div className="um-sep" />
           <button className="um-item" onClick={() => { setOpen(false); onSignOut(); }}>

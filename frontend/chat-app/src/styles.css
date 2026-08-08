@@ -151,6 +151,14 @@ body { background: var(--page); color: var(--text); overflow: hidden; }
 .um-item span:not(.um-check):not(.um-langlabel) { flex: 1; }
 .um-item .um-langlabel { flex: 1; }
 .um-item svg { flex-shrink: 0; opacity: .85; }
+/* 菜单里的外链项用 <a>（而非 button + window.open）：天然不被弹窗拦截，且
+   rel=noopener 挡住 tabnabbing。这里抹掉 <a> 的默认下划线/链接色，让它和
+   同列的 button 项视觉完全一致。box-sizing 是因为 .um-item 定了
+   width:100% + padding，<a> 默认 content-box 会溢出 6px 容器内边距。 */
+a.um-item { text-decoration: none; box-sizing: border-box; }
+a.um-item:visited { color: var(--text); }
+/* 外链尾部的箭头图标：靠右、比正文更淡，示意"会跳出当前页" */
+.um-extlink { margin-left: auto; opacity: .5; }
 .um-sep { height: 1px; background: var(--sidebar-border); margin: 5px 8px; }
 .um-sub { position: relative; }
 .um-submenu { margin: 2px 0 2px 8px; border-left: 1px solid var(--sidebar-border); padding-left: 4px; }
@@ -990,6 +998,8 @@ a.followup-btn { text-decoration: none; }
 .notif-health-more { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--link, #5a96ff); text-decoration: none; margin-top: 4px; }
 .notif-health-more:hover { text-decoration: underline; }
 .notif-health-unavail { padding: 18px 0; font-size: 13.5px; color: var(--muted); line-height: 1.6; }
+/* 收件箱被 limit 截断时的提示条(置于列表顶部，因为列表是倒序、被截掉的是更早的) */
+.notif-inbox-trunc { font-size: 12.5px; color: var(--muted); padding: 2px 0 6px; }
 .notif-health-unavail a { color: var(--link, #5a96ff); text-decoration: none; white-space: nowrap; }
 /* 「显示完整通知」就地展开的详情区 */
 .notif-act-expand { margin-left: auto; }

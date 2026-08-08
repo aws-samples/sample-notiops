@@ -101,20 +101,6 @@ mode comparison and how to switch — see
 
 ---
 
-## Tech stack
-
-| Layer | Tech |
-|---|---|
-| Runtime | ECS Fargate (IM bots) + AWS Lambda (report / push handlers + notiops Lambdas) |
-| State | DynamoDB (single-table multi-prefix) + S3 (reports, short TTL) |
-| LLM | Amazon Bedrock — per-session switch, per-model output-token cap |
-| MCP | AWS Knowledge MCP (hosted) + Pricing / Cost MCP |
-| IM SDKs | `lark-oapi` (Feishu) + `slack_bolt` (Slack) |
-| IaC | AWS CDK |
-| Container | Docker (linux/amd64, Fargate-compatible) |
-
----
-
 ## Architecture (high-level)
 
 ```

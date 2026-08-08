@@ -32,17 +32,25 @@ export interface NotificationItem {
 export interface NotificationsResponse {
   items: NotificationItem[];
   lastReadTs: number;
+  /** 收件箱真实总条数。被截断时由后端聚合得出；null = 查不到（不谎报）。 */
+  total?: number | null;
+  /** true = items 只是最新一页，还有更老的通知未返回（前端须如实提示，勿静默截断）。 */
+  truncated?: boolean;
+  /** 各事件类型在**整个**收件箱里的条数，键 = 落库的 source 标签（"CloudWatch Alarm" 等）。
+   *  分组徽章用它，才不会在截断时把各组数字一起报小。null = 未知。 */
+  bySource?: Record<string, number> | null;
 }
 
 /** 列出通知（倒序）。失败/未登录 → 空。 */
 export async function listNotifications(): Promise<NotificationsResponse> {
+  const empty = { items: [], lastReadTs: 0, total: 0, truncated: false, bySource: {} };
   const s = await signedClient();
-  if (!s) return { items: [], lastReadTs: 0 };
+  if (!s) return empty;
   try {
     const r = await s.aws.fetch(`${s.base}/notifications`, { headers: { "x-notiops-id-token": s.idToken } });
-    if (!r.ok) return { items: [], lastReadTs: 0 };
+    if (!r.ok) return empty;
     return await r.json();
-  } catch { return { items: [], lastReadTs: 0 }; }
+  } catch { return empty; }
 }
 
 /** 未读数（轻量，供 60s 轮询）。失败 → 0。 */

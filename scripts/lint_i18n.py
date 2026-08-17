@@ -154,6 +154,30 @@ CJK_ALLOWLIST = {
     # phrases route to case_analyze, not user-facing strings; routing
     # them through i18n would defeat the test.
     "scripts/test_case_analyze_intent.py",
+    # Mantle backend-task test — CJK strings are (a) console section
+    # headings for the developer running the suite and (b) prompt /
+    # response fixtures fed to the stubbed endpoint. Nothing here is
+    # emitted to an end user, so bilingual routing would only make the
+    # assertions harder to read.
+    "scripts/test_llm_provider_mantle.py",
+    # Secret-grant scope guard — CJK is the console section heading and the
+    # rationale in assertion labels, for the developer running the suite.
+    # Nothing here reaches an end user.
+    "scripts/test_secret_grants_scoped.py",
+    # Mantle region-list consistency guard — CJK is the suite heading and the
+    # failure hint telling the developer to update the extractors rather than
+    # delete the assertion. Developer-facing only; never reaches an end user.
+    "scripts/test_mantle_regions_consistent.py",
+    # "is every suite actually run by CI" meta-assertion — CJK is the suite
+    # heading plus the exemption reasons, which exist to be read by whoever is
+    # about to add an exemption. Developer-facing only.
+    "scripts/test_ci_runs_every_suite.py",
+    # dd1 token-savings test — asserts the trimmed prompt block no longer
+    # contains topic-specific wording ("本主题只读工具"). The CJK literal is
+    # an assertion about ABSENCE from a prompt, i.e. a fixture, not output.
+    # (It was first written as a \uXXXX escape to dodge this check; the linter
+    # decodes escapes, so allowlisting is the honest fix.)
+    "scripts/test_devops_deep_token_savings.py",
     # Sanitizer denylist — internal blocklist of OpenAI ChatML
     # protocol fragments + Chinese SEO/gambling spam tokens that
     # must NEVER reach end users. These strings are pattern fixtures,

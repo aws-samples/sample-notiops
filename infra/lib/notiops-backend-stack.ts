@@ -91,6 +91,15 @@ export class NotiOpsBackendStack extends cdk.Stack {
       sortKey: { name: "SK", type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      // PITR：这张表现在是**五个独立部署单元**的配置真源（web chat runtime / IM bot /
+      // 后端 Lambda / BFF / 前端），里面既有 RBAC 角色与用户权限，也有 LLM 模型目录、
+      // 纳管账号、通知配置。RETAIN 只防栈删除时丢表，防不住"一次写坏"——而模型目录
+      // 的写入路径包含整份 PUT 与回滚，人为写错的面不小。
+      // llmcfg 有 llmcfg#audit 里的变更前快照可回滚，但那只覆盖模型目录这一个 PK，
+      // 且快照本身也存在同一张表里。PITR 是唯一的表级恢复手段。
+      // `pointInTimeRecovery` 已废弃，用 Specification 形式（也支持 recoveryPeriodInDays，
+      // 此处不传 = AWS 默认 35 天）。
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
     });
     configTable.addGlobalSecondaryIndex({
       indexName: "GSI1",
@@ -274,6 +283,11 @@ export class NotiOpsBackendStack extends cdk.Stack {
       actions: ["bedrock:InvokeModel"],
       resources: [
         "arn:aws:bedrock:*::foundation-model/*",
+        // Global CRIS（`global.*` inference profile）授权时呈现的是 region 段为空的
+        // foundation-model ARN；上面那条里的 `*` 理论上能匹配空段，但判断错的后果是
+        // 生产全部 Bedrock 调用 AccessDenied，故显式写出。
+        // 见 https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-prereq.html
+        "arn:aws:bedrock:::foundation-model/*",
         `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
       ],
     }));
@@ -906,9 +920,15 @@ export class NotiOpsBackendStack extends cdk.Stack {
     // Slack-bound IM push.
     slackBotTokenSecret.grantRead(lambdaRole);
 
+    // 只读：后端 Lambda（health checker / notifier / summarizer）需要**读** Key 注入
+    // Bedrock 调用，但**不再写** —— Key 的唯一写入方是 webchat 管理页（web-chat-stack 的
+    // BFF 角色持 PutSecretValue）。历史上后端也持 PutSecretValue，成了第二条写路径：
+    // rds/elasticache 巡检配置页与 webchat 抢写同一个 Secret、后写覆盖先写。写入侧的
+    // 路由已改为拒绝（api/routes/*_health_check.py），这里同步撤掉 IAM 写权限，双保险
+    // （spec task 7.1 / R6.6）。
     lambdaRole.addToPolicy(new iam.PolicyStatement({
       sid: "BedrockApiKeySecretAccess",
-      actions: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"],
+      actions: ["secretsmanager:GetSecretValue"],
       resources: [bedrockApiKeySecret.secretArn],
     }));
 
@@ -1648,7 +1668,11 @@ def handler(event, context):
           BEDROCK_API_KEY_SECRET_ARN: bedrockApiKeySecret.secretArn,
           LITELLM_CONFIG_SECRET_ARN: liteLlmConfigSecret.secretName,
           FEISHU_SECRET_ARN: feishuSecret.secretArn,
+          // MODEL_ID 现在只是**兜底**：真值走 DDB appconfig#phd（Admin「后端任务模型」写入，
+          // 由 BFF 从模型目录解析 alias 后投影过去）。保留 env 是为了 DDB 不可用 / 未 seed
+          // 时仍能推送，见 shared/phd_config.py 的三级降级。
           MODEL_ID: "global.anthropic.claude-sonnet-5",
+          CONFIG_TABLE: configTable.tableName,
         },
         description: "PHD 事件转发 — SNS 触发,LLM 翻译摘要(Bedrock/LiteLLM 可切换),推送飞书",
       });
@@ -1664,12 +1688,22 @@ def handler(event, context):
         actions: ["bedrock:InvokeModel"],
         resources: [
           "arn:aws:bedrock:*::foundation-model/*",
+          // Global CRIS（`global.*` inference profile）授权时呈现的是 region 段为空的
+          // foundation-model ARN；上面那条里的 `*` 理论上能匹配空段，但判断错的后果是
+          // 生产全部 Bedrock 调用 AccessDenied，故显式写出。
+          // 见 https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-prereq.html
+          "arn:aws:bedrock:::foundation-model/*",
           `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
         ],
       }));
 
       bedrockApiKeySecret.grantRead(phdLambda);
       feishuSecret.grantRead(phdLambda);
+
+      // 只读 notiops-config：取 appconfig#phd / SK=bedrock_model_id（Admin 配的翻译模型）。
+      // PHD Lambda 用的是自己的 role（不是共享 lambdaRole），所以这条必须单独授予。
+      // 只需读 —— 这张表的写入方是 BFF 与 API Lambda。
+      configTable.grantReadData(phdLambda);
 
       // SNS → Lambda 订阅
       phdTopic.addSubscription(new subscriptions.LambdaSubscription(phdLambda));

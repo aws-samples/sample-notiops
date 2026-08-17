@@ -161,6 +161,11 @@ def _summarize_with_degrade(long_report: str | None) -> tuple[str, str | None, b
         card = summarize_investigation(
             long_report=long_report, model_id=model_id,
             agent_prompt=config.get("agent_prompt"),
+            # 协议 / 区域随 model_id 一起从目录投影下来。少了它们，只在
+            # bedrock-mantle 上架的模型会被当成 Converse 调，报「model identifier
+            # is invalid」，然后整段降级成截断的长报告 —— 归因很难。
+            model_kind=config.get("model_kind", ""),
+            model_region=config.get("model_region", ""),
         )
         return card, model_id, False
     except Exception as e:

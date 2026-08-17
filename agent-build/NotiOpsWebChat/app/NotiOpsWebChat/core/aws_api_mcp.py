@@ -13,9 +13,19 @@
 
 **严格只读 —— 三重防线（纵深防御）**：
   1) READ_OPERATIONS_ONLY=true：MCP 层只放行只读 allowlist 命令；
-  2) runtime 执行角色挂 AWS 托管 ReadOnlyAccess：IAM 硬天花板，即使 1) 有缝也写不了；
-  3) 自定义 denyList 兜底拦危险动作。
+  2) 执行角色的 IAM 策略：**唯一的硬边界**，即使 1)/3) 有缝也越不过；
+  3) 进程内命令级 denylist（`is_denied_command`）：拦"取密文明文"这类**本身属于只读、
+     因而会被 1) 放行**的动作 —— `secretsmanager get-secret-value`、
+     `ssm get-parameter --with-decryption`、`kms decrypt` 等。
   （写操作即使模型想调，也会在 1)/2) 被拒——把拒绝信息原样转达用户。）
+
+⚠️ 关于 3) 的强度，别高估：它是纵深防御，**不是安全边界**。匹配基于命令字符串的规范化
+形式，理论上可被构造绕过，也明确不拦 `lambda get-function-configuration` 这类会顺带返回
+容器环境变量的正常运维命令（拦掉代价过高）。真正不该被读的东西必须靠 2) 不授予。
+本文件曾长期声称有第三重而代码里没有（2026-08 补齐），改动它时请同步这段说明。
+
+**子进程环境**：`_server_env()` 会剥离注入型凭证（`AWS_BEARER_TOKEN_*`），否则长驻进程
+里设过的 Bedrock API Key 会被每个 MCP 子进程继承，而子进程执行的是 LLM 生成的命令。
 
 架构：复刻 finops_mcp / investigation_mcp —— Strands MCPClient(stdio_client(...))，
 模块级单例、首次用时 start 一次、常驻复用；失败安全（起不来返回空工具列表，agent 照常跑）。
@@ -176,8 +186,33 @@ _SERVER = ("awslabs.aws-api-mcp-server", "awslabs.aws_api_mcp_server.server")
 _WORKDIR = "/tmp/aws-api-mcp-workdir"
 
 
+# ---------------------------------------------------------------------------
+# 子进程环境：剥离注入型凭证（spec R6.5.3）
+# ---------------------------------------------------------------------------
+# `_server_env()` 以 `dict(os.environ)` 起步，也就是**全量继承**父进程环境。这在引入
+# Bedrock API Key 之后变成一个真实问题：Key 的注入方式是在父进程里
+# `os.environ["AWS_BEARER_TOKEN_BEDROCK"] = <key>` 然后构造 client（botocore 在构造时
+# 快照 token）。IM bot 是长驻 ECS 进程，一旦设过，之后 spawn 的**每个** MCP 子进程都会
+# 继承它 —— 其中包括 aws-api-mcp-server，而它再 spawn 的 `aws` CLI 又继承一层。
+# 那条链的输入是 LLM 生成的命令，也就是任何进入模型上下文的内容都能操纵它。
+#
+# 所以显式 pop。用前缀匹配而不是写死一个名字：`AWS_BEARER_TOKEN_<SERVICE>` 是 botocore
+# 的通用 bearer 机制，将来任何服务的 bearer token 都会落进同一个模式。
+# **不动** AWS_ACCESS_KEY_ID / SECRET / SESSION_TOKEN —— 子进程要靠它们以任务角色身份
+# 调 AWS，那是设计意图；它们的权限上限由 IAM 控制，不是靠这里剥。
+_INJECTED_CREDENTIAL_PREFIXES = ("AWS_BEARER_TOKEN_",)
+
+
+def _strip_injected_credentials(env: dict) -> dict:
+    """就地移除我们主动注入到父进程的凭证，返回同一个 dict（便于链式调用）。"""
+    for name in [k for k in env
+                 if k.upper().startswith(_INJECTED_CREDENTIAL_PREFIXES)]:
+        env.pop(name, None)
+    return env
+
+
 def _server_env() -> dict:
-    env = dict(os.environ)
+    env = _strip_injected_credentials(dict(os.environ))
     env.setdefault("AWS_REGION", _REGION)
     env.setdefault("AWS_DEFAULT_REGION", _REGION)
     # ── 只读铁律（防线 1）──
@@ -213,6 +248,134 @@ def _resolve_cmd() -> list[str]:
     return [sys.executable, "-m", module]
 
 
+# ---------------------------------------------------------------------------
+# 命令级 denylist（spec R6.5.1）—— 防线 3
+# ---------------------------------------------------------------------------
+# 本文件头长期声称「三重防线」，第三重（自定义 denyList）此前**只存在于那句注释里**，
+# 代码从未实现。这里补上，并把它的实际强度写清楚，免得再出现"文档承诺 > 代码"的落差。
+#
+# 为什么需要第三重：`call_aws` 执行的是 LLM 生成的 AWS CLI 命令，也就是任何进入模型
+# 上下文的内容（用户消息、skill 正文、被调查资源的标签……）都能影响它。而
+#   · 防线 1（READ_OPERATIONS_ONLY）只区分"读/写"，而 `secretsmanager get-secret-value`
+#     恰恰**是一个读操作**，会被放行；
+#   · 防线 2（IAM）是真正的边界，但它取决于执行角色的实际策略；托管 ReadOnlyAccess 对
+#     "返回敏感数据"的动作覆盖并不一致，而本系统还会被部署到我们看不到策略的客户账号里。
+# 所以这一层的价值是：把"取密文明文"这类动作在**进程内**先挡掉，不依赖对端策略。
+#
+# 强度声明（重要，别高估它）：这是**纵深防御，不是安全边界**。匹配基于命令字符串的
+# 规范化形式，理论上可被构造绕过（别名、--cli-input-json、大小写与空白变形已处理，但
+# 不可能穷尽）。唯一的硬边界是 IAM：真正不该被读的东西，要靠执行角色不授予它。
+#
+# 已知残留（明确不拦，因为会打断正常运维）：
+#   · `lambda get-function-configuration` / `ecs describe-task-definition` 会返回容器
+#     环境变量，若有人把密钥放进 env 就会被读到。查 Lambda/ECS 配置是日常排障动作，
+#     拦掉代价过高。本系统自身的 Bedrock Key 存 Secrets Manager 而非 env，且
+#     `_strip_injected_credentials()` 已保证不会进入子进程环境。
+_DENY_PATTERNS: tuple[tuple[str, ...], ...] = (
+    # 直接返回密文明文
+    ("secretsmanager", "get-secret-value"),
+    ("secretsmanager", "batch-get-secret-value"),
+    # 解密 / 返回明文数据密钥
+    ("kms", "decrypt"),
+    ("kms", "generate-data-key"),
+    ("kms", "generate-data-key-pair"),
+    ("kms", "generate-random"),
+    # 返回可直接用的 registry 凭证
+    ("ecr", "get-login-password"),
+    ("ecr-public", "get-login-password"),
+)
+# SSM 参数只在**要求解密**时才拦：读一个 String 类型参数是正常运维动作。
+_DENY_SSM_DECRYPT = ("get-parameter", "get-parameters", "get-parameters-by-path")
+
+# 运营方可追加（逗号分隔，形如 "service op,service op"）。只能加、不能减。
+_EXTRA_DENY = tuple(
+    tuple(item.strip().split())
+    for item in (os.environ.get("AWS_API_MCP_EXTRA_DENY", "") or "").split(",")
+    if len(item.strip().split()) == 2
+)
+
+_DENY_MESSAGE = (
+    "Refused: reading secret or decrypted values through this tool is not permitted. "
+    "If you need the value, obtain it through the intended configuration path instead."
+)
+
+
+def _normalise_cli(command: str) -> list[str]:
+    """把 CLI 命令规范化成 token 列表（小写、去引号、折叠空白）。"""
+    raw = (command or "").replace('"', " ").replace("'", " ")
+    return [t for t in raw.lower().split() if t]
+
+
+# AWS CLI 的**全局**选项里带值的那些。用于跳到真正的 service/operation 位置。
+# 布尔型全局选项（--debug / --no-cli-pager / --no-paginate …）不吃后一个 token，
+# 所以只能白名单式列出带值的，其余一律当布尔 —— 反过来（贪婪地把后一个非 flag token
+# 当值吃掉）会把 `aws --no-cli-pager kms decrypt` 里的 `kms` 误当成选项值。
+_GLOBAL_OPTS_WITH_VALUE = frozenset({
+    "--region", "--profile", "--output", "--endpoint-url", "--query",
+    "--ca-bundle", "--color", "--cli-read-timeout", "--cli-connect-timeout",
+})
+
+
+def _service_and_operation(tokens: list[str]) -> tuple[str, str]:
+    """从规范化 token 列表里定位 (service, operation)。
+
+    AWS CLI 语法是 `aws [全局选项] <service> <operation> [参数]`，所以 service/operation
+    是**位置**决定的，不能在整个 token 流里找相邻对 —— 那样
+    `aws logs filter-log-events --filter-pattern kms decrypt failed` 会因为参数值里
+    恰好相邻出现 "kms decrypt" 而被误拦（第一版就是这个 bug，被自己的测试抓到）。
+    搜日志里的 "kms decrypt failed" 是完全正常的排障动作。
+    """
+    i = 1 if tokens and tokens[0] == "aws" else 0
+    while i < len(tokens) and tokens[i].startswith("-"):
+        opt = tokens[i]
+        i += 1
+        if "=" in opt:                      # --output=json，值已在同一 token 里
+            continue
+        if opt in _GLOBAL_OPTS_WITH_VALUE and i < len(tokens):
+            i += 1
+    svc = tokens[i] if i < len(tokens) else ""
+    op = tokens[i + 1] if i + 1 < len(tokens) else ""
+    return svc, op
+
+
+def is_denied_command(command: str) -> bool:
+    """命令是否命中 denylist。**纯函数、可单测**（见 scripts/test_aws_api_mcp_denylist.py）。
+
+    只看**命令位**的 service/operation，不看参数值。所以：
+      · `aws secretsmanager get-secret-value --secret-id x`              → 拦
+      · `aws --region us-east-1 secretsmanager get-secret-value`         → 拦
+      · `aws --no-cli-pager kms decrypt --ciphertext-blob x`             → 拦
+      · `aws ssm describe-parameters --filters Name=secretsmanager`      → 放行
+      · `aws logs filter-log-events --filter-pattern kms decrypt failed` → 放行
+    """
+    tokens = _normalise_cli(command)
+    if not tokens:
+        return False
+    svc, op = _service_and_operation(tokens)
+    if not svc or not op:
+        return False
+    if (svc, op) in (*_DENY_PATTERNS, *_EXTRA_DENY):
+        return True
+    # SSM：读参数本身是正常动作，仅当**要求解密**时才拦。
+    # `--no-with-decryption` 是显式不解密，不该拦 —— 故做精确 token 比对而非子串匹配。
+    if svc == "ssm" and op in _DENY_SSM_DECRYPT and "--with-decryption" in tokens:
+        return True
+    return False
+
+
+def _denied_result(tool_use_id: str) -> dict:
+    """固定文案的拒绝结果。**不回显命令内容** —— 被拒的命令可能本身就带敏感标识
+    （secret 名、KMS key id），把它转述回模型上下文等于自己造一次泄漏。"""
+    return {
+        "type": "tool_result",
+        "tool_result": {
+            "toolUseId": tool_use_id,
+            "status": "error",
+            "content": [{"text": _DENY_MESSAGE}],
+        },
+    }
+
+
 def _wrap_capped(tool):
     """把 MCP 工具包一层：在结果回给模型前，对每个 text 块做体积上限截断。
     在工具的 stream() 拦截 ToolResultEvent，改写其 content 里的 text。失败安全：
@@ -224,6 +387,31 @@ def _wrap_capped(tool):
 
     class _CappedTool(type(tool)):  # 继承实际类（MCPAgentTool 子类），复用其全部行为
         async def stream(self, tool_use, invocation_state, **kwargs):
+            # ── 防线 3：执行**前**拦 denylist（spec R6.5.1）──
+            # 必须在 super().stream() 之前 —— 一旦进了子进程，密文明文已经拿到了。
+            # 只对携带 CLI 命令的工具生效（call_aws）；suggest_aws_commands 只产文本，
+            # 不执行，放行（它的建议若命中 denylist，执行那一步照样会被拦）。
+            try:
+                args = tool_use.get("input") if hasattr(tool_use, "get") else None
+                cmd = ""
+                if isinstance(args, dict):
+                    # awslabs aws-api-mcp-server 的参数名是 cli_command；容忍别名，
+                    # 避免上游改名后这层静默失效（宁可多扫几个字段）。
+                    for key in ("cli_command", "command", "cli"):
+                        if isinstance(args.get(key), str):
+                            cmd = args[key]
+                            break
+                if cmd and is_denied_command(cmd):
+                    # 只记"被拦了"，不记命令内容：命令本身可能带 secret 名 / KMS key id。
+                    logger.warning("aws_api_mcp: denied a secret-reading command (denylist)")
+                    yield _denied_result(
+                        (tool_use.get("toolUseId") if hasattr(tool_use, "get") else "") or "")
+                    return
+            except Exception as e:  # noqa: BLE001
+                # 拦截层自身出错时**放行**：这是纵深防御层，不是边界（IAM 才是），
+                # 让它变成可用性单点不划算。记 WARN 以便发现。
+                logger.warning("aws_api_mcp: denylist check failed (%s); allowing",
+                               _safe_err(e))
             async for event in super().stream(tool_use, invocation_state, **kwargs):
                 try:
                     # ToolResultEvent 是 dict 子类：{"type":"tool_result","tool_result":<ToolResult>}

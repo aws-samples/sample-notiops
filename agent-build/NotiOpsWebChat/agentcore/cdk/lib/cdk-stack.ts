@@ -113,26 +113,62 @@ export class AgentCoreStack extends Stack {
     }
     this.application = new AgentCoreApplication(this, 'Application', appProps as any);
 
-    // ── NotiOps：给所有 runtime 执行角色授予 Bedrock Mantle 权限（GPT-5.4 经 Mantle 调用）──
-    // GPT-5.4 走 Bedrock Mantle（OpenAI Responses API，us-east-2）。runtime 执行角色默认
-    // 没有 mantle 权限，缺了会在 SSE 流里报 401（CreateInference / CallWithBearerToken）。
-    // 在 CDK 里授予 → 客户首次部署即生效，无需手动 put-role-policy。
-    // 关闭 GPT-5.4 也无副作用（仅多了未用到的权限）。区域写死 us-east-2/us-west-2（GPT-5.4 可用区）。
-    const MANTLE_REGIONS = ['us-east-2', 'us-west-2'];
+    // ── NotiOps：给所有 runtime 执行角色授予 Bedrock Mantle 权限（GPT 系经 Mantle 调用）──
+    // runtime 执行角色默认没有 mantle 权限，缺了会在 SSE 流里报 401
+    // （CreateInference / CallWithBearerToken）。在 CDK 里授予 → 客户首次部署即生效。
+    // 没启用 GPT 也无副作用（仅多了未用到的权限）。
+    //
+    // ⚠️ 这份名单必须 **⊇ Admin 可保存的 Mantle 区域白名单**
+    // （bff/web-chat/llm_config.mjs::MANTLE_REGIONS）。原先写死 us-east-2/us-west-2，
+    // 而白名单后来按文档扩到 14 个区 —— 于是管理员能存下一个 region=us-east-1 的 GPT 条目：
+    // 校验过、保存时的连通性探测也过（探测用的是 **BFF** 的角色，那条是 resources:["*"]），
+    // 但真正发消息时是 runtime 的角色在调，403。配置存得进去、调不出去，且要到用户
+    // 发消息才暴露。`scripts/test_mantle_regions_consistent.py` 现在会断言两处一致。
+    const MANTLE_REGIONS = [
+      'us-east-1', 'us-east-2', 'us-west-2',
+      'ap-northeast-1', 'ap-south-1', 'ap-southeast-2', 'ap-southeast-3',
+      'eu-central-1', 'eu-north-1', 'eu-south-1', 'eu-west-1', 'eu-west-2',
+      'sa-east-1', 'us-gov-west-1',
+    ];
     for (const env of this.application.environments.values()) {
       env.runtime.role.addToPrincipalPolicy(
         new iam.PolicyStatement({
           sid: 'NotiOpsBedrockMantleInference',
+          // CreateInference / GetInference 的资源类型是 `project`（**必填**），见
+          // service-authorization/latest/reference/list_bedrock-mantle.html。
+          // AWS 托管策略 AmazonBedrockMantleInferenceAccess 用的是
+          // `arn:aws:bedrock-mantle:*:*:project/*`。这里的尾段 `*` 覆盖 `project/…`，
+          // 同时把区域与账号收窄了一层。
+          // （注意 infra/lib/bot-stack.ts 与 web-chat-stack.ts 的注释说 Mantle「无资源
+          //   ARN 维度」—— 那是错的。它们用 resources:["*"] 仍然能工作，只是理由写错了。）
           actions: ['bedrock-mantle:CreateInference', 'bedrock-mantle:GetInference'],
           resources: MANTLE_REGIONS.map((r) => `arn:aws:bedrock-mantle:${r}:${this.account}:*`),
         })
       );
-      // CallWithBearerToken 不支持资源级限定，必须 "*"
+      // CallWithBearerToken 是 permission-only action，服务授权参考里资源类型一列为空
+      // → 只能写 "*"（AWS 托管策略同样如此）。
       env.runtime.role.addToPrincipalPolicy(
         new iam.PolicyStatement({
           sid: 'NotiOpsBedrockMantleBearer',
           actions: ['bedrock-mantle:CallWithBearerToken'],
           resources: ['*'],
+        })
+      );
+      // ── NotiOps Global CRIS：region 段为空的 foundation-model ARN ──
+      // 模型目录里的 Claude 条目全部使用 `global.*` inference profile（2026-07 决策：
+      // 与 IM 端统一，消除同名不同路由）。Global CRIS 在授权时呈现的**不是**带 region 的
+      // ARN，而是 `arn:aws:bedrock:::foundation-model/<model>`，配合请求上下文
+      // `aws:RequestedRegion == "unspecified"`。
+      // agentcore CLI 生成的默认策略给的是 `arn:aws:bedrock:*::foundation-model/*`；那个
+      // `*` 理论上能匹配空 region 段（IAM 通配符匹配零个或多个字符），但这条判断错的后果
+      // 是 runtime 全部推理 AccessDenied，不值得赌语义细节。显式补一条，与 CLI 默认策略
+      // 并存无副作用。
+      // 见 https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-prereq.html
+      env.runtime.role.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          sid: 'NotiOpsBedrockGlobalCris',
+          actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
+          resources: ['arn:aws:bedrock:::foundation-model/*'],
         })
       );
       // ── NotiOps Web Search：允许 agent 调用 AgentCore Gateway（含内置 web-search 连接器）──
@@ -334,6 +370,21 @@ export class AgentCoreStack extends Stack {
         resources: [
           'arn:aws:dynamodb:*:*:table/notiops-config',
           'arn:aws:dynamodb:*:*:table/notiops-config/index/*',
+        ],
+      }));
+
+      // Bedrock API Key（spec R5.2 / task 6.2）：Admin 在 webchat 管理页把 Key 存进
+      // Secrets Manager，runtime 侧 `core/llm_config.get_bedrock_api_key()` 读它，
+      // 由 `model/load.py::_build_bedrock_model` 在构造 BedrockModel 前注入
+      // `AWS_BEARER_TOKEN_BEDROCK`。缺此授权的失败模式是**静默的**：get_secret_value 被拒 →
+      // 读取失败回退 IAM 角色 → 对话照常但 Key 永不生效，管理员在 UI 上看不出任何异常。
+      // 名称带 `-*`：Secrets Manager 的 ARN 尾部有 6 位随机后缀。
+      // 只读、只到这一个 secret —— 写入方是 BFF（web-chat-stack），不是 runtime。
+      env.runtime.role.addToPrincipalPolicy(new iam.PolicyStatement({
+        sid: 'ReadBedrockApiKeySecret',
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:notiops/bedrock-api-key-*`,
         ],
       }));
 

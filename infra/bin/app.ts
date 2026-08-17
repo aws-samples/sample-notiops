@@ -66,6 +66,13 @@ if (enabledPlatforms !== "none") {
   botStack.addDependency(main);
 }
 
+// 报告 CDN 域名（「深度调查（直连）」在线报告链接）。默认取 main.reportsCdnDomain
+// （跨栈引用，一次全量部署即自动打通）；也可用 `-c reportsCdnDomain=<域名>` 显式给值。
+// 为什么留这个口子：跨栈引用会给 NotiOpsBackendStack **新增一条 CFN Export**，也就是说
+// 只想单独更新 WebChatStack 时，也被迫先 update 主栈（会顺带带上主栈上所有未部署的改动）。
+// 传 -c 后 WebChatStack 不再引用主栈的这个属性，可以真正 `deploy WebChatStack --exclusively`。
+const reportsCdnDomainCtx = (app.node.tryGetContext("reportsCdnDomain") as string | undefined)?.trim();
+
 // WebChatStack：面向客户的 agentic Web Chat。
 // 复用 NotiOpsBackendStack 的 Cognito 池（认证统一），故依赖 main。
 const webChat = new WebChatStack(app, "WebChatStack", {
@@ -76,5 +83,6 @@ const webChat = new WebChatStack(app, "WebChatStack", {
   skillsBucketName: main.dataBucketName, // Skills 存共享 dataBucket 的 skills/ 前缀
   agentSpaceId: main.agentSpaceId, // FinOps 跨账号成本查询动态发现关联账号用
   idleConsoleUrl: main.consoleUrl, // 侧栏「巡检 & 报告」外链
+  reportsCdnDomain: reportsCdnDomainCtx || main.reportsCdnDomain, // 「深度调查（直连）」报告链接（CloudFront+OAC，只暴露 reports/*）
 });
 webChat.addDependency(main);

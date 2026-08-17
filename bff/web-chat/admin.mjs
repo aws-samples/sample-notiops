@@ -10,7 +10,7 @@ import {
 } from "@aws-sdk/client-cognito-identity-provider";
 import { randomBytes } from "node:crypto";
 import { allNodes } from "./capabilities.mjs";
-import { PRESET_ROLES, DEFAULT_GROUP_ROLE_MAP } from "./authz.mjs";
+import { PRESET_ROLES, DEFAULT_GROUP_ROLE_MAP, matchesAny } from "./authz.mjs";
 import {
   listRoles as storeListRoles, getRole, putRole, deleteRole,
   getUserPerm, putUserPerm, listUserPerms, countUsersWithRole, deleteUserPerm,
@@ -72,6 +72,20 @@ function invalidKeys(permissions) {
   return bad;
 }
 
+/** 会顺带吞掉 `nav:admin` 的通配（如 `nav:*`）。返回这类 pattern 数组。
+ *
+ * `satisfiesAdmin()` 已经在判定侧堵住了它们（通配不再跨界），所以这里纯粹是入口侧的
+ * 提醒：否则保存静默成功、角色定义里躺着一条看起来给了 admin 的 `nav:*`，下一个读它的
+ * 人只能靠猜。要给管理权限就该用 role:admin，而不是靠通配捎带。
+ * 显式点名 admin 的写法（`nav:admin`、`nav:admin:*`）不在此列 —— 那是明确的意图表达。
+ */
+export function adminSwallowingWildcards(permissions) {
+  return (permissions || []).filter(
+    (p) => typeof p === "string" && p !== "*" && p.endsWith(":*")
+      && !p.startsWith("nav:admin")
+      && matchesAny([p], "nav:admin"));
+}
+
 /** 建/改角色。role:admin 恒为 * 不可改（需求 4.5）；key 必须存在（需求 4.4）。 */
 export async function apiSaveRole(name, permissions) {
   if (!name || !/^[A-Za-z0-9:_-]{2,64}$/.test(name)) {
@@ -83,6 +97,11 @@ export async function apiSaveRole(name, permissions) {
   const perms = Array.isArray(permissions) ? permissions : [];
   const bad = invalidKeys(perms);
   if (bad.length) return { status: 400, body: { error: "unknown_permission_keys", keys: bad } };
+  const swallow = adminSwallowingWildcards(perms);
+  if (swallow.length) {
+    return { status: 400, body: { error: "wildcard_would_grant_admin", keys: swallow,
+                                  hint: "use role:admin to grant administration" } };
+  }
   await putRole(name, perms);
   return { status: 200, body: { name, permissions: perms } };
 }

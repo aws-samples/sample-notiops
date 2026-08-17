@@ -1283,6 +1283,28 @@ def _is_cross_account(account_id: str | None) -> bool:
         return True
 
 
+# ── 深度调查（DevOps Agent）的主题适用范围 ────────────────────────────────────
+# **口径：默认开启，按例外排除**（不是按主题白名单开启）。
+# 深度调查是一条**与主题解耦的通用能力**（"把用户诉求原样交给 DevOps Agent 去查"），
+# 以后新增主题应**自动继承**它，不需要回来改这里 —— 这正是本列表用"排除"而非"允许"的原因。
+#
+# ⚠️ 为什么必须这样：此前这里是硬编码白名单 `("investigate","finops","security")`，且在
+# **两处**重复（工具挂载 + 强制分支），前端 Composer 里还有第三份。新增主题时漏改任何一处
+# → 开关亮着但工具没挂 = **静默失效**（与 Cost Anomaly / Trusted Advisor 那次同一类事故）。
+#
+# 排除项的理由（保持与改造前**完全一致**的现网行为）：
+#   general    通用会话不显示该开关（前端也不给入口）
+#   cases      Support Case 全生命周期管理，不是环境排障
+#   whats-new  读 AWS 新发布资讯，与用户环境无关
+# 前端同一份口径见 frontend/chat-app/src/types.ts `topicHasDevopsAgent`（两边须一致）。
+_DEVOPS_TOPICS_EXCLUDED = frozenset({"general", "cases", "whats-new"})
+
+
+def _topic_has_devops(topic) -> bool:
+    """该主题是否提供「深度调查」能力。默认 True，仅排除 `_DEVOPS_TOPICS_EXCLUDED`。"""
+    return (topic or "general") not in _DEVOPS_TOPICS_EXCLUDED
+
+
 def _tools_for_topic(topic, account_id: str | None = None, devops_deep: bool = False):
     """工具选择(**账号感知 + 深度调查感知**)。
 
@@ -1296,7 +1318,7 @@ def _tools_for_topic(topic, account_id: str | None = None, devops_deep: bool = F
     DevOps Agent。此时**只挂 devops 工具 + 文档/基础工具**,不挂 rds_*/ec2_*/MCP/boto3 兜底等
     直接查询工具——从工具层面强制模型走 investigate_live(prompt 强制 + 无替代工具,双保险)。
     devops_agent 走 core/devops_agent.py,已按 account AssumeRole trigger role,跨账号安全。"""
-    if devops_deep and (topic or "general") in ("investigate", "finops", "security"):
+    if devops_deep and _topic_has_devops(topic):
         # 强制深度调查:只给 devops 工具 + 基础工具(tools 含文档/web_search 等,用于概念问答兜底)。
         # 不挂任何直接查环境的工具,模型只能走 investigate_live。
         return list(tools) + _devops_tools
@@ -1323,8 +1345,8 @@ def _tools_for_topic(topic, account_id: str | None = None, devops_deep: bool = F
                     _t += _futs[_k].result()
                 except Exception as _e:  # noqa: BLE001 — 单个 MCP 起不来不阻断其它/整体
                     log.warning("MCP %s tools load failed (parallel): %s", _k, _e)
-    # DevOps Agent 深度调查工具:故障调查 + FinOps + 安全主题挂(执行仍受开关 ContextVar 门控)。
-    if (topic or "general") in ("investigate", "finops", "security"):
+    # DevOps Agent 深度调查工具:凡提供该能力的主题都挂(执行仍受开关 ContextVar 门控)。
+    if _topic_has_devops(topic):
         _t += _devops_tools
     return _t
 
@@ -1372,30 +1394,44 @@ def _make_conversation_manager():
         pin_first=1,
     )
 
+from collections import OrderedDict as _OrderedDict  # noqa: E402
+from core import llm_config  # noqa: E402 — 模型目录（DDB 单一真源）
+
+# 缓存键与 LRU 逐出（上限 + 逐出策略的理由都在模块 docstring 里）。抽成独立模块是为了
+# 能被 scripts/test_webchat_agent_cache.py 直接测到 —— 内联在闭包里时测试只能手抄副本。
+from core import agent_cache as _agent_cache  # noqa: E402
+
+
 def agent_factory():
-    cache = {}
+    cache: "_OrderedDict[str, object]" = _OrderedDict()
     def get_or_create_agent(session_id, user_id, model_key=None, topic=None, account_id=None, devops_deep=False):
         _actor_id = user_id
-        # 模型 + 主题 + **账号** + **深度调查开关** 都纳入 cache key:切任一项都要换工具集。
-        # (跨账号→换账号安全 boto3 兜底;深度调查开→只挂 devops 工具强制走 DevOps Agent。)
         _topic = topic or "general"
-        _acct_key = "self" if not _is_cross_account(account_id) else str(account_id).strip()
-        _dd = "dd1" if devops_deep else "dd0"
-        key = f"{session_id}/{_actor_id}/{model_key or 'default'}/{_topic}/{_acct_key}/{_dd}"
-        if key not in cache:
-            def _build(restore: bool):
-                # restore=False：跳过 AgentCore Memory 的会话恢复（session_manager=None），
-                # 用于旧会话持久化状态与新 conversation manager 不兼容时的兜底。
-                return Agent(
-                    model=load_model(model_key),
-                    session_manager=get_memory_session_manager(session_id, _actor_id) if restore else None,
-                    conversation_manager=_make_conversation_manager(),
-                    system_prompt=DEFAULT_SYSTEM_PROMPT,
-                    tools=_tools_for_topic(_topic, account_id, devops_deep),
-                    hooks=[],
-                )
+        key = _agent_cache.build_key(
+            generation=llm_config.generation(),
+            session_id=session_id, user_id=_actor_id, model_key=model_key, topic=_topic,
+            cross_account=_is_cross_account(account_id), account_id=account_id,
+            devops_deep=devops_deep,
+            # 凭证被拒后必须换实例。generation 覆盖不到这件事 —— 它只在有人经 Admin 页
+            # 保存时才变，而直接改 Secret / 删 IAM user / 自动轮换都不经过它。而 client
+            # 里的 bearer token 是构造时冻结的，清 Key 缓存对它无效（见 agent_cache
+            # 的 cred_epoch 说明 与 llm_config.credential_epoch）。
+            cred_epoch=llm_config.credential_epoch(),
+        )
+        def _build(restore: bool):
+            # restore=False：跳过 AgentCore Memory 的会话恢复（session_manager=None），
+            # 用于旧会话持久化状态与新 conversation manager 不兼容时的兜底。
+            return Agent(
+                model=load_model(model_key),
+                session_manager=get_memory_session_manager(session_id, _actor_id) if restore else None,
+                conversation_manager=_make_conversation_manager(),
+                system_prompt=DEFAULT_SYSTEM_PROMPT,
+                tools=_tools_for_topic(_topic, account_id, devops_deep),
+                hooks=[],
+            )
+        def _build_with_restore_fallback():
             try:
-                cache[key] = _build(restore=True)
+                return _build(restore=True)
             except ValueError as e:
                 # 回归兜底：旧会话存的是 NullConversationManager 状态，新的 SlidingWindow
                 # restore 时 "Invalid conversation manager state." → 整轮崩、前端 "(no response)"。
@@ -1404,10 +1440,14 @@ def agent_factory():
                 if "conversation manager state" in str(e).lower():
                     log.warning("session %s has incompatible persisted state; starting without restore: %s",
                                 session_id, e)
-                    cache[key] = _build(restore=False)
-                else:
-                    raise
-        return cache[key]
+                    return _build(restore=False)
+                raise
+
+        agent, evicted = _agent_cache.admit(cache, key, _build_with_restore_fallback)
+        for old_key in evicted:
+            log.info("agent cache evicted (size>%d): %s",
+                     _agent_cache.AGENT_CACHE_MAX, old_key)
+        return agent
     return get_or_create_agent
 get_or_create_agent = agent_factory()
 
@@ -1903,6 +1943,14 @@ async def invoke(payload, context):
 
     session_id = getattr(context, 'session_id', 'default-session')
     user_id = getattr(context, 'user_id', 'default-user')
+
+    # 模型配置热生效（spec R4）：BFF 在 payload 里带**服务端读出**的 generation。
+    # 与本地缓存不同 → 绕过 TTL 立即强刷（限速内），使 Admin 保存后**下一条消息**即生效，
+    # 不必等 60s TTL、更不必重启 runtime。非法值（负数/1e308/字符串…）由 llm_config
+    # 内部忽略，只走 TTL 兜底。
+    # ⚠️ 必须在 get_or_create_agent 之前调用 —— 缓存键含 generation，先刷才能拿到新键。
+    llm_config.get_config(payload.get("generation"))
+
     # account_id + devops_deep 纳入 agent 选择:跨账号换账号安全工具集(禁串号 MCP);
     # 深度调查开关开→只挂 devops 工具强制走 DevOps Agent。
     agent = get_or_create_agent(session_id, user_id, payload.get("model"), payload.get("topic"),
@@ -2096,45 +2144,45 @@ async def invoke(payload, context):
             "本轮先用现有成本工具尽力给出分析；请在回答末尾用一句话友好告知用户"
             "「深度 FinOps Agent 分析即将上线，当前已为你做了快速成本分析」。]\n"
         ) + prompt
-    # DevOps Agent 深度调查开启（真接入，两段式）：引导模型在"需要深度调查"时用
-    # start_investigation 发起、并把 execution_id 告诉用户；用户回来再用 get_investigation_result 拉结果。
+    # DevOps Agent 深度调查开启：把本轮所有"要看用户 AWS 环境"的活都交给 DevOps Agent。
+    #
+    # ⚠️ 这段注入**与主题无关**（不提任何具体主题、不点名任何主题专属工具），因为深度调查是一条
+    # 通用能力、以后会加到更多主题上，行为必须默认一致。**主题差异一律放 `_TOPIC_FOCUS`**，
+    # 不要往这里塞任何 "xx 主题下如何如何"。
+    #
+    # ⚠️ 这段是**每 cycle 全价重发**的（不像 system prompt / 工具 schema 那样只算一次缓存前缀，
+    # 它在 user message 里；虽然 model/load.py 已开 message 级缓存，但首次写入仍按 cacheWrite 计），
+    # 且深度调查一轮至少 2 个 cycle（①决定调 investigate_live ②看到 toolResult 收尾）。
+    # 所以这里**只留真正改变模型行为的指令**，删掉了原先大段"禁止使用 rds_*/ec2_*/CloudWatch/
+    # CloudTrail/Cost MCP 自己查"的枚举 —— 深度调查模式下 `_tools_for_topic` 压根**不挂**这些工具
+    # （见该函数 devops_deep 分支），物理上调不到，逐个点名禁止是在为一件做不到的事反复付费。
+    # 只保留一句概括性的"聚焦段里提到的只读工具本轮不可用"，因为 `_TOPIC_FOCUS` 仍会介绍它们。
     if devops_deep:
         prompt = (
-            "[DevOps Agent 深度调查已开启。**这是一条硬规则**：用户既然打开了 DevOps Agent 开关，"
-            "凡是**排查 / 诊断 / 根因 / 为什么 / 故障 / 异常 / 出问题**这类请求(如『排查 RDS 昨晚 CPU 过高』"
-            "『EC2 为什么连不上』『xxx 挂了帮我看看』)，你**必须第一步就调用 `investigate_live`**，把用户的"
-            "原始诉求**原封不动**透传给 DevOps Agent 去干活。**严禁**先用 `rds_*` / `ec2_*` / CloudWatch / "
-            "CloudTrail 等本主题只读工具自己去查、更**不要**因为在某个默认区域没查到资源就反问用户"
-            "『在哪个区域』『实例 ID 是什么』——DevOps Agent 会自己跨区域、跨集群定位；缺信息就把用户"
-            "原话连同『请自行定位相关资源』一起交给它，**不要自己发挥、不要自己下结论**。\n"
-            "`investigate_live` 会**同步发起调查、并把 DevOps Agent 的分析过程实时流式显示给用户**，"
-            "结束后自动生成可下载报告（下载链接由系统追加，你不要自己粘 URL）。调用时给 title（简述）"
-            "+ description（把用户原话 + 现象/资源 ID/时间窗尽量原样带上）。**调用 `investigate_live` 后，"
-            "整个过程与结论已经实时呈现给用户了——你只需用一两句话收个尾，不要重复粘贴摘要全文、也不要再去 poll**。\n"
-            "**续查（重要）**：若 `investigate_live` 返回里带 `timed_out_waiting: true`，说明调查在同步等待"
-            "上限内还没结束、仍在 AWS 侧继续跑——按它 `note` 的指示收尾：告诉用户调查仍在进行、给出返回的 "
-            "`execution_id`、请用户过几分钟回来说一句『查一下刚才的调查结果』。**当用户回来询问某次调查的结果/"
-            "进度时**（如『查一下刚才的调查』『调查完了没』），用 `get_investigation_result(execution_id)` "
-            "续拉——execution_id 从对话历史里那条调查记录取；完成则它会给出结论+可下载报告，仍在跑则如实告知"
-            "『还没结束，请稍后再查』，**绝不编造结论**。\n"
-            "**转人工支持（重要）**：用户要把某次调查转人工/交给 AWS Support 时（如『转人工支持』），"
-            "**必须用 `escalate_to_support(execution_id)`**（execution_id 从对话历史那条调查取）——它会由"
-            "**后端**自动带上真实的报告链接与调查原文建案。**绝不要用 `support_case_create` 自己拼 case 正文、"
-            "更不要自己粘任何 S3/报告 URL**（你粘的链接是错的）。\n"
-            "**缓解方案**：用户要缓解/修复方案时用 `generate_mitigation_plan`，原样展示其返回。\n"
-            "**成本 / 账单 / 用量分析(重要)**：开关既然打开了,用户就是想让 **DevOps Agent** 来做。"
-            "碰到成本/账单/用量类请求(如『分析 6 月账单并给详细报告』『这个月成本为什么涨』),"
-            "**优先调用 `investigate_live`**(title/description 写清成本分析诉求 + 时间窗),"
-            "让 DevOps Agent 深度分析并出报告;**不要**先去调 Cost MCP。仅当 DevOps Agent 不可用"
-            "(not_onboarded / 明确失败)时,才用 Cost MCP 兜底。（开关**关闭**时,成本请求才默认走 Cost MCP。）\n"
-            "（旧的两段式 `start_investigation` 仅当用户明确要『只发起、稍后自己来查』时用。）"
-            "**强制口径(用户已显式打开开关)**：本轮**任何**需要查用户 AWS 环境/资源的请求——"
-            "**包括『列出/返回 xxx 列表』『看看有哪些 xxx』这类简单查询**——都**必须走 `investigate_live`**，"
-            "把用户原话透传给 DevOps Agent,**不要**自己用 `rds_*`/`ec2_*`/`aws_readonly`/CloudWatch 等工具直接查。"
-            "唯一可不走的是**纯概念问答**(如『RDS Serverless 是什么』『ALB 和 NLB 区别』,不涉及查他的环境)。"
-            "若 `investigate_live` 返回 not_onboarded（账号未接入 DevOps Agent），**用与用户提问相同的语言**"
-            "说明该账号未接入 DevOps Agent、可改用本主题只读工具即时排查（不要逐字粘工具返回的中文 message），"
-            "此时才可回退本主题只读工具。]\n"
+            "[DevOps Agent 深度调查已开启（用户显式打开了开关）。**硬规则**：\n"
+            "1. 本轮**任何**需要看用户 AWS 环境/资源/成本/用量/配置的请求——排查、诊断、根因、"
+            "『为什么』、故障、异常，以及『列出 xxx』『有哪些 xxx』这类简单查询、以及成本/账单分析"
+            "——都**必须第一步就调 `investigate_live`**，把用户**原话原封不动**透传过去。"
+            "唯一例外是**纯概念问答**（如『RDS Serverless 是什么』），那类直接回答。\n"
+            "2. 调用时给 title（简述）+ description（用户原话 + 现象/资源 ID/时间窗尽量原样带上）。"
+            "**不要**因为缺信息就反问『哪个区域』『实例 ID 是什么』——DevOps Agent 自己会跨区域定位，"
+            "缺信息就把原话加一句『请自行定位相关资源』交给它。**不要自己发挥、不要自己下结论。**\n"
+            "3. 本轮**只有** DevOps Agent 相关工具可用；对话里其它段落（主题聚焦等）提到的只读工具"
+            "（`rds_*`/`ec2_*`/CloudWatch/CloudTrail/Cost 类等）**本轮一律未挂载**，不要尝试调用。\n"
+            "4. `investigate_live` 会同步发起调查、把分析过程**实时流式显示给用户**，并自动生成可下载"
+            "报告（链接由系统追加）。调用后**整个过程与结论用户已经看到了**——你只需一两句话收尾，"
+            "**不要**重复粘贴摘要全文、**不要**再 poll、**不要**自己粘任何 S3/报告 URL。\n"
+            "5. 返回带 `timed_out_waiting: true` = 仍在 AWS 侧跑，按其 `note` 收尾（告知仍在进行 + "
+            "给出 `execution_id` + 请用户过几分钟说『查一下刚才的调查结果』）。用户回来问进度/结果时，"
+            "用 `get_investigation_result(execution_id)`（execution_id 取自对话历史那条调查记录）；"
+            "仍在跑就如实说『还没结束』，**绝不编造结论**。\n"
+            "6. 转人工/交给 AWS Support 时**必须用 `escalate_to_support(execution_id)`**（后端会自动"
+            "带上真实报告链接与调查原文建案）；**不要**用 `support_case_create` 自己拼正文。"
+            "要缓解/修复方案时用 `generate_mitigation_plan`，原样展示其返回。"
+            "`start_investigation` 仅当用户明确要『只发起、稍后自己来查』时用。\n"
+            "7. 返回 `not_onboarded`（该账号未接入 DevOps Agent）时，**用与用户提问相同的语言**如实"
+            "告知：该账号尚未接入 DevOps Agent，请先完成接入，或**关闭深度调查开关**后再提问"
+            "（关闭后即可用本主题的只读工具排查）。不要逐字粘工具返回的中文 message、不要假装已排查。]\n"
         ) + prompt
     forced_sources = []
     if web_on:
@@ -2323,12 +2371,23 @@ async def invoke(payload, context):
             out = int(usage.get("outputTokens", 0) or 0) - int(_u0.get("outputTokens", 0) or 0)
             tot = int(usage.get("totalTokens", 0) or 0) - int(_u0.get("totalTokens", 0) or 0)
             cycles = cyc_now - _c0
+            # 提示缓存命中量（cacheRead 约为普通 input 价的 10%，cacheWrite 略高于 input）。
+            # 这是**唯一**能持续观测缓存是否真的生效的手段：没有它，任何 prompt 结构调整
+            # 或 TTL 配置（见 model/load.py `_cache_ttl_for`）都只能盲改。
+            # 差值口径与上面一致（accumulated_usage 是 agent 实例跨请求累计值）。
+            # 这两个 key 是 Bedrock **可选**返回，模型不支持缓存时压根不出现 → 缺失即视作 0。
+            cr = int(usage.get("cacheReadInputTokens", 0) or 0) - int(_u0.get("cacheReadInputTokens", 0) or 0)
+            cw = int(usage.get("cacheWriteInputTokens", 0) or 0) - int(_u0.get("cacheWriteInputTokens", 0) or 0)
             # 差值理论上非负；异常情况（如 agent 被重建导致快照失配）兜底为非负。
             inp, out, cycles = max(inp, 0), max(out, 0), max(cycles, 0)
+            cr, cw = max(cr, 0), max(cw, 0)
             tot = max(tot, inp + out)
             if tot:
+                # 前端只读 totalTokens / cycles 渲染签名行（见 Message.tsx modelSignatureParts），
+                # 未知字段被忽略 → 加这两个字段对客户**完全不可感知**，纯观测用。
                 yield {"usage": {"inputTokens": inp, "outputTokens": out,
-                                 "totalTokens": tot, "cycles": cycles}}
+                                 "totalTokens": tot, "cycles": cycles,
+                                 "cacheReadInputTokens": cr, "cacheWriteInputTokens": cw}}
     except Exception as e:  # noqa: BLE001 — 用量统计失败不影响正文
         log.warning("emit usage failed: %s", e)
 

@@ -27,6 +27,136 @@ export const STRINGS: Dict = {
   "admin.tab.accounts": { zh: "账户", en: "Accounts" },
   "admin.tab.lifecycle": { zh: "生命周期", en: "Lifecycle" },
   "admin.tab.notifications": { zh: "集成 IM", en: "IM Integration" },
+  "admin.tab.models": { zh: "模型", en: "Models" },
+  // ── 模型目录（LLM provider / 候选模型 / 凭证 / 后端任务）──
+  "admin.models.title": { zh: "模型目录", en: "Model catalogue" },
+  "admin.models.sub": { zh: "勾选的模型就是所有用户在对话里能选到的全部候选;Provider 与凭证不对普通用户开放。保存后长驻实例会在下一条消息生效。", en: "The models you enable here are the only ones users can pick in chat; provider and credentials are never exposed to them. Long-running instances pick up changes on the next message." },
+  "admin.models.loading": { zh: "加载中…", en: "Loading…" },
+  "admin.models.provider": { zh: "Provider", en: "Provider" },
+  "admin.models.providerHint": { zh: "当前阶段仅支持 Amazon Bedrock;LiteLLM 等多 Provider 在后续阶段开放。", en: "Amazon Bedrock only for now; multi-provider (LiteLLM) lands in a later phase." },
+  "admin.models.credMode": { zh: "凭证方式", en: "Credentials" },
+  "admin.models.cred.iam": { zh: "IAM 角色(默认)", en: "IAM role (default)" },
+  "admin.models.cred.api_key": { zh: "Bedrock API Key", en: "Bedrock API key" },
+  "admin.models.credHint": { zh: "选 API Key 后,推理请求用该 Key 计费与鉴权;列模型等控制面操作仍走本系统自身的 IAM 角色。", en: "With an API key, inference is billed and authorised through it; control-plane calls such as listing models still use this system's own IAM role." },
+  "admin.models.keyPh": { zh: "粘贴 Bedrock API Key(保存后不再回显)", en: "Paste the Bedrock API key (never shown again)" },
+  "admin.models.keySave": { zh: "保存 Key", en: "Save key" },
+  "admin.models.keyClear": { zh: "清除", en: "Clear" },
+  "admin.models.keySet": { zh: "已配置", en: "Configured" },
+  "admin.models.keyUnset": { zh: "未配置", en: "Not configured" },
+  "admin.models.keyHint": { zh: "仅显示后 4 位;更换 Key 会让各端重建模型客户端。", en: "Only the last 4 chars are shown; replacing the key makes every surface rebuild its model client." },
+  // 谁在何时设的 + 轮换提示（spec R5.6）。Key 是共享凭证，只显示后 4 位定位不到人。
+  "admin.models.keySetBy": { zh: "由 {who} 于 {when} 设置", en: "Set by {who} on {when}" },
+  "admin.models.keySetByUnknown": { zh: "未记录的操作人", en: "an unrecorded actor" },
+  "admin.models.keyRotationDue": { zh: "该 Key 已使用 {days} 天(超过建议的 {limit} 天),建议轮换。轮换后所有模型的验证状态会重置,需重新测试。", en: "This key has been in use for {days} days (past the recommended {limit}); consider rotating it. Rotating resets every model's verification, so they will need re-testing." },
+  "admin.models.listTitle": { zh: "候选模型", en: "Candidate models" },
+  "admin.models.enabledCount": { zh: "已启用 {n} 个", en: "{n} enabled" },
+  "admin.models.surface.webchat": { zh: "Web", en: "Web" },
+  "admin.models.surface.im": { zh: "IM", en: "IM" },
+  "admin.models.default": { zh: "默认", en: "Default" },
+  "admin.models.defaultTip": { zh: "新对话的默认模型,必须已启用且通过连通性测试", en: "Default model for new chats; must be enabled and pass the connectivity test" },
+  "admin.models.capTip": { zh: "该模型的输出 token 硬上限(取自模型文档);设太低会静默截断回复", en: "The model's hard output-token cap from its docs; too low silently truncates replies" },
+  "model.degradedNotice": { zh: "⚠ 暂时读不到模型目录，当前用的是内置备用清单;稍后会自动重试。", en: "\u26a0 The model catalogue is temporarily unavailable; using the built-in fallback list. Retrying automatically." },
+  "model.noneEnabled": { zh: "管理员尚未为 Web 对话启用任何模型,暂时无法发送消息。请联系管理员在「管理 → 模型」中启用。", en: "No model has been enabled for web chat yet, so messages cannot be sent. Ask an administrator to enable one under Admin \u2192 Models." },
+  "model.loading": { zh: "正在读取可用模型…", en: "Loading available models…" },
+  "model.fallbackNotice": { zh: "⚠ 这是打包内置的备用清单 —— 未能读取管理员配置的模型目录，实际可用模型可能与此不同。", en: "\u26a0 Built-in fallback list \u2014 the administrator's model catalogue could not be loaded, so the models actually available may differ." },
+  "admin.models.cap": { zh: "最大输出", en: "Max output" },
+  "admin.models.searchPh": { zh: "搜索模型(如 claude 5、nova、gpt)", en: "Search models (e.g. claude 5, nova, gpt)" },
+  "admin.models.matchCount": { zh: "匹配 {n} / 共 {total} 个候选", en: "{n} of {total} candidates" },
+  "admin.models.noMatch": { zh: "没有匹配的模型。可改用下面的「手动填 model_id」。", en: "No matching model. You can use \"enter a model_id manually\" below." },
+  "admin.models.candLoading": { zh: "正在读取候选模型…", en: "Loading candidate models…" },
+  "admin.models.candFailed": { zh: "读取候选模型失败(见下方原因)。也可改用下面的「手动填 model_id」。", en: "Could not load candidate models (reason below). You can also use \"enter a model_id manually\" below." },
+  "admin.models.retry": { zh: "重试", en: "Retry" },
+  "admin.models.allAdded": { zh: "所有候选模型都已加入目录。", en: "Every candidate model is already in the catalogue." },
+  "admin.models.otherProvider": { zh: "其他", en: "Other" },
+  "admin.models.capUnit": { zh: "tokens", en: "tokens" },
+  "admin.models.needAtLeastOne": { zh: "请先添加至少一个模型。", en: "Add at least one model first." },
+  "admin.models.needEnabled": { zh: "至少启用一个模型(勾选模型名左侧的复选框)。", en: "Enable at least one model (tick the checkbox next to its name)." },
+  "admin.models.needDefault": { zh: "请指定一个默认模型。", en: "Pick a default model." },
+  "admin.models.defaultMustBeEnabled": { zh: "默认模型必须在启用集内。", en: "The default model must be one of the enabled ones." },
+  "admin.models.needSurface": { zh: "「{surface}」端还没有可用模型:请让至少一个启用模型勾上它。", en: "No model is available for \"{surface}\": tick it on at least one enabled model." },
+  "admin.models.cannotSave": { zh: "还不能保存", en: "Not ready to save" },
+  "admin.models.testBtn": { zh: "测试", en: "Test" },
+  "admin.models.testing": { zh: "测试中…", en: "Testing…" },
+  "admin.models.testTip": { zh: "发一次最小请求验证可达与授权(真实调用)", en: "Send one minimal request to check reachability and authorisation (a real call)" },
+  // 「已验证 / 未验证」这对文案随持久化的 verified 字段一起删除 —— 那是个会过期的快照。
+  // 「未测试」占位也已删除：字段没了之后它对每个模型恒成立，不携带任何信息，只占宽度。
+  // 现在结果只在点过「测试」之后出现，表达的就是那一次调用的结果。
+  "admin.models.remove": { zh: "从目录移除", en: "Remove from the catalogue" },
+  "admin.models.addModel": { zh: "添加模型", en: "Add model" },
+  "admin.models.pickPh": { zh: "从本账号可用模型中选择…", en: "Pick from the models available to this account…" },
+  "admin.models.add": { zh: "添加", en: "Add" },
+  "admin.models.cancel": { zh: "取消", en: "Cancel" },
+  // 推理路由范围 = 数据驻留范围，由 model_id 前缀决定（见 AdminPanel routingScopeKey）
+  "admin.models.routing.global": { zh: "全球路由", en: "Global routing" },
+  "admin.models.routing.us": { zh: "美加区域", en: "US & Canada" },
+  "admin.models.routing.eu": { zh: "欧洲区域", en: "Europe" },
+  "admin.models.routing.apac": { zh: "亚太区域", en: "Asia Pacific" },
+  "admin.models.routing.regional": { zh: "本区域", en: "This Region" },
+  "admin.models.routing.jp": { zh: "日本境内", en: "Japan only" },
+  "admin.models.routing.usgov": { zh: "US GovCloud", en: "US GovCloud" },
+  // 徽章要短：它与 model_id / region 同处一行时，长文案会把整行挤到换行（实测 GPT
+  // 那行错位）。端点细节改由 ⓘ 弹层的 admin.models.infoMantle 承担。
+  "admin.models.routing.mantle": { zh: "跨区", en: "Cross-Region" },
+  // ⓘ 弹层：技术标识不再平铺在行内，改为点开查阅
+  "admin.models.infoBtn": { zh: "查看模型标识与路由范围", en: "Model identifier and routing scope" },
+  "admin.models.infoModelId": { zh: "Model ID", en: "Model ID" },
+  "admin.models.infoRegion": { zh: "区域", en: "Region" },
+  "admin.models.infoRouting": { zh: "路由范围", en: "Routing scope" },
+  "admin.models.infoMantle": { zh: "该模型只在 bedrock-mantle 端点提供(不在 bedrock-runtime 上),请求会打到上面这个区域,与本部署区域无关。", en: "This model is served only on the bedrock-mantle endpoint (not on bedrock-runtime); requests go to the Region shown above, regardless of this deployment's Region." },
+  "admin.models.routingTip": { zh: "推理请求会被路由到哪些区域,也就是提示词与回复可能流经的范围。由 model_id 前缀决定:global. = 全球所有支持的商业区域;us./eu./apac. = 限定在该地理范围内;无前缀 = 仅本部署区域。换前缀就是一次数据驻留变更。", en: "Which Regions inference requests can be routed to — i.e. where prompts and responses may travel. Determined by the model_id prefix: global. = every supported commercial Region worldwide; us./eu./apac. = confined to that geography; no prefix = this deployment Region only. Changing the prefix is a data-residency change." },
+  "admin.models.orManual": { zh: "或手动填写 model_id：", en: "Or enter a model_id manually:" },
+  "admin.models.manualLabelPh": { zh: "显示名（可选）", en: "Display name (optional)" },
+  "admin.models.manualHint": { zh: "跨账号 Key 指向的模型可能不在本账号的候选列表里,此时手动填写。手填的条目未经枚举确认,务必先做连通性测试再启用。", en: "A model reached through a cross-account key may not appear in this account's candidate list; enter it manually here. A manual entry has not been confirmed by enumeration — always run the connectivity test before enabling it." },
+  // 候选列表的来源身份。枚举必须用「将来真正执行推理的那个身份」去问，否则列出来的模型
+  // Key 可能调不了 —— 那时必须说出来，不能默认两者一致。
+  "admin.models.candFromKey": { zh: "以下候选由已配置的 Bedrock API Key 列出 —— 与推理使用的凭证一致。", en: "The candidates below were listed using the configured Bedrock API key — the same credential used for inference." },
+  "admin.models.candFromRole": { zh: "以下候选由本系统的 IAM 角色列出（当前凭证方式为 IAM）。", en: "The candidates below were listed using this system's IAM role (credential mode is IAM)." },
+  "admin.models.candKeyNoListPerm": { zh: "注意:该 Bedrock API Key 没有列模型的权限,以下候选改由本系统的 IAM 角色列出 —— 可能包含 Key 实际调不了的模型。启用前请务必逐个测试。", en: "Note: this Bedrock API key lacks permission to list models, so the candidates below came from this system's IAM role — they may include models the key cannot actually invoke. Test each one before enabling it." },
+  "admin.models.test.ok": { zh: "可用", en: "OK" },
+  "admin.models.test.forbidden": { zh: "无权限", en: "Forbidden" },
+  "admin.models.test.unauthorized": { zh: "凭证无效", en: "Bad credentials" },
+  "admin.models.test.invalidModel": { zh: "模型 ID 无效", en: "Invalid model id" },
+  "admin.models.test.notFound": { zh: "未找到", en: "Not found" },
+  "admin.models.test.throttled": { zh: "被限流", en: "Throttled" },
+  "admin.models.test.notReady": { zh: "未就绪", en: "Not ready" },
+  "admin.models.test.timeout": { zh: "超时", en: "Timed out" },
+
+  "admin.models.test.error": { zh: "失败", en: "Failed" },
+  "admin.models.test.probeError": { zh: "探测参数不被接受(疑似本系统的探测请求有问题,非模型不可用),请反馈", en: "The probe request was rejected (likely a bug in our probe, not the model); please report it" },
+  "admin.models.test.needsProfile": { zh: "本区域不支持直调该模型,请改用带 global. / apac. 前缀的跨区域版本(在「添加模型」里搜同名模型)", en: "This Region cannot invoke the model directly; use the cross-Region version prefixed global. / apac. (search the same name under Add model)" },
+  "admin.models.backendTitle": { zh: "后端任务模型", en: "Backend task models" },
+  // 文案曾写「仅可选走 Converse 的模型(GPT 系不适用)」——那是我们后端缺 Mantle 分支时的
+  // 状态，且「GPT 系」本身过度概括（gpt-oss 系是支持 Converse 的）。现已两端对齐。
+  "admin.models.backendSub": { zh: "无人参与的后台任务用哪个模型。已启用的模型都可选。", en: "Which model unattended backend jobs use. Any enabled model can be selected." },
+
+  "admin.models.task.phd_translate": { zh: "PHD 事件翻译与摘要", en: "PHD event translation and summary" },
+  "admin.models.task.devops_report_summarize": { zh: "调查报告精简", en: "Investigation report summarisation" },
+  "admin.models.followDefault": { zh: "跟随默认模型", en: "Follow the default model" },
+  "admin.models.outOfSync": { zh: "上次同步到后端失败,请重新保存。", en: "The last sync to the backend failed; save again." },
+  "admin.models.syncUnknown": { zh: "无法读取后端当前值,同步状态未知。", en: "Could not read the backend's current value; sync state unknown." },
+  // 这条文案改过两轮，两轮都是因为它落后于代码：
+  //   ① 原写「IM 尚未接入」+「GPT 系例外,始终走 IAM」—— IM 侧注入已完成，Mantle(GPT)
+  //      三条路径也都改为优先用 Key，两条都不成立。
+  //   ② 接着写「列模型等控制面操作仍走本系统自身的 IAM 角色」—— 也不成立了：候选枚举
+  //      已改为用 Key 去列（否则用部署角色列出来的模型 Key 可能调不了,管理员加进目录、
+  //      启用,直到用户发消息才 403）。见 bff/web-chat/llm_config.mjs::apiGetCandidates
+  //      的 source_identity。
+  // 管理员按这句话判断「切到 Key 之后哪些行为会变」,写错就是误导,不是小瑕疵。
+  "admin.models.credApiKeyScope": { zh: "注意:API Key 用于全部推理调用 —— Web 对话、IM 机器人、后端任务(PHD 翻译 / 报告精简),对 Converse 与 Mantle(GPT)两类模型都生效。候选模型列表也用它枚举,好让列表与 Key 实际可调的范围一致;若 Key 没有列模型的权限,则退回本系统自身的 IAM 角色并在列表上标注。", en: "Note: the API key is used for every inference call — web chat, the IM bot, and backend tasks (PHD translation / report summarisation) — for both Converse and Mantle (GPT) models. It also enumerates the candidate model list, so that list matches what the key can actually invoke; if the key lacks listing permission, enumeration falls back to this system's own IAM role and says so." },
+  // 换 Key = 换 IAM 身份（Key 背后是独立 IAM user，权限可被按模型收窄），旧的「已验证」
+  // 随之失效。不说出来的话，管理员只看到绿勾变灰，还会撞上「默认模型未验证」的保存拦截。
+  "admin.models.keyChangedRetest": { zh: "页面上的测试结果已清空 —— 凭证换了,旧结果不再代表现在的状况。可点「全部测试」用新凭证重测一遍。保存时系统会自动现场校验默认模型。", en: "The test results on this page were cleared: the credential changed, so the old results no longer reflect reality. Use \"Test all\" to re-check with the new credential. On save, the system verifies the default model live anyway." },
+  "admin.models.testAll": { zh: "全部测试", en: "Test all" },
+  "admin.models.testAllTip": { zh: "逐个真调已启用的模型。AWS 没有「列出某凭证可调模型」的接口,能不能调只能实际调一次才知道。串行执行以免触发限流。", en: "Really calls each enabled model, one at a time. AWS has no API that lists which models a given credential may invoke, so the only reliable answer comes from actually calling them. Sequential, to avoid throttling." },
+  "admin.models.probedWithKey": { zh: "以上验证结果使用的是已配置的 Bedrock API Key —— 与推理请求实际使用的凭证一致。", en: "The results above were obtained with the configured Bedrock API key — the same credential inference requests actually use." },
+  "admin.models.probedWithRole": { zh: "注意:以上验证使用的是本系统的 IAM 角色,不是 Bedrock API Key(凭证方式为 IAM,或 Key 未配置)。若稍后改用 Key,需要重新验证。", en: "Note: the results above used this system's IAM role, not a Bedrock API key (credential mode is IAM, or no key is set). Re-verify after switching to a key." },
+  "admin.models.save": { zh: "保存", en: "Save" },
+  "admin.models.saving": { zh: "保存中…", en: "Saving…" },
+  "admin.models.saved": { zh: "已保存", en: "Saved" },
+  "admin.models.generation": { zh: "配置版本", en: "Config version" },
+  "admin.models.audit": { zh: "变更记录", en: "Change history" },
+  "admin.models.auditEmpty": { zh: "暂无变更记录。", en: "No changes recorded yet." },
+  "admin.models.rollback": { zh: "回滚到此前", en: "Roll back to before" },
   "admin.notif.title": { zh: "飞书机器人", en: "Feishu Bot" },
   "admin.notif.sub": { zh: "配置飞书自建应用凭证与推送群组;每日报告、告警推送、调查回调等都会发到这些群。", en: "Configure the Feishu app credentials and target group chats; daily reports, alert pushes and investigation callbacks are delivered to these chats." },
   "admin.notif.loading": { zh: "加载中…", en: "Loading…" },
@@ -428,6 +558,9 @@ export const STRINGS: Dict = {
   "sidebar.today": { zh: "今天", en: "Today" },
   "sidebar.earlier": { zh: "更早", en: "Earlier" },
   "sidebar.pinned": { zh: "已置顶", en: "Pinned" },
+  // 会话分组的一键折叠/展开（仅 ≥2 个非空组时显示）
+  "sidebar.collapseAll": { zh: "折叠全部", en: "Collapse all" },
+  "sidebar.expandAll": { zh: "展开全部", en: "Expand all" },
   "conv.rename": { zh: "重命名", en: "Rename" },
   "conv.pin": { zh: "置顶会话", en: "Pin chat" },
   "conv.unpin": { zh: "取消置顶", en: "Unpin chat" },
@@ -532,6 +665,7 @@ export const STRINGS: Dict = {
   "composer.websearch.short": { zh: "联网", en: "Web" },
   "composer.finops.short": { zh: "FinOps", en: "FinOps" },
   "composer.devops.short": { zh: "深度调查", en: "Deep Dive" },
+  "composer.devops.direct.short": { zh: "深度调查（直连）", en: "Deep Dive (Direct)" },
   "composer.websearch.hint": {
     zh: "开启后可联网查最新信息（默认走 AWS AgentCore 搜索，数据不出 AWS）",
     en: "Search the web for current info when on (uses AWS AgentCore search by default; data stays in AWS)",
@@ -541,6 +675,11 @@ export const STRINGS: Dict = {
   "composer.devops.hint": {
     zh: "开启 DevOps Agent 深度调查（发起多信号根因排查，耗时几分钟；关闭时用只读工具即时排查）",
     en: "Enable DevOps Agent deep investigation (multi-signal root-cause; takes minutes. Off = instant read-only triage)",
+  },
+  "composer.devops.direct": { zh: "DevOps Agent（直连）", en: "DevOps Agent (Direct)" },
+  "composer.devops.direct.hint": {
+    zh: "同样的 DevOps Agent 深度调查，但绕过大模型直连 API —— 不消耗 token。代价：调查描述按你的原话透传（不做智能改写），也不会先回答概念问题",
+    en: "The same DevOps Agent deep investigation, but calls the API directly without an LLM — costs 0 tokens. Trade-off: your wording is passed through as-is (no smart rewrite), and conceptual questions aren't answered first",
   },
   "composer.finops.hint": {
     zh: "开启 FinOps Agent 深度分析（更全面的成本归因/优化建议，耗时较长；关闭时走快速成本查询）",
@@ -573,6 +712,8 @@ export const STRINGS: Dict = {
   "model.desc.gpt": { zh: "OpenAI 旗舰 · 经 Bedrock", en: "OpenAI flagship · via Bedrock" },
   "model.desc.gptSol": { zh: "OpenAI GPT-5.6 Sol · 经 Bedrock", en: "OpenAI GPT-5.6 Sol · via Bedrock" },
   "model.desc.gptLuna": { zh: "OpenAI GPT-5.6 Luna · 经 Bedrock", en: "OpenAI GPT-5.6 Luna · via Bedrock" },
+  // 管理员手工添加的模型没有 desc_key，用这句通用描述兜底（避免把 i18n key 原样漏到界面上）
+  "model.desc.generic": { zh: "由管理员添加 · 经 Bedrock", en: "Added by an administrator · via Bedrock" },
   "model.flag.exp": { zh: "实验", en: "experimental" },
   "login.title": { zh: "登录 NotiOps", en: "Sign in to NotiOps" },
   "login.username": { zh: "用户名", en: "Username" },

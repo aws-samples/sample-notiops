@@ -154,11 +154,16 @@ def _invoke_with_retry(
     model_id: str,
     system_prompt: str,
     user_prompt: str,
+    model_kind: str = "",
+    model_region: str = "",
 ) -> dict:
     """调用 LLM,最多 3 次指数退避重试。
 
     历史签名第 1 个参数是 boto3 client(已不使用,通过 shared.llm_provider 自动选)。
     保留它是为了不破坏单元测试 fixture。
+
+    `model_kind` / `model_region` 决定走哪条协议、打哪个区(见 invoke_llm)。缺省
+    为空 = Converse,与历史行为一致 —— 存量测试 fixture 不传它们也仍然正确。
 
     返回 dict 字段:`output.message.content[0].text` / `stopReason` / `usage`,
     与 boto3 Bedrock Converse 一致(LiteLLM 路径已在 invoke_llm 里规范化)。
@@ -174,6 +179,8 @@ def _invoke_with_retry(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=_MAX_TOKENS,
+                kind=model_kind,
+                region=model_region,
             )
             # 用 Bedrock Converse 的 envelope 包回去,后续代码不用改
             return {
@@ -214,6 +221,8 @@ def summarize_investigation(
     long_report: str,
     model_id: str,
     agent_prompt: str | None = None,
+    model_kind: str = "",
+    model_region: str = "",
 ) -> str:
     """用 Bedrock Converse API 把长报告精简为结构化短卡片。
 
@@ -226,6 +235,10 @@ def summarize_investigation(
         long_report: 原始 investigation_summary_md 长报告全文。
         model_id: Bedrock 模型 ID，由调用方通过 load_summarizer_config() 获取。
         agent_prompt: 可选的 system prompt 覆盖，非空时直接使用，否则用硬编码默认。
+        model_kind: 模型目录的 `kind`，同样来自 load_summarizer_config()。空 = Converse；
+            `bedrock_mantle_responses` = 走 Mantle 的 Responses 协议（有一批 Bedrock
+            模型只在那个端点上架，Converse 调不到）。
+        model_region: Mantle 模型的固定区域，非 Mantle 时忽略。
 
     Returns:
         精简后的短卡片 Markdown 文本。
@@ -272,6 +285,8 @@ def summarize_investigation(
         model_id=model_id,
         system_prompt=system_prompt,
         user_prompt=long_report,
+        model_kind=model_kind,
+        model_region=model_region,
     )
 
     output = response.get("output", {})

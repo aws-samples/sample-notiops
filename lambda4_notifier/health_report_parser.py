@@ -102,11 +102,16 @@ def _invoke_with_retry(
     model_id: str,
     system_prompt: str,
     user_prompt: str,
+    model_kind: str = "",
+    model_region: str = "",
 ) -> dict:
     """[migration] 调用 LLM(provider 由 SSM 切换),最多 3 次指数退避重试。
 
     历史签名第一个参数是 boto3 client(已不使用,通过 shared.llm_provider 自动选)。
     保留是为了不破坏旧测试 fixture。返回 Bedrock Converse envelope 兼容结构。
+
+    `model_kind` / `model_region` 决定协议与区域(见 invoke_llm)。缺省为空 =
+    Converse,与历史行为一致,存量测试 fixture 不传也仍正确。
     """
     from shared.llm_provider import invoke_llm
 
@@ -118,6 +123,8 @@ def _invoke_with_retry(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=_MAX_TOKENS,
+                kind=model_kind,
+                region=model_region,
             )
             return {
                 "output": {
@@ -319,6 +326,9 @@ def parse_critical_by_account(
     # 读取 model_id（三级降级链已封装在 summarizer_config）
     config = load_summarizer_config()
     model_id = config["model_id"]
+    # 协议 / 区域随 model_id 一起从模型目录投影下来。空 = Converse（与历史一致）。
+    model_kind = config.get("model_kind", "")
+    model_region = config.get("model_region", "")
 
     # 认证：API Key 优先
     api_key = _get_api_key()
@@ -345,6 +355,8 @@ def parse_critical_by_account(
             model_id=model_id,
             system_prompt=_SYSTEM_PROMPT,
             user_prompt=user_prompt,
+            model_kind=model_kind,
+            model_region=model_region,
         )
     except Exception as e:
         logger.error("Health_Report_Parser Bedrock 调用失败，降级返回 {}: %s", e)

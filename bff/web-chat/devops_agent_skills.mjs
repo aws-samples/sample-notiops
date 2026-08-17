@@ -147,7 +147,9 @@ function uploadKeyFor(target) {
   return target.scope === "self" ? "self" : (target.accountId || "self");
 }
 
-async function resolveTarget(accountId) {
+// export：「深度调查（直连）」(devops_investigate.mjs) 复用同一套目标解析，避免两份跨账号
+// AssumeRole 逻辑漂移。签名/行为保持不变（只加 export），老调用方不受影响。
+export async function resolveTarget(accountId) {
   const id = String(accountId || "").trim();
   if (!id || id === SELF_ACCOUNT) {
     if (!SELF_AGENT_SPACE) throw Object.assign(new Error("no_local_agent_space"), { code: "bad_request" });

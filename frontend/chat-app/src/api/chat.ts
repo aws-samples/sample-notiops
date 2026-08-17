@@ -51,6 +51,9 @@ export interface StreamCallbacks {
   onFollowups?: (followups: Followup[]) => void;
   onInvestigationStep?: (step: InvestigationStep) => void;
   onUsage?: (usage: TokenUsage) => void;
+  // 服务端把本轮模型换掉了（客户端点的那个已不在管理员启用集内）。
+  // 静默替换会让用户以为自己还在用原来的模型，所以必须回传并纠正选择器。
+  onModelSubstituted?: (info: { requested?: string; effective?: string; reason?: string }) => void;
   onDone?: (info: { message_id?: string }) => void;
   onError?: (message: string) => void;
 }
@@ -63,7 +66,7 @@ export interface StreamCallbacks {
  * 头已被 SigV4 占用；BFF 从 body 校验 idToken 拿 sub 做会话隔离。
  */
 export async function streamChat(
-  params: { conversationId?: string; text: string; model?: string; locale?: string; webSearch?: boolean; finopsAgent?: boolean; devopsAgent?: boolean; topic?: string; accountId?: string; skillId?: string; skillVersion?: string },
+  params: { conversationId?: string; text: string; model?: string; locale?: string; webSearch?: boolean; finopsAgent?: boolean; devopsAgent?: boolean; devopsAgentDirect?: boolean; topic?: string; accountId?: string; skillId?: string; skillVersion?: string },
   cb: StreamCallbacks,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -94,6 +97,8 @@ export async function streamChat(
     web_search: params.webSearch === true,
     finops_agent: params.finopsAgent === true,
     devops_agent: params.devopsAgent === true,
+    // 「深度调查（直连）」：BFF 直连 DevOps Agent API（0 token），与 devops_agent 互斥。
+    deep_investigate_direct: params.devopsAgentDirect === true,
     topic: params.topic || "general",
     account_id: params.accountId || "",
     skill_id: params.skillId || "",
@@ -287,6 +292,51 @@ export async function executeActionApi(action: ProposedAction): Promise<{ ok: bo
   }
 }
 
+/** GET /models —— 管理员已启用的候选模型（登录即可读；不含 provider / 凭证 / 候选全集）。 */
+export interface ServerModel {
+  id: string;
+  name: string;
+  short?: string;
+  desc_key?: string;
+  /** 推理调用是否受 Admin 配的 Bedrock API Key 影响。现在恒为 true（Converse 与
+   *  Mantle 两类端点都接受该 Key）。保留字段是为了兼容存量客户端 —— 曾经 Mantle
+   *  是 false，那是我们没把 Key 传给 Mantle，不是端点不支持。 */
+  uses_api_key?: boolean;
+}
+export async function fetchModels(surface = "webchat"): Promise<{
+  models: ServerModel[]; default_model: string; generation: number; source: string;
+} | null> {
+  const s = await signedClient();
+  if (!s) return null;
+  try {
+    const r = await s.aws.fetch(`${s.base}/models?surface=${encodeURIComponent(surface)}`,
+                                { headers: { "x-notiops-id-token": s.idToken } });
+    if (!r.ok) {
+      // 一定要留痕。这个失败此前是完全静默的：下拉框继续显示**打包内置**的兜底清单，
+      // 于是管理员在管理页把目录收敛到 1 个模型，用户侧却仍然看到 8 个 —— 界面上、
+      // 控制台里、日志里都没有任何迹象（BFF 只记 5xx）。排查时无从下手。
+      console.error(`[models] GET /models failed: HTTP ${r.status}`);
+      return null;
+    }
+    const j = await r.json();
+    if (!Array.isArray(j?.models)) {
+      console.error("[models] GET /models returned an unexpected shape", j);
+      return null;
+    }
+    return { models: j.models as ServerModel[],
+             default_model: String(j.default_model || ""),
+             generation: Number(j.generation || 0),
+             // 服务端对"这份清单从哪来"的自述，前端据此分流（见 models.ts 的状态机）。
+             // 老版本 BFF 不返回它 —— 缺省当 ddb 处理，行为与改动前一致。
+             source: String(j.source || "ddb") };
+  } catch (e) {
+    // 返回 null 而不是 [] —— 调用方据此区分"管理员一个都没启用"（合法的空列表）
+    // 与"这次没读到"（该继续用内置兜底目录，别把下拉框清空）。
+    console.error("[models] GET /models threw", e);
+    return null;
+  }
+}
+
 /** 建案卡片的服务/类别下拉数据源（describe-services，BFF 缓存）。失败/计划不足 → []。 */
 export interface SupportServiceCat { code: string; name: string }
 export interface SupportService { code: string; name: string; categories: SupportServiceCat[] }
@@ -346,6 +396,9 @@ function routeEvent(event: string, data: any, cb: StreamCallbacks) {
       break;
     case "usage":
       if (data?.usage) cb.onUsage?.(data.usage);
+      break;
+    case "model_substituted":
+      cb.onModelSubstituted?.(data ?? {});
       break;
     case "sources":
       cb.onSources?.(data?.sources ?? []);

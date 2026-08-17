@@ -17,7 +17,9 @@ import boto3
 logger = logging.getLogger("shared.model_config")
 
 _SSM_PARAMETER = "/notiops/agent/model_id"
-_ENV_DEFAULT = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-5")
+# `global.*` —— 与 CDK 写入 SSM 的值（global.anthropic.claude-sonnet-5）一致。
+# 此前这里是 us.*，只有在 SSM 与 env 都缺失时才暴露，属于隐蔽的地理路由分叉。
+_ENV_DEFAULT = os.environ.get("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5")
 _CACHE_TTL = 300  # 5 分钟
 
 _cached_model_id: str | None = None

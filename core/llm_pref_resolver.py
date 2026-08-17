@@ -4,8 +4,25 @@ Priority chain (per inbound message):
 
     1. group chat preference  (set via `@bot model X` in a group)
     2. DM preference          (set via `@bot model X` in a 1:1)
-    3. env default            (DEFAULT_LLM_PROVIDER CFN parameter)
-    4. fallback "claude"
+    3. admin default          (DDB model catalogue `default_model`, see core/llm_config.py)
+
+Converged 2026-08 (spec R8.2). The chain used to be
+`env DEFAULT_LLM_PROVIDER → SSM /notiops/agent/model_id → catalogue constant`,
+which silently out-ranked the admin-managed default: an admin changing the
+default model in the console saw no effect on IM. Both legacy levels are gone:
+
+  * `DEFAULT_LLM_PROVIDER` — verified absent from CDK and from the deployed ECS
+    task definition (a SAM-era leftover), so dropping it changes no live behaviour.
+  * SSM `/notiops/agent/model_id` — still read by `shared/model_config.py::
+    get_bot_model_id()`, but that value drives **internal utility calls**
+    (intent classification / next-steps / progress-card narration / case
+    classification / skill dispatch), all of which hand-roll an Anthropic
+    `invoke_model` body and therefore hard-assume a Claude model. It is a
+    different concern from the user's conversational model choice and is tracked
+    separately (spec R8).
+
+The DDB read is fail-safe: `llm_config` falls back to its builtin catalogue
+snapshot when DynamoDB is unreachable, so this chain never hard-fails.
 
 Storage layout (piggy-backs on the existing conversations DDB table,
 mirrors `core/locale_resolver.py`):
@@ -22,10 +39,10 @@ flip its model for that chat.
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 from . import ddb_state
+from . import llm_config
 from . import model_catalog
 
 logger = logging.getLogger(__name__)
@@ -37,38 +54,31 @@ _CHAT_PREF_TTL = 30 * 24 * 3600
 _DM_PREF_TTL = 30 * 24 * 3600
 
 
-def _env_default() -> str:
-    """Read DEFAULT_LLM_PROVIDER on every call so a CFN parameter
-    flip propagates without a process restart. Falls back to SSM
-    model config (Dashboard "IM Bot 模型" setting), then catalogue default.
+def _admin_default() -> str:
+    """The admin-managed default model, read fresh from the DDB catalogue on
+    every call (TTL-cached inside `llm_config`) so a console change propagates
+    without restarting the container.
 
-    Priority: env DEFAULT_LLM_PROVIDER → SSM /notiops/agent/model_id
-    (resolved to alias via catalog) → hardcoded "claude".
+    Delegates to `llm_config.default_alias()`, which applies two rules this
+    function used to get wrong by hand-rolling a `next(...)` over `cfg["models"]`:
+
+      * the entry must be **enabled** — otherwise the admin's "turn this model
+        off" would still hand it out as the default;
+      * `default_model` is a **global** setting, so it may name a model that is
+        not offered on this surface (Claude Haiku is web-chat only, for
+        instance). In that case it falls back to the first model enabled *here*
+        rather than returning an alias IM cannot resolve.
+
+    Returns a canonical alias (`claude-sonnet-5`). The short-alias bridge that
+    used to live here is gone: `model_catalog` is DDB-backed now (spec task 4.1)
+    and accepts canonical, short and legacy forms alike, so there is nothing
+    left to translate.
     """
-    raw = (os.environ.get("DEFAULT_LLM_PROVIDER") or "").strip().lower()
-    if raw and model_catalog.is_known(raw):
-        return raw
-
-    # Fall back to SSM-configured model (Dashboard "IM Bot 模型" tab).
-    # get_bot_model_id() returns a model_id string; if it's in the catalog
-    # return the alias, otherwise return the raw model_id itself — get()
-    # and is_known() both support raw model_ids via find_by_model_id fallback.
     try:
-        from shared.model_config import get_bot_model_id
-        ssm_model_id = get_bot_model_id()
-        if ssm_model_id:
-            entry = model_catalog.find_by_model_id(ssm_model_id)
-            if entry:
-                # If it's a catalogued model, return alias for consistency.
-                # If it's a dynamic fallback entry, return raw model_id so
-                # get() can re-resolve it (alias "claude" would map back to
-                # the hardcoded sonnet-4.6 entry, not the SSM value).
-                if entry.model_id == ssm_model_id:
-                    return ssm_model_id
-                return entry.alias
-    except Exception:
-        pass
-
+        return llm_config.default_alias()
+    except Exception as e:  # noqa: BLE001 — never block a reply on config read
+        logger.warning("admin default lookup failed (%s); using catalogue default",
+                       type(e).__name__)
     return model_catalog.DEFAULT_ALIAS
 
 
@@ -142,11 +152,14 @@ def resolve(*,
 
       - ``"chat"``     — group-level preference set via `@bot model X`
       - ``"dm"``       — 1:1 preference set in DM
-      - ``"env"``      — DEFAULT_LLM_PROVIDER CFN parameter
-      - ``"default"``  — final fallback to the catalogue default
+      - ``"default"``  — the admin-managed default (DDB catalogue)
 
     The `source` is only used for the `@bot model` (no-arg) reply so
     users see why a particular model is in effect.
+
+    ``"env"`` was retired in 2026-08 together with the env/SSM levels of the
+    priority chain (see module docstring); no caller compares the value, it is
+    only interpolated into the reply text.
     """
     if platform and chat_id and not is_dm:
         v = _read_alias(_k_chat(platform, chat_id))
@@ -158,10 +171,7 @@ def resolve(*,
         if v:
             return v, "dm"
 
-    env = _env_default()
-    if env != model_catalog.DEFAULT_ALIAS:
-        return env, "env"
-    return env, "default"
+    return _admin_default(), "default"
 
 
 # ---------------------------------------------------------------------------

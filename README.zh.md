@@ -41,13 +41,16 @@
   资源健康巡检、AWS Support 工单管理 —— 大白话进,带引用的答案出
 - 🔍 **即时调查**:一句话提问,拿到完整报告(markdown 摘要 + HTML + trace)——
   内部测试中通常约 1-3 分钟(随问题复杂度、账号规模与模型而变)
-- 🛎️ **主动观测**:6 类 EventBridge 信号源(CloudWatch / Health / Backup /
-  GuardDuty / Cost / Trusted Advisor),可独立开关
+- 🛎️ **主动观测**:10 类 EventBridge 信号源(CloudWatch / Health / 成本异常 /
+  Trusted Advisor / GuardDuty / Backup / EC2 Spot 中断预警 / Auto Scaling 启动失败 /
+  RDS / Config),每类可独立开关 —— 其中 5 类默认开启
 - 📋 **完整 AWS Support 工单管理**:创建 / 列表 / 查看 / 回复 /
   **智能分析**(对工单会话做 LLM 归纳) / 解决
 - 💬 **AWS 概念问答**:Bedrock + Knowledge MCP 检索官方文档,答案带 📚 来源引用
-- 🤖 **多模型切换**:按会话保存模型偏好,全部通过 **Amazon Bedrock** 接入
-  (托管的安全、合规与成本管控)
+- 🤖 **多模型切换**:由运维方管理的模型目录 —— 在 Admin 控制台里勾选本部署对外提供
+  哪些模型、设默认模型、指定后端任务用哪个模型,改完即时生效无需重新部署;用户侧
+  仍按会话保存自己的模型偏好。所有模型均通过 **Amazon Bedrock** 接入(托管的安全、
+  合规与成本管控),凭证可用 IAM 或 Bedrock API Key
 - 🌍 **双语**:中 / 英自动识别 + 显式切换
 - 🛡 **只读承诺**:三层防线(入站正则 / 系统提示 / 出站审计)—— 助手绝不改动你的云
 - 💬 **IM 渠道**:Slack / 飞书 全功能
@@ -103,9 +106,10 @@ cd sample-notiops
         │   health / notifier / cost)+ handlers │
         └──────┬────────────────────┬────────────┘
                ▼                    ▼
-        AWS 调查              EventBridge × 6
-        (via STS AssumeRole)  (CloudWatch / Health / Backup /
-                               GuardDuty / Cost Anomaly / TA)
+        AWS 调查              EventBridge × 10
+        (via STS AssumeRole)  (CloudWatch / Health / Cost Anomaly / TA /
+                               GuardDuty / Backup / EC2 Spot / ASG /
+                               RDS / Config)
 ```
 
 完整架构见

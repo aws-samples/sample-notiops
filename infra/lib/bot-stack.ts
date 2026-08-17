@@ -194,10 +194,21 @@ export class BotStack extends cdk.Stack {
       actions: [
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream",
-        // GPT-5.x via Bedrock Mantle Responses API. Endpoint is in
-        // a different region (us-east-2 / us-west-2 / us-gov-west-1)
-        // than the bot's runtime region; the Mantle service is
-        // account-scoped, no resource-ARN dimension.
+        // GPT-5.x via Bedrock Mantle Responses API. The endpoint is
+        // region-addressed and may differ from the bot's runtime region,
+        // so this is deliberately not narrowed by region: the admin can
+        // repoint a Mantle model at any allowlisted region at runtime
+        // (bff/web-chat/llm_config.mjs::MANTLE_REGIONS) without a redeploy,
+        // and an IAM grant narrower than that allowlist yields a config
+        // that saves but cannot be invoked.
+        //
+        // NOTE: an earlier version of this comment claimed Mantle "is
+        // account-scoped, no resource-ARN dimension". That is wrong --
+        // CreateInference takes a required `project` resource type (see
+        // service-authorization/latest/reference/list_bedrock-mantle.html,
+        // and the AWS managed policy AmazonBedrockMantleInferenceAccess,
+        // which scopes it to arn:aws:bedrock-mantle:*:*:project/*).
+        // `*` here is a deliberate width, not a forced one.
         "bedrock-mantle:CreateInference",
       ],
       resources: ["*"],
@@ -251,9 +262,16 @@ export class BotStack extends cdk.Stack {
     }));
 
     // Secrets Manager read (Feishu credentials via Dashboard UI)
+    // Bedrock API Key（spec R5.2 / task 4.5）：Admin 在 webchat 管理页存进 Secrets Manager，
+    // IM 侧 `core/bedrock_credentials` 读它并在 bedrock 客户端构造前注入
+    // `AWS_BEARER_TOKEN_BEDROCK`。缺此授权的失败模式是**静默的**：读 secret 被拒 → 回退
+    // IAM 角色 → 对话照常但 Key 永不生效。只读、只到这一个 secret（写入方是 BFF）。
     role.addToPrincipalPolicy(new iam.PolicyStatement({
       actions: ["secretsmanager:GetSecretValue"],
-      resources: [`arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/im-bot-feishu-*`],
+      resources: [
+        `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/im-bot-feishu-*`,
+        `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/bedrock-api-key-*`,
+      ],
     }));
 
     // MCP sidecars (pricing + cost) call AWS APIs using the task role's
@@ -331,10 +349,21 @@ export class BotStack extends cdk.Stack {
       actions: [
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream",
-        // GPT-5.x via Bedrock Mantle Responses API. Endpoint is in
-        // a different region (us-east-2 / us-west-2 / us-gov-west-1)
-        // than the bot's runtime region; the Mantle service is
-        // account-scoped, no resource-ARN dimension.
+        // GPT-5.x via Bedrock Mantle Responses API. The endpoint is
+        // region-addressed and may differ from the bot's runtime region,
+        // so this is deliberately not narrowed by region: the admin can
+        // repoint a Mantle model at any allowlisted region at runtime
+        // (bff/web-chat/llm_config.mjs::MANTLE_REGIONS) without a redeploy,
+        // and an IAM grant narrower than that allowlist yields a config
+        // that saves but cannot be invoked.
+        //
+        // NOTE: an earlier version of this comment claimed Mantle "is
+        // account-scoped, no resource-ARN dimension". That is wrong --
+        // CreateInference takes a required `project` resource type (see
+        // service-authorization/latest/reference/list_bedrock-mantle.html,
+        // and the AWS managed policy AmazonBedrockMantleInferenceAccess,
+        // which scopes it to arn:aws:bedrock-mantle:*:*:project/*).
+        // `*` here is a deliberate width, not a forced one.
         "bedrock-mantle:CreateInference",
       ],
       resources: ["*"],
@@ -384,6 +413,8 @@ export class BotStack extends cdk.Stack {
       actions: ["secretsmanager:GetSecretValue"],
       resources: [
         `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/slack-*`,
+        // Bedrock API Key（task 4.5）—— 见 Feishu 角色处的说明（失败模式为静默回退 IAM）。
+        `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/bedrock-api-key-*`,
       ],
     }));
     grantMcpReadOnly(slackRole);
@@ -457,10 +488,21 @@ export class BotStack extends cdk.Stack {
       actions: [
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream",
-        // GPT-5.x via Bedrock Mantle Responses API. Endpoint is in
-        // a different region (us-east-2 / us-west-2 / us-gov-west-1)
-        // than the bot's runtime region; the Mantle service is
-        // account-scoped, no resource-ARN dimension.
+        // GPT-5.x via Bedrock Mantle Responses API. The endpoint is
+        // region-addressed and may differ from the bot's runtime region,
+        // so this is deliberately not narrowed by region: the admin can
+        // repoint a Mantle model at any allowlisted region at runtime
+        // (bff/web-chat/llm_config.mjs::MANTLE_REGIONS) without a redeploy,
+        // and an IAM grant narrower than that allowlist yields a config
+        // that saves but cannot be invoked.
+        //
+        // NOTE: an earlier version of this comment claimed Mantle "is
+        // account-scoped, no resource-ARN dimension". That is wrong --
+        // CreateInference takes a required `project` resource type (see
+        // service-authorization/latest/reference/list_bedrock-mantle.html,
+        // and the AWS managed policy AmazonBedrockMantleInferenceAccess,
+        // which scopes it to arn:aws:bedrock-mantle:*:*:project/*).
+        // `*` here is a deliberate width, not a forced one.
         "bedrock-mantle:CreateInference",
       ],
       resources: ["*"],
@@ -499,6 +541,8 @@ export class BotStack extends cdk.Stack {
       actions: ["secretsmanager:GetSecretValue"],
       resources: [
         `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/dingtalk-*`,
+        // Bedrock API Key（task 4.5）—— 见 Feishu 角色处的说明（失败模式为静默回退 IAM）。
+        `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/bedrock-api-key-*`,
       ],
     }));
     grantMcpReadOnly(dingtalkRole);

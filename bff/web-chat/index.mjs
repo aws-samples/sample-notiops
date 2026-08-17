@@ -32,6 +32,7 @@ import { apiListRoles, apiSaveRole, apiDeleteRole, apiListUsers, apiPutUser, api
 import { isAccountVisible, filterVisibleAccounts, visibleAccountSet, listVisibility, getVisibility, putVisibility, deleteVisibility } from "./account_visibility.mjs";
 import { listMemberAccounts, onboardAccount, onboardStatus, setAccountEnabled, offboardAccount, associateDevopsAgent, devopsAgentAssocStatus, generateLaunchStackUrl, manualPayloadSave, testDaConnection } from "./member_accounts.mjs";
 import { apiGetNotificationConfig, apiPutNotificationConfig, apiTestNotificationSend } from "./feishu_config.mjs";
+import { apiGetLlmConfig, apiPutLlmConfig, apiGetCandidates, apiPutBedrockKey, apiTestLlmModel, apiListLlmAudit, apiRollbackLlmConfig, apiGetModels, apiGetBackendTasks, apiPutBackendTasks, apiGetLlmStatus, resolveForStream } from "./llm_config.mjs";
 
 const enc = new TextEncoder();
 const sse = (event, data) => enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -69,6 +70,15 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
   }
   const sub = claims.sub;
   const groups = claims["cognito:groups"] || [];
+
+  /** 审计用操作者上下文（spec R6.4：谁 / 何时 / 从哪改的）。 */
+  const actorOf = () => ({
+    sub,
+    username: claims["cognito:username"] || claims.email || claims.username || "",
+    groups,
+    ip: event.requestContext?.http?.sourceIp || "",
+    ua: event.requestContext?.http?.userAgent || "",
+  });
 
   try {
     // ── 统一授权门禁（安全边界；见 authz.mjs / spec 需求 2）──
@@ -196,6 +206,58 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
     if (method === "PUT" && path.endsWith("/admin/notification-config")) {
       const r = await apiPutNotificationConfig(authBody);
       return r.error ? json(r.status || 400, { message: r.error }) : json(200, r);
+    }
+
+    // ── Admin: LLM 模型目录与凭证（DDB llmcfg + Secrets；门禁同 /admin/.+ = nav:admin）──
+    // 注意顺序：更具体的子路径必须排在 /admin/llm-config 之前，否则 endsWith 匹配不到。
+    if (method === "GET" && path.endsWith("/admin/llm-config/candidates")) {
+      return json(200, await apiGetCandidates());
+    }
+    if (method === "PUT" && path.endsWith("/admin/llm-config/bedrock-key")) {
+      const r = await apiPutBedrockKey(authBody, actorOf());
+      return r.error ? json(r.status || 400, { message: r.error }) : json(200, r);
+    }
+    if (method === "POST" && path.endsWith("/admin/llm-config/test")) {
+      const r = await apiTestLlmModel(authBody);
+      return r.error ? json(r.status || 400, { message: r.error }) : json(200, r);
+    }
+    if (method === "POST" && path.endsWith("/admin/llm-config/rollback")) {
+      const r = await apiRollbackLlmConfig(authBody, actorOf());
+      return r.error ? json(r.status || 400, { message: r.error }) : json(200, r);
+    }
+    if (method === "GET" && path.endsWith("/admin/llm-config/audit")) {
+      return json(200, await apiListLlmAudit());
+    }
+    if (method === "GET" && path.endsWith("/admin/llm-config/status")) {
+      return json(200, await apiGetLlmStatus());
+    }
+    if (method === "GET" && path.endsWith("/admin/llm-config/backend-tasks")) {
+      return json(200, await apiGetBackendTasks());
+    }
+    if (method === "PUT" && path.endsWith("/admin/llm-config/backend-tasks")) {
+      const r = await apiPutBackendTasks(authBody, actorOf());
+      return r.error ? json(r.status || 400, { message: r.error }) : json(200, r);
+    }
+    if (method === "GET" && path.endsWith("/admin/llm-config")) {
+      return json(200, await apiGetLlmConfig());
+    }
+    if (method === "PUT" && path.endsWith("/admin/llm-config")) {
+      const r = await apiPutLlmConfig(authBody, actorOf());
+      if (r.error) {
+        // 同时回 `error` 与 `message`：前端历史上只读其中一个，只回一个就会把拒绝原因
+        // 静默丢成 `http_400`（实际发生过：管理员看不出是哪条不变量没满足）。
+        // 并且**记一行日志** —— 4xx 此前完全不记，CloudWatch 里查不到任何线索，
+        // 而配置校验失败恰恰是最需要事后追溯的一类请求。不记请求体（含目录全文）。
+        console.warn(`[BFF] 400 PUT /admin/llm-config rejected: ${r.error}`);
+        return json(r.status || 400, { error: r.error, message: r.error });
+      }
+      return json(200, r);
+    }
+
+    // ── 用户侧：可选模型（仅启用集；登录即可，见 authz LOGIN_ONLY）──
+    if (method === "GET" && path.endsWith("/models")) {
+      const surface = (event.queryStringParameters && event.queryStringParameters.surface) || "webchat";
+      return json(200, await apiGetModels(surface));
     }
 
     // ── Admin: 成员账号一键接入（Organizations + StackSets；门禁同 /admin/.+ = nav:admin）──
@@ -522,11 +584,31 @@ async function streamChat(event, responseStream, { sub, groups }) {
   }
   const text = (body.text || "").toString();
   const conversationId = (body.conversation_id || `conv-${Date.now()}`).toString();
-  const model = (body.model || "claude-sonnet-5").toString();
+  const requestedModel = (body.model || "").toString(); // 客户端意向，**未经准入**，勿直接下发
   const locale = body.locale === "en" ? "en" : "zh";
   const webSearch = body.web_search === true; // 用户本轮是否开启联网搜索
   const finopsAgent = body.finops_agent === true; // 本轮是否启用 FinOps Agent 深度模式（仅 FinOps 主题）
-  const devopsAgent = body.devops_agent === true; // 本轮是否启用 DevOps Agent 深度调查（仅故障调查主题）
+  // 「深度调查（直连）」：绕开 agent runtime，BFF 直接调 DevOps Agent API → 全程 0 token。
+  // 与 devopsAgent（老路径）**互斥**（前端也做了互斥），老客户端不传此字段 → 永远走老路。
+  //
+  // ⚠️ 唯一例外：「转人工支持」按钮。它是 prompt 型 followup，点击 = 在**同一会话**里再发一轮，
+  // 而直连开关仍然开着 → 会再落回直连；而直连没有模型，`escalate_to_support` 是 agent 侧工具，
+  // 于是那一轮只会把同一份报告再贴一遍就结束（现象：闪一下文字、然后没反应）。
+  // 按设计文档 §5 方案 (a)：这个按钮**本轮回退老（计费）路径**，并且必须把 devops_agent 打开，
+  // 否则 agent 那边 `_devops_agent_enabled` 门控会拒掉 `escalate_to_support`（main.py:1111）。
+  // 判据放在 devops_investigate.mjs 里与生成该 prompt 的代码同文件（改文案不会漂移）。
+  // import 失败不该让整个请求 500（此时 SSE 头还没建立，客户端只会看到裸错误）——退化成
+  // "不回退"，直连分支自己还有兜底文案。
+  let escalateFallback = false;
+  if (body.deep_investigate_direct === true) {
+    try {
+      escalateFallback = (await import("./devops_investigate.mjs")).isEscalateRequest(text);
+    } catch (e) {
+      console.error(`[BFF] /stream escalate-detect import failed — ${e?.name || ""}: ${e?.message || e}`);
+    }
+  }
+  const devopsAgent = body.devops_agent === true || escalateFallback; // DevOps Agent 深度调查（仅故障调查主题）
+  const directInvestigate = body.deep_investigate_direct === true && !escalateFallback;
   const topic = (body.topic || "general").toString(); // 会话主题（用于分类 + 未来按主题微调）
   const accountId = (body.account_id || "").toString(); // 多账号：本轮目标 AWS 账号（缺省=部署账号）
   const skillId = (body.skill_id || "").toString();     // 显式 /skill：本轮强制使用的 skill
@@ -541,6 +623,31 @@ async function streamChat(event, responseStream, { sub, groups }) {
     },
   });
 
+  // ── 服务端模型准入 + generation 注入（spec R3.5 / R4）──
+  // 客户端传来的 model 只当**意向**：可能是 admin 刚下架的别名、也可能是前端缓存里的旧值，
+  // 甚至可能是手搓请求点名未授权模型。一律以 DDB 目录的启用集为准，不在集内则换默认模型
+  // 并回一条 model_substituted 让前端把选择器纠正过来（静默替换会让用户以为自己还在用旧模型）。
+  // generation 也在此处由**服务端**读出后注入 payload —— 绝不接受客户端传值（可被污染致
+  // runtime 侧 TTL 兜底失效 + 放大 DDB 读）。
+  // 失败安全：目录读不出来（DDB 抖动 / 尚未 seed）不阻断对话 —— 退回客户端值 + generation 0，
+  // 由 runtime 侧内置兜底 + TTL 自行收敛。宁可用旧模型，不可让聊天不可用。
+  let model = requestedModel || "claude-sonnet-5";
+  let generation = 0;
+  try {
+    const picked = await resolveForStream(requestedModel, "webchat");
+    if (picked.alias) model = picked.alias;
+    generation = Number(picked.generation) || 0;
+    if (picked.substituted) {
+      stream.write(sse("model_substituted", {
+        requested: requestedModel,
+        effective: model,
+        reason: "not_in_enabled_set",
+      }));
+    }
+  } catch (e) {
+    console.error(`[BFF] /stream model resolve failed, falling back to client value — ${e?.name || ""}: ${e?.message || e}`);
+  }
+
   // 落库：会话（带主题）+ 用户消息
   await ensureConversation(sub, conversationId, text.slice(0, 24), topic);
   await appendMessage(conversationId, { role: "user", text, ts: Date.now() });
@@ -549,7 +656,36 @@ async function streamChat(event, responseStream, { sub, groups }) {
   const collectedSources = [];
   let usage; // 本轮 token 用量（agent 收尾发来）
 
-  if (agentRuntimeConfigured()) {
+  if (directInvestigate) {
+    // ── 深度调查（直连）：0 token 路径 ──
+    // 不经 agent runtime / Bedrock，BFF 直接调 DevOps Agent API（发起 + 轮询 journal + 读摘要
+    // + 落 HTML 报告）。SSE 事件与老路径同形，故前端渲染/右侧「调查过程」面板零改动复用。
+    // ⚠️ 老路径（agentRuntimeConfigured 分支）一行未改——新增分支置于其前，互不影响。
+    try {
+      const { runDirectInvestigation } = await import("./devops_investigate.mjs");
+      reply = await runDirectInvestigation({
+        text, locale, accountId,
+        emit: (evt, data) => {
+          // sources 与老路径一致地累积，供落库复用（历史回显时报告链接不丢）。
+          if (evt === "sources") {
+            for (const s of data?.sources || []) collectedSources.push(s);
+            stream.write(sse("sources", { sources: collectedSources }));
+            return;
+          }
+          if (evt === "usage") usage = data?.usage;
+          stream.write(sse(evt, data || {}));
+        },
+      });
+    } catch (e) {
+      console.error(`[BFF] /stream direct investigation failed — ${e?.name || ""}: ${e?.message || e}`, e?.stack || "");
+      if (!reply) {
+        reply = locale === "en"
+          ? "⚠️ The direct deep investigation failed to run. Please retry, or turn off “Deep Dive (Direct)” to use the standard Deep Dive."
+          : "⚠️ 深度调查（直连）执行失败。请重试，或关闭「深度调查（直连）」改用普通「深度调查」。";
+        stream.write(sse("token", { delta: reply }));
+      }
+    }
+  } else if (agentRuntimeConfigured()) {
     // ── Phase 1：调 AgentCore Runtime（Strands agent），透传流式 ──
     // 冷启动兜底：AgentCore runtime 空闲回收后下次请求会冷启动，若容器初始化 >30s
     // 会被 kill 并抛 "Runtime initialization time exceeded"（RuntimeClientError）——
@@ -616,7 +752,7 @@ async function streamChat(event, responseStream, { sub, groups }) {
       try {
         reply = await invokeAgent(
           // allowedAccounts：可见性 RBAC 下发给 agent，防 prompt 点名账号绕过门禁
-          { conversationId, prompt: text, model, locale, webSearch, finopsAgent, devopsAgent, topic, accountId,
+          { conversationId, prompt: text, model, generation, locale, webSearch, finopsAgent, devopsAgent, topic, accountId,
             allowedAccounts: await (async () => {
               // eff 在本函数作用域内自行计算（此前误引用 handler 作用域变量 → ReferenceError
               // 被重试循环吞掉 → 前端 "(no response)"。事故根因，勿再跨作用域引用。）

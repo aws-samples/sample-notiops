@@ -19,6 +19,7 @@ import os
 import threading
 
 import boto3
+from core.lazy_boto import LazyClient
 from botocore.exceptions import ClientError
 
 from shared.model_config import get_bot_model_id
@@ -27,7 +28,10 @@ logger = logging.getLogger(__name__)
 
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
 
-_bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+# 惰性构造（core/lazy_boto.py）：botocore 在**构造时**快照凭证，import 期建好的
+# client 会让后续 setenv AWS_BEARER_TOKEN_BEDROCK 完全失效（Bedrock API Key 模式
+# 因此无法生效）。代理转发属性访问，所有调用点写法不变。
+_bedrock = LazyClient("bedrock-runtime", region=BEDROCK_REGION)
 _support = boto3.client("support", region_name="us-east-1")
 
 # Safe fallback when classification fails. These are guaranteed to exist

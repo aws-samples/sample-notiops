@@ -115,7 +115,7 @@ CDK 部署三个栈,`./setup.sh` 走 `cdk deploy --all` 一次部到位。**Web 
 
 | 栈(CDK 名) | 必选 | 部署内容 |
 |---|---|---|
-| **`notiops-*`** | ✅ 必选 | Lambda × 5(collector / analyzer / health-checker / notifier / cost-analyzer)、共享 DDB 表、S3 报告 bucket、EventBridge rules(6 个 push 事件源 + notiops schedules)、agent-trigger Role(供 STS AssumeRole) |
+| **`notiops-*`** | ✅ 必选 | Lambda × 5(collector / analyzer / health-checker / notifier / cost-analyzer)、共享 DDB 表、S3 报告 bucket、EventBridge rules(5 条 IM push 规则 + 10 条 web 通知规则 + notiops schedules)、agent-trigger Role(供 STS AssumeRole) |
 | **`WebChatStack`** | ✅ 默认部署 | 浏览器端 agentic AI 助手(**产品主入口**):BFF Lambda(`notiops-web-chat-bff`)+ Function URL(`AWS_IAM`)、DDB 单表 `notiops-web-chat`(会话/消息 + 通知收件箱)、静态前端(chat-app)、通知 handler。BFF 通过 `-c agentRuntimeArn` 注入上一步 agent 的 Runtime ARN |
 | **`BotStack`** | ✅ 部署(IM 可选) | VPC + Public Subnets、ECS Cluster(512 CPU / 1024 MB per task)、ECR repo、被勾选的 IM 平台 Fargate Service(v1: 飞书 / Slack)、**每个 task 内含 pricing + cost MCP sidecar**、Task Role、Security Group。**未选任何 IM 时该栈仍部署,但所有 bot `desiredCount=0`,不起容器、不计费** |
 

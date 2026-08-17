@@ -168,12 +168,22 @@ def _get_provider(force_refresh: bool = False) -> str:
 
 
 def reset_cache() -> None:
-    """测试用 / 强制刷新 provider 选择(管理员页保存配置后立刻生效)。"""
+    """测试用 / 强制刷新 provider 选择(管理员页保存配置后立刻生效)。
+
+    也清 credential_mode 与 Bedrock Key 缓存 —— 三者都是「Admin 一保存就该生效」的配置，
+    只清其中一部分会让调用方拿到半新半旧的组合（例如新 provider 配旧凭证方式）。
+    """
     global _cached_provider, _cached_provider_ts, _cached_litellm, _cached_litellm_ts
+    global _cached_cred_mode, _cached_cred_mode_ts
+    global _cached_bedrock_key, _cached_bedrock_key_ts
     _cached_provider = None
     _cached_provider_ts = 0.0
     _cached_litellm = None
     _cached_litellm_ts = 0.0
+    _cached_cred_mode = None
+    _cached_cred_mode_ts = 0.0
+    _cached_bedrock_key = None
+    _cached_bedrock_key_ts = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +248,54 @@ _cached_bedrock_key: str | None = None
 _cached_bedrock_key_ts: float = 0.0
 
 
+_CONFIG_TABLE_ENV = "CONFIG_TABLE"
+_LLMCFG_PK = "llmcfg"
+_LLMCFG_SK = "meta"
+_cached_cred_mode: str | None = None
+_cached_cred_mode_ts: float = 0.0
+
+
+def _credential_mode() -> str:
+    """Admin 配的凭证方式："iam" | "api_key"（TTL 缓存，读不到一律当 "iam"）。
+
+    为什么后端任务也必须看这个开关：在此之前本模块只判断「`BEDROCK_API_KEY_SECRET_ARN`
+    有值且 Secret 非空」就用 Key，而那个 env 是 CDK **无条件**注入的。于是管理员把开关
+    拨回 IAM 却保留 Key（这正是「先停用、别销毁」的标准做法）时，对话侧走 IAM、PHD 翻译
+    与报告精简走 Key —— 同一份目录、两个 caller 身份，正是 spec R5.2 要消灭的不一致。
+    对话侧（`core/llm_config.get_bedrock_api_key`）与 BFF 探测（`probeCredential`）都已按
+    这个开关判断，本模块是最后一处漏的。
+
+    读不到就当 "iam"：那是**不使用** Key 的一侧，失败方向保守（宁可回退部署角色，
+    也不要在管理员以为已停用 Key 的情况下继续拿它计费与鉴权）。
+    """
+    global _cached_cred_mode, _cached_cred_mode_ts
+    now = time.time()
+    if _cached_cred_mode is not None and (now - _cached_cred_mode_ts) < 300:
+        return _cached_cred_mode
+
+    table = os.environ.get(_CONFIG_TABLE_ENV, "")
+    if not table:
+        # 没有配置表的部署（老栈 / 单测）：保持历史行为，不因为读不到开关而砍掉 Key，
+        # 否则升级过程中后端任务会突然从 Key 静默切回 IAM。
+        _cached_cred_mode, _cached_cred_mode_ts = "api_key", now
+        return "api_key"
+    try:
+        import boto3 as _b
+        item = _b.resource("dynamodb").Table(table).get_item(
+            Key={"PK": _LLMCFG_PK, "SK": _LLMCFG_SK}).get("Item") or {}
+        mode = str(item.get("credential_mode") or "iam")
+    except Exception as e:  # noqa: BLE001 — 配置读失败不得中断推送
+        logger.warning("read credential_mode failed, assuming iam: %s", e)
+        mode = "iam"
+    _cached_cred_mode, _cached_cred_mode_ts = mode, now
+    return mode
+
+
 def _get_bedrock_api_key() -> str | None:
     global _cached_bedrock_key, _cached_bedrock_key_ts
+    # 开关不在 api_key 时连 Secret 都不读 —— 与 core/llm_config.get_bedrock_api_key 同款语义。
+    if _credential_mode() != "api_key":
+        return None
     now = time.time()
     if _cached_bedrock_key is not None and (now - _cached_bedrock_key_ts) < 300:
         return _cached_bedrock_key or None
@@ -263,6 +319,72 @@ def _get_bedrock_api_key() -> str | None:
         return None
 
 
+# 「凭证本身不被认可」的判据 —— 与 `core/llm_config.is_credential_rejected` 同一份逻辑。
+#
+# 为什么在这里重写一遍而不是 import：PHD Lambda 的打包是否含 `core/` 没有确认过，而这条
+# 判据是失效功能的核心，不能靠一个可能缺失的 import。`_invalidate_bedrock_api_key` 里那次
+# lazy import 只用来发指标，缺了可以降级；这里缺了功能就没了。
+#
+# **实测形状**（us-east-2，2026-08，本部署账号）：
+#   Converse + 已吊销 Key → 403 AccessDeniedException
+#       "Authentication failed: Please make sure your API Key is valid."
+#   Converse + 授权不足   → 403 AccessDeniedException
+#       "User: arn:... is not authorized to perform: bedrock:InvokeModel on resource: ..."
+#   Mantle   + 已吊销 Key → 401 invalid_api_key
+# 两种 403 共用同一个 code，只有 message 能区分。第一版「只认 401、绝不认 403」因此让
+# Converse 侧的失效永远不触发 —— 死 Key 在那条路上根本不回 401。
+_AUTH_FAIL_CODES = frozenset({
+    "UnrecognizedClientException",
+    "InvalidSignatureException",
+    "ExpiredTokenException",
+    "UnauthorizedException",
+    "HttpAuthenticationException",
+})
+_CREDENTIAL_DEAD_PHRASE = "authentication failed"
+_AUTHZ_DENIED_PHRASE = "is not authorized to perform"
+
+
+def _is_credential_rejected(status, code: str = "", message: str = "") -> bool:
+    """凭证本身不成立（而非授权不足 / 限流 / 参数错）。与 core 侧同语义。
+
+    message 只用于判断，绝不回传或落日志（可能含账号 / 资源 ARN，spec R5.5）。
+    """
+    if status == 401:
+        return True
+    if code in _AUTH_FAIL_CODES:
+        return True
+    if status == 403 and code == "AccessDeniedException":
+        low = (message or "").lower()
+        if _AUTHZ_DENIED_PHRASE in low:
+            return False
+        return _CREDENTIAL_DEAD_PHRASE in low
+    return False
+
+
+def _invalidate_bedrock_api_key() -> None:
+    """Key 被拒时失效**本模块的** Key 缓存（spec R7.2）。
+
+    为什么这里要单独实现一份：后端任务（PHD 翻译 / 报告精简）不走 `core/llm_config`，
+    它有上面那份独立的 `_cached_bedrock_key` + 300s TTL。只调 core 的
+    `invalidate_api_key()` 清不掉这一份，Key 轮换后这个 Lambda 仍会用旧 Key 直到 TTL 到期。
+
+    分两步且顺序固定：
+      1. 清本地缓存 —— 纯内存赋值，不可能失败，所以放在前面，保证核心效果一定达成；
+      2. 借 core 发 KeyAuthFail 指标 —— best-effort。PHD Lambda 的打包是否含 `core/`
+         没有确认过（`shared/report_delivery/*` 有 import core 的先例，但那是另一个 Lambda），
+         所以用分支内 lazy import + 吞异常降级：拿不到指标可以接受，丢掉失效不行。
+    """
+    global _cached_bedrock_key, _cached_bedrock_key_ts
+    _cached_bedrock_key = None
+    _cached_bedrock_key_ts = 0.0
+    try:
+        from core import llm_config as _core_llm_config
+        _core_llm_config.invalidate_api_key()
+    except Exception:  # noqa: BLE001 -- 指标是可选的，失效才是必须的
+        logger.warning("bedrock api key rejected (401); local cache cleared, "
+                       "KeyAuthFail metric not emitted (core/ unavailable)")
+
+
 def _invoke_bedrock(
     model_id: str,
     system_prompt: str,
@@ -277,6 +399,9 @@ def _invoke_bedrock(
 
     client = boto3.client("bedrock-runtime", config=_bedrock_config)
     try:
+        # Converse 分支。只在 bedrock-mantle 上架的模型走 _invoke_mantle_responses,
+        # 由 invoke_llm 按目录的 `kind` 分派 —— 那些模型在这里会报
+        # `ValidationException: The provided model identifier is invalid`。
         response = client.converse(
             modelId=model_id,
             system=[{"text": system_prompt}],
@@ -284,12 +409,18 @@ def _invoke_bedrock(
             inferenceConfig={"maxTokens": max_tokens},
         )
     except ClientError as e:
+        err = e.response.get("Error", {})
         logger.error(
             "Bedrock converse failed: code=%s message=%s model=%s",
-            e.response["Error"]["Code"],
-            e.response["Error"]["Message"],
+            err.get("Code"),
+            err.get("Message"),
             model_id,
         )
+        # 只有实际用了 Key 才可能是 Key 被拒；IAM 模式下这是执行角色的问题，与 Key 无关。
+        status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if api_key and _is_credential_rejected(status, err.get("Code") or "",
+                                               err.get("Message") or ""):
+            _invalidate_bedrock_api_key()
         raise
 
     output = response.get("output", {})
@@ -302,6 +433,164 @@ def _invoke_bedrock(
     if stop_reason == "max_tokens":
         content += _TRUNCATION_NOTICE
 
+    return {"content": content, "stop_reason": stop_reason, "usage": usage}
+
+
+# ---------------------------------------------------------------------------
+# Bedrock Mantle(OpenAI Responses 协议)
+# ---------------------------------------------------------------------------
+#
+# 为什么需要这条分支：Bedrock 上有一批模型**只在 `bedrock-mantle` 端点提供**，
+# 不在 `bedrock-runtime` 上，因此 Converse 根本调不到。实测(us-east-2)：
+#     Converse(openai.gpt-5.6-terra)    → ValidationException: The provided
+#                                          model identifier is invalid
+#     Converse(openai.gpt-oss-120b-1:0) → 200 OK    ← 对照组
+# 也就是说这不是「OpenAI 家族不支持 Converse」，而是**具体模型在哪个端点上架**的
+# 问题。GPT-5.6 Terra 的 model card 里 Programmatic Access 只有 bedrock-mantle
+# 一行，Geo / Global inference ID 均为 Not supported，可以对上。
+#
+# 在这条分支之前，对话侧(webchat / IM)早就能用这些模型了，后端任务侧(PHD 翻译 /
+# 报告精简)却不能 —— 因为后端只有 `client.converse()` 一条路。同一个模型目录，
+# 两端能力不一致，管理员在 Admin 里看到的就是「加进来了但后端下拉是灰的」。
+# 这条分支把两端补齐：目录里任何 Bedrock 模型，两端都能用。
+#
+# 与对话侧 `core/openai_responses_client.py` 的差别（有意为之，不是重复实现）：
+#   · 后端任务是**单轮无工具**调用，因此不传 tools / previous_response_id，
+#     也就用不到 Responses 的服务端会话状态；
+#   · 既然用不到，就显式 `store: false` —— 默认 `true` 会让提示词与回复在**请求
+#     源区**留存 30 天(见 Responses API 文档)。对话侧不能这么设(它靠
+#     previous_response_id 串多轮)，后端侧可以，白拿一个数据留存收益；
+#   · `max_output_tokens` 由调用方传入，而对话侧固定 8000。
+
+_MANTLE_KIND = "bedrock_mantle_responses"
+
+# Mantle 端点所在区域白名单。**必须白名单**：region 来自 DDB 模型目录（Admin 可写），
+# 直接插进 hostname 等于把请求目标交给配置数据决定 —— 白名单把它限制在 AWS 自家域名内。
+# 名单取自 Responses API 文档的 "Supported Regions and Endpoints"。
+_MANTLE_REGIONS = frozenset({
+    "us-east-1", "us-east-2", "us-west-2",
+    "ap-northeast-1", "ap-south-1", "ap-southeast-2", "ap-southeast-3",
+    "eu-central-1", "eu-north-1", "eu-south-1", "eu-west-1", "eu-west-2",
+    "sa-east-1", "us-gov-west-1",
+})
+_MANTLE_REGION_DEFAULT = "us-east-2"
+_MANTLE_TIMEOUT_SECONDS = 300
+
+
+def _mantle_region(region: str) -> str:
+    """校验并归一化 Mantle 区域。非白名单值一律回退到默认区并留日志。
+
+    回退而不抛异常：后端任务的契约是「配置问题不能阻断推送」——一条 PHD 通知晚发
+    或换个区发，都比不发好。但必须留 WARNING，否则拼错的 region 会静默生效。
+    """
+    r = (region or "").strip()
+    if r in _MANTLE_REGIONS:
+        return r
+    if r:
+        logger.warning(
+            "mantle region %r is not a known Mantle endpoint region; "
+            "falling back to %s", r, _MANTLE_REGION_DEFAULT,
+        )
+    return _MANTLE_REGION_DEFAULT
+
+
+def _mantle_text(response: dict) -> str:
+    """从 Responses 载荷里取助手可见文本。
+
+    形如 `{"output": [{"type": "reasoning"...}, {"type": "message",
+    "content": [{"type": "output_text", "text": "..."}]}]}`。
+
+    这里**不做**对话侧那套 protocol-leak / spam 清洗：那些事故都由**工具调用参数
+    被 token 上限截断**触发（见 core/openai_responses_client._looks_like_protocol_leak
+    的案例注释），而后端任务不传 tools，进不了那条路径。少一层清洗也就少一个
+    「翻译结果被静默丢弃」的失败模式。
+    """
+    parts: list[str] = []
+    for block in response.get("output") or []:
+        if block.get("type") != "message":
+            continue
+        for sub in block.get("content") or []:
+            if sub.get("type") == "output_text" and sub.get("text"):
+                parts.append(sub["text"])
+    return "\n".join(parts).strip()
+
+
+def _invoke_mantle_responses(
+    model_id: str,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+    region: str,
+) -> dict:
+    """单轮 Responses API 调用，返回与 `_invoke_bedrock` 完全一致的三键结构。
+
+    凭证：配了 Bedrock API Key 就发 `Authorization: Bearer <key>`（文档里 Mantle 的
+    推荐认证方式，对应 IAM 动作 `bedrock-mantle:CallWithBearerToken`）；没配则用
+    SigV4 签名，签名服务名 `bedrock`（与对话侧 core/openai_responses_client 一致，
+    那条已在生产验证）。这样 Key 语义在对话侧与后端侧终于统一 —— 之前后端只有 IAM。
+    """
+    region = _mantle_region(region)
+    url = f"https://bedrock-mantle.{region}.api.aws/openai/v1/responses"
+
+    body: dict = {
+        "model": model_id,
+        "input": user_prompt,
+        "max_output_tokens": max_tokens,
+        # 单轮无工具 → 不需要服务端会话状态。关掉可避免 30 天源区留存。
+        "store": False,
+    }
+    if system_prompt:
+        body["instructions"] = system_prompt
+    body_bytes = json.dumps(body).encode("utf-8")
+
+    headers = {"Content-Type": "application/json"}
+    api_key = _get_bedrock_api_key()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        req = urllib.request.Request(url, data=body_bytes, method="POST",
+                                     headers=headers)
+    else:
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        creds = boto3.Session().get_credentials().get_frozen_credentials()
+        signed = AWSRequest(method="POST", url=url, data=body_bytes,
+                            headers=headers)
+        SigV4Auth(creds, "bedrock", region).add_auth(signed)
+        prepared = signed.prepare()
+        req = urllib.request.Request(prepared.url, data=prepared.body,
+                                     method=prepared.method)
+        for k, v in prepared.headers.items():
+            req.add_header(k, v)
+
+    try:
+        with safe_urlopen(req, timeout=_MANTLE_TIMEOUT_SECONDS) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:500]
+        logger.error("Mantle responses failed: status=%s model=%s detail=%s",
+                     e.code, model_id, detail)
+        # 同 Converse 分支：只有真用了 Bearer 才可能是 Key 被拒，且只认 401。
+        if api_key and e.code == 401:
+            _invalidate_bedrock_api_key()
+        raise
+
+    content = _mantle_text(payload)
+    # Responses 用 `status` + `incomplete_details.reason` 表达截断，Bedrock 用
+    # `stopReason == "max_tokens"`。映射成后者，上游那套 _TRUNCATION_NOTICE /
+    # 截断判定就不用为第二种协议再写一遍。
+    reason = str(((payload.get("incomplete_details") or {}).get("reason") or ""))
+    stop_reason = "max_tokens" if reason == "max_output_tokens" else str(
+        payload.get("status") or "")
+    if stop_reason == "max_tokens":
+        content += _TRUNCATION_NOTICE
+
+    # usage 字段名对齐 Bedrock（调用方与既有测试都按 inputTokens/outputTokens 读）。
+    u = payload.get("usage") or {}
+    usage = {
+        "inputTokens": u.get("input_tokens", 0),
+        "outputTokens": u.get("output_tokens", 0),
+        "totalTokens": u.get("total_tokens", 0),
+    }
     return {"content": content, "stop_reason": stop_reason, "usage": usage}
 
 
@@ -435,6 +724,8 @@ def invoke_llm(
     system_prompt: str,
     user_prompt: str,
     max_tokens: int = 16000,
+    kind: str = "",
+    region: str = "",
 ) -> dict:
     """统一 LLM 调用入口,根据 SSM 中的 provider 选择走 Bedrock 或 LiteLLM。
 
@@ -444,21 +735,46 @@ def invoke_llm(
         system_prompt: 系统提示词
         user_prompt: 用户提示词
         max_tokens: 最大输出 token 数
+        kind: 模型目录里的 `kind`。`bedrock_mantle_responses` → 走 Mantle 的
+              Responses 协议；其余(含空值)→ Converse。
+              **不从 model_id 猜**：靠前缀猜会在目录换代时静默走错端点，而走错端点
+              的表现是 `ValidationException: model identifier is invalid`,看起来像
+              「模型不存在」,归因成本很高。缺省即 Converse,与历史行为一致。
+        region: Mantle 专用。模型只在特定区域上架(如 GPT-5.6 Terra 仅 us-east-1 /
+                us-east-2 / us-west-2),故区域是目录数据的一部分。非 Mantle 时忽略。
 
     Returns:
         {"content": str, "stop_reason": str, "usage": dict}
-        usage 字段名与 Bedrock 一致(inputTokens / outputTokens / totalTokens)。
+        usage 字段名与 Bedrock 一致(inputTokens / outputTokens / totalTokens),
+        三条协议分支都已归一到这个形状。
 
     Raises:
         ClientError: Bedrock 调用失败(限流、模型不可用)
+        HTTPError: Mantle 端点返回非 2xx
         LiteLLMConfigError: 选择 LiteLLM 但配置不完整
         LiteLLMHTTPError: LiteLLM 端点返回非 2xx 或非 JSON
+
+    协议覆盖:
+        Converse(bedrock-runtime) / Responses(bedrock-mantle) /
+        Chat Completions(LiteLLM)。**目录里任何 Bedrock 模型,后端任务都能绑** ——
+        这一点与对话侧(webchat / IM)现在是对齐的。曾经不对齐:后端只有 Converse
+        一条路,于是 Admin 的「后端任务模型」下拉里 Mantle-only 的模型是灰的,而同
+        一个模型在对话里明明能用。改动同时放宽了两处判定:
+          · bff/web-chat/llm_config.mjs  validateConfig
+          · frontend/chat-app/src/components/AdminPanel.tsx  backendEligible
+        再加协议时,这三处要一起动。
     """
     provider = _get_provider()
     logger.info(
-        "invoke_llm provider=%s model=%s sys_len=%d user_len=%d max_tokens=%d",
-        provider, model_id, len(system_prompt), len(user_prompt), max_tokens,
+        "invoke_llm provider=%s model=%s kind=%s region=%s sys_len=%d "
+        "user_len=%d max_tokens=%d",
+        provider, model_id, kind or "converse", region or "-",
+        len(system_prompt), len(user_prompt), max_tokens,
     )
     if provider == "litellm":
         return _invoke_litellm(model_id, system_prompt, user_prompt, max_tokens)
+    if kind == _MANTLE_KIND:
+        return _invoke_mantle_responses(
+            model_id, system_prompt, user_prompt, max_tokens, region,
+        )
     return _invoke_bedrock(model_id, system_prompt, user_prompt, max_tokens)

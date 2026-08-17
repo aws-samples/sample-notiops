@@ -481,7 +481,10 @@ async function _deepDiveInsight(scenario, rows, period) {
 Rows (top 40): ${JSON.stringify(rows.slice(0, 40))}
 Return ONLY the JSON object, no markdown, no prose.`;
     const resp = await bedrock.send(new ConverseCommand({
-      modelId: "us.anthropic.claude-sonnet-5",
+      // 注：这里的 model 是**硬编码**、不走 llmcfg 目录 —— 它是 dashboard 洞察生成，
+      // 不是用户可选的对话模型。已与目录口径对齐到 global.*（决策 2026-07）。
+      // 若要纳入 Admin 管理，应作为一类 backend_task 加进目录，而不是在这里各自写死。
+      modelId: "global.anthropic.claude-sonnet-5",
       messages: [{ role: "user", content: [{ text: prompt }] }],
       inferenceConfig: { maxTokens: 1000, temperature: 0 },
     }));
@@ -564,7 +567,10 @@ async function _tagCostInsight(tagKey, tagValue, rows, totalUsd, period) {
 Rows (top 40): ${JSON.stringify(rows.slice(0, 40))}
 Return ONLY the JSON object, no markdown, no prose.`;
     const resp = await bedrock.send(new ConverseCommand({
-      modelId: "us.anthropic.claude-sonnet-5",
+      // 注：这里的 model 是**硬编码**、不走 llmcfg 目录 —— 它是 dashboard 洞察生成，
+      // 不是用户可选的对话模型。已与目录口径对齐到 global.*（决策 2026-07）。
+      // 若要纳入 Admin 管理，应作为一类 backend_task 加进目录，而不是在这里各自写死。
+      modelId: "global.anthropic.claude-sonnet-5",
       messages: [{ role: "user", content: [{ text: prompt }] }],
       inferenceConfig: { maxTokens: 700, temperature: 0 },
     }));

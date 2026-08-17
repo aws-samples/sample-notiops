@@ -85,8 +85,33 @@ _SERVERS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# 子进程环境：剥离注入型凭证（spec R6.5.3）
+# ---------------------------------------------------------------------------
+# `_server_env()` 以 `dict(os.environ)` 起步，也就是**全量继承**父进程环境。这在引入
+# Bedrock API Key 之后变成一个真实问题：Key 的注入方式是在父进程里
+# `os.environ["AWS_BEARER_TOKEN_BEDROCK"] = <key>` 然后构造 client（botocore 在构造时
+# 快照 token）。IM bot 是长驻 ECS 进程，一旦设过，之后 spawn 的**每个** MCP 子进程都会
+# 继承它 —— 其中包括 aws-api-mcp-server，而它再 spawn 的 `aws` CLI 又继承一层。
+# 那条链的输入是 LLM 生成的命令，也就是任何进入模型上下文的内容都能操纵它。
+#
+# 所以显式 pop。用前缀匹配而不是写死一个名字：`AWS_BEARER_TOKEN_<SERVICE>` 是 botocore
+# 的通用 bearer 机制，将来任何服务的 bearer token 都会落进同一个模式。
+# **不动** AWS_ACCESS_KEY_ID / SECRET / SESSION_TOKEN —— 子进程要靠它们以任务角色身份
+# 调 AWS，那是设计意图；它们的权限上限由 IAM 控制，不是靠这里剥。
+_INJECTED_CREDENTIAL_PREFIXES = ("AWS_BEARER_TOKEN_",)
+
+
+def _strip_injected_credentials(env: dict) -> dict:
+    """就地移除我们主动注入到父进程的凭证，返回同一个 dict（便于链式调用）。"""
+    for name in [k for k in env
+                 if k.upper().startswith(_INJECTED_CREDENTIAL_PREFIXES)]:
+        env.pop(name, None)
+    return env
+
+
 def _server_env() -> dict:
-    env = dict(os.environ)
+    env = _strip_injected_credentials(dict(os.environ))
     env.setdefault("AWS_REGION", _REGION)
     env.setdefault("AWS_DEFAULT_REGION", _REGION)
     env["FASTMCP_LOG_LEVEL"] = "ERROR"

@@ -50,14 +50,20 @@ on-call engineers without granting write access.
 - 🔍 **Ad-hoc investigation**: ask a single sentence, get a complete report
   (markdown summary + HTML + trace) — typically ~1-3 minutes in internal testing
   (varies with query complexity, account size, and model)
-- 🛎️ **Proactive observation**: 6 EventBridge sources (CloudWatch / Health /
-  Backup / GuardDuty / Cost / Trusted Advisor), independently switchable
+- 🛎️ **Proactive observation**: 10 EventBridge sources (CloudWatch / Health /
+  Cost Anomaly / Trusted Advisor / GuardDuty / Backup / EC2 Spot interruption /
+  Auto Scaling launch failure / RDS / Config), each independently switchable —
+  five are on by default
 - 📋 **Full AWS Support case management**: create / list / view / reply /
   **smart-analyze** (LLM rollup of the case thread) / resolve
 - 💬 **AWS concept Q&A**: Bedrock + Knowledge MCP for official-doc retrieval,
   answers carry 📚 source citations
-- 🤖 **Multi-LLM switching**: per-session model preference, all served through
-  **Amazon Bedrock** (managed security, compliance, and cost controls)
+- 🤖 **Multi-LLM switching**: an operator-managed model catalogue — pick which
+  models your deployment offers, set the default, and choose the models used by
+  backend tasks, all from the Admin console with no redeploy. Users keep a
+  per-session model preference. Every model is served through **Amazon Bedrock**
+  (managed security, compliance, and cost controls), on either IAM or a Bedrock
+  API key
 - 🌍 **Bilingual**: Chinese / English auto-detect + explicit switching
 - 🛡 **Zero-Change Promise**: 3-layer defense (inbound regex / system prompt /
   outbound audit) — the assistant never mutates your cloud
@@ -120,9 +126,10 @@ Web console (browser)        Customer IM (Slack / Feishu)
         │   health / notifier / cost) + handlers │
         └──────┬────────────────────┬────────────┘
                ▼                    ▼
-        AWS investigation     EventBridge × 6
-        (via STS AssumeRole)  (CloudWatch / Health / Backup /
-                               GuardDuty / Cost Anomaly / TA)
+        AWS investigation     EventBridge × 10
+        (via STS AssumeRole)  (CloudWatch / Health / Cost Anomaly / TA /
+                               GuardDuty / Backup / EC2 Spot / ASG /
+                               RDS / Config)
 ```
 
 Full architecture in

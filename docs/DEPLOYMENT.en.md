@@ -114,7 +114,7 @@ CDK deploys three stacks in one shot via `cdk deploy --all`. **Web Chat (the bro
 
 | Stack (CDK name) | Required | Contents |
 |---|---|---|
-| **`notiops-*`** | ✅ Required | 5 Lambdas (collector / analyzer / health-checker / notifier / cost-analyzer), shared DDB tables, S3 report bucket, EventBridge rules (6 push sources + notiops schedules), agent-trigger Role (for STS AssumeRole) |
+| **`notiops-*`** | ✅ Required | 5 Lambdas (collector / analyzer / health-checker / notifier / cost-analyzer), shared DDB tables, S3 report bucket, EventBridge rules (5 IM push rules + 10 web notification rules + notiops schedules), agent-trigger Role (for STS AssumeRole) |
 | **`WebChatStack`** | ✅ Deployed by default | The browser-based agentic AI assistant (**the product's main entry**): BFF Lambda (`notiops-web-chat-bff`) + Function URL (`AWS_IAM`), single DDB table `notiops-web-chat` (sessions/messages + notification inbox), static frontend (chat-app), notification handler. The BFF gets the previous step's agent Runtime ARN injected via `-c agentRuntimeArn` |
 | **`BotStack`** | ✅ Deployed (IM optional) | VPC + public subnets, ECS Cluster (512 CPU / 1024 MB per task), ECR repo, one Fargate Service per selected IM platform (v1: Feishu / Slack), **each task bundles pricing + cost MCP sidecars**, Task Role, Security Group. **If no IM is selected the stack still deploys, but every bot runs at `desiredCount=0` — no containers, no cost** |
 

@@ -72,6 +72,18 @@ export const GENERAL_TAG: TopicDef = { key: "general", labelKey: "topic.general"
 export const tagDef = (k?: string): TopicDef =>
   TOPICS.find((t) => t.key === k) ?? GENERAL_TAG;
 
+// ── 「深度调查」（DevOps Agent）的主题适用范围 ────────────────────────────────
+// **口径：默认提供，按例外排除**（不是按主题白名单开启）。深度调查是一条与主题解耦的
+// 通用能力，以后新增主题应**自动继承**它 —— 所以这里列的是**不提供**它的主题。
+// 排除理由：general 通用会话不给入口；cases 是 Support Case 生命周期管理、不是环境排障；
+// whats-new 读 AWS 资讯、与用户环境无关。
+// ⚠️ 必须与后端 `main.py` 的 `_DEVOPS_TOPICS_EXCLUDED` **保持一致**：只改一边会造成
+// 「开关亮着但后端没挂工具」的静默失效。此前该判断在前后端共有三份硬编码字符串。
+const DEVOPS_TOPICS_EXCLUDED: ReadonlySet<string> = new Set(["general", "cases", "whats-new"]);
+
+export const topicHasDevopsAgent = (k?: string): boolean =>
+  !DEVOPS_TOPICS_EXCLUDED.has(k || "general");
+
 export interface Conversation {
   id: string;
   title: string;
@@ -82,12 +94,16 @@ export interface Conversation {
   webSearch?: boolean;   // 本会话是否开启联网搜索（默认关；每会话独立）
   finopsAgent?: boolean; // 本会话是否启用 FinOps Agent 深度模式（默认关；仅 FinOps 主题；每会话独立）
   devopsAgent?: boolean; // 本会话是否启用 DevOps Agent 深度调查（默认关；仅故障调查主题；每会话独立）
+  // 本会话是否启用「深度调查（直连）」：BFF 直连 DevOps Agent API、**0 token**（默认关）。
+  // 与 devopsAgent **互斥**（同时开会同时走两条路），互斥逻辑在 ChatApp 的 toggle 里。
+  devopsAgentDirect?: boolean;
   messages: ChatMessage[];
   updatedAt: number;
   pinned?: boolean;
 }
 
-// 新对话默认模型：Claude Sonnet 5（用户在某会话改了则该会话保持其选择）
+// 新对话默认模型的**兜底**值。真值由 GET /models 下发（管理员在「管理 → 模型」里定），
+// 见 models.ts 的 defaultModelId()。这里保留是为了首帧渲染和接口读不到时不至于没模型可用。
 export const DEFAULT_MODEL = "claude-sonnet-5";
 
 export interface ModelOption {
@@ -97,6 +113,9 @@ export interface ModelOption {
   flagKey?: string;      // 如 "实验"
 }
 
+// 内置**兜底**目录：GET /models 读不到（未登录首帧 / 接口异常 / 目录未 seed）时用它。
+// 正常情况下界面展示的是管理员勾选的启用集，别在这里加模型来"上线"一个模型 ——
+// 真源是 config/llm-model-catalog.json + DynamoDB llmcfg。
 // 按显示名首字母升序排列（A→Z）。
 export const MODELS: ModelOption[] = [
   { id: "amazon-nova-pro", name: "Amazon Nova Pro", descKey: "model.desc.nova" },

@@ -13,7 +13,10 @@ dependencies = [
     "bedrock-agentcore >= 1.9.1",
     "botocore[crt] >= 1.35.0",
     "mcp >= 1.19.0",
-    "strands-agents >= 1.15.0",
+    # >= 1.50.2：需要 BedrockModel 的 `cache_config` / `CacheToolsConfig`（message 级提示缓存
+    # + per-model TTL，见 model/load.py `_bedrock_kwargs`）。1.50.2 就是现网已部署的版本，
+    # 抬高下限只是把"恰好装到了新版"变成"保证有"。load.py 仍有守卫导入兜底。
+    "strands-agents >= 1.50.2",
     # 安全:解析 AWS RSS feed 用 defusedxml 防 XXE(见 core/whats_new.py)
     "defusedxml >= 0.7.1",
     # GPT-5.4 via Bedrock Mantle（OpenAI Responses API）所需

@@ -46,12 +46,28 @@ export const DEFAULT_GROUP_ROLE_MAP = {
   "dev-team": ["role:developer"],
 };
 
-/** 登录即可访问、无需功能级权限的路由（需求 2.7）。path 后缀匹配。 */
+/**
+ * 登录即可访问、无需功能级权限的路由（需求 2.7）。
+ *
+ * ⚠️ 这些是**后缀**正则，而 index.mjs 的路由分发**也是**后缀匹配。两个后缀匹配器
+ * 叠在一起意味着：一个路径可以同时满足这里的某条正则、又落到某个特权 handler 上。
+ * 所以本清单**只在 `matchRoute()` 找不到能力节点时**才被查询（见 `authorize()`），
+ * 绝不能反过来 —— 反过来就是特权路由被免鉴权清单遮蔽。
+ *
+ * 实际发生过：加入 `/\/models$/` 后，`DELETE /admin/roles/models`、
+ * `DELETE /admin/groups/models`、`PUT /admin/users/models`、`DELETE /skills/models`
+ * 全部对任意登录用户放行 —— 因为旧实现先查本清单就直接 return 了。
+ * `$` 锚点只挡住路径**中段**匹配（`/models/admin/...`），对这种尾段碰撞无效；
+ * 此处曾把这条理由写反，见 git history。
+ */
 const LOGIN_ONLY = [
   /\/conversations$/,
   /\/conversations\/[^/]+$/,
   /\/accounts$/,
   /\/me\/capabilities$/,
+  // 可选模型清单：只返回 admin 已启用的模型（无 provider / 凭证 / 候选全集字段），
+  // 任何登录用户都要用它渲染模型下拉（spec R6.2）。
+  /\/models$/,
 ];
 
 function isLoginOnly(path) {
@@ -76,6 +92,26 @@ export function satisfies(eff, key) {
   if (matchesAny(eff.denies, key)) return false;
   if ((eff.grants || []).includes("*")) return true;
   return matchesAny(eff.grants, key);
+}
+
+/** adminOnly 节点的判定：**通配不得跨界**，grant 必须显式点名 admin（或全局 `*`）。
+ *
+ * 为什么不能直接用 `satisfies(eff, "nav:admin")`：`nav:*` 的字面意思是「所有导航页」，
+ * 但按前缀通配规则它会命中 `nav:admin`，于是拿到 `nav:*` 的人得到整个 `/admin/.+`
+ * —— 包括改模型目录、写 Bedrock API Key，以及 `PUT /admin/users/:id/permissions`
+ * （即可给自己改成 `*`，完整提权）。
+ *
+ * 而权限选择器**特意过滤掉 adminOnly 节点**（admin.mjs 的 assignableTabs / allTabKeys），
+ * 也就是说「admin 不作为一个可授予的 nav 权限」本就是设计意图；`nav:finops:*` 这类写法
+ * 又是预置角色里的既有惯用法，管理员照着扩成 `nav:*` 表达"所有页面"非常自然。两者相撞
+ * 就是一个看起来安全的提权动作。这里把判定收紧到「显式点名」，其余通配语义不变。
+ *
+ * deny 一侧**保持宽匹配**（`denies:["nav:*"]` 仍能否决 admin）：拒绝宁可过宽。
+ */
+export function satisfiesAdmin(eff) {
+  if (matchesAny(eff.denies, "nav:admin")) return false;
+  return ((eff && eff.grants) || []).some(
+    (p) => p === "*" || p === "nav:admin" || p.startsWith("nav:admin:"));
 }
 
 /** 解析角色名 → 权限数组（预置角色用内存 PRESET_ROLES，其余查 DDB）。 */
@@ -127,9 +163,14 @@ export async function effective(sub, cognitoGroups = []) {
  * @returns {Promise<{allow:boolean, status?:number, required?:string}>}
  */
 export async function authorize({ method, path, query, body }, eff, { disabledModules = null } = {}) {
-  if (isLoginOnly(path)) return { allow: true };
+  // 能力节点反查**必须先做**。LOGIN_ONLY 是后缀正则，只有在没有任何能力节点覆盖该
+  // 请求时才有资格放行 —— 否则 `/admin/roles/models` 这类尾段碰撞会让免鉴权清单
+  // 遮蔽掉特权路由（见 LOGIN_ONLY 上方注释里的实际案例）。
   const node = matchRoute(method, path, query, body);
-  if (!node) return { allow: false, status: 403, required: "unknown_route" }; // fail-closed（需求 2.8）
+  if (!node) {
+    if (isLoginOnly(path)) return { allow: true };
+    return { allow: false, status: 403, required: "unknown_route" }; // fail-closed（需求 2.8）
+  }
 
   // alwaysOn 节点（chat）：任何登录用户放行（需求 schema alwaysOn）
   if (node.alwaysOn) return { allow: true };
@@ -138,6 +179,13 @@ export async function authorize({ method, path, query, body }, eff, { disabledMo
   const rootTab = rootTabOf(node.key);
   const disabled = disabledModules || (await getDisabledModules());
   if (rootTab && disabled.includes(rootTab)) {
+    return { allow: false, status: 403, required: node.key };
+  }
+  // adminOnly 节点单独判：通配派生的匹配不算，必须显式点名（见 satisfiesAdmin）。
+  // 放在这里而不是塞进 satisfies()：只收紧 adminOnly 节点，不动其余通配语义。
+  // 也不能落到下面的 subtab 兜底 —— nav:admin 没有子节点，落下去等于把判定绕开。
+  if (node.adminOnly) {
+    if (satisfiesAdmin(eff)) return { allow: true };
     return { allow: false, status: 403, required: node.key };
   }
   if (satisfies(eff, node.key)) return { allow: true };
@@ -187,7 +235,8 @@ export async function visibleTree(eff, { disabledModules = null } = {}) {
     const rootTab = rootTabOf(node.key);
     if (rootTab && disabled.includes(rootTab)) return false;
     if (node.alwaysOn) return true;
-    if (node.adminOnly) return satisfies(eff, "nav:admin");
+    // 与 authorize() 同源：侧栏若显示了 admin 但端点 403，用户点进去就是白屏 + 403。
+    if (node.adminOnly) return satisfiesAdmin(eff);
     return satisfies(eff, node.key);
   };
 

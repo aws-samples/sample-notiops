@@ -38,6 +38,7 @@ from typing import Callable
 import boto3
 from boto3.dynamodb.conditions import Attr
 
+from . import bedrock_credentials as _bedrock_credentials
 from . import ddb_state
 from . import progress_card
 from .progress_card import ProgressCardIR
@@ -101,6 +102,10 @@ def run(platform: str,
 
         while True:
             try:
+                # Bedrock API Key 热生效（task 4.5）：这个 daemon 线程独立于消息入口，
+                # 自己也调 Bedrock（进度叙述），所以必须自行收敛凭证变更。Key 未变时是
+                # 廉价 no-op；变了则重建缓存的 bedrock 客户端。
+                _bedrock_credentials.refresh()
                 rows = _scan_progress_rows(platform)
                 # Build the set of currently-active incidents so we can
                 # diff against `seen` and finalize the ones that vanished.

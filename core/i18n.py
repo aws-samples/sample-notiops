@@ -593,6 +593,26 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
                "\n(All models are accessed through Amazon Bedrock. "
                "GPT-5.6 Terra is currently experimental, see USER_GUIDE §7.3.)"),
     },
+    # 凭证被拒（401/403）。刻意不说成"临时故障、请重试"—— 它不会自愈，重试只是白等。
+    # 也刻意不透露任何凭证细节（spec R5.5）：只说是凭证问题，以及谁能修。
+    "gpt.auth_failed": {
+        "zh": ("⚠️ 调用当前模型(GPT-5.6 Terra)时,Amazon Bedrock 拒绝了本系统的凭证。\n"
+               "这**不是**临时故障,重试不会好 —— 通常是 Bedrock API Key 过期 / 被吊销,"
+               "或者这个 Key 被限制了不能调该模型。\n"
+               "\n你现在可以:\n"
+               "• `@bot model claude` → 换 Claude Sonnet 5 继续(走另一套调用路径,大概率可用)\n"
+               "• 让管理员到控制台「模型」页检查凭证方式与 Bedrock API Key\n"),
+        "en": ("⚠️ Amazon Bedrock rejected this system's credential when calling "
+               "the current model (GPT-5.6 Terra).\n"
+               "This is **not** a transient error and retrying will not help — "
+               "usually the Bedrock API key has expired or been revoked, or that "
+               "key is not permitted to invoke this model.\n"
+               "\nWhat you can do now:\n"
+               "• `@bot model claude` → switch to Claude Sonnet 5 (a different "
+               "call path, very likely still working)\n"
+               "• Ask an administrator to check the credential mode and the "
+               "Bedrock API key on the console's Models page\n"),
+    },
 
     # -- Slash commands ----------------------------------------------------
     "lang.current.user": {

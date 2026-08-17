@@ -1674,6 +1674,16 @@ def _build_response(toast: str, new_card: dict) -> P2CardActionTriggerResponse:
 # Entrypoint
 # ===========================================================================
 def main():
+    # Bedrock API Key 注入（spec task 4.5）：注册 bedrock 客户端的构造前钩子并做一次
+    # 初次收敛。必须在任何 Bedrock 调用之前 —— botocore 在**构造时**快照 token provider，
+    # 设晚了会 NoAuthTokenError 硬失败而非回退 IAM。之后每条消息 / 每轮轮询各自 refresh()。
+    try:
+        from core import bedrock_credentials
+        bedrock_credentials.install()
+        bedrock_credentials.refresh()
+    except Exception as e:  # noqa: BLE001 — 凭证注入失败不阻断启动（回退 IAM 仍可对话）
+        logger.warning("bedrock credential install failed: %s", type(e).__name__)
+
     handler = (lark.EventDispatcherHandler.builder("", "")
                .register_p2_im_message_receive_v1(on_message)
                .register_p2_card_action_trigger(on_card_action)

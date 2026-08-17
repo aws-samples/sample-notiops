@@ -20,6 +20,7 @@ from botocore.config import Config
 
 from phd_event_forwarder.event_parser import PHDEvent
 from shared.llm_provider import invoke_llm
+from shared.phd_config import phd_model_id, phd_model_route
 
 logger = logging.getLogger("phd_event_forwarder.summarizer")
 
@@ -123,6 +124,8 @@ def summarize_event(phd_event: PHDEvent) -> str:
     (走 shared.llm_provider)。Bedrock 路径下沿用原有 API Key/IAM 认证;
     LiteLLM 路径走配置好的 Proxy。
 
+    模型 ID 由 shared.phd_config 决定：DDB (appconfig#phd) → env MODEL_ID → 硬编码。
+
     Args:
         phd_event: 解析后的 PHD 事件
 
@@ -132,15 +135,27 @@ def summarize_event(phd_event: PHDEvent) -> str:
     Raises:
         Exception: LLM 调用失败时抛出异常,由调用方处理降级。
     """
-    model_id = os.environ.get("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
+    # 模型 ID 走 DDB → env MODEL_ID → 硬编码 三级降级（shared/phd_config.py）。
+    # DDB 那一层由 Admin「后端任务模型」写入，改完**下一条 PHD 事件**即生效，不必重新部署。
+    model_id = phd_model_id()
+    # 协议与区域也来自同一份投影。缺省为空 = Converse（env / 硬编码兜底那两级本就是
+    # Converse 模型），有值时才切到 Mantle Responses —— 有一批 Bedrock 模型只在
+    # bedrock-mantle 上架，Converse 调不到。
+    # 传 model_id 是必需的，不是方便：三行投影是独立 item，读者可能跨代读到
+    # 「旧 model_id + 新 kind」。phd_model_route 用行上的 for_model_id 校验配对，
+    # 不匹配就当没有路由信息（= Converse）。详见该函数 docstring。
+    model_kind, model_region = phd_model_route(model_id)
     user_prompt = _build_user_prompt(phd_event)
 
-    logger.info("Invoking LLM for PHD summary, model=%s", model_id)
+    logger.info("Invoking LLM for PHD summary, model=%s kind=%s region=%s",
+                model_id, model_kind or "converse", model_region or "-")
     result = invoke_llm(
         model_id=model_id,
         system_prompt=SYSTEM_PROMPT,
         user_prompt=user_prompt,
         max_tokens=1024,
+        kind=model_kind,
+        region=model_region,
     )
 
     logger.info(

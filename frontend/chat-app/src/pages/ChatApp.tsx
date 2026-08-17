@@ -22,7 +22,8 @@ import Logo from "../components/Logo";
 import { unreadCount } from "../api/notifications";
 import { streamChat, listConversations, getMessages, deleteConversationApi, renameConversationApi, setPinnedApi, executeActionApi, getAccountsFull, type SourceItem, type AccountInfo } from "../api/chat";
 import { useLocale, useT } from "../i18n";
-import { MODELS, DEFAULT_MODEL, topicDef, type ChatMessage, type Conversation, type TopicKey } from "../types";
+import { topicDef, type ChatMessage, type Conversation, type TopicKey } from "../types";
+import { defaultModelId, modelDisplayName, refreshModelCatalog, isSelectableModel, useModelCatalog } from "../models";
 import { IconInvestigate, IconFinOps, IconCases, IconSecurity, IconWhatsNew, IconReports, IconDatabase, IconGauge, IconPercent, IconCluster } from "../components/icons";
 
 // 通用对话主页（Codex 式空态）的启动卡片池：每次进入随机抽 4 个。
@@ -132,7 +133,7 @@ function emptyConversation(locale: string, topic: TopicKey = "general"): Convers
     id: newId("conv"),
     title: locale === "en" ? "New chat" : "新对话",
     topic,
-    model: DEFAULT_MODEL, // 新对话默认 Amazon Nova
+    model: defaultModelId(), // 新对话用管理员设的默认模型（GET /models 下发；读不到时走内置兜底）
     messages: [],
     updatedAt: Date.now(),
     // DevOps Agent 深度调查开关：所有主题**默认关闭**，由用户按需手动打开
@@ -279,9 +280,19 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   // 已持久化（来自后端 / 已发过消息）的会话 id —— 用于判定"可丢弃的空会话"。
   // 注意不能用 loadedRef：它会把任何被选中的空会话也标上，无法区分本地新建。
   const persistedRef = useRef<Set<string>>(new Set());
+  // 正在从后端拉历史（"水合"中）的会话 id。历史是懒加载的，请求在飞的那几秒里
+  // messages 仍是 []，若只看 isEmpty 就会把**空会话落地页**当加载占位闪出来
+  // （各主题闪各自的落地页：general 闪 4 卡主页、finops/cases/… 闪 greeting+建议）。
+  // 故把"历史未到"与"真的是空会话"分开，前者渲染骨架屏。
+  const [hydratingIds, setHydratingIds] = useState<Set<string>>(new Set());
 
   const active = conversations.find((c) => c.id === activeId) ?? conversations[0];
   const isEmpty = active.messages.length === 0; // 空对话 → 居中布局（ChatGPT 风）
+  // 水合中：消息为空只是因为历史还没拉回来 → 骨架屏，不是空会话。
+  const isHydrating = isEmpty && hydratingIds.has(active.id);
+  // 真正该渲染"空会话落地页"的条件。凡是"空态布局"判断都用它，不要再直接用 isEmpty，
+  // 否则水合期间仍会走居中空态（.main.empty）而出现落地页闪现。
+  const showLanding = isEmpty && !isHydrating;
   // 通用主页启动卡片：从池里随机抽 4 个（每切换到一个新的空会话就重抽 → 每次「新对话」不同）。
   const homeCards = useMemo(() => {
     const arr = [...HOME_CARD_POOL];
@@ -320,8 +331,13 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   const invMsg = invMsgId ? active.messages.find((m) => m.id === invMsgId) : undefined;
   const invSteps = invMsg?.investigationSteps ?? [];
   const invConsoleUrl = invMsg?.investigationConsoleUrl ?? "";
-  // 模型改为**每会话**：当前会话模型（默认 Amazon Nova）；改了只影响该会话、切走再回保持。
-  const model = active.model ?? DEFAULT_MODEL;
+  // 模型改为**每会话**：改了只影响该会话、切走再回保持。
+  // 存量会话记的模型可能已被管理员下架 —— 此时回落到当前默认值，让下拉框显示的就是真正会用的
+  // 那个（服务端也会做同样的替换并回一条 model_substituted，两侧结论一致）。
+  // 订阅目录：`model` 是派生值，目录落地后必须重渲染，否则会一直停在加载期的空值。
+  // （改动前 defaultModelId() 的初值是个非空常量，掩盖了这里没有订阅的问题。）
+  const { defaultModel: catalogDefault } = useModelCatalog();
+  const model = isSelectableModel(active.model) ? active.model! : catalogDefault;
   const setModel = (id: string) => setConversations((prev) => prev.map((c) => (c.id === activeId ? { ...c, model: id } : c)));
   // 多账号：当前 **chat 会话** 目标账号（默认空=部署账号）；改了只影响该会话（per-session 锁定）。
   const accountId = active.accountId ?? "";
@@ -387,15 +403,22 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   // FinOps Agent 深度模式：同样**每会话**独立（默认关）；仅 FinOps 主题会显示该开关。
   const finopsAgent = active.finopsAgent ?? false;
   const toggleFinopsAgent = () => setConversations((prev) => prev.map((c) => (c.id === activeId ? { ...c, finopsAgent: !(c.finopsAgent ?? false) } : c)));
-  // DevOps Agent 深度调查：每会话独立（默认关）；仅故障调查主题显示该开关。
+  // DevOps Agent 深度调查：每会话独立（默认关）；哪些主题显示该开关见 types.ts
+  // `topicHasDevopsAgent`（默认全部提供，只排除 general/cases/whats-new）。
   const devopsAgent = active.devopsAgent ?? false;
-  const toggleDevopsAgent = () => setConversations((prev) => prev.map((c) => (c.id === activeId ? { ...c, devopsAgent: !(c.devopsAgent ?? false) } : c)));
+  // 「深度调查（直连）」：同一能力的 0-token 版本。两个开关**互斥** —— 点亮一个自动灭另一个
+  // （同时开会同时走两条路：一条烧 token 的 + 一条直连的）。
+  const devopsAgentDirect = active.devopsAgentDirect ?? false;
+  const toggleDevopsAgent = () => setConversations((prev) => prev.map((c) => (c.id === activeId
+    ? { ...c, devopsAgent: !(c.devopsAgent ?? false), devopsAgentDirect: false } : c)));
+  const toggleDevopsAgentDirect = () => setConversations((prev) => prev.map((c) => (c.id === activeId
+    ? { ...c, devopsAgentDirect: !(c.devopsAgentDirect ?? false), devopsAgent: false } : c)));
 
   // ── 主题 landing 页的开关草稿（per-topic，互不影响）──
   // BUG 修复：各主题 landing 页共用同一个 active 会话，直接读写 active.webSearch 会导致
   // 「一个主题开联网 → 所有主题都变」。landing 页改用按 topic 存的草稿状态，真正发消息时
   // 通过 convPatch 带进新会话。（真实会话内的开关仍走上面的 active.* per-会话逻辑。）
-  type LandingToggle = { webSearch?: boolean; finopsAgent?: boolean; devopsAgent?: boolean };
+  type LandingToggle = { webSearch?: boolean; finopsAgent?: boolean; devopsAgent?: boolean; devopsAgentDirect?: boolean };
   const [landingToggles, setLandingToggles] = useState<Record<string, LandingToggle>>({});
   // 各主题 landing 开关的默认值 —— 必须与 emptyConversation 的默认保持一致，否则
   // landing 开关显示的状态与新会话实际发送的状态脱节（曾导致：investigate 深度调查
@@ -436,6 +459,10 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     return () => { stop = true; clearInterval(id); };
   }, [view]);
 
+  // 启动时拉一次可选模型（管理员勾选的启用集，GET /models）。
+  // 失败不处理：models.ts 会继续用内置兜底目录，下拉框不会空（见该文件「失败安全」）。
+  useEffect(() => { void refreshModelCatalog(); }, []);
+
   // 启动时从后端加载历史会话列表（持久化：刷新不再清空）。
   useEffect(() => {
     let cancelled = false;
@@ -465,6 +492,20 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     const conv = conversations.find((c) => c.id === activeId);
     if (!conv || loadedRef.current.has(activeId) || conv.messages.length > 0) return;
     loadedRef.current.add(activeId);
+    // 只有**后端来的**会话才可能有历史待拉取 → 标记水合中，让主区渲染骨架屏而不是落地页。
+    // 本地新建的空会话不在 persistedRef 里（见启动加载处的 persistedRef 填充），不标记，
+    // 落地页照旧立即渲染 —— 「新对话」体验零回归。
+    const willHydrate = persistedRef.current.has(activeId);
+    if (willHydrate) setHydratingIds((p) => new Set(p).add(activeId));
+    const settleHydration = () => {
+      if (!willHydrate) return;
+      setHydratingIds((p) => {
+        if (!p.has(activeId)) return p; // 无变化就返回原引用，避免多余重渲染
+        const n = new Set(p);
+        n.delete(activeId);
+        return n;
+      });
+    };
     getMessages(activeId)
       .then((msgs) => {
         if (!msgs.length) return;
@@ -480,7 +521,11 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
         }));
         setConversations((prev) => prev.map((c) => (c.id === activeId ? { ...c, messages: mapped } : c)));
       })
-      .catch(() => { /* ignore */ });
+      .catch(() => { /* ignore */ })
+      // 必须放在 then 之后：先落消息再摘水合标记，否则中间会有一帧
+      // messages 仍空、水合已结束 → 落地页又闪一下（就是要修的那个 bug）。
+      // 拉到空数组 / 请求失败时同样要摘，否则骨架屏卡死。
+      .finally(settleHydration);
   }, [activeId, conversations]);
 
   // 监听滚动：判断用户是否贴着底部（留 120px 容差）。上滚则暂停自动跟随。
@@ -558,7 +603,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     const sendModel = targetConv?.model ?? model;
     // 本轮提问的目标账号（与下方 streamChat 同源）——存进 assistant 消息,让历史回复能标明针对哪个账号。
     const sendAccountId = targetConv?.accountId ?? (conversations.find(findConv)?.accountId) ?? "";
-    const botMsg: ChatMessage = { id: botId, role: "assistant", text: "", ts: Date.now(), thinking: true, thinkElapsed: 0, streaming: true, model: MODELS.find((m) => m.id === sendModel)?.name, accountId: sendAccountId };
+    const botMsg: ChatMessage = { id: botId, role: "assistant", text: "", ts: Date.now(), thinking: true, thinkElapsed: 0, streaming: true, model: modelDisplayName(sendModel), accountId: sendAccountId };
 
     // upsert:通常会话已在列表里(map 命中);但从通知卡发起时,新会话可能还没被
     // React flush 进 conversations（setConversations 与本 setTimeout 的时序不定）——
@@ -592,7 +637,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
 
     try {
       await streamChat(
-        { conversationId: convId, text, model: sendModel, locale, webSearch: (conversations.find(findConv)?.webSearch) ?? false, finopsAgent: (conversations.find(findConv)?.finopsAgent) ?? false, devopsAgent: targetConv?.devopsAgent ?? (conversations.find(findConv)?.devopsAgent) ?? false, topic: convTopic, accountId: targetConv?.accountId ?? (conversations.find(findConv)?.accountId) ?? "", skillId },
+        { conversationId: convId, text, model: sendModel, locale, webSearch: (conversations.find(findConv)?.webSearch) ?? false, finopsAgent: (conversations.find(findConv)?.finopsAgent) ?? false, devopsAgent: targetConv?.devopsAgent ?? (conversations.find(findConv)?.devopsAgent) ?? false, devopsAgentDirect: targetConv?.devopsAgentDirect ?? (conversations.find(findConv)?.devopsAgentDirect) ?? false, topic: convTopic, accountId: targetConv?.accountId ?? (conversations.find(findConv)?.accountId) ?? "", skillId },
         {
           onToken: (delta) => {
             if (firstToken) { firstToken = false; clearInterval(tk); }
@@ -615,6 +660,15 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
             patchMsgIn(convId, botId, patch);
           },
           onUsage: (usage) => patchMsgIn(convId, botId, { usage }),
+          // 服务端换了模型（本会话记的那个已被管理员下架）：把会话选择和本条署名都纠正过来，
+          // 并重拉一次候选集 —— 说明本地目录已过期。不纠正的话用户会一直看到一个再也用不了的名字。
+          onModelSubstituted: (info) => {
+            const eff = String(info?.effective || "");
+            if (!eff) return;
+            setConversations((prev) => prev.map((c) => (c.id === convId ? { ...c, model: eff } : c)));
+            patchMsgIn(convId, botId, { model: modelDisplayName(eff) });
+            void refreshModelCatalog();
+          },
           onDone: () => { clearInterval(tk); patchMsgIn(convId, botId, { streaming: false, thinking: false, progress: "" }); },
           onError: (msg) => { clearInterval(tk); patchMsgIn(convId, botId, { text: acc || `⚠️ ${msg}`, streaming: false, thinking: false, progress: "" }); },
         },
@@ -865,7 +919,8 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
           busy={false} /* landing 是发起新会话入口,永远可发送 */ showSuggestions={false} prefill={themePrefill[topicKey]}
           webSearch={lt(topicKey).webSearch ?? false} onToggleWebSearch={() => setLt(topicKey, { webSearch: !(lt(topicKey).webSearch ?? false) })}
           finopsAgent={lt(topicKey).finopsAgent ?? false} onToggleFinopsAgent={() => setLt(topicKey, { finopsAgent: !(lt(topicKey).finopsAgent ?? false) })}
-          devopsAgent={lt(topicKey).devopsAgent ?? false} onToggleDevopsAgent={() => setLt(topicKey, { devopsAgent: !(lt(topicKey).devopsAgent ?? false) })}
+          devopsAgent={lt(topicKey).devopsAgent ?? false} onToggleDevopsAgent={() => setLt(topicKey, { devopsAgent: !(lt(topicKey).devopsAgent ?? false), devopsAgentDirect: false })}
+          devopsAgentDirect={lt(topicKey).devopsAgentDirect ?? false} onToggleDevopsAgentDirect={() => setLt(topicKey, { devopsAgentDirect: !(lt(topicKey).devopsAgentDirect ?? false), devopsAgent: false })}
           onStop={stopGen} topic={topicKey} onOpenDashboard={openDash} convKey={"landing:" + topicKey}
           onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
       </div>
@@ -920,7 +975,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
       {!collapsed && <div className="resize-handle" onMouseDown={startResize} title="拖动调整宽度" />}
       {/* 移动端：侧栏作为覆盖式抽屉打开时的背景遮罩，点击关闭 */}
       {!collapsed && <div className="sidebar-backdrop" onClick={() => setCollapsed(true)} />}
-      <main className={"main" + (view === "chat" && isEmpty ? " empty" : "")}>
+      <main className={"main" + (view === "chat" && showLanding ? " empty" : "")}>
         <ErrorBoundary key={view} label={view}>
         {view === "notifications" ? (
           <>
@@ -1058,8 +1113,10 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
         <>
         {/* 空对话态：无标题（标题无意义），但多账号可用时显示账号选择器 —— 让"新对话"
             也能在发消息前选定目标账号（选择写入当前会话，发送时随会话带上）。
-            无成员账号时 headerAcctPicker 为 null，退回原来的"仅悬浮展开钮"。 */}
-        {isEmpty ? (
+            无成员账号时 headerAcctPicker 为 null，退回原来的"仅悬浮展开钮"。
+            水合中用 showLanding（而非 isEmpty）：会话标题在列表接口里就有，拉历史时
+            直接显示真实标题栏，避免"标题栏先空后有"的第二次跳动。 */}
+        {showLanding ? (
           (accounts.length > 0 || collapsed) ? (
             <div className="topbar">
               {collapsed && (
@@ -1119,8 +1176,31 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                 ))}
               </div>
             </div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id}
 
+              onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
+          </>
+        ) : isHydrating ? (
+          /* 历史水合中的骨架屏：复用 .stream/.thread/.row 的真实排版（同 max-width、padding、gap），
+             所以历史到达时是"灰块换成文字"，布局不位移。行宽写死不随机 —— 用 Math.random 会
+             在每次重渲染时跳变。composer 与真实聊天态一致（用户可以直接开始输入）。 */
+          <>
+            <div className="stream">
+              <div className="thread" aria-busy="true">
+                <div className="row user"><div className="msg"><div className="sk sk-bubble" /></div></div>
+                <div className="row bot"><div className="msg">
+                  <div className="sk sk-line" style={{ width: "92%" }} />
+                  <div className="sk sk-line" style={{ width: "84%" }} />
+                  <div className="sk sk-line" style={{ width: "61%" }} />
+                </div></div>
+                <div className="row user"><div className="msg"><div className="sk sk-bubble sk-bubble-sm" /></div></div>
+                <div className="row bot"><div className="msg">
+                  <div className="sk sk-line" style={{ width: "88%" }} />
+                  <div className="sk sk-line" style={{ width: "70%" }} />
+                </div></div>
+              </div>
+            </div>
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id}
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
           </>
         ) : (active.topic ?? "general") === "general" ? (
@@ -1143,7 +1223,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                 })}
               </div>
             </div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} onStop={stopGen} topic={active.topic ?? "general"} prefill={homePrefill[active.id]} convKey={active.id}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} onStop={stopGen} topic={active.topic ?? "general"} prefill={homePrefill[active.id]} convKey={active.id}
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
           </div>
         ) : (active.topic ?? "general") === "whats-new" ? (
@@ -1167,13 +1247,13 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                 })}
               </div>
             </div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} onStop={stopGen} topic={active.topic ?? "general"} prefill={homePrefill[active.id]} convKey={active.id}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} onStop={stopGen} topic={active.topic ?? "general"} prefill={homePrefill[active.id]} convKey={active.id}
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
           </div>
         ) : (
           <div className="empty-center">
             <div className="empty-greeting">{greeting(active.topic, locale)}</div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={true} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={true} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id}
 
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
             {(() => {

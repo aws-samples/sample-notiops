@@ -7,6 +7,7 @@ import { TOPICS } from "../types";
 import {
   IconNewChat, IconInvestigate, IconFinOps, IconCases, IconSecurity,
   IconReports, IconMore, IconExternal, IconSkill, IconCustomize, IconWhatsNew, IconChevronRight, IconBell,
+  IconCollapseAll, IconExpandAll,
 } from "./icons";
 import ConvItem from "./ConvItem";
 import UserMenu from "./UserMenu";
@@ -87,12 +88,16 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
       return raw ? new Set<string>(JSON.parse(raw)) : new Set<string>();
     } catch { return new Set<string>(); }
   });
+  // 收起态写回 localStorage 的唯一出口（单组 toggle 与「全部折叠/展开」共用，避免两处各写一遍）
+  const persistCollapsed = (next: Set<string>) => {
+    try { localStorage.setItem("notiops.collapsedGroups", JSON.stringify([...next])); } catch { /* 忽略：隐私模式等 */ }
+    return next;
+  };
   const toggleGroup = (key: string) =>
     setCollapsedGroups((prev) => {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key); else next.add(key);
-      try { localStorage.setItem("notiops.collapsedGroups", JSON.stringify([...next])); } catch { /* 忽略：隐私模式等 */ }
-      return next;
+      return persistCollapsed(next);
     });
 
   // 会话列表按"最近活动时间"(updatedAt)降序——发过消息/刚打开的排在最前，
@@ -101,18 +106,35 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
   const pinned = conversations.filter((c) => c.pinned).sort(byRecent);
   const recent = conversations.filter((c) => !c.pinned).sort(byRecent);
 
-  // 非置顶会话按主题分组：分组顺序与上方主题导航一致（TOPICS 顺序），
-  // 通用会话（general/未设主题）归到最后一组。组内按最近活动时间降序。
+  // 非置顶会话按主题分组：主题组顺序与上方主题导航一致（TOPICS 顺序），
+  // 但**通用组排在最前**（在「调查」之上）—— 新建会话默认落 general，放最上面才好找，
+  // 不用每次滚到底。组内按最近活动时间降序。
   // 空组不渲染标题。置顶组独立在最上，不参与主题分组。
   const groups: { key: string; labelKey: string; items: Conversation[] }[] = [
-    ...TOPICS.map((tp) => ({ key: tp.key, labelKey: tp.labelKey, items: [] as Conversation[] })),
     { key: "general", labelKey: "topic.general", items: [] as Conversation[] },
+    ...TOPICS.map((tp) => ({ key: tp.key, labelKey: tp.labelKey, items: [] as Conversation[] })),
   ];
   const groupIndex = new Map(groups.map((g, i) => [g.key, i]));
   for (const c of recent) {
     const gi = groupIndex.get(c.topic ?? "general") ?? groupIndex.get("general")!;
     groups[gi].items.push(c);
   }
+
+  // 「一键折叠/展开全部」：只针对**当前可见**（非空）的组。空组不渲染标题，
+  // 把它们算进来会让按钮状态和用户看到的画面不一致（比如全部收起了却还显示"折叠全部"）。
+  const visibleGroups = groups.filter((g) => g.items.length > 0);
+  const allCollapsed = visibleGroups.length > 0 && visibleGroups.every((g) => collapsedGroups.has(g.key));
+  // 只有 ≥2 个可见组时才值得给批量按钮（1 个组时点标题就够了）
+  const showBulkToggle = visibleGroups.length > 1;
+  const toggleAllGroups = () =>
+    setCollapsedGroups((prev) => {
+      // 已全部收起 → 展开全部：只删可见组的 key，保留不可见组的收起态
+      // （否则某主题的会话被删空又新建时，用户之前给它设的收起态会被悄悄清掉）
+      const next = new Set(prev);
+      if (allCollapsed) visibleGroups.forEach((g) => next.delete(g.key));
+      else visibleGroups.forEach((g) => next.add(g.key));
+      return persistCollapsed(next);
+    });
 
   // idle 控制台：扩展区第一个链接（同一套登录，深链到现有控制台）
   const openConsole = () => {
@@ -206,6 +228,18 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
                 onDelete={() => onDelete(c.id)} />
             ))}
           </>
+        )}
+        {/* 一键折叠/展开全部分组：组多了逐个点太烦。只在 ≥2 个非空组时出现。
+            与单组 toggle 共用同一份 collapsedGroups 持久化。 */}
+        {showBulkToggle && (
+          <div className="sb-groups-bar">
+            <button className="sb-groups-toggle" onClick={toggleAllGroups}
+              title={t(allCollapsed ? "sidebar.expandAll" : "sidebar.collapseAll")}
+              aria-label={t(allCollapsed ? "sidebar.expandAll" : "sidebar.collapseAll")}>
+              {allCollapsed ? <IconExpandAll size={14} /> : <IconCollapseAll size={14} />}
+              <span>{t(allCollapsed ? "sidebar.expandAll" : "sidebar.collapseAll")}</span>
+            </button>
+          </div>
         )}
         {/* 主题分组：组标题已标明主题，组内会话不再重复显示 tag（showTag=false）。
             标题可点击收起/展开该组（caret 指示，收起态持久化）。 */}

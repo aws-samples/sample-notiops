@@ -19,11 +19,15 @@ import {
   fetchAccountAccess, putAccountAccess, deleteAccountAccess,
   fetchNotificationConfig, putNotificationConfig, testNotificationSend,
   generateLaunchStack, saveManualPayload, testDaConnection,
+  fetchLlmConfig, putLlmConfig, fetchLlmCandidates, putBedrockKey, testLlmModel,
+  fetchLlmAudit, rollbackLlmConfig, fetchBackendTasks,
   type FullCapabilityNode, type RoleRec, type UserRec, type ModuleToggle, type GroupRec, type EolMap,
   type MemberAccountRec, type AccountVisibilityRec,
+  type LlmConfig, type LlmModelEntry, type LlmCandidate, type BackendTaskRow,
+  type ModelSurface, type ModelKind,
 } from "../api/admin";
 
-type Tab = "roles" | "users" | "groups" | "modules" | "accounts" | "lifecycle" | "notifications";
+type Tab = "roles" | "users" | "groups" | "modules" | "accounts" | "lifecycle" | "notifications" | "models";
 type TFn = (key: string) => string;
 const ADMIN_ROLE = "role:admin";
 const RED = "#d13212";
@@ -36,6 +40,12 @@ const btnGhost: CSSProperties = { padding: "7px 13px", borderRadius: 8, border: 
 const iconBtn: CSSProperties = { padding: "3px 9px", borderRadius: 6, border: "1px solid var(--line)", background: "transparent", color: "var(--muted)", fontSize: 12, cursor: "pointer", lineHeight: 1.5 };
 const okText: CSSProperties = { color: "var(--green)", fontSize: 12.5, fontWeight: 600 };
 const errText: CSSProperties = { color: RED, fontSize: 12.5 };
+/** ⓘ 弹层里的字段名（MODEL ID / REGION / …）。与 FieldLabel 同一视觉语言，但更小一号。 */
+const infoKeyStyle: CSSProperties = { fontSize: 10, color: "var(--muted)", letterSpacing: .5, textTransform: "uppercase" };
+// 服务端没下发 default_region 时的兜底（老版本 BFF / 响应被裁剪）。与 BFF 的
+// MANTLE_REGION_DEFAULT、Python 的 _MANTLE_REGION_DEFAULT 是同一个值；
+// scripts/test_mantle_regions_consistent.py 会断言三处一致。
+const MANTLE_REGION_FALLBACK = "us-east-2";
 
 /* 预置角色/Cognito 状态 → i18n key（无中文字面量，满足 i18n lint；未知值回退原文） */
 const ROLE_KEY: Record<string, string> = {
@@ -99,7 +109,7 @@ export default function AdminPanel() {
 
       {/* 分段 tab 切换（替代原侧栏风格按钮） */}
       <div style={{ display: "inline-flex", gap: 4, padding: 4, ...box, background: "var(--page)", borderRadius: 10, marginBottom: 18 }}>
-        {(["roles", "users", "groups", "modules", "accounts", "lifecycle", "notifications"] as Tab[]).map((k) => (
+        {(["roles", "users", "groups", "modules", "accounts", "lifecycle", "notifications", "models"] as Tab[]).map((k) => (
           <button key={k} onClick={() => setTab(k)} style={{
             padding: "6px 16px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 13,
             fontWeight: tab === k ? 700 : 500,
@@ -118,6 +128,7 @@ export default function AdminPanel() {
       {tab === "accounts" && <AccountsView />}
       {tab === "lifecycle" && <LifecycleView />}
       {tab === "notifications" && <NotificationsView />}
+      {tab === "models" && <ModelsView />}
     </div>
   );
 }
@@ -214,6 +225,852 @@ function NotificationsView() {
             <button style={btnPrimary} disabled={saving} onClick={save}>{saving ? t("admin.notif.saving") : t("admin.notif.save")}</button>
             {msg && <span style={msg.ok ? okText : errText}>{msg.text}</span>}
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ───────────────── 模型（LLM 目录 + 凭证 + 后端任务）─────────────────
+ * 真源是 DynamoDB PK=llmcfg（spec: llm-provider-and-model-management）。
+ * 这里勾选的启用集就是普通用户在对话框里能选到的全部模型 —— provider 与凭证不对普通
+ * 用户开放，权限边界落在接口上（GET /models 只回启用集，/admin/llm-config 需 nav:admin）。
+ * 保存后 generation 前进，长驻的 webchat microVM 与 IM bot 会在下一条消息重建实例。 */
+
+/** 探测结果 → i18n key（无中文字面量；未知值回退原文）。 */
+const TEST_KEY: Record<string, string> = {
+  ok: "admin.models.test.ok", forbidden: "admin.models.test.forbidden",
+  unauthorized: "admin.models.test.unauthorized", invalid_model: "admin.models.test.invalidModel",
+  not_found: "admin.models.test.notFound", throttled: "admin.models.test.throttled",
+  not_ready: "admin.models.test.notReady", timeout: "admin.models.test.timeout",
+  error: "admin.models.test.error",
+  // `skipped` 已不在服务端的返回集合里 —— Mantle 现在是真探测（早先返回 skipped 是把
+  // 一个未实现固化成了「预期行为」，后果是 GPT 系上线前无法验证）。映射一并去掉，
+  // 避免留着一个永不出现的分支让人以为「跳过」仍是正常结果。
+  // 探测自身的请求参数被模型拒了（不是模型不可用）—— 见 BFF probeMantle/apiTestLlmModel
+  probe_error: "admin.models.test.probeError",
+  // 本区不支持按需直调，需改用 global./apac. 前缀的 inference profile
+  needs_profile: "admin.models.test.needsProfile",
+};
+const MODEL_SURFACES: ModelSurface[] = ["webchat", "im"];
+/* 后端任务的可选性判定（原 `backendEligible`）已删除。
+ *
+ * 它曾排除所有 `bedrock_mantle_responses`（GPT 系），理由是「后端链只走 Converse」。
+ * 那是我们自己的实现缺口，不是模型限制 —— `shared/llm_provider.py` 的 `invoke_llm`
+ * 现在有 Mantle Responses 分支，对话侧与后端侧已对齐：**目录里任何已启用的模型都能
+ * 绑后端任务**，于是「列出但禁用 + 写原因」这套机制没有可触发的情形了。
+ *
+ * 一度保留过「Mantle 缺 region 则不可选」作为兜底，但那也是不可达的：候选添加会带上
+ * region（服务端下发的 `default_region`），手填只会生成非 Mantle 的 kind，而已保存
+ * 的目录早被 BFF 的逐模型校验挡过一轮。留着等于让人以为存在一种会被禁用的模型。 */
+/** model_id → 建议 alias（[a-z0-9-]）。仅作预填，管理员可改。 */
+function suggestAlias(modelId: string): string {
+  return modelId.replace(/^[a-z]+\.(anthropic|openai|amazon|deepseek|meta|mistral)\./i, "")
+    .replace(/^(anthropic|openai|amazon|deepseek|meta|mistral)\./i, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 63) || "model";
+}
+
+/**
+ * model_id 前缀 → 推理路由范围的 i18n key。
+ *
+ * 这是数据驻留的**实际决定因素**，而管理员在界面上看到的只是一串不透明的 model_id。
+ * Bedrock 的跨区推理配置文件把范围编码进了前缀：`global.` 路由到全球所有支持的商业
+ * 区域，`us.` / `eu.` / `apac.` 限制在对应地理范围内，无前缀则跟随部署区域。
+ * 也就是说「换成 us.anthropic.claude-sonnet-5」就是一次数据驻留变更 —— 把它显示出来，
+ * 管理员才是在做知情选择，而不是在改一个看不懂的字符串。
+ * https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference.html
+ */
+/** 路由范围（= 数据驻留范围）→ i18n key。
+ *
+ *  `scope` 优先用服务端给的值（`LlmCandidate.scope`，由 BFF 的 `routingScope()` 算出）。
+ *  只在没有它时才按 model_id 前缀回推 —— 目录里已保存的条目不带 scope 字段，所以回推路径
+ *  必须留着。
+ *
+ *  ⚠️ `kind` 参数不能省：Mantle（GPT 系）的 model_id **没有地理前缀**
+ *  （`openai.gpt-5.6-terra`），按前缀回推会得到「本区域」，而它实际打的是
+ *  `bedrock-mantle.us-east-2.api.aws` —— 在东京部署上，恰好是真正跨了边界的那批模型被标成
+ *  "不跨区"。数据驻留标签给错答案比不给更危险，所以按 kind 显式判定。
+ */
+function routingScopeKey(modelId: string, opts?: { scope?: string; kind?: string }): string {
+  const scope = opts?.scope;
+  if (opts?.kind === "bedrock_mantle_responses" || scope === "mantle") {
+    return "admin.models.routing.mantle";
+  }
+  const byScope: Record<string, string> = {
+    global: "admin.models.routing.global",
+    us: "admin.models.routing.us",
+    eu: "admin.models.routing.eu",
+    apac: "admin.models.routing.apac",
+    jp: "admin.models.routing.jp",
+    "us-gov": "admin.models.routing.usgov",
+    regional: "admin.models.routing.regional",
+  };
+  if (scope && byScope[scope]) return byScope[scope];
+  const id = (modelId || "").toLowerCase();
+  // 前缀回推。顺序要紧：`us-gov.` 必须先判，否则 `us.` 的分支不会命中它（是 `us-` 不是 `us.`），
+  // 会静默落到「本区域」。
+  if (id.startsWith("us-gov.")) return "admin.models.routing.usgov";
+  if (id.startsWith("global.")) return "admin.models.routing.global";
+  if (id.startsWith("us.")) return "admin.models.routing.us";
+  if (id.startsWith("eu.")) return "admin.models.routing.eu";
+  if (id.startsWith("jp.")) return "admin.models.routing.jp";
+  if (id.startsWith("apac.") || id.startsWith("au.")) return "admin.models.routing.apac";
+  return "admin.models.routing.regional";
+}
+
+/** 候选分组的展示顺序。把最常被选的厂商顶上去 —— 候选有 90+ 条（基座模型 + 跨区域
+ *  inference profile），按 AWS 返回的原始顺序平铺时，找 Claude 只能靠滚动翻。 */
+const PROVIDER_ORDER = ["Anthropic", "Amazon", "OpenAI", "DeepSeek", "Meta", "Mistral AI"];
+
+/** 候选排序：厂商优先级 → 组内跨区域 profile 优先（本目录默认用 global.*）→ 名称。
+ *  同一个模型会同时以基座（`anthropic.claude-sonnet-5`）和 profile
+ *  （`global.anthropic.claude-sonnet-5`）两种形式出现，profile 排在前面，避免管理员
+ *  选了本区域形式却与目录里实际生效的 ID 不一致。 */
+function sortCandidates(list: LlmCandidate[]): LlmCandidate[] {
+  const rank = (c: LlmCandidate) => {
+    const p = PROVIDER_ORDER.indexOf(c.provider_name || "");
+    return p === -1 ? PROVIDER_ORDER.length : p;
+  };
+  return [...list].sort((a, b) => {
+    const ra = rank(a), rb = rank(b);
+    if (ra !== rb) return ra - rb;
+    const pa = (a.provider_name || "").localeCompare(b.provider_name || "");
+    if (pa !== 0) return pa;
+    const ga = a.model_id.startsWith("global.") ? 0 : 1;
+    const gb = b.model_id.startsWith("global.") ? 0 : 1;
+    if (ga !== gb) return ga - gb;
+    return (a.label || a.model_id).localeCompare(b.label || b.model_id);
+  });
+}
+
+/** 搜索匹配：label 与 model_id 都参与，空格分隔的词需**全部**命中（AND）。
+ *  这样输入「claude 5」既能命中 `Claude Sonnet 5`，也能命中
+ *  `global.anthropic.claude-sonnet-5` —— 用户记得的是"Claude 5"，而列表里的字符串
+ *  有三种写法，单串前缀匹配会让人以为模型不存在。连字符与点视作分隔符。 */
+function candMatches(c: LlmCandidate, query: string): boolean {
+  const hay = `${c.label || ""} ${c.model_id} ${c.provider_name || ""}`
+    .toLowerCase().replace(/[-_.]/g, " ");
+  // 查询串按「空白 + 连字符 + 下划线 + 点」**切成多个词**。
+  // 早先的写法是每个词内部把分隔符替换成空格，那等于把 `claude-5` 变成一个
+  // **短语** "claude 5" 去做连续子串匹配 —— 而干草堆里是 "claude sonnet 5"，
+  // 中间夹着 sonnet，于是恒不命中：`claude 5` 有 10 条结果，`claude-5` 是 0 条。
+  // 而列表里每个 model_id 都是连字符形式，`claude-5` 正是最自然的输入。
+  return candTokens(query).every((w) => hay.includes(w));
+}
+
+/** 查询串 → 词元。分隔符与干草堆的归一化保持一致，避免两边规则漂移。 */
+function candTokens(query: string): string[] {
+  return query.trim().toLowerCase().split(/[\s\-_.]+/).filter(Boolean);
+}
+
+function ModelsView() {
+  const t = useT();
+  const [loading, setLoading] = useState(true);
+  const [cfg, setCfg] = useState<LlmConfig | null>(null);
+  const [models, setModels] = useState<LlmModelEntry[]>([]);
+  const [defaultModel, setDefaultModel] = useState("");
+  const [credMode, setCredMode] = useState<"iam" | "api_key">("iam");
+  const [tasks, setTasks] = useState<Record<string, string>>({});
+  const [taskRows, setTaskRows] = useState<BackendTaskRow[]>([]);
+  const [apiKey, setApiKey] = useState("");
+  const [candidates, setCandidates] = useState<LlmCandidate[]>([]);
+  const [candWarn, setCandWarn] = useState("");
+  /** 候选列表是用哪个身份枚举出来的（服务端 `source_identity`）。
+   *  `iam_fallback` 必须显眼：那时列表来自部署角色，而推理用 Key，两者可能**不是同一批
+   *  模型** —— 管理员会选中一个 Key 调不了的模型，直到用户发消息才 403。 */
+  const [candSource, setCandSource] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [pick, setPick] = useState("");
+  const [candQuery, setCandQuery] = useState("");
+  const [manualId, setManualId] = useState("");
+  const [manualLabel, setManualLabel] = useState("");
+  const [testing, setTesting] = useState<string>("");
+  const [results, setResults] = useState<Record<string, string>>({});
+  /** 哪一行的技术标识弹层是展开的（alias；空串 = 全收起）。单值 ⇒ 天然互斥，
+   *  打开一行会收起另一行，不会堆出一屏弹层。 */
+  const [infoOpen, setInfoOpen] = useState<string>("");
+  /** 最近一次探测**实际使用**的凭证（服务端回的 `credential`：api_key / iam）。
+   *  用来把「已验证」说清楚 —— 选了 API Key 但 Key 是空的时，服务端会回退 IAM，
+   *  此时绿勾证明的只是部署角色能调，与 Key 无关。 */
+  const [probeCred, setProbeCred] = useState<string>("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [auditOpen, setAuditOpen] = useState(false);
+  const [audit, setAudit] = useState<Awaited<ReturnType<typeof fetchLlmAudit>>["entries"]>([]);
+
+  const load = () => {
+    setLoading(true);
+    fetchLlmConfig()
+      .then((c) => {
+        setCfg(c);
+        setModels(c.models.map((m) => ({ ...m })));
+        setDefaultModel(c.default_model);
+        setCredMode(c.credential_mode);
+        const tk: Record<string, string> = {};
+        for (const [k, v] of Object.entries(c.backend_tasks || {})) tk[k] = String(v || "");
+        setTasks(tk);
+      })
+      .catch((e) => setMsg({ ok: false, text: String(e?.message || e) }))
+      .finally(() => setLoading(false));
+    fetchBackendTasks().then((r) => setTaskRows(r.tasks)).catch(() => { /* 非关键：仅用于同步提示 */ });
+  };
+  useEffect(load, []);
+
+  const loadCandidates = () => {
+    setAdding(true);
+    if (candidates.length) return;
+    fetchLlmCandidates()
+      .then((r) => {
+        setCandidates(r.models || []);
+        setCandWarn(r.warning || "");
+        setCandSource(r.source_identity || "");
+      })
+      .catch((e) => setCandWarn(String(e?.message || e)));
+  };
+
+  const patch = (alias: string, p: Partial<LlmModelEntry>) =>
+    setModels((prev) => prev.map((m) => (m.alias === alias ? { ...m, ...p } : m)));
+
+  const toggleSurface = (m: LlmModelEntry, s: ModelSurface) => {
+    const next = m.surfaces.includes(s) ? m.surfaces.filter((x) => x !== s) : [...m.surfaces, s];
+    patch(m.alias, { surfaces: next });
+  };
+
+  /** 新条目的公共骨架。上限给一个多数模型都安全的值，管理员可按该模型文档调高 ——
+   *  设太低会静默截断回复，所以这个字段在行内是可见可改的。 */
+  const newEntry = (modelId: string, label: string, kind: ModelKind,
+                    region: string | null): LlmModelEntry => {
+    let alias = suggestAlias(modelId);
+    while (models.some((m) => m.alias === alias)) alias = `${alias}-2`;
+    return {
+      alias, short: null, aliases_legacy: [], model_id: modelId, label: label || modelId,
+      kind, region,
+      hard_output_limit: 8192,
+      output_override: null, supports_prompt_cache: false,
+      // 两个端都勾上：validateConfig 要求每个端至少有一个启用模型，只勾 webchat 的话，
+      // 一个只剩这条新模型的目录会被拒（400），管理员很难看出原因。
+      surfaces: ["webchat", "im"],
+      // **添加即启用**。此前默认 false，于是「加完模型 → 保存」必然 400
+      // （"at least one model must be enabled"），管理员得再回来逐个勾一遍才明白。
+      // 启用开关的真正用途是**下架**已有模型（enabled=false 保留条目以留住历史落款，
+      // 见 spec R2.7），不该同时充当"首次可用"的门槛 —— 显式添加一个模型就是想用它。
+      enabled: true,
+    };
+  };
+
+  /** 追加一个条目并维持不变量：目录里若还没有默认模型，这条就是默认。
+   *  让「添加」这一个动作产生一个**可直接保存**的合法配置，而不是留三个待办给管理员。 */
+  const appendEntry = (entry: LlmModelEntry) => {
+    setModels((prev) => [...prev, entry]);
+    setDefaultModel((prev) => prev || entry.alias);
+  };
+
+  const addFromCandidate = () => {
+    const c = candidates.find((x) => x.model_id === pick);
+    if (!c) return;
+    appendEntry(newEntry(
+      c.model_id, c.label || c.model_id, c.kind,
+      // 默认区用服务端下发的 `default_region`，**不要退回 `regions[0]`**：那个名单按区域名
+      // 排序，扩容时谁排第一会变。实际发生过 —— 名单从 2 个区扩到 14 个区后，`regions[0]`
+      // 把默认区从 us-east-2 静默变成 us-east-1，而 runtime 的 IAM 当时只授了
+      // us-east-2/us-west-2，于是配置存得进去、聊天时才 403。
+      c.kind === "bedrock_mantle_responses"
+        ? (c.default_region || MANTLE_REGION_FALLBACK) : null,
+    ));
+    setPick(""); setCandQuery(""); setAdding(false);
+  };
+
+  /** 手填 model_id。候选枚举列不出来时（跨账号 Key 指向的模型不在本账号候选里、
+   *  或 ListFoundationModels 无权限）这是唯一入口 —— 服务端文档一直承诺有它，
+   *  但 UI 此前并未提供。加进来之前，候选为空就等于彻底加不了模型。 */
+  const addManual = () => {
+    const id = manualId.trim();
+    if (!id) return;
+    if (models.some((m) => m.model_id === id)) { setManualId(""); return; }
+    const kind: ModelKind = /anthropic/i.test(id) ? "bedrock_anthropic" : "bedrock_converse";
+    appendEntry(newEntry(id, manualLabel.trim() || id, kind, null));
+    setManualId(""); setManualLabel(""); setAdding(false);
+  };
+
+  const test = async (m: LlmModelEntry) => {
+    setTesting(m.alias); setMsg(null);
+    try {
+      await runProbe(m);
+    } finally { setTesting(""); }
+  };
+
+  /** 单模型探测 + 落状态。抽出来给「全部测试」复用，避免两处各写一遍成功判定。 */
+  const runProbe = async (m: LlmModelEntry) => {
+    try {
+      const r = await testLlmModel({ model_id: m.model_id, kind: m.kind, region: m.region || undefined });
+      setResults((p) => ({ ...p, [m.alias]: r.result }));
+      // 服务端回的 `credential` 说明这次验的是哪种凭证。记下来，因为「用你的 Key 验过」
+      // 和「用部署角色验过」是两个不同的保证 —— 后者在 api_key 模式下等于没验。
+      if (r.credential) setProbeCred(r.credential);
+      // 只认 "ok"。此前还把 "skipped" 当通过，理由是「BFF 无法探测 Mantle」——
+      // 那个前提已不成立（Mantle 现在是真探测，不再返回 skipped）。继续把 skipped
+      // 当成功等于给一个从未被验证的模型盖绿章。
+      // 不再把结果写回目录（`verified` 字段已删除）。探测结论只属于**这一次**：
+      // 它依赖模型 × 区域 × 凭证 × 时刻，持久化就会变成一个过期的假绿。
+      // 保存时服务端会对默认模型再现场探一次，那才是拦住不可用模型的地方。
+      return r.result;
+    } catch (e) {
+      setResults((p) => ({ ...p, [m.alias]: "error" }));
+      setMsg({ ok: false, text: String((e as Error)?.message || e) });
+      return "error";
+    }
+  };
+
+  /**
+   * 「全部测试」—— 逐个探测已启用的模型。
+   *
+   * 这就是「测试这个 Key 能调哪些模型」的**可行形态**：AWS 没有「列出某凭证可调模型」
+   * 的 API（ListFoundationModels 返回的是区域内的全部模型，与调用者权限无关），所以
+   * 唯一可靠的答案只能由逐个真调换回来。换 Key 之后想确认哪些模型仍可用，这是入口。
+   * 串行：Bedrock 对探测这种小请求也会限流，并发打过去容易换回一片 throttled，
+   * 那种假红比慢几秒更糟。
+   */
+  const testAll = async () => {
+    const targets = models.filter((m) => m.enabled);
+    if (!targets.length) return;
+    setMsg(null);
+    for (const m of targets) {
+      setTesting(m.alias);
+      await runProbe(m);
+    }
+    setTesting("");
+  };
+
+  const save = async () => {
+    setSaving(true); setMsg(null);
+    try {
+      const r = await putLlmConfig({
+        provider: "bedrock",
+        credential_mode: credMode,
+        default_model: effectiveDefault,
+        models,
+        backend_tasks: Object.fromEntries(Object.entries(tasks).map(([k, v]) => [k, v || null])),
+      });
+      setMsg({ ok: !r.warning, text: r.warning || r.message || t("admin.models.saved") });
+      load();
+    } catch (e) {
+      // 409 = 有人先改了；文案提示重新载入，避免把对方的改动覆盖掉
+      setMsg({ ok: false, text: String((e as Error)?.message || e) });
+    } finally { setSaving(false); }
+  };
+
+  const saveKey = async (clear: boolean) => {
+    setSaving(true); setMsg(null);
+    try {
+      const r = await putBedrockKey(clear ? { clear: true } : { api_key: apiKey.trim() });
+      setApiKey("");
+      // 换了凭证，页面上那批测试结果就不再代表现在的状况 —— 清掉，别让管理员对着一屏
+      // 用旧 Key 得到的绿字做判断。提示他用新 Key 重测一遍。
+      setMsg({ ok: true, text: `${r.message} — ${t("admin.models.keyChangedRetest")}` });
+      setResults({});
+      setProbeCred("");
+      load();
+    } catch (e) {
+      setMsg({ ok: false, text: String((e as Error)?.message || e) });
+    } finally { setSaving(false); }
+  };
+
+  const openAudit = () => {
+    setAuditOpen(!auditOpen);
+    if (!auditOpen && !audit.length) fetchLlmAudit().then((r) => setAudit(r.entries || [])).catch(() => { /* ignore */ });
+  };
+
+  const doRollback = async (sk: string) => {
+    setSaving(true); setMsg(null);
+    try {
+      const r = await rollbackLlmConfig(sk);
+      setMsg({ ok: !r.warning, text: r.warning || r.message });
+      load();
+    } catch (e) {
+      setMsg({ ok: false, text: String((e as Error)?.message || e) });
+    } finally { setSaving(false); }
+  };
+
+  const enabledCount = models.filter((m) => m.enabled).length;
+  const testLabel = (r?: string) => (r ? (TEST_KEY[r] ? t(TEST_KEY[r]) : r) : "");
+
+  // 候选的可选集与当前匹配集。提到 JSX 之外：`pickVisible` 需要它，且它也是
+  // 「加载中 / 加载失败 / 全部已加入 / 无匹配」四个态能被区分开的前提。
+  const availCandidates = sortCandidates(
+    candidates.filter((c) => !models.some((m) => m.model_id === c.model_id)),
+  );
+  const shownCandidates = availCandidates.filter((c) => candMatches(c, candQuery));
+  const pickVisible = !!pick && shownCandidates.some((c) => c.model_id === pick);
+
+  // 默认模型收敛到启用集内。触发场景：取消勾选当前默认那条、或把它删掉 —— 此时
+  // default_model 会指向一个非启用项，保存必被服务端拒（"default model must be enabled"）。
+  // 与其让管理员再撞一次 400 并自己找出是哪一条，不如就近改正：落到第一个启用项上。
+  // 这是纠正而非猜测：不变量本身要求默认模型 ∈ 启用集，候选只有一个合法方向。
+  //
+  // 用**派生值**而不是 useEffect+setState：后者会在每次 models 变化后多跑一轮渲染
+  // （eslint 也会拦：Calling setState synchronously within an effect）。这里读的时候
+  // 算一次即可，保存时用的也是这个收敛后的值。
+  const effectiveDefault = models.some((m) => m.alias === defaultModel && m.enabled)
+    ? defaultModel
+    : (models.find((m) => m.enabled)?.alias || "");
+
+  /** 保存前的不变量预检 —— 与服务端 validateConfig 同源的那几条。
+   *
+   *  为什么要在前端重复一遍：服务端拒绝是**正确**的，但让 400 成为管理员的第一次反馈是
+   *  糟糕的交互 —— 他刚把模型加进列表、点保存，只看到一个 `http_400`，而真实原因
+   *  （"一个都没启用"）藏在响应体里。这里把同样的判断提前到点击之前，并直接指出该做什么。
+   *  服务端校验仍是唯一权威（前端可被绕过），这里只负责"别让用户白撞一次"。
+   */
+  const blockers: string[] = [];
+  if (models.length === 0) blockers.push(t("admin.models.needAtLeastOne"));
+  else if (enabledCount === 0) blockers.push(t("admin.models.needEnabled"));
+  else if (!effectiveDefault) blockers.push(t("admin.models.needDefault"));
+  else {
+    // 这里曾有「默认模型必须 verified」一条，镜像服务端的同名校验。两者都已删除：
+    // `verified` 是个会过期的快照，服务端改为**保存时现场探测**默认模型。
+    // 因此这条预检也不该留 —— 前端无法在不发请求的情况下知道模型此刻能不能调，
+    // 硬留下来只会变成一条凭陈旧数据阻止保存的假拦截。
+    // 每个端至少一个启用模型：少了这条，那个端的用户会拿不到任何可选模型。
+    for (const s of MODEL_SURFACES) {
+      if (!models.some((m) => m.enabled && m.surfaces.includes(s))) {
+        blockers.push(t("admin.models.needSurface").replace("{surface}", t(`admin.models.surface.${s}`)));
+      }
+    }
+  }
+
+  return (
+    <div>
+      <SectionHead title={t("admin.models.title")} sub={t("admin.models.sub")} />
+      {loading ? <div style={{ color: "var(--muted)", fontSize: 13 }}>{t("admin.models.loading")}</div> : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+          {/* ── Provider 与凭证 ── */}
+          <div style={{ ...box, padding: 18, maxWidth: 780, display: "flex", flexDirection: "column", gap: 14 }}>
+            <div>
+              <FieldLabel>{t("admin.models.provider")}</FieldLabel>
+              <select style={{ ...inputStyle, width: 240 }} value="bedrock" disabled>
+                <option value="bedrock">Amazon Bedrock</option>
+              </select>
+              <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>{t("admin.models.providerHint")}</div>
+            </div>
+            <div>
+              <FieldLabel>{t("admin.models.credMode")}</FieldLabel>
+              <div style={{ display: "flex", gap: 16, fontSize: 13 }}>
+                {(["iam", "api_key"] as const).map((mode) => (
+                  <label key={mode} style={{ display: "inline-flex", gap: 6, alignItems: "center", cursor: "pointer" }}>
+                    <input type="radio" checked={credMode === mode} onChange={() => setCredMode(mode)} style={{ margin: 0 }} />
+                    {t(`admin.models.cred.${mode}`)}
+                  </label>
+                ))}
+              </div>
+              <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>{t("admin.models.credHint")}</div>
+              {credMode === "api_key" && (
+                // 诚实性：这条提示要说清 Key 到底覆盖到哪。四条消费路径都已接线 ——
+                // webchat runtime（model/load.py）、IM bot（core/bedrock_credentials.py +
+                // core/openai_responses_client.py）、后端任务（shared/llm_provider.py），
+                // 且对 Converse 与 Mantle(GPT) 两类模型都生效。
+                // 此处原写「IM bot 尚未接线（task 4.5 待做）」+「GPT 系不受 Key 影响（R5.7）」，
+                // 两条都已不成立，别照着它把代码改回去。文案见 admin.models.credApiKeyScope。
+                <div style={{ ...errText, fontSize: 11.5, marginTop: 6 }}>
+                  {t("admin.models.credApiKeyScope")}
+                </div>
+              )}
+            </div>
+            {credMode === "api_key" && (
+              <div>
+                <FieldLabel>Bedrock API Key</FieldLabel>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input type="password" style={{ ...inputStyle, flex: 1 }} value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)} placeholder={t("admin.models.keyPh")} />
+                  <button style={btnGhost} disabled={saving || !apiKey.trim()} onClick={() => saveKey(false)}>
+                    {t("admin.models.keySave")}
+                  </button>
+                  <button style={iconBtn} disabled={saving || !cfg?.bedrock_api_key.configured} onClick={() => saveKey(true)}>
+                    {t("admin.models.keyClear")}
+                  </button>
+                </div>
+                <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>
+                  {cfg?.bedrock_api_key.configured
+                    ? `${t("admin.models.keySet")} ****${cfg.bedrock_api_key.last_4 || ""}`
+                    : t("admin.models.keyUnset")}
+                  {" · "}{t("admin.models.keyHint")}
+                </div>
+                {/* 谁在何时设的（spec R5.6 的 set_by / set_at）。Key 是共享凭证，出问题时
+                    「谁换过它」是第一个要问的问题；只显示后 4 位定位不到人。 */}
+                {cfg?.bedrock_api_key.configured && (cfg.bedrock_api_key.set_at || cfg.bedrock_api_key.set_by) && (
+                  <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 2 }}>
+                    {t("admin.models.keySetBy")
+                      .replace("{who}", cfg.bedrock_api_key.set_by || t("admin.models.keySetByUnknown"))
+                      .replace("{when}", (cfg.bedrock_api_key.set_at || "").slice(0, 10))}
+                  </div>
+                )}
+                {/* 轮换提示（R5.6）。判定在服务端算好（`rotation_due`），前端不重算 ——
+                    两边各算一遍迟早漂移，而这是一条安全提示。 */}
+                {cfg?.bedrock_api_key.rotation_due && (
+                  <div style={{ ...errText, fontSize: 11.5, marginTop: 2 }}>
+                    {t("admin.models.keyRotationDue")
+                      .replace("{days}", String(cfg.bedrock_api_key.age_days ?? ""))
+                      .replace("{limit}", String(cfg.bedrock_api_key.rotation_days ?? 90))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* ── 模型清单（勾选即用户可见）── */}
+          <div style={{ ...box, padding: 18 }}>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>{t("admin.models.listTitle")}</div>
+              <div style={{ color: "var(--muted)", fontSize: 11.5 }}>
+                {t("admin.models.enabledCount").replace("{n}", String(enabledCount))}
+              </div>
+              {/* 「全部测试」——「这个 Key 能调哪些模型」只能靠逐个真调换回来，AWS 没有
+                  按凭证列模型的 API。换 Key 后想确认哪些模型仍可用，用这个。 */}
+              <button style={{ ...iconBtn, marginLeft: "auto" }} onClick={testAll}
+                disabled={Boolean(testing) || !enabledCount} title={t("admin.models.testAllTip")}>
+                {testing ? t("admin.models.testing") : t("admin.models.testAll")}
+              </button>
+            </div>
+            {/* 探测用的是哪种凭证。选了 API Key 但 Key 为空时服务端会回退 IAM —— 那时
+                绿勾只证明部署角色能调，与 Key 无关，必须说清楚。 */}
+            {probeCred && (
+              <div style={{
+                fontSize: 11.5, marginTop: -4, marginBottom: 8,
+                color: probeCred === "api_key" ? "var(--muted)" : RED,
+              }}>
+                {t(probeCred === "api_key"
+                  ? "admin.models.probedWithKey"
+                  : "admin.models.probedWithRole")}
+              </div>
+            )}
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {models.map((m) => (
+                <div key={m.alias} style={{
+                  display: "flex", alignItems: "center", gap: 10, padding: "9px 11px", borderRadius: 9,
+                  border: `1px solid ${m.enabled ? "var(--orange)" : "var(--line)"}`,
+                  background: m.enabled ? "rgba(255,153,0,.06)" : "transparent", flexWrap: "wrap",
+                }}>
+                  <label style={{ display: "inline-flex", gap: 6, alignItems: "center", cursor: "pointer", minWidth: 190 }}>
+                    <input type="checkbox" checked={m.enabled} style={{ margin: 0 }}
+                      onChange={() => patch(m.alias, { enabled: !m.enabled })} />
+                    <span style={{ fontSize: 13, fontWeight: m.enabled ? 600 : 500 }}>{m.label || m.alias}</span>
+                  </label>
+                  {/* 技术标识（model_id / region）收进 ⓘ 弹层，不再平铺在行内。
+                      平铺时这段最长到 ~50 字符（`openai.gpt-5.6-terra · us-east-2` 再加
+                      「跨区(Mantle 端点)」），把后面的 Web/IM、默认、输出上限、测试全挤到
+                      换行，整行错位 —— 而它们是**查阅**用的，不需要每行都读。
+                      路由范围徽章留在行内：那是数据驻留结论，藏起来等于降低安全可见性。 */}
+                  <span style={{
+                    position: "relative", display: "inline-flex", alignItems: "center",
+                    gap: 6, flex: 1, minWidth: 130,
+                  }}>
+                    <span style={{
+                      fontSize: 10.5, fontWeight: 600, padding: "1px 6px", borderRadius: 5,
+                      whiteSpace: "nowrap", border: "1px solid var(--line)", color: "var(--muted)",
+                    }}>{t(routingScopeKey(m.model_id, { kind: m.kind }))}</span>
+                    <button type="button" aria-expanded={infoOpen === m.alias}
+                      aria-label={t("admin.models.infoBtn")} title={t("admin.models.infoBtn")}
+                      style={{ ...iconBtn, padding: "0 7px", borderRadius: 100, fontSize: 13 }}
+                      onClick={() => setInfoOpen(infoOpen === m.alias ? "" : m.alias)}>ⓘ</button>
+                    {infoOpen === m.alias && (
+                      <span style={{
+                        ...box, position: "absolute", top: "calc(100% + 6px)", left: 0, zIndex: 20,
+                        padding: "10px 12px", width: 340, display: "flex",
+                        flexDirection: "column", gap: 3,
+                        boxShadow: "0 6px 20px rgba(0,0,0,.18)",
+                      }}>
+                        <span style={infoKeyStyle}>{t("admin.models.infoModelId")}</span>
+                        <code style={{ fontSize: 11.5, wordBreak: "break-all" }}>{m.model_id}</code>
+                        {m.region && (
+                          <>
+                            <span style={{ ...infoKeyStyle, marginTop: 5 }}>{t("admin.models.infoRegion")}</span>
+                            <code style={{ fontSize: 11.5 }}>{m.region}</code>
+                          </>
+                        )}
+                        <span style={{ ...infoKeyStyle, marginTop: 5 }}>{t("admin.models.infoRouting")}</span>
+                        <span style={{ fontSize: 11.5 }}>
+                          {t(routingScopeKey(m.model_id, { kind: m.kind }))}
+                        </span>
+                        <span style={{ fontSize: 11, color: "var(--muted)", lineHeight: 1.55, marginTop: 3 }}>
+                          {t("admin.models.routingTip")}
+                        </span>
+                        {m.kind === "bedrock_mantle_responses" && (
+                          <span style={{ fontSize: 11, color: "var(--muted)", lineHeight: 1.55, marginTop: 5 }}>
+                            {t("admin.models.infoMantle")}
+                          </span>
+                        )}
+                      </span>
+                    )}
+                  </span>
+                  <div style={{ display: "flex", gap: 5 }}>
+                    {MODEL_SURFACES.map((s) => (
+                      <label key={s} title={t(`admin.models.surface.${s}`)} style={{
+                        display: "inline-flex", gap: 4, alignItems: "center", padding: "3px 9px", borderRadius: 100,
+                        cursor: "pointer", fontSize: 11.5,
+                        border: `1px solid ${m.surfaces.includes(s) ? "var(--blue)" : "var(--line)"}`,
+                        color: m.surfaces.includes(s) ? "var(--text)" : "var(--muted)",
+                      }}>
+                        <input type="checkbox" checked={m.surfaces.includes(s)} style={{ margin: 0 }}
+                          onChange={() => toggleSurface(m, s)} />
+                        {t(`admin.models.surface.${s}`)}
+                      </label>
+                    ))}
+                  </div>
+                  <label title={t("admin.models.defaultTip")} style={{
+                    display: "inline-flex", gap: 5, alignItems: "center", fontSize: 11.5,
+                    color: effectiveDefault === m.alias ? "var(--text)" : "var(--muted)",
+                    cursor: m.enabled ? "pointer" : "not-allowed", opacity: m.enabled ? 1 : 0.5,
+                  }}>
+                    <input type="radio" checked={effectiveDefault === m.alias} disabled={!m.enabled}
+                      onChange={() => setDefaultModel(m.alias)} style={{ margin: 0 }} />
+                    {t("admin.models.default")}
+                  </label>
+                  {/* 裸数字框曾被误认成端口号 —— 加上可见的名字与单位。它是该模型单次回复的
+                      输出上限，设太低会把长回答静默截断，所以保持行内可见可改。 */}
+                  <label title={t("admin.models.capTip")} style={{
+                    display: "inline-flex", gap: 5, alignItems: "center",
+                    fontSize: 11.5, color: "var(--muted)", whiteSpace: "nowrap",
+                  }}>
+                    {t("admin.models.cap")}
+                    <input style={{ ...inputStyle, width: 82, fontSize: 11.5 }} type="number" min={1}
+                      value={m.hard_output_limit}
+                      onChange={(e) => patch(m.alias, { hard_output_limit: Number(e.target.value) || 0 })} />
+                    {t("admin.models.capUnit")}
+                  </label>
+                  <button style={iconBtn} disabled={testing === m.alias} onClick={() => test(m)}
+                    title={t("admin.models.testTip")}>
+                    {testing === m.alias ? t("admin.models.testing") : t("admin.models.testBtn")}
+                  </button>
+                  {/* 只在点过「测试」之后显示这一次的结果，没点过就什么都不显示。
+                      这里曾有一个「未测试」占位，那是持久化 `verified` 字段留下的语义 ——
+                      当时它是个状态（存在 DDB 里、参与保存门禁）。字段删掉之后，「未测试」
+                      就退化成了一句废话：它对每个模型、每次打开页面都成立，既不代表模型有
+                      问题，也不代表管理员漏了一步，却占着一列宽度让本就挤的行更难读。
+                      可用性由保存时的现场探测负责，不需要页面上有个常驻标记。 */}
+                  {results[m.alias] ? (
+                    <span style={{ fontSize: 11.5,
+                      color: results[m.alias] === "ok" ? "var(--green)" : RED }}>
+                      {testLabel(results[m.alias])}
+                    </span>
+                  ) : null}
+                  <button style={iconBtn} title={t("admin.models.remove")}
+                    onClick={() => setModels(models.filter((x) => x.alias !== m.alias))}>✕</button>
+                </div>
+              ))}
+            </div>
+            {adding ? (
+              <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+                {/* 候选选择器。原先是一个原生 <select>：90+ 条、零排序、无法搜索，
+                    找 Claude 5 只能滚动翻，而它还同时以 `anthropic.*` 与 `global.anthropic.*`
+                    两种形式存在 —— 实测管理员的结论是"这个模型没有"。
+                    改成 搜索 + 按厂商分组 + 路由范围徽章。 */}
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <input style={{ ...inputStyle, minWidth: 260 }} value={candQuery} autoFocus
+                    aria-label={t("admin.models.searchPh")}
+                    placeholder={t("admin.models.searchPh")}
+                    onChange={(e) => setCandQuery(e.target.value)} />
+                  {/* 只有当选中项**当前可见**时才允许添加。否则会出现：搜索把选中项过滤掉了，
+                      按钮却仍然亮着、点下去加进一个屏幕上看不到的模型 —— 而它还会被
+                      appendEntry 自动设为默认模型（enabled 也默认为 true）。 */}
+                  <button style={btnGhost} disabled={!pickVisible} onClick={addFromCandidate}>{t("admin.models.add")}</button>
+                  <button style={iconBtn} onClick={() => {
+                    setAdding(false); setPick(""); setManualId(""); setCandQuery("");
+                  }}>
+                    {t("admin.models.cancel")}
+                  </button>
+                </div>
+                {(() => {
+                  // 四个态必须分开说，否则管理员会误判：
+                  //  · 还在读     → 「正在读取…」
+                  //  · 读失败     → 之前这里也显示「正在读取…」并**永久停在那**（candidates 恒空），
+                  //                同时下方一条红色 warning，自相矛盾。现在明确说失败 + 给重试。
+                  //  · 全部已加入 → 之前显示「没有匹配的模型」，听起来像搜索没结果
+                  //  · 无匹配     → 才是真的没搜到
+                  if (!candidates.length) {
+                    return candWarn
+                      ? (
+                        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                          <span style={{ ...errText, fontSize: 12 }}>{t("admin.models.candFailed")}</span>
+                          <button style={iconBtn} onClick={() => { setCandWarn(""); loadCandidates(); }}>
+                            {t("admin.models.retry")}
+                          </button>
+                        </div>
+                      )
+                      : <div style={{ color: "var(--muted)", fontSize: 12 }}>{t("admin.models.candLoading")}</div>;
+                  }
+                  if (!availCandidates.length) {
+                    return <div style={{ color: "var(--muted)", fontSize: 12 }}>{t("admin.models.allAdded")}</div>;
+                  }
+                  if (!shownCandidates.length) {
+                    return <div style={{ color: "var(--muted)", fontSize: 12 }}>{t("admin.models.noMatch")}</div>;
+                  }
+                  // 分组：保持 sortCandidates 已排好的顺序，按厂商切段
+                  const groups: { name: string; items: LlmCandidate[] }[] = [];
+                  for (const c of shownCandidates) {
+                    const name = c.provider_name || t("admin.models.otherProvider");
+                    const last = groups[groups.length - 1];
+                    if (last && last.name === name) last.items.push(c);
+                    else groups.push({ name, items: [c] });
+                  }
+                  return (
+                    <div>
+                      <div style={{ color: "var(--muted)", fontSize: 11.5, marginBottom: 4 }}>
+                        {t("admin.models.matchCount").replace("{n}", String(shownCandidates.length))
+                          .replace("{total}", String(availCandidates.length))}
+                      </div>
+                      <div style={{
+                        maxHeight: 280, overflowY: "auto", border: "1px solid var(--line)",
+                        borderRadius: 8, padding: 6,
+                      }}>
+                        {groups.map((g) => (
+                          <div key={g.name}>
+                            <div style={{
+                              fontSize: 10.5, fontWeight: 700, color: "var(--muted)",
+                              padding: "6px 6px 3px", textTransform: "uppercase", letterSpacing: .4,
+                            }}>{g.name}</div>
+                            {g.items.map((c) => {
+                              const on = pick === c.model_id;
+                              return (
+                                <div key={c.model_id} onClick={() => setPick(c.model_id)}
+                                  style={{
+                                    display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap",
+                                    padding: "5px 7px", borderRadius: 6, cursor: "pointer",
+                                    background: on ? "rgba(255,153,0,.10)" : "transparent",
+                                    border: `1px solid ${on ? "var(--orange)" : "transparent"}`,
+                                  }}>
+                                  <input type="radio" name="llm-candidate" checked={on} onChange={() => setPick(c.model_id)}
+                                    style={{ margin: 0 }} />
+                                  <span style={{ fontSize: 12.5, fontWeight: on ? 600 : 500 }}>
+                                    {c.label || c.model_id}
+                                  </span>
+                                  <code style={{
+                                    fontSize: 11, color: "var(--muted)", flex: 1, minWidth: 200,
+                                    wordBreak: "break-all",
+                                  }}>{c.model_id}</code>
+                                  <span title={t("admin.models.routingTip")} style={{
+                                    fontSize: 10, fontWeight: 600, padding: "1px 6px", borderRadius: 5,
+                                    whiteSpace: "nowrap", border: "1px solid var(--line)", color: "var(--muted)",
+                                  }}>{t(routingScopeKey(c.model_id, { scope: c.scope, kind: c.kind }))}</span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+                {candWarn && <div style={{ ...errText, fontSize: 11.5 }}>{candWarn}</div>}
+                {/* 列表来源身份。`iam_fallback` 是唯一危险的情形：列表来自部署角色而推理
+                    用 Key，两者可能不是同一批模型。以前默认两者一致、什么都不说，管理员
+                    会选中一个 Key 调不了的模型，到生产才 403。 */}
+                {candSource && (
+                  <div style={candSource === "iam_fallback"
+                    ? { ...errText, fontSize: 11.5 }
+                    : { color: "var(--muted)", fontSize: 11.5 }}>
+                    {t(candSource === "api_key" ? "admin.models.candFromKey"
+                      : candSource === "iam_fallback" ? "admin.models.candKeyNoListPerm"
+                        : "admin.models.candFromRole")}
+                  </div>
+                )}
+                {/* 手填入口：候选列不出来时（跨账号 Key 指向的模型不在本账号候选里、
+                    或本栈缺 ListFoundationModels 权限）这是唯一的加模型方式。 */}
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <span style={{ color: "var(--muted)", fontSize: 11.5 }}>{t("admin.models.orManual")}</span>
+                  <input style={{ ...inputStyle, minWidth: 260 }} value={manualId}
+                    placeholder="global.anthropic.claude-sonnet-5"
+                    onChange={(e) => setManualId(e.target.value)} />
+                  <input style={{ ...inputStyle, width: 160 }} value={manualLabel}
+                    placeholder={t("admin.models.manualLabelPh")}
+                    onChange={(e) => setManualLabel(e.target.value)} />
+                  <button style={btnGhost} disabled={!manualId.trim()} onClick={addManual}>
+                    {t("admin.models.add")}
+                  </button>
+                </div>
+                <div style={{ color: "var(--muted)", fontSize: 11.5 }}>{t("admin.models.manualHint")}</div>
+              </div>
+            ) : (
+              <button style={{ ...btnGhost, marginTop: 10 }} onClick={loadCandidates}>+ {t("admin.models.addModel")}</button>
+            )}
+          </div>
+
+          {/* ── 后端任务模型（PHD 翻译 / 报告精简）── */}
+          <div style={{ ...box, padding: 18, maxWidth: 780, display: "flex", flexDirection: "column", gap: 14 }}>
+            <div style={{ fontSize: 13, fontWeight: 700 }}>{t("admin.models.backendTitle")}</div>
+            <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: -8 }}>{t("admin.models.backendSub")}</div>
+            {["phd_translate", "devops_report_summarize"].map((task) => {
+              const row = taskRows.find((r) => r.task === task);
+              return (
+                <div key={task}>
+                  <FieldLabel>{t(`admin.models.task.${task}`)}</FieldLabel>
+                  <select style={{ ...inputStyle, width: 320 }} value={tasks[task] || ""}
+                    onChange={(e) => setTasks({ ...tasks, [task]: e.target.value })}>
+                    <option value="">{t("admin.models.followDefault")}</option>
+                    {/* 已启用的模型全部可选，没有例外。此处曾把 GPT 系「列出但禁用 +
+                        写原因」，因为后端链只走 Converse —— 那个缺口已补齐（见上方注释）。 */}
+                    {models.filter((m) => m.enabled).map((m) => (
+                      <option key={m.alias} value={m.alias}>{m.label || m.alias}</option>
+                    ))}
+                  </select>
+                  {row?.status === "drift" && (
+                    <div style={{ ...errText, fontSize: 11.5, marginTop: 4 }}>{t("admin.models.outOfSync")}</div>
+                  )}
+                  {row?.status === "unknown" && (
+                    <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>
+                      {t("admin.models.syncUnknown")}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* ── 保存 + 审计/回滚 ── */}
+          {/* 不变量预检结果放在按钮**旁边、点击之前**。此前这些条件只在服务端校验，
+              管理员点保存后只看到 `http_400`，得自己猜是哪一条 —— 实测就卡在这里。 */}
+          {blockers.length > 0 && (
+            <div style={{
+              border: `1px solid ${RED}`, borderRadius: 8, padding: "9px 12px",
+              display: "flex", flexDirection: "column", gap: 3, maxWidth: 780,
+            }}>
+              <div style={{ ...errText, fontWeight: 600 }}>{t("admin.models.cannotSave")}</div>
+              {blockers.map((b) => (
+                <div key={b} style={{ ...errText, fontSize: 11.5 }}>· {b}</div>
+              ))}
+            </div>
+          )}
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <button style={{ ...btnPrimary, opacity: blockers.length ? 0.5 : 1,
+                             cursor: blockers.length ? "not-allowed" : "pointer" }}
+              disabled={saving || blockers.length > 0} onClick={save}
+              title={blockers.length ? blockers.join(" / ") : undefined}>
+              {saving ? t("admin.models.saving") : t("admin.models.save")}
+            </button>
+            <button style={btnGhost} onClick={openAudit}>{t("admin.models.audit")}</button>
+            {cfg && <span style={{ color: "var(--muted)", fontSize: 11.5 }}>
+              {t("admin.models.generation")}: {cfg.generation}
+              {cfg.updated_by ? ` · ${cfg.updated_by}` : ""}
+            </span>}
+            {msg && <span style={msg.ok ? okText : errText}>{msg.text}</span>}
+          </div>
+          {auditOpen && (
+            <div style={{ ...box, padding: 14 }}>
+              {audit.length === 0 ? <div style={{ color: "var(--muted)", fontSize: 12.5 }}>{t("admin.models.auditEmpty")}</div> : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {audit.map((a) => (
+                    <div key={a.SK} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12 }}>
+                      <span style={{ color: "var(--muted)", minWidth: 165 }}>{a.at}</span>
+                      <span style={{ flex: 1 }}>{a.actor_name || a.actor_sub || ""}</span>
+                      <span style={{ color: "var(--muted)" }}>{a.generation_before} → {a.generation_after}</span>
+                      <button style={iconBtn} disabled={saving} onClick={() => doRollback(a.SK)}>
+                        {t("admin.models.rollback")}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

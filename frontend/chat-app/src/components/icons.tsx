@@ -95,6 +95,13 @@ export const IconChevronRight = ({ size = 14 }: P) => (
 export const IconCheck = ({ size = 15 }: P) => (
   <svg {...base(size)}><path d="m5 12 5 5L20 7" /></svg>
 );
+// 全部折叠 / 全部展开（会话分组批量操作）—— 双箭头相向 / 相背
+export const IconCollapseAll = ({ size = 15 }: P) => (
+  <svg {...base(size)}><path d="m7 9 5-5 5 5" /><path d="m7 15 5 5 5-5" /></svg>
+);
+export const IconExpandAll = ({ size = 15 }: P) => (
+  <svg {...base(size)}><path d="m7 4 5 5 5-5" /><path d="m7 20 5-5 5 5" /></svg>
+);
 
 // 会话项操作：⋯ / 置顶 / 重命名 / 删除
 export const IconKebab = ({ size = 16 }: P) => (

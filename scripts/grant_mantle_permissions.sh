@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
-# 幂等地给 NotiOps AgentCore runtime 执行角色补 Bedrock Mantle 权限（GPT-5.4 用）。
+# 幂等地给 NotiOps AgentCore runtime 执行角色补 Bedrock Mantle 权限（GPT 系用）。
 #
-# 背景：GPT-5.4 经 Bedrock Mantle（OpenAI Responses API，us-east-2/us-west-2）调用。
+# 背景：GPT 系经 Bedrock Mantle（OpenAI Responses API）调用，端点按区寻址。
 # `agentcore deploy` 生成的 runtime 执行角色默认没有 mantle 权限，缺了会在 SSE 流里报 401
 # （bedrock-mantle:CreateInference / CallWithBearerToken）。
+#
+# ⚠️ 区域集必须与 agent-build/NotiOpsWebChat/agentcore/cdk/lib/cdk-stack.ts 的
+# MANTLE_REGIONS、以及 bff/web-chat/llm_config.mjs 的 MANTLE_REGIONS 一致。
+# 本脚本原先只授 us-east-2/us-west-2，而 Admin 可保存的白名单是 14 个区 —— 管理员存下一个
+# 别的区的 GPT 条目后，保存时的连通性探测会过（那用的是 BFF 的角色，resources 为 "*"），
+# 但真发消息时是本角色在调，403。scripts/test_mantle_regions_consistent.py 会断言一致。
 #
 # 推荐做法是把权限写进 agentcore CDK（cdk-stack.ts，部署即生效，客户零操作）；
 # 本脚本是**补救路径**：当角色已存在、或没带 CDK 改动时，手动一键补权限。重复执行安全。
@@ -43,8 +49,20 @@ POLICY_DOC="$(cat <<EOF
       "Effect": "Allow",
       "Action": ["bedrock-mantle:CreateInference", "bedrock-mantle:GetInference"],
       "Resource": [
+        "arn:aws:bedrock-mantle:us-east-1:${ACCOUNT}:*",
         "arn:aws:bedrock-mantle:us-east-2:${ACCOUNT}:*",
-        "arn:aws:bedrock-mantle:us-west-2:${ACCOUNT}:*"
+        "arn:aws:bedrock-mantle:us-west-2:${ACCOUNT}:*",
+        "arn:aws:bedrock-mantle:ap-northeast-1:${ACCOUNT}:*",
+        "arn:aws:bedrock-mantle:ap-south-1:${ACCOUNT}:*",
+        "arn:aws:bedrock-mantle:ap-southeast-2:${ACCOUNT}:*",
+        "arn:aws:bedrock-mantle:ap-southeast-3:${ACCOUNT}:*",
+        "arn:aws:bedrock-mantle:eu-central-1:${ACCOUNT}:*",
+        "arn:aws:bedrock-mantle:eu-north-1:${ACCOUNT}:*",
+        "arn:aws:bedrock-mantle:eu-south-1:${ACCOUNT}:*",
+        "arn:aws:bedrock-mantle:eu-west-1:${ACCOUNT}:*",
+        "arn:aws:bedrock-mantle:eu-west-2:${ACCOUNT}:*",
+        "arn:aws:bedrock-mantle:sa-east-1:${ACCOUNT}:*",
+        "arn:aws:bedrock-mantle:us-gov-west-1:${ACCOUNT}:*"
       ]
     },
     {

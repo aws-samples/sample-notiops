@@ -39,6 +39,7 @@ import os
 import re
 
 import boto3
+from .lazy_boto import LazyClient
 
 from datetime import datetime, timezone
 
@@ -47,6 +48,9 @@ from . import aws_pricing_mcp as _aws_pricing_mcp
 from . import aws_cost_mcp as _aws_cost_mcp
 from . import llm_pref_resolver as _llm_pref_resolver
 from . import model_catalog as _model_catalog
+# 导入即注册 bedrock 客户端的「构造前钩子」（Bedrock API Key 注入，spec task 4.5）。
+# 必须在任何 bedrock-runtime 客户端首次构造之前完成 —— botocore 构造时快照 token provider。
+from . import bedrock_credentials as _bedrock_credentials
 from . import openai_responses_client as _openai_responses
 # WA Security MCP retired 2026-05-30 — awslabs only ships account-
 # scanner tools (GuardDuty / SecurityHub / encryption / network-scan),
@@ -64,8 +68,14 @@ from . import openai_responses_client as _openai_responses
 
 logger = logging.getLogger(__name__)
 
+# `global.*` inference profile, matching core/model_catalog.py and web chat.
+# This fallback is not theoretical: the IM ECS task does not set
+# BEDROCK_MODEL_ID (only lambda3 gets it from the CDK stack), so whatever is
+# written here is what IM actually routes through. It used to say `us.*`,
+# which meant IM traffic was US-routed while web chat was globally routed for
+# the very same alias. Unified on `global.*` (decision 2026-07).
 BEDROCK_MODEL_ID = os.environ.get(
-    "BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-5"
+    "BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5"
 )
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
 
@@ -102,7 +112,10 @@ def _max_output_tokens_for(model_id: str | None) -> int:
         return _MAX_OUTPUT_TOKENS_FALLBACK
     return entry.max_output_tokens
 
-_bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+# 惰性构造（core/lazy_boto.py）：botocore 在**构造时**快照凭证，import 期建好的
+# client 会让后续 setenv AWS_BEARER_TOKEN_BEDROCK 完全失效（Bedrock API Key 模式
+# 因此无法生效）。代理转发属性访问，所有调用点写法不变。
+_bedrock = LazyClient("bedrock-runtime", region=BEDROCK_REGION)
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +572,11 @@ def respond(user_text: str, *, command: str,
     if command not in {"chitchat", "general_qa"}:
         return ""
 
+    # Bedrock API Key 热生效（spec R5.2 / task 4.5）。Admin 改了 Key / 切了凭证模式后，
+    # 缓存的 bedrock 客户端仍持旧凭证 —— refresh() 在 Key 变化时重建它们（未变则廉价 no-op）。
+    # 放在这里而不是模块导入处：IM 是长驻 ECS 进程，必须每条消息都有机会收敛。
+    _bedrock_credentials.refresh()
+
     # Resolve which model to use BEFORE we hit the change-request
     # filter — same model has to render both the canned refusal footer
     # and any actual reply, so callers see consistent attribution
@@ -717,43 +735,12 @@ def respond(user_text: str, *, command: str,
     return _maybe_append_guidance(reply, chitchat_count, locale)
 
 
-_MODEL_FRIENDLY_NAMES: dict[str, str] = {
-    # Inference-profile IDs (us./eu./apac. cross-region prefixes) and
-    # bare model IDs both map to the same display name. Anyone reading
-    # the chat reply sees "Claude Sonnet 4.6", not the underlying ARN
-    # bits — internal debug needs go through CloudWatch, not the UI.
-    "claude-sonnet-5": "Claude Sonnet 5",
-    "claude-opus-4-7": "Claude Opus 4.7",
-    "claude-opus-4-6": "Claude Opus 4.6",
-    "claude-sonnet-4-6": "Claude Sonnet 4.6",
-    "claude-sonnet-4-5": "Claude Sonnet 4.5",
-    "claude-haiku-4-5": "Claude Haiku 4.5",
-    "claude-3-7-sonnet": "Claude Sonnet 3.7",
-    "claude-3-5-sonnet": "Claude Sonnet 3.5",
-    "claude-3-5-haiku": "Claude Haiku 3.5",
-}
-
-
-def _friendly_model_name(model_id: str) -> str:
-    """Return a human-readable model name (e.g. "Claude Sonnet 4.6")
-    derived from a Bedrock model / inference-profile ID. Falls back to
-    the raw ID when an unknown model is configured — better to show
-    something users can google than to silently lie."""
-    mid = (model_id or "").lower()
-    for needle, label in _MODEL_FRIENDLY_NAMES.items():
-        if needle in mid:
-            return label
-    return model_id
-
-
-def _model_footer() -> str:
-    """Trailing line attributing the response to its underlying LLM.
-    Plain text byline — Feishu's `reply_text` path doesn't render
-    markdown (so `_italic_` showed as literal underscores), and the
-    earlier em-dash variant looked decorative without making it clear
-    that the line names the model. "By <name>" reads as attribution
-    in both Chinese and English chat contexts."""
-    return f"By {_friendly_model_name(BEDROCK_MODEL_ID)} (via Amazon Bedrock)"
+# Removed 2026-08 (spec task 4.4): `_MODEL_FRIENDLY_NAMES` / `_friendly_model_name()`
+# / `_model_footer()`. That trio was a second, hardcoded model-id → label map that
+# had no callers left — the live byline is built in `respond()` from the catalogue's
+# own label (`model_entry.label`), which now comes from DynamoDB. Keeping a parallel
+# substring-matching table would only invite drift, and its matching was unsound:
+# the needle "claude-sonnet-5" also matches a future "claude-sonnet-5x" id.
 
 
 def _maybe_append_guidance(reply: str, chitchat_count: int,
@@ -2043,6 +2030,19 @@ def _invoke_with_tools_responses(user_text: str, locale: str,
             [],   # no citations: nothing was rendered
             [],   # no tool-call trace: would only confuse the user
         )
+
+    # 同上，但针对**凭证被拒**（401/403）。这条以前落进了泛化的空文本路径：
+    # 所有失败都返回 "",  而调用方把空文本当成"模型没说话"，回一句客套的兜底话术。
+    # 于是 Bedrock API Key 过期 / 被吊销的表现是机器人礼貌地答非所问 —— 用户以为模型
+    # 变笨了，管理员在 Admin 页也看不出来（那边的「测试」用的是 BFF 的角色，不是 IM 的凭证）。
+    # 凭证问题不会自愈，且下一步很明确（去 Admin 换 Key），必须说出来。
+    if any(tc.get("name") == _openai_responses.AUTH_FAILED_SENTINEL
+           for tc in trace):
+        logger.warning(
+            "bedrock_chat: GPT call rejected the credential — surfacing "
+            "credential guidance to user instead of generic fallback")
+        from . import i18n as _i18n
+        return (_i18n.t("gpt.auth_failed", locale), [], [])
 
     return text, citations, trace
 

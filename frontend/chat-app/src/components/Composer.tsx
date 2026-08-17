@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { useT, useLocale } from "../i18n";
-import { MODELS } from "../types";
+import { useModelCatalog } from "../models";
+// `MODELS` 不再从 types 引入：模型清单已改为运行时从 `/models` 拉取（useModelCatalog），
+// types.ts 里那份只剩历史落款用途。main 侧这行原本是 `{ MODELS, topicHasDevopsAgent }`，
+// 合并时只保留后者 —— 本文件已无 MODELS 引用，留着会是未使用导入。
+import { topicHasDevopsAgent } from "../types";
 import { getCasesSummary } from "../api/chat";
 import { listSkills, skillDisplay, isPresetSkill, type Skill } from "../api/skills";
 import { IconInvestigate, IconCases, IconFinOps, IconReports, IconGlobe, IconSecurity, IconSkill, IconWhatsNew, IconChevronRight, IconPlus, IconCustomize, IconGauge, skillIcon } from "./icons";
@@ -20,6 +24,9 @@ interface Props {
   onToggleFinopsAgent?: () => void;
   devopsAgent?: boolean;
   onToggleDevopsAgent?: () => void;
+  /** 「深度调查（直连）」开关（默认关）：BFF 直连 DevOps Agent API、0 token。与 devopsAgent 互斥。 */
+  devopsAgentDirect?: boolean;
+  onToggleDevopsAgentDirect?: () => void;
   /** 停止当前会话正在进行的生成。 */
   onStop?: () => void;
   /** 当前会话主题，用于切换专属推荐 prompt。 */
@@ -38,7 +45,7 @@ interface Props {
 
 const EFFORTS = ["model.effort.fast", "model.effort.balanced", "model.effort.deep"] as const;
 
-export default function Composer({ model, onModelChange, onSend, busy, showSuggestions = true, webSearch = false, onToggleWebSearch, devopsAgent = false, onToggleDevopsAgent, onStop, topic = "general", prefill, onManageSkills, onOpenDashboard, convKey }: Props) {
+export default function Composer({ model, onModelChange, onSend, busy, showSuggestions = true, webSearch = false, onToggleWebSearch, devopsAgent = false, onToggleDevopsAgent, devopsAgentDirect = false, onToggleDevopsAgentDirect, onStop, topic = "general", prefill, onManageSkills, onOpenDashboard, convKey }: Props) {
   const t = useT();
   const { locale } = useLocale();
   const [text, setText] = useState("");
@@ -118,7 +125,14 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
     onManageSkills?.();
   };
 
-  const modelName = MODELS.find((m) => m.id === model)?.name ?? model;
+  // 候选集由管理员在服务端勾选（GET /models），拉取落地后本组件自动重渲染。
+  const { models: modelOptions, loading: catalogLoading, source: catalogSource,
+          canSend: catalogCanSend, canSendWithoutModel } = useModelCatalog();
+  // 「深度调查（直连）」由 BFF 直连 DevOps Agent API，全程 0 token、不碰 Bedrock，
+  // 所以它不受模型目录门禁约束 —— 否则管理员取消勾选全部 webchat 模型后，唯一不需要
+  // 模型的功能反而发不出去，而提示语还指向一个与它无关的配置项。
+  const sendAllowed = devopsAgentDirect ? canSendWithoutModel : catalogCanSend;
+  const modelName = modelOptions.find((m) => m.id === model)?.name ?? model;
 
   useEffect(() => {
     const onDocClick = (e: MouseEvent) => {
@@ -138,6 +152,11 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
   const send = () => {
     const v = text.trim();
     if (!v || busy) return;
+    // 目录还没落地（或管理员没为本端启用任何模型）就先别发：否则消息会带着一个
+    // 界面上显示的、但其实不在启用集里的模型发出去，服务端替换后用户看到的模型
+    // 与他选的不一致。`canSend` 在宽限期结束后会自动放行（见 models.ts 状态机）。
+    // 直连路径不需要模型，用 sendAllowed 而不是 catalogCanSend。
+    if (!sendAllowed) return;
     onSend(v, activeSkill?.skill_id);
     setText("");
     setActiveSkill(null);
@@ -457,10 +476,11 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
                 <span className="toggle-soon">{t("composer.soon")}</span>
               </button>
             )}
-            {/* DevOps Agent 深度调查开关：故障调查 + FinOps + 安全主题都显示
-                (FinOps 里用它分析成本/用量;安全里用它深度排查安全风险/配置)。
-                默认状态由会话初始值决定(见 ChatApp;当前三者均默认关)。 */}
-            {(topic === "investigate" || topic === "finops" || topic === "security") && (
+            {/* DevOps Agent 深度调查开关：**默认所有主题都显示**，只排除少数不适用的
+                (见 types.ts `topicHasDevopsAgent` —— 与后端 `_DEVOPS_TOPICS_EXCLUDED` 同一口径)。
+                这样以后新增主题自动继承该能力，不需要回来改这里。
+                默认开/关状态由会话初始值决定(见 ChatApp;当前一律默认关，用户按需手动开)。 */}
+            {topicHasDevopsAgent(topic) && (
               <button
                 type="button"
                 className={"websearch-toggle" + (devopsAgent ? " on" : "")}
@@ -469,6 +489,20 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
                 aria-pressed={devopsAgent}
               >
                 <IconInvestigate size={15} /> {t("composer.devops.short")}
+              </button>
+            )}
+            {/* 「深度调查（直连）」：与上面同一能力的 **0 token** 版本（BFF 直连 DevOps Agent
+                API，不经大模型）。与上面的开关**互斥**（互斥在 ChatApp 的 toggle 里实现），
+                主题门控沿用同一个 topicHasDevopsAgent。老开关一行未改。 */}
+            {topicHasDevopsAgent(topic) && (
+              <button
+                type="button"
+                className={"websearch-toggle" + (devopsAgentDirect ? " on" : "")}
+                onClick={onToggleDevopsAgentDirect}
+                title={t("composer.devops.direct") + " — " + t("composer.devops.direct.hint")}
+                aria-pressed={devopsAgentDirect}
+              >
+                <IconInvestigate size={15} /> {t("composer.devops.direct.short")}
               </button>
             )}
             <div className="cbar-right" style={{ marginLeft: "auto" }} ref={selRef}>
@@ -496,7 +530,10 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
                   </svg>
                 </button>
               ) : (
-                <button className="send" onClick={send} disabled={!text.trim()} aria-label="Send">
+                <button className="send" onClick={send} disabled={!text.trim() || !sendAllowed}
+                  title={!sendAllowed
+                    ? t(catalogLoading ? "model.loading" : "model.noneEnabled") : undefined}
+                  aria-label="Send">
                   <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M12 19V6" /><path d="M6 12l6-6 6 6" />
                   </svg>
@@ -505,7 +542,35 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
 
               {menuOpen && (
                 <div className={"modelmenu" + (menuDropUp ? "" : " drop-down")} onClick={(e) => e.stopPropagation()}>
-                  {MODELS.map((mo) => (
+                  {/* 这一份清单不是管理员配的那一份 —— 读服务端目录失败时会静默退回打包内置
+                      清单，于是用户看到的模型多于（甚至完全不同于）管理员启用的那些。
+                      此前这个状态在界面上毫无痕迹，问题只能靠对比 DDB 才能发现。 */}
+                  {catalogLoading && (
+                    <div style={{ fontSize: 11.5, color: "var(--muted)", padding: "8px 10px" }}>
+                      {t("model.loading")}
+                    </div>
+                  )}
+                  {/* 只在服务端明确"没有目录"时才提示降级。`cache` 不提示 —— 它是这个部署
+                      真实目录的上一次快照，后台正在校验，提示只会造成噪声。 */}
+                  {!catalogLoading && (catalogSource === "read_error" || catalogSource === "unseeded"
+                                       || catalogSource === "disabled") && (
+                    <div style={{ fontSize: 11, color: "#8a5a00", background: "#fff3da",
+                                  borderBottom: "1px solid #f0d9a6", padding: "6px 10px",
+                                  lineHeight: 1.45 }}>
+                      {t(catalogSource === "read_error" ? "model.degradedNotice" : "model.fallbackNotice")}
+                    </div>
+                  )}
+                  {/* 目录读到了、但管理员没为 Web 对话启用任何模型：这要他去改配置，
+                      不能偷偷换一份清单顶上（那正是之前"看到 8 个其实只有 1 个"的成因）。 */}
+                  {!catalogLoading && catalogSource === "ddb" && modelOptions.length === 0 && (
+                    <div style={{ fontSize: 11.5, color: "#8a5a00", padding: "8px 10px", lineHeight: 1.45 }}>
+                      {t("model.noneEnabled")}
+                    </div>
+                  )}
+                  {/* 加载中不渲染任何模型行：`catalog` 的初值是打包内置清单，渲染它等于
+                      在那一秒里把一份错清单当成正式目录给用户选（实测：先看到 8 个，
+                      落地后变 1 个）。宁可短暂空着，也不给可选的错项。 */}
+                  {!catalogLoading && modelOptions.map((mo) => (
                     <div key={mo.id} className={"mm-item" + (mo.id === model ? " sel" : "")} onClick={() => { onModelChange(mo.id); setMenuOpen(false); }}>
                       <div style={{ flex: 1 }}>
                         <div className="mm-name">

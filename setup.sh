@@ -1283,6 +1283,27 @@ if [ -n "$CDK_ACCOUNT" ] && command -v jq >/dev/null 2>&1; then
   fi
 fi
 
+# ─── LLM 模型目录 seed（DDB PK=llmcfg / SK=meta）───
+# 幂等：写入条件是 attribute_not_exists(PK)，所以重跑部署绝不覆盖管理员在控制台里
+# 配好的目录。不 seed 也能聊（各端都有内置兜底目录），但 Admin 的「模型」页会是空表，
+# 而管理员只能添加**能被枚举并连通性测试通过**的模型 —— 于是第一次保存很难做成。
+# 详见 scripts/seed_llm_catalog.py 的文件头。
+echo ""
+echo "$(t "── LLM 模型目录 ──" "── LLM model catalogue ──")"
+if command -v python3 >/dev/null 2>&1; then
+  if AWS_REGION="$DEPLOY_REGION" python3 "$(dirname "$0")/scripts/seed_llm_catalog.py" \
+       --table notiops-config --region "$DEPLOY_REGION" 2>/tmp/notiops-llmcfg-seed-err.log; then
+    :
+  else
+    echo "  $(t "⚠ 模型目录 seed 失败（各端会使用内置兜底目录，对话不受影响；Admin「模型」页将为空表）。详情：" "⚠ Model catalogue seed failed (every surface falls back to its builtin catalogue, chat is unaffected; the Admin \"Models\" tab will be empty). Details:")"
+    head -5 /tmp/notiops-llmcfg-seed-err.log 2>/dev/null
+    echo "  $(t "  修好后可单独重跑：python3 scripts/seed_llm_catalog.py --region " "  Re-run on its own once fixed: python3 scripts/seed_llm_catalog.py --region ")$DEPLOY_REGION"
+  fi
+  rm -f /tmp/notiops-llmcfg-seed-err.log
+else
+  echo "  $(t "⚠ 未找到 python3，跳过模型目录 seed。稍后手动执行：python3 scripts/seed_llm_catalog.py --region " "⚠ python3 not found, skipping the model catalogue seed. Run manually later: python3 scripts/seed_llm_catalog.py --region ")$DEPLOY_REGION"
+fi
+
 # ─── 首次部署时创建 admin 用户 ───
 ADMIN_USER_EXISTS=$(aws cognito-idp list-users \
   --user-pool-id "$USER_POOL_ID" --region "$DEPLOY_REGION" \

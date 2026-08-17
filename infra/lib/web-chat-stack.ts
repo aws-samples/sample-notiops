@@ -38,6 +38,10 @@ export interface WebChatStackProps extends cdk.StackProps {
   /** idle 控制台前端 CloudFront 地址（NotiOpsBackendStack.consoleUrl）——写入 config.json，
    * 供 chat-app 侧栏「巡检 & 报告」外链跳转。 */
   idleConsoleUrl?: string;
+  /** 报告 CDN 域名（NotiOpsBackendStack.reportsCdnDomain，CloudFront + OAC，只暴露 reports/*）。
+   * 「深度调查（直连）」把 HTML 报告落到 dataBucket 的 reports/ 前缀后，用它拼**不过期**的链接。
+   * 缺省时直连路径只是少一个报告链接（摘要仍在聊天里），不报错。 */
+  reportsCdnDomain?: string;
 }
 
 export class WebChatStack extends cdk.Stack {
@@ -98,6 +102,9 @@ export class WebChatStack extends cdk.Stack {
         // 关联账号（找 payer），不再硬编码账号 ID/角色 ARN（见
         // bff/web-chat/devops_agent_accounts.mjs）。空值 = 查询回退到部署账号自身视角。
         DEVOPS_AGENT_SPACE_ID: props.agentSpaceId ?? "",
+        // 「深度调查（直连）」报告链接：报告落 SKILLS_BUCKET 的 reports/ 前缀，用此 CDN 域名拼
+        // 直读链接（CloudFront + OAC，**不过期**）。空值 = 直连路径不给报告链接（不报错）。
+        REPORTS_CDN_DOMAIN: props.reportsCdnDomain ?? "",
         // AWS_REGION 由 Lambda 运行时自动注入
       },
       logRetention: logs.RetentionDays.TWO_WEEKS,
@@ -289,10 +296,17 @@ export class WebChatStack extends cdk.Stack {
         //   Agent Space，激活由 DevOps Agent 自行判断（read-only 边界不受影响）。跨 payer
         //   成员账号的上传走 AssumeRole 进 notiops-agent-trigger-* 触发角色，权限在成员
         //   模板 member-devops-agent.yaml 里授予，不在此 BFF Role。
+        // 「深度调查（直连）」（bff/web-chat/devops_investigate.mjs）：BFF 不经 agent runtime
+        // 直接发起并跟踪 DevOps Agent 调查 —— CreateBacklogTask 建 INVESTIGATION 任务、
+        // GetBacklogTask 判终态、ListJournalRecords 拉分析过程与最终摘要、ListRecommendations
+        // 备缓解建议。这是老「深度调查」链路里 core/devops_agent.py 用的同一组 API（0 token），
+        // 只是搬到了 BFF 侧执行。跨 payer 成员账号仍走 AssumeRole（权限在成员模板里）。
         actions: [
           "aidevops:ListAssociations",
           "aidevops:CreateAsset", "aidevops:UpdateAsset",
           "aidevops:DeleteAsset", "aidevops:ListAssets",
+          "aidevops:CreateBacklogTask", "aidevops:GetBacklogTask",
+          "aidevops:ListJournalRecords", "aidevops:ListRecommendations",
         ],
         resources: [`arn:aws:aidevops:${this.region}:${this.account}:agentspace/*`],
       }),
@@ -330,13 +344,91 @@ export class WebChatStack extends cdk.Stack {
         resources: [`arn:aws:athena:${this.region}:${this.account}:workgroup/primary`],
       }),
     );
-    // Cost Deep Dive：BFF 对【已 grounded 的 Athena 结果行】调用 Bedrock(Sonnet) 生成 insight + 图型 spec。
+    // Bedrock 推理。两个用途：
+    //  1. Cost Deep Dive —— 对【已 grounded 的 Athena 结果行】生成 insight + 图型 spec。
+    //  2. Admin「模型」页的连通性测试 —— 对目录里任一候选模型发一次最小 Converse
+    //     探测（POST /admin/llm-config/test）。
+    // 用途 2 要求 foundation-model 不能只限 anthropic.claude-*：原先那样收窄的话，测
+    // Nova / DeepSeek 一律返回 forbidden → UI 永不置 verified → validateConfig 拒绝把
+    // 未 verified 的模型设为默认 → **任何非 Claude 模型都无法成为默认模型**。
+    // 探测请求本身极小（maxTokens 8），且该端点受 nav:admin 门禁。
     bff.addToRolePolicy(
       new iam.PolicyStatement({
+        sid: "BedrockInferenceAndConnectivityProbe",
         actions: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
         resources: [
-          "arn:aws:bedrock:*::foundation-model/anthropic.claude-*",
+          "arn:aws:bedrock:*::foundation-model/*",
+          // Global CRIS（`global.*` inference profile，本目录 Claude 条目全部在用）在授权
+          // 时呈现的是一个**region 段为空**的 foundation-model ARN，配合
+          // `aws:RequestedRegion == "unspecified"`。上面那条里的 `*` 理论上能匹配空段
+          // （IAM 通配符匹配零个或多个字符），但这条判断错的后果是生产环境全部 Bedrock
+          // 调用 AccessDenied，不值得赌语义细节 —— 显式写出来，也让意图可读。
+          // 参见 https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-prereq.html
+          "arn:aws:bedrock:::foundation-model/*",
           `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
+        ],
+      }),
+    );
+
+    // Mantle（GPT 系）连通性探测：Admin「模型」页点「测试」时，BFF 用自己的角色 SigV4 签
+    // 一次最小 Responses 请求（签名服务名 bedrock-mantle）。
+    // **必须单独一条语句**：`bedrock-mantle:*` 的资源不可能匹配上面那条
+    // `arn:aws:bedrock:...` 的语句 —— 一次 Allow 要求 action 与 resource **同时**命中。
+    // 写错的后果是探测恒返回 forbidden，于是 GPT 系模型永远通不过保存时的默认模型校验。
+    //
+    // resources 为 "*" 是**有意为宽**，不是被迫：探测的目标区域由管理员在 Admin 页选，
+    // 取值范围是 llm_config.mjs::MANTLE_REGIONS（14 个区），随时可改且不需要重新部署。
+    // 早先这里的注释写「Mantle 是账号级服务、无资源维度」—— 那是错的：CreateInference
+    // 有必填的 `project` 资源类型（见 service-authorization 的 list_bedrock-mantle，
+    // AWS 托管策略 AmazonBedrockMantleInferenceAccess 就收窄到
+    // arn:aws:bedrock-mantle:*:*:project/*）。
+    //
+    // ⚠️ 注意本条与 AgentCore runtime 角色的**不对称**：这里是 "*"（全区），
+    // agent-build/.../cdk/lib/cdk-stack.ts 按区收窄。所以「保存时探测通过」不等于
+    // 「聊天时调得通」—— 探测用的是 BFF 这个角色。两者的区域集必须保持
+    // runtime ⊇ 白名单，由 scripts/test_mantle_regions_consistent.py 守。
+    bff.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "BedrockMantleConnectivityProbe",
+        actions: ["bedrock-mantle:CreateInference"],
+        resources: ["*"],
+      }),
+    );
+
+    // Admin「模型」页的候选全集：GET /admin/llm-config/candidates 需要**两个** List：
+    //   · ListFoundationModels  —— 本区域的基座模型（`anthropic.claude-sonnet-5` 这类）
+    //   · ListInferenceProfiles —— 跨区域路由 profile（`global.*` / `apac.*` / `jp.*`）
+    // 两者缺一不可：本系统目录默认用 Global CRIS（`global.anthropic.claude-sonnet-5`），
+    // 而 ListFoundationModels **不返回** profile。只有基座模型时，候选里看到的是
+    // `anthropic.claude-sonnet-5`，与目录里实际生效的 ID 对不上号，管理员会以为模型没上。
+    // 两个 API 都不支持资源级限定，只能是 "*"（纯读、不含模型内容）。
+    // 缺 ListFoundationModels 时 apiGetCandidates 只回 3 个 Mantle 型号 + warning；
+    // 缺 ListInferenceProfiles 时基座模型仍在，但 global.* 全部消失（附 warning）。
+    bff.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "BedrockListFoundationModels",
+        actions: ["bedrock:ListFoundationModels", "bedrock:ListInferenceProfiles"],
+        resources: ["*"],
+      }),
+    );
+
+    // Admin「模型」页的 Bedrock API Key：读状态（是否已配置 + 后 4 位）与写入 / 清除。
+    // Secret 由 NotiOpsBackendStack 创建（notiops/bedrock-api-key），故这里按**字面名**
+    // 限定（Secrets Manager ARN 带随机后缀，所以带 *）。CreateSecret 兜住 backend 栈
+    // 尚未部署过的场景。
+    // 缺这条时：keyStatus() 吞掉 AccessDenied 报「未配置」（即使已配置），而
+    // apiPutBedrockKey 的 UpdateSecret 抛的不是 ResourceNotFoundException，
+    // 于是穿透到 500 —— API Key 页面直接报错且无可操作信息。
+    bff.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "BedrockApiKeySecretAccess",
+        actions: [
+          "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue",
+          "secretsmanager:UpdateSecret", "secretsmanager:DescribeSecret",
+          "secretsmanager:CreateSecret",
+        ],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:notiops/bedrock-api-key*`,
         ],
       }),
     );
@@ -392,6 +484,15 @@ export class WebChatStack extends cdk.Stack {
           actions: ["s3:ListBucket"],
           resources: [`arn:aws:s3:::${props.skillsBucketName}`],
           conditions: { StringLike: { "s3:prefix": ["skills/*", "skills/"] } },
+        }),
+      );
+      // 「深度调查（直连）」报告落盘：HTML 报告写共享数据桶的 reports/ 前缀，读取走
+      // ReportsCDN（CloudFront + OAC，ReportsPathGuard 把非 /reports/ 一律 403），
+      // 因此**只需写权限、不需要 presign**（CDN 链接直读且不过期）。
+      bff.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: ["s3:PutObject"],
+          resources: [`arn:aws:s3:::${props.skillsBucketName}/reports/*`],
         }),
       );
       // 跨 payer 接入：generateLaunchStackUrl 读模板源(onboarding-templates/member-devops-agent.yaml)

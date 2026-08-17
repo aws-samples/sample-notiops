@@ -23,6 +23,7 @@ added so the regression can't sneak back in:
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -458,6 +459,117 @@ def test_bad_json_args_dont_dispatch() -> None:
            f"trace={trace}")
 
 
+def test_auth_failure_is_reported_not_swallowed() -> None:
+    """凭证被拒必须留下哨兵，不能落进泛化的空文本路径。
+
+    run_tool_use_loop 的每个错误出口都返回 `("", ...)`，而调用方把空文本当成
+    "模型没说话" → 回一句客套的兜底话术。于是 Key 过期 / 被吊销的表现是机器人礼貌地
+    答非所问：用户以为模型变笨，管理员在 Admin 页也看不出来（那边「测试」用的是 BFF
+    的角色，不是 IM 的凭证）。凭证问题不会自愈，必须说出来。
+    """
+    print("test_auth_failure_is_reported_not_swallowed")
+    import io
+    import urllib.error
+
+    real_sender = getattr(orc, "_sign_and_send")
+
+    def run(status):
+        def boom(body, region):
+            raise urllib.error.HTTPError(
+                "https://x/y", status, "err", {}, io.BytesIO(b'{"error":{}}'))
+        setattr(orc, "_sign_and_send", boom)
+        try:
+            return orc.run_tool_use_loop(
+                model_id="openai.gpt-5.6-terra",
+                instructions="be helpful",
+                user_text="hi",
+                tools=[],
+                tool_dispatch=lambda n, a: (True, "ok", []),
+                max_iterations=2,
+            )
+        finally:
+            setattr(orc, "_sign_and_send", real_sender)
+
+    for status in (401, 403):
+        text, _cits, trace = run(status)
+        _check(f"HTTP {status}: no text is produced", text == "", repr(text))
+        _check(f"HTTP {status}: AUTH_FAILED_SENTINEL pushed onto the trace",
+               any(t.get("name") == orc.AUTH_FAILED_SENTINEL for t in trace),
+               f"trace={trace}")
+        # 上游 body 可能含账号 / 凭证片段，绝不能进 trace（spec R5.5）
+        _check(f"HTTP {status}: upstream body not carried in the trace",
+               "error" not in json.dumps(trace, ensure_ascii=False).replace(
+                   "AUTH_FAILED", ""),
+               f"trace={trace}")
+
+    # 对照组：其它失败**不得**被当成凭证问题，否则用户会被指去换 Key 而白折腾。
+    for status in (429, 500, 503):
+        _text, _c, trace = run(status)
+        _check(f"HTTP {status}: not reported as an auth failure",
+               all(t.get("name") != orc.AUTH_FAILED_SENTINEL for t in trace),
+               f"trace={trace}")
+
+
+def test_bearer_401_invalidates_key() -> None:
+    """IM Mantle 的 Bearer 被拒（401）必须失效 Key 缓存（spec R7.2）。
+
+    只认 401：403 是「Key 有效但不许调这个模型」—— 本部署的 Admin 会按模型收窄 Key，
+    被禁模型每次调用都回 403，当失效处理就是每次白读一次 Secrets Manager，
+    还会把 KeyAuthFail 指标刷成噪声，真正的轮换事故反而被淹没。
+    """
+    print("test_bearer_401_invalidates_key")
+    import io
+    import urllib.error
+    from core import llm_config
+
+    calls = {"n": 0}
+    real_invalidate = llm_config.invalidate_api_key
+    real_get_key = getattr(orc, "_get_api_key")
+    real_send = getattr(orc, "_send")
+    llm_config.invalidate_api_key = lambda: calls.__setitem__("n", calls["n"] + 1)
+    setattr(orc, "_get_api_key", lambda: "bedrock-api-key-value")
+    try:
+        for status, expect in ((401, 1), (403, 0), (500, 0)):
+            calls["n"] = 0
+
+            def _boom(req, _s=status):
+                raise urllib.error.HTTPError(
+                    "https://x/y", _s, "err", {}, io.BytesIO(b"{}"))
+
+            setattr(orc, "_send", _boom)
+            raised = False
+            try:
+                orc._sign_and_send({"model": "openai.gpt-5.6-terra"}, "us-east-2")
+            except urllib.error.HTTPError:
+                raised = True
+            _check(f"HTTP {status}: original error still propagates", raised)
+            _check(f"HTTP {status}: invalidate_api_key called {expect}x",
+                   calls["n"] == expect, f"got {calls['n']}")
+
+        # 加固不得顶替真错误：失效动作自身抛异常时，调用方仍须看到原始 HTTPError。
+        calls["n"] = 0
+        llm_config.invalidate_api_key = lambda: (_ for _ in ()).throw(
+            RuntimeError("metrics backend down"))
+
+        def _boom401(req):
+            raise urllib.error.HTTPError(
+                "https://x/y", 401, "err", {}, io.BytesIO(b"{}"))
+
+        setattr(orc, "_send", _boom401)
+        try:
+            orc._sign_and_send({"model": "m"}, "us-east-2")
+            ok = False
+        except urllib.error.HTTPError:
+            ok = True
+        except RuntimeError:
+            ok = False
+        _check("invalidation failure does not replace the real HTTPError", ok)
+    finally:
+        llm_config.invalidate_api_key = real_invalidate
+        setattr(orc, "_get_api_key", real_get_key)
+        setattr(orc, "_send", real_send)
+
+
 def main() -> int:
     test_protocol_fragments()
     test_spam_tokens()
@@ -472,6 +584,8 @@ def main() -> int:
     test_bad_json_args_dont_dispatch()
     test_sentinel_pushed_when_audit_redacts()
     test_sentinel_NOT_pushed_when_clean()
+    test_auth_failure_is_reported_not_swallowed()
+    test_bearer_401_invalidates_key()
 
     if _failed:
         print(f"\n{FAIL} {_failed} check(s) failed")

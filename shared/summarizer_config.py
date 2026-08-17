@@ -37,10 +37,12 @@ _ENV_MODEL_ID = "DEVOPS_AGENT_SUMMARIZER_MODEL_ID"
 _PK_PREFIX = "appconfig#devops_agent"
 
 
-def _query_config(config_key: str) -> str | None:
-    """Query a single config item from DDB config table.
+def _query_row(config_key: str) -> dict | None:
+    """Query a single config item from DDB and return the whole item.
 
-    Returns None on DDB exception, missing item, or empty value.
+    Returns the item rather than just ``config_value`` because the routing rows
+    carry a second attribute (``for_model_id``) naming the model id they belong
+    to -- see ``_model_route``.
     """
     try:
         resp = config_table().get_item(
@@ -53,7 +55,15 @@ def _query_config(config_key: str) -> str | None:
         )
         return None
 
-    item = resp.get("Item")
+    return resp.get("Item") or None
+
+
+def _query_config(config_key: str) -> str | None:
+    """Query a single config value from DDB config table.
+
+    Returns None on DDB exception, missing item, or empty value.
+    """
+    item = _query_row(config_key)
     if not item:
         return None
 
@@ -62,6 +72,49 @@ def _query_config(config_key: str) -> str | None:
         return None
 
     return value
+
+
+def _model_route(model_id: str) -> tuple[str, str]:
+    """``(kind, region)`` for ``model_id``, or ``("", "")`` meaning Converse.
+
+    The pairing is **checked**, not assumed. The three projected rows are
+    separate DDB items, so a reader can straddle two generations. The writer
+    orders its puts ``kind -> region -> model_id`` so the trigger row lands
+    last; that protection was cancelled by this module reading ``model_id``
+    first and ``kind`` last, which yields OLD model_id + NEW kind -- the
+    Responses protocol aimed at a Converse-only model id.
+
+    Since ``model_id`` is written last, "the kind row names the model id I am
+    holding" is sufficient proof that both came from the same projection. A
+    mismatch means a torn read, and the safe reading is "no routing info",
+    which is what absence already means.
+
+    Rows predating ``for_model_id`` carry no tag and are trusted as before --
+    otherwise the first deploy of this code would silently revert every
+    already-projected Mantle binding to Converse.
+    """
+    kind_row = _query_row("bedrock_model_kind") or {}
+    region_row = _query_row("bedrock_model_region") or {}
+
+    kind = str(kind_row.get("config_value") or "").strip()
+    region = str(region_row.get("config_value") or "").strip()
+    if not kind:
+        return "", ""
+
+    # 两行都校验：BFF 给 kind 与 region 都写了 `for_model_id`，早先只查 kind，于是
+    # 「region 来自下一代」的组合会被接受 —— 而 region 决定 Mantle 的 hostname。
+    want = (model_id or "").strip()
+    for label, row in (("kind", kind_row), ("region", region_row)):
+        owner = row.get("for_model_id")
+        if isinstance(owner, str) and owner.strip() and owner.strip() != want:
+            logger.warning(
+                "summarizer model route discarded: the %s row belongs to %s but "
+                "model_id is %s (torn projection read); treating as Converse",
+                label, owner.strip(), model_id,
+            )
+            return "", ""
+
+    return kind, region
 
 
 def _load_model_id() -> str:
@@ -109,11 +162,27 @@ def load_summarizer_config() -> dict:
         {
             "model_id": str,              # Bedrock model ID
             "agent_prompt": str | None,   # Optional prompt override, None if unconfigured
+            "model_kind": str,            # "" => Converse; else e.g. bedrock_mantle_responses
+            "model_region": str,          # Region for Region-pinned models, "" otherwise
         }
+
+    ``model_kind`` / ``model_region`` are projected by the BFF next to
+    ``bedrock_model_id`` (see ``projectBackendTasks``). They are needed because
+    some Bedrock models are served **only** on the ``bedrock-mantle`` endpoint;
+    calling Converse for those fails with ``ValidationException: The provided
+    model identifier is invalid``. Empty means Converse, which is both the
+    pre-existing behaviour and the right answer for the env/default fallbacks.
 
     Requirements: R18.5
     """
+    # 顺序有意义：先定下 model_id，再拿它去校验路由行的配对。
+    # 别退回 dict 字面量里直接 `_query_config("bedrock_model_kind")` —— 那样读到的
+    # kind 可能属于另一代的 model_id（见 _model_route）。
+    model_id = _load_model_id()
+    model_kind, model_region = _model_route(model_id)
     return {
-        "model_id": _load_model_id(),
+        "model_id": model_id,
         "agent_prompt": _load_agent_prompt(),
+        "model_kind": model_kind,
+        "model_region": model_region,
     }

@@ -25,10 +25,37 @@ export function toSessionId(conversationId) {
 }
 
 /**
+ * 组装发往 runtime 的 payload。抽成纯函数便于断言字段契约（见 tests/agentcore.test.mjs）。
+ *
+ * generation：BFF 服务端读出的配置版本号（epoch-ms）。runtime 用它判断长驻 microVM 里的
+ * 模型目录缓存是否过期 —— 与本地值不同就绕过 TTL 立即强刷，使 Admin 保存后**下一条消息**
+ * 即生效。
+ * BFF 读目录失败（generation=0）时**整个字段省掉**（JSON.stringify 丢弃 undefined），
+ * 而不是传 0：runtime 侧 0 是合法值（未 seed 的目录就是 0），传 0 会让"与本地不同"恒真、
+ * 每条消息都触发一次强制 ConsistentRead。省掉 → runtime 收到 None → 纯走 TTL 兜底。
+ */
+export function buildRuntimePayload({ prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, now, topic, accountId, allowedAccounts, skillId, skillVersion }) {
+  const gen = Number(generation);
+  return {
+    prompt, model, locale,
+    generation: Number.isFinite(gen) && gen > 0 ? gen : undefined,
+    web_search: Boolean(webSearch),
+    finops_agent: Boolean(finopsAgent),
+    devops_agent: Boolean(devopsAgent),
+    now,
+    topic: topic || "general",
+    account_id: accountId || "",
+    allowed_accounts: allowedAccounts || "*",
+    skill_id: skillId || "",
+    skill_version: skillVersion || "",
+  };
+}
+
+/**
  * 调用 runtime，回调 onToken(text) / onSources(arr)。返回拼好的全文。
  * 解析失败不抛，尽量把能拿到的文本推出去。
  */
-export async function invokeAgent({ conversationId, prompt, model, locale, webSearch, finopsAgent, devopsAgent, topic, accountId, allowedAccounts, skillId, skillVersion }, { onToken, onSources, onActions, onUsage, onFollowups, onInvestigationStep, onProgress, onReasoning }) {
+export async function invokeAgent({ conversationId, prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, topic, accountId, allowedAccounts, skillId, skillVersion }, { onToken, onSources, onActions, onUsage, onFollowups, onInvestigationStep, onProgress, onReasoning }) {
   // 把"今天"传给 agent：用于联网搜索时给 query 补当前年份（让结果偏向最新），
   // 也让模型知道当前日期、不把训练截止当“现在”。
   const now = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
@@ -37,7 +64,10 @@ export async function invokeAgent({ conversationId, prompt, model, locale, webSe
     runtimeSessionId: toSessionId(conversationId),
     contentType: "application/json",
     accept: "text/event-stream",
-    payload: new TextEncoder().encode(JSON.stringify({ prompt, model, locale, web_search: Boolean(webSearch), finops_agent: Boolean(finopsAgent), devops_agent: Boolean(devopsAgent), now, topic: topic || "general", account_id: accountId || "", allowed_accounts: allowedAccounts || "*", skill_id: skillId || "", skill_version: skillVersion || "" })),
+    payload: new TextEncoder().encode(JSON.stringify(buildRuntimePayload({
+      prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, now,
+      topic, accountId, allowedAccounts, skillId, skillVersion,
+    }))),
   });
 
   const resp = await client.send(cmd);

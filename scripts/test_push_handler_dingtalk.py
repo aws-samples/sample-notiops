@@ -23,7 +23,11 @@ import sys
 import unittest.mock as mock
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lambda"))
+# `push_handler` / `dingtalk_sender` 已从 `lambda/` 搬到 `shared/report_delivery/`，
+# 而这行路径没跟着改 —— 于是这三套测试一直 ModuleNotFoundError，也正因为一直是坏的
+# 才没被加进 CI。修路径而不是继续豁免：它们覆盖的是钉钉推送与健康报告投递。
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..",
+                                "shared", "report_delivery"))
 
 # Required so module-level boto3 calls in the lambda don't blow up.
 os.environ.setdefault("CONVERSATIONS_TABLE", "test")

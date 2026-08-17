@@ -2,18 +2,12 @@ import { useState, useEffect, useId } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useT, useLocale } from "../i18n";
-import { MODELS, type ChatMessage, type ProposedAction } from "../types";
+import { type ChatMessage, type ProposedAction } from "../types";
 import { getSupportServices, type SupportService } from "../api/chat";
-
 // 模型署名：m.model 在流式时是显示名（如 "DeepSeek V3.2"），从历史加载时是
-// id（如 "deepseek-v3-2"）。两种都归一成显示名。
-function modelDisplayName(model?: string): string {
-  if (!model) return "";
-  const byId = MODELS.find((m) => m.id === model);
-  if (byId) return byId.name;
-  const byName = MODELS.find((m) => m.name === model);
-  return byName ? byName.name : model;
-}
+// id（如 "deepseek-v3-2"）。两种都归一成显示名 —— 归一逻辑已挪到 models.ts，
+// 因为候选集现在由管理员在服务端决定，不再是编译期常量。
+import { modelDisplayName } from "../models";
 
 // 署名行文案："AWS Bedrock (DeepSeek V3.2) · 1,234 tokens · 3 步"
 // 所有模型均经 Amazon Bedrock 提供（GPT-5.4 经 Bedrock Mantle），故 provider 统一。

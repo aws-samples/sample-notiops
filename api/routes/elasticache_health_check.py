@@ -277,6 +277,18 @@ def _update_config(body: dict | None) -> dict:
     if not body:
         raise ValueError("Request body is required")
 
+    # Bedrock API Key 的写入已收敛到 webchat 管理页（BFF `/admin/llm-config/bedrock-key`）
+    # 为唯一入口。历史上这里也能写同一个 Secret `notiops/bedrock-api-key`，于是两处抢写、
+    # 后写覆盖先写。现在写一律拒绝并指回 webchat（放在最前，避免 model_id/prompt 半写后才
+    # 失败）；GET 仍回脱敏状态（读同一个 Secret，无冲突）。后端 lambdaRole 的 PutSecretValue
+    # 也已一并移除（notiops-backend-stack.ts），判定层 + IAM 层双保险。
+    if "bedrock_api_key" in body:
+        return {
+            "success": False,
+            "error": "Bedrock API Key 已由 webchat 管理页统一管理，请在 webchat 设置；此处不再接受写入。",
+            "_status_code": 409,
+        }
+
     _table = config_table()
     from shared.queries._client import _now_iso
     now = _now_iso()
@@ -290,30 +302,6 @@ def _update_config(body: dict | None) -> dict:
                 "config_value": value,
                 "updated_at": now,
             })
-
-    # Handle bedrock_api_key: write to shared Secrets Manager
-    if "bedrock_api_key" in body:
-        api_key = body["bedrock_api_key"] if body["bedrock_api_key"] is not None else ""
-        secret_arn = os.environ.get("BEDROCK_API_KEY_SECRET_ARN", "")
-        if not secret_arn:
-            return {
-                "success": False,
-                "error": "BEDROCK_API_KEY_SECRET_ARN 环境变量未配置",
-                "_status_code": 500,
-            }
-        try:
-            sm = boto3.client("secretsmanager")
-            sm.put_secret_value(
-                SecretId=secret_arn,
-                SecretString=json.dumps({"bedrock_api_key": api_key}),
-            )
-        except Exception as e:
-            logger.error("Failed to write API Key to Secrets Manager: %s", e)
-            return {
-                "success": False,
-                "error": f"Secrets Manager 写入失败: {e}",
-                "_status_code": 500,
-            }
 
     return {"success": True}
 

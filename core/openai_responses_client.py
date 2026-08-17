@@ -97,6 +97,29 @@ def _sign_and_send(body: dict, region: str) -> dict:
         body_preview = body_bytes.decode("utf-8", errors="replace")[:8000]
         logger.info("openai_responses: outbound body (truncated 8KB): %s",
                     body_preview)
+    # Credential selection. A configured Bedrock API key wins: per the Bedrock
+    # docs the Mantle endpoint takes the key as a plain `Authorization: Bearer`
+    # header (that is the documented path for the OpenAI SDK), and the matching
+    # IAM action `bedrock-mantle:CallWithBearerToken` ships in
+    # AmazonBedrockLimitedAccess. Without this branch the key silently did not
+    # apply to GPT models while it did apply to every Converse model, so the
+    # Admin "credential mode" switch meant two different things depending on
+    # which model the user picked -- and CloudTrail showed the deployment role,
+    # not the key's identity, for exactly the GPT turns.
+    # No key configured -> SigV4 as before.
+    api_key = _get_api_key()
+    if api_key:
+        http_req = urllib.request.Request(
+            _endpoint(region), data=body_bytes, method="POST",
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {api_key}"},
+        )
+        try:
+            return _send(http_req)
+        except urllib.error.HTTPError as e:
+            _note_bearer_rejection(e.code)
+            raise
+
     creds = boto3.Session().get_credentials().get_frozen_credentials()
 
     req = AWSRequest(
@@ -114,8 +137,49 @@ def _sign_and_send(body: dict, region: str) -> dict:
     for k, v in prepared.headers.items():
         http_req.add_header(k, v)
 
+    return _send(http_req)
+
+
+def _send(http_req: urllib.request.Request) -> dict:
     with safe_urlopen(http_req, timeout=_HTTP_TIMEOUT_SECONDS) as resp:
         return _json.loads(resp.read().decode("utf-8"))
+
+
+def _note_bearer_rejection(status: int) -> None:
+    """Bearer 认证被拒时失效 Key 缓存（spec R7.2），让下次调用重读 Secret。
+
+    只认 401，不认 403 —— 与 Converse 侧 `core/bedrock_credentials._on_after_call`
+    同一条线：401 是「这个 token 不成立」（轮换 / 吊销，重读有意义），403 是
+    「token 有效但不许调这个模型」（本部署的常态，重读拿到的还是同一个 Key，
+    只会白读 Secrets Manager 并把 KeyAuthFail 指标刷成噪声）。
+
+    自身绝不抛：调用方正在 `except` 里准备把原始 HTTPError 抛出去，
+    失效动作失败不能顶替掉真正的错误。
+    """
+    if status != 401:
+        return
+    try:
+        from core import llm_config
+        llm_config.invalidate_api_key()
+    except Exception as e:  # noqa: BLE001 -- 加固不能成为新的故障源
+        logger.warning("openai_responses: key invalidation failed: %s", e)
+
+
+def _get_api_key() -> str | None:
+    """Configured Bedrock API key, or None.
+
+    Lazy + defensive: `core.llm_config` reads DynamoDB, and this module is also
+    imported by paths that may run without that table wired. A failure here must
+    degrade to SigV4 (which is what the deployment role can do anyway) rather
+    than break the chat turn.
+    """
+    try:
+        from core import llm_config
+        return llm_config.get_bedrock_api_key()
+    except Exception as e:  # noqa: BLE001 -- credential lookup must never break chat
+        logger.warning("openai_responses: Bedrock API key lookup failed, "
+                       "falling back to SigV4: %s", e)
+        return None
 
 
 def call_responses(*,
@@ -352,6 +416,44 @@ _SPAM_TOKENS = (
 #      question.
 OUTPUT_BLOCKED_SENTINEL = "_OUTPUT_BLOCKED_BY_AUDIT"
 
+# 同样的机制，用于「凭证被拒」。
+#
+# 为什么需要它：run_tool_use_loop 的**每一个**错误出口都返回 `("", ...)`，而调用方把空
+# 文本一律当成"模型没说话"，回一句客套的兜底话术。于是 Bedrock API Key 过期 / 被吊销的
+# 表现是：机器人礼貌地答非所问，日志里一条 WARNING，没有任何人会去 grep。用户以为是模型
+# 变笨了，管理员在 Admin 页看不出异常（那边的「测试」按钮用的是 BFF 的角色，不是 IM 的凭证）。
+#
+# 401/403 与其它失败有本质区别：它**不会自己好**，且下一步动作是明确的（去 Admin 页换
+# Key），完全不同于"重试一下"。所以把它和其它错误区分开、如实说出来。
+AUTH_FAILED_SENTINEL = "_AUTH_FAILED_UPSTREAM"
+
+# 判定「这次失败是凭证问题」的 HTTP 状态码。
+#   401 = token 不成立（过期 / 被删 / 拼错）
+#   403 = token 有效但不许调这个模型（Admin 生成 Key 时按模型收窄了）
+# 两者对用户的含义不同，但下一步都在 Admin 的凭证页，所以共用一条提示。
+# 注意与 `_note_bearer_rejection` 的判据**故意不同**：那里只有 401 才清缓存（403 重读
+# Secret 拿到的还是同一个 Key，只会白刷指标）；这里 403 也要告诉用户，因为沉默才是问题。
+_AUTH_FAILED_STATUSES = frozenset({401, 403})
+
+
+def _note_auth_failure(status: int, tool_calls_trace: list[dict]) -> None:
+    """凭证类失败时往 trace 里压一个哨兵，让调用方能把它和普通失败区分开。
+
+    走 trace 而不是抛异常：`run_tool_use_loop` 的返回形状是三条路径共享的契约
+    （Anthropic / Nova / Mantle 都返回 `(text, citations, trace)`），改成抛异常会要求
+    每个调用点都加 except。哨兵与既有的 `OUTPUT_BLOCKED_SENTINEL` 同型，调用方那边
+    已经有一段完全一样的处理，照着加一个分支即可。
+
+    只记状态码，**不记 body** —— 上游报错可能带账号 / 凭证片段（spec R5.5）。
+    """
+    if status not in _AUTH_FAILED_STATUSES:
+        return
+    tool_calls_trace.append({
+        "name": AUTH_FAILED_SENTINEL,
+        "ok": False,
+        "summary": f"upstream rejected the credential (HTTP {status})",
+    })
+
 
 def _extract_text_and_record(response: dict,
                               tool_calls_trace: list[dict]) -> str:
@@ -476,6 +578,7 @@ def run_tool_use_loop(*,
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")[:500]
         logger.warning("openai_responses: initial call HTTP %d: %s", e.code, body)
+        _note_auth_failure(e.code, tool_calls_trace)
         return ("", citations, tool_calls_trace)
     except Exception as e:
         logger.warning("openai_responses: initial call failed: %s", e)
@@ -597,6 +700,7 @@ def run_tool_use_loop(*,
             logger.warning(
                 "openai_responses: continuation HTTP %d: %s", e.code, body,
             )
+            _note_auth_failure(e.code, tool_calls_trace)
             return ("", citations, tool_calls_trace)
         except Exception as e:
             logger.warning("openai_responses: continuation failed: %s", e)

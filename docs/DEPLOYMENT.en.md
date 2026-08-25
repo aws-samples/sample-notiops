@@ -631,6 +631,14 @@ aws dynamodb delete-item --table-name <conv-table> \
 | **L5 delete the stack** | `cd infra && npx cdk destroy <stack-name>` | Entire stack |
 
 > ⚠️ Stack deletion removes ECR / IAM / SG / ECS. **The DDB tables and S3 report bucket are NOT deleted** (`removalPolicy: RETAIN`) — clean them up manually if needed. By design, every AWS resource created by this project carries the `auto-delete=no` tag to protect it from automated cleanup jobs.
+>
+> To remove the **whole environment** (as opposed to rolling back one stack), don't run
+> `cdk destroy` stack by stack — use `./teardown.sh` in the repository root. It deletes
+> the stacks in reverse dependency order and cleans up the non-CDK leftovers (CUR report
+> definition, the one-shot EventBridge schedule, the WebSearch gateway, the 30-day
+> recovery window on the secrets, orphaned log groups). Start with
+> `./teardown.sh --dry-run`; the default keeps the three RETAIN'd tables, and
+> `--delete-everything` wipes them too.
 
 ---
 

@@ -35,7 +35,7 @@ on-call engineers without granting write access.
 
 | Doc | Purpose |
 |---|---|
-| 🚀 [One-click Deploy](docs/DEPLOYMENT_ONECLICK.en.md) | Browser only: upload one CloudFormation template, ~4.5 minutes to a running Web Chat (Web Chat only) |
+| 🚀 [One-click Deploy](docs/DEPLOYMENT_ONECLICK.en.md) | Browser only: upload one CloudFormation template, about 5 minutes to a running Web Chat (Web Chat only) |
 | 🛠 [Deployment Guide](docs/DEPLOYMENT.en.md) | Full install: step-by-step from `./setup.sh` to first smoke test (web console + optional IM) |
 | 👤 [User Guide](docs/USER_GUIDE.en.md) | End-user manual + conversation samples + FAQ |
 | 🏗 [Technical Design](docs/TECHNICAL_DESIGN.en.md) | Module boundaries / data flow / security / 3-layer defense |
@@ -86,7 +86,7 @@ Console, nothing is installed on your machine.
    [Releases](https://github.com/aws-samples/sample-notiops/releases/latest);
 2. Open the CloudFormation console → **Create stack** → **Upload a template file**;
 3. Enter an administrator email (the temporary password is mailed there), tick
-   the IAM capabilities acknowledgement, and create — measured at ~4.5 minutes.
+   the IAM capabilities acknowledgement, and create — measured at about 5 minutes.
    The stack outputs include the Web Chat URL.
 
 Two optional parameters are worth knowing about: **deep investigation** (AWS
@@ -148,22 +148,21 @@ mode comparison and how to switch — see
 | **Prerequisites and timing** | | |
 | Installed locally | nothing (browser only) | git / Node / Python / CDK / container runtime |
 | Long-lived access key required | no | yes, credentials that can deploy |
-| Deploy time | ~4.5 minutes | 10–20 minutes (includes local builds) |
-| One-click teardown | ✅ pick `KeepData` / `DeleteEverything` on delete | manual cleanup |
+| Deploy time | about 5 minutes | 10–20 minutes (includes local builds) |
+| One-click teardown | ✅ pick `KeepData` / `DeleteEverything` on delete | ✅ `./teardown.sh` (keeps data by default, `--delete-everything` for a full wipe) |
 | **Chat and investigation** | | |
 | Web Chat (read-only Q&A) | ✅ | ✅ |
 | AWS concept Q&A (official-doc retrieval + citations) | ✅ | ✅ |
 | Resource-health inspection (on demand) | ✅ | ✅ |
 | Incident investigation (instant, read-only tools) | ✅ | ✅ |
-| DevOps Agent deep investigation | ❌ | ✅ |
-| Web search (Exa) | ❌ | ✅ (bring your own API key) |
+| DevOps Agent deep investigation | ✅ see note ¹ | ✅ |
 | **Cost / FinOps** | | |
 | FinOps dashboard (Cost Explorer data) | ✅ deploy account only | ✅ cross-account |
 | CUR + Athena billing-detail drill-down | ❌ | ✅ |
 | **Cases and Skills** | | |
 | Full AWS Support case management | ✅ | ✅ |
 | 11 bundled Skills + your own | ✅ | ✅ |
-| Publish a Skill to DevOps Agent | ❌ | ✅ |
+| Publish a Skill to DevOps Agent | ✅ see note ¹ | ✅ |
 | **Models** | | |
 | Multi-LLM switching + model catalogue | ✅ | ✅ |
 | Bedrock API key as the credential | ❌ (IAM only) | ✅ |
@@ -174,8 +173,18 @@ mode comparison and how to switch — see
 | Notification inbox | ⚠️ UI present, no backend to produce notifications | ✅ |
 | Admin dashboard (thresholds / target accounts / Skills management) | ❌ | ✅ |
 | **Scope** | | |
-| Multi-account (across an AWS Organization) | ❌ deploy account only | ✅ `--multi-account` |
+| Multi-account (across an AWS Organization) | ✅ set `DeployMode=MultiAccount` + your organization id | ✅ `--multi-account` |
 | Upgrade | update the stack with the new template (~1 min) | re-run `./setup.sh` |
+
+> ¹ **Deep investigation and "publish a Skill to DevOps Agent" share one Agent Space
+> on Option A.** The stack creates it in the deploy account provided that
+> `EnableDeepInvestigation=Yes` (the default) **and** the deploy Region is one where
+> AWS DevOps Agent is available (`us-east-1`, `us-west-2`, `ca-central-1`, `sa-east-1`,
+> `ap-south-1`, `ap-southeast-1`, `ap-southeast-2`, `ap-northeast-1`, `eu-central-1`,
+> `eu-west-1`, `eu-west-2`). Other Regions still deploy successfully, just without the
+> Agent Space — the related toggles are **greyed out with the reason shown**, and the
+> `DeepInvestigationStatus` stack output says whether you turned it off or the Region
+> doesn't support it.
 
 > 📋 **The AWS Support features (create / view / reply / resolve) require the
 > account to be on a Business, Enterprise On-Ramp, or Enterprise support plan** —
@@ -233,10 +242,32 @@ preserved, and one log group named like
 - **Upgrade**: `git pull`, then **re-run `./setup.sh`** — it is incremental and only
   updates what changed. IM credentials you already put in Secrets Manager are not
   overwritten.
-- **Delete**: there is **no one-click uninstall**. Remove the stacks with
-  `cd infra && npx cdk destroy <stack-name>`. Note that the DynamoDB tables and the
-  reports bucket use a `RETAIN` policy, so they are **not** deleted automatically and
-  need manual cleanup.
+- **Delete**: run **`./teardown.sh`** from the repository root. It deletes what
+  `setup.sh` created in reverse dependency order, including the non-CDK leftovers
+  (the CUR report definition, the one-shot EventBridge schedule, the WebSearch
+  gateway, and the 30-day recovery window on the secrets). Same two settings as
+  Option A:
+
+  ```bash
+  ./teardown.sh --dry-run           # inventory only, deletes nothing (run this first)
+  ./teardown.sh                     # keep data: delete the stacks, keep the three RETAIN'd tables
+  ./teardown.sh --delete-everything  # also delete the tables, CUR report/bucket, Athena saved queries, leftover log groups
+  ```
+
+  You have to type the 12-digit account id to confirm (`--delete-everything` also asks
+  you to type `DELETE EVERYTHING`).
+  ⚠️ On this path the data bucket `notiops-data-<account>-<region>` is destroyed with
+  the stack (your Skills and saved reports live there), so the script **syncs it to a
+  local backup directory first** — pass `--no-backup` to skip that.
+  If you have deployed **both** options into the same account and Region: they use the
+  same resource names, so before emptying a bucket or deleting a table the script asks
+  CloudFormation which stack owns it and **skips anything owned by the one-click stack**
+  (delete that stack instead).
+  Cross-account resources are **deliberately left alone**; the script prints the exact
+  commands instead: the two member-account StackSets (deleted only with
+  `--delete-member-stacksets`) and the PHD forwarder stack in each linked account
+  (`./setup.sh --phd --remove`). CDK bootstrap resources (`CDKToolkit` and friends) are
+  never touched.
 
 ---
 

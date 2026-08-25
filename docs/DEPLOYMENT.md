@@ -630,6 +630,11 @@ aws dynamodb delete-item --table-name <conv-table> \
 | **L5 删栈** | `cd infra && npx cdk destroy <stack-name>` | 整个 stack |
 
 > ⚠️ 删栈会清掉 ECR / IAM / SG / ECS 相关资源。**DDB 表和 S3 报告 bucket 不会被自动删**(`removalPolicy: RETAIN`),需要手动清理。本项目所有 AWS 资源默认带 `auto-delete=no` 标签,避免被自动清理任务误删。
+>
+> 要**删掉整个环境**(而不是回滚单个栈),别逐个 `cdk destroy` —— 用仓库根目录的
+> `./teardown.sh`:它按依赖倒序删栈,并收掉 CDK 之外的尾巴(CUR 报告定义、一次性
+> EventBridge schedule、WebSearch Gateway、secret 的 30 天恢复期、孤儿日志组)。
+> 先 `./teardown.sh --dry-run` 看清单;默认保留三张 RETAIN 表,`--delete-everything` 全删。
 
 ---
 

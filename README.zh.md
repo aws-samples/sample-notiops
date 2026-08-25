@@ -28,7 +28,7 @@
 
 | 文档 | 用途 |
 |---|---|
-| 🚀 [一键部署](docs/DEPLOYMENT_ONECLICK.md) | 只要一个浏览器:上传一份 CloudFormation 模板,约 4.5 分钟拿到 Web Chat(只含 Web Chat) |
+| 🚀 [一键部署](docs/DEPLOYMENT_ONECLICK.md) | 只要一个浏览器:上传一份 CloudFormation 模板,大约 5 分钟拿到 Web Chat(只含 Web Chat) |
 | 🛠 [部署指南](docs/DEPLOYMENT.md) | 完整版:从 `./setup.sh` 到首次冒烟测试的分步指南(Web 控制台 + 可选 IM) |
 | 👤 [用户指南](docs/USER_GUIDE.md) | 终端用户手册 + 对话示例 + FAQ |
 | 🏗 [技术设计](docs/TECHNICAL_DESIGN.md) | 模块边界 / 数据流 / 安全 / 三层防线 |
@@ -70,8 +70,8 @@
 1. 从 [Releases](https://github.com/aws-samples/sample-notiops/releases/latest)
    下载 `notiops-webchat.template.json`;
 2. 打开 CloudFormation 控制台 → **Create stack** → **Upload a template file**;
-3. 填管理员邮箱(临时密码会发到这个邮箱)、勾选 IAM 能力确认框、创建 —— 实测约
-   4.5 分钟完成,栈输出里就是 Web Chat 的访问地址。
+3. 填管理员邮箱(临时密码会发到这个邮箱)、勾选 IAM 能力确认框、创建 —— 实测大约
+   5 分钟完成,栈输出里就是 Web Chat 的访问地址。
 
 开栈时有两个可选参数值得知道:**深度调查**(AWS DevOps Agent,默认开,闲置不计费,
 区域不支持时自动跳过而不是让栈失败)与**部署模式**(默认单账号;选多账号并填组织 id,
@@ -119,22 +119,21 @@ cd sample-notiops
 | **前提与耗时** | | |
 | 本地要装的东西 | 无(只要浏览器) | git / Node / Python / CDK / 容器运行时 |
 | 需要长期 access key | 不需要 | 需要一份能部署的凭证 |
-| 部署耗时 | ~4.5 分钟 | 十几分钟(含本地构建) |
-| 一键删除整个环境 | ✅ 删栈时选 `KeepData` / `DeleteEverything` | 手工清理 |
+| 部署耗时 | 大约 5 分钟 | 十几分钟(含本地构建) |
+| 一键删除整个环境 | ✅ 删栈时选 `KeepData` / `DeleteEverything` | ✅ `./teardown.sh`(默认保数据 / `--delete-everything` 全删) |
 | **聊天与调查** | | |
 | 网页 Web Chat(只读问答) | ✅ | ✅ |
 | AWS 概念问答(官方文档检索 + 引用) | ✅ | ✅ |
 | 资源健康巡检(按需提问) | ✅ | ✅ |
 | 故障调查(即时,只读工具) | ✅ | ✅ |
-| DevOps Agent 深度调查 | ❌ | ✅ |
-| Web 搜索(Exa) | ❌ | ✅(需自备 API key) |
+| DevOps Agent 深度调查 | ✅ 见下方注 ¹ | ✅ |
 | **成本 / FinOps** | | |
 | FinOps 仪表盘(Cost Explorer 口径) | ✅ 仅部署账号 | ✅ 可跨账号 |
 | CUR + Athena 账单明细下钻 | ❌ | ✅ |
 | **工单与 Skills** | | |
 | AWS Support 工单全生命周期 | ✅ | ✅ |
 | 11 个预置 Skill + 客户自建 | ✅ | ✅ |
-| 把 Skill 发布到 DevOps Agent | ❌ | ✅ |
+| 把 Skill 发布到 DevOps Agent | ✅ 见下方注 ¹ | ✅ |
 | **模型** | | |
 | 多模型切换 + 模型目录管理 | ✅ | ✅ |
 | 用 Bedrock API Key 作为凭证 | ❌(只走 IAM) | ✅ |
@@ -145,8 +144,16 @@ cd sample-notiops
 | 通知收件箱 | ⚠️ 界面在,但没有产生通知的后端 | ✅ |
 | 管理仪表盘(阈值 / 目标账户 / Skills 管理) | ❌ | ✅ |
 | **范围** | | |
-| 多账号(AWS Organizations 跨账号) | ❌ 只看部署它的这个账号 | ✅ `--multi-account` |
+| 多账号(AWS Organizations 跨账号) | ✅ 开栈时选 `DeployMode=MultiAccount` + 填组织 id | ✅ `--multi-account` |
 | 升级 | 换新版模板 update 栈(~1 分钟) | 重跑 `./setup.sh` |
+
+> ¹ **深度调查与「把 Skill 发布到 DevOps Agent」在方式 A 里依赖同一个 Agent Space**:
+> 栈会在部署账号里建它,前提是参数 `EnableDeepInvestigation=Yes`(默认值)**且**部署区域
+> 在 AWS DevOps Agent 已开服的区域内(`us-east-1` / `us-west-2` / `ca-central-1` /
+> `sa-east-1` / `ap-south-1` / `ap-southeast-1` / `ap-southeast-2` / `ap-northeast-1` /
+> `eu-central-1` / `eu-west-1` / `eu-west-2`)。别的区域照样开栈成功,只是没有 Agent Space
+> —— 界面上相关开关会**置灰并写清原因**,栈输出 `DeepInvestigationStatus` 会说明是你自己
+> 关的还是该区域不支持。
 
 > 📋 **AWS Support 相关功能(建案 / 查案 / 回复 / 解决)需要账号开通 Business、
 > Enterprise On-Ramp 或 Enterprise 支持计划** —— 这是 AWS Support API 本身的要求,
@@ -196,8 +203,25 @@ cd sample-notiops
 
 - **升级**:`git pull` 拉最新代码,**重跑 `./setup.sh`** —— 它是增量的,只更新有变化的部分。
   你之前填进 Secrets Manager 的 IM 凭据不会被覆盖。
-- **删除**:目前**没有一键卸载**。用 `cd infra && npx cdk destroy <stack-name>` 逐个删栈。
-  注意 DynamoDB 表和报告桶是 `RETAIN` 策略,**不会**被自动删掉,需要手工清理。
+- **删除**:跑仓库根目录的 **`./teardown.sh`**,它按依赖倒序把 `setup.sh` 建的东西删干净
+  (含 CDK 之外的收尾:CUR 报告定义、一次性 EventBridge Scheduler、WebSearch Gateway、
+  Secrets 的 30 天恢复期)。和方式 A 一样是两档语义:
+
+  ```bash
+  ./teardown.sh --dry-run          # 先看清单,什么都不删(强烈建议先跑这个)
+  ./teardown.sh                    # 保数据:删栈与运行时,保留三张 RETAIN 表
+  ./teardown.sh --delete-everything # 全删:连表、CUR 报告 / CUR 桶、Athena 保存查询、残留日志组
+  ```
+
+  删除需要输入 12 位账号号码确认(`--delete-everything` 还要再输一次 `DELETE EVERYTHING`)。
+  ⚠️ 数据桶 `notiops-data-<账号>-<区域>` 在这条路径上是随栈删除的(Skill 与长报告都在里面),
+  所以脚本**默认先把它同步到本地备份目录**,不想备份加 `--no-backup`。
+  如果同一个账号+区域里**两种方式都装过**:两边用的是同一套资源名,所以脚本在清空桶 /
+  删表前会先问 CloudFormation "这资源属于哪个栈",属于一键部署那个栈的会**自动跳过**
+  (要删它请去删那个栈)。
+  跨账号的东西脚本**故意不动**,只打印命令让你自己确认:成员账号的两个 StackSet
+  (加 `--delete-member-stacksets` 才删)、以及各 linked 账号里的 PHD 转发栈
+  (`./setup.sh --phd --remove`)。CDK bootstrap 相关资源(`CDKToolkit` 等)一律不碰。
 
 ---
 

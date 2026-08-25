@@ -1836,6 +1836,11 @@
               "Resource": "arn:aws:aidevops:us-east-1:111122223333:agentspace/*"
             },
             {
+              "Action": "aidevops:ListAgentSpaces",
+              "Effect": "Allow",
+              "Resource": "*"
+            },
+            {
               "Action": "organizations:DescribeOrganization",
               "Effect": "Allow",
               "Resource": "*"

@@ -75,18 +75,22 @@ class ModelEntry:
 
 
 # Last-resort alias. Deliberately the *short* form: it is also the `short` of
-# the seed's default (`claude-sonnet-5`), and `llm_config` accepts short
-# aliases, so this resolves even when DynamoDB is unreachable.
-DEFAULT_ALIAS = "claude"
+# the seed's default (`xai-grok-4-6`), and `llm_config` accepts short aliases,
+# so this resolves even when DynamoDB is unreachable.
+DEFAULT_ALIAS = "grok"
 
 # Absolute floor, used only if `llm_config` itself somehow fails (it is written
 # not to raise, but `get()` is on the critical path of every reply and must not
 # be the thing that breaks it).
+# `max_output_tokens` is the IM surface target, not the model's ceiling: Grok's
+# measured hard limit is 524288 and it carries no `output_override`, so the
+# normal path resolves to min(524288, 6000) = 6000 — the floor must match that,
+# not the model card.
 _FLOOR = ModelEntry(
     alias=DEFAULT_ALIAS,
-    model_id="global.anthropic.claude-sonnet-5",
-    label="Claude Sonnet 5",
-    kind="bedrock_anthropic",
+    model_id="global.xai.grok-4.6",
+    label="Grok 4.6",
+    kind="bedrock_converse",
     max_output_tokens=6000,
 )
 

@@ -66,6 +66,21 @@ export interface WebChatCoreProps {
   corsAllowedOrigins?: string[];
 
   /**
+   * 多账号（Organizations）模式的**部署期**表达 —— 一键部署（静态模板）专用。
+   *
+   * CDK / setup.sh 路径**不传**这个，仍走 synth 期的 `-c organizationId=o-xxxx`
+   * （下面那个 `orgMode` 布尔）。静态模板里「单账号还是多账号」是客户在
+   * CloudFormation 参数页选的，synth 期无从得知，所以受它影响的 env var 只能落成
+   * `Fn::If`，不能是 TS 的三元表达式。
+   */
+  multiAccount?: {
+    /** `o-xxxx`。这里传的是 CFN token（某个 Parameter 的 `valueAsString`）。 */
+    organizationId: string;
+    /** 「客户选了多账号」那个 `CfnCondition` 的逻辑 ID。 */
+    conditionLogicalId: string;
+  };
+
+  /**
    * 一键部署（Launch Stack）的**静态模板**模式。默认 `false` = 现有 CDK / setup.sh 路径。
    *
    * `true` 时去掉 4 个**隐式 CDK Lambda**（`Custom::LogRetention`、
@@ -114,6 +129,19 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   const organizationId = (scope.node.tryGetContext("organizationId") as string | undefined)?.trim() || "";
   const orgMode = organizationId.length > 0;
 
+  // 两条路径共用一个开关点：`props.multiAccount` 在（一键部署的静态模板里）→ 部署期
+  // `Fn::If`；不在（CDK / setup.sh）→ synth 期的 `orgMode` 布尔。所有受多账号影响的
+  // env var 都从这个函数取值，避免两套分支各写一遍写歪。
+  const orgSwitch = (whenMulti: string, whenSingle: string): string =>
+    props.multiAccount
+      ? cdk.Fn.conditionIf(props.multiAccount.conditionLogicalId, whenMulti, whenSingle).toString()
+      : orgMode
+        ? whenMulti
+        : whenSingle;
+  // 「这份部署有可能是多账号」——静态模板里恒为真（选没选由部署期条件决定），
+  // CDK 路径下等于 orgMode。只用来决定**授权**给不给（见下方 IAM 段的理由）。
+  const mayBeOrgMode = orgMode || props.multiAccount !== undefined;
+
   // ─── DynamoDB：会话/消息单表（§4.3）───
   const table = new dynamodb.Table(scope, "WebChatTable", {
     tableName: "notiops-web-chat",
@@ -145,15 +173,16 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       AGENT_RUNTIME_ARN: agentRuntimeArn,
       // 多账号：config 表名（复用 notiops-config）+ 跨账号角色名 + 单账号锁定
       CONFIG_TABLE: "notiops-config",
-      NOTIOPS_CROSS_ACCOUNT_ROLE: orgMode ? `notiops-idle-detection-role-${stack.account}` : "notiops-idle-detection-role",
-      LOCKED_ACCOUNT_ID: orgMode
-        ? "" // 多账号(Organizations)模式：解锁，多账号选择器可切换到成员账号
-        : stack.account, // 默认锁定部署账号，跨账号 disabled（可在 onboard 后放开）
-      // 多账号(org 模式)：Admin「账户」页一键接入用（StackSets）；非 org 模式留空 = 功能禁用
-      MEMBER_ONBOARDING_STACKSET_NAME: orgMode ? "notiops-member-onboarding" : "",
-      NOTIOPS_MEMBER_ROLE_NAME: orgMode ? `notiops-idle-detection-role-${stack.account}` : "",
-      MEMBER_DA_STACKSET_NAME: orgMode ? "notiops-member-devops-agent" : "",
-      ORGANIZATION_ID: orgMode ? organizationId : "",
+      NOTIOPS_CROSS_ACCOUNT_ROLE: orgSwitch(`notiops-idle-detection-role-${stack.account}`, "notiops-idle-detection-role"),
+      // 多账号：解锁，多账号选择器可切换到成员账号。
+      // 单账号：锁定部署账号，跨账号 disabled（可在 onboard 后放开）。
+      LOCKED_ACCOUNT_ID: orgSwitch("", stack.account),
+      // 多账号：Admin「账户」页一键接入用（StackSets）；单账号留空 = 功能禁用
+      // （BFF 侧 stackSetName() 见空就抛 org_mode_disabled，不会走到 API 调用）。
+      MEMBER_ONBOARDING_STACKSET_NAME: orgSwitch("notiops-member-onboarding", ""),
+      NOTIOPS_MEMBER_ROLE_NAME: orgSwitch(`notiops-idle-detection-role-${stack.account}`, ""),
+      MEMBER_DA_STACKSET_NAME: orgSwitch("notiops-member-devops-agent", ""),
+      ORGANIZATION_ID: orgSwitch(props.multiAccount?.organizationId ?? organizationId, ""),
       // Skills 存共享数据桶的 skills/ 前缀（与 IM 端共享）；缺省时 BFF skills 路由会报未配置
       SKILLS_BUCKET: props.skillsBucketName ?? "",
       // Athena 查询结果落共享数据桶的 athena-results/ 前缀（FinOps 仪表盘 CUR 查询）
@@ -206,7 +235,15 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   );
 
   // org 模式：Admin「账户」页一键接入 —— StackSets 下发成员账号资源 + Organizations 账号列表
-  if (orgMode) {
+  //
+  // 静态模板下这两条语句**无条件**授予（`mayBeOrgMode` 恒真），不跟着部署期条件走。理由：
+  //   · 把整条语句换成 `AWS::NoValue` 得手改 CDK 生成的那份 PolicyDocument，等于跟生成
+  //     逻辑赛跑（同一顾虑见下方 StagerReadArtifactMirror 的注释）；
+  //   · 客户选了单账号时这两条其实什么都拿不到 —— 两个成员账号 StackSet 只在多账号条件
+  //     成立时才由 StagerFn 的 OrgSetup 阶段建出来，压根不存在（资源级 ARN 指空），
+  //     `organizations:List*/Describe*` 是纯只读元数据，且 BFF 侧 env 为空会先抛
+  //     `org_mode_disabled`，调用根本发不出去。
+  if (mayBeOrgMode) {
     const onboardingStackSetName = "notiops-member-onboarding";
     bff.addToRolePolicy(
       new iam.PolicyStatement({
@@ -380,6 +417,16 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       ],
       resources: [`arn:aws:aidevops:${stack.region}:${stack.account}:agentspace/*`],
     }),
+  );
+  // Agent Space **自动发现**（bff/web-chat/devops_agent_skills.mjs 的 localAgentSpaceProbe）：
+  // DEVOPS_AGENT_SPACE_ID 只在「主栈 + WebChatStack 一起部署」时才被跨栈引用注入，单独
+  // 部署 WebChatStack 等场景会是空串 —— 此时回退到 ListAgentSpaces 找 notiops-devops-<account>，
+  // 与 agent runtime 侧（core/devops_agent.py 的 _discover_space）行为一致，避免"账号里明明
+  // 有 Agent Space，深度调查却报 no_local_agent_space"。
+  // List 类 API 不接受资源级限定（列的就是"本账号有哪些"），只能 *；它是只读且不返回任何
+  // Agent Space 内的数据（只有 id/name），扩权面很小。
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({ actions: ["aidevops:ListAgentSpaces"], resources: ["*"] }),
   );
   // 动态发现 Organization payer（管理账号）——FinOps 跨账号成本查询用它拿到 payer
   // 账号 ID，再 AssumeRole 进 payer 的成本只读角色（见 bff/web-chat/devops_agent_accounts.mjs

@@ -55,7 +55,7 @@ export function buildRuntimePayload({ prompt, model, generation, locale, webSear
  * 调用 runtime，回调 onToken(text) / onSources(arr)。返回拼好的全文。
  * 解析失败不抛，尽量把能拿到的文本推出去。
  */
-export async function invokeAgent({ conversationId, prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, topic, accountId, allowedAccounts, skillId, skillVersion }, { onToken, onSources, onActions, onUsage, onFollowups, onInvestigationStep, onProgress, onReasoning }) {
+export async function invokeAgent({ conversationId, prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, topic, accountId, allowedAccounts, skillId, skillVersion }, { onToken, onSources, onActions, onUsage, onFollowups, onInvestigationStep, onProgress, onReasoning, onRuntimeError }) {
   // 把"今天"传给 agent：用于联网搜索时给 query 补当前年份（让结果偏向最新），
   // 也让模型知道当前日期、不把训练截止当“现在”。
   const now = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
@@ -79,6 +79,9 @@ export async function invokeAgent({ conversationId, prompt, model, generation, l
 
   const decoder = new TextDecoder();
   let buf = "";
+  // runtime 侧异常帧（见下 extract 的 error 分支）。**先记下、流读完再处理** ——
+  // 在 chunk 回调里抛会把 SDK 的迭代器撕开、丢掉后面已经在缓冲里的帧。
+  let runtimeError = null;
 
   const handleChunk = (chunk) => {
     buf += decoder.decode(chunk, { stream: true });
@@ -92,7 +95,8 @@ export async function invokeAgent({ conversationId, prompt, model, generation, l
         if (!m) continue;
         let evt;
         try { evt = JSON.parse(m[1]); } catch { evt = m[1]; }
-        const { text, sources, actions, usage, followups, investigationStep, progress, reasoning } = extract(evt);
+        const { text, sources, actions, usage, followups, investigationStep, progress, reasoning, error } = extract(evt);
+        if (error) runtimeError = error;
         if (text) { full += text; onToken?.(text); }
         if (sources?.length) onSources?.(sources);
         if (actions?.length) onActions?.(actions);
@@ -115,7 +119,28 @@ export async function invokeAgent({ conversationId, prompt, model, generation, l
   } else if (typeof body.transformToString === "function") {
     handleChunk(new TextEncoder().encode(await body.transformToString()));
   }
+
+  // runtime 里抛了异常：AgentCore 的 _sync_stream_with_error_handling 会**发一帧**
+  // `{"error":…, "error_type":…}` 然后正常结束流（HTTP 早已 200）。此前这帧被 extract
+  // 无声丢弃 → invokeAgent 正常返回空串 → 调用方既没拿到文本也没拿到异常，前端只剩
+  // 「（无响应）」（2026-08-25 现网事故：Grok 4.6 连续 InternalServerException）。
+  // 现在：一个字都没吐 → 抛出带 name=错误类型的异常，让 /stream 走它的错误分支；
+  // 已经吐过部分正文 → 不抛（避免调用方重试造成重复输出），只把错误交给回调。
+  if (runtimeError) {
+    onRuntimeError?.(runtimeError);
+    if (!full) throw new AgentRuntimeStreamError(runtimeError.type, runtimeError.message);
+  }
   return full;
+}
+
+/** runtime 流内异常（区别于 invoke 调用本身失败）。`name` = runtime 报的错误类型，
+ *  好让 /stream 的 isColdStart / 文案分支按类型判断。 */
+export class AgentRuntimeStreamError extends Error {
+  constructor(type, message) {
+    super(message || "agent runtime stream error");
+    this.name = type || "AgentRuntimeStreamError";
+    this.runtimeErrorType = type || "";
+  }
 }
 
 /** 从 Strands 事件里宽容提取文本增量与 sources。
@@ -186,5 +211,14 @@ export function extract(evt) {
   // 本轮 token 用量（agent 收尾 yield {"usage":{inputTokens,outputTokens,totalTokens}}）。
   const usage = evt.usage && typeof evt.usage === "object" ? evt.usage : undefined;
 
-  return { text: typeof text === "string" ? text : "", sources, actions, usage, followups, investigationStep, progress, reasoning };
+  // runtime 流内异常帧。形状由 AgentCore SDK 固定（bedrock_agentcore/runtime/app.py 的
+  // `_sync_stream_with_error_handling`）：{error, error_type, message}。判据用
+  // **error_type 存在**，而不是"有 error 字段"——后者太宽，工具返回里 `{"error": "..."}`
+  // 一类的业务字段会被误判成 runtime 崩了。
+  let error;
+  if (typeof evt.error_type === "string" && evt.error_type) {
+    error = { type: evt.error_type, message: typeof evt.error === "string" ? evt.error : "" };
+  }
+
+  return { text: typeof text === "string" ? text : "", sources, actions, usage, followups, investigationStep, progress, reasoning, error };
 }

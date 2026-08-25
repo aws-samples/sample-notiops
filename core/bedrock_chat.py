@@ -558,9 +558,11 @@ def respond(user_text: str, *, command: str,
     platform / chat_id / user_id / is_dm : routing context used to
                 resolve the per-chat model preference set via
                 `@bot model X`. Optional — when omitted the bot falls
-                back to the env default (DEFAULT_LLM_PROVIDER) and
-                ultimately the catalogue default (Claude Sonnet 4.6),
-                which preserves the pre-multi-model behavior.
+                back to the catalogue's admin-managed `default_model`
+                (Grok 4.6 today). The old `DEFAULT_LLM_PROVIDER` /
+                SSM levels were removed in 2026-08 (spec R8.2) because
+                they silently out-ranked the admin default; see
+                `core/llm_pref_resolver.py`.
 
     Returns the reply text, or "" when this module shouldn't reply (mode
     disabled, command outside scope). Callers that get "" must fall back

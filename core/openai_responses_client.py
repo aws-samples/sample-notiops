@@ -1,7 +1,8 @@
 """Bedrock Mantle Responses API client (OpenAI-compatible).
 
 Used by `core/bedrock_chat.py` for the `bedrock_mantle_responses` model
-kind (today: GPT-5.4, GPT-5.5). The Mantle endpoint speaks OpenAI's
+kind (today the catalogue ships GPT-5.6 Terra / Sol / Luna; earlier
+GPT-5.4 / GPT-5.5 used the same path). The Mantle endpoint speaks OpenAI's
 Responses API protocol (different from Bedrock InvokeModel/Converse):
 
     POST https://bedrock-mantle.<region>.api.aws/openai/v1/responses
@@ -10,9 +11,13 @@ Authentication is SigV4 with service="bedrock" using whatever IAM
 credentials boto3 picks up (ECS task role in production, AWS profile
 locally) — no separate Bedrock API key is required.
 
-Region constraints (per AWS blog 2026-06):
+Region constraints (per AWS blog 2026-06, verified for the 5.4/5.5
+generation -- re-check before pinning a newer model to a new Region):
     - GPT-5.4 → us-east-2 / us-west-2 / GovCloud-us-west
     - GPT-5.5 → us-east-2 only
+
+The Region actually used is `GPT_REGION` (default us-east-2, exposed as the
+CFN parameter `GptRegion`), not inferred from the model id.
 
 The bot ECS deployment runs in us-east-1, so we make a cross-region
 HTTPS call. Latency is ~50ms higher than in-region but acceptable for

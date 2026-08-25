@@ -32,7 +32,13 @@ logger = logging.getLogger("shared.phd_config")
 
 # Final fallback. Aligned with the CDK-injected MODEL_ID and with
 # config/llm-model-catalog.json's default_model, so all three agree.
-_DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-5"
+#
+# Must stay Converse-capable. ``phd_model_route`` returns ("", "") on the env /
+# hardcoded paths -- i.e. "speak Converse" -- so a Mantle-only id here would
+# fail as ``ValidationException: model identifier is invalid`` on every push
+# that lands before an admin has ever saved the catalogue. Grok 4.6's catalogue
+# entry is ``kind: bedrock_converse``, so it satisfies that.
+_DEFAULT_MODEL_ID = "global.xai.grok-4.6"
 
 _ENV_MODEL_ID = "MODEL_ID"
 
@@ -113,8 +119,9 @@ def phd_model_route(model_id: str) -> tuple[str, str]:
     Returns ``("", "")`` whenever the rows are absent, which ``invoke_llm``
     reads as "speak Converse" -- i.e. exactly the pre-existing behaviour. That
     matters for the fallback paths: when ``phd_model_id`` came from the env var
-    or the hardcoded default (both Converse-capable Claude profiles), there is
-    no projection to read and defaulting to Converse is correct.
+    or the hardcoded default (both deliberately Converse-capable profiles --
+    see ``_DEFAULT_MODEL_ID``), there is no projection to read and defaulting
+    to Converse is correct.
 
     **Deliberately not inferred from the model id.** Guessing by prefix breaks
     silently the moment the catalogue gains a model whose id does not match the

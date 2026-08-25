@@ -272,7 +272,7 @@ BFF 把 AgentCore Runtime 的产出转成一条 SSE 事件流,前端按类型分
 
 #### 2.4.5 左侧主题导航(有序)
 
-通知(Notifications) / 调查(Investigate) / FinOps / 案例(Cases) / Skills(一级) / 更多(安全 · 巡检报告外链 · 定制)。新对话默认模型 **Claude Sonnet 4.6**;另可切 Amazon Nova Pro、Claude Haiku 4.5、DeepSeek V3.2、GPT-5.4(实验)。每会话记忆模型偏好,每条回复署名所用模型。多账号选择器默认部署账号(团队共享);联网搜索开关默认关。
+通知(Notifications) / 调查(Investigate) / FinOps / 案例(Cases) / Skills(一级) / 更多(安全 · 巡检报告外链 · 定制)。新对话默认模型 **Grok 4.6**;另可切 Claude Sonnet 5、Claude Opus 5、Claude Haiku 4.5、Amazon Nova Pro、DeepSeek V3.2、GPT-5.6(Terra / Sol / Luna)。默认模型与启用集都由管理员在 Admin「模型」页定(真源:`config/llm-model-catalog.json` → DDB `llmcfg`)。每会话记忆模型偏好,每条回复署名所用模型。多账号选择器默认部署账号(团队共享);联网搜索开关默认关。
 
 > ⚠️ **FinOps Agent 深度分析当前置灰禁用(即将上线,暂未完善)**:DevOps Agent 开关现在在「调查」与「FinOps」两个主题都显示,FinOps 里可开它做成本 / 用量深度分析;但 **FinOps Agent 开关目前置灰禁用**,前端提示"即将上线"。进入 FinOps 主题时该开关默认关(仅「调查」主题默认开)。
 
@@ -662,7 +662,7 @@ def respond(user_text, *, command, chitchat_count, locale="en") -> str:
     if not reply: return CHITCHAT_DOWNGRADED_TEXT # Bedrock 失败 → 固定话术
     if _audit_response_for_change(reply):
         return REFUSAL                             # L3
-    return reply + _model_footer()                 # 模型署名(见 §4.2.8)
+    return reply + "\n\nBy " + model_label + " (via Amazon Bedrock)"   # 模型署名(见 §4.2.8)
 ```
 
 返回 `""` 的情况(mode=disabled)由调用方降级到 investigate 路径;返回固定话术的情况(Bedrock 失败 / qa_only chitchat)用户能继续对话。**绝不静默丢失消息**。
@@ -672,11 +672,12 @@ def respond(user_text, *, command, chitchat_count, locale="en") -> str:
 每条 LLM 产出的回复尾部会追加单行模型署名,让用户清楚看到回复来自哪个模型(而不是被当成"标准答案"信赖):
 
 ```
-By Claude Sonnet 4.6
+By Grok 4.6 (via Amazon Bedrock)
 ```
 
-- 实现:`core/bedrock_chat.py::_model_footer()`,通过 `_friendly_model_name()` 把推理 profile id(如 `us.anthropic.claude-sonnet-4-6`)映射到友好名("Claude Sonnet 4.6")
-- 映射表覆盖 Opus 4.7/4.6, Sonnet 4.6/4.5/3.7/3.5, Haiku 4.5/3.5;**未知模型 fallback 到原始 ID**(便于排查)
+- 实现:`core/bedrock_chat.py::respond()` 直接用本轮解析出的目录条目 label(`model_entry.label`)拼 `By <label> (via Amazon Bedrock)`
+- **只有一张模型名表 —— 模型目录本身**(DynamoDB,Admin「模型」页可改)。早期还有一张硬编码的 `_MODEL_FRIENDLY_NAMES` / `_friendly_model_name()` / `_model_footer()`,2026-08 已删(spec task 4.4):它没有调用方了,而且子串匹配不严谨(needle `claude-sonnet-5` 也会命中未来的 `claude-sonnet-5x`)。目录里查不到的 alias 由 `core/model_catalog.py` 兜底
+- 署名跟随本群 / 本 DM 当前选的模型(默认 Grok 4.6),不是写死 Claude
 - 纯文本格式(不用 markdown italic),原因:飞书 `reply_text` 路径不渲染 markdown,`_..._` 字面会显示出来
 
 代码:[core/bedrock_chat.py](../core/bedrock_chat.py)
@@ -1032,7 +1033,7 @@ core.webhook_dispatch.dispatch(query=investigate_query, ...)
 2. **prompt 组装**([core/case_analyze.py](../core/case_analyze.py) `_format_for_prompt`):
    - 一段结构化 markdown,case 头部 + 全部 communications 编号 + speaker 标记
    - 每条 message 单条上限 4000 字符,超长截断
-3. **LLM 调用**(`bedrock-runtime:InvokeModel`,模型走 `get_bot_model_id()` 选当前 chat 偏好的模型 — Sonnet 4.6 / Nova / GPT):
+3. **LLM 调用**(`bedrock-runtime:InvokeModel`,模型走 `get_bot_model_id()` —— 即 SSM `/notiops/agent/model_id`,当前 `global.anthropic.claude-sonnet-5`。⚠️ 这条**不跟随** `@bot model` 的会话偏好:本调用点手搓 Anthropic 原生 body,换非 Claude 模型会 ValidationException,见 `shared/model_config.py`):
    - System prompt 硬规则:
      - 不发明资源 ID / ARN / account ID
      - 不输出 mutation 命令(零变更承诺,read-only 命令 OK)
@@ -1195,7 +1196,7 @@ Lambda 这一侧(report-handler / push-handler)拿到的事件里没有 user_id,
 用户问 "ALB 和 NLB 什么区别"
    │
    ▼  bedrock_chat.respond(...) 走 Bedrock Tool Use
-Bedrock Sonnet 4.6
+Bedrock 会话模型(默认 Grok 4.6)
    │  自主决定要不要调 tool
    ├── aws_docs_search(query)    ← MCP tool 1
    ├── aws_docs_read(url)         ← MCP tool 2
@@ -1209,7 +1210,7 @@ knowledge-mcp.global.api.aws  (AWS Knowledge MCP, 公网开放)
    ▼  最终 Bedrock 回复带:
 Body 文本 + 📚 来源块(列出每个引用的 URL)
    + 🔧 调用的 MCP 工具(透明展示)
-   + By Claude Sonnet 4.6 footer
+   + By <model> (via Amazon Bedrock) footer
 ```
 
 #### 4.10.2 模块边界

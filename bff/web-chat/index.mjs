@@ -38,6 +38,31 @@ const enc = new TextEncoder();
 const sse = (event, data) => enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** 本轮一个字都没产出、且**不是**冷启动 → 说清失败原因 + 给下一步（别再只给「（无响应）」）。
+ *
+ * 事故背景（2026-08-25 现网）：Grok 4.6 那轮 Bedrock ConverseStream 连续
+ * InternalServerException，agent runtime 按约定发了 `{error, error_type}` 帧，但 BFF 当时
+ * 不认识那帧、也就没有 lastErr → 用户只看到「（无响应）」，无从判断是该重试还是换模型。
+ * 现在 agentcore.mjs 会把那帧变成异常，这里负责把它翻成人话。
+ *
+ * 只回显**错误类型**（如 InternalServerException），不回显原始报文
+ * （docs/LOGGING_STANDARD.md：日志与用户可见文案都不带模型/服务的原始 message）。
+ */
+function modelFailureText(locale, err) {
+  const kind = String(err?.runtimeErrorType || err?.name || "").trim() || "UnknownError";
+  // Bedrock 侧的临时故障/限流 → 明确告诉用户「重试通常就好，或换个模型」；
+  // 其它（多为本端 bug）→ 只说失败并建议重试/反馈，不误导成"模型的问题"。
+  const transient = /InternalServer|ServiceUnavailable|Throttl|Timeout|ModelError|ModelNotReady/i.test(kind);
+  if (locale === "en") {
+    return transient
+      ? `⚠️ The model service returned \`${kind}\` and this turn produced no answer (already retried automatically).\n\n**Next steps:**\n1. Send the message again — this class of error is usually transient;\n2. If it keeps failing, switch to a different model (e.g. Claude Sonnet 5) above the input box and retry.`
+      : `⚠️ This turn failed (\`${kind}\`) and produced no answer.\n\n**Next step:** send the message again. If it keeps failing, report it to your administrator with the time of this message.`;
+  }
+  return transient
+    ? `⚠️ 模型服务返回 \`${kind}\`，本轮未能生成回答（已自动重试）。\n\n**下一步：**\n1. 直接再发一次 —— 这类错误多为模型服务端的临时故障；\n2. 若连续失败，在输入框上方切换到**另一个模型**（如 Claude Sonnet 5）后重试。`
+    : `⚠️ 本轮处理失败（\`${kind}\`），未能生成回答。\n\n**下一步：** 请再发送一次。若持续失败，请把这条消息的时间点反馈给管理员。`;
+}
+
 function pathOf(event) {
   return event.rawPath || event.requestContext?.http?.path || "/";
 }
@@ -363,6 +388,14 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
       const dep = await deploymentInfo();
       return json(200, { accounts: await filterVisibleAccounts(all, sub, groups, eff), deployment: dep });
     }
+    // ── 深度调查可用性（前端据此决定两个「深度调查」开关能不能点）──
+    // 没有 DevOps Agent Agent Space 的部署/账号，点开关只能白等一轮再吃一句
+    // no_local_agent_space / account_not_onboarded_to_devops_agent。这里提前把答案给前端。
+    // ?account= 走上面统一的账号可见性校验（不可见 → 403），无需本地再判。
+    if (method === "GET" && path.endsWith("/features/deep-investigation")) {
+      const { deepInvestigationAvailability } = await import("./devops_investigate.mjs");
+      return json(200, await deepInvestigationAvailability(q.account || ""));
+    }
     // ── Skills（Customize 页；存 S3 skills/ 前缀，与 IM 端共享）──
     const parseBody = () => { try { return JSON.parse(event.isBase64Encoded ? Buffer.from(event.body, "base64").toString("utf8") : (event.body || "{}")); } catch { return {}; } };
     const skillExistsMatch = /\/skills\/([^/]+)\/exists$/.exec(path);
@@ -652,7 +685,7 @@ async function streamChat(event, responseStream, { sub, groups }) {
   // runtime 侧 TTL 兜底失效 + 放大 DDB 读）。
   // 失败安全：目录读不出来（DDB 抖动 / 尚未 seed）不阻断对话 —— 退回客户端值 + generation 0，
   // 由 runtime 侧内置兜底 + TTL 自行收敛。宁可用旧模型，不可让聊天不可用。
-  let model = requestedModel || "claude-sonnet-5";
+  let model = requestedModel || "xai-grok-4-6";
   let generation = 0;
   try {
     const picked = await resolveForStream(requestedModel, "webchat");
@@ -760,6 +793,11 @@ async function streamChat(event, responseStream, { sub, groups }) {
       onReasoning: (r) => { gotOutput(); stream.write(sse("reasoning", r || {})); },
       // 本轮 token 用量 → 前端在消息末尾显示「· N tokens」
       onUsage: (u) => { usage = u; stream.write(sse("usage", { usage: u })); },
+      // runtime 流内异常帧（模型 5xx/限流等）。只记**类型**，不记原始报文
+      // （docs/LOGGING_STANDARD.md）。文案由下面的 fallback 统一给，这里只保证可观测。
+      onRuntimeError: (err) => {
+        console.error(`[BFF] /stream agent runtime error frame — type=${err?.type || "?"} model=${model || "-"}`);
+      },
     };
     // 冷启动类错误(容器初始化超时/未就绪)才重试；真实业务错误不重试。
     const isColdStart = (e) => {
@@ -802,9 +840,12 @@ async function streamChat(event, responseStream, { sub, groups }) {
       }
     }
     stopHeartbeat(); // 循环结束（成功/失败/放弃）——务必停掉心跳，避免定时器泄漏到响应之后
-    if (lastErr && !streamedAny) {
-      stream.write(sse("error", { message: String(lastErr?.message || lastErr) }));
-    }
+    // 注意：**不**再往前端发 sse("error", {message: 原始报文})。
+    // 一是违反日志/展示纪律（docs/LOGGING_STANDARD.md）——Bedrock 的原始报文里带
+    // region / model id / 内部提示（Strands 还会追加 `└ Model id: …` 两行），不该进用户界面；
+    // 二是会闪一下：前端 onError 把气泡先置成「⚠️ 原始报文」，紧接着下面的 token 又把它
+    // 覆盖成友好文案，用户会看到一帧乱码似的英文错误。错误一律只走下面的 modelFailureText。
+    // 排障靠 CloudWatch：上面 catch 里的 console.error 已记了 name/message/stack。
     if (!reply) {
       // 仍无产出——冷启动没醒给明确的下一步建议（区分 vs 真空响应），避免空白气泡。
       // 冷启动失败文案带"再发一次"引导：第二次请求通常已落到预热/已热实例。
@@ -812,7 +853,9 @@ async function streamChat(event, responseStream, { sub, groups }) {
         ? (locale === "en"
             ? "⏳ The service is still starting up and didn't respond in time (cold start after idle).\n\n**Next step:** send your message again — the second request usually lands on an already-warmed instance and responds immediately."
             : "⏳ 服务仍在启动中，本次未能及时响应（空闲后的冷启动）。\n\n**下一步：** 请再发送一次消息 —— 第二次请求通常会落到已预热的实例，会立即响应。")
-        : (locale === "en" ? "(no response)" : "（无响应）");
+        : lastErr
+          ? modelFailureText(locale, lastErr)
+          : (locale === "en" ? "(no response)" : "（无响应）");
       stream.write(sse("token", { delta: reply }));
     }
   } else {

@@ -41,7 +41,7 @@
 | **管理 Support case** | 创建 / 列出 / 查看 / 回复 / **智能分析** / 关闭 AWS Support case | `@bot 帮我开个 case 处理 RDS 故障` / `@bot 分析 case 12345` |
 | **回答 AWS 概念问题** | 引用 AWS 官方文档解释概念、最佳实践、API 用法 | `@bot ALB 和 NLB 有什么区别` |
 | **主动观察告警** | CloudWatch / Health / Backup / GuardDuty / Cost / TA 6 类事件源,自动派发调查 | (无需操作,告警自动触发)|
-| **多 LLM 切换** | 在 Claude Sonnet 4.6 / Amazon Nova Pro / OpenAI GPT-5.4 之间任意切换(均经 Amazon Bedrock 访问),per-chat / per-DM 记忆偏好 | `@bot model nova` / `@bot model claude` / `@bot model list` |
+| **多 LLM 切换** | 在管理员启用的模型之间任意切换(默认 **Grok 4.6**,另有 Claude Sonnet 5 / Opus 5 / Haiku 4.5、Amazon Nova Pro、DeepSeek V3.2、GPT-5.6 系列;均经 Amazon Bedrock 访问),per-chat / per-DM 记忆偏好 | `@bot model nova` / `@bot model claude` / `@bot model list` |
 | **语言切换** | 中 / 英文切换,记住你的偏好 | `language zh` / `language en` / `请帮我切换到英文` |
 
 ### bot 不会做什么 ❌
@@ -314,7 +314,7 @@ bot 会先发"正在分析 case xxx…"提示,5-15 秒后返回**紫色智能分
 
 ### 5.2 回答样式
 
-bot 调用 **AWS Knowledge MCP** 检索官方文档,然后用 Bedrock Sonnet 4.6 回答,**附带可验证的来源**:
+bot 调用 **AWS Knowledge MCP** 检索官方文档,然后用本群当前的对话模型(默认 **Grok 4.6**,见 §7)回答,**附带可验证的来源**:
 
 ```
 ALB (Application Load Balancer) 工作在 OSI Layer 7,理解 HTTP/HTTPS 协议,
@@ -337,13 +337,13 @@ Layer 4,只看 TCP/UDP,不解析应用层。
 - aws_docs_search("ALB vs NLB difference")
 - aws_docs_read(...)
 
-By Claude Sonnet 4.6
+By Grok 4.6
 ```
 
 **重点**:
 - **"📚 来源"块** = 实际被 LLM 看过的 URL,不是凭空编的
 - **"🔧 调用的 MCP 工具"** = 透明展示 LLM 用了哪些工具
-- **"By Claude Sonnet 4.6"** = 标明这是模型生成的回答,不是固化的"标准答案"
+- **"By Grok 4.6"**(署名跟随本群当前模型)= 标明这是模型生成的回答,不是固化的"标准答案"
 
 ### 5.3 概念问题样例
 
@@ -423,15 +423,16 @@ DevOps Agent 已自动启动调查...
 
 ## 7. 模型选择(切换 LLM)
 
-bot 当前支持 3 个 LLM 别名,任何用户都可以在群里 / DM 里**随时切换**(无 admin 控制):
+bot 支持的别名 = 管理员在模型目录里勾选的 IM 启用集(下表列出常用几个),任何用户都可以在群里 / DM 里**随时切换**(无 admin 控制);完整清单用 `@bot model list` 现场查:
 
 | alias | 模型 | 说明 |
 |---|---|---|
-| `claude` | **Claude Sonnet 4.6** | 默认值,内部测试中工具调用较稳、中英文都好,故设为默认首选 |
+| `grok` | **Grok 4.6** | **默认值**(模型目录 `default_model`)。Bedrock Converse;⚠️ 不支持显式提示缓存,长会话的 input 成本比 Claude 高 |
+| `claude` | **Claude Sonnet 5** | 内部测试中工具调用较稳、中英文都好;支持提示缓存 |
 | `nova` | **Amazon Nova Pro** | Bedrock Converse,单价约为 Claude Sonnet 的 1/4(据 Bedrock 公开定价,截至 2026-07),中文够用,合规白名单常见 |
-| `gpt` | **GPT-5.4**(实验性)| 走 Bedrock Mantle Responses API,工具调用稳定性弱于上面两个,建议仅作尝鲜 |
+| `gpt` / `gpt_sol` / `gpt_luna` | **GPT-5.6** Terra / Sol / Luna(实验性)| 走 Bedrock Mantle Responses API,工具调用稳定性弱于上面两个,建议仅作尝鲜 |
 
-> ⚠️ **GPT-5.4 当前为实验性档位**。GPT 在 tool-use 场景下偶发把 OpenAI 内部协议片段或低质 token 输出到回复中。bot 已经叠了三层硬防护(token 预算、JSON 错误回喂、输出审计),即便如此仍建议默认使用 `claude` 或 `nova`,把 GPT 当作"我想试试 Open AI 模型"的尝鲜选项。
+> ⚠️ **GPT-5.6 当前为实验性档位**。GPT 在 tool-use 场景下偶发把 OpenAI 内部协议片段或低质 token 输出到回复中。bot 已经叠了三层硬防护(token 预算、JSON 错误回喂、输出审计),即便如此仍建议默认使用 `claude` 或 `nova`,把 GPT 当作"我想试试 Open AI 模型"的尝鲜选项。
 >
 > 注:所有模型均经 Amazon Bedrock 访问(托管的安全、合规监控与成本控制);本项目为示例代码(sample code),用于学习/参考,非生产就绪;正式使用前请按贵组织的安全、合规要求自行完成充分测试与加固。
 
@@ -441,8 +442,8 @@ bot 当前支持 3 个 LLM 别名,任何用户都可以在群里 / DM 里**随�
 @bot model              # 查看本群 / 本 DM 当前模型
 @bot model list         # 列出所有可用别名
 @bot model nova         # 切到 Nova(整个群从此用 Nova)
-@bot model claude       # 切回 Claude
-@bot model default      # 清除偏好,回到部署默认(env)
+@bot model claude       # 切到 Claude Sonnet 5
+@bot model default      # 清除偏好,回到管理员设的 default_model(当前 Grok 4.6)
 ```
 
 ### 7.2 切换的范围
@@ -450,14 +451,14 @@ bot 当前支持 3 个 LLM 别名,任何用户都可以在群里 / DM 里**随�
 - 在**群里**发命令 → **整个群**之后都用这个模型(包括别人的提问)
 - 在**私聊**发命令 → **只影响你的 DM**,不影响群
 
-也就是说:海外群可以用 `claude`,国内合规群可以用 `nova`,**同一个 bot 部署服务多个市场**。
+也就是说:某些群可以用 `claude`,对成本敏感的群可以用 `nova`,**同一个 bot 部署服务多个场景**。
 
 ### 7.3 切到 GPT 的注意事项(实验性)
 
-GPT-5.4 走 **Bedrock Mantle Responses API**(OpenAI 兼容协议),跟 Claude / Nova 在 Bedrock InvokeModel / Converse 上不一样:
+GPT-5.6 走 **Bedrock Mantle Responses API**(OpenAI 兼容协议),跟 Claude / Nova / Grok 在 Bedrock InvokeModel / Converse 上不一样:
 
-- **稳定性**:在 tool-use(派调查 / 概念问答)场景下,GPT-5.4 偶发会把 OpenAI 内部协议片段(`to=functions.<tool>`)或低质 token 写到回复里。bot 端已加三层硬防护拦截这种输出 —— 拦截后用户会看到 canned 兜底回复,而不是 garbage,但当下可见的"半灰"概率仍高于 Claude / Nova。**正式使用时优先 `claude` 或 `nova`**,GPT 仅作为尝鲜或对比档位。
-- **跨 region 调用**:GPT-5.4 在 `us-east-2`(也支持 `us-west-2` / GovCloud-us-west)。bot 部署在 `us-east-1`,所以选 `gpt` 时会发起一次跨 region HTTPS 调用,延迟比 Claude / Nova 高 ~50ms,但不影响功能。
+- **稳定性**:在 tool-use(派调查 / 概念问答)场景下,GPT-5.6 偶发会把 OpenAI 内部协议片段(`to=functions.<tool>`)或低质 token 写到回复里。bot 端已加三层硬防护拦截这种输出 —— 拦截后用户会看到 canned 兜底回复,而不是 garbage,但当下可见的"半灰"概率仍高于 Claude / Nova。**正式使用时优先 `claude` 或 `nova`**,GPT 仅作为尝鲜或对比档位。
+- **跨 region 调用**:GPT-5.6 在 `us-east-2`(也支持 `us-west-2` / GovCloud-us-west)。bot 部署在 `us-east-1`,所以选 `gpt` 时会发起一次跨 region HTTPS 调用,延迟比 Claude / Nova 高 ~50ms,但不影响功能。
 - **管理员可改 region**:CFN parameter `GptRegion` 默认 `us-east-2`,可改成 `us-west-2` 或 `us-gov-west-1`。
 - **Reasoning effort**:GPT-5.x 有显式的"思考深度"档位,默认 `medium`,管理员可通过 `GPT_REASONING_EFFORT` env 改成 `low` / `high`。
 - **延迟**:reasoning=high 时单次回复可能 10-30 秒;chitchat 路径推荐保持 `medium`。
@@ -560,7 +561,7 @@ DDB TTL 自动清理,不需要人工干预。
 ### Q6: bot 回的内容是模型生成的吗?会不会胡编?
 
 - **调查报告**:DevOps Agent 真实读你的资源生成,有 trace.html 可查,不会编
-- **概念问答**:Bedrock Sonnet 4.6 + AWS 官方文档检索(Knowledge MCP),回答附带 📚 来源 URL,可点击验证
+- **概念问答**:Bedrock 上的对话模型(默认 Grok 4.6)+ AWS 官方文档检索(Knowledge MCP),回答附带 📚 来源 URL,可点击验证
 - **意图判断 / 进度叙事**:LLM 生成,可能会有偏差,但不影响调查结果本身的真实性
 
 如果 bot 给的概念回答跟你认知不符,**点 📚 来源 URL 自己看 AWS 官方文档**——这是 ground truth。
@@ -692,7 +693,7 @@ bot 在飞书 / Slack 上完整可用的功能,在钉钉上**当前处于分阶�
 
 - **登录**:Web Chat 走 Cognito 登录(复用 notiops 用户池)。打开管理员发给你的网址,用你的账号登录即可。
 - **左侧导航(主题)**:按顺序是 **通知(Notifications) / 调查(Investigate) / FinOps / 案例(Cases) / Skills / 更多(More)**。点某个主题即进入对应对话场景。
-- **默认模型**:新对话默认使用 **Claude Sonnet 4.6**。
+- **默认模型**:新对话默认使用 **Grok 4.6**(具体默认值由管理员在「管理 → 模型」页设定)。
 - **右侧 Sources / 调查过程面板**:展示工具调用、出处透传,以及调查主题下的"调查过程"实时面板(见 §12.3)。
 
 顶部/工具区可用的开关:**多账号选择器**、**多模型切换**、**联网搜索开关**(见 §12.7)。
@@ -762,7 +763,7 @@ Web Chat 提供**两条建案路径,客户二选一**。两种方式都走**确�
 
 ### 12.7 多账号 / 多模型 / 联网搜索 / What's New / "/" 命令
 
-- **多模型切换**:默认 **Claude Sonnet 4.6**,另可选 **Amazon Nova Pro**、**Claude Haiku 4.5**、**DeepSeek V3.2**、**GPT-5.4(实验性)**(均经 Amazon Bedrock 访问,第三方模型非直连厂商 API)。**每会话记忆你的模型偏好**,**每条回复都会署名所用模型**。
+- **多模型切换**:默认 **Grok 4.6**,另可选 **Claude Sonnet 5**、**Claude Opus 5**、**Claude Haiku 4.5**、**Amazon Nova Pro**、**DeepSeek V3.2**、**GPT-5.6(Terra / Sol / Luna)**(均经 Amazon Bedrock 访问,第三方模型非直连厂商 API;实际可选项 = 管理员勾的启用集)。**每会话记忆你的模型偏好**,**每条回复都会署名所用模型**。
 - **多账号选择器**:默认使用**部署账号**,团队共享。⚠️ **v1 跨账号默认锁定在部署账号**(尚未开放任意切换到其他账号)。
 - **联网搜索开关**:**默认关闭**,需要时手动打开,让助手参考公网信息。
 - **What's New**:查看 AWS 新发布内容。

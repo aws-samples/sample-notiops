@@ -155,7 +155,7 @@ CDK 部署三个栈,`./setup.sh` 走 `cdk deploy --all` 一次部到位。**Web 
 - **AWS 账号**:有 admin 或同等权限
 - **VPC**:任何能跑 ECS Fargate 的 VPC + ≥ 2 个 AZ 的 public subnet(**仅当你启用 IM bot 时需要** —— Fargate task 出公网调 IM API;只用 web 端可忽略)
 - **AWS DevOps Agent**:已开通(深度调查功能需要)。**无需自备 Agent Space** —— CDK 会在你账号下自动新建一个 `notiops-devops-<account>` space(详见 §5.3.4),你不用先手动创建或提供 space id
-- **Bedrock**:`us.anthropic.claude-sonnet-4-6` 推理 profile 在你的 region 已 enable(Bedrock 控制台 → Model access)
+- **Bedrock**:模型目录里**默认模型**对应的 model 在你的 region 已 enable(Bedrock 控制台 → Model access)。当前默认是 **Grok 4.6**(`global.xai.grok-4.6`);想让用户能切别的(Claude Sonnet 5 / Opus 5、Nova Pro、DeepSeek、GPT-5.6 系列)就把对应的一并 enable
 
 ### 2.3 Region 选择
 
@@ -692,7 +692,7 @@ aws dynamodb delete-item --table-name <conv-table> \
 
 | 组件 | 说明 |
 |---|---|
-| **Agent Runtime** | Bedrock AgentCore Runtime,承载 Strands agent(默认模型 Claude Sonnet 4.6)。由 `scripts/deploy_agent.sh` 以 CodeZip 方式部署,产出一个 **Runtime ARN** |
+| **Agent Runtime** | Bedrock AgentCore Runtime,承载 Strands agent(默认模型 **Grok 4.6**,取自模型目录的 `default_model`)。由 `scripts/deploy_agent.sh` 以 CodeZip 方式部署,产出一个 **Runtime ARN** |
 | **BFF Lambda** | Node 20 Lambda(`notiops-web-chat-bff`),挂 **Function URL**(`AuthType=AWS_IAM`),以 **SSE 流式**响应前端;调 Agent Runtime,并直接处理确定性操作(建案 `/actions/execute`、`/support/services` 目录等) |
 | **前端** | React / Vite 单页应用,静态托管 |
 | **鉴权** | Cognito(复用 notiops 的 user pool)+ Identity Pool,前端拿临时凭据对 Function URL 做 **SigV4** 签名 |

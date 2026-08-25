@@ -68,6 +68,9 @@ const LOGIN_ONLY = [
   // 可选模型清单：只返回 admin 已启用的模型（无 provider / 凭证 / 候选全集字段），
   // 任何登录用户都要用它渲染模型下拉（spec R6.2）。
   /\/models$/,
+  // 深度调查可用性：只回 {available, reason}（无 Agent Space id / 无账号清单），
+  // 任何能看到输入框的用户都要用它决定「深度调查」开关是否置灰。
+  /\/features\/deep-investigation$/,
 ];
 
 function isLoginOnly(path) {

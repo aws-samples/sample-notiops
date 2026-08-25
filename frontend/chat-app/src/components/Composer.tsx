@@ -5,7 +5,7 @@ import { useModelCatalog } from "../models";
 // types.ts 里那份只剩历史落款用途。main 侧这行原本是 `{ MODELS, topicHasDevopsAgent }`，
 // 合并时只保留后者 —— 本文件已无 MODELS 引用，留着会是未使用导入。
 import { topicHasDevopsAgent } from "../types";
-import { getCasesSummary } from "../api/chat";
+import { getCasesSummary, getDeepInvestigationAvailability } from "../api/chat";
 import { listSkills, skillDisplay, isPresetSkill, type Skill } from "../api/skills";
 import { IconInvestigate, IconCases, IconFinOps, IconReports, IconGlobe, IconSecurity, IconSkill, IconWhatsNew, IconChevronRight, IconPlus, IconCustomize, IconGauge, skillIcon } from "./icons";
 
@@ -34,6 +34,8 @@ interface Props {
   /** 外部预填输入框（如通用主页的启动卡片点击）。seq 变化即触发一次填入 + 聚焦。 */
   prefill?: { text: string; seq: number };
   /** 多账号：已注册账号 + 当前选择（空=部署账号）+ 切换。 */
+  /** 本会话/本页当前选中的账号（空=部署账号）。用于判断「深度调查」在该账号上是否可用。 */
+  accountId?: string;
   /** 跳转到 Skills 管理页（Customize → Skills）。 */
   onManageSkills?: () => void;
   /** 主题页：点「打开 Dashboard」跳该主题仪表盘详情。传了才渲染——作为紧贴输入框左上角的一体化标签。 */
@@ -45,7 +47,7 @@ interface Props {
 
 const EFFORTS = ["model.effort.fast", "model.effort.balanced", "model.effort.deep"] as const;
 
-export default function Composer({ model, onModelChange, onSend, busy, showSuggestions = true, webSearch = false, onToggleWebSearch, devopsAgent = false, onToggleDevopsAgent, devopsAgentDirect = false, onToggleDevopsAgentDirect, onStop, topic = "general", prefill, onManageSkills, onOpenDashboard, convKey }: Props) {
+export default function Composer({ model, onModelChange, onSend, busy, showSuggestions = true, webSearch = false, onToggleWebSearch, devopsAgent = false, onToggleDevopsAgent, devopsAgentDirect = false, onToggleDevopsAgentDirect, onStop, topic = "general", prefill, onManageSkills, onOpenDashboard, convKey, accountId = "" }: Props) {
   const t = useT();
   const { locale } = useLocale();
   const [text, setText] = useState("");
@@ -76,6 +78,32 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
   // 根菜单(恰为"/")总是显示分类；过滤层有匹配才显示。
   useEffect(() => { setSlashOpen(slashQuery !== null && (slashRoot || slashMatches.length > 0)); }, [text, skills.length]); // eslint-disable-line
   useEffect(() => { if (!slashRoot) setSkillsSub(false); }, [slashRoot]);
+
+  // ── 深度调查可用性：这个部署/这个账号有没有 DevOps Agent 的 Agent Space ──
+  // 此前两个「深度调查」开关只按主题显示，没有 Agent Space 的部署（或没接入 DevOps Agent 的
+  // 成员账号）也照样能点开，用户发一轮才收到一句 no_local_agent_space /
+  // account_not_onboarded_to_devops_agent。这里提前问一次，不可用就置灰 + 写清原因和出路。
+  // "" = 可用（或还没问出来 —— 探测不确定一律按可用处理，见 api/chat.ts）。
+  const deepShown = topicHasDevopsAgent(topic);
+  const [deepNa, setDeepNa] = useState("");
+  useEffect(() => {
+    if (!deepShown) return;
+    let stop = false;
+    getDeepInvestigationAvailability(accountId)
+      .then((r) => { if (!stop) setDeepNa(r.available ? "" : (r.reason || "unavailable")); })
+      .catch(() => { /* 探测失败按可用处理 */ });
+    return () => { stop = true; };
+  }, [deepShown, accountId]);
+  // 切到一个做不了深度调查的账号时，把已经开着的开关自动关掉 —— 否则用户带着一个必然失败的
+  // 开关继续发消息（开关置灰后他也点不掉）。
+  useEffect(() => {
+    if (!deepNa) return;
+    if (devopsAgent) onToggleDevopsAgent?.();
+    if (devopsAgentDirect) onToggleDevopsAgentDirect?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepNa, devopsAgent, devopsAgentDirect]);
+  const deepNaHint = deepNa === "account_not_onboarded_to_devops_agent"
+    ? t("composer.devops.na.account") : t("composer.devops.na.self");
 
   // 二级子菜单只随机展示 3 个 skill（其余靠「输入以筛选」找）。每次展开子菜单重新洗牌。
   const [subSeed, setSubSeed] = useState(0);
@@ -480,29 +508,35 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
                 (见 types.ts `topicHasDevopsAgent` —— 与后端 `_DEVOPS_TOPICS_EXCLUDED` 同一口径)。
                 这样以后新增主题自动继承该能力，不需要回来改这里。
                 默认开/关状态由会话初始值决定(见 ChatApp;当前一律默认关，用户按需手动开)。 */}
-            {topicHasDevopsAgent(topic) && (
+            {deepShown && (
               <button
                 type="button"
-                className={"websearch-toggle" + (devopsAgent ? " on" : "")}
-                onClick={onToggleDevopsAgent}
-                title={t("composer.devops") + " — " + t("composer.devops.hint")}
+                className={"websearch-toggle" + (devopsAgent ? " on" : "") + (deepNa ? " disabled" : "")}
+                onClick={deepNa ? undefined : onToggleDevopsAgent}
+                disabled={!!deepNa}
+                title={deepNa ? deepNaHint : t("composer.devops") + " — " + t("composer.devops.hint")}
                 aria-pressed={devopsAgent}
+                aria-disabled={deepNa ? "true" : undefined}
               >
                 <IconInvestigate size={15} /> {t("composer.devops.short")}
+                {deepNa && <span className="toggle-soon">{t("composer.devops.na")}</span>}
               </button>
             )}
             {/* 「深度调查（直连）」：与上面同一能力的 **0 token** 版本（BFF 直连 DevOps Agent
                 API，不经大模型）。与上面的开关**互斥**（互斥在 ChatApp 的 toggle 里实现），
                 主题门控沿用同一个 topicHasDevopsAgent。老开关一行未改。 */}
-            {topicHasDevopsAgent(topic) && (
+            {deepShown && (
               <button
                 type="button"
-                className={"websearch-toggle" + (devopsAgentDirect ? " on" : "")}
-                onClick={onToggleDevopsAgentDirect}
-                title={t("composer.devops.direct") + " — " + t("composer.devops.direct.hint")}
+                className={"websearch-toggle" + (devopsAgentDirect ? " on" : "") + (deepNa ? " disabled" : "")}
+                onClick={deepNa ? undefined : onToggleDevopsAgentDirect}
+                disabled={!!deepNa}
+                title={deepNa ? deepNaHint : t("composer.devops.direct") + " — " + t("composer.devops.direct.hint")}
                 aria-pressed={devopsAgentDirect}
+                aria-disabled={deepNa ? "true" : undefined}
               >
                 <IconInvestigate size={15} /> {t("composer.devops.direct.short")}
+                {deepNa && <span className="toggle-soon">{t("composer.devops.na")}</span>}
               </button>
             )}
             <div className="cbar-right" style={{ marginLeft: "auto" }} ref={selRef}>

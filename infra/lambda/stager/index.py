@@ -6,11 +6,13 @@ BucketDeployment / ChatConfig provider），因为一键模板里不能有任何
 本文件通过 `Code.ZipFile` **内联**进模板（官方上限 4MB，本文件 ~20KB），
 所以它自己不需要任何桶。这条部署路径的对客说明见 docs/DEPLOYMENT_ONECLICK.md。
 
-一个函数、两个自定义资源（用 `Phase` 属性区分），这样切是为了**避开循环依赖**：
+一个函数、多个自定义资源（用 `Phase` 属性区分），前两个这样切是为了**避开循环依赖**：
   · Phase=Artifacts —— 把 Release 产物搬进 staging 桶。BFF 的 Lambda 代码与 AgentCore
     Runtime 的 zip 都从这个桶取，所以它们 `DependsOn` 这一个。它自己只依赖 staging 桶。
   · Phase=Site —— 写前端 + config.json + 建管理员。config.json 里有 BFF 的 Function URL，
     所以它**依赖 BFF**；而 BFF 依赖 Artifacts。两件事塞进同一个自定义资源就会成环。
+  · Phase=OrgSetup —— 只在客户选了多账号时才存在：打开 StackSets 的组织信任访问
+    （没有对应的 CFN 资源）+ 建两个成员账号 StackSet。理由见下方该段注释。
 
 铁律（改这个文件前先读）：
   1. **绝不打印凭证/密码**。管理员初始密码由 Cognito 生成并直接发邮件，本函数从不接触它。
@@ -376,6 +378,135 @@ def _teardown_site(props) -> dict:
     return report
 
 
+# ── Phase=OrgSetup：多账号（Organizations）落地 ───────────────────────────────
+# 只在客户在参数页选了 MultiAccount 时才存在（模板侧带 Condition）。做两件事：
+#   1. 打开 StackSets 的组织信任访问（Organizations 那个开关没有任何 CFN 资源可用）；
+#   2. 建/更新两个 service-managed StackSet —— 成员账号只读角色、成员账号 DevOps Agent。
+#
+# 为什么 StackSet 不用原生 `AWS::CloudFormation::StackSet` 资源，而在这里调 API：
+#   · 成员账号是客户之后在 Admin「账户」页逐个接入的（BFF 调 CreateStackInstances），
+#     那些实例对 CFN 而言是**栈外**的。原生资源在删栈时会尝试删掉整个 StackSet，
+#     而带实例的 StackSet 删不掉 → DELETE_FAILED，客户接入了 20 个账号之后就再也
+#     删不掉这个栈了。这是不可接受的失败模式。
+#   · 成员接入 StackSet 还开着 auto-deployment（新账号进组织自动下发），实例会自己长出来，
+#     更加不可能让 CFN 去对账。
+#   · setup.sh 那条路径也是用 API 建的（setup.sh §2/§2b），两条路径行为一致。
+# 代价：删栈时这两个 StackSet 会**留下**。这是刻意的 —— 删它们要先删掉全部实例，
+# 也就是抹掉客户各成员账号里的跨账号角色，那是一次跨账号的破坏性操作，不能由
+# 「删掉一个栈」隐式触发。文档里明说要手工清理。
+_STACKSETS_SERVICE_PRINCIPAL = "member.org.stacksets.cloudformation.amazonaws.com"
+
+
+def _enable_stacksets_trusted_access() -> str:
+    """打开 Organizations 对 StackSets 的信任访问（幂等）。
+
+    **失败不抛**：委派管理员（delegated administrator）账号没有 organizations:*
+    的写权限，但那种账号本来就是「管理账号已经打开过」才可能存在的。真的没打开时，
+    下一步 CreateStackSet 会带着 CFN 自己的报错失败，比在这里猜错要清楚。
+    """
+    org = boto3.client("organizations")
+    try:
+        for page in org.get_paginator("list_aws_service_access_for_organization").paginate():
+            for sp in page.get("EnabledServicePrincipals") or []:
+                if sp.get("ServicePrincipal") == _STACKSETS_SERVICE_PRINCIPAL:
+                    return "already enabled"
+    except ClientError as exc:  # noqa: PERF203
+        print(f"list_aws_service_access_for_organization failed: {_err_code(exc)}")
+    try:
+        org.enable_aws_service_access(ServicePrincipal=_STACKSETS_SERVICE_PRINCIPAL)
+        return "enabled"
+    except ClientError as exc:
+        code = _err_code(exc)
+        print(f"enable_aws_service_access failed: {code}")
+        return f"not enabled by us ({code}); assuming the management account already did it"
+
+
+def _err_code(exc: Exception) -> str:
+    if isinstance(exc, ClientError):
+        return exc.response.get("Error", {}).get("Code") or "ClientError"
+    return type(exc).__name__
+
+
+def _stackset_upsert(cfn, name: str, template: str, params: dict, description: str,
+                     auto_deployment: bool) -> str:
+    """建或更新一个 service-managed StackSet。已存在就更新（升级时把新版模板滚到
+    全部既有实例，成员账号的新增只读权限就是这么下去的）。
+
+    更新失败**不抛**：最常见的原因是「有 operation 正在跑」，而那不该让客户整个栈
+    更新回滚 —— 与 setup.sh 同一取舍（那边也是打一条 ⚠ 就继续）。
+    """
+    parameters = [{"ParameterKey": k, "ParameterValue": v} for k, v in sorted(params.items())]
+    try:
+        cfn.describe_stack_set(StackSetName=name)
+        exists = True
+    except ClientError as exc:
+        if _err_code(exc) not in ("StackSetNotFoundException", "ValidationError"):
+            raise
+        exists = False
+
+    if not exists:
+        auto = ({"Enabled": True, "RetainStacksOnAccountRemoval": False}
+                if auto_deployment else {"Enabled": False})
+        try:
+            cfn.create_stack_set(
+                StackSetName=name, Description=description, TemplateBody=template,
+                Parameters=parameters, Capabilities=["CAPABILITY_NAMED_IAM"],
+                PermissionModel="SERVICE_MANAGED", AutoDeployment=auto,
+            )
+        except ClientError as exc:
+            code = _err_code(exc)
+            # 这里失败**必须**让栈失败（选了多账号却没建成，静默降级=客户以为跨账号能用）。
+            # 但错误得说人话：绝大多数是"这个账号不是管理账号 / 委派管理员"，原始
+            # AccessDenied 完全看不出该去改什么。
+            if code in ("AccessDenied", "AccessDeniedException", "ValidationError"):
+                raise RuntimeError(
+                    f"cannot create StackSet {name} ({code}). DeployMode=MultiAccount requires this "
+                    "account to be the AWS Organizations management account or a CloudFormation "
+                    "StackSets delegated administrator. Redeploy with DeployMode=SingleAccount, or "
+                    "run this template from an account that qualifies."
+                ) from exc
+            raise
+        return "created"
+    try:
+        cfn.update_stack_set(
+            StackSetName=name, Description=description, TemplateBody=template,
+            Parameters=parameters, Capabilities=["CAPABILITY_NAMED_IAM"],
+            # 单个坏账号不该卡住整次升级；每个账号的实际状态在 Admin「账户」页看得到。
+            OperationPreferences={"RegionConcurrencyType": "PARALLEL",
+                                  "FailureTolerancePercentage": 100,
+                                  "MaxConcurrentPercentage": 100},
+        )
+        return "updated"
+    except ClientError as exc:
+        code = _err_code(exc)
+        print(f"update_stack_set {name} failed: {code}")
+        return f"update skipped ({code})"
+
+
+def _org_setup(props: dict) -> dict:
+    report = {"TrustedAccess": _enable_stacksets_trusted_access()}
+    cfn = boto3.client("cloudformation")
+    common = {"SystemAccountId": props["SystemAccountId"],
+              "OrganizationId": props["OrganizationId"]}
+
+    report["OnboardingStackSet"] = _stackset_upsert(
+        cfn, props["OnboardingStackSetName"], props["OnboardingTemplateBody"],
+        # 一键部署里系统账号没有 DevOps 事件总线、也没有 PHD topic，两个转发块整块跳过
+        # （member-account-onboarding.yaml 里它们都是可选的），只要那个跨账号只读角色。
+        {**common, "PrimaryRegion": props["PrimaryRegion"]},
+        "NotiOps member account onboarding (cross-account read-only role)",
+        auto_deployment=True,
+    )
+    report["DevOpsAgentStackSet"] = _stackset_upsert(
+        cfn, props["DevOpsStackSetName"], props["DevOpsTemplateBody"], common,
+        "NotiOps member DevOps Agent onboarding (agent space + trigger role)",
+        # 不自动下发：成员账号的 Agent Space 有独立成本与配置，按账号在 Admin
+        # 「账户」页第二步一键关联时才建实例。
+        auto_deployment=False,
+    )
+    return report
+
+
 # ── 入口 ────────────────────────────────────────────────────────────────────
 def handler(event, context):
     # 打日志时剔掉 ResponseURL（里面带签名），其余属性都不含敏感值。
@@ -389,10 +520,22 @@ def handler(event, context):
     pid = f"notiops-stager-{phase}"
     try:
         if rt == "Delete":
-            data = _teardown_site(props) if phase == "Site" else {
-                "StagingObjectsDeleted": str(_empty_bucket(props["StagingBucket"]))}
+            if phase == "Site":
+                data = _teardown_site(props)
+            elif phase == "OrgSetup":
+                # 什么都不做，两条都是刻意的：
+                #   · 信任访问是**组织级**开关，组织里与 NotiOps 无关的 StackSet 也靠它，
+                #     删我们的栈就把它关掉会打断别人的部署；
+                #   · StackSet 要先删掉全部实例才删得掉，而那等于抹掉客户各成员账号里的
+                #     跨账号角色 —— 跨账号的破坏性操作不能由「删一个栈」隐式触发。
+                data = {"LeftInPlace": "trusted access + member StackSets (delete them by hand "
+                                       "if you also want the member-account roles gone)"}
+            else:
+                data = {"StagingObjectsDeleted": str(_empty_bucket(props["StagingBucket"]))}
         elif phase == "Artifacts":
             data = _artifacts_upsert(props)
+        elif phase == "OrgSetup":
+            data = _org_setup(props)
         elif phase == "Site":
             n = _publish_frontend(props)
             _write_config(props)

@@ -73,9 +73,13 @@
 3. 填管理员邮箱(临时密码会发到这个邮箱)、勾选 IAM 能力确认框、创建 —— 实测约
    4.5 分钟完成,栈输出里就是 Web Chat 的访问地址。
 
+开栈时有两个可选参数值得知道:**深度调查**(AWS DevOps Agent,默认开,闲置不计费,
+区域不支持时自动跳过而不是让栈失败)与**部署模式**(默认单账号;选多账号并填组织 id,
+就能跨组织内其它账号做只读排查 —— 需要从组织管理账号或 StackSets 委派管理员账号部署)。
+
 ⚠️ 一键部署**只部署 Web Chat**(前端 + BFF + agent),**不含** IM 机器人、定时巡检、
 管理仪表盘与 CUR/Athena FinOps —— 要这些请用下面的方式 B。前提条件(区域与 Bedrock
-模型开通)、资源与成本构成、升级 / 回滚、一键删除,见
+模型开通)、参数逐条说明、资源与成本构成、升级 / 回滚、一键删除,见
 [docs/DEPLOYMENT_ONECLICK.md](docs/DEPLOYMENT_ONECLICK.md)。
 
 ### 方式 B:`setup.sh` —— 完整版
@@ -107,6 +111,93 @@ cd sample-notiops
 
 完整的部署到你自己 AWS 账号的步骤(含模式对比与如何切换)见
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+
+### 两种方式的功能对比
+
+| 能力 | 方式 A(一键部署) | 方式 B(`setup.sh`) |
+|---|:---:|:---:|
+| **前提与耗时** | | |
+| 本地要装的东西 | 无(只要浏览器) | git / Node / Python / CDK / 容器运行时 |
+| 需要长期 access key | 不需要 | 需要一份能部署的凭证 |
+| 部署耗时 | ~4.5 分钟 | 十几分钟(含本地构建) |
+| 一键删除整个环境 | ✅ 删栈时选 `KeepData` / `DeleteEverything` | 手工清理 |
+| **聊天与调查** | | |
+| 网页 Web Chat(只读问答) | ✅ | ✅ |
+| AWS 概念问答(官方文档检索 + 引用) | ✅ | ✅ |
+| 资源健康巡检(按需提问) | ✅ | ✅ |
+| 故障调查(即时,只读工具) | ✅ | ✅ |
+| DevOps Agent 深度调查 | ❌ | ✅ |
+| Web 搜索(Exa) | ❌ | ✅(需自备 API key) |
+| **成本 / FinOps** | | |
+| FinOps 仪表盘(Cost Explorer 口径) | ✅ 仅部署账号 | ✅ 可跨账号 |
+| CUR + Athena 账单明细下钻 | ❌ | ✅ |
+| **工单与 Skills** | | |
+| AWS Support 工单全生命周期 | ✅ | ✅ |
+| 11 个预置 Skill + 客户自建 | ✅ | ✅ |
+| 把 Skill 发布到 DevOps Agent | ❌ | ✅ |
+| **模型** | | |
+| 多模型切换 + 模型目录管理 | ✅ | ✅ |
+| 用 Bedrock API Key 作为凭证 | ❌(只走 IAM) | ✅ |
+| **主动化 / IM** | | |
+| IM 渠道(Slack / 飞书) | ❌ | ✅ |
+| 主动推送(10 类 EventBridge 信号源) | ❌ | ✅ |
+| 每日自动巡检(闲置资源 / 成本异常) | ❌ | ✅ |
+| 通知收件箱 | ⚠️ 界面在,但没有产生通知的后端 | ✅ |
+| 管理仪表盘(阈值 / 目标账户 / Skills 管理) | ❌ | ✅ |
+| **范围** | | |
+| 多账号(AWS Organizations 跨账号) | ❌ 只看部署它的这个账号 | ✅ `--multi-account` |
+| 升级 | 换新版模板 update 栈(~1 分钟) | 重跑 `./setup.sh` |
+
+> 📋 **AWS Support 相关功能(建案 / 查案 / 回复 / 解决)需要账号开通 Business、
+> Enterprise On-Ramp 或 Enterprise 支持计划** —— 这是 AWS Support API 本身的要求,
+> 与用哪种部署方式无关。Basic / Developer 计划下服务列表会是空的。
+
+**两条路径可以先后走**:先用方式 A 试用,之后想要 IM 推送和自动巡检,再跑方式 B
+(两边建的管理员用户名都是 `admin`,不会打架)。
+
+### 升级到新版本 / 删除整个环境
+
+两种方式的升级和卸载步骤**不一样**,请照着你实际用的那一种做。
+
+#### 方式 A(一键部署)
+
+**升级到新版本**(实测约 1 分钟):
+
+1. 从 [Releases](https://github.com/aws-samples/sample-notiops/releases) 下新版本的
+   `notiops-webchat.template.json`。
+2. CloudFormation 控制台 → 选中你的栈 → **Update** → **Replace existing template** →
+   上传刚下的模板。
+3. 参数页**什么都不用改**,一路选 **Use existing value** → 下一步到底 → **Submit**。
+
+升级**不会**动这些:不重发邀请邮件、管理员邮箱和密码不变、你在 Admin 里改过的配置不变、
+聊天历史不清空。想回退就用**旧版本的模板**再 update 一次。
+
+**删除整个环境** —— 栈有一个 `TeardownMode` 参数,两档:
+
+| | 保留什么 |
+|---|---|
+| `KeepData`(默认) | 保留配置表、聊天记录表、数据桶(里面有你的 Skill 和报告) |
+| `DeleteEverything` | 全删,不留东西 |
+
+⚠️ **两个必须注意的点:**
+
+1. **要删干净,顺序不能错** —— 先做一次 **Update**,把 `TeardownMode` 改成
+   `DeleteEverything`(约 45 秒),**然后**再 **Delete stack**(约 3 分钟)。
+   在删除对话框里改这个参数是**没有用的**:CloudFormation 用的是最后一次成功部署时的参数值。
+   如果直接删,就是按 `KeepData` 删的。
+2. **两种模式都会删掉 Cognito 用户池** —— `KeepData` 保的是**数据**,不是**账号**。
+   重新装完之后,用户需要重新邀请。
+
+删完之后可能还剩下(不产生费用,想清就手工删):`KeepData` 模式保下来的两张 DynamoDB 表和
+数据桶;一个名字像 `/aws/vendedlogs/RUMService_<栈名>-web-chat<随机串>` 的日志组
+(0 字节,30 天自动过期)。
+
+#### 方式 B(`setup.sh`)
+
+- **升级**:`git pull` 拉最新代码,**重跑 `./setup.sh`** —— 它是增量的,只更新有变化的部分。
+  你之前填进 Secrets Manager 的 IM 凭据不会被覆盖。
+- **删除**:目前**没有一键卸载**。用 `cd infra && npx cdk destroy <stack-name>` 逐个删栈。
+  注意 DynamoDB 表和报告桶是 `RETAIN` 策略,**不会**被自动删掉,需要手工清理。
 
 ---
 

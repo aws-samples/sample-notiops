@@ -123,11 +123,56 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         "then fail with an access-denied message naming the missing action.",
     });
 
+    // 深度调查（AWS DevOps Agent）—— 要在本账号建一个 Agent Space。
+    // 给开关而不是一律建：DevOps Agent 只在部分区域可用，且它是**另一个计费服务**
+    // （按 agent-second 计费；空 Agent Space 不产生费用，但客户仍有权选择不建）。
+    const enableDeepInvestigation = new cdk.CfnParameter(this, "EnableDeepInvestigation", {
+      type: "String",
+      default: "Yes",
+      allowedValues: ["Yes", "No"],
+      description:
+        "Create an AWS DevOps Agent Agent Space so the assistant can run deep root-cause " +
+        "investigations. Billed per agent-second only while an investigation runs; an idle " +
+        "Agent Space costs nothing. Silently skipped in Regions where AWS DevOps Agent is not " +
+        "available yet -- the stack still deploys and everything else works.",
+    });
+
+    // ── 单账号 / 多账号 ──
+    // 为什么这是**部署期**参数而不是合成期 context：模板是预先发布出去的一份静态文件，
+    // 合成时不知道客户有没有 Organizations。于是受它影响的一切都得落成 Condition。
+    const deployMode = new cdk.CfnParameter(this, "DeployMode", {
+      type: "String",
+      default: "SingleAccount",
+      allowedValues: ["SingleAccount", "MultiAccount"],
+      description:
+        "SingleAccount: NotiOps only looks at the account you deploy into. MultiAccount: also " +
+        "inspect and investigate other accounts in your AWS Organization -- you then onboard them " +
+        "one click at a time from the admin console. MultiAccount REQUIRES that you deploy into " +
+        "the organization management account (or a CloudFormation StackSets delegated " +
+        "administrator) and that you fill in the organization id below.",
+    });
+
+    const organizationId = new cdk.CfnParameter(this, "OrganizationId", {
+      type: "String",
+      default: "",
+      allowedPattern: "^(o-[a-z0-9]{10,32})?$",
+      constraintDescription: "Must be an AWS Organizations id (o-xxxx...) or empty.",
+      description:
+        "Required when the deployment mode above is MultiAccount, ignored otherwise. Find it with " +
+        "'aws organizations describe-organization'. It is used to scope the cross-account trust " +
+        "policies to your organization (aws:PrincipalOrgID), so leaving it out is not just " +
+        "inconvenient -- MultiAccount stays off without it.",
+    });
+
     // 控制台参数分组 —— 一键部署的门面就是那个参数页，顺序/分组直接决定客户观感。
     this.templateOptions.metadata = {
       "AWS::CloudFormation::Interface": {
         ParameterGroups: [
           { Label: { default: "Required" }, Parameters: [adminEmail.logicalId] },
+          {
+            Label: { default: "Scope" },
+            Parameters: [deployMode.logicalId, organizationId.logicalId, enableDeepInvestigation.logicalId],
+          },
           {
             Label: { default: "Security (safe defaults -- change only if you know why)" },
             Parameters: [agentReadOnlyAccess.logicalId, allowedOrigins.logicalId],
@@ -139,6 +184,9 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         ],
         ParameterLabels: {
           [adminEmail.logicalId]: { default: "Administrator email" },
+          [deployMode.logicalId]: { default: "Deployment mode" },
+          [organizationId.logicalId]: { default: "AWS Organizations id (MultiAccount only)" },
+          [enableDeepInvestigation.logicalId]: { default: "Enable deep investigation (AWS DevOps Agent)?" },
           [agentReadOnlyAccess.logicalId]: { default: "Give the agent account-wide read-only access?" },
           [allowedOrigins.logicalId]: { default: "CORS allowed origins" },
           [teardownMode.logicalId]: { default: "On stack delete" },
@@ -147,6 +195,48 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         },
       },
     };
+
+    // ══ Conditions ════════════════════════════════════════════════════════════
+    // AWS DevOps Agent 只在这些区域可用（docs.aws.amazon.com/devopsagent →
+    // "Supported Regions"）。为什么要把区域也编进条件、而不是只给客户一个 Yes/No：
+    // 在不支持的区域建 Agent Space 会 CREATE_FAILED，**整栈回滚** —— 一键部署的客户
+    // 大概率不知道这个限制，那就是"点一下、等 5 分钟、什么都没有"。硬编码这份清单会
+    // 随 AWS 开区变旧，但它旧的方向是安全的：新开的区域先按"不支持"处理（拿不到深度
+    // 调查，其余功能全在），下个 Release 补上即可。Fn::Or 最多 10 项，故拆两段。
+    const daRegionsA = ["us-east-1", "us-west-2", "ca-central-1", "sa-east-1", "ap-south-1", "ap-southeast-1"];
+    const daRegionsB = ["ap-southeast-2", "ap-northeast-1", "eu-central-1", "eu-west-1", "eu-west-2"];
+    const inRegions = (id: string, regions: string[]) =>
+      new cdk.CfnCondition(this, id, {
+        expression: cdk.Fn.conditionOr(...regions.map((r) => cdk.Fn.conditionEquals(cdk.Aws.REGION, r))),
+      });
+    // 拆出「客户要了」这个单独的条件，Outputs 才分得清"你自己关的"和"这个区没有"。
+    const deepInvestigationRequested = new cdk.CfnCondition(this, "DeepInvestigationRequested", {
+      expression: cdk.Fn.conditionEquals(enableDeepInvestigation.valueAsString, "Yes"),
+    });
+    const deepInvestigationEnabled = new cdk.CfnCondition(this, "DeepInvestigationEnabled", {
+      expression: cdk.Fn.conditionAnd(
+        deepInvestigationRequested,
+        // CfnCondition 本身就是一个 ICfnConditionExpression，resolve 成 `{Condition: id}`
+        // —— 于是这里是"引用另一个命名条件"，不是把表达式再抄一遍。
+        cdk.Fn.conditionOr(
+          inRegions("DevOpsAgentRegionsA", daRegionsA),
+          inRegions("DevOpsAgentRegionsB", daRegionsB),
+        ),
+      ),
+    });
+
+    // 多账号：**两个**都要满足。少了 OrganizationId 那半，跨账号信任策略就没有
+    // aws:PrincipalOrgID 可以收口，成员账号的角色会退化成"信任系统账号 root"而没有
+    // 组织边界 —— 不如干脆不开，并在 Outputs 里说清为什么没开。
+    const multiAccountRequested = new cdk.CfnCondition(this, "MultiAccountRequested", {
+      expression: cdk.Fn.conditionEquals(deployMode.valueAsString, "MultiAccount"),
+    });
+    const isMultiAccount = new cdk.CfnCondition(this, "IsMultiAccount", {
+      expression: cdk.Fn.conditionAnd(
+        multiAccountRequested,
+        cdk.Fn.conditionNot(cdk.Fn.conditionEquals(organizationId.valueAsString, "")),
+      ),
+    });
 
     // ══ Mappings：本模板绑定的 Release ═════════════════════════════════════════
     // 为什么用 Mappings 而不是 Parameter：客户**不该**能随便换版本 —— 模板结构与产物
@@ -280,6 +370,68 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       },
     });
     stagerArtifacts.addDependency(stagerFn);
+
+    // ══ 深度调查：AWS DevOps Agent Agent Space（可选，同栈资源）════════════════
+    // `setup.sh` 那条路径在 notiops-backend-stack.ts 里建同样的三件套；这里必须自己建，
+    // 否则 BFF/agent 的 DEVOPS_AGENT_SPACE_ID 为空 → 「深度调查」一按就 no_local_agent_space。
+    // 三个资源都带 Condition，客户关掉（或区域不支持）时整块不存在。
+    //
+    // 与 `setup.sh` 路径的两处刻意差异：
+    //   · 名字带 `-oneclick`：README 明说两条部署路径可以先后跑在同一个账号里，
+    //     撞上 `notiops-devops-<account>` 就会 CREATE_FAILED。
+    //   · PrimaryRole **不指定 roleName**（交给 CFN 生成）：同理，固定名会和
+    //     `notiops-agent-primary-<account>` 撞。角色名没有任何东西按字面引用它。
+    const devopsAgent = require("aws-cdk-lib/aws-devopsagent");
+    const agentSpace = new devopsAgent.CfnAgentSpace(this, "DevOpsAgentSpace", {
+      name: `notiops-oneclick-${cdk.Aws.ACCOUNT_ID}`,
+      description: "NotiOps deep investigation (one-click deployment)",
+    });
+    agentSpace.cfnOptions.condition = deepInvestigationEnabled;
+
+    const daPrimaryRole = new iam.Role(this, "DevOpsAgentPrimaryRole", {
+      assumedBy: new iam.ServicePrincipal("aidevops.amazonaws.com", {
+        // confused-deputy 防护：只有本账号、且只有本账号的 agentspace 能把这个角色用起来。
+        conditions: {
+          StringEquals: { "aws:SourceAccount": cdk.Aws.ACCOUNT_ID },
+          ArnLike: { "aws:SourceArn": `arn:${this.partition}:aidevops:${this.region}:${this.account}:agentspace/*` },
+        },
+      }),
+      description: "Assumed by AWS DevOps Agent to investigate this account (read-only)",
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName("AIDevOpsAgentAccessPolicy")],
+    });
+    // Resource Explorer 的服务关联角色 —— DevOps Agent 靠它做资源发现，缺了调查会瘸。
+    daPrimaryRole.addToPolicy(new iam.PolicyStatement({
+      sid: "CreateResourceExplorerSlr",
+      actions: ["iam:CreateServiceLinkedRole"],
+      resources: [`arn:${this.partition}:iam::${this.account}:role/aws-service-role/resource-explorer-2.amazonaws.com/AWSServiceRoleForResourceExplorer`],
+      conditions: { StringEquals: { "iam:AWSServiceName": "resource-explorer-2.amazonaws.com" } },
+    }));
+    // 刻意**不给** Athena/Glue/CUR 那组（`setup.sh` 路径有）：一键部署不含 CUR-Athena
+    // FinOps，给了就是一组用不上的宽权限。
+    //
+    // 角色的内联策略是**另一个资源**，条件必须一起打 —— 只给 Role 打条件的话，
+    // 客户关掉深度调查时会剩下一条引用不存在角色的 AWS::IAM::Policy，直接部署失败。
+    const applyCondition = (role: iam.Role, condition: cdk.CfnCondition) => {
+      (role.node.defaultChild as iam.CfnRole).cfnOptions.condition = condition;
+      const inlinePolicy = role.node.tryFindChild("DefaultPolicy")?.node.defaultChild;
+      if (inlinePolicy) (inlinePolicy as cdk.CfnResource).cfnOptions.condition = condition;
+    };
+    applyCondition(daPrimaryRole, deepInvestigationEnabled);
+
+    const daAssociation = new devopsAgent.CfnAssociation(this, "DevOpsAgentAssociation", {
+      agentSpaceId: agentSpace.attrAgentSpaceId,
+      serviceId: "aws",
+      configuration: { aws: { accountId: this.account, accountType: "monitor", assumableRoleArn: daPrimaryRole.roleArn } },
+    });
+    daAssociation.cfnOptions.condition = deepInvestigationEnabled;
+    daAssociation.node.addDependency(agentSpace);
+    daAssociation.node.addDependency(daPrimaryRole);
+
+    // 关掉/区域不支持时是空串（**不是** AWS::NoValue）：这两处消费方都是普通字符串
+    // 环境变量，空串就是"没配"，见 core/devops_agent.py 与 bff 的 SELF_AGENT_SPACE。
+    const agentSpaceIdOrEmpty = cdk.Fn.conditionIf(
+      deepInvestigationEnabled.logicalId, agentSpace.attrAgentSpaceId, "",
+    ).toString();
 
     // ══ AgentCore Runtime（同栈资源）══════════════════════════════════════════
     // 这是一键部署与 `setup.sh` 路径最大的结构差异：那条路上 agent 是用
@@ -416,6 +568,20 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       actions: ["dynamodb:GetItem", "dynamodb:Query"],
       resources: [base.configTable.tableArn, `${base.configTable.tableArn}/index/*`],
     }));
+    // 多账号：agent 唯一需要跨账号的动作 —— 到成员账号的 trigger 角色去发起深度调查
+    // （core/devops_agent.py `_assume_client`，角色 ARN 来自 Admin 接入时写的 da# 配置行）。
+    // 单账号模式下这个资源整块不存在，所以是真的一条权限都不给：
+    // 用**独立的 AWS::IAM::Policy**（不是 role.addToPolicy）才做得到——DefaultPolicy 那份
+    // 文档由 CDK 生成，往里塞 Fn::If 就得跟生成逻辑赛跑。
+    const runtimeCrossAccount = new iam.Policy(this, "AgentRuntimeCrossAccount", {
+      roles: [runtimeRole],
+      statements: [new iam.PolicyStatement({
+        sid: "AssumeMemberDevOpsAgentTriggerRole",
+        actions: ["sts:AssumeRole"],
+        resources: [`arn:${this.partition}:iam::*:role/notiops-agent-trigger-*`],
+      })],
+    });
+    (runtimeCrossAccount.node.defaultChild as cdk.CfnResource).cfnOptions.condition = isMultiAccount;
 
     const runtime = new cdk.CfnResource(this, "AgentRuntime", {
       type: "AWS::BedrockAgentCore::Runtime",
@@ -433,10 +599,26 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         },
         NetworkConfiguration: { NetworkMode: "PUBLIC" },
         RoleArn: runtimeRole.roleArn,
+        // 必须显式写：AgentCore 的默认 idle 是 **900 秒**，而 NotiOps 要的是 1 小时。
+        // 900 秒下，用户离开十几分钟回来提问就吃一次冷启动（~30s，BFF 那边只能靠
+        // "再发一次"的提示兜），体验明显退化。老路径（setup.sh）靠部署后
+        // `scripts/backfill_runtime_env.sh SET_IDLE=3600` 纠偏；这条路径是原生 CFN
+        // 属性（非 createOnly，可原地更新），直接在模板里定死，不需要部署后补。
+        // 两个值与 `agent-build/NotiOpsWebChat/agentcore/agentcore.json` 保持一致。
+        LifecycleConfiguration: {
+          IdleRuntimeSessionTimeout: 3600,
+          MaxLifetime: 28800,
+        },
         EnvironmentVariables: {
           // 只给 M1 真的有的那几个。空串在部分 AgentCore 校验下会被拒，
           // 缺省项一律**不写**（agent 侧都是 os.environ.get(..., "")）。
           SKILLS_BUCKET: base.dataBucket.bucketName,
+          // 同上：关掉深度调查时整个键消失，绝不写空串。
+          // 不写这个键时 agent 会走 ListAgentSpaces 自动发现（core/devops_agent.py），
+          // 显式给了就少一次 API、也不会挑错（同账号里可能还有别的 Agent Space）。
+          DEVOPS_AGENT_SPACE_ID: cdk.Fn.conditionIf(
+            deepInvestigationEnabled.logicalId, agentSpace.attrAgentSpaceId, cdk.Aws.NO_VALUE,
+          ),
         },
       },
     });
@@ -452,7 +634,13 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       // 同栈资源，直接 GetAtt —— 不走 `-c agentRuntimeArn=`（那条路是给两步部署用的）。
       agentRuntimeArn: runtime.getAtt("AgentRuntimeArn").toString(),
       corsAllowedOrigins: allowedOrigins.valueAsList,
-      // M1 不带：IM 巡检控制台、报告 CDN、DevOps Agent Space（都属于完整部署）。
+      // 关掉深度调查时是空串 → BFF 侧 SELF_AGENT_SPACE 为空 → 「深度调查」相关路由
+      // 返回 no_local_agent_space（前端已按能力位置灰，见 Composer）。
+      agentSpaceId: agentSpaceIdOrEmpty,
+      // 「单账号还是多账号」是部署期才知道的，所以传条件而不是布尔 —— 受影响的 6 个
+      // BFF 环境变量在 web-chat-core.ts 里落成 Fn::If。
+      multiAccount: { organizationId: organizationId.valueAsString, conditionLogicalId: isMultiAccount.logicalId },
+      // M1 不带：IM 巡检控制台、报告 CDN（都属于完整部署）。
     });
     // BFF 的代码 zip 也在 staging 桶里（`S3Bucket` 由 postprocess 改写成 !Ref StagingBucket），
     // 所以它也必须等搬完。放在 CDK 里声明而不是让 postprocess 补 DependsOn：
@@ -532,6 +720,70 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     base.groups.forEach((g) => stagerSite.addDependency(g));
     if (stagerPolicy) stagerSite.addDependency(stagerPolicy as cdk.CfnResource);
 
+    // ══ 多账号落地（Phase=OrgSetup，仅 MultiAccount）═══════════════════════════
+    // 两个成员账号 StackSet 的模板在**合成期**读进来、当字符串内联 —— 不是 CDK 资产
+    // （客户账号没有资产桶，见文件头第 1 条）。`setup.sh` 那条路径用的是同两份文件，
+    // 于是两条部署路径下发给成员账号的东西逐字相同。
+    const onboardingStackSetName = "notiops-member-onboarding";
+    const devopsStackSetName = "notiops-member-devops-agent";
+    const memberTemplate = (f: string) => fs.readFileSync(path.join(INFRA_DIR, f), "utf-8");
+
+    // 权限用**独立的 AWS::IAM::Policy**挂到 StagerRole 上，好处就是能整块带 Condition：
+    // 客户选单账号时，这个搬运工角色一条 organizations/StackSet 权限都没有。
+    const stagerOrgPolicy = new iam.Policy(this, "StagerOrgSetupPolicy", {
+      roles: [stagerRole],
+      statements: [
+        new iam.PolicyStatement({
+          sid: "EnableStackSetsTrustedAccess",
+          // Organizations 这三个 API 都不支持资源级限定（只能 *）。EnableAWSServiceAccess
+          // 是本模板里**唯一**一个组织级写动作，只开 StackSets 那一个 service principal
+          // （handler 里写死，不从属性取）。
+          actions: [
+            "organizations:DescribeOrganization",
+            "organizations:EnableAWSServiceAccess",
+            "organizations:ListAWSServiceAccessForOrganization",
+          ],
+          resources: ["*"],
+        }),
+        new iam.PolicyStatement({
+          sid: "ManageMemberStackSets",
+          actions: [
+            "cloudformation:CreateStackSet",
+            "cloudformation:DescribeStackSet",
+            "cloudformation:UpdateStackSet",
+          ],
+          // 精确到我们自己那两个 StackSet（名字写死）—— 不给「管理本账号任意 StackSet」。
+          resources: [
+            `arn:${this.partition}:cloudformation:${this.region}:${this.account}:stackset/${onboardingStackSetName}:*`,
+            `arn:${this.partition}:cloudformation:${this.region}:${this.account}:stackset/${devopsStackSetName}:*`,
+            `arn:${this.partition}:cloudformation:*::type/resource/*`,
+          ],
+        }),
+      ],
+    });
+    (stagerOrgPolicy.node.defaultChild as cdk.CfnResource).cfnOptions.condition = isMultiAccount;
+
+    const stagerOrgSetup = new cdk.CfnResource(this, "StagerOrgSetup", {
+      type: "Custom::NotiOpsStagerOrgSetup",
+      properties: {
+        ServiceToken: stagerFn.attrArn,
+        Phase: "OrgSetup",
+        SystemAccountId: this.account,
+        OrganizationId: organizationId.valueAsString,
+        // 成员账号只在主区（=本栈所在区）建 IAM 角色；其余区只建转发规则，而一键部署
+        // 不开转发，所以实际上就是「只有主区有东西」。见 member-account-onboarding.yaml。
+        PrimaryRegion: this.region,
+        OnboardingStackSetName: onboardingStackSetName,
+        OnboardingTemplateBody: memberTemplate("member-account-onboarding.yaml"),
+        DevOpsStackSetName: devopsStackSetName,
+        DevOpsTemplateBody: memberTemplate("member-devops-agent.yaml"),
+      },
+    });
+    stagerOrgSetup.cfnOptions.condition = isMultiAccount;
+    stagerOrgSetup.addDependency(stagerFn);
+    stagerOrgSetup.addDependency(stagerOrgPolicy.node.defaultChild as cdk.CfnResource);
+    if (stagerPolicy) stagerOrgSetup.addDependency(stagerPolicy as cdk.CfnResource);
+
     // ══ Outputs ══════════════════════════════════════════════════════════════
     // `ChatUrl` / `ChatBffUrl` / `WebChatTableName` 已由 createWebChatCore 输出。
     new cdk.CfnOutput(this, "NextSteps", {
@@ -552,6 +804,47 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         base.dataBucket.bucketName,
         "; the Cognito user pool is always deleted. To switch modes, update the stack first, then delete it.",
       ]),
+    });
+
+    // 两个「你选的到底生效了吗」输出。没有它们，两种最容易踩的情况都是**静默**的：
+    // 区域不支持 DevOps Agent、以及选了 MultiAccount 但没填 org id。
+    // Agent Space id 单独一个**带条件**的 Output，而不是拼进下面那句话：Output 的 Value 里
+    // 引用条件资源、只靠 `Fn::If` 挡着，CFN 的模板校验会告警（它看不出分支同条件）。
+    const agentSpaceIdOutput = new cdk.CfnOutput(this, "DevOpsAgentSpaceId", {
+      description: "AWS DevOps Agent space created for deep investigation",
+      value: agentSpace.attrAgentSpaceId,
+    });
+    agentSpaceIdOutput.condition = deepInvestigationEnabled;
+    new cdk.CfnOutput(this, "DeepInvestigationStatus", {
+      description: "Deep investigation (AWS DevOps Agent)",
+      value: cdk.Fn.conditionIf(
+        deepInvestigationEnabled.logicalId,
+        "Enabled. See the DevOpsAgentSpaceId output.",
+        cdk.Fn.conditionIf(
+          deepInvestigationRequested.logicalId,
+          "Skipped: AWS DevOps Agent is not available in this Region, so no agent space was created. "
+            + "Everything else in this deployment works; redeploy in a supported Region to get it.",
+          "Off (EnableDeepInvestigation=No). Update the stack to turn it on later.",
+        ).toString(),
+      ).toString(),
+    });
+    new cdk.CfnOutput(this, "DeployModeStatus", {
+      description: "Single-account or multi-account (AWS Organizations)",
+      value: cdk.Fn.conditionIf(
+        isMultiAccount.logicalId,
+        cdk.Fn.join("", [
+          "MultiAccount. Member StackSets notiops-member-onboarding and ",
+          "notiops-member-devops-agent were created in this account; onboard member accounts from ",
+          "the Admin panel. Deleting this stack does NOT delete those StackSets or the roles they ",
+          "created in member accounts - delete them by hand if you want them gone.",
+        ]),
+        cdk.Fn.conditionIf(
+          multiAccountRequested.logicalId,
+          "SingleAccount: you chose MultiAccount but left the AWS Organizations id empty, so it stays off. "
+            + "Update the stack with a valid o-xxxx id to enable it.",
+          "SingleAccount. This deployment only inspects the account it runs in.",
+        ).toString(),
+      ).toString(),
     });
   }
 }

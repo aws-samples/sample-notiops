@@ -460,7 +460,10 @@ export class NotiOpsBackendStack extends cdk.Stack {
       description: "RDS/ElastiCache AI 智能巡检 — Bedrock 分析与报告生成（路径 C）",
     } as lambda.FunctionProps);
 
-    lambda3.addEnvironment("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5");
+    // 与 config/llm-model-catalog.json 的 default_model 一致（Grok 4.6）。
+    // lambda3 走 `client.converse()`（见 lambda3_health_checker/bedrock_invoker.py），
+    // Grok 的目录 kind 是 bedrock_converse，协议对得上。
+    lambda3.addEnvironment("BEDROCK_MODEL_ID", "global.xai.grok-4.6");
     apiLambda.addEnvironment("HEALTH_CHECKER_FUNCTION_NAME", lambda3.functionName);
     apiLambda.addEnvironment("COLLECTOR_FUNCTION_NAME", "notiops-collector");
 
@@ -901,6 +904,15 @@ export class NotiOpsBackendStack extends cdk.Stack {
     });
     llmProviderParam.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
+    // ⚠️ 这一条**故意不跟随** config/llm-model-catalog.json 的 default_model（现为 Grok 4.6）。
+    // 它不是"对话默认模型"，而是 IM 侧一批**内部工具调用**的模型：意图分类 / 下一步建议 /
+    // 进度卡叙述 / 案例分类 / 技能派发 / 技能编写（shared/model_config.py::get_bot_model_id
+    // 的 8 个调用点）。那 8 处都是手搓 Anthropic 原生 `invoke_model` body
+    // （"anthropic_version": "bedrock-2023-05-31"），换成非 Claude 模型会直接
+    // ValidationException —— 也就是"机器人一说话就报错"。
+    // 要真正统一，得先把那 8 处迁到 shared/llm_provider.py::invoke_llm（Converse），
+    // 且注意它们现在各自设了 temperature，迁移时不能丢（分类器靠低温保证确定性）。
+    // 见 core/llm_pref_resolver.py 顶部对同一约束的说明（spec R8）。
     const agentModelIdParam = new ssm.StringParameter(this, "AgentModelIdParam", {
       parameterName: "/notiops/agent/model_id",
       stringValue: "global.anthropic.claude-sonnet-5",
@@ -1671,7 +1683,7 @@ def handler(event, context):
           // MODEL_ID 现在只是**兜底**：真值走 DDB appconfig#phd（Admin「后端任务模型」写入，
           // 由 BFF 从模型目录解析 alias 后投影过去）。保留 env 是为了 DDB 不可用 / 未 seed
           // 时仍能推送，见 shared/phd_config.py 的三级降级。
-          MODEL_ID: "global.anthropic.claude-sonnet-5",
+          MODEL_ID: "global.xai.grok-4.6",
           CONFIG_TABLE: configTable.tableName,
         },
         description: "PHD 事件转发 — SNS 触发,LLM 翻译摘要(Bedrock/LiteLLM 可切换),推送飞书",

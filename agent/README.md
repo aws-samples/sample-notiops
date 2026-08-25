@@ -48,8 +48,8 @@ agentcore deploy                        # CDK 部署 Runtime + Memory + IAM
 agentcore status                        # 拿到 Agent Runtime ARN
 ```
 
-### ⚠️ GPT-5.4（经 Bedrock Mantle）需要给 runtime 执行角色补权限
-GPT-5.4 走 **Bedrock Mantle**（OpenAI Responses API，仅 us-east-2/us-west-2）。`agentcore deploy`
+### ⚠️ GPT-5.6 系列（经 Bedrock Mantle）需要给 runtime 执行角色补权限
+GPT-5.6 Terra/Sol/Luna 走 **Bedrock Mantle**（OpenAI Responses API，当前部署固定 us-east-2）。`agentcore deploy`
 生成的 runtime 执行角色默认**没有** mantle 权限，缺了会在回答的 SSE 流里报 401。两种处理：
 - **推荐（已内置，客户零操作）**：在 graft 时同时把 `agentcore/cdk/lib/cdk-stack.ts` 里的
   「NotiOps Bedrock Mantle 授权」代码块带上（给所有 runtime 执行角色加
@@ -58,7 +58,7 @@ GPT-5.4 走 **Bedrock Mantle**（OpenAI Responses API，仅 us-east-2/us-west-2�
 - **补救（角色已存在 / 没带 CDK 改动时）**：跑一次幂等脚本
   `scripts/grant_mantle_permissions.sh`（自动找到执行角色并 put-role-policy）。
 
-> 还需：① Bedrock 控制台(us-east-2)开通 GPT-5.4 model access；② Strands 1.44 的 Mantle base_url
+> 还需：① Bedrock 控制台(us-east-2)开通对应 GPT-5.6 model access；② Strands 1.44 的 Mantle base_url
 > 模板缺 `/openai`，已在 `model/load.py` 的 `_make_mantle_responses_model` 子类化修正（graft 时带上）。
 > 详见 memory `web-chat-phase1-deploy`。
 

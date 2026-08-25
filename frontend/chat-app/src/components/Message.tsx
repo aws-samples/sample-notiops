@@ -10,7 +10,7 @@ import { getSupportServices, type SupportService } from "../api/chat";
 import { modelDisplayName } from "../models";
 
 // 署名行文案："AWS Bedrock (DeepSeek V3.2) · 1,234 tokens · 3 步"
-// 所有模型均经 Amazon Bedrock 提供（GPT-5.4 经 Bedrock Mantle），故 provider 统一。
+// 所有模型均经 Amazon Bedrock 提供（GPT-5.6 经 Bedrock Mantle），故 provider 统一。
 // tokens 是本轮真实账单（agentic loop 每个 cycle 都重发上下文、都计费）；当 cycle>1 时
 // 附「N 步」，把大数字解释成"做了多步工具调用/推理"，避免用户误以为一句话就吃了那么多。
 // 署名行拆成「正文 + 可选 steps」两段：steps 单独带 tooltip 解释什么是「步」。
@@ -48,6 +48,11 @@ const SourcesIcon = () => (
 const CheckCircle = () => (
   <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
     <circle cx="12" cy="12" r="9" /><path d="M8.5 12.5l2.5 2.5 4.5-5" />
+  </svg>
+);
+const InfoCircle = () => (
+  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="12" r="9" /><path d="M12 11v5" /><path d="M12 7.5h.01" />
   </svg>
 );
 
@@ -223,6 +228,9 @@ function CaseFormCard({ action, onSubmit, onCancel, locale }: {
   const [extra, setExtra] = useState("");
   const [services, setServices] = useState<SupportService[]>([]);
   const [svcLoading, setSvcLoading] = useState(true);
+  // 目录拉不到的**原因**。"support_plan_required" = 这个账号开不了 case，直接换成提醒面板
+  // （别让客户填完一整张表才在执行时吃报错）；其他原因只是这次没读到，表照常给。
+  const [svcUnavailable, setSvcUnavailable] = useState("");
   const [preview, setPreview] = useState(false);
   // 服务下拉可搜索：AWS 有几百个服务，原生 select 难找。改用 input+datalist 输入即筛。
   // svcQuery = 输入框可见文本(服务名)；真正的值仍是 serviceCode，onChange 时按名字反查 code。
@@ -233,8 +241,12 @@ function CaseFormCard({ action, onSubmit, onCancel, locale }: {
   useEffect(() => {
     let stop = false;
     setSvcLoading(true);
-    getSupportServices(language).then((s) => { if (!stop) { setServices(s); setSvcLoading(false); } })
-      .catch(() => { if (!stop) setSvcLoading(false); });
+    getSupportServices(language).then((res) => {
+      if (stop) return;
+      setServices(res.services);
+      setSvcUnavailable(res.unavailable || "");
+      setSvcLoading(false);
+    }).catch(() => { if (!stop) setSvcLoading(false); });
     return () => { stop = true; };
   }, [language]);
 
@@ -321,6 +333,37 @@ function CaseFormCard({ action, onSubmit, onCancel, locale }: {
     );
   }
 
+  // 这个账号的支持计划不含 Support API（Basic/Developer）→ **换成提醒**，而不是给一张
+  // 填完必然失败的表。Agent 侧通常已在弹卡前就拦下（core.support_cases.case_capability），
+  // 这里是兜底：跨账号切换、缓存过期、老版本 agent 都可能走到这。
+  if (svcUnavailable === "support_plan_required") {
+    return (
+      <div className="casecard">
+        <div className="casecard-h">
+          <span className="casecard-badge">{en ? "Create support case" : "创建支持案例"}</span>
+          <span className="casecard-hint">{en ? "Not available in this account" : "该账号暂不可用"}</span>
+        </div>
+        <div className="casecard-preview">
+          <div className="cf-prev-row"><InfoCircle />{" "}
+            {en
+              ? "This account's support plan doesn't include AWS Support API access, so a case can't be opened from here — it needs Business, Enterprise On-Ramp, or Enterprise."
+              : "这个账号的支持计划不包含 AWS Support API 访问，因此无法从这里建案 —— 需要 Business、Enterprise On-Ramp 或 Enterprise 之一。"}
+          </div>
+          <div className="cf-prev-row">
+            {en
+              ? "You can still file it by hand in Support Center in the AWS console (on Basic, only account and billing questions), or upgrade the support plan and come back."
+              : "你仍然可以在 AWS 控制台的 Support Center 手工提交（Basic 计划只能提账单与账户类问题），或升级支持计划后再回来建案。"}
+          </div>
+          <div className="casecard-foot">
+            <a className="actbtn confirm" href="https://console.aws.amazon.com/support/home#/case/create"
+              target="_blank" rel="noopener noreferrer">{en ? "Open Support Center" : "打开 Support Center"}</a>
+            <button className="actbtn cancel" onClick={onCancel}>{en ? "Close" : "关闭"}</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="casecard">
       <div className="casecard-h">
@@ -330,6 +373,15 @@ function CaseFormCard({ action, onSubmit, onCancel, locale }: {
 
       {!preview ? (
         <div className="casecard-form">
+          {/* 目录为空(非计划原因)时"服务"永远选不中 → 提交按钮永远灰着。把原因说出来，
+              别让客户对着一个不能点的按钮猜。 */}
+          {!svcLoading && !services.length && (
+            <div className="cf-prev-row cf-warn">
+              {en
+                ? "Couldn't load the AWS service catalog, so Service can't be picked and the case can't be submitted from here. Try again in a moment, or file it in Support Center in the AWS console."
+                : "没能加载 AWS 服务目录，因此「服务」选不了、也无法从这里提交案例。请稍后重试，或在 AWS 控制台的 Support Center 手工提交。"}
+            </div>
+          )}
           <label className="cf-field">
             <span>{en ? "Subject" : "主题"} *</span>
             <input value={subject} onChange={(e) => setSubject(e.target.value)}

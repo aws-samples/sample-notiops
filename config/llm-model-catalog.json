@@ -46,7 +46,7 @@
   "generation": 0,
   "provider": "bedrock",
   "credential_mode": "iam",
-  "default_model": "claude-sonnet-5",
+  "default_model": "xai-grok-4-6",
 
   "models": [
     {

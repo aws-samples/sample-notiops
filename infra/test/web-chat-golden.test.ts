@@ -146,6 +146,14 @@ describe("WebChatStack golden template", () => {
   });
 
   it("模板里不出现真实账号 ID（fixture 会随 infra/ 一起公开发布）", () => {
-    expect(JSON.stringify(template)).not.toMatch(/\b533734273591\b/);
+    // 判据是「除 fixture 账号外不得有任何 12 位号码」，**不点名**某个真账号 ——
+    // 点名等于把真账号写进一个会公开发布的文件里（本测试自己曾经如此），
+    // 而且 publish gate 的 `\b[0-9]{12}\b` 恰恰扫不到那种写法：正则转义 `\b` 的
+    // 字母 b 紧贴数字，词边界不成立，gate 结构性失明（已同步收紧 gate 判据）。
+    // 取「极大数字串长度恰为 12」而非 \b，顺带排掉 13 位时间戳里的 12 位子串。
+    const twelveDigit = [...JSON.stringify(template).matchAll(/[0-9]{12,}/g)]
+      .map((m) => m[0])
+      .filter((s) => s.length === 12);
+    expect([...new Set(twelveDigit)].filter((s) => s !== FIXTURE_ACCOUNT)).toEqual([]);
   });
 });

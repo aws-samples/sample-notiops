@@ -348,8 +348,11 @@ a.followup-btn { text-decoration: none; }
 .cf-field input.cf-input-warn { border-color: #e5844d; }
 .casecard-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 14px 13px; border-top: 1px solid var(--line); }
 .actbtn.confirm:disabled { opacity: .45; cursor: not-allowed; }
+/* 建案不可用时"打开 Support Center"是个链接，但要长得和按钮一样 */
+a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 .casecard-preview { padding: 13px 14px; display: flex; flex-direction: column; gap: 7px; }
 .cf-prev-row { font-size: 13px; color: var(--text); }
+.cf-prev-row > svg { vertical-align: -3px; margin-right: 3px; }
 .cf-prev-row b { color: var(--muted); font-weight: 600; margin-right: 4px; }
 .cf-prev-body { margin-top: 4px; font-size: 12.5px; }
 .cf-prev-body b { color: var(--muted); font-weight: 600; }

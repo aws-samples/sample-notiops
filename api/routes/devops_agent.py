@@ -859,12 +859,14 @@ def _update_summarizer_config(body: dict | None) -> dict:
         raise ValueError("Request body is required")
 
     allowed_keys = {"bedrock_model_id", "agent_prompt"}
-    updated: list[str] = []
 
-    _table = config_table()
-    now = _now_iso()
-
-    for key in allowed_keys:
+    # **先全量校验，再碰 DynamoDB**。原来是边遍历边 put_item，于是
+    #   - 一个字段合法、后一个字段类型不对的请求会留下半截写入；
+    #   - 一个字段都没带的请求（只有未知字段）在 `config_table()` 上先炸掉，
+    #     调用方看到的是 CONFIG_TABLE 解析失败而不是本该返回的「至少需要…」。
+    # 校验通过后才取表、才写，请求要么全写要么不写。
+    pending: list[tuple[str, str]] = []
+    for key in sorted(allowed_keys):
         if key not in body:
             continue
         value = body[key]
@@ -872,6 +874,15 @@ def _update_summarizer_config(body: dict | None) -> dict:
             value = ""
         if not isinstance(value, str):
             raise ValueError(f"{key} 必须是字符串")
+        pending.append((key, value))
+
+    if not pending:
+        raise ValueError(f"至少需要提供一个字段：{sorted(allowed_keys)}")
+
+    _table = config_table()
+    now = _now_iso()
+    updated: list[str] = []
+    for key, value in pending:
         _table.put_item(Item={
             "PK": _DA_CONFIG_PK,
             "SK": key,
@@ -879,8 +890,5 @@ def _update_summarizer_config(body: dict | None) -> dict:
             "updated_at": now,
         })
         updated.append(key)
-
-    if not updated:
-        raise ValueError(f"至少需要提供一个字段：{sorted(allowed_keys)}")
 
     return {"updated": updated}

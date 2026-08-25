@@ -12,6 +12,26 @@ try:
 except ImportError:  # pragma: no cover
     class MaxTokensReachedException(Exception):  # type: ignore[no-redef]
         """占位：当前 strands 版本无此异常类型时用（永不会被抛出/匹配）。"""
+# 模型调用本身失败时的异常族（Bedrock 侧 5xx/限流/超时）。放在**元组**里供 except 用。
+# 为什么要显式列举、而不是 `except Exception`：工具里的异常由 Strands 自己接住并变成
+# toolResult，不会走到这里；能冒到这里的要么是模型调用失败，要么是**我们自己的 bug**。
+# 后者必须继续往上抛（进日志/告警），不能被伪装成「模型暂时不可用」。
+from botocore.exceptions import (  # noqa: E402
+    ClientError,
+    ConnectionClosedError,
+    EndpointConnectionError,
+    EventStreamError,
+    ReadTimeoutError,
+)
+try:
+    from strands.types.exceptions import ModelThrottledException
+except ImportError:  # pragma: no cover
+    class ModelThrottledException(Exception):  # type: ignore[no-redef]
+        """占位：老版本 strands 无此异常类型。"""
+_MODEL_CALL_ERRORS = (
+    ClientError, EventStreamError, ReadTimeoutError,
+    ConnectionClosedError, EndpointConnectionError, ModelThrottledException,
+)
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from model.load import load_model, resolve_model_id
 from memory.session import get_memory_session_manager
@@ -572,6 +592,47 @@ def support_list_severities() -> dict:
 _case_tools.append(support_list_severities)
 
 # —— 写操作：propose-only（人工确认后由 BFF 执行）——
+def _case_unavailable(cap: dict) -> dict:
+    """把"这个账号开不了 case"翻译成一句能直接说给客户听的话（含出路）。
+
+    用在**弹卡之前**：计划不足/缺权限时，客户不该先填完一整张表、点了确认才吃一个
+    SubscriptionRequiredException。返回里刻意不带 proposal —— 模型只需把 message 转述。
+    """
+    reason = cap.get("reason") or "unknown"
+    if reason == "support_plan_required":
+        msg = _dv(
+            "这个 AWS 账号的支持计划不包含 Support API 访问，所以我没法在这里替你开 case"
+            "（需要 Business、Enterprise On-Ramp 或 Enterprise 之一）。两条出路："
+            "① 现在就去 AWS 控制台的 Support Center 手工提交（Basic 计划只能提账单与账户类问题）；"
+            "② 升级支持计划之后回来，我就能直接帮你建案。",
+            "This AWS account's support plan doesn't include AWS Support API access, so I can't open "
+            "a case for you here (it needs Business, Enterprise On-Ramp, or Enterprise). Two ways "
+            "forward: (1) file it by hand in Support Center in the AWS console (on Basic you can only "
+            "raise account and billing questions); (2) upgrade the support plan and I can open cases "
+            "for you directly.")
+    elif reason == "access_denied":
+        # 跨账号时"我这边的角色"= 成员账号里的 NotiOps 跨账号角色（它默认只给只读，
+        # 不含 CreateCase），所以措辞不写死成 agent 角色。
+        msg = _dv(
+            "这个账号的支持计划够用，但 NotiOps 用来访问它的角色没有 AWS Support API 权限，"
+            "所以开不了 case。让管理员给该角色补上 support:DescribeSeverityLevels、"
+            "support:DescribeServices、support:CreateCase 这几条 action 即可。",
+            "This account's support plan is fine, but the role NotiOps uses to reach it lacks AWS "
+            "Support API permissions, so a case can't be opened. Ask an administrator to add "
+            "support:DescribeSeverityLevels, support:DescribeServices, and support:CreateCase to "
+            "that role.")
+    elif reason == "cross_account_unavailable":
+        msg = _dv(
+            "我访问不到这个 AWS 账号，所以开不了 case —— 请确认它已经在 NotiOps 里接入（管理 → 账户）。",
+            "I can't reach this AWS account, so I can't open a case — check that it has been "
+            "onboarded in NotiOps (Admin → Accounts).")
+    else:
+        msg = _dv("这个账号目前开不了 support case：" + str(cap.get("message") or reason),
+                  "This account can't open a support case right now: " + str(cap.get("message") or reason))
+    return {"ok": False, "case_creation_unavailable": reason, "message": msg,
+            "note": "把 message 原样转述给用户（可稍作润色），不要重试建案、不要弹确认卡。"}
+
+
 @tool
 def support_case_create(subject: str = "", body: str = "", service_code: str = "",
                         category_code: str = "", severity_code: str = "",
@@ -590,7 +651,14 @@ def support_case_create(subject: str = "", body: str = "", service_code: str = "
         never guess blindly and never query tools just to guess.
       - category_code / severity_code / language: leave "" unless the user stated them; the
         card provides pickers and sensible defaults.
+    If the account cannot open cases at all (support plan / permissions), this returns
+    `case_creation_unavailable` + a `message` to relay instead of a card — say it plainly and stop.
     Returns an editable form proposal (type=create_case_form)."""
+    # 先探一次"这个账号能不能开 case"（15 分钟缓存，通常 0 次额外 API 调用）：不通就当场
+    # 说清楚，而不是弹一张客户填完才发现建不了的卡。
+    cap = _cases.case_capability(account_id=_acct())
+    if not cap.get("ok"):
+        return _case_unavailable(cap)
     lang = language or ("en" if _is_probably_english(subject + " " + body) else "zh")
     return _propose({"type": "create_case_form",
                      "summary": _dv(f"创建 case：{subject}", f"Create case: {subject}"),
@@ -639,6 +707,11 @@ def create_case_from_template(subject: str, service_text: str = "", problem: str
         return {"ok": False, "message": _dv(
             "模版信息不足(缺主题或问题描述),请补全后再发。",
             "Template is incomplete (missing subject or problem description); please complete it and resend.")}
+    # 同 support_case_create：账号开不了 case 就直接说，别让客户以为是"服务名没写对"
+    # —— 计划不足时 _resolve_service 拿不到服务目录，只会 matched=False，误导性极强。
+    cap = _cases.case_capability(account_id=_acct())
+    if not cap.get("ok"):
+        return _case_unavailable(cap)
     resolved = _resolve_service(service_text)
     it = case_type if case_type in ("technical", "customer-service", "service-limit-increase") else "technical"
     sev = severity if severity in ("low", "normal", "high", "urgent", "critical") else "normal"
@@ -1546,6 +1619,9 @@ _TOPIC_FOCUS = {
         "**绝不要声称已经创建/回复/关闭**。提议后告诉用户「点击确认卡上的按钮后才会执行，"
         "**执行结果（含案例编号）会显示在确认卡上**」——不要说「你将收到案例编号」之类暗示会另发消息的话。\n"
         "- 若账号支持计划不足（support_plan_required），礼貌说明需 Business/Enterprise 计划。\n"
+        "- 建案工具返回 `case_creation_unavailable` 时（这个账号根本开不了 case：计划不足 / 缺权限 / "
+        "账号访问不到）：**把返回里的 message 直接说给用户**（含出路），然后停下 —— 不要重试、"
+        "不要改参数再试、不要说「已为你创建确认卡」。\n"
         "- **case 标识：工具返回里有两个字段——短数字（如 177968533700953，面向控制台）和一个长内部 ID"
         "（形如 case-账号-mczh-年-哈希）。一律用那个短数字，绝不展示或链接长的那个（控制台打不开）。**\n"
         "- **面向用户称呼它时一律叫「Case ID / 案例 ID」，绝不要用 `displayId`、`caseId` 这类内部字段名**"
@@ -2360,6 +2436,35 @@ async def invoke(payload, context):
         # 撞输出上限：不是故障，是回答太长。保留已生成内容，收尾照常走（下方补提示 + sources）。
         log.warning("stream hit max_tokens, finishing gracefully with partial answer: %s", e)
         _truncated_by_max_tokens = True
+    except _MODEL_CALL_ERRORS as e:  # 模型调用失败（Bedrock 5xx / 限流 / 超时）
+        # 客户实测事故（2026-08-25，现网）：Grok 4.6 这轮 ConverseStream 连续 4 次
+        # InternalServerException，异常从这里一路冒到 AgentCore，runtime 只在 SSE 里发一个
+        # `{"error":…,"error_type":…}` 帧就结束流。BFF 当时**不认识**那个帧 → 前端只看到
+        # 「（无响应）」，用户完全不知道发生了什么、也不知道该重试还是换模型。
+        # 所以这里就地降级成一条**用户可读的答案**：说明失败、给下一步。异常不再外抛，
+        # 收尾流程（sources/usage）照常走，会话状态保持一致。
+        # 日志纪律（docs/LOGGING_STANDARD.md）：只记异常类型与 AWS 错误码，不记原始报文。
+        _code = ""
+        if isinstance(e, ClientError):
+            _code = str((e.response or {}).get("Error", {}).get("Code") or "")
+        log.error("model invocation failed: type=%s code=%s model=%s",
+                  type(e).__name__, _code or "-", _model_id)
+        _zh_err = not _is_probably_english(_raw_q)
+        _what = _code or type(e).__name__
+        _msg = (
+            f"\n\n---\n⚠️ 模型调用失败（`{_what}`），本轮未能生成回答。\n\n"
+            "**下一步：**\n"
+            "1. 直接再发一次 —— 这类错误多为模型服务端的临时故障，重试通常就好；\n"
+            "2. 若连续失败，在输入框上方切换到**另一个模型**（如 Claude Sonnet 5）后重试。\n"
+            if _zh_err else
+            f"\n\n---\n⚠️ The model call failed (`{_what}`), so this turn produced no answer.\n\n"
+            "**Next steps:**\n"
+            "1. Send the message again — this class of error is usually a transient "
+            "model-service fault and a retry succeeds;\n"
+            "2. If it keeps failing, switch to a different model (e.g. Claude Sonnet 5) "
+            "above the input box and retry.\n"
+        )
+        yield {"event": {"contentBlockDelta": {"delta": {"text": _msg}, "contentBlockIndex": 0}}}
     # 流结束：把清洗器里暂存的尾巴（确认非标记的部分）补发出去
     _tail = _scrubber.flush()
     if _tail:

@@ -647,6 +647,43 @@ export function extractExecutionId(text) {
   return m ? m[1] : "";
 }
 
+/* ───────────────────────── 能力探测（前端据此决定开关能不能点）─────────────────────────
+ *
+ * 为什么需要：两个「深度调查」开关此前只按主题显示，点了才知道这个部署/这个账号根本没有
+ * DevOps Agent Agent Space —— 用户看到的是一句 `no_local_agent_space`
+ * / `account_not_onboarded_to_devops_agent`（老路径则是 agent 回一段 not_onboarded 文案），
+ * 白等一轮。前端拿到 available:false 就把开关置灰并写明原因，点不下去。
+ *
+ * 判据直接复用 resolveTarget（probeOnly，不做 AssumeRole）：调查能不能发起，取决的正是
+ * "能不能解析出目标 Agent Space"。不另写一套判断，避免两处漂移。
+ */
+const _availCache = new Map();   // key(账号或"self") -> { at, val }
+const AVAIL_TTL_MS = 5 * 60 * 1000;
+
+/** 这个账号能不能做深度调查。{ available, reason }。reason ∈
+ *  no_local_agent_space | account_not_onboarded_to_devops_agent | <其它错误名>。 */
+export async function deepInvestigationAvailability(accountId, { useCache = true } = {}) {
+  const key = String(accountId || "").trim() || "self";
+  const hit = useCache ? _availCache.get(key) : null;
+  // Date.now 在 Lambda 里没问题（这里不是 workflow 脚本），只用于 TTL。
+  if (hit && Date.now() - hit.at < AVAIL_TTL_MS) return { ...hit.val };
+
+  let val;
+  try {
+    const t = await resolveTarget(key === "self" ? "" : key, { probeOnly: true });
+    val = { available: true, scope: t.scope };
+  } catch (e) {
+    const reason = String(e?.message || "unknown");
+    // 只有"确定没有"才算不可用。其它异常（DDB 抖动、权限、超时）**放行** —— 宁可让用户
+    // 点进去看到真实报错，也不要因为一次抖动把功能藏起来（和建案能力探测同一取舍）。
+    const definitive = reason === "no_local_agent_space" || reason === "account_not_onboarded_to_devops_agent";
+    if (!definitive) return { available: true, probe_error: e?.name || "Error" };
+    val = { available: false, reason };
+  }
+  _availCache.set(key, { at: Date.now(), val });
+  return { ...val };
+}
+
 // ───────────────────────── 主流程 ─────────────────────────
 
 /**

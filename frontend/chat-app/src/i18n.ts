@@ -690,6 +690,17 @@ export const STRINGS: Dict = {
     en: "FinOps Agent deep analysis coming soon; use DevOps Agent to analyze cost & usage for now",
   },
   "composer.soon": { zh: "即将上线", en: "Soon" },
+  // 深度调查不可用（这个部署/这个账号没有 DevOps Agent Agent Space）。开关置灰 + 说清原因与出路，
+  // 而不是让用户点开、发一轮、再吃一句 no_local_agent_space / account_not_onboarded。
+  "composer.devops.na": { zh: "未接入", en: "N/A" },
+  "composer.devops.na.self": {
+    zh: "深度调查不可用：本部署账号里没有 AWS DevOps Agent 的 Agent Space。请在本账号创建 Agent Space（或重新部署 NotiOps 让它自动创建）后再用。",
+    en: "Deep investigation is unavailable: this deployment account has no AWS DevOps Agent Agent Space. Create one in this account (or redeploy NotiOps, which creates it automatically) and try again.",
+  },
+  "composer.devops.na.account": {
+    zh: "深度调查不可用：所选账号尚未接入 AWS DevOps Agent。请在「管理 → 账户」里给该账号完成 DevOps Agent 接入，或切回部署账号。",
+    en: "Deep investigation is unavailable: the selected account isn't onboarded to AWS DevOps Agent. Onboard it under Admin → Accounts, or switch back to the deployment account.",
+  },
   // Nova Pro 在成本主题不推荐:它对「大量工具 + 大成本明细结果」处理易超限/失败(输出上限仅 5K),
   // Claude / DeepSeek 更稳。见 D 诊断。
   "model.novaFinopsWarn": { zh: "成本分析不推荐(建议用 Claude / DeepSeek)", en: "Not ideal for cost analysis — use Claude / DeepSeek" },

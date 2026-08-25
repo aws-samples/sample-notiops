@@ -155,7 +155,7 @@ Credential flow: `setup.sh` **does not collect IM credentials** — it only sets
 - **AWS account**: admin or equivalent permissions
 - **VPC**: any VPC capable of running ECS Fargate + ≥ 2 AZs of public subnets (**only needed if you enable the IM bot** — Fargate tasks reach IM APIs over the public internet; ignore for web-only)
 - **AWS DevOps Agent**: enabled (required for deep investigation). **No need to bring your own Agent Space** — CDK auto-creates one named `notiops-devops-<account>` in your account (see §5.3.4); you don't pre-create one or supply a space id
-- **Bedrock**: the `us.anthropic.claude-sonnet-4-6` inference profile is enabled in your region (Bedrock console → Model access)
+- **Bedrock**: the model behind the catalogue's **default_model** is enabled in your region (Bedrock console → Model access). Today that is **Grok 4.6** (`global.xai.grok-4.6`); enable the others too (Claude Sonnet 5 / Opus 5, Nova Pro, DeepSeek, the GPT-5.6 family) if you want users to be able to switch
 
 ### 2.3 Region selection
 
@@ -693,7 +693,7 @@ All tunable parameters live under the `context` block in `infra/cdk.json`. After
 
 | Component | Description |
 |---|---|
-| **Agent Runtime** | Bedrock AgentCore Runtime hosting the Strands agent (default model Claude Sonnet 4.6). Deployed as a CodeZip by `scripts/deploy_agent.sh`, which emits a **Runtime ARN** |
+| **Agent Runtime** | Bedrock AgentCore Runtime hosting the Strands agent (default model **Grok 4.6**, taken from the catalogue's `default_model`). Deployed as a CodeZip by `scripts/deploy_agent.sh`, which emits a **Runtime ARN** |
 | **BFF Lambda** | Node 20 Lambda (`notiops-web-chat-bff`) with a **Function URL** (`AuthType=AWS_IAM`) that responds to the frontend via **SSE streaming**; it calls the Agent Runtime and also handles deterministic operations directly (case creation `/actions/execute`, the `/support/services` catalog, etc.) |
 | **Frontend** | React / Vite single-page app, statically hosted |
 | **Auth** | Cognito (reuses the notiops user pool) + Identity Pool; the frontend gets temporary credentials and **SigV4-signs** requests to the Function URL |

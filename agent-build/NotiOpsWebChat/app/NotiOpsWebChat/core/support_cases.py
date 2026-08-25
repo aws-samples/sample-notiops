@@ -19,6 +19,7 @@ IAM 角色调本账号的 AWS Support API，读/写**客户自己的** support c
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import boto3
@@ -212,6 +213,60 @@ def list_severity_levels(*, account_id: str | None = None) -> dict:
         return {"severityLevels": [{"code": s.get("code"), "name": s.get("name")}
                                     for s in resp.get("severityLevels", [])]}
     return _wrap(go)
+
+
+# ──────────────── 建案能力探测（先提醒，别让客户白填一整张表）────────────────
+# 为什么要单独探一次：Basic/Developer 计划（或 agent 角色缺 support:* 权限）下，"开 case"
+# 这条路从头到尾都不通，但失败点在**最后一步** execute_create_case —— 客户已经把主题、
+# 服务、正文都填完点了确认，才收到一句 SubscriptionRequiredException。所以在弹卡之前先
+# 探一次，把"这个账号开不了 case"当场说清楚，并给出出路。
+# 用 describe_severity_levels 探：Support API 里最便宜的只读调用，且它和 create_case 受
+# 同一个支持计划闸门、同一套 IAM action 约束 —— 它通，建案就通。
+_CAP_TTL_SEC = 900
+_cap_cache: dict[str, tuple[float, dict]] = {}
+_DENIED_CODES = ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation",
+                 "UnrecognizedClientException")
+
+
+def case_capability(*, account_id: str | None = None, use_cache: bool = True) -> dict:
+    """这个账号现在能不能开 support case。
+
+    返回 {"ok": True} 或 {"ok": False, "reason": ..., "message": ...}；
+    reason ∈ support_plan_required | access_denied | cross_account_unavailable。
+
+    拿不准时（限流、网络抖动、未知错误码）**返回 ok** 并带上 probe_error —— 宁可让客户
+    继续走下去在真正建案时看到确切报错，也不要因为一次抖动就断言"你开不了 case"。
+    """
+    key = account_id or "_local"
+    now = time.monotonic()
+    if use_cache:
+        hit = _cap_cache.get(key)
+        if hit and now - hit[0] < _CAP_TTL_SEC:
+            return dict(hit[1])
+
+    probe = list_severity_levels(account_id=account_id)
+    err = probe.get("error") if isinstance(probe, dict) else "support_error"
+    if not err:
+        verdict = {"ok": True}
+    elif err == "support_plan_required":
+        verdict = {"ok": False, "reason": "support_plan_required",
+                   "message": "该账号的支持计划不包含 Support API 访问"
+                              "（需 Business / Enterprise On-Ramp / Enterprise 之一）。"}
+    elif err in _DENIED_CODES:
+        verdict = {"ok": False, "reason": "access_denied",
+                   "message": "该账号有支持计划，但当前角色缺少 Support API 权限"
+                              "（至少需要 support:DescribeSeverityLevels 与 support:CreateCase）。"}
+    elif err == "cross_account_unavailable":
+        verdict = {"ok": False, "reason": "cross_account_unavailable",
+                   "message": str(probe.get("message", ""))}
+    else:
+        logger.info("case_capability inconclusive (%s) — treating as available", err)
+        return {"ok": True, "probe_error": err}
+
+    # 只缓存**确定**的结论。cross_account_unavailable 不缓存：账号随时可能被 onboard。
+    if verdict["ok"] or verdict["reason"] in ("support_plan_required", "access_denied"):
+        _cap_cache[key] = (now, dict(verdict))
+    return verdict
 
 
 # ─────────────────────── 写操作（仅 BFF 在用户确认后调用）───────────────────────

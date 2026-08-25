@@ -337,18 +337,47 @@ export async function fetchModels(surface = "webchat"): Promise<{
   }
 }
 
-/** 建案卡片的服务/类别下拉数据源（describe-services，BFF 缓存）。失败/计划不足 → []。 */
+/**
+ * 建案卡片的服务/类别下拉数据源（describe-services，BFF 缓存）。
+ *
+ * 拿不到目录时**必须区分原因**：`unavailable === "support_plan_required"` 意味着这个账号
+ * 根本开不了 case（Basic/Developer 计划），卡片要当场提醒；而不是显示成"没匹配到服务"，
+ * 让客户把整张表填完、点了确认才吃一个报错。其他原因（网络/权限/BFF 异常）只当"这次没读到"。
+ */
 export interface SupportServiceCat { code: string; name: string }
 export interface SupportService { code: string; name: string; categories: SupportServiceCat[] }
-export async function getSupportServices(language = "en"): Promise<SupportService[]> {
+export interface SupportServicesResult { services: SupportService[]; unavailable?: string }
+export async function getSupportServices(language = "en"): Promise<SupportServicesResult> {
   const s = await signedClient();
-  if (!s) return [];
+  if (!s) return { services: [] };
   try {
     const r = await s.aws.fetch(`${s.base}/support/services?language=${encodeURIComponent(language)}`, { headers: { "x-notiops-id-token": s.idToken } });
-    if (!r.ok) return [];
+    if (!r.ok) return { services: [] };
     const j = await r.json();
-    return (j.services ?? []) as SupportService[];
-  } catch { return []; }
+    // BFF 用 200 + {ok:false, code} 表达"能问但答不了"（见 support.mjs 的 wrapErr）。
+    if (j?.ok === false) return { services: [], unavailable: String(j.code || "support_error") };
+    return { services: (j.services ?? []) as SupportService[] };
+  } catch { return { services: [] }; }
+}
+
+/**
+ * 「深度调查」两个开关能不能点：这个部署/这个账号有没有可用的 DevOps Agent Agent Space。
+ *
+ * 拿不到答案时**当可用**（返回 available:true）—— 宁可让用户点进去看到真实报错，也不要因为
+ * 一次网络抖动或老版本 BFF（没有这个路由 → 404）把功能藏起来。BFF 侧同样对"探测不确定"
+ * 放行（见 devops_investigate.mjs 的 deepInvestigationAvailability）。
+ */
+export interface DeepInvestigationAvailability { available: boolean; reason?: string }
+export async function getDeepInvestigationAvailability(accountId = ""): Promise<DeepInvestigationAvailability> {
+  const s = await signedClient();
+  if (!s) return { available: true };
+  try {
+    const qs = accountId ? `?account=${encodeURIComponent(accountId)}` : "";
+    const r = await s.aws.fetch(`${s.base}/features/deep-investigation${qs}`, { headers: { "x-notiops-id-token": s.idToken } });
+    if (!r.ok) return { available: true };
+    const j = await r.json();
+    return { available: j?.available !== false, reason: j?.reason ? String(j.reason) : undefined };
+  } catch { return { available: true }; }
 }
 
 /** 重命名会话。 */

@@ -9,8 +9,11 @@ The user types something like "分析 case 12345" / "summarize case 67890" /
      via `core.case_management.describe_case`.
   2. Pull all communications (newest first, capped at 30 to fit Bedrock
      context) via `core.case_management.list_communications`.
-  3. Compose a structured prompt and call Bedrock Sonnet 4.6 (or whichever
-     LLM the chat is currently switched to via `shared.llm_provider`).
+  3. Compose a structured prompt and call Bedrock via `get_bot_model_id()`
+     (SSM `/notiops/agent/model_id`, Claude Sonnet 5 today). This is an
+     internal utility call with a hand-rolled Anthropic-native body, so it
+     deliberately does NOT follow the chat's `@bot model` preference --
+     see `shared/model_config.py`.
   4. Return an `AnalyzeResult` dataclass the platform sender renders into
      a card.
 
@@ -48,7 +51,7 @@ _bedrock = LazyClient("bedrock-runtime", region=BEDROCK_REGION)
 
 
 # Cap communications fed into the prompt. AWS Support cases occasionally
-# accumulate 50+ messages; a Sonnet 4.6 input window is 200K tokens but
+# accumulate 50+ messages; a Sonnet 5 input window is 200K tokens but
 # each communication can be ~5K chars, so 30 is a comfortable upper bound
 # that keeps the prompt under ~150K chars / ~50K tokens.
 _MAX_COMMS = 30

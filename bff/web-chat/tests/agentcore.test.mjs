@@ -124,5 +124,35 @@ t("reasoning / progress / usage 各走各的通道，不进正文", () => {
   assert.equal(extract({ usage: { totalTokens: 7 } }).usage.totalTokens, 7);
 });
 
+/* ── extract()：runtime 流内异常帧必须被认出来 ──
+ *
+ * 事故（2026-08-25 现网）：Grok 4.6 这轮 Bedrock ConverseStream 连续 InternalServerException，
+ * 异常冒到 AgentCore，runtime 按 `_sync_stream_with_error_handling` 的约定发一帧
+ * {error, error_type, message} 然后**正常结束流**（HTTP 早已 200）。旧 extract 不认识这帧 →
+ * invokeAgent 返回空串且不抛 → /stream 的 lastErr 是 undefined → 用户只看到「（无响应）」。
+ * 判据必须锚在 error_type：工具/业务返回里 `{"error": "..."}` 很常见，不能当成 runtime 崩了。
+ */
+console.log("\nagentcore — extract(): runtime 异常帧");
+
+t("识别 AgentCore 的 {error, error_type} 帧", () => {
+  const e = extract({
+    error: "An error occurred (InternalServerException) …",
+    error_type: "EventStreamError",
+    message: "An error occurred during streaming",
+  });
+  assert.equal(e.error.type, "EventStreamError");
+  assert.equal(e.text, "");
+});
+
+t("业务/工具返回里的 error 字段不误判成 runtime 崩了", () => {
+  assert.equal(extract({ error: "bucket not found" }).error, undefined);
+  assert.equal(extract({ event: { contentBlockDelta: { delta: { text: '{"error":"x"}' } } } }).error, undefined);
+  assert.equal(extract({ error_type: "" }).error, undefined);
+});
+
+t("正常事件不带 error", () => {
+  assert.equal(extract({ event: { contentBlockDelta: { delta: { text: "hi" } } } }).error, undefined);
+});
+
 console.log(`\n${fail === 0 ? "PASSED" : "FAILED"}: ${pass} ok, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

@@ -89,7 +89,7 @@ export interface Conversation {
   title: string;
   icon?: string;
   topic?: TopicKey;      // 会话所属主题（默认 general/未设 = 通用）
-  model?: string;        // 本会话选用的模型（默认 DEFAULT_MODEL=Amazon Nova）
+  model?: string;        // 本会话选用的模型（缺省走 defaultModelId()，兜底 DEFAULT_MODEL）
   accountId?: string;    // 本会话目标 AWS 账号（默认空=部署账号）
   webSearch?: boolean;   // 本会话是否开启联网搜索（默认关；每会话独立）
   finopsAgent?: boolean; // 本会话是否启用 FinOps Agent 深度模式（默认关；仅 FinOps 主题；每会话独立）
@@ -104,7 +104,7 @@ export interface Conversation {
 
 // 新对话默认模型的**兜底**值。真值由 GET /models 下发（管理员在「管理 → 模型」里定），
 // 见 models.ts 的 defaultModelId()。这里保留是为了首帧渲染和接口读不到时不至于没模型可用。
-export const DEFAULT_MODEL = "claude-sonnet-5";
+export const DEFAULT_MODEL = "xai-grok-4-6";
 
 export interface ModelOption {
   id: string;

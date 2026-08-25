@@ -41,7 +41,7 @@
 | **Manage Support cases** | Create / list / view / reply to / **smart-analyze** / close AWS Support cases | `@bot open a case for the RDS outage` / `@bot analyze case 12345` |
 | **Answer AWS concept questions** | Cite AWS official docs to explain concepts, best practices, API usage | `@bot what's the difference between ALB and NLB` |
 | **Proactive alarm watching** | Six event sources — CloudWatch / Health / Backup / GuardDuty / Cost / TA — auto-dispatch investigations | (No action needed; alarms trigger automatically) |
-| **Multi-LLM switching** | Switch freely between Claude Sonnet 4.6 / Amazon Nova Pro / OpenAI GPT-5.4 (all accessed via Amazon Bedrock); per-chat / per-DM preference is remembered | `@bot model nova` / `@bot model claude` / `@bot model list` |
+| **Multi-LLM switching** | Switch freely between whichever models your admin enabled (default **Grok 4.6**, plus Claude Sonnet 5 / Opus 5 / Haiku 4.5, Amazon Nova Pro, DeepSeek V3.2, and the GPT-5.6 family — all accessed via Amazon Bedrock); per-chat / per-DM preference is remembered | `@bot model nova` / `@bot model claude` / `@bot model list` |
 | **Language switching** | Switch between Chinese and English; remembers your preference | `language zh` / `language en` / `please switch to English` |
 
 ### What the bot WILL NOT do ❌
@@ -314,7 +314,7 @@ Just @ the bot — it auto-detects this is a "concept question" rather than an "
 
 ### 5.2 Answer style
 
-The bot calls **AWS Knowledge MCP** to retrieve official docs, then answers with Bedrock Sonnet 4.6, **with verifiable sources attached**:
+The bot calls **AWS Knowledge MCP** to retrieve official docs, then answers with the chat's current conversational model (**Grok 4.6** by default, see §7), **with verifiable sources attached**:
 
 ```
 ALB (Application Load Balancer) operates at OSI Layer 7 and understands
@@ -338,13 +338,13 @@ Key differences:
 - aws_docs_search("ALB vs NLB difference")
 - aws_docs_read(...)
 
-By Claude Sonnet 4.6
+By Grok 4.6
 ```
 
 **Key points**:
 - **The "📚 Sources" block** = URLs the LLM actually read, not made-up references
 - **"🔧 MCP tools called"** = transparent display of which tools the LLM used
-- **"By Claude Sonnet 4.6"** = explicit signal that this is model-generated, not a hard-coded "official answer"
+- **"By Grok 4.6"** (the signature follows the chat's current model) = explicit signal that this is model-generated, not a hard-coded "official answer"
 
 ### 5.3 Concept question samples
 
@@ -424,16 +424,16 @@ Detailed config options in [DEPLOYMENT.en.md §7](DEPLOYMENT.en.md#7-enable--tun
 
 ## 7. Model selection (`@bot model`)
 
-The bot supports 3 LLM aliases that **anyone in a chat can switch
-between** (no admin gate):
+The aliases the bot accepts are whatever your admin enabled for the IM surface in the model catalogue (the common ones are below); **anyone in a chat can switch between them** (no admin gate). Ask `@bot model list` for the live set:
 
 | alias | model | notes |
 |---|---|---|
-| `claude` | **Claude Sonnet 4.6** | Default; reliable tool-use and good in Chinese & English in internal testing, hence the preferred default |
+| `grok` | **Grok 4.6** | **Default** (the catalogue's `default_model`). Bedrock Converse; ⚠️ no explicit prompt caching, so long conversations cost more on input than Claude |
+| `claude` | **Claude Sonnet 5** | Reliable tool-use and good in Chinese & English in internal testing; supports prompt caching |
 | `nova` | **Amazon Nova Pro** | Bedrock Converse API; ~1/4 the unit cost of Claude Sonnet (per public Bedrock pricing, as of 2026-07); works for compliance-restricted lists |
-| `gpt` | **GPT-5.4** (experimental) | Bedrock Mantle Responses API; tool-use is less reliable than the two above. Suggested for experimentation only. |
+| `gpt` / `gpt_sol` / `gpt_luna` | **GPT-5.6** Terra / Sol / Luna (experimental) | Bedrock Mantle Responses API; tool-use is less reliable than the two above. Suggested for experimentation only. |
 
-> ⚠️ **GPT-5.4 is currently an experimental tier.** Under tool-use the model occasionally leaks OpenAI internal protocol fragments or low-quality tokens into the reply. The bot ships three layers of hard defenses (output-token cap / JSON-error feedback / output sanitizer) but the residual leak rate is still higher than Claude / Nova. Treat it as a "try out an OpenAI model" tier, and prefer `claude` / `nova` as the default.
+> ⚠️ **GPT-5.6 is currently an experimental tier.** Under tool-use the model occasionally leaks OpenAI internal protocol fragments or low-quality tokens into the reply. The bot ships three layers of hard defenses (output-token cap / JSON-error feedback / output sanitizer) but the residual leak rate is still higher than Claude / Nova. Treat it as a "try out an OpenAI model" tier, and prefer `claude` / `nova` as the default.
 >
 > Note: all models are accessed through Amazon Bedrock (managed security, compliance monitoring, and cost controls). This is sample code for educational/reference purposes, not production-ready; test and harden it against your organization's security and compliance requirements before any real use.
 
@@ -458,11 +458,11 @@ overseas channels on `claude`, set compliance-restricted teams to
 
 ### 7.3 Notes on switching to `gpt` (experimental)
 
-GPT-5.4 uses the **Bedrock Mantle Responses API** (OpenAI-compatible
+GPT-5.6 uses the **Bedrock Mantle Responses API** (OpenAI-compatible
 protocol), which differs from Bedrock InvokeModel / Converse:
 
-- **Reliability**: Under tool-use (investigation dispatch / concept Q&A) GPT-5.4 occasionally writes OpenAI internal protocol fragments (`to=functions.<tool>`) or low-quality tokens into the reply. The bot has three hard defenses to intercept that output — when triggered, the user gets the canned chitchat fallback instead of garbage — but the visible "half-broken" rate is still higher than Claude / Nova. **Prefer `claude` or `nova` for serious use**; treat `gpt` as a "try it / compare" tier.
-- **Cross-region call**: GPT-5.4 lives in `us-east-2` (also supported in `us-west-2` and GovCloud-us-west). The bot ECS deployment runs in `us-east-1`, so selecting `gpt` triggers a cross-region HTTPS POST. Latency is ~50ms higher than Claude / Nova but otherwise transparent.
+- **Reliability**: Under tool-use (investigation dispatch / concept Q&A) GPT-5.6 occasionally writes OpenAI internal protocol fragments (`to=functions.<tool>`) or low-quality tokens into the reply. The bot has three hard defenses to intercept that output — when triggered, the user gets the canned chitchat fallback instead of garbage — but the visible "half-broken" rate is still higher than Claude / Nova. **Prefer `claude` or `nova` for serious use**; treat `gpt` as a "try it / compare" tier.
+- **Cross-region call**: GPT-5.6 lives in `us-east-2` (also supported in `us-west-2` and GovCloud-us-west). The bot ECS deployment runs in `us-east-1`, so selecting `gpt` triggers a cross-region HTTPS POST. Latency is ~50ms higher than Claude / Nova but otherwise transparent.
 - **Operator can pin a different region**: the CFN parameter `GptRegion` defaults to `us-east-2`; can be changed to `us-west-2` or `us-gov-west-1`.
 - **Reasoning effort**: GPT-5.x has an explicit reasoning-depth knob, default `medium`. Operators can change `GPT_REASONING_EFFORT` env to `low` / `high`.
 - **Latency**: at `effort=high`, a single reply may take 10-30 seconds. For the chat path, keep `medium`.
@@ -566,7 +566,7 @@ Yes. **We strongly recommend trying it in a test channel for 1–2 weeks first**
 ### Q6: Are the bot's replies model-generated? Will it hallucinate?
 
 - **Investigation reports**: generated by DevOps Agent actually reading your resources, with a trace.html for verification — no fabrication
-- **Concept Q&A**: Bedrock Sonnet 4.6 + AWS official docs retrieval (Knowledge MCP); answers come with 📚 source URLs you can click to verify
+- **Concept Q&A**: the conversation's Bedrock model (Grok 4.6 by default) + AWS official docs retrieval (Knowledge MCP); answers come with 📚 source URLs you can click to verify
 - **Intent classification / progress narration**: LLM-generated and may have minor inaccuracies, but doesn't affect the truthfulness of the investigation result itself
 
 If a concept answer disagrees with what you know, **click the 📚 source URL and read the AWS official docs yourself** — that's ground truth.
@@ -700,7 +700,7 @@ In addition to the bot in Feishu / Slack, NotiOps also ships a **browser-based a
 
 - **Sign-in**: Web Chat uses Cognito sign-in (reusing the notiops user pool). Open the URL your admin gives you and sign in with your account.
 - **Left-side navigation (topics)**, in order: **Notifications / Investigate / FinOps / Cases / Skills / More**. Click a topic to enter that conversation scenario.
-- **Default model**: a new conversation defaults to **Claude Sonnet 4.6**.
+- **Default model**: a new conversation defaults to **Grok 4.6** (the exact default is set by your admin on the Admin → Models page).
 - **Right-side Sources / Investigation panel**: shows tool calls and source pass-through, plus the live "Investigation" panel under the Investigate topic (see §12.3).
 
 Toggles available in the top/toolbar area: **multi-account selector**, **model switching**, **web search toggle** (see §12.7).
@@ -770,7 +770,7 @@ Web Chat offers **two case-filing paths; you pick one**. Both run **deterministi
 
 ### 12.7 Multi-account / multi-model / web search / What's New / "/" commands
 
-- **Model switching**: defaults to **Claude Sonnet 4.6**, with **Amazon Nova Pro**, **Claude Haiku 4.5**, **DeepSeek V3.2**, and **GPT-5.4 (experimental)** also available (all accessed via Amazon Bedrock; third-party models run via Bedrock, not direct vendor APIs). It **remembers your model preference per session**, and **each reply is signed with the model used**.
+- **Model switching**: defaults to **Grok 4.6**, with **Claude Sonnet 5**, **Claude Opus 5**, **Claude Haiku 4.5**, **Amazon Nova Pro**, **DeepSeek V3.2**, and the **GPT-5.6** family (Terra / Sol / Luna) also available (all accessed via Amazon Bedrock; third-party models run via Bedrock, not direct vendor APIs). It **remembers your model preference per session**, and **each reply is signed with the model used**.
 - **Multi-account selector**: defaults to the **deployment account**, shared by the team. ⚠️ **In v1, cross-account is locked to the deployment account by default** (switching to arbitrary other accounts isn't open yet).
 - **Web search toggle**: **off by default**; turn it on manually when you want the assistant to reference public web information.
 - **What's New**: view the latest AWS announcements.

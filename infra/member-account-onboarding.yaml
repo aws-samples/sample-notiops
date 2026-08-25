@@ -3,7 +3,7 @@ Description: >
   NotiOps member account onboarding (StackSet payload).
   在业务账号内创建 NotiOps 多账号接入所需的全部资源：
   1. notiops-idle-detection-role — 系统账号跨账号只读采集角色（RDS/ElastiCache/CW/TA/CE/COH 等）
-  2. DevOps Agent 事件转发 — EventBridge Rule + Role，把 aws.aidevops 调查事件转发到系统账号 Custom Bus
+  2. (可选) DevOps Agent 事件转发 — EventBridge Rule + Role，把 aws.aidevops 调查事件转发到系统账号 Custom Bus
   3. (可选) PHD 事件转发 — EventBridge Rule + Role，把 AWS Health 事件转发到系统账号 SNS Topic
   通过 CloudFormation StackSets (service-managed) 从管理账号批量下发；
   也可在单个业务账号手动部署（aws cloudformation deploy）。
@@ -27,17 +27,20 @@ Parameters:
 
   DevOpsEventBusArn:
     Type: String
+    Default: ""
     Description: >
-      系统账号 Custom Event Bus ARN
-      (e.g. arn:aws:events:us-east-1:123456789012:event-bus/notiops-devops-events)
-    AllowedPattern: "arn:aws:events:[a-z0-9-]+:[0-9]{12}:event-bus/.+"
-    ConstraintDescription: Must be a valid EventBridge event bus ARN
+      (可选) 系统账号 Custom Event Bus ARN
+      (e.g. arn:aws:events:us-east-1:<system-account-id>:event-bus/notiops-devops-events)。
+      留空则不部署 DevOps Agent 调查事件转发 —— 一键部署(Web Chat only)那条路径上
+      系统账号里没有这条总线，也没有消费它的回调 Lambda，只需要本模板的跨账号只读角色。
+    AllowedPattern: "^(arn:aws:events:[a-z0-9-]+:[0-9]{12}:event-bus/.+)?$"
+    ConstraintDescription: Must be a valid EventBridge event bus ARN, or empty
 
   PhdSnsTopicArn:
     Type: String
     Default: ""
     Description: >
-      (可选) 系统账号 PHD SNS Topic ARN (e.g. arn:aws:sns:us-east-1:123456789012:phd-events)。
+      (可选) 系统账号 PHD SNS Topic ARN (e.g. arn:aws:sns:us-east-1:<system-account-id>:phd-events)。
       留空则不部署 PHD 转发。
 
   ObservabilitySinkArn:
@@ -62,6 +65,11 @@ Conditions:
   EnablePhdForwarding: !And
     - !Not [!Equals [!Ref PhdSnsTopicArn, ""]]
     - !Condition IsPrimaryRegion  # EventBridge→SNS Target 仅支持同 Region，PHD 转发只在主 Region
+  # 转发角色是 IAM(全局)，只在主 Region 建；转发规则每个 Region 都要（跨 Region 事件也要回总线）。
+  EnableDevOpsForwardRole: !And
+    - !Not [!Equals [!Ref DevOpsEventBusArn, ""]]
+    - !Condition IsPrimaryRegion
+  EnableDevOpsForwarding: !Not [!Equals [!Ref DevOpsEventBusArn, ""]]
   IsPrimaryRegion: !Equals [!Ref "AWS::Region", !Ref PrimaryRegion]
   HasOrgId: !Not [!Equals [!Ref OrganizationId, ""]]
 
@@ -173,10 +181,11 @@ Resources:
                   - cur:DescribeReportDefinitions
                 Resource: "*"
 
-  # ─── 2. DevOps Agent 调查事件转发 ───
+  # ─── 2. (可选) DevOps Agent 调查事件转发 ───
+  # DevOpsEventBusArn 留空 = 跳过整块（一键部署路径：系统账号没有这条总线）。
   DevOpsEventsForwardRole:
     Type: AWS::IAM::Role
-    Condition: IsPrimaryRegion
+    Condition: EnableDevOpsForwardRole
     Properties:
       RoleName: !Sub "notiops-devops-forwarder-role-${AWS::AccountId}"
       Description: "Allow EventBridge to forward aws.aidevops events to NotiOps system account custom bus"
@@ -198,6 +207,7 @@ Resources:
 
   DevOpsEventsForwardRule:
     Type: AWS::Events::Rule
+    Condition: EnableDevOpsForwarding
     Properties:
       Name: notiops-devops-events-forward
       Description: "Forward DevOps Agent investigation events to NotiOps system account"

@@ -68,15 +68,25 @@ _TOPIC_FOCUS = {
 
 app = BedrockAgentCoreApp()
 
-# 模型可由 BFF 通过 payload.model 覆盖；默认 Claude Sonnet（与产品默认一致）。
+# 模型可由 BFF 通过 payload.model 覆盖；默认跟随 config/llm-model-catalog.json 的
+# default_model（现为 Grok 4.6）。
+#
+# ⚠️ 这份 alias→model_id 映射是**离线镜像**，不是运行时权威。部署的 agent
+# （agent-build/NotiOpsWebChat/app/NotiOpsWebChat/model/load.py）从 DDB 的模型目录
+# （PK=llmcfg）解析，Admin 改完下一条消息即生效；那边**刻意没有**合并这张硬编码表
+# （见该文件顶部注释）。所以这里只需与 config/llm-model-catalog.json 的 seed 值同值，
+# 加新模型时**先改目录**，这张表只是让本目录能独立跑起来。
 _DEFAULT_MODEL = os.environ.get(
-    "NOTIOPS_DEFAULT_MODEL", "us.anthropic.claude-sonnet-5"
+    "NOTIOPS_DEFAULT_MODEL", "global.xai.grok-4.6"
 )
 
 _MODEL_MAP = {
-    "claude-sonnet-5": "us.anthropic.claude-sonnet-5",
-    "claude-sonnet-4-6": "us.anthropic.claude-sonnet-4-6-v1:0",  # 保留:老会话/显式选择
-    "amazon-nova-pro": "amazon.nova-pro-v1:0",
+    "xai-grok-4-6": "global.xai.grok-4.6",  # 目录 default_model
+    "claude-sonnet-5": "global.anthropic.claude-sonnet-5",
+    "claude-opus-5": "global.anthropic.claude-opus-5",
+    "claude-haiku-4-5": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "claude-sonnet-4-6": "global.anthropic.claude-sonnet-4-6",  # 目录里已 disabled，留给老会话
+    "amazon-nova-pro": "apac.amazon.nova-pro-v1:0",
     "deepseek-v3-2": "deepseek.v3.2",  # Bedrock ON_DEMAND，支持流式
     "gpt-5-6": "openai.gpt-5.6-terra",  # 走 Bedrock Mantle（OpenAI Responses API），见下
     "gpt-5-6-sol": "openai.gpt-5.6-sol",    # GPT-5.6 Sol，走 Mantle
@@ -84,8 +94,10 @@ _MODEL_MAP = {
 }
 
 # 走 Bedrock Mantle 的模型（OpenAI Responses API，非标准 Converse）。
-# GPT-5.6 系列（Terra/Sol/Luna）仅 us-east-2 / us-west-2；runtime 在 us-east-1，故显式指定区域。
-# 见 https://aws.amazon.com/blogs/aws/get-started-with-openai-gpt-5-5-gpt-5-4-models-and-codex-on-amazon-bedrock/
+# 区域由这里**显式指定**（runtime 在 us-east-1，Mantle 不在），不从 model id 推。
+# us-east-2 这个取值来自 GPT-5.4/5.5 那代的区域约束（AWS 博客见下）；给 5.6 沿用是
+# 实测可用，换新模型/新区域前请重新核对，别把旧博客当 5.6 的依据。
+# https://aws.amazon.com/blogs/aws/get-started-with-openai-gpt-5-5-gpt-5-4-models-and-codex-on-amazon-bedrock/
 _MANTLE_MODELS = {
     "gpt-5-6": {"model_id": "openai.gpt-5.6-terra", "region": "us-east-2"},
     "gpt-5-6-sol": {"model_id": "openai.gpt-5.6-sol", "region": "us-east-2"},
@@ -94,7 +106,7 @@ _MANTLE_MODELS = {
 
 
 def _make_mantle_responses_model(cfg: dict):
-    """构造走 Bedrock Mantle 的 GPT-5.4（OpenAI Responses API）模型实例。
+    """构造走 Bedrock Mantle 的 GPT-5.6（OpenAI Responses API）模型实例。
 
     坑：Strands 1.44 的 Mantle base_url 模板是 `https://bedrock-mantle.{region}.api.aws/v1`，
     **少了 `/openai`**。正确应为 `.../api.aws/openai/v1`（见 AWS 博客）。否则请求打到

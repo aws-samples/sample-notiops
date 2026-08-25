@@ -89,10 +89,19 @@ Console, nothing is installed on your machine.
    the IAM capabilities acknowledgement, and create — measured at ~4.5 minutes.
    The stack outputs include the Web Chat URL.
 
+Two optional parameters are worth knowing about: **deep investigation** (AWS
+DevOps Agent — on by default, free while idle, and silently skipped instead of
+failing the stack in Regions that don't have it) and **deployment mode** (single
+account by default; pick multi-account and supply your organization id to run
+read-only investigations across other accounts in the organization — requires
+deploying from the organization management account or a StackSets delegated
+administrator).
+
 ⚠️ One-click deploys **Web Chat only** (frontend + BFF + agent). It does **not**
 include the IM bots, scheduled inspections, the admin dashboard, or CUR/Athena
 FinOps — use Option B for those. Prerequisites (region and Bedrock model access),
-the resource and cost breakdown, upgrade/rollback, and one-click teardown are in
+a parameter-by-parameter walkthrough, the resource and cost breakdown,
+upgrade/rollback, and one-click teardown are in
 [docs/DEPLOYMENT_ONECLICK.en.md](docs/DEPLOYMENT_ONECLICK.en.md).
 
 ### Option B: `setup.sh` — the full install
@@ -131,6 +140,103 @@ switching later requires a redeploy.
 For the full deployment walkthrough into your own AWS account — including the
 mode comparison and how to switch — see
 [docs/DEPLOYMENT.en.md](docs/DEPLOYMENT.en.md).
+
+### Feature comparison
+
+| Capability | Option A (one-click) | Option B (`setup.sh`) |
+|---|:---:|:---:|
+| **Prerequisites and timing** | | |
+| Installed locally | nothing (browser only) | git / Node / Python / CDK / container runtime |
+| Long-lived access key required | no | yes, credentials that can deploy |
+| Deploy time | ~4.5 minutes | 10–20 minutes (includes local builds) |
+| One-click teardown | ✅ pick `KeepData` / `DeleteEverything` on delete | manual cleanup |
+| **Chat and investigation** | | |
+| Web Chat (read-only Q&A) | ✅ | ✅ |
+| AWS concept Q&A (official-doc retrieval + citations) | ✅ | ✅ |
+| Resource-health inspection (on demand) | ✅ | ✅ |
+| Incident investigation (instant, read-only tools) | ✅ | ✅ |
+| DevOps Agent deep investigation | ❌ | ✅ |
+| Web search (Exa) | ❌ | ✅ (bring your own API key) |
+| **Cost / FinOps** | | |
+| FinOps dashboard (Cost Explorer data) | ✅ deploy account only | ✅ cross-account |
+| CUR + Athena billing-detail drill-down | ❌ | ✅ |
+| **Cases and Skills** | | |
+| Full AWS Support case management | ✅ | ✅ |
+| 11 bundled Skills + your own | ✅ | ✅ |
+| Publish a Skill to DevOps Agent | ❌ | ✅ |
+| **Models** | | |
+| Multi-LLM switching + model catalogue | ✅ | ✅ |
+| Bedrock API key as the credential | ❌ (IAM only) | ✅ |
+| **Proactive / IM** | | |
+| IM channels (Slack / Feishu) | ❌ | ✅ |
+| Proactive push (10 EventBridge sources) | ❌ | ✅ |
+| Daily scheduled inspection (idle resources / cost anomalies) | ❌ | ✅ |
+| Notification inbox | ⚠️ UI present, no backend to produce notifications | ✅ |
+| Admin dashboard (thresholds / target accounts / Skills management) | ❌ | ✅ |
+| **Scope** | | |
+| Multi-account (across an AWS Organization) | ❌ deploy account only | ✅ `--multi-account` |
+| Upgrade | update the stack with the new template (~1 min) | re-run `./setup.sh` |
+
+> 📋 **The AWS Support features (create / view / reply / resolve) require the
+> account to be on a Business, Enterprise On-Ramp, or Enterprise support plan** —
+> that is a requirement of the AWS Support API itself, independent of which
+> deployment path you choose. On Basic / Developer the service list comes back empty.
+
+**The two paths compose**: start with Option A to try it out, then run Option B when
+you want IM push and scheduled inspections (both create an admin named `admin`, so
+they don't collide).
+
+### Upgrading to a new version / deleting the environment
+
+The two options upgrade and uninstall **differently** — follow the one you actually used.
+
+#### Option A (one-click)
+
+**Upgrade to a new version** (measured at about 1 minute):
+
+1. Download the new `notiops-webchat.template.json` from
+   [Releases](https://github.com/aws-samples/sample-notiops/releases).
+2. CloudFormation console → select your stack → **Update** → **Replace existing
+   template** → upload the template you just downloaded.
+3. Change **nothing** on the parameters page — pick **Use existing value** for
+   everything, click through, then **Submit**.
+
+An upgrade does **not**: resend the invitation email, change the admin email or
+password, revert settings you changed in Admin, or wipe chat history. To roll back,
+run the same update again with the **older** template.
+
+**Delete the environment** — the stack has a `TeardownMode` parameter with two settings:
+
+| | What survives |
+|---|---|
+| `KeepData` (default) | The config table, the chat-history table, and the data bucket (your Skills and reports) |
+| `DeleteEverything` | Nothing — everything goes |
+
+⚠️ **Two things to know:**
+
+1. **For a clean delete, the order matters.** First run an **Update** that sets
+   `TeardownMode` to `DeleteEverything` (~45 s), **then** **Delete stack** (~3 min).
+   Changing the parameter in the delete dialog does **nothing**: CloudFormation uses the
+   parameter values from the last successful deployment, so a straight delete behaves
+   as `KeepData`.
+2. **Both modes delete the Cognito user pool.** `KeepData` preserves your *data*, not
+   your *accounts* — after reinstalling you have to invite users again.
+
+Things that may be left behind afterwards (they cost nothing; delete by hand if you
+want a clean account): the two DynamoDB tables and the data bucket that `KeepData`
+preserved, and one log group named like
+`/aws/vendedlogs/RUMService_<stack>-web-chat<hash>` (0 bytes, expires on its own after
+30 days).
+
+#### Option B (`setup.sh`)
+
+- **Upgrade**: `git pull`, then **re-run `./setup.sh`** — it is incremental and only
+  updates what changed. IM credentials you already put in Secrets Manager are not
+  overwritten.
+- **Delete**: there is **no one-click uninstall**. Remove the stacks with
+  `cd infra && npx cdk destroy <stack-name>`. Note that the DynamoDB tables and the
+  reports bucket use a `RETAIN` policy, so they are **not** deleted automatically and
+  need manual cleanup.
 
 ---
 

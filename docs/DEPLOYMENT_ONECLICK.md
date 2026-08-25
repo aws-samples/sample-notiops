@@ -23,7 +23,7 @@
 |---|---|---|
 | 你要准备什么 | git、Node、Python、AWS CDK、Docker/finch + 一份能部署的 AWS 凭证 | **只要一个能登进 AWS 控制台的浏览器** |
 | 怎么开始 | clone 仓库 → `./setup.sh` | 从 Release 下一个模板文件 → 在 CloudFormation 控制台上传 |
-| 部署内容 | Web Chat + IM bot（飞书/Slack）+ 每日巡检 + 管理仪表盘 + CUR/Athena FinOps 数据源 | **只有 Web Chat**（聊天界面 + BFF + agent） |
+| 部署内容 | Web Chat + IM bot（飞书/Slack）+ 每日巡检 + 管理仪表盘 + CUR/Athena FinOps 数据源 | **只有 Web Chat**（聊天界面 + BFF + agent + DevOps Agent Agent Space；可选多账号） |
 | 适合 | 长期使用、要 IM 推送和自动巡检 | 先试用 / 演示 / 只要浏览器里那个只读运维助手 |
 
 **两条路径可以先后走**：先一键部署试用，之后想要 IM 和巡检，再按 [DEPLOYMENT.md](DEPLOYMENT.md) 跑 `setup.sh`（两边建的管理员用户名都是 `admin`，不会打架）。
@@ -37,8 +37,9 @@
 - **管理仪表盘**（阈值配置、目标账户管理、Skills 管理界面）——一键部署只有聊天界面。
 - **「通知」收件箱里的内容**：界面在，但产生通知的后端（Health 事件转发、告警推送）不在。
 - **CUR + Athena 成本明细数据源**：FinOps 提问仍可用 Cost Explorer 口径，但没有账单明细级下钻。
-- **跨账号巡检 / 多 payer 接入**：agent 只看**部署它的这个账号**。
-- **Web 搜索**（Exa）与 **DevOps Agent 深度调查**：这两个功能依赖额外的密钥/服务开通，默认关闭。
+- **跨账号的自动巡检与事件推送**：一键部署可以做**跨账号只读排查/调查/开案例**（`DeployMode=MultiAccount`，见 [§2.6](#26-可选多账号组织内跨账号)），但成员账号侧的 **CloudWatch OAM Sink** 与 **跨账号事件转发**（Health / DevOps Agent 调查事件回流）不在这条路径里 —— 那两样要 `setup.sh`。
+- **Web 搜索**（Exa）：需要你自己的 API key，默认关闭。
+  （**DevOps Agent 深度调查**不在此列 —— 它由这个栈自动建好，见 [§2.7](#27-深度调查aws-devops-agent)。）
 
 ---
 
@@ -53,8 +54,10 @@
 
 ### 1.2 选好区域，并在该区域开通 Bedrock 模型访问
 
-agent 跑在 **Amazon Bedrock** 上。**先去 Bedrock 控制台 → Model access，确认你要用的 Claude 模型在这个区域是「Access granted」**，再来开栈。
+agent 跑在 **Amazon Bedrock** 上。**先去 Bedrock 控制台 → Model access，确认你要用的模型在这个区域是「Access granted」**，再来开栈。
 
+- **默认模型是 xAI 的 Grok 4.6**（`global.xai.grok-4.6`）—— 这一个必须开通，否则装完不能用。
+- 想用别的模型（Claude Sonnet 5 / Opus 5、Amazon Nova Pro、DeepSeek、GPT-5.6 系列）就把对应的也一起开通；用户在聊天页右上角可以按会话切换。
 - 推荐 **us-east-1** 或 **us-west-2**（Bedrock AgentCore 与模型覆盖最全）。
 - 没开通模型访问时，栈会**开成功**、页面能打开、登录也没问题，但一提问就报 `AccessDeniedException`。这是最常见的"部署完了不能用"。
 
@@ -106,6 +109,9 @@ notiops-webchat.template.json
 | **Give the agent account-wide read-only access?** | `Yes` | 选 `Yes` 会给 agent 挂上 AWS 托管的 `ReadOnlyAccess`，于是它能回答这个账号里任何资源的问题。选 `No` 则只保留精选的只读授权（成本、日志、指标、RDS/EC2 describe），有些问题会答不了并明确告诉你缺哪条 action。**两种选择都不给任何写权限。** |
 | **CORS allowed origins** | `*` | 接口本身已经是 `AWS_IAM`（SigV4）鉴权，`*` 不构成越权。想再收一层，可以在第一次部署完之后 update 栈、把它设成 `ChatUrl` 那个地址。 |
 | **On stack delete** | `KeepData` | 决定删栈时你的数据怎么办。见 [§6 删除](#6-删除这个栈)——**改这个值有个坑，删栈前先读那一节**。 |
+| **Deployment mode** | `SingleAccount` | 想让它同时看组织里**其它**账号，就选 `MultiAccount` 并填下面的 org id。有前置条件，见 [§2.6](#26-可选多账号组织内跨账号)。 |
+| **AWS Organizations id (MultiAccount only)** | 空 | 只有选了 `MultiAccount` 才填（`o-` 开头）。**只填一半不生效**（选了 MultiAccount 但 org id 留空 = 仍是单账号），Outputs 的 `DeployModeStatus` 会告诉你。 |
+| **Enable deep investigation (AWS DevOps Agent)?** | `Yes` | 见 [§2.7](#27-深度调查aws-devops-agent)。闲置不计费，所以默认开着；不想要就选 `No`。 |
 | **Artifact base URL override** / **Artifact mirror bucket name (s3:// only)** | 空 | 只有拿不到 GitHub 时才填，见 [§7](#7-无公网出口用私有-s3-镜像)。 |
 
 ### 2.4 勾 IAM 确认框，开栈
@@ -128,6 +134,9 @@ notiops-webchat.template.json
 | **InstalledRelease** | 这个栈当前装的是哪个 release |
 | **DataRetentionOnDelete** | 当前 `TeardownMode` 下，删栈会对数据做什么 |
 | **WebChatTableName** | 存聊天历史与通知的 DynamoDB 表名（想自己查数据、或删栈后手工清理时用） |
+| **DeployModeStatus** | 单账号还是多账号**实际生效**的那个。选了 `MultiAccount` 却忘了填 org id，这里会明说"仍是单账号"。 |
+| **DeepInvestigationStatus** | 深度调查是开着、你自己关了、还是**因为这个区域没有 AWS DevOps Agent 被跳过**。 |
+| **DevOpsAgentSpaceId** | 深度调查开着时才有：栈给你建的 Agent Space id。 |
 
 打开 `ChatUrl`，用：
 
@@ -142,11 +151,36 @@ notiops-webchat.template.json
 
 登录后建议先问一句 `列出这个账号里的 EC2 实例` 之类的，确认 agent 真的能答（顺便验证 §1.2 的模型访问）。
 
+### 2.6 （可选）多账号：组织内跨账号
+
+默认的 `SingleAccount` 只看部署它的这个账号。想让它同时看组织里其它账号，开栈时把 **Deployment mode** 选成 `MultiAccount` 并填 **AWS Organizations id**。
+
+**前置条件（不满足就别选）**：
+
+1. 你部署的这个账号是**组织管理账号**，或者是 **StackSets 的委派管理员**（delegated administrator）。这是硬性的 —— 建成员账号 StackSet 需要这个身份。
+2. 你知道自己的 org id（`o-` 开头）。控制台 **AWS Organizations** 首页就有，或 `aws organizations describe-organization --query Organization.Id`。
+
+**两个都要填。** 只选了 `MultiAccount` 但 org id 留空，栈会**照样开成功、但仍是单账号** —— 这是故意的：org id 是跨账号信任策略里 `aws:PrincipalOrgID` 那道收口条件，没有它，成员账号里的角色就只是"信任系统账号 root"而没有组织边界，不如干脆不开。Outputs 的 `DeployModeStatus` 会把这件事说出来。
+
+**多了什么**：栈会在你这个账号里建两个 StackSet（`notiops-member-onboarding`、`notiops-member-devops-agent`），并打开 Organizations 对 StackSets 的信任访问。之后在 Web 界面的**管理 → 账户**页把成员账号一个个接进来（每个成员账号里会创建一个跨账号**只读**角色 + 一个深度调查触发角色）。接进来之后，你就能在聊天界面切换账号做只读排查、深度调查、开案例。
+
+**这条路径**仍然**没有**：成员账号的 CloudWatch OAM Sink、跨账号 Health / 调查事件回流、跨账号定时巡检。那三样要 `setup.sh`。
+
+> ⚠️ **删栈不会删这两个 StackSet**，也不会关掉信任访问。理由见 [§6.4](#64-会留下的东西孤儿要不要管)。
+
+### 2.7 深度调查（AWS DevOps Agent）
+
+**Enable deep investigation** 默认 `Yes`：栈会顺手建一个 **AWS DevOps Agent Agent Space**（名字 `notiops-oneclick-<账号 id>`）并把本账号以 **monitor（只读）** 身份关联进去。有了它，聊天界面里的「深度调查」才能用 —— 那是把一个问题交给 AWS 托管的 DevOps Agent 去多轮自主排查，比一次问答挖得深。
+
+- **计费**：按**任务运行的 agent-秒**收费，**闲置的 Agent Space 不收费**。所以默认开着不会给你带来一笔"什么都没做的月费"。
+- **区域**：AWS DevOps Agent 只在部分区域可用。**你选的区域没有它，栈不会失败** —— 这一块被静默跳过，其余功能全在，Outputs 的 `DeepInvestigationStatus` 会写明"因为区域跳过"。
+- 事后想改主意：update 栈、把这个参数改掉即可。
+
 ---
 
 ## 3. 这个栈建了什么
 
-44 个资源，都在你自己的账号里：
+默认参数下 **48 个**资源（关掉深度调查是 44；再选上多账号是 51），都在你自己的账号里：
 
 | 类别 | 资源 |
 |---|---|
@@ -157,6 +191,8 @@ notiops-webchat.template.json
 | 数据 | DynamoDB `notiops-config`、`notiops-web-chat`；1 个数据桶（报告等） |
 | 部署辅助 | 1 个 staging 桶（放搬进来的产物）+ 1 个内联的部署 Lambda + 2 个自定义资源 |
 | 权限 | 5 个 IAM 角色 + 5 个内联策略 |
+| 深度调查（默认开） | 1 个 DevOps Agent Agent Space + 1 个只读关联 + 1 个被 DevOps Agent 假设的角色（+ 它的策略） |
+| 多账号（可选） | 1 个自定义资源（去建两个成员账号 StackSet）+ 2 个内联策略 |
 
 **成本量级**（空闲时）：CloudFront + S3 + DynamoDB 按量、Lambda 不调用不计费、AgentCore Runtime 空闲不计费 —— 不用的时候基本只有几毛钱的存储。真正花钱的是**提问时的 Bedrock token**。staging 桶里每个 release 约 **165 MB**（S3 标准存储 ≈ $0.004/月），升级不会自动清掉旧版本，见 [§5](#5-升级到新版本)。
 
@@ -174,6 +210,7 @@ Events 页，找第一条 `CREATE_FAILED`（不是最后一条）。常见的两
 |---|---|
 | `StagerArtifacts` 失败，日志里有超时/连不上 | 这个账号出不了公网、拉不到 GitHub。走 [§7](#7-无公网出口用私有-s3-镜像)。 |
 | `AgentRuntime` 失败 | 该区域可能不支持 Bedrock AgentCore。换 us-east-1 / us-west-2。 |
+| `StagerOrgSetup` 失败，提到 `management account or a delegated administrator` | 你选了 `MultiAccount`，但这个账号既不是组织管理账号也不是 StackSets 委派管理员。改回 `SingleAccount` 重开，或者换个够格的账号。见 [§2.6](#26-可选多账号组织内跨账号)。 |
 
 详细日志在 CloudWatch 日志组 `/aws/lambda/notiops-stager`（把 `notiops` 换成你的栈名）。
 
@@ -211,12 +248,15 @@ CloudFront 分发要几分钟才在全球生效。先等 2–3 分钟、强刷�
 可以，但有两个坑：
 
 ```bash
-# 模板 ~95 KB > --template-body 的 51,200 字节上限 ⇒ 必须先传 S3、用 --template-url
+# 模板 ~140 KB > --template-body 的 51,200 字节上限 ⇒ 必须先传 S3、用 --template-url
 aws s3 cp notiops-webchat.template.json s3://<你的桶>/notiops-webchat.template.json
 aws cloudformation create-stack --stack-name notiops \
   --template-url https://<你的桶>.s3.<区域>.amazonaws.com/notiops-webchat.template.json \
   --capabilities CAPABILITY_IAM \
   --parameters ParameterKey=AdminEmail,ParameterValue=you@example.com
+# 多账号：再加两个参数（缺一不生效，见 §2.6）
+#   ParameterKey=DeployMode,ParameterValue=MultiAccount \
+#   ParameterKey=OrganizationId,ParameterValue=o-xxxxxxxxxx
 ```
 
 漏了 `--capabilities CAPABILITY_IAM` 会被直接拒（栈里有 IAM 角色）。
@@ -284,8 +324,9 @@ CloudFormation → 选中栈 → **Delete**。**实测 ~3 分 10 秒**（两种�
 | `/aws/vendedlogs/RUMService_<栈名>-web-chat<hash>` 日志组 | CloudWatch RUM 自己建的，不属于这个栈 | **可以不管**：实测 0 字节，30 天后自动过期。想清就在 CloudWatch 里按这个**完整名字**删（别按前缀批量删） |
 | `KeepData` 下的两张表 + 数据桶 | 这是 `KeepData` 的**本意** | 不再用了就手工删（桶要先清空） |
 | CloudFront 的访问日志（如果你自己开过） | 不由这个栈管理 | 按需 |
+| **多账号模式下**：`notiops-member-onboarding` / `notiops-member-devops-agent` 两个 StackSet，以及 Organizations 对 StackSets 的信任访问 | **故意留的。** ① StackSet 要先删掉全部 stack instance 才删得掉，而那等于抹掉各成员账号里的跨账号角色 —— 这种跨账号的破坏性动作不该由"删一个栈"隐式触发；② 信任访问是**组织级**开关，删我们的栈就把它关掉会打断组织里别人的 StackSets 部署。 | 确实不要了：先在 CloudFormation → StackSets 里 **Delete stacks from StackSet**（删实例），再删 StackSet 本身。信任访问除非你确认没别人在用，否则别关。 |
 
-**没有**其他孤儿：agent 的日志组、BFF 的日志组、部署 Lambda 的日志组、IAM 角色、Cognito 用户池、RUM app monitor、AgentCore Runtime、网站桶、staging 桶 —— 实测全部随栈删除。
+**没有**其他孤儿：agent 的日志组、BFF 的日志组、部署 Lambda 的日志组、IAM 角色、Cognito 用户池、RUM app monitor、AgentCore Runtime、网站桶、staging 桶 —— 实测全部随栈删除。深度调查建的 Agent Space 与关联也随栈删除（它是栈里的普通资源）。
 
 ---
 

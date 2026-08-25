@@ -20,7 +20,12 @@ import * as zlib from "node:zlib";
 import { getSkillWithFiles, buildSkillMd, setSkillDevopsStatus } from "./skills.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
-const SELF_AGENT_SPACE = process.env.DEVOPS_AGENT_SPACE_ID || "";
+// 未被部署流程替换的 `__FOO__` 占位符按"未配置"处理（与 devops_investigate.mjs 的 envClean、
+// core/devops_agent.py 同策略），否则会拿字面占位符当 space id 去调 API。
+const SELF_AGENT_SPACE = (() => {
+  const v = (process.env.DEVOPS_AGENT_SPACE_ID || "").trim();
+  return v.startsWith("__") && v.endsWith("__") ? "" : v;
+})();
 const SELF_ACCOUNT = process.env.LOCKED_ACCOUNT_ID || process.env.AWS_ACCOUNT_ID || "";
 const CONFIG_TABLE = process.env.CONFIG_TABLE || "notiops-config";
 // Asset API 里 skill 类别的 assetType。开放标准里就叫 "skill"；用 env 兜底以防服务改名。
@@ -147,13 +152,68 @@ function uploadKeyFor(target) {
   return target.scope === "self" ? "self" : (target.accountId || "self");
 }
 
+// ─────────── 本部署账号的 Agent Space：env 优先，缺了就自动发现 ───────────
+// 为什么需要自动发现：DEVOPS_AGENT_SPACE_ID 只在「主栈 + WebChatStack 一起部署」时被
+// 跨栈引用注入。单独部署 WebChatStack（--exclusively）、一键部署的早期版本、或用脚本
+// 手改过 env 的现网，都可能拿到空串 —— 而账号里那个 `notiops-devops-<account>`
+// Agent Space 明明是存在的。此前空串直接 throw no_local_agent_space，等于把「深度调查
+// （直连）」整条路封死，客户侧只看到一句 bad_request。
+// agent runtime 侧（core/devops_agent.py 的 _discover_space）本来就是这么做的；这里补上
+// 同一套逻辑（同样的偏好名 + 缓存），让两条链路对「有没有 Agent Space」的判断一致。
+let _localSpace = null;   // null=未探测过；""=确认这个账号没有；其它=space id
+
+/** 探测本地 Agent Space → { spaceId, inconclusive }。env 指定优先；否则 ListAgentSpaces
+ * 自动发现，偏好 `notiops-devops-<account>`，否则取第一个。
+ *
+ * `inconclusive: true` = 这次**没问出来**（限流 / BFF 角色缺 aidevops:ListAgentSpaces /
+ * 服务抖动），不等于"这个账号没有 Agent Space"。两者必须分开，因为能力探测据此决定要不要
+ * 把「深度调查」开关置灰 —— 老路径（agent runtime）用的是**另一个角色**去发现 space，
+ * 它可能好着呢，此时把按钮变灰就是凭空砍掉一个可用功能。
+ *
+ * ⚠️ 只缓存**确定**的结论（含"列表为空 = 真没有"），inconclusive 不缓存：否则一次抖动会让
+ * 这个 Lambda 容器在整个生命周期里都认为没有 Agent Space。 */
+export async function localAgentSpaceProbe() {
+  if (SELF_AGENT_SPACE) return { spaceId: SELF_AGENT_SPACE, inconclusive: false };
+  if (_localSpace !== null) return { spaceId: _localSpace, inconclusive: false };
+  try {
+    const { DevOpsAgentClient, ListAgentSpacesCommand } = await import("@aws-sdk/client-devops-agent");
+    const client = new DevOpsAgentClient({ region: REGION });
+    const resp = await client.send(new ListAgentSpacesCommand({}));
+    const spaces = resp.agentSpaces || [];
+    const preferred = SELF_ACCOUNT ? `notiops-devops-${SELF_ACCOUNT}` : "";
+    const chosen = (preferred && spaces.find((s) => s.name === preferred)) || spaces[0];
+    _localSpace = chosen?.agentSpaceId || "";   // 列表拿到了就是确定结论（空列表=真没有）
+    return { spaceId: _localSpace, inconclusive: false };
+  } catch (e) {
+    // 只记类型/错误码，不记原始 message（docs/LOGGING_STANDARD.md）。
+    console.warn(`[devops-agent] ListAgentSpaces failed: ${e?.name || "Error"}`);
+    return { spaceId: "", inconclusive: true };
+  }
+}
+
+/** 本地 Agent Space id（拿不到返回 ""）。只关心结果、不关心"为什么拿不到"的调用方用这个。 */
+export async function localAgentSpaceId() {
+  return (await localAgentSpaceProbe()).spaceId;
+}
+
 // export：「深度调查（直连）」(devops_investigate.mjs) 复用同一套目标解析，避免两份跨账号
 // AssumeRole 逻辑漂移。签名/行为保持不变（只加 export），老调用方不受影响。
-export async function resolveTarget(accountId) {
+//
+// opts.probeOnly：只回答"这个账号有没有可用的 Agent Space"，**跳过 AssumeRole**。
+// 给能力探测（deepInvestigationAvailability）用 —— 前端每次切账号都会问一次，
+// 为了把按钮变灰去 assume 一个 15 分钟的跨账号会话完全没必要。
+export async function resolveTarget(accountId, opts = {}) {
   const id = String(accountId || "").trim();
   if (!id || id === SELF_ACCOUNT) {
-    if (!SELF_AGENT_SPACE) throw Object.assign(new Error("no_local_agent_space"), { code: "bad_request" });
-    return { agentSpaceId: SELF_AGENT_SPACE, credentials: undefined, accountId: SELF_ACCOUNT, scope: "self" };
+    const { spaceId, inconclusive } = await localAgentSpaceProbe();
+    if (!spaceId) {
+      // 分开两种失败：确定没有 → bad_request(400)；这次问不出来 → 当服务端错误(500)，
+      // 且能力探测不会据此把开关置灰（见 deepInvestigationAvailability）。
+      throw inconclusive
+        ? new Error("agent_space_probe_failed")
+        : Object.assign(new Error("no_local_agent_space"), { code: "bad_request" });
+    }
+    return { agentSpaceId: spaceId, credentials: undefined, accountId: SELF_ACCOUNT, scope: "self" };
   }
   const { DynamoDBClient } = await import("@aws-sdk/client-dynamodb");
   const { DynamoDBDocumentClient, GetCommand } = await import("@aws-sdk/lib-dynamodb");
@@ -162,6 +222,10 @@ export async function resolveTarget(accountId) {
   const cfg = rec.Item;
   if (!cfg || !cfg.trigger_role_arn || !cfg.agent_space_id) {
     throw Object.assign(new Error("account_not_onboarded_to_devops_agent"), { code: "bad_request" });
+  }
+  if (opts.probeOnly) {
+    return { agentSpaceId: cfg.agent_space_id, credentials: undefined, accountId: id,
+             scope: "cross-payer", region: cfg.region || REGION, probeOnly: true };
   }
   const { STSClient, AssumeRoleCommand } = await import("@aws-sdk/client-sts");
   const sts = new STSClient({});
@@ -313,8 +377,10 @@ export async function removeSkillFromDevopsAgent(skillId, { accountId = "" } = {
  * 的成员账号（da# 记录 status=active）。供前端「上传到哪个 Agent Space」下拉。 */
 export async function listDevopsAgentTargets() {
   const targets = [];
-  if (SELF_AGENT_SPACE) {
-    targets.push({ account_id: SELF_ACCOUNT || "self", agent_space_id: SELF_AGENT_SPACE, scope: "self", label: "本账号 (This account)" });
+  // env 缺失时也别把本账号漏掉 —— 账号里有 Agent Space 就该能选（见 localAgentSpaceId）。
+  const selfSpace = await localAgentSpaceId();
+  if (selfSpace) {
+    targets.push({ account_id: SELF_ACCOUNT || "self", agent_space_id: selfSpace, scope: "self", label: "本账号 (This account)" });
   }
   try {
     const { DynamoDBClient } = await import("@aws-sdk/client-dynamodb");
@@ -331,7 +397,7 @@ export async function listDevopsAgentTargets() {
       // LOCKED_ACCOUNT_ID 未配置时 SELF_ACCOUNT 为空，只能靠 agent_space_id 去重，
       // 否则本部署账号会既以 self 又以 cross-payer 出现（同一个 Agent Space）。
       if (it.account_id === SELF_ACCOUNT) continue;
-      if (it.agent_space_id === SELF_AGENT_SPACE) continue;
+      if (selfSpace && it.agent_space_id === selfSpace) continue;
       targets.push({
         account_id: it.account_id, agent_space_id: it.agent_space_id,
         scope: "cross-payer", label: it.account_alias || it.account_id,

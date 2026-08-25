@@ -22,7 +22,7 @@ The repository ships **two** ways to deploy, with different scope. This document
 |---|---|---|
 | What you need | git, Node, Python, AWS CDK, Docker/finch, plus deployment credentials | **just a browser logged into the AWS console** |
 | How you start | clone the repo → `./setup.sh` | download one template from the Release → upload it in the CloudFormation console |
-| What gets deployed | Web Chat + IM bots (Feishu/Slack) + daily inspection + admin dashboard + CUR/Athena FinOps source | **Web Chat only** (chat UI + BFF + agent) |
+| What gets deployed | Web Chat + IM bots (Feishu/Slack) + daily inspection + admin dashboard + CUR/Athena FinOps source | **Web Chat only** (chat UI + BFF + agent + a DevOps Agent space; multi-account optional) |
 | Good for | long-term use, IM notifications, scheduled inspection | trying it out / demos / just the read-only ops assistant in a browser |
 
 **You can do both, in order**: deploy one-click to try it, then run `setup.sh` later when you want IM and inspection. (Both paths create the same admin username, `admin`, so they don't collide.)
@@ -36,8 +36,9 @@ Better said up front than discovered later. These require `setup.sh`:
 - **The admin dashboard** (thresholds, target-account management, Skills management UI). One-click ships the chat UI only.
 - **Content for the Notifications inbox**: the UI is there, but the backend that produces notifications (Health event forwarding, alert push) is not.
 - **CUR + Athena cost detail**: FinOps questions still work at Cost Explorer granularity, but there is no bill-line-level drill-down.
-- **Cross-account inspection / multi-payer onboarding**: the agent only sees **the account it is deployed into**.
-- **Web search** (Exa) and **DevOps Agent deep investigation**: both need extra keys/service enablement and are off by default.
+- **Cross-account scheduled inspection and event forwarding**: one-click *can* do **cross-account read-only inspection / investigation / case creation** (`DeployMode=MultiAccount`, see [§2.6](#26-optional-multi-account-across-an-organization)), but the member-account **CloudWatch OAM Sink** and **cross-account event forwarding** (Health / DevOps Agent investigation events flowing back) are not part of this path — those need `setup.sh`.
+- **Web search** (Exa): needs your own API key, off by default.
+  (**DevOps Agent deep investigation** is *not* in this list — the stack creates it for you, see [§2.7](#27-deep-investigation-aws-devops-agent).)
 
 ---
 
@@ -52,8 +53,10 @@ Your identity needs to be able to create a CloudFormation stack and the resource
 
 ### 1.2 Pick a region, and enable Bedrock model access there
 
-The agent runs on **Amazon Bedrock**. **Before creating the stack**, go to the Bedrock console → Model access and confirm the Claude model you want shows **Access granted** in that region.
+The agent runs on **Amazon Bedrock**. **Before creating the stack**, go to the Bedrock console → Model access and confirm the model you want shows **Access granted** in that region.
 
+- **The default model is xAI Grok 4.6** (`global.xai.grok-4.6`) — grant access to that one or the deployment is unusable.
+- Want a different model (Claude Sonnet 5 / Opus 5, Amazon Nova Pro, DeepSeek, the GPT-5.6 family)? Grant those too; users can switch per session from the top-right of the chat page.
 - **us-east-1** or **us-west-2** recommended (best Bedrock AgentCore and model coverage).
 - Without model access the stack still **succeeds**, the site loads and login works — but every question fails with `AccessDeniedException`. This is the most common "it deployed but doesn't work".
 
@@ -106,6 +109,9 @@ Everything else has a safe default. For a first deployment, **leave them all alo
 | **Give the agent account-wide read-only access?** | `Yes` | `Yes` attaches the AWS-managed `ReadOnlyAccess` policy so the agent can answer questions about any resource in the account. `No` restricts it to the explicit read-only grants (cost, logs, metrics, RDS/EC2 describe); some questions then fail with a message naming the missing action. **Neither option grants any write permission.** |
 | **CORS allowed origins** | `*` | The endpoint is already `AWS_IAM` (SigV4) authenticated, so `*` is not a privilege hole. For defence in depth, update the stack after the first deploy and set this to the `ChatUrl` output. |
 | **On stack delete** | `KeepData` | Decides what happens to your data when the stack is deleted. See [§6](#6-deleting-the-stack) — **there is a gotcha; read it before you delete**. |
+| **Deployment mode** | `SingleAccount` | Pick `MultiAccount` (and fill in the org id below) to let it also see **other** accounts in your organization. There are prerequisites — see [§2.6](#26-optional-multi-account-across-an-organization). |
+| **AWS Organizations id (MultiAccount only)** | empty | Only needed with `MultiAccount` (starts with `o-`). **Half a choice does nothing**: `MultiAccount` with an empty org id stays single-account, and the `DeployModeStatus` output says so. |
+| **Enable deep investigation (AWS DevOps Agent)?** | `Yes` | See [§2.7](#27-deep-investigation-aws-devops-agent). An idle agent space costs nothing, which is why it defaults to on; pick `No` if you don't want it. |
 | **Artifact base URL override** / **Artifact mirror bucket name (s3:// only)** | empty | Only when you can't reach GitHub — see [§7](#7-no-internet-egress-use-a-private-s3-mirror). |
 
 ### 2.4 Acknowledge IAM, create
@@ -126,6 +132,9 @@ Once the stack is **CREATE_COMPLETE**, open the **Outputs** tab:
 | **InstalledRelease** | Which release this stack currently runs |
 | **DataRetentionOnDelete** | What deleting the stack does to your data under the current `TeardownMode` |
 | **WebChatTableName** | The DynamoDB table holding chat history and notifications (for querying it yourself, or cleaning up manually after a delete) |
+| **DeployModeStatus** | Which mode is **actually in effect**. If you picked `MultiAccount` but forgot the org id, this says so plainly. |
+| **DeepInvestigationStatus** | Whether deep investigation is on, off because you said so, or **skipped because this Region has no AWS DevOps Agent**. |
+| **DevOpsAgentSpaceId** | Present only when deep investigation is on: the agent space the stack created. |
 
 Open `ChatUrl` and sign in with:
 
@@ -140,11 +149,36 @@ Open `ChatUrl` and sign in with:
 
 After signing in, ask something like `list the EC2 instances in this account` to confirm the agent actually answers (this also verifies §1.2).
 
+### 2.6 (Optional) Multi-account: across an organization
+
+The default `SingleAccount` only ever looks at the account it runs in. To let it also see other accounts in your organization, set **Deployment mode** to `MultiAccount` and fill in the **AWS Organizations id**.
+
+**Prerequisites (don't pick it otherwise)**:
+
+1. The account you're deploying into is the **organization management account**, or a **CloudFormation StackSets delegated administrator**. This is hard-required — creating the member StackSets needs that standing.
+2. You know your org id (starts with `o-`). It's on the **AWS Organizations** console home, or `aws organizations describe-organization --query Organization.Id`.
+
+**Both fields are required.** Picking `MultiAccount` while leaving the org id empty still **deploys successfully but stays single-account** — deliberately: the org id is the `aws:PrincipalOrgID` condition that closes off the cross-account trust policy. Without it, the member-account role would merely trust the system account's root with no organization boundary, which is worse than not enabling it. The `DeployModeStatus` output spells this out.
+
+**What you additionally get**: the stack creates two StackSets in this account (`notiops-member-onboarding`, `notiops-member-devops-agent`) and enables Organizations trusted access for StackSets. You then onboard member accounts one at a time from **Admin → Accounts** in the web UI (each member account gets a cross-account **read-only** role plus a deep-investigation trigger role). After that you can switch accounts in the chat UI for read-only inspection, deep investigation, and case creation.
+
+This path still does **not** include: member-account CloudWatch OAM Sinks, cross-account Health / investigation event forwarding, or cross-account scheduled inspection. Those three need `setup.sh`.
+
+> ⚠️ **Deleting the stack does not delete those two StackSets**, nor does it disable trusted access. Reasoning in [§6.4](#64-whats-left-behind-orphans-and-whether-to-care).
+
+### 2.7 Deep investigation (AWS DevOps Agent)
+
+**Enable deep investigation** defaults to `Yes`: the stack also creates an **AWS DevOps Agent agent space** (named `notiops-oneclick-<account id>`) and associates this account with it as a **monitor (read-only)** target. That's what powers "deep investigation" in the chat UI — handing a problem to the AWS-managed DevOps Agent for multi-round autonomous triage, which digs deeper than a single question-and-answer round.
+
+- **Billing**: charged per **agent-second while a task runs**; an **idle agent space costs nothing**. That's why it defaults to on — it won't hand you a monthly bill for doing nothing.
+- **Regions**: AWS DevOps Agent is only available in some Regions. **If yours isn't one of them the stack does not fail** — this piece is silently skipped, everything else works, and `DeepInvestigationStatus` says it was skipped for that reason.
+- Changed your mind later: update the stack and flip the parameter.
+
 ---
 
 ## 3. What the stack creates
 
-44 resources, all in your own account:
+**48 resources** with the default parameters (44 with deep investigation off; 51 if you also pick multi-account), all in your own account:
 
 | Category | Resources |
 |---|---|
@@ -155,6 +189,8 @@ After signing in, ask something like `list the EC2 instances in this account` to
 | Data | DynamoDB `notiops-config`, `notiops-web-chat`; 1 data bucket (reports etc.) |
 | Deployment helper | 1 staging bucket (for the staged artifacts) + 1 inline Lambda + 2 custom resources |
 | Permissions | 5 IAM roles + 5 inline policies |
+| Deep investigation (on by default) | 1 DevOps Agent agent space + 1 read-only association + 1 role assumed by DevOps Agent (plus its policy) |
+| Multi-account (optional) | 1 custom resource (creates the two member StackSets) + 2 inline policies |
 
 **Cost, idle**: CloudFront, S3 and DynamoDB are pay-per-use, Lambda costs nothing when not invoked, and an idle AgentCore Runtime costs nothing — idle, this is cents of storage. The real cost is **Bedrock tokens when you ask questions**. Each installed release keeps ~**165 MB** in the staging bucket (≈ $0.004/month in S3 Standard); upgrades don't purge old versions, see [§5](#5-upgrading).
 
@@ -172,6 +208,7 @@ On the Events tab, find the **first** `CREATE_FAILED` (not the last). The two co
 |---|---|
 | `StagerArtifacts` failed, logs show a timeout / connection error | The account has no internet egress and can't reach GitHub. Go to [§7](#7-no-internet-egress-use-a-private-s3-mirror). |
 | `AgentRuntime` failed | The region may not support Bedrock AgentCore. Use us-east-1 / us-west-2. |
+| `StagerOrgSetup` failed, mentioning `management account or a delegated administrator` | You picked `MultiAccount`, but this account is neither the organization management account nor a StackSets delegated administrator. Redeploy with `SingleAccount`, or use an account that qualifies. See [§2.6](#26-optional-multi-account-across-an-organization). |
 
 Detailed logs are in the CloudWatch log group `/aws/lambda/notiops-stager` (substitute your stack name).
 
@@ -207,12 +244,15 @@ A new CloudFront distribution takes a few minutes to propagate. Wait 2–3 minut
 You can, with two catches:
 
 ```bash
-# The template is ~95 KB > the 51,200-byte --template-body limit, so it must go via S3 + --template-url
+# The template is ~140 KB > the 51,200-byte --template-body limit, so it must go via S3 + --template-url
 aws s3 cp notiops-webchat.template.json s3://<your-bucket>/notiops-webchat.template.json
 aws cloudformation create-stack --stack-name notiops \
   --template-url https://<your-bucket>.s3.<region>.amazonaws.com/notiops-webchat.template.json \
   --capabilities CAPABILITY_IAM \
   --parameters ParameterKey=AdminEmail,ParameterValue=you@example.com
+# Multi-account: add both of these (either one alone does nothing, see §2.6)
+#   ParameterKey=DeployMode,ParameterValue=MultiAccount \
+#   ParameterKey=OrganizationId,ParameterValue=o-xxxxxxxxxx
 ```
 
 Omitting `--capabilities CAPABILITY_IAM` is rejected outright (the stack contains IAM roles).
@@ -280,8 +320,9 @@ During deletion the stack's deployment Lambda first **empties** the website and 
 | Log group `/aws/vendedlogs/RUMService_<stack>-web-chat<hash>` | Created by CloudWatch RUM itself; not owned by the stack | **Fine to ignore**: measured at 0 bytes, expires after 30 days. To clean up, delete it in CloudWatch by its **full name** (don't bulk-delete by prefix) |
 | The two tables + data bucket under `KeepData` | That is what `KeepData` **means** | Delete manually when you're done with them (empty the bucket first) |
 | CloudFront access logs, if you enabled them yourself | Not managed by this stack | As you like |
+| **In multi-account mode**: the `notiops-member-onboarding` / `notiops-member-devops-agent` StackSets, and Organizations trusted access for StackSets | **Deliberate.** (1) A StackSet can only be deleted once every stack instance is gone, and removing those wipes the cross-account roles in your member accounts — a cross-account destructive action shouldn't be triggered implicitly by deleting one stack. (2) Trusted access is an **organization-wide** switch; turning it off with our stack would break other people's StackSet deployments. | If you really want them gone: CloudFormation → StackSets → **Delete stacks from StackSet** (removes the instances), then delete the StackSet itself. Leave trusted access alone unless you're sure nobody else relies on it. |
 
-**No other orphans**: the agent's log group, the BFF's log group, the deployment Lambda's log group, IAM roles, the Cognito user pool, the RUM app monitor, the AgentCore Runtime, the website bucket and the staging bucket were all verified to go away with the stack.
+**No other orphans**: the agent's log group, the BFF's log group, the deployment Lambda's log group, IAM roles, the Cognito user pool, the RUM app monitor, the AgentCore Runtime, the website bucket and the staging bucket were all verified to go away with the stack. The agent space and association created for deep investigation also go away with it (they are ordinary stack resources).
 
 ---
 

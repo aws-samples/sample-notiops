@@ -278,7 +278,7 @@ The BFF turns AgentCore Runtime output into a single SSE event stream; the front
 
 #### 2.4.5 Left-side theme navigation (ordered)
 
-Notifications / Investigate / FinOps / Cases / Skills (top-level) / More (security · inspection-report external links · customization). New conversations default to **Claude Sonnet 4.6**; other options are Amazon Nova Pro, Claude Haiku 4.5, DeepSeek V3.2, GPT-5.4 (experimental). Model preference is remembered per conversation, and each reply is attributed with the model used. The account selector defaults to the deployment account (team-shared); the web-search toggle defaults to off.
+Notifications / Investigate / FinOps / Cases / Skills (top-level) / More (security · inspection-report external links · customization). New conversations default to **Grok 4.6**; other options are Claude Sonnet 5, Claude Opus 5, Claude Haiku 4.5, Amazon Nova Pro, DeepSeek V3.2, and GPT-5.6 (Terra / Sol / Luna). Both the default and the enabled set are set by an administrator on the Admin "Models" page (source of truth: `config/llm-model-catalog.json` → DynamoDB `llmcfg`). Model preference is remembered per conversation, and each reply is attributed with the model used. The account selector defaults to the deployment account (team-shared); the web-search toggle defaults to off.
 
 > ⚠️ **FinOps Agent deep analysis is currently greyed-out / disabled (coming soon, not yet complete)**: the DevOps Agent toggle now shows in both the "Investigate" and "FinOps" themes, and inside FinOps it can enable deep cost / usage analysis; however the **FinOps Agent toggle is currently greyed-out / disabled** and the UI shows "coming soon". Entering the FinOps theme, the toggle defaults to off (only the "Investigate" theme defaults it on).
 
@@ -667,7 +667,7 @@ def respond(user_text, *, command, chitchat_count, locale="en") -> str:
     if not reply: return CHITCHAT_DOWNGRADED_TEXT # Bedrock failure → canned message
     if _audit_response_for_change(reply):
         return REFUSAL                             # L3
-    return reply + _model_footer()                 # model attribution (see §4.2.8)
+    return reply + "\n\nBy " + model_label + " (via Amazon Bedrock)"   # model attribution (see §4.2.8)
 ```
 
 When `""` is returned (mode=disabled), the caller falls back to the investigate path; when a canned message is returned (Bedrock failure / qa_only chitchat), the user can keep talking. **Messages are never silently dropped.**
@@ -677,11 +677,12 @@ When `""` is returned (mode=disabled), the caller falls back to the investigate 
 A single-line model attribution is appended to every LLM-produced reply, so users can see clearly which model the answer came from (rather than treating it as an authoritative answer):
 
 ```
-By Claude Sonnet 4.6
+By Grok 4.6 (via Amazon Bedrock)
 ```
 
-- Implementation: `core/bedrock_chat.py::_model_footer()` uses `_friendly_model_name()` to map an inference profile id (e.g. `us.anthropic.claude-sonnet-4-6`) to a friendly name ("Claude Sonnet 4.6")
-- The map covers Opus 4.7/4.6, Sonnet 4.6/4.5/3.7/3.5, Haiku 4.5/3.5; **unknown models fall back to the raw ID** (helps debugging)
+- Implementation: `core/bedrock_chat.py::respond()` builds `By <label> (via Amazon Bedrock)` straight from the catalogue entry resolved for this turn (`model_entry.label`)
+- **There is exactly one model-name table — the catalogue itself** (DynamoDB, editable on the Admin "Models" page). An earlier hardcoded `_MODEL_FRIENDLY_NAMES` / `_friendly_model_name()` / `_model_footer()` trio was deleted in 2026-08 (spec task 4.4): it had no callers left, and its substring matching was unsound (the needle `claude-sonnet-5` also matches a future `claude-sonnet-5x`). Aliases missing from the catalogue fall back inside `core/model_catalog.py`
+- The byline follows the model currently selected for this chat / DM (Grok 4.6 by default) — it is not pinned to Claude
 - Plain-text format (no markdown italics), because Feishu's `reply_text` path does not render markdown — `_..._` would show up literally
 
 Code: [core/bedrock_chat.py](../core/bedrock_chat.py)
@@ -1037,7 +1038,7 @@ Triggered by user phrases like "analyze case xxx" / "summarize case xxx" / "what
 2. **Prompt assembly** ([core/case_analyze.py](../core/case_analyze.py) `_format_for_prompt`):
    - Structured markdown payload — case header + numbered communications + speaker labels
    - Per-message hard cap at 4000 chars; longer messages truncated with `[…truncated]`
-3. **LLM invocation** (`bedrock-runtime:InvokeModel`, model picked by `get_bot_model_id()` so the chat's current model preference — Sonnet 4.6 / Nova / GPT — is honored):
+3. **LLM invocation** (`bedrock-runtime:InvokeModel`, model picked by `get_bot_model_id()` — i.e. SSM `/notiops/agent/model_id`, currently `global.anthropic.claude-sonnet-5`. ⚠️ this call site does **not** follow the `@bot model` per-chat preference: it hand-rolls an Anthropic-native body, so a non-Claude model would raise ValidationException — see `shared/model_config.py`):
    - System prompt hard rules:
      - Do not invent resource IDs, ARNs, or account IDs
      - Do not output mutating commands (Zero-Change Promise; read-only commands are fine)
@@ -1200,7 +1201,7 @@ Code: [core/i18n.py](../core/i18n.py), [core/locale_resolver.py](../core/locale_
 User asks "what's the difference between ALB and NLB"
    │
    ▼  bedrock_chat.respond(...) goes through Bedrock Tool Use
-Bedrock Sonnet 4.6
+Bedrock conversational model (Grok 4.6 by default)
    │  decides whether to call a tool autonomously
    ├── aws_docs_search(query)    ← MCP tool 1
    ├── aws_docs_read(url)         ← MCP tool 2
@@ -1214,7 +1215,7 @@ fed back to Bedrock for further reasoning
    ▼  final Bedrock reply contains:
 body text + 📚 sources block (each cited URL)
    + 🔧 MCP tools called (transparency)
-   + By Claude Sonnet 4.6 footer
+   + By <model> (via Amazon Bedrock) footer
 ```
 
 #### 4.10.2 Module boundaries

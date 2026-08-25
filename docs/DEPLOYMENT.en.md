@@ -9,7 +9,8 @@
 > **Expected duration**: **~30 min via §0 Quick Deploy** / ~2 hours for the full walkthrough.
 >
 > **Companion docs**:
-> - [USER_GUIDE.md](USER_GUIDE.md) — end-user usage guide
+> - [USER_GUIDE.en.md](USER_GUIDE.en.md) — end-user usage guide
+> - [DEPLOYMENT_ONECLICK.en.md](DEPLOYMENT_ONECLICK.en.md) — **the other path**: read that one if you only want Web Chat and don't want a local toolchain
 
 **Version**: v3.0 · 2026-06-09 (post-fusion CDK rewrite)
 
@@ -39,6 +40,13 @@
 ## 0. Quick Deploy (TL;DR)
 
 > For "get it running first, read details later". All commands assume you've already finished §2 Prerequisites. The web console (browser chat) deploys by default and is the product's main entry; IM (Feishu / Slack) is an optional supplement — only walk §3 Register IM Apps if you want to enable it.
+
+> 💡 **Just want to try Web Chat?** Then you can skip this whole document.
+> [DEPLOYMENT_ONECLICK.en.md](DEPLOYMENT_ONECLICK.en.md) is a path that needs **nothing installed
+> locally and no access keys**: download one CloudFormation template from the Release, upload it in
+> the console, stack done in ~4.5 minutes. The trade-off is that it deploys **Web Chat only** — no IM
+> bots, no daily inspection, no admin dashboard. Want those, come back here and run `setup.sh`
+> (both paths create the same admin username, `admin`, so doing one then the other is fine).
 
 ### 0.1 One-command deploy
 

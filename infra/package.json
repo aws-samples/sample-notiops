@@ -6,6 +6,7 @@
     "build": "tsc",
     "cdk": "cdk",
     "synth": "cdk synth",
+    "synth:standalone": "cdk synth --app 'npx ts-node bin/standalone.ts' NotiOps",
     "deploy": "cdk deploy --all",
     "diff": "cdk diff",
     "test": "jest"

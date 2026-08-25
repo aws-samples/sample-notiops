@@ -1,0 +1,336 @@
+# NotiOps — 一键部署（CloudFormation，无需本地环境）
+
+> ⚠️ **免责声明 / Disclaimer**：这是示例代码(sample code)，仅供学习与参考，**非生产就绪产品**。正式部署或承载生产工作负载前，请与贵组织的安全与法务团队一起，按你们的安全、监管与合规要求对其进行充分测试、加固与优化。
+> _This is sample code, for non-production usage. You should work with your security and legal teams to meet your organizational security, regulatory and compliance requirements before deployment._
+
+> 🌐 **Language**: [中文](DEPLOYMENT_ONECLICK.md) · [English](DEPLOYMENT_ONECLICK.en.md)
+>
+> **目标读者**：想先把 Web Chat 跑起来看看的人。**不需要**本地装任何东西，**不需要**创建 IAM 用户和 access key。
+>
+> **预期完成时间**：**~10 分钟**（其中开栈本身实测 ~4.5 分钟）。
+>
+> **配套文档**：
+> - [DEPLOYMENT.md](DEPLOYMENT.md) — 完整部署手册（`setup.sh` 路径：IM bot、巡检、仪表盘、CUR/Athena 全量功能）
+> - [USER_GUIDE.md](USER_GUIDE.md) — 部署完之后怎么用
+
+---
+
+## 0. 先搞清楚：两条部署路径，这篇讲哪一条
+
+仓库里有**两条**部署路径，功能范围不同。这篇只讲第二条。
+
+| | **`setup.sh`**（完整版，见 [DEPLOYMENT.md](DEPLOYMENT.md)） | **本篇：一键部署** |
+|---|---|---|
+| 你要准备什么 | git、Node、Python、AWS CDK、Docker/finch + 一份能部署的 AWS 凭证 | **只要一个能登进 AWS 控制台的浏览器** |
+| 怎么开始 | clone 仓库 → `./setup.sh` | 从 Release 下一个模板文件 → 在 CloudFormation 控制台上传 |
+| 部署内容 | Web Chat + IM bot（飞书/Slack）+ 每日巡检 + 管理仪表盘 + CUR/Athena FinOps 数据源 | **只有 Web Chat**（聊天界面 + BFF + agent） |
+| 适合 | 长期使用、要 IM 推送和自动巡检 | 先试用 / 演示 / 只要浏览器里那个只读运维助手 |
+
+**两条路径可以先后走**：先一键部署试用，之后想要 IM 和巡检，再按 [DEPLOYMENT.md](DEPLOYMENT.md) 跑 `setup.sh`（两边建的管理员用户名都是 `admin`，不会打架）。
+
+### 0.1 一键部署**不包含**什么
+
+说清楚比事后惊讶好。下面这些**这条路径不部署**，需要 `setup.sh`：
+
+- **IM bot**（飞书 / Slack / 钉钉）——包括往 IM 推送告警。
+- **每日自动巡检**（闲置资源检测、成本异常扫描）与它的 5 个 Lambda。
+- **管理仪表盘**（阈值配置、目标账户管理、Skills 管理界面）——一键部署只有聊天界面。
+- **「通知」收件箱里的内容**：界面在，但产生通知的后端（Health 事件转发、告警推送）不在。
+- **CUR + Athena 成本明细数据源**：FinOps 提问仍可用 Cost Explorer 口径，但没有账单明细级下钻。
+- **跨账号巡检 / 多 payer 接入**：agent 只看**部署它的这个账号**。
+- **Web 搜索**（Exa）与 **DevOps Agent 深度调查**：这两个功能依赖额外的密钥/服务开通，默认关闭。
+
+---
+
+## 1. 前置条件（三条，都要满足）
+
+### 1.1 一个能开栈的 AWS 账号 + 控制台权限
+
+你的身份需要能创建 CloudFormation 栈以及栈里的资源（IAM 角色、Lambda、DynamoDB、S3、CloudFront、Cognito、Bedrock AgentCore）。**没有 `AdministratorAccess` 也能做**，但权限太窄会在开栈中途失败；如果不确定，先用一个测试账号。
+
+> 开栈时必须勾选 **"I acknowledge that AWS CloudFormation might create IAM resources"** ——
+> 这个栈要为 agent 和 BFF 建角色。
+
+### 1.2 选好区域，并在该区域开通 Bedrock 模型访问
+
+agent 跑在 **Amazon Bedrock** 上。**先去 Bedrock 控制台 → Model access，确认你要用的 Claude 模型在这个区域是「Access granted」**，再来开栈。
+
+- 推荐 **us-east-1** 或 **us-west-2**（Bedrock AgentCore 与模型覆盖最全）。
+- 没开通模型访问时，栈会**开成功**、页面能打开、登录也没问题，但一提问就报 `AccessDeniedException`。这是最常见的"部署完了不能用"。
+
+### 1.3 这个账号要能访问 GitHub（或者准备一个私有镜像）
+
+部署过程中，栈里的一个 Lambda 会去 **GitHub Release** 下三个产物（前端、BFF、agent 代码）搬进你自己的 S3 桶。Lambda 默认不在 VPC 里、走 AWS 托管的公网出口，**绝大多数账号天然满足**。
+
+企业环境如果**出口白名单不含 github.com**，不必放弃这条路径 —— 见 [§7 无公网出口：用私有 S3 镜像](#7-无公网出口用私有-s3-镜像)。
+
+---
+
+## 2. 部署（5 步）
+
+### 2.1 下模板
+
+打开 [Releases](https://github.com/aws-samples/sample-notiops/releases) 页，从最新的 release 里下载：
+
+```
+notiops-webchat.template.json
+```
+
+同一个 release 里还有三个产物（`bff.zip` / `chat-dist.zip` / `agent-code.zip`）——**不用下**，模板会让你的账号自己去取。模板里写死了这三个文件的 SHA256，下载后当场校验，不匹配就让开栈失败。
+
+> **为什么不是"点一下就开栈"的 Launch Stack 链接？** CloudFormation 的 `TemplateURL` 只接受
+> S3 上的对象，不接受 GitHub 的 URL。所以这里多两步点击（下载 + 上传），换来的是我们
+> **不托管任何东西**：产物只在 GitHub Release 上，代码进你账号的每一步都是你自己的凭证在动。
+
+### 2.2 在 CloudFormation 控制台上传
+
+1. 确认右上角**区域**是你在 §1.2 选好的那个。
+2. **CloudFormation** → **Create stack** → **With new resources (standard)**。
+3. **Choose an existing template** → **Upload a template file** → 选刚下的 `notiops-webchat.template.json` → **Next**。
+   （控制台会自己把模板存进 CFN 托管的 S3，你不需要有桶。）
+
+### 2.3 填参数
+
+**Stack name** 填 `notiops`（下面的文档都按这个名字写；换名字也行，DynamoDB 表名固定为 `notiops-config` / `notiops-web-chat`，与栈名无关）。
+
+只有**一个参数必填**：
+
+| 参数 | 说明 |
+|---|---|
+| **Administrator email** | 你的邮箱。栈开完后 Cognito 会往这里发一封带**临时密码**的邮件。必须是真实可收的邮箱 —— **这是唯一的入口**。 |
+
+其余都有安全的默认值，第一次部署**建议全部不动**：
+
+| 参数 | 默认 | 什么时候才需要改 |
+|---|---|---|
+| **Give the agent account-wide read-only access?** | `Yes` | 选 `Yes` 会给 agent 挂上 AWS 托管的 `ReadOnlyAccess`，于是它能回答这个账号里任何资源的问题。选 `No` 则只保留精选的只读授权（成本、日志、指标、RDS/EC2 describe），有些问题会答不了并明确告诉你缺哪条 action。**两种选择都不给任何写权限。** |
+| **CORS allowed origins** | `*` | 接口本身已经是 `AWS_IAM`（SigV4）鉴权，`*` 不构成越权。想再收一层，可以在第一次部署完之后 update 栈、把它设成 `ChatUrl` 那个地址。 |
+| **On stack delete** | `KeepData` | 决定删栈时你的数据怎么办。见 [§6 删除](#6-删除这个栈)——**改这个值有个坑，删栈前先读那一节**。 |
+| **Artifact base URL override** / **Artifact mirror bucket name (s3:// only)** | 空 | 只有拿不到 GitHub 时才填，见 [§7](#7-无公网出口用私有-s3-镜像)。 |
+
+### 2.4 勾 IAM 确认框，开栈
+
+**Next** → 到最后一页勾上 **"I acknowledge that AWS CloudFormation might create IAM resources"** → **Submit**。
+
+**实测耗时约 4.5 分钟**（两次独立测量：4m16s / 4m25s，us-east-1）。中途你会看到栈在等两个
+`Custom::NotiOpsStager…` 资源 —— 那是它在把 ~165 MB 产物从 GitHub 搬进你的 S3 桶、
+解压前端、写运行时配置、建管理员用户。
+
+### 2.5 登录
+
+栈变 **CREATE_COMPLETE** 后，去 **Outputs** 页：
+
+| Output | 是什么 |
+|---|---|
+| **ChatUrl** | 聊天界面地址（CloudFront）。**打开这个。** |
+| **ChatBffUrl** | 后端接口地址（前端自己会用，你不用管） |
+| **NextSteps** | 一句话的登录指引 |
+| **InstalledRelease** | 这个栈当前装的是哪个 release |
+| **DataRetentionOnDelete** | 当前 `TeardownMode` 下，删栈会对数据做什么 |
+| **WebChatTableName** | 存聊天历史与通知的 DynamoDB 表名（想自己查数据、或删栈后手工清理时用） |
+
+打开 `ChatUrl`，用：
+
+- **用户名：`admin`**（不是邮箱；邮箱也能登，它被配成了别名）
+- **密码**：邮件里的临时密码，首次登录会要求你改成新密码
+
+> 📧 **收不到邮件？** 发件人是 `no-reply@verificationemail.com`（Cognito 默认发信），
+> 主题 `Your temporary password`。**企业邮箱常常给它打上 `[EXTERNAL]` 标记或直接丢进垃圾邮件**
+> —— 先翻垃圾箱。实测在 us-east-1 从栈完成到收信约 1 分钟。
+>
+> 真的丢了：Cognito 控制台 → 该 user pool → Users → `admin` → 重设密码。
+
+登录后建议先问一句 `列出这个账号里的 EC2 实例` 之类的，确认 agent 真的能答（顺便验证 §1.2 的模型访问）。
+
+---
+
+## 3. 这个栈建了什么
+
+44 个资源，都在你自己的账号里：
+
+| 类别 | 资源 |
+|---|---|
+| 前端 | S3 网站桶 + CloudFront distribution + CloudWatch RUM |
+| 接口 | 1 个 Lambda（BFF）+ Function URL（`AWS_IAM` 鉴权，流式返回） |
+| Agent | 1 个 Bedrock AgentCore Runtime |
+| 登录 | Cognito User Pool + Client + Identity Pool + 8 个用户组（角色） |
+| 数据 | DynamoDB `notiops-config`、`notiops-web-chat`；1 个数据桶（报告等） |
+| 部署辅助 | 1 个 staging 桶（放搬进来的产物）+ 1 个内联的部署 Lambda + 2 个自定义资源 |
+| 权限 | 5 个 IAM 角色 + 5 个内联策略 |
+
+**成本量级**（空闲时）：CloudFront + S3 + DynamoDB 按量、Lambda 不调用不计费、AgentCore Runtime 空闲不计费 —— 不用的时候基本只有几毛钱的存储。真正花钱的是**提问时的 Bedrock token**。staging 桶里每个 release 约 **165 MB**（S3 标准存储 ≈ $0.004/月），升级不会自动清掉旧版本，见 [§5](#5-升级到新版本)。
+
+**只读设计**：agent 拿到的全是只读授权，产品层面也没有任何"改你资源"的工具。它能做的最大动作是**开一个 AWS Support 案例**（且需要你在对话里确认）。
+
+---
+
+## 4. 出问题了怎么办
+
+### 4.1 栈 ROLLBACK 了 —— 先看是哪个资源失败
+
+Events 页，找第一条 `CREATE_FAILED`（不是最后一条）。常见的两类：
+
+| 症状 | 原因与处置 |
+|---|---|
+| `StagerArtifacts` 失败，日志里有超时/连不上 | 这个账号出不了公网、拉不到 GitHub。走 [§7](#7-无公网出口用私有-s3-镜像)。 |
+| `AgentRuntime` 失败 | 该区域可能不支持 Bedrock AgentCore。换 us-east-1 / us-west-2。 |
+
+详细日志在 CloudWatch 日志组 `/aws/lambda/notiops-stager`（把 `notiops` 换成你的栈名）。
+
+### 4.2 ⚠️ 失败重试前，必须先删掉三个"留下来的"资源
+
+这是**最容易卡住的一步**。为了保护数据，下面三个资源上带着 `Retain`：
+
+- DynamoDB 表 `notiops-config`
+- DynamoDB 表 `notiops-web-chat`
+- S3 桶 `notiops-data-<账号ID>-<区域>`
+
+**即使开栈失败回滚，它们也会留下**（Events 里显示 `DELETE_SKIPPED`）。于是你直接重试会撞上
+`BucketAlreadyOwnedByYou` / 表已存在。正确顺序：
+
+```
+1. 删掉那个失败的栈（DELETE_COMPLETE）
+2. 删掉上面两张表和那个 S3 桶（桶要先清空）
+3. 再重新开栈
+```
+
+（如果第一次部署已经用过、里面有你想留的数据，就**不要**删表/桶 —— 重开栈时它们会被复用。）
+
+### 4.3 页面打开是白屏 / 404
+
+CloudFront 分发要几分钟才在全球生效。先等 2–3 分钟、强刷一次。仍然不行：确认 Outputs 里的
+`ChatUrl` 是完整的 `https://xxx.cloudfront.net`，并检查网站桶里有 `index.html`、`config.json` 和 `assets/`。
+
+### 4.4 登录成功但提问报错
+
+- `AccessDeniedException` 提到 `bedrock` → §1.2 的模型访问没开。
+- 报错提到某个具体 action（比如 `rds:DescribeDBInstances`）→ 你把 **Give the agent account-wide read-only access** 选成了 `No`。要么按提示补授权，要么 update 栈改回 `Yes`。
+
+### 4.5 想用命令行而不是控制台
+
+可以，但有两个坑：
+
+```bash
+# 模板 ~95 KB > --template-body 的 51,200 字节上限 ⇒ 必须先传 S3、用 --template-url
+aws s3 cp notiops-webchat.template.json s3://<你的桶>/notiops-webchat.template.json
+aws cloudformation create-stack --stack-name notiops \
+  --template-url https://<你的桶>.s3.<区域>.amazonaws.com/notiops-webchat.template.json \
+  --capabilities CAPABILITY_IAM \
+  --parameters ParameterKey=AdminEmail,ParameterValue=you@example.com
+```
+
+漏了 `--capabilities CAPABILITY_IAM` 会被直接拒（栈里有 IAM 角色）。
+
+---
+
+## 5. 升级到新版本
+
+新 release 出来后：**下新版模板 → update 现有栈**（不要新开一个栈）。
+
+1. 从新 release 下 `notiops-webchat.template.json`。
+2. CloudFormation → 选中你的栈 → **Update** → **Replace existing template** → **Upload a template file**。
+3. 参数保持 **Use existing value**（除了你确实想改的）→ 勾 IAM → Submit。
+
+**实测 ~1 分钟**。升级过程中会发生：新产物搬进 staging 桶（key 里带 release tag，所以旧版本对象仍在）
+→ 前端重新发布并清掉上一版残留文件 → CloudFront 缓存失效（`/*`）→ AgentCore Runtime **原地**出一个新版本（ARN 不变，前端配置不用动）。
+
+**升级不会**：重发邀请邮件、改管理员的邮箱或密码、动 `config.json` 里已有的配置、清空你的聊天历史。
+
+**回滚**：用**旧版本的模板**再 update 一次即可（产物按 tag 存在 staging 桶里，旧对象还在）。
+
+> **staging 桶会累积**：每个装过的 release 留 ~165 MB。想清理就手工删 staging 桶里
+> `agent/<旧tag>/` 和 `frontend/<旧tag>/` 前缀下的对象 —— **别删当前 release 的**，
+> 那会让下一次栈更新找不到代码。
+
+---
+
+## 6. 删除这个栈
+
+### 6.1 先决定数据怎么办
+
+`TeardownMode` 参数决定删栈时下面三样东西的命运：
+
+| | `KeepData`（默认） | `DeleteEverything` |
+|---|---|---|
+| `notiops-config` 表（配置） | **保留** | 删除 |
+| `notiops-web-chat` 表（聊天历史、通知） | **保留** | 删除 |
+| 数据桶 `notiops-data-…`（导出的报告等） | **保留** | 删除 |
+| 其他一切（前端、CloudFront、Lambda、agent、**Cognito 用户池**） | 删除 | 删除 |
+
+> ⚠️ **两种模式下 Cognito 用户池都会被删除** —— 也就是用户和密码都没了。`KeepData` 保的是
+> **数据**，不是账号。重新部署后需要用新收到的临时密码重新登录（数据还在）。
+
+### 6.2 ⚠️ 想用 `DeleteEverything`：必须先 update，再 delete
+
+CloudFormation 在删栈时交给自定义资源的是**上一次成功部署时的参数值**，不是你删栈那一刻想要的值。所以「在删栈对话框里改 TeardownMode」这件事**不存在**。正确做法：
+
+```
+1. Update 栈，只把 On stack delete 改成 DeleteEverything（实测 ~45 秒）
+2. 然后 Delete 栈
+```
+
+顺序错了的后果是"沉默的"：栈删掉了，但表和桶还在，你以为清干净了。
+
+### 6.3 删除
+
+CloudFormation → 选中栈 → **Delete**。**实测 ~3 分 10 秒**（两种模式都一样）。
+
+删栈过程中，栈里的部署 Lambda 会先把网站桶和 staging 桶**清空**（非空的桶删不掉，会把整个删栈卡住），然后按 `TeardownMode` 决定要不要删那两张表和数据桶。实测两种模式都是**零 `DELETE_FAILED`**。
+
+### 6.4 会留下的东西（孤儿），要不要管
+
+| 留下的 | 为什么 | 建议 |
+|---|---|---|
+| `/aws/vendedlogs/RUMService_<栈名>-web-chat<hash>` 日志组 | CloudWatch RUM 自己建的，不属于这个栈 | **可以不管**：实测 0 字节，30 天后自动过期。想清就在 CloudWatch 里按这个**完整名字**删（别按前缀批量删） |
+| `KeepData` 下的两张表 + 数据桶 | 这是 `KeepData` 的**本意** | 不再用了就手工删（桶要先清空） |
+| CloudFront 的访问日志（如果你自己开过） | 不由这个栈管理 | 按需 |
+
+**没有**其他孤儿：agent 的日志组、BFF 的日志组、部署 Lambda 的日志组、IAM 角色、Cognito 用户池、RUM app monitor、AgentCore Runtime、网站桶、staging 桶 —— 实测全部随栈删除。
+
+---
+
+## 7. 无公网出口：用私有 S3 镜像
+
+如果你的账号出不了公网（或企业策略不允许从 github.com 拉可执行代码），可以把三个产物**先镜像到一个 S3 桶**，让栈从那里取。桶**可以完全私有**（Block Public Access 全开）——部署 Lambda 用它自己的角色签名去读，走的是 S3 API，不需要公网。
+
+**一次性准备**（由一个有凭证的人做，之后所有账号/团队都能复用这一份镜像）：
+
+```bash
+# 从 release 下三个产物，放进一个桶（桶要和你开栈的区域同区）
+aws s3 cp bff.zip        s3://my-mirror/notiops/v1.2.3/
+aws s3 cp chat-dist.zip  s3://my-mirror/notiops/v1.2.3/
+aws s3 cp agent-code.zip s3://my-mirror/notiops/v1.2.3/
+```
+
+**开栈时填两个参数**：
+
+| 参数 | 填什么 |
+|---|---|
+| **Artifact base URL override** | `s3://my-mirror/notiops/v1.2.3`（**不要**结尾斜杠；文件名由模板拼） |
+| **Artifact mirror bucket name (s3:// only)** | `my-mirror` —— 部署 Lambda 只会被授予**这一个桶**的 `s3:GetObject`，别的什么都没有 |
+
+跨账号也行：桶策略允许部署账号读即可（`Code.S3Bucket` 允许跨账号，但**必须同区域**）。
+
+镜像的完整性照样有保障：模板里那三个 SHA256 是按 release 里的原始产物算的，镜像内容被换过会当场校验失败、栈 CREATE_FAILED。
+
+`https://` 形式也支持（`https://host/path`），但那是**不带任何凭证**的普通 GET —— 对象必须匿名可读。私有场景请用 `s3://`。
+
+---
+
+## 8. 安全说明（值得知道的几条）
+
+1. **只读**：agent 的授权全是只读，产品里也没有修改资源的工具。唯一的对外动作是开 Support 案例，且需要你在对话里确认。
+2. **接口有鉴权**：BFF 的 Function URL 是 `AWS_IAM`（SigV4）—— 就算地址泄漏了，没有签名也调不动。上面还叠了一层 Cognito 身份校验。
+3. **代码从公网进你的账号**：这是这条部署路径的实质。两条控制措施：① 只从固定 tag 的
+   `aws-samples/sample-notiops` release 取；② 每个产物的 SHA256 写死在模板里、下载后当场校验，
+   不匹配就删掉已上传的对象并让栈失败。不接受这个前提的话，请走 [§7](#7-无公网出口用私有-s3-镜像) 的私有镜像，或走 `setup.sh`。
+4. **管理员密码我们碰不到**：临时密码由 Cognito 生成并直接发给你。部署流程不传、不读、不打印、不放进 Outputs。
+5. **你自己的凭证做的所有动作**：整条链路上没有我们的账号、我们的桶、我们的角色。
+
+---
+
+## 9. 接下来
+
+- [USER_GUIDE.md](USER_GUIDE.md) — 界面怎么用、有哪些主题（成本、故障调查、Support 案例、Skills…）
+- [DEPLOYMENT.md](DEPLOYMENT.md) — 想要 IM bot、自动巡检、管理仪表盘时，走完整版部署
+- [TECHNICAL_DESIGN.md](TECHNICAL_DESIGN.md) — 架构与设计取舍

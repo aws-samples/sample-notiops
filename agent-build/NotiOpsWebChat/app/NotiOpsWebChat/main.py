@@ -909,7 +909,8 @@ def get_investigation_result(execution_id: str) -> dict:
     it's not done yet and to check again shortly (do NOT fabricate a conclusion)."""
     if not _devops_agent_enabled.get():
         return {"notice": "DevOps Agent 深度调查未开启。请打开『DevOps Agent』开关后重试。"}
-    res = _devops_agent.get_investigation_result(execution_id, account_id=_acct())
+    res = _devops_agent.get_investigation_result(execution_id, account_id=_acct(),
+                                                 lang=_ui_locale.get())
     # 续查完成 → 对称地生成 **HTML 网页报告** + 网页链接（与 investigate_live 完成体验一致）。
     if isinstance(res, dict) and res.get("ok") and res.get("summary_markdown"):
         summary_md = res["summary_markdown"]
@@ -926,10 +927,13 @@ def get_investigation_result(execution_id: str) -> dict:
             res["report_is_html"] = True
             _src_suffix = _dv("（在线报告）", " (online report)")
             res["sources"] = [{"icon": "file", "title": rep_title + _src_suffix, "detail": saved["url"]}]
-        # 摘要过长则截断（避免作为工具结果糊爆上下文）；完整版走在线报告。
+        # 过长则截断（避免作为工具结果糊爆上下文）；完整版走在线报告。**按区截断**：整篇截断会把
+        # 排在后面的 Root cause / Mitigation plan 整段吃掉，而这三段正是要给用户看的。
         if len(summary_md) > 6000:
-            res["summary_markdown"] = summary_md[:6000] + _dv(
-                "\n\n…（完整内容见在线报告）", "\n\n… (see the full online report)")
+            res["summary_markdown"] = _devops_agent.build_full_report_md(
+                res.get("sections") or {}, _ui_locale.get(),
+                clip={"summary": 3000, "root_cause": 4000, "mitigation": 3000},
+            ) or (summary_md[:6000] + _dv("\n\n…（完整内容见在线报告）", "\n\n… (see the full online report)"))
         # 与 investigate_live 完成体验对齐：续查完成也补上两个快捷按钮（① 去后台生成缓解方案
         # ② 转人工支持）。续查工具是**返回 dict** 的普通工具，无法直接 yield followups，故塞进
         # 收集器，由 entrypoint 收尾统一发出。console 深链缺 task_id 时回退到 Agent Space 首页。
@@ -944,10 +948,15 @@ def get_investigation_result(execution_id: str) -> dict:
         )
         _fups = []
         if _console:
-            _fups.append({"label": _dv("🛠️ 去 DevOps Agent 后台生成缓解方案（打开后切到 Root cause 页）",
-                                       "🛠️ Generate a mitigation plan in the DevOps Agent console "
-                                       "(open, then switch to the Root cause tab)"),
-                          "url": _console})
+            # 与 investigate_live 一致：正文已带 Mitigation plan 区时换文案（别再叫"生成"）。
+            _fups.append({"label": (
+                _dv("🛠️ 在 DevOps Agent 后台查看本次调查（含缓解方案）",
+                    "🛠️ Open this investigation in the DevOps Agent console (incl. the mitigation plan)")
+                if res.get("has_mitigation") else
+                _dv("🛠️ 去 DevOps Agent 后台生成缓解方案（打开后切到 Root cause 页）",
+                    "🛠️ Generate a mitigation plan in the DevOps Agent console "
+                    "(open, then switch to the Root cause tab)")),
+                "url": _console})
         _fups.append({"label": _dv("🆘 转人工支持（AWS Support）", "🆘 Escalate to human support (AWS Support)"),
                       "prompt": _esc_prompt})
         _add_followups(_fups)
@@ -1035,7 +1044,7 @@ def escalate_to_support(execution_id: str, problem_title: str = "", background: 
         return {"ok": False, "message": "缺少 execution_id，无法从调查建案。"}
     acct = _acct()
     # 1) 取调查结论（原文摘要，结构化）——DevOps Agent 的内容，不加工。
-    res = _devops_agent.get_investigation_result(execution_id, account_id=acct)
+    res = _devops_agent.get_investigation_result(execution_id, account_id=acct, lang=_ui_locale.get())
     if not isinstance(res, dict) or not res.get("ok") or not res.get("summary_markdown"):
         return {"ok": False, "message": _dv(
             "尚未取到该调查的结论（可能仍在进行）。请稍后再试。",
@@ -1142,6 +1151,14 @@ async def investigate_live(title: str, description: str):
     seen = set()
     waited = 0
     status = "IN_PROGRESS"
+    # 活跃度心跳（每 ~40s 一条瞬态 progress）。DevOps Agent 一次调查里常有**几分钟没有任何新
+    # timeline 行**，此前那几分钟里整条 SSE 一个字节都不发 —— 用户只看到开场那句"过程在右侧栏
+    # 实时更新"一动不动，无法区分"在跑"还是"已经断了"。走 progress 通道 = 纯瞬态（收到正文即
+    # 清空、不入库），只报"还在跑 + 已用时长"，不编造进展。
+    # ⚠️ 这只解决**观感**；真正防连接被中间跳空闲回收的是 BFF 的全程 keepalive
+    #    （bff/web-chat/index.mjs 的 `: ka` 注释行）—— 两者缺一不可。
+    _hb_every = max(1, 40 // max(1, _DEVOPS_POLL_INTERVAL))  # 每 N 轮轮询发一次
+    _ticks = 0
     while waited < _DEVOPS_MAX_WAIT:
         poll = await _asyncio.to_thread(_devops_agent.poll_investigation,
                                         exec_id, task_id, space, acct, seen, _ui_locale.get())
@@ -1155,6 +1172,14 @@ async def investigate_live(title: str, description: str):
                 break
         await _asyncio.sleep(_DEVOPS_POLL_INTERVAL)
         waited += _DEVOPS_POLL_INTERVAL
+        _ticks += 1
+        if _ticks % _hb_every == 0:
+            _m, _s = divmod(waited, 60)
+            yield {"progress": {
+                "text": _dv(f"深度调查进行中…已用 {_m} 分 {_s} 秒（分析过程见右侧「调查过程」面板）",
+                            f"Deep investigation running… {_m}m {_s}s elapsed "
+                            f"(steps stream in the “Investigation” panel)"),
+                "kind": "investigation"}}
 
     # 优雅超时兜底：到我们的等待上限还没终态 → **不报错**，明确告诉用户调查仍在 AWS 侧继续跑，
     # 给出 execution_id，并说明稍后回来一句"查一下刚才的调查结果"即可续查（模型会用
@@ -1187,15 +1212,19 @@ async def investigate_live(title: str, description: str):
                         "or invent a conclusion. IMPORTANT: write your closing in the SAME language as the "
                         "user's question (English question → English).")}
         return
-    result = await _asyncio.to_thread(_devops_agent.get_investigation_result, exec_id, acct)
+    _lang = _ui_locale.get()
+    result = await _asyncio.to_thread(_devops_agent.get_investigation_result, exec_id, acct, _lang)
     summary_md = result.get("summary_markdown", "") if isinstance(result, dict) else ""
+    _sections = result.get("sections") or {} if isinstance(result, dict) else {}
     out = {"ok": True, "status": status, "execution_id": exec_id}
     if status != "COMPLETED":
         yield _dv(f"\n\n⚠️ 调查以状态 **{status}** 结束。\n",
                   f"\n\n⚠️ Investigation ended with status **{status}**.\n")
     if summary_md:
-        # 忠实透传：报告与聊天都用 DevOps Agent 的**原文摘要**，不加我们自己的小标题/summary。
-        # mitigation 不在此自动生成——由用户点「生成缓解方案」按钮触发（对齐 Operator App）。
+        # 忠实透传：正文内容全是 DevOps Agent 原文，NotiOps 只按后台的 tab 名分章节
+        # （Summary / Root cause / Mitigation plan），不做二次总结。Investigation timeline
+        # 仍然只在右侧「调查过程」面板（上面的 investigation_step 流），不进正文。
+        # mitigation 不在此自动生成——「有就展示」（后台生成过就有）；没有则由用户点按钮去后台生成。
         rep_title = _dv(f"DevOps Agent 深度调查报告 - {title[:40]}",
                         f"DevOps Agent Deep Investigation Report - {title[:40]}")
         saved = await _asyncio.to_thread(
@@ -1208,10 +1237,12 @@ async def investigate_live(title: str, description: str):
             out["report_is_html"] = True
             out["sources"] = [{"icon": "file", "title": rep_title + _dv("（在线报告）", " (online report)"),
                                "detail": saved["url"]}]
-        # 聊天里展示 DevOps Agent 摘要**原文**（过长仅在聊天里截断，完整版在报告；不做二次总结）。
-        _more = _dv("\n\n…（完整内容见下方在线报告）", "\n\n… (see the full report linked below)")
-        yield _dv("\n\n✅ **调查完成**\n\n", "\n\n✅ **Investigation complete**\n\n") + (
-            summary_md if len(summary_md) <= 8000 else summary_md[:8000] + _more) + "\n"
+        # 聊天里展示 DevOps Agent 原文，**按区截断**而不是整篇截断 —— 整篇截断时 Summary 一长，
+        # 后面的 Root cause / Mitigation plan 会被整段吃掉（正是要修的问题）。完整版在在线报告。
+        _chat_md = _devops_agent.build_full_report_md(
+            _sections, _lang, clip={"summary": 4000, "root_cause": 6000, "mitigation": 4000},
+        ) if _sections else summary_md[:8000]
+        yield _dv("\n\n✅ **调查完成**\n\n", "\n\n✅ **Investigation complete**\n\n") + _chat_md + "\n"
         # 末尾快捷操作。① 生成缓解方案 → **跳转 DevOps Agent 后台**（在后台点 Generate mitigation
         #   plan 生成，NotiOps 不再自己触发；followup 用 url 型=新标签打开）② 转人工支持（建案）。
         out["report_saved"] = bool(out.get("report_url"))
@@ -1228,10 +1259,15 @@ async def investigate_live(title: str, description: str):
         if console_url:  # 生成缓解方案 = 去后台（deep link 到本次调查页，在那点 Generate mitigation plan）
             # Operator App 是纯前端切 tab(URL 不变)、无法深链直达 Root cause 页,
             # 故在文案里明确提示：打开后切到 Root cause 标签生成缓解方案。
-            _fups.append({"label": _dv("🛠️ 去 DevOps Agent 后台生成缓解方案（打开后切到 Root cause 页）",
-                                       "🛠️ Generate a mitigation plan in the DevOps Agent console "
-                                       "(open, then switch to the Root cause tab)"),
-                          "url": console_url})
+            # 已经有缓解方案（正文 Mitigation plan 区已展示）时换文案 —— 再叫"生成"会让用户以为没生成。
+            _fups.append({"label": (
+                _dv("🛠️ 在 DevOps Agent 后台查看本次调查（含缓解方案）",
+                    "🛠️ Open this investigation in the DevOps Agent console (incl. the mitigation plan)")
+                if (_sections.get("mitigation") or "").strip() else
+                _dv("🛠️ 去 DevOps Agent 后台生成缓解方案（打开后切到 Root cause 页）",
+                    "🛠️ Generate a mitigation plan in the DevOps Agent console "
+                    "(open, then switch to the Root cause tab)")),
+                "url": console_url})
         _fups.append({"label": _dv("🆘 转人工支持（AWS Support）", "🆘 Escalate to human support (AWS Support)"),
                       "prompt": _esc_prompt})
         yield {"followups": _fups}
@@ -1843,6 +1879,61 @@ def _scrub_event_text(event, scrubber):
     return event
 
 
+def _event_has_bytes(obj, _depth: int = 0) -> bool:
+    """事件里是否含 bytes —— 含 bytes 的事件**一律不能发给前端**。
+
+    AgentCore runtime 序列化事件时,json.dumps 遇到 bytes 抛 TypeError,它的兜底是
+    `json.dumps(str(obj))` —— 于是整个事件的 **Python repr** 变成一个合法 JSON
+    字符串发出去,BFF 拿到字符串事件就当正文追加,客户在回答里看到一坨
+    `{'event': {'contentBlockDelta': {'delta': {'reasoningContent': {'redactedContent': b'rsn_…'`。
+    实测触发者:Grok 这类**加密思考链**模型(Sonnet 的思考链是明文 text,不带 bytes,
+    所以同样的代码在 Sonnet 上看不出问题)。已知来源是 reasoningContent.redactedContent,
+    下面 `_stream_events` 已按名字过滤;这里是**兜底**——换个模型/新增一种带二进制的
+    chunk 时,失败模式不会再是「往用户回答里灌 repr」。"""
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        return True
+    if _depth > 6:  # 事件是浅结构;设上限防病态嵌套
+        return False
+    if isinstance(obj, dict):
+        return any(_event_has_bytes(v, _depth + 1) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_event_has_bytes(v, _depth + 1) for v in obj)
+    return False
+
+
+def _stream_events(event, scrubber):
+    """把 Strands 的一个原始 stream 事件翻成 0..n 个「发给前端」的事件。
+
+    **唯一出口**:问候快路径与主循环都必须走这里。两处各写一遍过滤正是上面那个
+    redactedContent 泄漏的成因 —— 主循环滤掉了 reasoning,快路径(寒暄/问候,如"你好")
+    漏了,于是同一个模型在长问答里干净、一句"你好"就把原始事件糊到回答里。
+    """
+    if not isinstance(event, dict) or "event" not in event:
+        return []  # Strands 自有事件(init_event_loop / message 等)不外发
+    _ev = event["event"]
+    # 工具开始调用 → 只发一句进度行;contentBlockStart 本身不含正文,不转发。
+    cbs = _ev.get("contentBlockStart")
+    if cbs is not None:
+        _tu = (cbs.get("start") or {}).get("toolUse") or {}
+        _tname = _tu.get("name") if isinstance(_tu, dict) else ""
+        return [{"progress": {"text": _progress_for_tool(_tname), "kind": "tool"}}] if _tname else []
+    _delta = (_ev.get("contentBlockDelta") or {}).get("delta") or {}
+    # 正文增量:最常见的一支,先走(顺带跳过下面的 bytes 扫描)。
+    if isinstance(_delta, dict) and isinstance(_delta.get("text"), str):
+        return [_scrub_event_text(event, scrubber)]
+    # 思考过程:只有明文 text 才发(前端折叠灰字)。signature / redactedContent 一律丢弃 ——
+    # 它们对用户无意义,且 redactedContent 是 bytes(见 _event_has_bytes)。
+    _rc = _delta.get("reasoningContent") if isinstance(_delta, dict) else None
+    if isinstance(_rc, dict):
+        _rtext = _rc.get("text")
+        return [{"reasoning": {"text": _rtext}}] if isinstance(_rtext, str) and _rtext else []
+    if _event_has_bytes(event):
+        log.warning("dropping stream event carrying bytes (would leak as repr): keys=%s",
+                    list(_ev) if isinstance(_ev, dict) else type(_ev).__name__)
+        return []
+    return [_scrub_event_text(event, scrubber)]
+
+
 def _collect_sources(messages, since_idx: int):
     """扫描本轮新增消息，产出 Sources 抽屉条目（供前端展示，做到来源/工具透明）：
     1) **工具调用透明**：每个 toolUse（任意工具，含 FinOps/Cases MCP）→ 一条「工具：X」来源，
@@ -2004,11 +2095,10 @@ async def invoke(payload, context):
             )
             _greet_scrubber = _MarkerScrubber()
             async for event in greet_agent.stream_async(f"{_lang_directive()}{_raw_q}{_lang_lock()}"):
-                if isinstance(event, dict) and "event" in event:
-                    cbs = event["event"].get("contentBlockStart")
-                    if cbs is not None and not cbs.get("start"):
-                        continue
-                    yield _scrub_event_text(event, _greet_scrubber)
+                # 与主循环共用 _stream_events：快路径曾自己写一遍过滤、漏掉 reasoning，
+                # 导致 Grok 的加密思考链(bytes)被 runtime 退化成 repr 灌进"你好"的回答。
+                for _out in _stream_events(event, _greet_scrubber):
+                    yield _out
             _gtail = _greet_scrubber.flush()
             if _gtail:
                 yield {"event": {"contentBlockDelta": {"delta": {"text": _gtail}, "contentBlockIndex": 0}}}
@@ -2251,34 +2341,21 @@ async def invoke(payload, context):
                     if data.get("console_url"):
                         _st["console_url"] = data["console_url"]
                     yield {"investigation_step": _st}
+                elif isinstance(data, dict) and isinstance(data.get("progress"), dict):
+                    # 流式工具的**瞬态**进度（如深度调查的"已用 N 分"活跃度心跳）→ progress 通道，
+                    # 前端当临时状态行显示、收到正文即清空、不入库。不能走正文，否则会污染答案。
+                    yield {"progress": data["progress"]}
                 elif isinstance(data, dict) and isinstance(data.get("followups"), list):
                     # 流式工具产出的"快捷按钮"（如调查完成后的 生成缓解方案/转人工）→ 透传给前端。
                     yield {"followups": data["followups"]}
                 continue
-            if "event" not in event:
-                continue
-            _ev = event["event"]
-            # 进度行：工具开始调用 → 亮一句"正在做什么"（双语随本轮语言）。这样像成本突增排查
-            # 这类长耗时处理，处理期间聊天窗口不再"干等"，客户能看到每一步在做什么。
-            cbs = _ev.get("contentBlockStart")
-            if cbs is not None:
-                _tu = (cbs.get("start") or {}).get("toolUse") or {}
-                _tname = _tu.get("name") if isinstance(_tu, dict) else ""
-                if _tname:
-                    yield {"progress": {"text": _progress_for_tool(_tname), "kind": "tool"}}
-                # contentBlockStart 本身不含正文（无论是否 toolUse），无需转发给前端。
-                continue
-            # 思考过程（reasoning）增量 → 独立 reasoning 事件（前端可折叠灰字，收到正文即隐藏）。
-            # 语言：reasoning 是模型自生成文本，已被 prompt 末尾 _lang_lock() 锁到本轮语言，
-            # 与正文/进度行一致（中问中答、英问英答）。
-            _delta = (_ev.get("contentBlockDelta") or {}).get("delta") or {}
-            _rc = _delta.get("reasoningContent") if isinstance(_delta, dict) else None
-            if isinstance(_rc, dict):
-                _rtext = _rc.get("text")
-                if isinstance(_rtext, str) and _rtext:
-                    yield {"reasoning": {"text": _rtext}}
-                continue  # reasoning 事件不进正文清洗器，避免混入回答
-            yield _scrub_event_text(event, _scrubber)
+            # 原始事件 → 发给前端的事件，统一由 _stream_events 决定（与问候快路径同一出口）：
+            #   · 工具开始调用 → 一句"正在做什么"进度行（长耗时处理时聊天窗口不再干等）；
+            #   · 思考过程明文 → {reasoning}（前端折叠灰字，收到正文即隐藏；语言已被
+            #     prompt 末尾 _lang_lock() 锁到本轮语言，与正文/进度行一致）；
+            #   · 加密思考链 / 任何含 bytes 的事件 → 丢弃（否则被序列化成 repr 灌进正文）。
+            for _out in _stream_events(event, _scrubber):
+                yield _out
     except MaxTokensReachedException as e:  # 见顶部 import（撞输出上限，非故障）
         # 撞输出上限：不是故障，是回答太长。保留已生成内容，收尾照常走（下方补提示 + sources）。
         log.warning("stream hit max_tokens, finishing gracefully with partial answer: %s", e)

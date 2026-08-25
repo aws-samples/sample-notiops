@@ -126,4 +126,5 @@ export const MODELS: ModelOption[] = [
   { id: "gpt-5-6-luna", name: "GPT-5.6 Luna", descKey: "model.desc.gptLuna" },
   { id: "gpt-5-6-sol", name: "GPT-5.6 Sol", descKey: "model.desc.gptSol" },
   { id: "gpt-5-6", name: "GPT-5.6 Terra", descKey: "model.desc.gpt" },
+  { id: "xai-grok-4-6", name: "Grok 4.6", descKey: "model.desc.grok" },
 ];

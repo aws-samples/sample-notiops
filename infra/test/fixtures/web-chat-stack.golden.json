@@ -1,0 +1,2107 @@
+{
+  "Description": "NotiOps Web Chat (agentic) — BFF streaming + chat-app frontend",
+  "Outputs": {
+    "ChatBffUrl": {
+      "Description": "Web Chat BFF Function URL (streaming)",
+      "Value": {
+        "Fn::GetAtt": [
+          "WebChatBffFunctionUrl88DBBB67",
+          "FunctionUrl"
+        ]
+      }
+    },
+    "ChatUrl": {
+      "Description": "Web Chat frontend URL",
+      "Value": {
+        "Fn::Join": [
+          "",
+          [
+            "https://",
+            {
+              "Fn::GetAtt": [
+                "ChatCDNEC24BD4A",
+                "DomainName"
+              ]
+            }
+          ]
+        ]
+      }
+    },
+    "WebChatTableName": {
+      "Value": {
+        "Ref": "WebChatTable02103F86"
+      }
+    }
+  },
+  "Parameters": {
+    "BootstrapVersion": {
+      "Default": "/cdk-bootstrap/hnb659fds/version",
+      "Description": "Version of the CDK Bootstrap resources in this environment, automatically retrieved from SSM Parameter Store. [cdk:skip]",
+      "Type": "AWS::SSM::Parameter::Value<String>"
+    }
+  },
+  "Resources": {
+    "ChatAuthRoleDefaultPolicyDD95B0D0": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatAuthRole/DefaultPolicy/Resource"
+      },
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": "lambda:InvokeFunctionUrl",
+              "Condition": {
+                "StringEquals": {
+                  "lambda:FunctionUrlAuthType": "AWS_IAM"
+                }
+              },
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "WebChatBffF9213199",
+                  "Arn"
+                ]
+              }
+            },
+            {
+              "Action": "lambda:InvokeFunction",
+              "Condition": {
+                "Bool": {
+                  "lambda:InvokedViaFunctionUrl": "true"
+                }
+              },
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "WebChatBffF9213199",
+                  "Arn"
+                ]
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "ChatAuthRoleDefaultPolicyDD95B0D0",
+        "Roles": [
+          {
+            "Ref": "ChatAuthRoleE61C691F"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    },
+    "ChatAuthRoleE61C691F": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatAuthRole/Resource"
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "ForAnyValue:StringLike": {
+                  "cognito-identity.amazonaws.com:amr": "authenticated"
+                },
+                "StringEquals": {
+                  "cognito-identity.amazonaws.com:aud": {
+                    "Ref": "ChatIdentityPool"
+                  }
+                }
+              },
+              "Effect": "Allow",
+              "Principal": {
+                "Federated": "cognito-identity.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "ChatCDNEC24BD4A": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatCDN/Resource"
+      },
+      "Properties": {
+        "DistributionConfig": {
+          "CustomErrorResponses": [
+            {
+              "ErrorCachingMinTTL": 300,
+              "ErrorCode": 403,
+              "ResponseCode": 200,
+              "ResponsePagePath": "/index.html"
+            },
+            {
+              "ErrorCachingMinTTL": 300,
+              "ErrorCode": 404,
+              "ResponseCode": 200,
+              "ResponsePagePath": "/index.html"
+            }
+          ],
+          "DefaultCacheBehavior": {
+            "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
+            "Compress": true,
+            "TargetOriginId": "WebChatStackChatCDNOrigin19AFD38BC",
+            "ViewerProtocolPolicy": "redirect-to-https"
+          },
+          "DefaultRootObject": "index.html",
+          "Enabled": true,
+          "HttpVersion": "http2",
+          "IPV6Enabled": true,
+          "Origins": [
+            {
+              "DomainName": {
+                "Fn::GetAtt": [
+                  "ChatFrontendBucketAF0BD58C",
+                  "RegionalDomainName"
+                ]
+              },
+              "Id": "WebChatStackChatCDNOrigin19AFD38BC",
+              "S3OriginConfig": {
+                "OriginAccessIdentity": {
+                  "Fn::Join": [
+                    "",
+                    [
+                      "origin-access-identity/cloudfront/",
+                      {
+                        "Ref": "ChatOAI6FC703AC"
+                      }
+                    ]
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ]
+      },
+      "Type": "AWS::CloudFront::Distribution"
+    },
+    "ChatConfig": {
+      "DeletionPolicy": "Delete",
+      "DependsOn": [
+        "DeployChatFrontendAwsCliLayer1EA925D0",
+        "DeployChatFrontendCustomResourceE06500D5"
+      ],
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatConfig/Default"
+      },
+      "Properties": {
+        "ServiceToken": {
+          "Fn::GetAtt": [
+            "ChatConfigProviderframeworkonEvent8BA35C76",
+            "Arn"
+          ]
+        },
+        "bucketName": {
+          "Ref": "ChatFrontendBucketAF0BD58C"
+        },
+        "config": {
+          "Fn::Join": [
+            "",
+            [
+              "{\"chatApiBase\":\"",
+              {
+                "Fn::GetAtt": [
+                  "WebChatBffFunctionUrl88DBBB67",
+                  "FunctionUrl"
+                ]
+              },
+              "\",\"cognitoUserPoolId\":\"us-east-1_FIXTUREPOOL\",\"cognitoClientId\":\"fixtureuserpoolclientid00\",\"cognitoIdentityPoolId\":\"",
+              {
+                "Ref": "ChatIdentityPool"
+              },
+              "\",\"region\":\"us-east-1\",\"idleConsoleUrl\":\"https://console.example.invalid\",\"rumAppMonitorId\":\"",
+              {
+                "Fn::GetAtt": [
+                  "ChatRumAppMonitor",
+                  "Id"
+                ]
+              },
+              "\",\"rumIdentityPoolId\":\"",
+              {
+                "Ref": "RumIdentityPool"
+              },
+              "\",\"rumGuestRoleArn\":\"",
+              {
+                "Fn::GetAtt": [
+                  "RumGuestRoleF35ADC3C",
+                  "Arn"
+                ]
+              },
+              "\",\"rumRegion\":\"us-east-1\"}"
+            ]
+          ]
+        },
+        "timestamp": "<TIMESTAMP>"
+      },
+      "Type": "AWS::CloudFormation::CustomResource",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "ChatConfigFunctionDEDB9D4B": {
+      "DependsOn": [
+        "ChatConfigFunctionServiceRoleDefaultPolicy8D2DA83F",
+        "ChatConfigFunctionServiceRoleDCA484C4"
+      ],
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatConfigFunction/Resource"
+      },
+      "Properties": {
+        "Code": {
+          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Key": "<ASSET>"
+        },
+        "Handler": "index.handler",
+        "MemorySize": 256,
+        "Role": {
+          "Fn::GetAtt": [
+            "ChatConfigFunctionServiceRoleDCA484C4",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.14",
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ],
+        "Timeout": 120
+      },
+      "Type": "AWS::Lambda::Function"
+    },
+    "ChatConfigFunctionServiceRoleDCA484C4": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatConfigFunction/ServiceRole/Resource"
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+              ]
+            ]
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "ChatConfigFunctionServiceRoleDefaultPolicy8D2DA83F": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatConfigFunction/ServiceRole/DefaultPolicy/Resource"
+      },
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": [
+                "s3:DeleteObject*",
+                "s3:PutObject",
+                "s3:PutObjectLegalHold",
+                "s3:PutObjectRetention",
+                "s3:PutObjectTagging",
+                "s3:PutObjectVersionTagging",
+                "s3:Abort*"
+              ],
+              "Effect": "Allow",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "ChatFrontendBucketAF0BD58C",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      {
+                        "Fn::GetAtt": [
+                          "ChatFrontendBucketAF0BD58C",
+                          "Arn"
+                        ]
+                      },
+                      "/*"
+                    ]
+                  ]
+                }
+              ]
+            },
+            {
+              "Action": "s3:PutObject",
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    {
+                      "Fn::GetAtt": [
+                        "ChatFrontendBucketAF0BD58C",
+                        "Arn"
+                      ]
+                    },
+                    "/*"
+                  ]
+                ]
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "ChatConfigFunctionServiceRoleDefaultPolicy8D2DA83F",
+        "Roles": [
+          {
+            "Ref": "ChatConfigFunctionServiceRoleDCA484C4"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    },
+    "ChatConfigProviderframeworkonEvent8BA35C76": {
+      "DependsOn": [
+        "ChatConfigProviderframeworkonEventServiceRoleDefaultPolicy4D60B344",
+        "ChatConfigProviderframeworkonEventServiceRoleAE7F44A2"
+      ],
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatConfigProvider/framework-onEvent/Resource"
+      },
+      "Properties": {
+        "Code": {
+          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Key": "<ASSET>"
+        },
+        "Description": "AWS CDK resource provider framework - onEvent (WebChatStack/ChatConfigProvider)",
+        "Environment": {
+          "Variables": {
+            "USER_ON_EVENT_FUNCTION_ARN": {
+              "Fn::GetAtt": [
+                "ChatConfigFunctionDEDB9D4B",
+                "Arn"
+              ]
+            }
+          }
+        },
+        "Handler": "framework.onEvent",
+        "LoggingConfig": {
+          "ApplicationLogLevel": "FATAL",
+          "LogFormat": "JSON"
+        },
+        "Role": {
+          "Fn::GetAtt": [
+            "ChatConfigProviderframeworkonEventServiceRoleAE7F44A2",
+            "Arn"
+          ]
+        },
+        "Runtime": "nodejs24.x",
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ],
+        "Timeout": 900
+      },
+      "Type": "AWS::Lambda::Function"
+    },
+    "ChatConfigProviderframeworkonEventLogRetentionBC58477C": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatConfigProvider/framework-onEvent/LogRetention/Resource"
+      },
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Join": [
+            "",
+            [
+              "/aws/lambda/",
+              {
+                "Ref": "ChatConfigProviderframeworkonEvent8BA35C76"
+              }
+            ]
+          ]
+        },
+        "RetentionInDays": 7,
+        "ServiceToken": {
+          "Fn::GetAtt": [
+            "LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8aFD4BFC8A",
+            "Arn"
+          ]
+        }
+      },
+      "Type": "Custom::LogRetention"
+    },
+    "ChatConfigProviderframeworkonEventServiceRoleAE7F44A2": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatConfigProvider/framework-onEvent/ServiceRole/Resource"
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+              ]
+            ]
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "ChatConfigProviderframeworkonEventServiceRoleDefaultPolicy4D60B344": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatConfigProvider/framework-onEvent/ServiceRole/DefaultPolicy/Resource"
+      },
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": "lambda:InvokeFunction",
+              "Effect": "Allow",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "ChatConfigFunctionDEDB9D4B",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      {
+                        "Fn::GetAtt": [
+                          "ChatConfigFunctionDEDB9D4B",
+                          "Arn"
+                        ]
+                      },
+                      ":*"
+                    ]
+                  ]
+                }
+              ]
+            },
+            {
+              "Action": "lambda:GetFunction",
+              "Effect": "Allow",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "ChatConfigFunctionDEDB9D4B",
+                  "Arn"
+                ]
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "ChatConfigProviderframeworkonEventServiceRoleDefaultPolicy4D60B344",
+        "Roles": [
+          {
+            "Ref": "ChatConfigProviderframeworkonEventServiceRoleAE7F44A2"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    },
+    "ChatFrontendBucketAF0BD58C": {
+      "DeletionPolicy": "Delete",
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatFrontendBucket/Resource"
+      },
+      "Properties": {
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "BucketName": "notiops-chat-frontend-111122223333-us-east-1",
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "aws-cdk:auto-delete-objects",
+            "Value": "true"
+          },
+          {
+            "Key": "aws-cdk:cr-owned:7ccfa47a",
+            "Value": "true"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ]
+      },
+      "Type": "AWS::S3::Bucket",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "ChatFrontendBucketAutoDeleteObjectsCustomResource65C39AB8": {
+      "DeletionPolicy": "Delete",
+      "DependsOn": [
+        "ChatFrontendBucketPolicyD23772C2"
+      ],
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatFrontendBucket/AutoDeleteObjectsCustomResource/Default"
+      },
+      "Properties": {
+        "BucketName": {
+          "Ref": "ChatFrontendBucketAF0BD58C"
+        },
+        "ServiceToken": {
+          "Fn::GetAtt": [
+            "CustomS3AutoDeleteObjectsCustomResourceProviderHandler9D90184F",
+            "Arn"
+          ]
+        }
+      },
+      "Type": "Custom::S3AutoDeleteObjects",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "ChatFrontendBucketPolicyD23772C2": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatFrontendBucket/Policy/Resource"
+      },
+      "Properties": {
+        "Bucket": {
+          "Ref": "ChatFrontendBucketAF0BD58C"
+        },
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": "s3:*",
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              },
+              "Effect": "Deny",
+              "Principal": {
+                "AWS": "*"
+              },
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "ChatFrontendBucketAF0BD58C",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      {
+                        "Fn::GetAtt": [
+                          "ChatFrontendBucketAF0BD58C",
+                          "Arn"
+                        ]
+                      },
+                      "/*"
+                    ]
+                  ]
+                }
+              ]
+            },
+            {
+              "Action": [
+                "s3:PutBucketPolicy",
+                "s3:GetBucket*",
+                "s3:List*",
+                "s3:DeleteObject*"
+              ],
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::GetAtt": [
+                    "CustomS3AutoDeleteObjectsCustomResourceProviderRole3B1BD092",
+                    "Arn"
+                  ]
+                }
+              },
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "ChatFrontendBucketAF0BD58C",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      {
+                        "Fn::GetAtt": [
+                          "ChatFrontendBucketAF0BD58C",
+                          "Arn"
+                        ]
+                      },
+                      "/*"
+                    ]
+                  ]
+                }
+              ]
+            },
+            {
+              "Action": [
+                "s3:GetObject*",
+                "s3:GetBucket*",
+                "s3:List*"
+              ],
+              "Effect": "Allow",
+              "Principal": {
+                "CanonicalUser": {
+                  "Fn::GetAtt": [
+                    "ChatOAI6FC703AC",
+                    "S3CanonicalUserId"
+                  ]
+                }
+              },
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "ChatFrontendBucketAF0BD58C",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      {
+                        "Fn::GetAtt": [
+                          "ChatFrontendBucketAF0BD58C",
+                          "Arn"
+                        ]
+                      },
+                      "/*"
+                    ]
+                  ]
+                }
+              ]
+            },
+            {
+              "Action": "s3:GetObject",
+              "Effect": "Allow",
+              "Principal": {
+                "CanonicalUser": {
+                  "Fn::GetAtt": [
+                    "ChatOAI6FC703AC",
+                    "S3CanonicalUserId"
+                  ]
+                }
+              },
+              "Resource": {
+                "Fn::Join": [
+                  "",
+                  [
+                    {
+                      "Fn::GetAtt": [
+                        "ChatFrontendBucketAF0BD58C",
+                        "Arn"
+                      ]
+                    },
+                    "/*"
+                  ]
+                ]
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        }
+      },
+      "Type": "AWS::S3::BucketPolicy"
+    },
+    "ChatIdentityPool": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatIdentityPool"
+      },
+      "Properties": {
+        "AllowUnauthenticatedIdentities": false,
+        "CognitoIdentityProviders": [
+          {
+            "ClientId": "fixtureuserpoolclientid00",
+            "ProviderName": "cognito-idp.us-east-1.amazonaws.com/us-east-1_FIXTUREPOOL"
+          }
+        ],
+        "IdentityPoolName": "notiops-web-chat",
+        "IdentityPoolTags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ]
+      },
+      "Type": "AWS::Cognito::IdentityPool"
+    },
+    "ChatIdentityPoolRoles": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatIdentityPoolRoles"
+      },
+      "Properties": {
+        "IdentityPoolId": {
+          "Ref": "ChatIdentityPool"
+        },
+        "Roles": {
+          "authenticated": {
+            "Fn::GetAtt": [
+              "ChatAuthRoleE61C691F",
+              "Arn"
+            ]
+          }
+        }
+      },
+      "Type": "AWS::Cognito::IdentityPoolRoleAttachment"
+    },
+    "ChatOAI6FC703AC": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatOAI/Resource"
+      },
+      "Properties": {
+        "CloudFrontOriginAccessIdentityConfig": {
+          "Comment": "Allows CloudFront to reach the bucket"
+        }
+      },
+      "Type": "AWS::CloudFront::CloudFrontOriginAccessIdentity"
+    },
+    "ChatRumAppMonitor": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/ChatRumAppMonitor"
+      },
+      "Properties": {
+        "AppMonitorConfiguration": {
+          "AllowCookies": true,
+          "EnableXRay": false,
+          "GuestRoleArn": {
+            "Fn::GetAtt": [
+              "RumGuestRoleF35ADC3C",
+              "Arn"
+            ]
+          },
+          "IdentityPoolId": {
+            "Ref": "RumIdentityPool"
+          },
+          "SessionSampleRate": 1,
+          "Telemetries": [
+            "errors",
+            "performance",
+            "http"
+          ]
+        },
+        "CwLogEnabled": true,
+        "Domain": {
+          "Fn::GetAtt": [
+            "ChatCDNEC24BD4A",
+            "DomainName"
+          ]
+        },
+        "Name": "notiops-web-chat",
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ]
+      },
+      "Type": "AWS::RUM::AppMonitor"
+    },
+    "CustomCDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C81C01536": {
+      "DependsOn": [
+        "CustomCDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756CServiceRoleDefaultPolicy88902FDF",
+        "CustomCDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756CServiceRole89A01265"
+      ],
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C/Resource"
+      },
+      "Properties": {
+        "Code": {
+          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Key": "<ASSET>"
+        },
+        "Environment": {
+          "Variables": {
+            "AWS_CA_BUNDLE": "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+          }
+        },
+        "Handler": "index.handler",
+        "Layers": [
+          {
+            "Ref": "DeployChatFrontendAwsCliLayer1EA925D0"
+          }
+        ],
+        "Role": {
+          "Fn::GetAtt": [
+            "CustomCDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756CServiceRole89A01265",
+            "Arn"
+          ]
+        },
+        "Runtime": "python3.13",
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ],
+        "Timeout": 900
+      },
+      "Type": "AWS::Lambda::Function"
+    },
+    "CustomCDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756CServiceRole89A01265": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C/ServiceRole/Resource"
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+              ]
+            ]
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "CustomCDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756CServiceRoleDefaultPolicy88902FDF": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C/ServiceRole/DefaultPolicy/Resource"
+      },
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": [
+                "s3:GetObject*",
+                "s3:GetBucket*",
+                "s3:List*"
+              ],
+              "Effect": "Allow",
+              "Resource": [
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      "arn:",
+                      {
+                        "Ref": "AWS::Partition"
+                      },
+                      ":s3:::cdk-hnb659fds-assets-111122223333-us-east-1"
+                    ]
+                  ]
+                },
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      "arn:",
+                      {
+                        "Ref": "AWS::Partition"
+                      },
+                      ":s3:::cdk-hnb659fds-assets-111122223333-us-east-1/*"
+                    ]
+                  ]
+                }
+              ]
+            },
+            {
+              "Action": [
+                "s3:GetObject*",
+                "s3:GetBucket*",
+                "s3:List*",
+                "s3:DeleteObject*",
+                "s3:PutObject",
+                "s3:PutObjectLegalHold",
+                "s3:PutObjectRetention",
+                "s3:PutObjectTagging",
+                "s3:PutObjectVersionTagging",
+                "s3:Abort*"
+              ],
+              "Effect": "Allow",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "ChatFrontendBucketAF0BD58C",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      {
+                        "Fn::GetAtt": [
+                          "ChatFrontendBucketAF0BD58C",
+                          "Arn"
+                        ]
+                      },
+                      "/*"
+                    ]
+                  ]
+                }
+              ]
+            },
+            {
+              "Action": [
+                "cloudfront:GetInvalidation",
+                "cloudfront:CreateInvalidation"
+              ],
+              "Effect": "Allow",
+              "Resource": "*"
+            },
+            {
+              "Action": [
+                "s3:GetObject*",
+                "s3:GetBucket*",
+                "s3:List*",
+                "s3:DeleteObject*",
+                "s3:PutObject",
+                "s3:PutObjectLegalHold",
+                "s3:PutObjectRetention",
+                "s3:PutObjectTagging",
+                "s3:PutObjectVersionTagging",
+                "s3:Abort*"
+              ],
+              "Effect": "Allow",
+              "Resource": [
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      "arn:",
+                      {
+                        "Ref": "AWS::Partition"
+                      },
+                      ":s3:::notiops-data-111122223333-us-east-1"
+                    ]
+                  ]
+                },
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      "arn:",
+                      {
+                        "Ref": "AWS::Partition"
+                      },
+                      ":s3:::notiops-data-111122223333-us-east-1/*"
+                    ]
+                  ]
+                }
+              ]
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "CustomCDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756CServiceRoleDefaultPolicy88902FDF",
+        "Roles": [
+          {
+            "Ref": "CustomCDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756CServiceRole89A01265"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    },
+    "CustomS3AutoDeleteObjectsCustomResourceProviderHandler9D90184F": {
+      "DependsOn": [
+        "CustomS3AutoDeleteObjectsCustomResourceProviderRole3B1BD092"
+      ],
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/Custom::S3AutoDeleteObjectsCustomResourceProvider/Handler"
+      },
+      "Properties": {
+        "Code": {
+          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Key": "<ASSET>"
+        },
+        "Description": {
+          "Fn::Join": [
+            "",
+            [
+              "Lambda function for auto-deleting objects in ",
+              {
+                "Ref": "ChatFrontendBucketAF0BD58C"
+              },
+              " S3 bucket."
+            ]
+          ]
+        },
+        "Handler": "index.handler",
+        "MemorySize": 128,
+        "Role": {
+          "Fn::GetAtt": [
+            "CustomS3AutoDeleteObjectsCustomResourceProviderRole3B1BD092",
+            "Arn"
+          ]
+        },
+        "Runtime": "nodejs24.x",
+        "Timeout": 900
+      },
+      "Type": "AWS::Lambda::Function"
+    },
+    "CustomS3AutoDeleteObjectsCustomResourceProviderRole3B1BD092": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/Custom::S3AutoDeleteObjectsCustomResourceProvider/Role"
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "DeployChatFrontendAwsCliLayer1EA925D0": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/DeployChatFrontend/AwsCliLayer/Resource"
+      },
+      "Properties": {
+        "Content": {
+          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Key": "<ASSET>"
+        },
+        "Description": "/opt/awscli/aws"
+      },
+      "Type": "AWS::Lambda::LayerVersion"
+    },
+    "DeployChatFrontendCustomResourceE06500D5": {
+      "DeletionPolicy": "Delete",
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/DeployChatFrontend/CustomResource/Default"
+      },
+      "Properties": {
+        "DestinationBucketName": {
+          "Ref": "ChatFrontendBucketAF0BD58C"
+        },
+        "DistributionId": {
+          "Ref": "ChatCDNEC24BD4A"
+        },
+        "DistributionPaths": [
+          "/*"
+        ],
+        "OutputObjectKeys": true,
+        "Prune": true,
+        "ServiceToken": {
+          "Fn::GetAtt": [
+            "CustomCDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C81C01536",
+            "Arn"
+          ]
+        },
+        "SourceBucketNames": [
+          "cdk-hnb659fds-assets-111122223333-us-east-1"
+        ],
+        "SourceObjectKeys": [
+          "<ASSET>"
+        ],
+        "WaitForDistributionInvalidation": true
+      },
+      "Type": "Custom::CDKBucketDeployment",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "DeployOnboardingTemplateAwsCliLayerFF9934C6": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/DeployOnboardingTemplate/AwsCliLayer/Resource"
+      },
+      "Properties": {
+        "Content": {
+          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Key": "<ASSET>"
+        },
+        "Description": "/opt/awscli/aws"
+      },
+      "Type": "AWS::Lambda::LayerVersion"
+    },
+    "DeployOnboardingTemplateCustomResource607EB07A": {
+      "DeletionPolicy": "Delete",
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/DeployOnboardingTemplate/CustomResource/Default"
+      },
+      "Properties": {
+        "DestinationBucketKeyPrefix": "onboarding-templates",
+        "DestinationBucketName": "notiops-data-111122223333-us-east-1",
+        "OutputObjectKeys": true,
+        "Prune": false,
+        "ServiceToken": {
+          "Fn::GetAtt": [
+            "CustomCDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C81C01536",
+            "Arn"
+          ]
+        },
+        "SourceBucketNames": [
+          "cdk-hnb659fds-assets-111122223333-us-east-1"
+        ],
+        "SourceMarkers": [
+          {}
+        ],
+        "SourceObjectKeys": [
+          "<ASSET>"
+        ],
+        "WaitForDistributionInvalidation": true
+      },
+      "Type": "Custom::CDKBucketDeployment",
+      "UpdateReplacePolicy": "Delete"
+    },
+    "LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8aFD4BFC8A": {
+      "DependsOn": [
+        "LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8aServiceRoleDefaultPolicyADDA7DEB",
+        "LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8aServiceRole9741ECFB"
+      ],
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8a/Resource"
+      },
+      "Properties": {
+        "Code": {
+          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Key": "<ASSET>"
+        },
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8aServiceRole9741ECFB",
+            "Arn"
+          ]
+        },
+        "Runtime": "nodejs24.x",
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ],
+        "Timeout": 900
+      },
+      "Type": "AWS::Lambda::Function"
+    },
+    "LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8aServiceRole9741ECFB": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8a/ServiceRole/Resource"
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+              ]
+            ]
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8aServiceRoleDefaultPolicyADDA7DEB": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8a/ServiceRole/DefaultPolicy/Resource"
+      },
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": [
+                "logs:PutRetentionPolicy",
+                "logs:DeleteRetentionPolicy"
+              ],
+              "Effect": "Allow",
+              "Resource": "*"
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8aServiceRoleDefaultPolicyADDA7DEB",
+        "Roles": [
+          {
+            "Ref": "LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8aServiceRole9741ECFB"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    },
+    "RumGuestRoleDefaultPolicyBF05A973": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/RumGuestRole/DefaultPolicy/Resource"
+      },
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": "rum:PutRumEvents",
+              "Effect": "Allow",
+              "Resource": "arn:aws:rum:us-east-1:111122223333:appmonitor/notiops-web-chat"
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "RumGuestRoleDefaultPolicyBF05A973",
+        "Roles": [
+          {
+            "Ref": "RumGuestRoleF35ADC3C"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    },
+    "RumGuestRoleF35ADC3C": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/RumGuestRole/Resource"
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "ForAnyValue:StringLike": {
+                  "cognito-identity.amazonaws.com:amr": "unauthenticated"
+                },
+                "StringEquals": {
+                  "cognito-identity.amazonaws.com:aud": {
+                    "Ref": "RumIdentityPool"
+                  }
+                }
+              },
+              "Effect": "Allow",
+              "Principal": {
+                "Federated": "cognito-identity.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "RumIdentityPool": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/RumIdentityPool"
+      },
+      "Properties": {
+        "AllowUnauthenticatedIdentities": true,
+        "IdentityPoolName": "notiops-web-chat-rum",
+        "IdentityPoolTags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ]
+      },
+      "Type": "AWS::Cognito::IdentityPool"
+    },
+    "RumIdentityPoolRoles": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/RumIdentityPoolRoles"
+      },
+      "Properties": {
+        "IdentityPoolId": {
+          "Ref": "RumIdentityPool"
+        },
+        "Roles": {
+          "unauthenticated": {
+            "Fn::GetAtt": [
+              "RumGuestRoleF35ADC3C",
+              "Arn"
+            ]
+          }
+        }
+      },
+      "Type": "AWS::Cognito::IdentityPoolRoleAttachment"
+    },
+    "WebChatBffF9213199": {
+      "DependsOn": [
+        "WebChatBffServiceRoleDefaultPolicyF068D5C2",
+        "WebChatBffServiceRole61946212"
+      ],
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/WebChatBff/Resource"
+      },
+      "Properties": {
+        "Code": {
+          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Key": "<ASSET>"
+        },
+        "Environment": {
+          "Variables": {
+            "AGENT_RUNTIME_ARN": "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/NotiOpsWebChat-fixture",
+            "ATHENA_RESULTS_BUCKET": "notiops-data-111122223333-us-east-1",
+            "COGNITO_USER_POOL_ID": "us-east-1_FIXTUREPOOL",
+            "CONFIG_TABLE": "notiops-config",
+            "DEVOPS_AGENT_SPACE_ID": "fixture-agent-space",
+            "LOCKED_ACCOUNT_ID": "111122223333",
+            "MEMBER_DA_STACKSET_NAME": "",
+            "MEMBER_ONBOARDING_STACKSET_NAME": "",
+            "NOTIOPS_CROSS_ACCOUNT_ROLE": "notiops-idle-detection-role",
+            "NOTIOPS_MEMBER_ROLE_NAME": "",
+            "ORGANIZATION_ID": "",
+            "REPORTS_CDN_DOMAIN": "reports.example.invalid",
+            "SKILLS_BUCKET": "notiops-data-111122223333-us-east-1",
+            "WEB_CHAT_TABLE": {
+              "Ref": "WebChatTable02103F86"
+            }
+          }
+        },
+        "FunctionName": "notiops-web-chat-bff",
+        "Handler": "index.handler",
+        "MemorySize": 512,
+        "Role": {
+          "Fn::GetAtt": [
+            "WebChatBffServiceRole61946212",
+            "Arn"
+          ]
+        },
+        "Runtime": "nodejs20.x",
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ],
+        "Timeout": 900
+      },
+      "Type": "AWS::Lambda::Function"
+    },
+    "WebChatBffFunctionUrl88DBBB67": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/WebChatBff/FunctionUrl/Resource"
+      },
+      "Properties": {
+        "AuthType": "AWS_IAM",
+        "Cors": {
+          "AllowHeaders": [
+            "content-type",
+            "authorization",
+            "x-amz-date",
+            "x-amz-security-token",
+            "x-amz-content-sha256",
+            "x-notiops-id-token"
+          ],
+          "AllowMethods": [
+            "GET",
+            "POST",
+            "PUT",
+            "DELETE",
+            "PATCH"
+          ],
+          "AllowOrigins": [
+            "*"
+          ]
+        },
+        "InvokeMode": "RESPONSE_STREAM",
+        "TargetFunctionArn": {
+          "Fn::GetAtt": [
+            "WebChatBffF9213199",
+            "Arn"
+          ]
+        }
+      },
+      "Type": "AWS::Lambda::Url"
+    },
+    "WebChatBffLogRetentionE9890C8C": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/WebChatBff/LogRetention/Resource"
+      },
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Join": [
+            "",
+            [
+              "/aws/lambda/",
+              {
+                "Ref": "WebChatBffF9213199"
+              }
+            ]
+          ]
+        },
+        "RetentionInDays": 14,
+        "ServiceToken": {
+          "Fn::GetAtt": [
+            "LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8aFD4BFC8A",
+            "Arn"
+          ]
+        }
+      },
+      "Type": "Custom::LogRetention"
+    },
+    "WebChatBffServiceRole61946212": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/WebChatBff/ServiceRole/Resource"
+      },
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              }
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                {
+                  "Ref": "AWS::Partition"
+                },
+                ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+              ]
+            ]
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Role"
+    },
+    "WebChatBffServiceRoleDefaultPolicyF068D5C2": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/WebChatBff/ServiceRole/DefaultPolicy/Resource"
+      },
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": [
+                "dynamodb:BatchGetItem",
+                "dynamodb:Query",
+                "dynamodb:GetItem",
+                "dynamodb:Scan",
+                "dynamodb:ConditionCheckItem",
+                "dynamodb:BatchWriteItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:DeleteItem",
+                "dynamodb:DescribeTable"
+              ],
+              "Effect": "Allow",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "WebChatTable02103F86",
+                    "Arn"
+                  ]
+                }
+              ]
+            },
+            {
+              "Action": [
+                "dynamodb:GetRecords",
+                "dynamodb:GetShardIterator"
+              ],
+              "Effect": "Allow",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "WebChatTable02103F86",
+                    "Arn"
+                  ]
+                }
+              ]
+            },
+            {
+              "Action": [
+                "cognito-idp:ListUsers",
+                "cognito-idp:AdminCreateUser",
+                "cognito-idp:AdminDeleteUser",
+                "cognito-idp:ListGroups",
+                "cognito-idp:CreateGroup",
+                "cognito-idp:DeleteGroup",
+                "cognito-idp:ListUsersInGroup",
+                "cognito-idp:AdminAddUserToGroup",
+                "cognito-idp:AdminRemoveUserFromGroup"
+              ],
+              "Effect": "Allow",
+              "Resource": "arn:aws:cognito-idp:us-east-1:111122223333:userpool/us-east-1_FIXTUREPOOL"
+            },
+            {
+              "Action": [
+                "dynamodb:Query",
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:DeleteItem"
+              ],
+              "Effect": "Allow",
+              "Resource": [
+                "arn:aws:dynamodb:us-east-1:111122223333:table/notiops-config",
+                "arn:aws:dynamodb:us-east-1:111122223333:table/notiops-config/index/*"
+              ]
+            },
+            {
+              "Action": [
+                "guardduty:ListDetectors",
+                "guardduty:GetFindingsStatistics",
+                "guardduty:ListFindings",
+                "guardduty:GetFindings",
+                "backup:ListBackupJobs",
+                "backup:ListBackupVaults",
+                "backup:ListProtectedResources"
+              ],
+              "Effect": "Allow",
+              "Resource": "*",
+              "Sid": "SecOpsDashboardsReadOnly"
+            },
+            {
+              "Action": "sts:AssumeRole",
+              "Effect": "Allow",
+              "Resource": [
+                "arn:aws:iam::*:role/notiops-idle-detection-role",
+                "arn:aws:iam::*:role/notiops-idle-detection-role-*",
+                "arn:aws:iam::*:role/notiops-agent-trigger-*"
+              ]
+            },
+            {
+              "Action": "bedrock-agentcore:InvokeAgentRuntime",
+              "Effect": "Allow",
+              "Resource": "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/*"
+            },
+            {
+              "Action": [
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:PutSecretValue",
+                "secretsmanager:UpdateSecret"
+              ],
+              "Effect": "Allow",
+              "Resource": "arn:aws:secretsmanager:us-east-1:111122223333:secret:notiops/im-bot-feishu*"
+            },
+            {
+              "Action": "secretsmanager:CreateSecret",
+              "Effect": "Allow",
+              "Resource": "arn:aws:secretsmanager:us-east-1:111122223333:secret:notiops/im-bot-feishu*"
+            },
+            {
+              "Action": [
+                "health:DescribeEvents",
+                "health:DescribeEventDetails",
+                "health:DescribeAffectedEntities"
+              ],
+              "Effect": "Allow",
+              "Resource": "*"
+            },
+            {
+              "Action": [
+                "budgets:ViewBudget",
+                "budgets:DescribeBudgets"
+              ],
+              "Effect": "Allow",
+              "Resource": "*"
+            },
+            {
+              "Action": [
+                "ce:GetCostAndUsage",
+                "ce:GetCostAndUsageComparisons",
+                "ce:GetCostComparisonDrivers",
+                "ce:GetCostForecast",
+                "ce:GetAnomalies",
+                "ce:GetAnomalyMonitors",
+                "ce:GetAnomalySubscriptions",
+                "ce:GetReservationCoverage",
+                "ce:GetReservationUtilization",
+                "ce:GetSavingsPlansCoverage",
+                "ce:GetSavingsPlansUtilization",
+                "ce:GetDimensionValues",
+                "ce:GetTags",
+                "ce:GetCostCategories"
+              ],
+              "Effect": "Allow",
+              "Resource": "*"
+            },
+            {
+              "Action": [
+                "cost-optimization-hub:ListEnrollmentStatuses",
+                "cost-optimization-hub:GetRecommendation",
+                "cost-optimization-hub:ListRecommendations",
+                "cost-optimization-hub:ListRecommendationSummaries"
+              ],
+              "Effect": "Allow",
+              "Resource": "*"
+            },
+            {
+              "Action": [
+                "aidevops:ListAssociations",
+                "aidevops:CreateAsset",
+                "aidevops:UpdateAsset",
+                "aidevops:DeleteAsset",
+                "aidevops:ListAssets",
+                "aidevops:CreateBacklogTask",
+                "aidevops:GetBacklogTask",
+                "aidevops:ListJournalRecords",
+                "aidevops:ListRecommendations"
+              ],
+              "Effect": "Allow",
+              "Resource": "arn:aws:aidevops:us-east-1:111122223333:agentspace/*"
+            },
+            {
+              "Action": "organizations:DescribeOrganization",
+              "Effect": "Allow",
+              "Resource": "*"
+            },
+            {
+              "Action": "dynamodb:GetItem",
+              "Effect": "Allow",
+              "Resource": "arn:aws:dynamodb:us-east-1:111122223333:table/notiops-config"
+            },
+            {
+              "Action": [
+                "athena:StartQueryExecution",
+                "athena:GetQueryExecution",
+                "athena:GetQueryResults",
+                "athena:StopQueryExecution",
+                "athena:ListNamedQueries",
+                "athena:BatchGetNamedQuery",
+                "athena:GetNamedQuery"
+              ],
+              "Effect": "Allow",
+              "Resource": "arn:aws:athena:us-east-1:111122223333:workgroup/primary"
+            },
+            {
+              "Action": [
+                "bedrock:InvokeModel",
+                "bedrock:InvokeModelWithResponseStream"
+              ],
+              "Effect": "Allow",
+              "Resource": [
+                "arn:aws:bedrock:*::foundation-model/*",
+                "arn:aws:bedrock:::foundation-model/*",
+                "arn:aws:bedrock:*:111122223333:inference-profile/*"
+              ],
+              "Sid": "BedrockInferenceAndConnectivityProbe"
+            },
+            {
+              "Action": "bedrock-mantle:CreateInference",
+              "Effect": "Allow",
+              "Resource": "*",
+              "Sid": "BedrockMantleConnectivityProbe"
+            },
+            {
+              "Action": [
+                "bedrock:ListFoundationModels",
+                "bedrock:ListInferenceProfiles"
+              ],
+              "Effect": "Allow",
+              "Resource": "*",
+              "Sid": "BedrockListFoundationModels"
+            },
+            {
+              "Action": [
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:PutSecretValue",
+                "secretsmanager:UpdateSecret",
+                "secretsmanager:DescribeSecret",
+                "secretsmanager:CreateSecret"
+              ],
+              "Effect": "Allow",
+              "Resource": "arn:aws:secretsmanager:us-east-1:111122223333:secret:notiops/bedrock-api-key*",
+              "Sid": "BedrockApiKeySecretAccess"
+            },
+            {
+              "Action": [
+                "glue:GetDatabase",
+                "glue:GetTable",
+                "glue:GetTables",
+                "glue:GetPartitions"
+              ],
+              "Effect": "Allow",
+              "Resource": [
+                "arn:aws:glue:us-east-1:111122223333:catalog",
+                "arn:aws:glue:us-east-1:111122223333:database/*",
+                "arn:aws:glue:us-east-1:111122223333:table/*/*"
+              ]
+            },
+            {
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:ListBucket",
+                "s3:GetBucketLocation"
+              ],
+              "Effect": "Allow",
+              "Resource": [
+                "arn:aws:s3:::notiops-data-111122223333-us-east-1",
+                "arn:aws:s3:::notiops-data-111122223333-us-east-1/athena-results/*"
+              ]
+            },
+            {
+              "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+              ],
+              "Effect": "Allow",
+              "Resource": "*"
+            },
+            {
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject"
+              ],
+              "Effect": "Allow",
+              "Resource": "arn:aws:s3:::notiops-data-111122223333-us-east-1/skills/*"
+            },
+            {
+              "Action": "s3:ListBucket",
+              "Condition": {
+                "StringLike": {
+                  "s3:prefix": [
+                    "skills/*",
+                    "skills/"
+                  ]
+                }
+              },
+              "Effect": "Allow",
+              "Resource": "arn:aws:s3:::notiops-data-111122223333-us-east-1"
+            },
+            {
+              "Action": "s3:PutObject",
+              "Effect": "Allow",
+              "Resource": "arn:aws:s3:::notiops-data-111122223333-us-east-1/reports/*"
+            },
+            {
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject"
+              ],
+              "Effect": "Allow",
+              "Resource": "arn:aws:s3:::notiops-data-111122223333-us-east-1/onboarding-templates/*"
+            },
+            {
+              "Action": [
+                "support:CreateCase",
+                "support:AddCommunicationToCase",
+                "support:ResolveCase",
+                "support:DescribeCases",
+                "support:DescribeCommunications",
+                "support:DescribeServices",
+                "support:DescribeSeverityLevels",
+                "support:DescribeTrustedAdvisorChecks",
+                "support:DescribeTrustedAdvisorCheckResult"
+              ],
+              "Effect": "Allow",
+              "Resource": "*"
+            },
+            {
+              "Action": [
+                "cloudwatch:DescribeAlarms",
+                "cloudwatch:DescribeAlarmHistory"
+              ],
+              "Effect": "Allow",
+              "Resource": "*"
+            },
+            {
+              "Action": [
+                "ec2:DescribeRegions",
+                "rds:DescribeDBInstances",
+                "rds:DescribeDBClusters",
+                "rds:DescribeDBEngineVersions",
+                "eks:ListClusters",
+                "eks:DescribeCluster",
+                "eks:DescribeClusterVersions",
+                "lambda:ListFunctions",
+                "elasticache:DescribeCacheClusters",
+                "es:ListDomainNames",
+                "es:DescribeDomains",
+                "elasticmapreduce:ListClusters",
+                "elasticmapreduce:DescribeCluster"
+              ],
+              "Effect": "Allow",
+              "Resource": "*"
+            },
+            {
+              "Action": [
+                "securityhub:GetFindings",
+                "securityhub:GetInsights"
+              ],
+              "Effect": "Allow",
+              "Resource": "*"
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "WebChatBffServiceRoleDefaultPolicyF068D5C2",
+        "Roles": [
+          {
+            "Ref": "WebChatBffServiceRole61946212"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    },
+    "WebChatTable02103F86": {
+      "DeletionPolicy": "Retain",
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/WebChatTable/Resource"
+      },
+      "Properties": {
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "PK",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "SK",
+            "AttributeType": "S"
+          }
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "KeySchema": [
+          {
+            "AttributeName": "PK",
+            "KeyType": "HASH"
+          },
+          {
+            "AttributeName": "SK",
+            "KeyType": "RANGE"
+          }
+        ],
+        "TableName": "notiops-web-chat",
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ],
+        "TimeToLiveSpecification": {
+          "AttributeName": "ttl",
+          "Enabled": true
+        }
+      },
+      "Type": "AWS::DynamoDB::Table",
+      "UpdateReplacePolicy": "Retain"
+    }
+  },
+  "Rules": {
+    "CheckBootstrapVersion": {
+      "Assertions": [
+        {
+          "Assert": {
+            "Fn::Not": [
+              {
+                "Fn::Contains": [
+                  [
+                    "1",
+                    "2",
+                    "3",
+                    "4",
+                    "5"
+                  ],
+                  {
+                    "Ref": "BootstrapVersion"
+                  }
+                ]
+              }
+            ]
+          },
+          "AssertDescription": "CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' with a recent version of the CDK CLI."
+        }
+      ]
+    }
+  }
+}

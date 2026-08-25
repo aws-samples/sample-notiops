@@ -218,6 +218,54 @@ def _collect_sources(messages, since_idx: int):
     return out
 
 
+def _event_has_bytes(obj, _depth: int = 0) -> bool:
+    """事件里是否含 bytes —— 含 bytes 的事件**一律不能发给前端**。
+
+    AgentCore runtime 序列化事件时 json.dumps 遇到 bytes 抛 TypeError，其兜底是
+    `json.dumps(str(obj))` —— 整个事件的 **Python repr** 变成一个合法 JSON 字符串发出，
+    BFF 拿到字符串事件当正文追加，用户在回答里看到
+    `{'event': {…'reasoningContent': {'redactedContent': b'rsn_…'`。
+    实测触发者是 Grok 这类**加密思考链**模型（Sonnet 的思考链是明文 text，不带 bytes，
+    所以同一份代码在 Sonnet 上看不出问题）。已知来源见下面 `_stream_events` 的按名过滤；
+    本函数是兜底，保证换模型/新增二进制 chunk 时失败模式不再是「往回答里灌 repr」。"""
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        return True
+    if _depth > 6:  # 事件是浅结构；设上限防病态嵌套
+        return False
+    if isinstance(obj, dict):
+        return any(_event_has_bytes(v, _depth + 1) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_event_has_bytes(v, _depth + 1) for v in obj)
+    return False
+
+
+def _stream_events(event, en: bool):
+    """把 Strands 的一个原始 stream 事件翻成 0..n 个「发给前端」的事件。
+
+    只转发**看得懂的**事件：正文增量原样、工具开始 → 进度行、思考过程明文 → reasoning。
+    其余（Strands 自有事件、contentBlockStart、加密思考链、任何含 bytes 的事件）一律丢弃。
+    """
+    if not isinstance(event, dict) or "event" not in event:
+        return []  # Strands 自有事件（init_event_loop / TextStreamEvent 等）不外发
+    _ev = event["event"]
+    cbs = _ev.get("contentBlockStart")
+    if cbs is not None:
+        _tu = (cbs.get("start") or {}).get("toolUse") or {}
+        _tname = _tu.get("name") if isinstance(_tu, dict) else ""
+        return [{"progress": {"text": _progress_for_tool(_tname, en), "kind": "tool"}}] if _tname else []
+    _delta = (_ev.get("contentBlockDelta") or {}).get("delta") or {}
+    if isinstance(_delta, dict) and isinstance(_delta.get("text"), str):
+        return [event]  # 正文增量：最常见的一支，先走
+    _rc = _delta.get("reasoningContent") if isinstance(_delta, dict) else None
+    if isinstance(_rc, dict):
+        # 只发明文思考；signature / redactedContent 对用户无意义，且后者是 bytes。
+        _rtext = _rc.get("text")
+        return [{"reasoning": {"text": _rtext}}] if isinstance(_rtext, str) and _rtext else []
+    if _event_has_bytes(event):
+        return []
+    return [event]
+
+
 @app.entrypoint
 async def invoke(payload):
     """AgentCore Runtime 调用入口。payload 来自 BFF 的 InvokeAgentRuntime body。"""
@@ -300,23 +348,8 @@ async def invoke(payload):
     #   · 工具开始调用 → {progress}：一句"正在做什么"（双语随本轮语言）。
     #   · reasoning 增量 → {reasoning}：模型思考过程（前端可折叠灰字，收到正文即隐藏）。
     async for event in agent.stream_async(prompt):
-        if isinstance(event, dict) and "event" in event:
-            _ev = event["event"]
-            cbs = _ev.get("contentBlockStart")
-            if cbs is not None:
-                _tu = (cbs.get("start") or {}).get("toolUse") or {}
-                _tname = _tu.get("name") if isinstance(_tu, dict) else ""
-                if _tname:
-                    yield {"progress": {"text": _progress_for_tool(_tname, _en), "kind": "tool"}}
-                continue  # contentBlockStart 不含正文，无需转发
-            _delta = (_ev.get("contentBlockDelta") or {}).get("delta") or {}
-            _rc = _delta.get("reasoningContent") if isinstance(_delta, dict) else None
-            if isinstance(_rc, dict):
-                _rtext = _rc.get("text")
-                if isinstance(_rtext, str) and _rtext:
-                    yield {"reasoning": {"text": _rtext}}
-                continue  # reasoning 不进正文
-        yield event
+        for _out in _stream_events(event, _en):
+            yield _out
 
     # 收尾：合并强制预搜来源 + 模型额外调工具的来源，去重后作为末尾事件发出。
     try:

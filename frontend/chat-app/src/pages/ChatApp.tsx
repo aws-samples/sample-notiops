@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentUser, signOut, fetchAuthSession } from "aws-amplify/auth";
 import Sidebar from "../components/Sidebar";
 import Message from "../components/Message";
@@ -270,9 +270,26 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     return () => { cancelled = true; };
   }, [view, casesData, dashAccountId]);
   const [invMsgId, setInvMsgId] = useState<string>("");
-  const streamRef = useRef<HTMLDivElement>(null);
+  // 对话流滚动容器：用 **callback ref + state** 而不是纯 useRef —— 滚动监听必须以真实节点
+  // 为依赖重绑（`.stream` 会随 <ErrorBoundary key={view}> 重挂载），见下方滚动跟随 effect。
+  const streamRef = useRef<HTMLDivElement | null>(null);
+  const [streamEl, setStreamEl] = useState<HTMLDivElement | null>(null);
+  const attachStream = useCallback((el: HTMLDivElement | null) => { streamRef.current = el; setStreamEl(el); }, []);
   // 仅当用户停在底部附近时才自动跟随流式输出；一旦上滚查看历史就停止打扰
   const followRef = useRef(true);
+  // 上一次已知的 scrollTop + "这次滚动是我们自己发起的"标记 —— 用来把**用户上滚**与
+  // **程序滚到底**区分开，否则自动滚底触发的 scroll 事件会把跟随状态又打开。
+  const lastTopRef = useRef(0);
+  const selfScrollRef = useRef(false);
+  // 程序滚到底：只有位置真的会变时才打 selfScroll 标记，否则标记留着会误吞用户的下一次滚动。
+  const scrollToBottom = () => {
+    const el = streamRef.current;
+    if (!el) return;
+    const bottom = el.scrollHeight - el.clientHeight;
+    if (bottom - el.scrollTop > 1) selfScrollRef.current = true;
+    el.scrollTop = el.scrollHeight;
+    lastTopRef.current = el.scrollTop;
+  };
   // 已从后端拉过消息的会话 id（避免重复加载）
   const loadedRef = useRef<Set<string>>(new Set());
   // 每会话进行中的 AbortController（用于"停止生成"）
@@ -428,6 +445,20 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   const setLt = (topic: string, patch: LandingToggle) =>
     setLandingToggles((prev) => ({ ...prev, [topic]: { ...(LANDING_DEFAULTS[topic] ?? {}), ...(prev[topic] ?? {}), ...patch } }));
 
+  // ── 主题 landing 页的**模型**草稿（per-topic，与上面的开关同源同理）──
+  // BUG 修复：landing 的模型选择器此前直接读写 `model`/`setModel`（= 背后那个 active 会话的
+  // 模型），而发送走 startFromNotification **新建**会话、只继承账号与开关，模型被
+  // emptyConversation 重置成管理员默认值 —— 表现为「选了 Grok 4.6，一发送又变回 Sonnet 5」，
+  // 且**真的用默认模型发出去了**（handleSend 的 sendModel 取新会话的 model），不只是显示不对。
+  // 现在与开关一样按 topic 存草稿，发送时通过 convPatch 带进新会话。
+  const [landingModels, setLandingModels] = useState<Record<string, string>>({});
+  // 草稿为空 / 记的模型已被管理员下架 → 回落到当前默认模型（与会话内 `model` 的口径一致）。
+  const lm = (topic: string): string => {
+    const id = landingModels[topic];
+    return isSelectableModel(id) ? id! : catalogDefault;
+  };
+  const setLm = (topic: string, id: string) => setLandingModels((prev) => ({ ...prev, [topic]: id }));
+
   useEffect(() => {
     getCurrentUser()
       .then((u) => setUsername(u.username || "U"))
@@ -528,46 +559,56 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
       .finally(settleHydration);
   }, [activeId, conversations]);
 
-  // 监听滚动：判断用户是否贴着底部（留 120px 容差）。上滚则暂停自动跟随。
-  // 依赖 isEmpty：空对话居中态下 .stream 不挂载（streamRef=null），发首条消息后
-  // .stream 才挂载——必须在那时重新绑定监听，否则 followRef 永远 true、一直被强拉到底。
+  // 监听滚动：判断用户是否还贴着底部；一旦上滚就停止自动跟随。
+  //
+  // ⚠️ 依赖必须是**真实 DOM 节点**（streamEl），不能用 isEmpty 之类的近似信号 —— 这是
+  // 「上滚被强拉回底」反复复发的根因：`.stream` 会随 <ErrorBoundary key={view}> 在**切换视图**
+  // （主题落地页/仪表盘 → chat）时整棵子树重挂载。若切走前的 active 会话本来就有消息，
+  // isEmpty 全程为 false → effect 不重跑 → 监听留在**已卸载的旧节点**上，而 streamRef 指向
+  // 新节点、身上一个监听都没有 → followRef 永远是 true → 每个 token 都把视口按回底部。
+  // 复现路径：先在任意会话里聊过 → 进「成本/调查」等主题页 → 从落地页发问 → 流式中上滚。
+  // 用 callback ref 把节点存进 state：节点换了就一定重绑，与 view/topic/isEmpty 全部解耦。
   useEffect(() => {
-    const el = streamRef.current;
+    const el = streamEl;
     if (!el) return;
+    const dist = () => el.scrollHeight - el.scrollTop - el.clientHeight;
+    // 用户主动上滚：**任何输入方式**都靠"scrollTop 变小且不是我们自己滚的"识别（滚轮/触摸/
+    // 拖滚动条/键盘 PageUp 都覆盖）。wheel/touch 额外保留一份即时判定，比 scroll 事件更早到。
     const onScroll = () => {
-      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-      followRef.current = nearBottom;
+      const top = el.scrollTop;
+      if (selfScrollRef.current) { selfScrollRef.current = false; lastTopRef.current = top; return; }
+      if (top < lastTopRef.current - 1) followRef.current = false;
+      else if (dist() < 24) followRef.current = true; // 只有真正回到底部才重新跟随
+      lastTopRef.current = top;
     };
-    // 用户主动向上滚(滚轮/触摸)时**立即**停止跟随,不等 scroll 事件的 nearBottom 异步判断——
-    // 否则流式内容持续长高,相对位置又被推回底部,表现为"上滚被强拉回底、滚不上去"。
-    const onWheel = (e: WheelEvent) => { if (e.deltaY < 0) followRef.current = false; };
+    const stopFollow = () => { followRef.current = false; selfScrollRef.current = false; };
+    const onWheel = (e: WheelEvent) => { if (e.deltaY < 0) stopFollow(); };
     let touchY = 0;
     const onTouchStart = (e: TouchEvent) => { touchY = e.touches[0]?.clientY ?? 0; };
-    const onTouchMove = (e: TouchEvent) => { if ((e.touches[0]?.clientY ?? 0) > touchY) followRef.current = false; };
+    const onTouchMove = (e: TouchEvent) => { if ((e.touches[0]?.clientY ?? 0) > touchY) stopFollow(); };
     el.addEventListener("scroll", onScroll, { passive: true });
     el.addEventListener("wheel", onWheel, { passive: true });
     el.addEventListener("touchstart", onTouchStart, { passive: true });
     el.addEventListener("touchmove", onTouchMove, { passive: true });
+    lastTopRef.current = el.scrollTop;
     return () => {
       el.removeEventListener("scroll", onScroll);
       el.removeEventListener("wheel", onWheel);
       el.removeEventListener("touchstart", onTouchStart);
       el.removeEventListener("touchmove", onTouchMove);
     };
-  }, [isEmpty]);
+  }, [streamEl]);
 
   useEffect(() => {
     // 只有在"跟随"状态才滚到底；用户上滚看历史时不强拉
-    const el = streamRef.current;
-    if (el && followRef.current) el.scrollTop = el.scrollHeight;
+    if (followRef.current) scrollToBottom();
   }, [active.messages]);
 
   // 切换会话时重置为跟随并滚到底
   useEffect(() => {
     followRef.current = true;
-    const el = streamRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [activeId]);
+    scrollToBottom();
+  }, [activeId, streamEl]);
 
   // 按**指定会话 id**改写（流式回调必须用启动时捕获的 convId，而非随时会变的 activeId，
   // 否则用户中途切会话会把 token 写到错误的会话里）。
@@ -850,7 +891,12 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     // 否则从 landing Composer 发起的调查会丢掉跨账号选择 → agent 用默认凭据返回部署账号数据。
     // 用 accountIdRef.current(最新值)而非闭包 accountId,避免选账号后立即发送时读到 stale 值。
     const inheritedAccount = convPatch && "accountId" in convPatch ? {} : { accountId: accountIdRef.current };
-    const c = { ...emptyConversation(locale, topic), ...inheritedAccount, ...(convPatch || {}) };
+    // 新会话继承该主题 landing 上选的模型（lm 的草稿），否则从 landing / 仪表盘卡片发起的会话
+    // 会被 emptyConversation 重置成管理员默认模型 —— 用户选的 Grok 4.6 等于白选，且是**静默**
+    // 用错模型。放在这里统一兜底，所有入口（landing Composer、通知卡、各仪表盘的
+    // 「深入调查 / 就此提问」）一次覆盖；调用方显式给 model 时以调用方为准。
+    const inheritedModel = convPatch && "model" in convPatch ? {} : { model: lm(topic) };
+    const c = { ...emptyConversation(locale, topic), ...inheritedAccount, ...inheritedModel, ...(convPatch || {}) };
     // 先丢弃当前 throwaway 空会话 + 切到新会话;新会话的**插入交给 handleSend 的 upsert**
     // (它带 target 兜底,不依赖本次 setConversations 是否已 flush)——避免时序竞态导致
     // "有时点了没反应"。这里只处理 throwaway 清理 + activeId,不预插 c(否则可能双插)。
@@ -914,7 +960,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
             })}
           </div>
         </div>
-        <Composer model={model} onModelChange={setModel}
+        <Composer model={lm(topicKey)} onModelChange={(id) => setLm(topicKey, id)}
           onSend={(text, skillId) => startFromNotification(text, topicKey, { ...lt(topicKey), accountId: dashAccountId }, skillId)}
           busy={false} /* landing 是发起新会话入口,永远可发送 */ showSuggestions={false} prefill={themePrefill[topicKey]}
           webSearch={lt(topicKey).webSearch ?? false} onToggleWebSearch={() => setLt(topicKey, { webSearch: !(lt(topicKey).webSearch ?? false) })}
@@ -1157,7 +1203,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
             自然顺序堆叠、整体垂直居中——不用任何写死偏移，任意屏幕相对位置恒定、不重叠。 */}
         {!isEmpty ? (
           <>
-            <div className="stream" ref={streamRef}>
+            <div className="stream" ref={attachStream}>
               <div className="thread">
                 {active.messages.map((m) => (
                   <Message key={m.id} m={m} onOpenSources={openSources}

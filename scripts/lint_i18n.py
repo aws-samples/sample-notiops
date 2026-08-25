@@ -172,12 +172,20 @@ CJK_ALLOWLIST = {
     # heading plus the exemption reasons, which exist to be read by whoever is
     # about to add an exemption. Developer-facing only.
     "scripts/test_ci_runs_every_suite.py",
+    # 流事件过滤测试 —— CJK 是测试标题/断言标签，以及**事故复现用的 fixture**
+    # （Grok 加密思考链泄漏时用户看到的那串正文）。Developer-facing only。
+    "scripts/test_stream_event_filter.py",
     # dd1 token-savings test — asserts the trimmed prompt block no longer
     # contains topic-specific wording ("本主题只读工具"). The CJK literal is
     # an assertion about ABSENCE from a prompt, i.e. a fixture, not output.
     # (It was first written as a \uXXXX escape to dodge this check; the linter
     # decodes escapes, so allowlisting is the honest fix.)
     "scripts/test_devops_deep_token_savings.py",
+    # 一键部署模板的判据测试 —— CJK 分两类，都不是产品输出：断言标签/失败提示
+    # （给下一个撞上判据的维护者看的），以及**故意造的坏模板 fixture**。后者尤其
+    # 不能翻译：那条判据本身就是「客户可见文案里不许有非 ASCII」（CFN 会把它们换成
+    # `?`），反例必须真的是中文/破折号才撞得上它。Developer-facing only。
+    "scripts/test_postprocess_template.py",
     # Sanitizer denylist — internal blocklist of OpenAI ChatML
     # protocol fragments + Chinese SEO/gambling spam tokens that
     # must NEVER reach end users. These strings are pattern fixtures,

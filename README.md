@@ -35,7 +35,8 @@ on-call engineers without granting write access.
 
 | Doc | Purpose |
 |---|---|
-| 🛠 [Deployment Guide](docs/DEPLOYMENT.en.md) | Step-by-step from `./setup.sh` to first smoke test (web console + optional IM) |
+| 🚀 [One-click Deploy](docs/DEPLOYMENT_ONECLICK.en.md) | Browser only: upload one CloudFormation template, ~4.5 minutes to a running Web Chat (Web Chat only) |
+| 🛠 [Deployment Guide](docs/DEPLOYMENT.en.md) | Full install: step-by-step from `./setup.sh` to first smoke test (web console + optional IM) |
 | 👤 [User Guide](docs/USER_GUIDE.en.md) | End-user manual + conversation samples + FAQ |
 | 🏗 [Technical Design](docs/TECHNICAL_DESIGN.en.md) | Module boundaries / data flow / security / 3-layer defense |
 | 🧑‍💻 [CONTRIBUTING](CONTRIBUTING.md) | Conventions (i18n / security / PR process) |
@@ -73,6 +74,29 @@ on-call engineers without granting write access.
 
 ## Getting started
 
+Two ways to deploy — pick one.
+
+### Option A: one-click deploy — a browser is all you need
+
+For environments where long-lived access keys aren't available, or where you
+can't install CDK and a container runtime locally: everything happens in the AWS
+Console, nothing is installed on your machine.
+
+1. Download `notiops-webchat.template.json` from
+   [Releases](https://github.com/aws-samples/sample-notiops/releases/latest);
+2. Open the CloudFormation console → **Create stack** → **Upload a template file**;
+3. Enter an administrator email (the temporary password is mailed there), tick
+   the IAM capabilities acknowledgement, and create — measured at ~4.5 minutes.
+   The stack outputs include the Web Chat URL.
+
+⚠️ One-click deploys **Web Chat only** (frontend + BFF + agent). It does **not**
+include the IM bots, scheduled inspections, the admin dashboard, or CUR/Athena
+FinOps — use Option B for those. Prerequisites (region and Bedrock model access),
+the resource and cost breakdown, upgrade/rollback, and one-click teardown are in
+[docs/DEPLOYMENT_ONECLICK.en.md](docs/DEPLOYMENT_ONECLICK.en.md).
+
+### Option B: `setup.sh` — the full install
+
 ```bash
 # 1. Clone
 git clone https://github.com/aws-samples/sample-notiops.git
@@ -86,7 +110,10 @@ cd sample-notiops
 # container build → cdk deploy --all. Re-runs only patch deltas.
 ```
 
-### Deploy modes: single-account (default) vs multi-account
+Requires git, Node.js, Python, the AWS CDK, and a container runtime locally,
+plus credentials that can deploy.
+
+#### Deploy modes: single-account (default) vs multi-account
 
 Decide before you run `setup.sh` — the mode is baked in at deploy time and
 switching later requires a redeploy.

@@ -127,8 +127,19 @@ export async function invokeAgent({ conversationId, prompt, model, generation, l
  *   {"event": {"contentBlockStart": {"start": {"toolUse": {...}}}}}
  *   {"event": {"messageStop": {...}}} / {"event": {"metadata": {...}}}
  */
-function extract(evt) {
-  if (typeof evt === "string") return { text: evt, sources: [], actions: [] };
+export function extract(evt) {
+  // 字符串事件 = 「极少数实现直接发纯文本」的兜底。但它同时是 runtime 序列化失败的
+  // **退化产物**：AgentCore 的 _safe_serialize_to_json_string 在 json.dumps 抛
+  // TypeError（事件里有 bytes，如 Grok 的加密思考链 reasoningContent.redactedContent）时，
+  // 兜底成 json.dumps(str(obj)) —— 于是整个事件的 Python repr 变成一个**合法 JSON
+  // 字符串**发过来。把它当正文，用户回答里就会出现一坨
+  // `{'event': {'contentBlockDelta': … b'rsn_…'}}`（实测事故）。
+  // 判据：序列化出来的对象/字节 repr 一定以 { [ b' b" 开头，纯文本不会 → 只收后者。
+  if (typeof evt === "string") {
+    const s = evt.trimStart();
+    const looksSerialised = /^[{[]/.test(s) || /^b['"]/.test(s);
+    return { text: looksSerialised ? "" : evt, sources: [], actions: [] };
+  }
   if (!evt || typeof evt !== "object") return { text: "", sources: [], actions: [] };
 
   // 先解开外层 `event` 包装（runtime 实际就是这层结构）

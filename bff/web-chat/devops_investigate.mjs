@@ -1,8 +1,6 @@
 /**
  * 深度调查（直连）/ Deep Dive (Direct) —— **0 token** 的第二条深度调查路径。
  *
- * 设计：`docs/DEEP_DIVE_DIRECT_DESIGN.md`。
- *
  * 与老路径（「深度调查」/ Deep Dive）的关系：**完全并行、互不影响**。
  *   老：前端 devops_agent:true → BFF → agent runtime（Strands + Bedrock，烧 token）
  *       → investigate_live 工具 → core/devops_agent.py（boto3，本身 0 token）
@@ -134,20 +132,231 @@ async function pollInvestigation({ client, agentSpaceId, executionId, taskId, se
   return { status, terminal: TERMINAL.has(status), newLines };
 }
 
-/** 取最终摘要（结构化优先，退化到 summary_md，再退化到最后一条 assistant 消息）。 */
-async function getInvestigationSummary({ client, agentSpaceId, executionId }) {
+/** 取最终结果，**按后台的 tab 分区**（对齐 core/devops_agent.py 的 get_investigation_result）：
+ *   Summary → sections.summary（`ui_investigation_summary` 终版里的执行摘要卡：问题概要/根本原因/
+ *     修复方案；退化到末条 assistant 原文）
+ *   Root cause → sections.rootCause（结构化 investigation_summary：Impact/Root causes/…；
+ *     退化到 investigation_summary_md 原文）
+ *   Mitigation plan → sections.mitigation（`mitigation_summary_md`：Action/Reasoning/Execution
+ *     Plan/Code Change Spec；退化到 ListRecommendations。有就给、没有就空）
+ *   Investigation timeline → 不在这里：走 pollOnce 的 investigation_step 实时进右侧栏
+ *
+ * ⚠️ 数据源是**实测**校准的（2026-08-20 拿现网一次真调查的 92 条 journal 记录逐类核对）：
+ * `investigation_summary_md` 其实是 `# Investigation Summary` + Symptoms/Findings/**Root Cause**，
+ * 它是后台 **Root cause** 页的 md 版而非 Summary 页；Summary 页来自 `ui_investigation_summary`
+ * （UI 组件树，逐步刷新、最后一条为终版）；Mitigation plan 页来自 `mitigation_summary_md`，而
+ * `ListRecommendations` 那次返回 0 条 —— 故它只当退化来源。按老映射接会让 Summary 与 Root cause
+ * 内容重复、缓解方案永远缺失。
+ * `markdown` 保持存在（报告/聊天用），内容是三段拼好的完整文档。 */
+async function getInvestigationSummary({ client, agentSpaceId, executionId, locale = "zh" }) {
   const records = await listAllRecords(client, agentSpaceId, executionId);
-  let md = buildStructuredReportMd(records);
-  const structured = Boolean(md);
-  if (!md) md = readSummaryMd(records);
-  if (!md) md = readLastAssistant(records);
+  const rootCause = buildStructuredReportMd(records) || mdRecordFrom(records, "investigation_summary_md");
+  const summaryText = uiSummaryFrom(records) || readLastAssistant(records) || "";
   // taskId 从记录里反推（续查场景调用方手里可能只有 execution_id）。
   let taskId = "";
   for (const r of records) {
     const tid = r?.taskId || r?.task?.taskId;
     if (tid) { taskId = tid; break; }
   }
-  return { markdown: md || "", structured, taskId };
+  let mitigation = mdRecordFrom(records, "mitigation_summary_md");
+  if (!mitigation && taskId) {
+    mitigation = await readRecommendationsMd({ client, agentSpaceId, taskId, locale });
+  }
+  const sections = { summary: summaryText, rootCause, mitigation };
+  return { markdown: buildFullReportMd(sections, locale), sections,
+           structured: Boolean(rootCause), hasMitigation: Boolean(mitigation), taskId };
+}
+
+/** 取某类 **markdown 型** journal 记录的终版原文（investigation_summary_md /
+ *  mitigation_summary_md），去掉它自带的 H1（`# Investigation Summary` / `# Mitigation Summary`）
+ *  —— 外面会套统一的章节标题（后台 tab 名），留着就是重复标题。没有 → ""。
+ *  移植 core/devops_agent.py 的 _md_record_from_records。 */
+function mdRecordFrom(records, recordType) {
+  let latest = "";
+  for (const r of records || []) {
+    if (r?.recordType !== recordType) continue;
+    const c = r.content;
+    const s = typeof c === "string" ? c : (c?.text || "");
+    if (s && s.trim()) latest = s;         // 记录按 ASC，最后一条即终版
+  }
+  if (!latest) return "";
+  const lines = latest.split("\n");
+  for (let i = 0; i < Math.min(5, lines.length); i++) {
+    if (lines[i].trimStart().startsWith("# ")) return lines.slice(i + 1).join("\n").trim();
+    if (lines[i].trim()) break;
+  }
+  return latest.trim();
+}
+
+// ── ui_investigation_summary：后台 Summary 页的数据源（一棵 UI 组件树，不是 markdown）──────────
+// 实测终版树：container > [card#summary（执行摘要：标题+状态/严重性徽章+问题概要/根本原因/修复方案）,
+// card（调查发现与证据 = Root cause tab）, container（指标小卡）, card（缓解方案 = Mitigation tab）]。
+// Summary 区**只取第一张卡**，否则三个区互相重复。移植 _ui_summary_from_records / _flatten_ui。
+const UI_HEADING_TYPES = new Set(["title", "card-title"]);
+
+/** 深度优先收集 [type, text] 叶子文本。 */
+function uiLeaves(node, out = []) {
+  if (!node || typeof node !== "object") return out;
+  if (typeof node.text === "string" && node.text.trim()) {
+    out.push([(node.type || "").toLowerCase(), node.text.trim()]);
+  }
+  for (const ch of node.children || []) uiLeaves(ch, out);
+  return out;
+}
+
+/** UI 组件树 → markdown 行（正文原文透传，只映射层级/列表符号）；标题从 `###` 起。 */
+function flattenUi(node, out) {
+  if (!node || typeof node !== "object") return;
+  const t = (node.type || "").toLowerCase();
+  const txt = (node.text || "").trim();
+  if (t === "card-header" || t === "accordion-trigger") {
+    const leaves = uiLeaves(node);
+    const heads = leaves.filter(([k]) => UI_HEADING_TYPES.has(k) || k === "text").map(([, s]) => s);
+    const badges = leaves.filter(([k]) => k === "badge").map(([, s]) => s);
+    const descs = leaves.filter(([k]) => k === "card-description" || k === "markdown").map(([, s]) => s);
+    let line = heads.length ? `**${heads[0]}**` : "";
+    if (badges.length) line = (line ? `${line} ` : "") + badges.map((b) => `\`${b}\``).join(" · ");
+    if (line) out.push(line);
+    out.push(...descs);
+    return;
+  }
+  if (t === "title") {
+    const lvl = Number(node.props?.level);
+    const n = Number.isFinite(lvl) ? Math.max(3, Math.min(6, lvl)) : 3;
+    if (txt) out.push(`${"#".repeat(n)} ${txt}`);
+    return;
+  }
+  if (t === "markdown" || t === "text" || t === "paragraph" || t === "code") {
+    if (txt) out.push(txt);
+    return;
+  }
+  if (t === "badge") { if (txt) out.push(`\`${txt}\``); return; }
+  if (t === "list-item") { if (txt) out.push(`- ${txt}`); return; }
+  if (txt) out.push(txt);
+  for (const ch of node.children || []) flattenUi(ch, out);
+}
+
+/** 从 ui_investigation_summary 终版里取**执行摘要卡**并摊平成 markdown（拿不到 → ""）。 */
+function uiSummaryFrom(records) {
+  let tree = null;
+  for (const r of records || []) {
+    if (r?.recordType !== "ui_investigation_summary") continue;
+    const obj = parseContent(r.content);
+    if (obj && typeof obj === "object") tree = (obj.content && typeof obj.content === "object") ? obj.content : obj;
+  }
+  if (!tree) return "";
+  // 优先按 id 命中执行摘要卡（后台稳定用 "summary" 前缀），否则退化到树里第一张 card。
+  const findCard = (n, byId) => {
+    if (!n || typeof n !== "object") return null;
+    if ((n.type || "").toLowerCase() === "card") {
+      if (!byId || String(n.id || "").split("__")[0] === "summary") return n;
+    }
+    for (const ch of n.children || []) {
+      const got = findCard(ch, byId);
+      if (got) return got;
+    }
+    return null;
+  };
+  const card = findCard(tree, true) || findCard(tree, false);
+  if (!card) return "";
+  const lines = [];
+  flattenUi(card, lines);
+  return lines.filter(Boolean).join("\n\n").trim();
+}
+
+/** Mitigation plan 区：后台 ListRecommendations（不是每次调查都生成 → 没有就空串）。
+ *  失败安全：任何异常都只是"这次没有缓解方案"，绝不让它掀翻整场调查收尾。 */
+async function readRecommendationsMd({ client, agentSpaceId, taskId, locale }) {
+  let recs = [];
+  try {
+    const { ListRecommendationsCommand } = await import("@aws-sdk/client-devops-agent");
+    const resp = await client.send(new ListRecommendationsCommand({ agentSpaceId, taskId }));
+    recs = resp?.recommendations || [];
+  } catch (e) {
+    console.warn("[direct-investigate] list_recommendations_failed", safeErr(e));
+    return "";
+  }
+  if (!recs.length) return "";
+  const en = locale === "en";
+  const out = [""];
+  [...recs].sort((a, b) => (a?.rankPosition ?? 999) - (b?.rankPosition ?? 999)).forEach((r, i) => {
+    const n = i + 1;
+    const title = r?.title || (en ? `Recommendation ${n}` : `建议 ${n}`);
+    const pri = r?.priority ? (en ? ` (priority: ${r.priority})` : `（优先级：${r.priority}）`) : "";
+    const c = r?.content;
+    const body = typeof c === "string" ? c : (c?.text || "");
+    out.push(`### ${n}. ${title}${pri}`);
+    if (body) out.push(String(body));
+    out.push("");
+  });
+  return out.join("\n");
+}
+
+/** ATX 标题整体降 `times` 级（`## X` → `### X`），把自带标题层级的区块嵌到 `## <tab 名>` 之下。
+ *  跳过 ``` 围栏内的行（shell 注释里的 `#` 不是标题）。移植 core/devops_agent.py 的 _demote_md。 */
+function demoteMd(md, times = 1) {
+  if (times <= 0) return String(md || "");
+  let fenced = false;
+  return String(md || "").split("\n").map((ln) => {
+    const s = ln.trimStart();
+    if (s.startsWith("```") || s.startsWith("~~~")) { fenced = !fenced; return ln; }
+    if (fenced || !s.startsWith("#")) return ln;
+    const lvl = s.length - s.replace(/^#+/, "").length;
+    return "#".repeat(Math.min(6 - lvl, times)) + ln;
+  }).join("\n");
+}
+
+/** 一段 markdown 里最浅的 ATX 标题层级（围栏内的 `#` 不算）；没有标题 → 0。 */
+function minHeadingLevel(md) {
+  let lo = 0, fenced = false;
+  for (const ln of String(md || "").split("\n")) {
+    const s = ln.trimStart();
+    if (s.startsWith("```") || s.startsWith("~~~")) { fenced = !fenced; continue; }
+    if (fenced || !s.startsWith("#")) continue;
+    const n = s.length - s.replace(/^#+/, "").length;
+    const rest = s.slice(n);
+    if (n > 6 || (rest && !rest.startsWith(" "))) continue;  // 不是合法 ATX 标题（如 `#tag`）
+    lo = lo === 0 ? n : Math.min(lo, n);
+  }
+  return lo;
+}
+
+/** 把区块标题层级整体压到 `target` 及更深，让它干净嵌在 `##` 章节标题下。各区来源层级不同
+ *  （结构化根因 `##` 起、mitigation_summary_md `##` 起、recommendations/UI 摘要 `###` 起），
+ *  统一按**实测最浅层级**归一，不再硬编码"哪个区要降级"。移植 _fit_under_section。 */
+function fitUnderSection(md, target = 3) {
+  const lo = minHeadingLevel(md);
+  return (lo > 0 && lo < target) ? demoteMd(md, target - lo) : String(md || "");
+}
+
+// 章节标题 = **后台的 tab 名**，让正文与客户在后台看到的一致。
+const SECTION_TITLES = {
+  summary:    ["## 调查摘要（Summary）", "## Summary"],
+  rootCause:  ["## 根因分析（Root cause）", "## Root cause"],
+  mitigation: ["## 缓解方案（Mitigation plan）", "## Mitigation plan"],
+};
+
+/** 按 Summary → Root cause → Mitigation plan 拼成一篇 markdown；空区段跳过。
+ *  clip：**逐区**字符上限（聊天气泡控长用）—— 整篇截断会把后两段整段吃掉。 */
+function buildFullReportMd(sections, locale = "zh", clip = null) {
+  const en = locale === "en";
+  const parts = [];
+  for (const key of ["summary", "rootCause", "mitigation"]) {
+    let body = String((sections || {})[key] || "").trim();
+    if (!body) continue;
+    // 层级归一（**先归一再截断**：截断可能切断 ``` 围栏，之后再判标题会把代码注释当标题）。
+    body = fitUnderSection(body, 3);
+    const limit = clip?.[key];
+    if (limit && body.length > limit) {
+      body = body.slice(0, limit);
+      // 截断点可能落在 ``` 围栏里 —— 不补收尾围栏，后面全被渲染成代码块。
+      if ((body.match(/```/g) || []).length % 2) body += "\n```";
+      body += (en ? "\n\n… (truncated; see the full report below)"
+                  : "\n\n…（此处截断，完整内容见下方在线报告）");
+    }
+    parts.push(`${SECTION_TITLES[key][en ? 1 : 0]}\n\n${body}`);
+  }
+  return parts.join("\n\n").trim();
 }
 
 // ───────────────────────── journal 记录 → 进度行（移植 _record_progress_line）─────────────────────────
@@ -313,16 +522,8 @@ function buildStructuredReportMd(records) {
   return lines.join("\n").trim();
 }
 
-/** 退化路径①：读 investigation_summary_md 记录（取最后一条非空）。 */
-function readSummaryMd(records) {
-  for (let i = records.length - 1; i >= 0; i--) {
-    if (records[i]?.recordType !== "investigation_summary_md") continue;
-    const obj = parseContent(records[i].content);
-    if (typeof obj === "string" && obj.trim()) return obj;
-    if (obj && typeof obj === "object" && typeof obj.text === "string" && obj.text.trim()) return obj.text;
-  }
-  return "";
-}
+// （原 readSummaryMd 已由 mdRecordFrom(records, "investigation_summary_md") 取代：那条记录是
+//   后台 Root cause 页的 md 版，且需要剥掉自带 H1，见 getInvestigationSummary 的实测说明。）
 
 /** 退化路径②：读最后一条 assistant message。 */
 function readLastAssistant(records) {
@@ -532,8 +733,14 @@ export async function runDirectInvestigation({ text, locale, accountId, emit }) 
   });
 
   // —— 轮询 ——
+  // 活跃度心跳（每 ~40s 一条瞬态 progress）：一次调查里常有**几分钟没有任何新 timeline 行**，
+  // 那几分钟里用户只看到上面那句"过程在右侧栏实时更新"一动不动，无法区分"在跑"还是"已经断了"。
+  // 走 progress 通道 = 纯瞬态（收到正文即清空、不入库），只报"还在跑 + 已用时长"，不编造进展。
+  // ⚠️ 这只解决**观感**；防连接被中间跳空闲回收的是 index.mjs 里的全程 keepalive（`: ka`）。
+  const HB_EVERY = Math.max(1, Math.floor(40 / Math.max(1, POLL_INTERVAL_SEC)));
   const seen = new Set();
   let waited = 0;
+  let ticks = 0;
   let status = "IN_PROGRESS";
   while (waited < MAX_WAIT_SEC) {
     try {
@@ -547,6 +754,14 @@ export async function runDirectInvestigation({ text, locale, accountId, emit }) 
     }
     await sleep(POLL_INTERVAL_SEC * 1000);
     waited += POLL_INTERVAL_SEC;
+    if (++ticks % HB_EVERY === 0) {
+      const m = Math.floor(waited / 60), s = waited % 60;
+      emit("progress", {
+        text: dv(`深度调查进行中…已用 ${m} 分 ${s} 秒（分析过程见右侧「调查过程」面板）`,
+                 `Deep investigation running… ${m}m ${s}s elapsed (steps stream in the “Investigation” panel)`),
+        kind: "investigation",
+      });
+    }
   }
 
   // —— 优雅超时：不报错，明确说明调查仍在 AWS 侧继续跑，并给一个 0-token 的续查按钮 ——
@@ -579,7 +794,7 @@ async function resumeInvestigation({ client, space, executionId, locale, emit, s
 
   let summary;
   try {
-    summary = await getInvestigationSummary({ client, agentSpaceId: space, executionId });
+    summary = await getInvestigationSummary({ client, agentSpaceId: space, executionId, locale });
   } catch (e) {
     console.warn("[direct-investigate] resume_read_failed", safeErr(e));
     say(dv(`\n⚠️ 读取调查结果失败：${safeErr(e)}\n`, `\n⚠️ Failed to read the investigation result: ${safeErr(e)}\n`));
@@ -630,10 +845,10 @@ async function finishAndReport({ client, space, executionId, taskId, status, tit
   let summary = preloaded;
   if (!summary) {
     try {
-      summary = await getInvestigationSummary({ client, agentSpaceId: space, executionId });
+      summary = await getInvestigationSummary({ client, agentSpaceId: space, executionId, locale });
     } catch (e) {
       console.warn("[direct-investigate] read_summary_failed", safeErr(e));
-      summary = { markdown: "", structured: false, taskId };
+      summary = { markdown: "", sections: {}, structured: false, hasMitigation: false, taskId };
     }
   }
   const md = summary.markdown || "";
@@ -652,10 +867,13 @@ async function finishAndReport({ client, space, executionId, taskId, status, tit
     return;
   }
 
-  // 忠实透传 DevOps Agent 的原文摘要（不做二次总结——那才是要花 token 的事）。
-  const more = dv("\n\n…（完整内容见下方在线报告）", "\n\n… (see the full report linked below)");
-  say(dv("\n\n✅ **调查完成**\n\n", "\n\n✅ **Investigation complete**\n\n")
-      + (md.length <= 8000 ? md : md.slice(0, 8000) + more) + "\n");
+  // 忠实透传 DevOps Agent 的原文（不做二次总结——那才是要花 token 的事），只按后台的 tab 名
+  // 分章节：Summary / Root cause / Mitigation plan（Investigation timeline 在右侧栏）。
+  // **按区截断**而不是整篇截断：整篇截断时 Summary 一长，后面两段会被整段吃掉。
+  const chatMd = summary.sections
+    ? buildFullReportMd(summary.sections, locale, { summary: 4000, rootCause: 6000, mitigation: 4000 })
+    : md.slice(0, 8000);
+  say(dv("\n\n✅ **调查完成**\n\n", "\n\n✅ **Investigation complete**\n\n") + chatMd + "\n");
 
   const repTitle = dv(`DevOps Agent 深度调查报告 - ${title.slice(0, 40)}`,
                       `DevOps Agent Deep Investigation Report - ${title.slice(0, 40)}`);
@@ -673,7 +891,8 @@ async function finishAndReport({ client, space, executionId, taskId, status, tit
   }
   // 已出结论 → **不给**续查按钮（点了只是把同一份报告再刷一遍）；与老路径完成时一致：只有
   // ①去后台生成缓解方案 + ③转人工支持。
-  emitFollowups({ emit, locale, consoleUrl, executionId, title: escTitle, description });
+  emitFollowups({ emit, locale, consoleUrl, executionId, title: escTitle, description,
+                  hasMitigation: Boolean(summary.hasMitigation) });
 }
 
 /** 末尾快捷操作。
@@ -692,15 +911,20 @@ async function finishAndReport({ client, space, executionId, taskId, status, tit
  * @param {string}  p.title      建案主题用的问题描述：用户原话，或从摘要里推出来的（titleFromSummary）。
  *                               为空 = 连摘要都还没有 → ③ 的 prompt 改成"先取结论再建案"。
  */
-function emitFollowups({ emit, locale, consoleUrl, executionId, title, description, resumable = false }) {
+function emitFollowups({ emit, locale, consoleUrl, executionId, title, description, resumable = false,
+                        hasMitigation = false }) {
   const en = locale === "en";
   const dv = (zh, enStr) => (en ? enStr : zh);
   const fups = [];
   if (consoleUrl) {
     // Operator App 是纯前端切 tab（URL 不变）、无法深链直达 Root cause 页，故文案里明确提示。
+    // 正文已经带 Mitigation plan 区时换文案 —— 再叫"生成"会让用户以为后台还没生成。
     fups.push({
-      label: dv("🛠️ 去 DevOps Agent 后台生成缓解方案（打开后切到 Root cause 页）",
-                "🛠️ Generate a mitigation plan in the DevOps Agent console (open, then switch to the Root cause tab)"),
+      label: hasMitigation
+        ? dv("🛠️ 在 DevOps Agent 后台查看本次调查（含缓解方案）",
+             "🛠️ Open this investigation in the DevOps Agent console (incl. the mitigation plan)")
+        : dv("🛠️ 去 DevOps Agent 后台生成缓解方案（打开后切到 Root cause 页）",
+             "🛠️ Generate a mitigation plan in the DevOps Agent console (open, then switch to the Root cause tab)"),
       url: consoleUrl,
     });
   }

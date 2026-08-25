@@ -28,7 +28,8 @@
 
 | 文档 | 用途 |
 |---|---|
-| 🛠 [部署指南](docs/DEPLOYMENT.md) | 从 `./setup.sh` 到首次冒烟测试的分步指南(Web 控制台 + 可选 IM) |
+| 🚀 [一键部署](docs/DEPLOYMENT_ONECLICK.md) | 只要一个浏览器:上传一份 CloudFormation 模板,约 4.5 分钟拿到 Web Chat(只含 Web Chat) |
+| 🛠 [部署指南](docs/DEPLOYMENT.md) | 完整版:从 `./setup.sh` 到首次冒烟测试的分步指南(Web 控制台 + 可选 IM) |
 | 👤 [用户指南](docs/USER_GUIDE.md) | 终端用户手册 + 对话示例 + FAQ |
 | 🏗 [技术设计](docs/TECHNICAL_DESIGN.md) | 模块边界 / 数据流 / 安全 / 三层防线 |
 | 🧑‍💻 [贡献指南](CONTRIBUTING.md) | 约定(i18n / 安全 / PR 流程) |
@@ -59,6 +60,26 @@
 
 ## 快速开始
 
+两种部署方式,选一种即可。
+
+### 方式 A:一键部署 —— 只要一个浏览器
+
+适合拿不到长期 access key,或不允许在本地装 CDK / 容器运行时的环境:全程在 AWS
+控制台里完成,你自己的机器上什么都不用装。
+
+1. 从 [Releases](https://github.com/aws-samples/sample-notiops/releases/latest)
+   下载 `notiops-webchat.template.json`;
+2. 打开 CloudFormation 控制台 → **Create stack** → **Upload a template file**;
+3. 填管理员邮箱(临时密码会发到这个邮箱)、勾选 IAM 能力确认框、创建 —— 实测约
+   4.5 分钟完成,栈输出里就是 Web Chat 的访问地址。
+
+⚠️ 一键部署**只部署 Web Chat**(前端 + BFF + agent),**不含** IM 机器人、定时巡检、
+管理仪表盘与 CUR/Athena FinOps —— 要这些请用下面的方式 B。前提条件(区域与 Bedrock
+模型开通)、资源与成本构成、升级 / 回滚、一键删除,见
+[docs/DEPLOYMENT_ONECLICK.md](docs/DEPLOYMENT_ONECLICK.md)。
+
+### 方式 B:`setup.sh` —— 完整版
+
 ```bash
 # 1. 克隆
 git clone https://github.com/aws-samples/sample-notiops.git
@@ -71,7 +92,9 @@ cd sample-notiops
 # 容器构建 → cdk deploy --all。重复运行只增量更新。
 ```
 
-### 部署模式:单账号(默认) vs 多账号
+需要本地有 git / Node.js / Python / AWS CDK / 一个容器运行时,以及一份能部署的 AWS 凭证。
+
+#### 部署模式:单账号(默认) vs 多账号
 
 在跑 `setup.sh` 前先定 —— 模式在部署时写死,之后切换需要重新部署。
 

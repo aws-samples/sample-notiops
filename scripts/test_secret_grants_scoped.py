@@ -39,14 +39,22 @@ PASS = "✅"
 FAIL = "❌"
 _failed = 0
 
-# 扫这些 CDK 源文件。用源码而非 synth 出来的模板：synth 需要 npx + 90 秒，而这条不变量
-# 在源码层面就能判定，放进快速测试集里才会真的每次被跑到。
-_STACK_FILES = (
-    "infra/lib/notiops-backend-stack.ts",
-    "infra/lib/bot-stack.ts",
-    "infra/lib/web-chat-stack.ts",
-    "infra/lib/api-stack.ts",
-)
+# 用源码而非 synth 出来的模板：synth 需要 npx + 90 秒，而这条不变量在源码层面就能判定，
+# 放进快速测试集里才会真的每次被跑到。
+#
+# 扫 `infra/lib` 下**所有** .ts 而不是列一串固定文件名：2026-08-22 的 Construct 抽取把
+# Web Chat 的授权从 `web-chat-stack.ts` 搬进了 `constructs/web-chat-core.ts`，写死文件名
+# 的版本会照样通过（其它栈里还有 Secret 语句，`scanned > 0` 依然成立）—— 也就是**静默漏扫**。
+_STACK_DIR = "infra/lib"
+
+
+def _stack_files() -> list[str]:
+    out: list[str] = []
+    for dirpath, _dirnames, filenames in os.walk(os.path.join(ROOT, _STACK_DIR)):
+        for fn in sorted(filenames):
+            if fn.endswith(".ts"):
+                out.append(os.path.relpath(os.path.join(dirpath, fn), ROOT))
+    return sorted(out)
 
 # Secrets Manager 的取值类动作。`DescribeSecret` / `ListSecrets` 不含密文，不在此列 ——
 # 它们用 `*` 是合理的（列举本身不泄密），一并禁掉会逼人写无意义的枚举。
@@ -108,11 +116,8 @@ def test_secret_value_grants_are_resource_scoped() -> None:
     print("test_secret_value_grants_are_resource_scoped")
     scanned = 0
     offenders: list[str] = []
-    for rel in _STACK_FILES:
-        path = os.path.join(ROOT, rel)
-        if not os.path.exists(path):
-            continue
-        src = open(path, encoding="utf-8").read()
+    for rel in _stack_files():
+        src = open(os.path.join(ROOT, rel), encoding="utf-8").read()
         for block in _policy_statements(src):
             if not any(a in block for a in _SECRET_VALUE_ACTIONS):
                 continue

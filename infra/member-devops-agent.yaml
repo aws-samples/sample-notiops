@@ -146,6 +146,11 @@ Resources:
                   - aidevops:GetJournalRecord
                   - aidevops:CreateChat          # generate_mitigation（生成缓解方案）需要
                   - aidevops:SendMessage         # generate_mitigation 发消息需要
+                  # 调查结论里的 **Mitigation plan** 区（对齐后台第 4 个 tab）的**退化**来源。
+                  # 主来源是 journal 的 mitigation_summary_md（上面的 ListJournalRecords 已覆盖，
+                  # 故已接入的成员账号无需更新栈也能拿到这一段）。只读；缺它不报错，代码里失败安全。
+                  - aidevops:ListRecommendations
+                  - aidevops:GetRecommendation
                   # Skill 发布（NotiOps 把文档型 skill zip 装进本成员账号的 Agent Space）——
                   # 管理账号 AssumeRole 进本角色后调 Asset API（见 devops_agent_skills.mjs）。
                   - aidevops:CreateAsset

@@ -131,6 +131,16 @@ _BUILTIN_CATALOG: dict = {
          "kind": "bedrock_mantle_responses", "region": "us-east-2", "hard_output_limit": 32768,
          "output_override": {"im": 8000}, "supports_prompt_cache": False,
          "surfaces": ["webchat", "im"], "enabled": True},
+        # `hard_output_limit` / `supports_prompt_cache` 的取值依据见种子文件里同名的
+        # `_*_note`（都是 us-east-1 实测，不是抄文档）：524288 是 Converse 的拒绝阈值，
+        # prompt cache 虽被模型卡列为支持、但显式 cachePoint 实测被拒，故为 False。
+        # `aliases_legacy` 收的是运维在 Admin 页手工加这个模型时用过的 alias。
+        {"alias": "xai-grok-4-6", "short": "grok",
+         "aliases_legacy": ["global-xai-grok-4-6"],
+         "model_id": "global.xai.grok-4.6", "label": "Grok 4.6",
+         "kind": "bedrock_converse", "region": None, "hard_output_limit": 524288,
+         "output_override": None, "supports_prompt_cache": False,
+         "surfaces": ["webchat", "im"], "enabled": True},
     ],
 }
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """The IAM grants the model-catalogue feature needs, asserted against the CDK source.
 
-Why this exists: `infra/**` has no CI job — no `tsc`, no `cdk synth`, no template
-assertions — so a missing grant is invisible to every other test in the repo, and
-its failure mode is a silent degradation rather than an error:
+Why this exists: nothing else in the repo notices a missing grant, and its failure
+mode is a silent degradation rather than an error. (`infra/**` had no CI job at all
+when this suite was written; since 2026-08-22 the `infra-tests` job does run `tsc`
+plus template assertions — but those check the template's *shape*, not whether a
+particular grant is still there. A grant that quietly disappears still needs this.)
 
   * no `bedrock:ListFoundationModels` → `apiGetCandidates` swallows AccessDenied
     and returns only the 3 hardcoded Mantle entries plus a warning, so an admin
@@ -38,7 +40,15 @@ PASS, FAIL = "\u2705", "\u274c"
 _failed = 0
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WEBCHAT_STACK = os.path.join(ROOT, "infra", "lib", "web-chat-stack.ts")
+# Web Chat 侧的资源与授权定义在 2026-08-22 的重构里从 `web-chat-stack.ts` 搬进了
+# `constructs/web-chat-core.ts`（一键部署的 standalone 单栈要复用同一份定义）。
+# 这里读**这些文件的拼接**而不是钉住其中一个：
+# 钉住单个文件的话，下一次搬家会让本套件里所有 BFF 断言一起变红（还算好），或者更糟 ——
+# 如果断言写成 "不出现某个宽授权" 就会静默地空转通过。缺文件在 main() 里直接判失败。
+WEBCHAT_SOURCES = [
+    os.path.join(ROOT, "infra", "lib", "web-chat-stack.ts"),
+    os.path.join(ROOT, "infra", "lib", "constructs", "web-chat-core.ts"),
+]
 BACKEND_STACK = os.path.join(ROOT, "infra", "lib", "notiops-backend-stack.ts")
 
 
@@ -55,6 +65,11 @@ def _read(path: str) -> str:
     return open(path, encoding="utf-8").read()
 
 
+def _read_webchat() -> str:
+    """WebChatStack + 它的 core 构件源码拼接（顺序无关，断言都是「文本里有没有」）。"""
+    return "\n".join(_read(p) for p in WEBCHAT_SOURCES if os.path.exists(p))
+
+
 def _statement(src: str, sid: str) -> str:
     """The text of the PolicyStatement carrying this sid (up to the closing brace)."""
     i = src.find(f'sid: "{sid}"')
@@ -68,7 +83,7 @@ def _statement(src: str, sid: str) -> str:
 
 def test_bff_can_enumerate_models() -> None:
     print("test_bff_can_enumerate_models")
-    src = _read(WEBCHAT_STACK)
+    src = _read_webchat()
     st = _statement(src, "BedrockListFoundationModels")
     _check("the BFF has a ListFoundationModels statement", bool(st))
     _check("it grants bedrock:ListFoundationModels",
@@ -81,7 +96,7 @@ def test_bff_can_enumerate_models() -> None:
 
 def test_connectivity_probe_is_not_limited_to_claude() -> None:
     print("test_connectivity_probe_is_not_limited_to_claude")
-    src = _read(WEBCHAT_STACK)
+    src = _read_webchat()
     st = _statement(src, "BedrockInferenceAndConnectivityProbe")
     _check("the BFF has a Bedrock inference statement", bool(st))
     _check("it allows any foundation model",
@@ -97,7 +112,7 @@ def test_connectivity_probe_is_not_limited_to_claude() -> None:
 
 def test_bff_can_read_and_write_the_bedrock_api_key() -> None:
     print("test_bff_can_read_and_write_the_bedrock_api_key")
-    src = _read(WEBCHAT_STACK)
+    src = _read_webchat()
     st = _statement(src, "BedrockApiKeySecretAccess")
     _check("the BFF has a bedrock-api-key secret statement", bool(st))
     for action in ("secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue",
@@ -112,7 +127,7 @@ def test_bff_can_read_and_write_the_bedrock_api_key() -> None:
 
 def test_bff_can_read_the_config_table() -> None:
     print("test_bff_can_read_the_config_table")
-    src = _read(WEBCHAT_STACK)
+    src = _read_webchat()
     _check("the config table is granted to the BFF",
            "table.grantReadWriteData(bff)" in src or "grantReadWriteData(bff)" in src)
 
@@ -142,16 +157,19 @@ def test_global_cris_regionless_arn_is_granted() -> None:
     print("test_global_cris_regionless_arn_is_granted")
     REGIONLESS = "arn:aws:bedrock:::foundation-model/"
     targets = [
-        ("BFF (web-chat-stack)", WEBCHAT_STACK),
+        ("BFF (web-chat-core)", None),  # None = WEBCHAT_SOURCES 的拼接
         ("shared lambda role + PHD (notiops-backend-stack)", BACKEND_STACK),
         ("AgentCore runtime (agentcore cdk)", os.path.join(
             ROOT, "agent-build", "NotiOpsWebChat", "agentcore", "cdk", "lib", "cdk-stack.ts")),
     ]
     for label, path in targets:
-        if not os.path.exists(path):
+        if path is None:
+            src = _read_webchat()
+        elif not os.path.exists(path):
             _check(f"{label}: file present", False, path)
             continue
-        src = _read(path)
+        else:
+            src = _read(path)
         _check(f"{label}: grants the Region-less foundation-model ARN",
                REGIONLESS in src,
                "global.* inference profiles will fail with AccessDenied without it")
@@ -262,7 +280,7 @@ def test_grants_are_documented_where_they_are_easy_to_narrow() -> None:
     （也避免在本脚本里内联中文检索词 —— scripts/lint_i18n.py 会拦）。
     """
     print("test_grants_are_documented_where_they_are_easy_to_narrow")
-    src = _read(WEBCHAT_STACK)
+    src = _read_webchat()
     for sid in ("BedrockListFoundationModels",
                 "BedrockInferenceAndConnectivityProbe",
                 "BedrockApiKeySecretAccess"):
@@ -287,8 +305,11 @@ def test_grants_are_documented_where_they_are_easy_to_narrow() -> None:
 
 
 def main() -> int:
-    if not os.path.exists(WEBCHAT_STACK):
-        print(f"{FAIL} {WEBCHAT_STACK} not found")
+    missing = [p for p in WEBCHAT_SOURCES if not os.path.exists(p)]
+    if missing:
+        # 不降级为「跳过」：文件搬走后本套件必须红，而不是静默少断言。
+        for p in missing:
+            print(f"{FAIL} {p} not found")
         return 1
     test_bff_can_enumerate_models()
     test_connectivity_probe_is_not_limited_to_claude()

@@ -8,7 +8,7 @@
  * "与本地缓存不同" 恒真，每条消息都打一次 ConsistentRead，TTL 兜底形同虚设。
  */
 import assert from "node:assert/strict";
-import { buildRuntimePayload, toSessionId } from "../agentcore.mjs";
+import { buildRuntimePayload, toSessionId, extract } from "../agentcore.mjs";
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -75,6 +75,53 @@ t("boolean flags are coerced, never passed as truthy junk", () => {
 t("session id meets the 33-char runtime minimum", () => {
   assert.ok(toSessionId("c-1").length >= 33);
   assert.ok(toSessionId("").length >= 33);
+});
+
+/* ── extract()：序列化失败的退化产物绝不能当正文 ──
+ *
+ * 实测事故（Grok 一句"你好"）：回答里出现一坨
+ *   {'event': {'contentBlockDelta': {'delta': {'reasoningContent': {'redactedContent': b'rsn_…'
+ * 来路：agent 转发了含 bytes 的原始 chunk（加密思考链）→ AgentCore runtime 的
+ * json.dumps 抛 TypeError → 兜底 json.dumps(str(obj)) → 事件的 **Python repr** 变成一个
+ * 合法 JSON 字符串发到 BFF → 这里旧代码 `typeof evt === "string"` 就当正文。
+ * agent 侧已在源头丢弃（scripts/test_stream_event_filter.py），这里是第二道：
+ * 任何"看起来是序列化对象"的字符串事件都不进正文。
+ */
+console.log("\nagentcore — extract(): 退化字符串事件不得当正文");
+
+const LEAK = "{'event': {'contentBlockDelta': {'delta': {'reasoningContent': "
+  + "{'redactedContent': b'rsn_jQzyXZIFJLlpKyfl'}}, 'contentBlockIndex': 0}}}";
+
+t("Python repr 泄漏字符串不进正文", () => {
+  assert.equal(extract(LEAK).text, "");
+});
+
+t("JSON 对象字面量字符串也不进正文（parse 失败的半截行同理）", () => {
+  assert.equal(extract('{"event": {"messageStop": {}}}').text, "");
+  assert.equal(extract("  [1,2,3]").text, "");
+  assert.equal(extract("b'\\x00binary'").text, "");
+});
+
+t("真正的纯文本字符串事件仍当正文（兜底路径不被误杀）", () => {
+  assert.equal(extract("你好！我是 NotiOps").text, "你好！我是 NotiOps");
+  assert.equal(extract("plain text").text, "plain text");
+});
+
+t("正常文本增量事件照旧提取", () => {
+  const e = { event: { contentBlockDelta: { delta: { text: "hi" }, contentBlockIndex: 0 } } };
+  assert.equal(extract(e).text, "hi");
+});
+
+t("工具入参增量不当正文（否则 JSON 入参混进回答）", () => {
+  const e = { event: { contentBlockDelta: { delta: { toolUse: { input: '{"a":1}' } } } } };
+  assert.equal(extract(e).text, "");
+});
+
+t("reasoning / progress / usage 各走各的通道，不进正文", () => {
+  assert.equal(extract({ reasoning: { text: "想一下" } }).text, "");
+  assert.deepEqual(extract({ reasoning: { text: "想一下" } }).reasoning, { text: "想一下" });
+  assert.deepEqual(extract({ progress: { text: "查文档" } }).progress, { text: "查文档" });
+  assert.equal(extract({ usage: { totalTokens: 7 } }).usage.totalTokens, 7);
 });
 
 console.log(`\n${fail === 0 ? "PASSED" : "FAILED"}: ${pass} ok, ${fail} failed`);

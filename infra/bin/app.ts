@@ -63,7 +63,9 @@ if (enabledPlatforms !== "none") {
 
   // BotStack consumes the DynamoDB tables created by NotiOpsBackendStack
   // (by name), so the main stack must be deployed first.
-  botStack.addDependency(main);
+  // addStackDependency 是 Stack#addDependency 的新名字（后者自 aws-cdk-lib 2.26x
+  // 起标记 deprecated，v3 会删）。Construct 级的 node.addDependency 不受影响。
+  botStack.addStackDependency(main);
 }
 
 // 报告 CDN 域名（「深度调查（直连）」在线报告链接）。默认取 main.reportsCdnDomain
@@ -85,4 +87,4 @@ const webChat = new WebChatStack(app, "WebChatStack", {
   idleConsoleUrl: main.consoleUrl, // 侧栏「巡检 & 报告」外链
   reportsCdnDomain: reportsCdnDomainCtx || main.reportsCdnDomain, // 「深度调查（直连）」报告链接（CloudFront+OAC，只暴露 reports/*）
 });
-webChat.addDependency(main);
+webChat.addStackDependency(main);

@@ -237,8 +237,33 @@ def start_investigation(title: str, description: str, account_id: str | None = N
         return {"error": "start_failed", "message": f"发起调查失败：{_safe_err(e)}"}
 
 
-def get_investigation_result(execution_id: str, account_id: str | None = None) -> dict:
-    """凭 execution_id 拉回调查摘要 Markdown。还没跑完 → {status:'running'}。"""
+def get_investigation_result(execution_id: str, account_id: str | None = None,
+                             lang: str = "en") -> dict:
+    """凭 execution_id 拉回调查结果。还没跑完 → {status:'running'}。
+
+    对齐 DevOps Agent 后台的 4 个 tab，**分区返回**（此前是 `structured or summary_md or
+    last_assistant` 三选一，Root cause 一出现就把 Summary 顶掉、Mitigation plan 从来没取过）：
+      - Summary            → `sections.summary`      （`ui_investigation_summary` 的**执行摘要卡**：
+                                                      问题概要 / 根本原因 / 修复方案；退化到末条 assistant）
+      - Investigation timeline → 不在这里：调查过程走 `poll_investigation` 实时进右侧栏
+      - Root cause         → `sections.root_cause`   （结构化 investigation_summary：Impact/Root
+                                                      causes/Key findings/Investigation gaps；
+                                                      退化到 investigation_summary_md 原文）
+      - Mitigation plan    → `sections.mitigation`   （`mitigation_summary_md` 原文：Action/Reasoning/
+                                                      Execution Plan/Code Change Spec；退化到
+                                                      list_recommendations。**有就给、没有就空**）
+
+    ⚠️ 数据源是**实测**校准过的（2026-08-20 拿现网一次真调查 exe-ops1-0cbea51b… 的 92 条 journal
+    记录逐类核对）：`investigation_summary_md` 的内容其实是 `# Investigation Summary` +
+    Symptoms/Findings/**Root Cause** —— 它是后台 **Root cause** 页的 md 版，**不是** Summary 页；
+    Summary 页真正的数据源是 `ui_investigation_summary`（一棵 UI 组件树，逐步刷新，最后一条为终版）；
+    Mitigation plan 页来自 `mitigation_summary_md`，而 `list_recommendations` 在这次调查里返回 0 条
+    —— 所以只把 recommendations 当**退化**来源。早先按"summary_md=Summary、recommendations=
+    Mitigation"接，会导致 Summary 与 Root cause 内容重复、且缓解方案永远缺失。
+
+    `summary_markdown` 保持存在（调用方/报告仍用它），但内容变成按 Summary → Root cause →
+    Mitigation plan 顺序拼好的完整文档。lang 只影响章节标题（正文一律 DevOps Agent 原文透传）。
+    """
     if _DISABLED:
         return _not_onboarded(account_id)
     if not execution_id:
@@ -253,19 +278,30 @@ def get_investigation_result(execution_id: str, account_id: str | None = None) -
     if not client or not space:
         return _not_onboarded(acct)
     try:
-        # 优先按**后台 Root cause 页同样的结构**组织（用 investigation_summary 结构化记录：
-        # Impact/Root causes/Key findings/Gaps，纯透传）；拿不到再回退 investigation_summary_md 原文。
-        structured = ""
+        # 只拉一次全量 journal 记录，三个区段都从里面取（避免同一份数据查三遍）。
+        recs = []
         try:
             recs = _list_all_records(client, space, execution_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("list_journal_records failed: %s", _safe_err(e))
+        # ① Root cause 区：按**后台 Root cause 页同样的结构**组织（结构化 investigation_summary：
+        #    Impact/Root causes/Key findings/Gaps，纯透传）；拿不到结构化就用它的 md 版原文。
+        structured, summary_md_raw = "", ""
+        try:
             structured = build_structured_report_md(recs)
         except Exception as e:  # noqa: BLE001
             logger.warning("build_structured_report_md failed: %s", _safe_err(e))
-        md = structured or _read_summary_md(client, space, execution_id) or \
-            _read_last_assistant(client, space, execution_id)
-        if not md:
+        summary_md_raw = _md_record_from_records(recs, "investigation_summary_md")
+        root_cause = structured or summary_md_raw
+        # 「跑完没跑完」只看**终态产物**（结构化摘要 / summary md）：ui_investigation_summary 在调查
+        # 刚开始时就有一条 "Investigation starting…"，拿它判断会把在跑的调查误判成已完成。
+        if not root_cause:
             return {"status": "running", "message": "调查仍在进行中（暂无摘要）。请稍后再查。"}
-        # 尽力从 journal 记录反查本次调查的 taskId（用于拼后台深链）。拿不到就回退首页。
+        # ② Summary 区：后台 Summary 页的数据源 = ui_investigation_summary 终版里的**执行摘要卡**
+        #    （问题概要 / 根本原因 / 修复方案）；取不到才退化到末条 assistant 原文。
+        summary = _ui_summary_from_records(recs) or \
+            _read_last_assistant(client, space, execution_id) or ""
+        # 尽力从 journal 记录反查本次调查的 taskId（用于拼后台深链 + 拉 recommendations）。
         task_id = ""
         try:
             for r in (recs or []):
@@ -275,9 +311,19 @@ def get_investigation_result(execution_id: str, account_id: str | None = None) -
                     break
         except Exception:  # noqa: BLE001
             task_id = ""
+        # ③ Mitigation plan 区：后台 Mitigation plan 页的数据源 = mitigation_summary_md（Action/
+        #    Reasoning/Execution Plan/Code Change Spec）；没有它才退化到 recommendations。
+        #    后台不一定生成过 —— 失败安全地"有就取"（异常/没有 → 空串，整段不出现）。
+        mitigation = _md_record_from_records(recs, "mitigation_summary_md")
+        if not mitigation and task_id:
+            mitigation = get_recommendations_md(task_id, acct, lang, with_header=False)
         _urls = operator_urls(space, task_id)
-        return {"ok": True, "status": "completed", "summary_markdown": md,
-                "structured": bool(structured), "agent_space_id": space, "task_id": task_id,
+        sections = {"summary": summary, "root_cause": root_cause, "mitigation": mitigation}
+        return {"ok": True, "status": "completed",
+                "summary_markdown": build_full_report_md(sections, lang),
+                "sections": sections,
+                "structured": bool(structured), "has_mitigation": bool(mitigation),
+                "agent_space_id": space, "task_id": task_id,
                 "console_url": _urls["deep_link"], "console_home": _urls["home"]}
     except (ClientError, BotoCoreError, Exception) as e:  # noqa: BLE001
         logger.warning("devops_agent get_result failed: %s", _safe_err(e))
@@ -542,6 +588,243 @@ def build_structured_report_md(records: list) -> str:
     return "\n".join(lines).strip()
 
 
+def _md_record_from_records(records: list, record_type: str) -> str:
+    """取某类**markdown 型** journal 记录的终版原文（如 investigation_summary_md /
+    mitigation_summary_md），并去掉它自带的 H1 标题行（`# Investigation Summary` /
+    `# Mitigation Summary`）—— 我们会在外面套统一的章节标题（后台 tab 名），留着就是重复标题。
+    没有 → 空串。"""
+    latest = ""
+    for r in records or []:
+        if not isinstance(r, dict) or r.get("recordType") != record_type:
+            continue
+        c = r.get("content")
+        if isinstance(c, dict):
+            c = c.get("text") or ""
+        if isinstance(c, str) and c.strip():
+            latest = c  # 记录已按 ASC 排序，最后一条即终版
+    if not latest:
+        return ""
+    lines = latest.split("\n")
+    # 去掉开头的 H1（可能前面有空行）
+    for i, ln in enumerate(lines[:5]):
+        if ln.lstrip().startswith("# ") :
+            lines = lines[i + 1:]
+            break
+        if ln.strip():
+            break
+    return "\n".join(lines).strip()
+
+
+# ── ui_investigation_summary：后台 Summary 页的数据源（一棵 UI 组件树，不是 markdown） ──────
+# 实测终版树的形状（exe-ops1-0cbea51b…）：
+#   container
+#     card#summary            ← ①执行摘要卡：标题 + 状态/严重性徽章 + 问题概要/根本原因/修复方案
+#     card                    ← ②调查发现与证据（= Root cause tab，我们那一区已经有了）
+#     container(卡片指标)      ← ③统计小卡
+#     card                    ← ④缓解方案（= Mitigation plan tab，我们那一区已经有了）
+# 所以 Summary 区**只取 ①**，否则一篇报告里三个区互相重复。
+_UI_HEADINGS = {"title", "card-title"}
+
+
+def _ui_leaves(node) -> list:
+    """深度优先收集 (type, text) 叶子文本。"""
+    out = []
+    if not isinstance(node, dict):
+        return out
+    s = node.get("text")
+    if isinstance(s, str) and s.strip():
+        out.append(((node.get("type") or "").lower(), s.strip()))
+    for ch in node.get("children") or []:
+        out.extend(_ui_leaves(ch))
+    return out
+
+
+def _flatten_ui(node, out: list) -> None:
+    """把 UI 组件树摊平成 markdown 行（正文一律原文透传，只做层级/列表符号的映射）。
+    产出的标题从 `###` 起（外面套的章节标题是 `##`）。"""
+    if not isinstance(node, dict):
+        return
+    t = (node.get("type") or "").lower()
+    txt = (node.get("text") or "").strip()
+    props = node.get("props") or {}
+    kids = node.get("children") or []
+    if t in ("card-header", "accordion-trigger"):
+        # 标题行：标题文字 + 徽章合成**一行**（徽章用 code 记号，避免和正文混淆）
+        leaves = _ui_leaves(node)
+        heads = [s for k, s in leaves if k in _UI_HEADINGS or k == "text"]
+        badges = [s for k, s in leaves if k == "badge"]
+        descs = [s for k, s in leaves if k in ("card-description", "markdown")]
+        line = " ".join(f"**{h}**" for h in heads[:1]) if heads else ""
+        if badges:
+            line = (line + " " if line else "") + " · ".join(f"`{b}`" for b in badges)
+        if line:
+            out.append(line)
+        out.extend(descs)
+        return
+    if t == "title":
+        lvl = props.get("level")
+        try:
+            lvl = int(lvl)
+        except (TypeError, ValueError):
+            lvl = 3
+        if txt:
+            out.append("#" * max(3, min(6, lvl)) + " " + txt)
+        return
+    if t in ("markdown", "text", "paragraph", "code"):
+        if txt:
+            out.append(txt)
+        return
+    if t == "badge":
+        if txt:
+            out.append(f"`{txt}`")
+        return
+    if t == "list-item":
+        if txt:
+            out.append(f"- {txt}")
+        return
+    if txt:
+        out.append(txt)
+    for ch in kids:
+        _flatten_ui(ch, out)
+
+
+def _ui_summary_from_records(records: list) -> str:
+    """从 `ui_investigation_summary` 终版里取**执行摘要卡**并摊平成 markdown。
+    找不到 / 解析失败 → 空串（调用方退化到末条 assistant 原文）。"""
+    tree = None
+    for r in records or []:
+        if not isinstance(r, dict) or r.get("recordType") != "ui_investigation_summary":
+            continue
+        c = r.get("content")
+        try:
+            c = json.loads(c) if isinstance(c, str) else c
+        except (ValueError, TypeError):
+            continue
+        if isinstance(c, dict):
+            tree = c.get("content") if isinstance(c.get("content"), dict) else c
+    if not isinstance(tree, dict):
+        return ""
+    # 执行摘要卡：优先按 id 命中（后台稳定用 "summary" 前缀），否则退化到树里第一张 card。
+    card = None
+
+    def _find(n):
+        nonlocal card
+        if card is not None or not isinstance(n, dict):
+            return
+        if (n.get("type") or "").lower() == "card":
+            if str(n.get("id") or "").split("__")[0] == "summary":
+                card = n
+                return
+        for ch in n.get("children") or []:
+            _find(ch)
+
+    _find(tree)
+    if card is None:
+        def _first_card(n):
+            if not isinstance(n, dict):
+                return None
+            if (n.get("type") or "").lower() == "card":
+                return n
+            for ch in n.get("children") or []:
+                got = _first_card(ch)
+                if got is not None:
+                    return got
+            return None
+        card = _first_card(tree)
+    if card is None:
+        return ""
+    lines: list = []
+    _flatten_ui(card, lines)
+    return "\n\n".join(x for x in lines if x).strip()
+
+
+def _demote_md(md: str, times: int = 1) -> str:
+    """把一段 markdown 里的 ATX 标题整体降 `times` 级（`## X` → `### X`），用于把**自带标题层级的
+    区块**（如 build_structured_report_md 产出的 `## Impact` / `### 1. …`）嵌到更高一级的章节
+    标题（`## Root cause`）之下，避免出现"子区块标题与父章节同级"的错乱目录。
+    跳过 ``` 围栏代码块内的行（shell 注释里的 `#` 不是标题）；已到 h6 不再降。"""
+    if times <= 0:
+        return md or ""
+    out, fenced = [], False
+    for ln in (md or "").split("\n"):
+        s = ln.lstrip()
+        if s.startswith("```") or s.startswith("~~~"):
+            fenced = not fenced
+            out.append(ln)
+            continue
+        if not fenced and s.startswith("#"):
+            lvl = len(s) - len(s.lstrip("#"))
+            out.append("#" * min(6 - lvl, times) + ln)
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+def _min_heading_level(md: str) -> int:
+    """一段 markdown 里最浅的 ATX 标题层级（围栏代码块内的 `#` 不算）；没有标题 → 0。"""
+    lo, fenced = 0, False
+    for ln in (md or "").split("\n"):
+        s = ln.lstrip()
+        if s.startswith("```") or s.startswith("~~~"):
+            fenced = not fenced
+            continue
+        if fenced or not s.startswith("#"):
+            continue
+        n = len(s) - len(s.lstrip("#"))
+        rest = s[n:]
+        if n > 6 or (rest and not rest.startswith(" ")):
+            continue  # 不是合法 ATX 标题（如 `#tag`）
+        lo = n if lo == 0 else min(lo, n)
+    return lo
+
+
+def _fit_under_section(md: str, target: int = 3) -> str:
+    """把一段区块的标题层级整体压到 `target` 及更深，让它能干净地嵌在 `##` 章节标题之下。
+    各区来源的原始层级不一样（结构化根因是 `##` 起、mitigation_summary_md 是 `##` 起、
+    recommendations 是 `###` 起、UI 摘要是 `###` 起），统一在这里按**实测最浅层级**归一，
+    不再靠"哪个区要降级"的硬编码（那正是之前 mitigation 多降一级的来源）。"""
+    lo = _min_heading_level(md)
+    return _demote_md(md, target - lo) if 0 < lo < target else (md or "")
+
+
+# 章节标题：**照抄 DevOps Agent 后台的 tab 名**（Summary / Root cause / Mitigation plan），
+# 让"前端正文"与客户在后台看到的一致。Investigation timeline 不在这里 —— 它走右侧栏。
+_SECTION_TITLES = {
+    "summary":    ("## Summary", "## 调查摘要（Summary）"),
+    "root_cause": ("## Root cause", "## 根因分析（Root cause）"),
+    "mitigation": ("## Mitigation plan", "## 缓解方案（Mitigation plan）"),
+}
+
+
+def build_full_report_md(sections: dict, lang: str = "en", clip: dict | None = None) -> str:
+    """把分区内容按 **Summary → Root cause → Mitigation plan** 顺序拼成一篇 markdown。
+    空区段直接跳过（mitigation 常常没有）。正文一律 DevOps Agent 原文透传，我们只加章节标题
+    （标题即后台 tab 名）。clip：可选的**逐区**字符上限 {section: n} —— 用于聊天气泡这类需要
+    控长的场合；按区截断而不是整篇截断，否则后面的 Root cause / Mitigation plan 会被整段吃掉。"""
+    en = str(lang).lower() != "zh"
+    parts = []
+    for key in ("summary", "root_cause", "mitigation"):
+        body = (sections or {}).get(key) or ""
+        body = body.strip()
+        if not body:
+            continue
+        # 层级归一（**先归一再截断**：截断可能切断 ``` 围栏，之后再判标题会把代码注释当标题）：
+        # 各区来源的最浅标题层级不同（`##` / `###`），统一压到 `###` 及更深，保证都能干净嵌在
+        # `## <tab 名>` 之下（详见 _fit_under_section）。
+        body = _fit_under_section(body, 3)
+        limit = (clip or {}).get(key)
+        if limit and len(body) > limit:
+            body = body[:limit]
+            # 截断点可能落在 ``` 围栏里 —— 不补一个收尾围栏，后面所有内容都会被渲染成代码块。
+            if body.count("```") % 2:
+                body += "\n```"
+            body += ("\n\n… (truncated; see the full report below)" if en
+                     else "\n\n…（此处截断，完整内容见下方在线报告）")
+        title = _SECTION_TITLES[key][0 if en else 1]
+        parts.append(f"{title}\n\n{body}")
+    return "\n\n".join(parts).strip()
+
+
 def generate_mitigation(root_cause_summary: str, account_id: str | None = None,
                         timeout_s: int = 90) -> str:
     """复刻 Operator App "Generate mitigation plan" 按钮：让 **DevOps Agent 自己**基于本次调查
@@ -597,7 +880,8 @@ def generate_mitigation(root_cause_summary: str, account_id: str | None = None,
         return ""
 
 
-def get_recommendations_md(task_id: str, account_id: str | None = None, lang: str = "en") -> str:
+def get_recommendations_md(task_id: str, account_id: str | None = None, lang: str = "en",
+                           with_header: bool = True) -> str:
     """拉某次调查(task_id)的**缓解建议/推荐**（DevOps Agent 的 mitigation plan，若有），
     渲染成一段 markdown 追加到报告。没有则返回空串。失败安全（异常→空串）。
     注意：recommendations 非每次调查都自动生成；这里是"有就加"。
@@ -621,7 +905,9 @@ def get_recommendations_md(task_id: str, account_id: str | None = None, lang: st
         return ""
     en = (str(lang).lower() == "en")
     recs = sorted(recs, key=lambda r: r.get("rankPosition", 999))
-    lines = ["", ("## Mitigation Plan" if en else "## 缓解建议（Mitigation Plan）"), ""]
+    # with_header=False：调用方自己出「## Mitigation plan」章节标题（见 build_full_report_md），
+    # 这里只出条目，避免一篇报告里出现两个同义标题。
+    lines = ["", ("## Mitigation Plan" if en else "## 缓解建议（Mitigation Plan）"), ""] if with_header else [""]
     for i, r in enumerate(recs, 1):
         title = r.get("title", "") or (f"Recommendation {i}" if en else f"建议 {i}")
         pri = r.get("priority", "")
@@ -635,20 +921,8 @@ def get_recommendations_md(task_id: str, account_id: str | None = None, lang: st
     return "\n".join(lines)
 
 
-def _read_summary_md(client, space, execution_id) -> str | None:
-    try:
-        resp = client.list_journal_records(
-            agentSpaceId=space, executionId=execution_id,
-            recordType="investigation_summary_md", order="DESC")
-        for rec in resp.get("records", []):
-            c = rec.get("content")
-            if isinstance(c, str) and c.strip():
-                return c
-            if isinstance(c, dict) and c.get("text"):
-                return c["text"]
-    except Exception:  # noqa: BLE001
-        pass
-    return None
+# （原 _read_summary_md 已由 _md_record_from_records(recs, "investigation_summary_md") 取代：
+#   那条记录是后台 Root cause 页的 md 版、且要剥掉自带 H1；同时全量记录只拉一次即可复用。）
 
 
 def _read_last_assistant(client, space, execution_id) -> str | None:

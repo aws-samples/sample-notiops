@@ -159,7 +159,7 @@ export class NotiOpsBackendStack extends cdk.Stack {
     new cognito.CfnUserPoolGroup(this, "MemberGroup", {
       userPoolId: userPool.userPoolId,
       groupName: "member",
-      description: "Members — web chat only",
+      description: "Members: web chat only",
       precedence: 10,
     });
 

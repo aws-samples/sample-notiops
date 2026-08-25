@@ -11,6 +11,7 @@
 >
 > **配套文档**:
 > - [USER_GUIDE.md](USER_GUIDE.md) — 终端用户使用指南
+> - [DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md) — **另一条路径**:只要 Web Chat、且不想在本地装工具链时看这篇
 
 **版本**:v3.0 · 2026-06-09(post-fusion CDK rewrite)
 
@@ -40,6 +41,12 @@
 ## 0. 快速部署 TL;DR
 
 > 适合"先快速跑起来,细节后看"。所有命令都假设你已经走完 §2 前置条件。Web 端(浏览器聊天控制台)默认部署,是产品主入口;IM(飞书 / Slack)是可选补充,只有你想启用时才需要走 §3 注册 IM 应用。
+
+> 💡 **只想先试试 Web Chat?** 那这篇整个都不用读。[DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md)
+> 是一条**不需要本地装任何东西、也不需要 access key** 的路径:从 Release 下一个
+> CloudFormation 模板、在控制台上传、~4.5 分钟开完栈。代价是它**只部署 Web Chat** ——
+> 没有 IM bot、没有每日巡检、没有管理仪表盘。想要这些就回来走本篇的 `setup.sh`
+> (两条路径的管理员用户名都是 `admin`,先后走不冲突)。
 
 ### 0.1 一键部署
 

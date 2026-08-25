@@ -163,6 +163,45 @@ def test_node_suites_are_wired() -> None:
            "written but never executed by `npm test`: " + ", ".join(missing))
 
 
+def test_infra_suites_are_wired() -> None:
+    """`infra/test/*.test.ts` 必须有 job 承载。
+
+    这一条不是「怕漏点名某个文件」—— infra 的 jest 用 `**/*.test.ts` 通配，加文件不用改配置。
+    要守的是**上一级**的缺失：2026-08-22 之前 `infra/` 根本没有任何 job，于是那两套
+    CDK 断言从写下那天起就没跑过，并同时腐坏成「一条恒红 + 一条空转通过」。本地
+    `npx jest` 全绿的人也看不出 CI 里没有它。
+
+    所以断言三件事：有 job 装了 infra 依赖并跑 test、jest 仍然是通配（不是逐个点名）、
+    以及 infra/test 下确实有测试（目录被搬空时要红）。
+    """
+    print("test_infra_suites_are_wired")
+    import json as _json
+
+    test_dir = os.path.join(ROOT, "infra", "test")
+    pkg_path = os.path.join(ROOT, "infra", "package.json")
+    if not os.path.isdir(test_dir) or not os.path.exists(pkg_path):
+        _check("infra/test and infra/package.json exist", False,
+               "layout changed; update this assertion")
+        return
+    suites = sorted(f for f in os.listdir(test_dir) if f.endswith(".test.ts"))
+    _check("infra has CDK test suites", len(suites) >= 2, f"found {len(suites)}: {suites}")
+
+    with open(pkg_path, encoding="utf-8") as fh:
+        pkg = _json.load(fh)
+    _check("`npm test` in infra runs jest",
+           "jest" in ((pkg.get("scripts") or {}).get("test") or ""))
+    match = (pkg.get("jest") or {}).get("testMatch") or []
+    _check("jest picks up suites by glob (no per-file wiring)",
+           any("*" in m and m.endswith(".test.ts") for m in match),
+           f"testMatch={match} — if this becomes a fixed list, this assertion must "
+           "start comparing it against the directory listing")
+
+    ci = _ci_text()
+    _check("a CI job installs infra deps and runs its tests",
+           "cd infra && npm ci" in ci,
+           "no job runs infra/test — that is how those two suites rotted unnoticed")
+
+
 def test_self_is_wired() -> None:
     """本文件必须被 CI 显式调用，否则这条元断言自己也是"写了不跑"。"""
     print("test_self_is_wired")
@@ -178,6 +217,7 @@ def main() -> int:
     test_every_suite_is_invoked()
     test_exempt_suites_are_not_silently_broken()
     test_node_suites_are_wired()
+    test_infra_suites_are_wired()
     test_self_is_wired()
     print("\n" + "=" * 72)
     if _failed:

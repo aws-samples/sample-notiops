@@ -623,6 +623,27 @@ async function streamChat(event, responseStream, { sub, groups }) {
     },
   });
 
+  // ── 保活（keepalive）：整条 SSE 流**全程**每 10s 写一个注释行 ────────────────────
+  // 事故：深度调查（`investigate_live`）只在**有新 timeline 行**时才 yield，一次调查里
+  // 常有 3-5 分钟一个字节都不发；而下面那个"冷启动心跳"见到首个产出就永久停了
+  // （`beat()` 在 `sawAgentOutput` 后直接 return）。结果是浏览器 → Function URL 的连接
+  // 长时间零字节 —— 中间任何一跳（企业代理 / NAT / 客户端网络栈）的空闲回收都会把它掐断，
+  // 而 Lambda **不会**因客户端断连而停止（AWS 文档明确："streamed responses are not
+  // interrupted or stopped when the invoking client connection is broken"），所以后端照样
+  // 跑完并写完最终答案，前端却永远停在那句"分析过程正在右侧…面板实时更新"直到超时。
+  // 这里与业务事件完全解耦：只要流没结束就一直发，保证**任何**分支（agent / 直连调查 / echo）
+  // 都不会出现分钟级静默。用 SSE 注释行（`: ka`）而不是自定义事件 —— 前端解析器按
+  // "event:/data:" 取字段，注释块没有 data 行会被直接忽略，故前端零改动、也不入库。
+  // 自终止：除了正常收尾时 stopKeepalive()，还要防「本函数中途抛错 → 定时器留在容器里，
+  // 下次调用复用同一容器时对着已关闭的流狂写」。故三重停：流已 end / 写失败 / 超过 Lambda
+  // 超时（15min = 90 tick）都自己 clear。
+  let kaLeft = 90, kaTick = null;
+  const stopKeepalive = () => { if (kaTick) { clearInterval(kaTick); kaTick = null; } };
+  kaTick = setInterval(() => {
+    if (--kaLeft <= 0 || responseStream.writableEnded || responseStream.destroyed) return stopKeepalive();
+    try { stream.write(enc.encode(": ka\n\n")); } catch { stopKeepalive(); }
+  }, 10000);
+
   // ── 服务端模型准入 + generation 注入（spec R3.5 / R4）──
   // 客户端传来的 model 只当**意向**：可能是 admin 刚下架的别名、也可能是前端缓存里的旧值，
   // 甚至可能是手搓请求点名未授权模型。一律以 DDB 目录的启用集为准，不在集内则换默认模型
@@ -816,6 +837,7 @@ async function streamChat(event, responseStream, { sub, groups }) {
   });
   await touchConversation(sub, conversationId, accountId);
 
+  stopKeepalive(); // 收尾：务必在 end() 前停，否则定时器会写进已关闭的流
   stream.write(sse("done", { message_id: `m-${ts}` }));
   stream.end();
 }

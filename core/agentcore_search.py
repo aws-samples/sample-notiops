@@ -2,16 +2,18 @@
 Web Search via **AWS Bedrock AgentCore Gateway** (built-in `web-search` connector).
 
 This is the AWS-native, in-region web search (GA 2026): queries **stay inside AWS**
-(no third-party egress, unlike Exa). We reach it over the Gateway's MCP endpoint with
-a single `tools/call` to the `WebSearch` tool, SigV4-signed with the runtime's IAM role
-(service = ``bedrock-agentcore``). Mirrors core/web_search.py's synchronous
-JSON-RPC-over-HTTP style to stay dependency-light (no extra MCP client lib).
+(no third-party egress). Since 2026-08 it is the **only** web-search provider — the Exa
+public-MCP fallback was removed, see core/web_search.py's module docstring for why.
+We reach it over the Gateway's MCP endpoint with a single `tools/call` to the `WebSearch`
+tool, SigV4-signed with the runtime's IAM role (service = ``bedrock-agentcore``), using
+plain synchronous JSON-RPC-over-HTTP to stay dependency-light (no extra MCP client lib).
 
 Design:
-  - ``search()`` returns ``{"text","sources"}`` (same shape as Exa) or **None** on any
-    failure / when not configured — the caller (core/web_search.py) then falls back to Exa.
-  - Gateway URL comes from env ``AGENTCORE_WEBSEARCH_GATEWAY_URL`` (set at deploy time);
-    if unset, returns None immediately so behavior is unchanged where it's not provisioned.
+  - ``search()`` returns ``{"text","sources"}`` or **None** on any failure / when not
+    configured. The caller (core/web_search.py) turns None into an empty result — there is
+    no second provider to fall back to.
+  - Gateway URL comes from env ``AGENTCORE_WEBSEARCH_GATEWAY_URL`` (injected at deploy time
+    by both deployment paths); if unset, returns None immediately.
 
 Refs (official AWS docs):
   - Web Search connector + input/response schema:
@@ -29,7 +31,23 @@ import os
 
 logger = logging.getLogger(__name__)
 
-_GATEWAY_URL = os.environ.get("AGENTCORE_WEBSEARCH_GATEWAY_URL", "").strip()
+def _read_gateway_url() -> str:
+    """Gateway URL from env, or "" when this deployment has no web-search capability.
+
+    Only an ``https://`` value counts as configured. Both non-URL values that reach this
+    env var in practice are "no capability", and both used to fail *later*, obscurely:
+      - ``__WEBSEARCH_GATEWAY_URL__`` — the un-substituted placeholder you get by running
+        `agentcore deploy` by hand instead of `scripts/deploy_agent.sh`;
+      - ``unavailable`` — what the one-click stager writes when the Gateway could not be
+        provisioned (it cannot write "" — AgentCore Runtime rejects empty env values).
+    Treating them as unconfigured makes the failure mode "no web search" instead of
+    "every search SigV4-signs a request to a garbage host and times out".
+    """
+    raw = os.environ.get("AGENTCORE_WEBSEARCH_GATEWAY_URL", "").strip()
+    return raw if raw.startswith("https://") else ""
+
+
+_GATEWAY_URL = _read_gateway_url()
 _REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
 _HTTP_TIMEOUT_SECONDS = float(os.environ.get("WEB_SEARCH_HTTP_TIMEOUT", "8.0"))
 _MAX_RESULTS = int(os.environ.get("WEB_SEARCH_MAX_RESULTS", "5"))
@@ -118,6 +136,21 @@ def _mcp_call(tool: str, arguments: dict) -> dict | None:
     return envelope.get("result")
 
 
+# JS 渲染的占位/无正文页面特征（如 aws.amazon.com/new/ 抓回来是一堆 "Loading…"）。
+# 这类命中没有真实内容，却会把模型带回训练记忆里的旧信息 —— 必须丢弃，不能当"有结果"。
+# （原先长在 core/web_search.py 的 Exa 解析里；Exa 移除后搬到这一层 —— 这里才拿得到
+#   结构化的 hit，能逐条丢弃而不是整批放弃。）
+_NOISE_MARKERS = ("正在加载", "Loading", "Skip to main content", "跳至主要内容")
+_MIN_SNIPPET_CHARS = 40
+
+
+def _looks_like_noise(snippet: str) -> bool:
+    s = (snippet or "").strip()
+    if len(s) < _MIN_SNIPPET_CHARS:
+        return True
+    return sum(s.count(m) for m in _NOISE_MARKERS) >= 3
+
+
 def _extract_results(result: dict | None) -> list[dict]:
     """Pull the inner ``results`` array out of the MCP result. The connector returns
     content[].text as a **JSON-encoded string** {"id":..,"results":[{text,url,title,publishedDate}]}."""
@@ -141,7 +174,7 @@ def _extract_results(result: dict | None) -> list[dict]:
             out.append({"text": txt, "url": "", "title": "", "publishedDate": ""})
             continue
         for r in inner.get("results", []) or []:
-            if isinstance(r, dict) and r.get("text"):
+            if isinstance(r, dict) and r.get("text") and not _looks_like_noise(r.get("text")):
                 out.append({
                     "text": r.get("text", ""),
                     "url": r.get("url", ""),
@@ -154,8 +187,9 @@ def _extract_results(result: dict | None) -> list[dict]:
 def search(query: str, *, num_results: int = _MAX_RESULTS) -> dict | None:
     """Search the web via AgentCore. Returns ``{"text","sources"}`` or **None**.
 
-    None signals "unavailable / failed" so the caller falls back to Exa. Never raises.
-    ``sources`` mirrors the aws_docs/exa shape so the UI Sources drawer renders the same.
+    None signals "unavailable / failed"; the caller (core/web_search.py) turns it into an
+    empty result. Never raises. ``sources`` mirrors the aws_docs tools' shape so the UI
+    Sources drawer renders identically.
     """
     if not _GATEWAY_URL:
         return None
@@ -169,7 +203,7 @@ def search(query: str, *, num_results: int = _MAX_RESULTS) -> dict | None:
     result = _mcp_call(_TOOL_NAME, {"query": query, "maxResults": max_results})
     hits = _extract_results(result)
     if not hits:
-        return None  # treat empty/failed as "fall back to Exa"
+        return None  # empty / all-noise / failed → caller returns an empty result
 
     lines, sources = [], []
     for h in hits[:_MAX_RESULTS]:

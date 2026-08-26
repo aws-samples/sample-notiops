@@ -11,7 +11,8 @@
 #   DEPLOY_REGION         必填，部署区域（agentcore runtime 区）。
 #   PROJECT_ROOT          仓库根（默认脚本上级目录）。
 #   ENABLE_WEBSEARCH      "true"(默认) 则 provision web-search Gateway 并注入 URL；
-#                         "false" 则跳过（agent 仍可用 Exa 兜底联网搜索）。
+#                         "false" 则跳过 —— **本部署就没有联网搜索能力**（2026-08 起没有
+#                         第三方兜底），界面开关按无能力处理。
 #   AGENT_ARN_OUT         可选，把捕获到的 Runtime ARN 写到这个文件路径。
 #   NOTIOPS_ALLOW_CROSS_ACCOUNT
 #                         跨账号闸门（默认安全）。"1" = 放开多账号（setup.sh --multi-account
@@ -55,7 +56,7 @@ fi
 export AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" CDK_DEFAULT_REGION="$REGION"
 
 # ── 2. Web Search Gateway（可选）──
-# AgentCore web search 仅 us-east-1。非该区时自动跳过（不阻断；agent 用 Exa 兜底）。
+# AgentCore web search 仅 us-east-1。非该区时自动跳过（不阻断部署，但该部署没有联网搜索）。
 GATEWAY_URL=""
 if [ "$ENABLE_WEBSEARCH" = "true" ] && [ "$REGION" = "us-east-1" ]; then
   echo "  $(t "正在 provision AgentCore Web Search Gateway…" "Provisioning AgentCore Web Search Gateway...")"
@@ -65,14 +66,14 @@ if [ "$ENABLE_WEBSEARCH" = "true" ] && [ "$REGION" = "us-east-1" ]; then
     echo "$GW_OUT" | sed 's/^/    /'
   else
     echo "$GW_OUT" | sed 's/^/    /'
-    echo "  $(t "⚠ Gateway provision 失败 —— agent 仍会用 Exa 兜底联网搜索，不阻断部署。" "⚠ Gateway provisioning failed — the agent still falls back to Exa web search; deployment continues.")" >&2
+    echo "  $(t "⚠ Gateway provision 失败 —— 不阻断部署，但本部署将没有联网搜索能力（界面开关按无能力处理）。" "⚠ Gateway provisioning failed — deployment continues, but this deployment will have no web-search capability (the UI toggle is treated as unavailable).")" >&2
   fi
 elif [ "$ENABLE_WEBSEARCH" = "true" ]; then
-  echo "  $(t "（AgentCore Web Search 仅 us-east-1 可用，当前 $REGION 跳过；agent 用 Exa 兜底。）" "(AgentCore Web Search is only available in us-east-1; skipping in $REGION — the agent falls back to Exa.)")"
+  echo "  $(t "（AgentCore Web Search 仅 us-east-1 可用，当前 $REGION 跳过；本部署没有联网搜索能力。）" "(AgentCore Web Search is only available in us-east-1; skipping in $REGION — this deployment has no web-search capability.)")"
 fi
 
 # 注入 env 占位符到 agentcore.json：
-#  - __WEBSEARCH_GATEWAY_URL__：web-search Gateway（空串 → agent 用 Exa 兜底）
+#  - __WEBSEARCH_GATEWAY_URL__：web-search Gateway（空串 → 本部署无联网搜索能力）
 #  - __SKILLS_BUCKET__：Skills 共享数据桶（notiops-data-<account>-<region>）
 #  - __DEVOPS_AGENT_SPACE_ID__：部署账号 DevOps Agent Space（NotiOpsBackendStack 的 AgentSpaceId 输出）
 ACCT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo '')"
@@ -102,7 +103,7 @@ d = json.load(open(path))
 for rt in d.get("runtimes", []):
     for ev in rt.get("envVars", []):
         if ev.get("name") == "AGENTCORE_WEBSEARCH_GATEWAY_URL":
-            ev["value"] = url  # 空串=未启用，agent 用 Exa 兜底
+            ev["value"] = url  # 空串=未启用，本部署无联网搜索能力
         elif ev.get("name") == "SKILLS_BUCKET":
             ev["value"] = skills_bucket  # 空串=skills 读取关闭（不阻断）
         elif ev.get("name") == "DEVOPS_AGENT_SPACE_ID":
@@ -115,13 +116,13 @@ json.dump(d, open(path, "w"), indent=2, ensure_ascii=False)
 import os as _os
 _zh = _os.environ.get("UI_LANG") == "zh"
 if _zh:
-    print(f"    agentcore.json 已写入 gateway URL: {url or '(空，用 Exa 兜底)'}; "
+    print(f"    agentcore.json 已写入 gateway URL: {url or '(空，本部署无联网搜索)'}; "
           f"SKILLS_BUCKET: {skills_bucket or '(空)'}; "
           f"DEVOPS_AGENT_SPACE_ID: {da_space or '(空，运行时自动发现)'}; "
           f"REPORTS_CDN_DOMAIN: {reports_cdn or '(空，回退 presigned)'}; "
           f"跨账号闸门: {'开启（多账号模式）' if allow_cross else '关闭（仅部署账号）'}")
 else:
-    print(f"    agentcore.json written — gateway URL: {url or '(empty, Exa fallback)'}; "
+    print(f"    agentcore.json written — gateway URL: {url or '(empty, no web search)'}; "
           f"SKILLS_BUCKET: {skills_bucket or '(empty)'}; "
           f"DEVOPS_AGENT_SPACE_ID: {da_space or '(empty, auto-discovered at runtime)'}; "
           f"REPORTS_CDN_DOMAIN: {reports_cdn or '(empty, presigned fallback)'}; "

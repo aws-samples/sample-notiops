@@ -29,6 +29,8 @@ import hashlib
 import json
 import mimetypes
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from io import BytesIO
@@ -70,14 +72,33 @@ def _send(event, context, status, data=None, reason=None, physical_id=None):
         print(f"cfn-response {status} http={resp.status}")
 
 
+class _AgentCoreError(Exception):
+    """bedrock-agentcore-control 的一个 REST 错误（见 Phase=WebSearch 那节的 `_ac_call`）。
+    带上 `code`（`x-amzn-errortype` / body 里的 __type），这样 `_ignore_missing` 能像对
+    boto3 的 ClientError 一样判断「本来就不存在」。"""
+
+    def __init__(self, code: str, status: int, message: str):
+        super().__init__(f"{code} (HTTP {status}): {message}")
+        self.code = code
+        self.status = status
+
+
+_MISSING_CODES = {
+    "NoSuchBucket", "NoSuchKey", "404", "NotFound",
+    "ResourceNotFoundException", "UserNotFoundException",
+    # `_ac_call` 在响应既没有 `x-amzn-errortype` 头、body 里也没有 `__type` 时会退化成
+    # `HTTP<状态码>`。404 无论怎么写都是「本来就不存在」。
+    "HTTP404",
+}
+
+
 def _ignore_missing(exc: Exception) -> bool:
     """只吞「本来就不存在」这一类错误（幂等重试用），其余一律上抛。"""
+    if isinstance(exc, _AgentCoreError):
+        return exc.code in _MISSING_CODES
     if not isinstance(exc, ClientError):
         return False
-    return exc.response.get("Error", {}).get("Code") in {
-        "NoSuchBucket", "NoSuchKey", "404", "NotFound",
-        "ResourceNotFoundException", "UserNotFoundException",
-    }
+    return exc.response.get("Error", {}).get("Code") in _MISSING_CODES
 
 
 # ── 流式下载 + SHA256 校验 ───────────────────────────────────────────────────
@@ -374,6 +395,22 @@ def _teardown_site(props) -> dict:
         except Exception as exc:  # noqa: BLE001
             if not _ignore_missing(exc):
                 raise
+    # Bedrock API Key 的 secret 不是栈内资源 —— 管理员在 Admin「模型」页选「API Key」
+    # 凭证方式时由 BFF 按需 CreateSecret（见 bff/web-chat/llm_config.mjs），CFN 因此
+    # 完全不知道它存在。DeleteEverything 却承诺"不留东西"，所以必须在这里收尾。
+    # 用 ForceDeleteWithoutRecovery：默认的 30 天恢复期会让同账号同区重装时
+    # CreateSecret 撞 InvalidRequestException（"scheduled for deletion"），
+    # 而这是"客户明确要求全删"的路径。`setup.sh` 那条路径由 teardown.sh 做同一件事。
+    sm = boto3.client("secretsmanager")
+    for name in json.loads(props.get("SecretNames") or "[]"):
+        try:
+            sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+            print(f"deleted secret {name}")
+        except Exception as exc:  # noqa: BLE001
+            # 绝大多数情况下它根本不存在（客户从没用过 API Key 模式）—— 那是正常的，
+            # 不该把删栈卡在 ResourceNotFoundException 上。
+            if not _ignore_missing(exc):
+                raise
     report["DeletedEverything"] = "true"
     return report
 
@@ -507,6 +544,257 @@ def _org_setup(props: dict) -> dict:
     return report
 
 
+# ── Phase=WebSearch：AgentCore Web Search Gateway ────────────────────────────
+# 联网搜索是**唯一**走 AWS 原生通道的外网能力：查询文本不发给任何第三方搜索引擎
+# （2026-08 起 Exa 兜底已从两条部署路径彻底移除）。AgentCore web search 没有独立 API，
+# 必须经 **Gateway + web-search connector target** 调用，而这两样都**没有 CFN 资源**
+# —— 所以只能由 stager 建，等价于 `setup.sh` 路径上的 scripts/provision_websearch_gateway.sh。
+#
+# 为什么用**手签 SigV4 + 裸 REST**，不用 boto3 客户端：
+#   `mcp.connector` 这个 target 形态需要 **botocore>=1.43.36**，比它老的会直接报
+#   "Unknown parameter ... connector"。Lambda 运行时自带的 botocore 版本由 AWS 决定、
+#   我们控制不了，而一键模板里**不能有资产**（没法打 layer、也不能 pip 装）。
+#   rest-json 协议下请求体就是入参结构本身，所以手写 JSON 与新版 boto3 发出的字节一致，
+#   彻底摆脱版本依赖。签名用的 service name 是 `bedrock-agentcore`（服务模型的
+#   signingName），**不是** host 前缀 `bedrock-agentcore-control`。
+_AC_SIGNING_NAME = "bedrock-agentcore"
+_WEBSEARCH_TOOL_ARN_SUFFIX = "tool/web-search.v1"
+# target 名决定 agent 侧看到的工具名（"<target>___WebSearch"），必须与
+# core/agentcore_search.py 的 `_TOOL_NAME` 默认值一致，改这里就要同时改那里。
+_WEBSEARCH_TARGET_NAME = "web-search-tool"
+
+
+def _ac_call(method: str, path: str, body: dict | None = None) -> dict:
+    """对 bedrock-agentcore-control 发一个手签 SigV4 的 REST 请求，返回解析后的 JSON。
+
+    失败抛 `_AgentCoreError`（带 AWS 错误码），这样调用方能用 `_ignore_missing` 判幂等。
+    """
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    session = boto3.Session()
+    region = session.region_name or "us-east-1"
+    url = f"https://bedrock-agentcore-control.{region}.amazonaws.com{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"content-type": "application/json"} if data is not None else {}
+
+    aws_req = AWSRequest(method=method, url=url, data=data, headers=headers)
+    creds = session.get_credentials()
+    if creds is None:
+        raise _AgentCoreError("NoCredentials", 0, "no AWS credentials on the stager role")
+    SigV4Auth(creds.get_frozen_credentials(), _AC_SIGNING_NAME, region).add_auth(aws_req)
+
+    req = urllib.request.Request(url, data=data, method=method, headers=dict(aws_req.headers))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        # 错误码在 x-amzn-errortype 头（形如 "ResourceNotFoundException:http://..."），
+        # 少数情况只在 body 的 __type 里。message 可能含服务端细节，只留给日志。
+        code = (exc.headers.get("x-amzn-errortype") or "").split(":")[0]
+        msg = ""
+        try:
+            parsed = json.loads(raw)
+            code = code or str(parsed.get("__type", "")).split("#")[-1]
+            msg = str(parsed.get("message") or parsed.get("Message") or "")
+        except ValueError:
+            msg = raw[:200]
+        raise _AgentCoreError(code or f"HTTP{exc.code}", exc.code, msg) from None
+    return json.loads(raw) if raw.strip() else {}
+
+
+def _ac_paginate(path: str, key: str = "items") -> list:
+    """把一个 List* 接口翻完页。nextToken 走 querystring。"""
+    out, token = [], None
+    while True:
+        page = _ac_call("GET", path + (f"?nextToken={urllib.parse.quote(token)}" if token else ""))
+        out.extend(page.get(key) or [])
+        token = page.get("nextToken")
+        if not token:
+            return out
+
+
+def _mcp_url(gateway_url: str) -> str:
+    """gatewayUrl 实测已带 /mcp 后缀，但不保证；缺了才补，避免拼出 /mcp/mcp。"""
+    url = (gateway_url or "").rstrip("/")
+    return url if url.endswith("/mcp") else f"{url}/mcp"
+
+
+def _wait_gateway_ready(gw_id: str) -> dict:
+    """轮询到 READY（或明确失败）。返回最后一次 GetGateway 的响应。
+
+    不设"超时就抛"：Gateway 建好只要几秒，真卡住时让它把自定义资源的时间用完比让
+    整栈因为一个可选能力回滚划算 —— 上层 `_websearch` 会把任何异常降级成"没有联网搜索"。
+    """
+    last: dict = {}
+    for _ in range(40):  # 40 × 3s = 2 分钟
+        last = _ac_call("GET", f"/gateways/{gw_id}/")
+        status = last.get("status")
+        if status == "READY":
+            return last
+        if status in ("FAILED", "UPDATE_UNSUCCESSFUL", "DELETING"):
+            raise _AgentCoreError("GatewayNotReady", 0, f"status={status}")
+        time.sleep(3)
+    raise _AgentCoreError("GatewayNotReady", 0, f"still {last.get('status')} after 2 min")
+
+
+def _pid_owns_gateway(pid: str) -> bool:
+    """PhysicalResourceId 里编码的归属位（见 `_websearch_provision`）。"""
+    return (pid or "").endswith("-own")
+
+
+# 建失败的 Gateway 停在这些状态上，且**不会**自己恢复。
+_GATEWAY_DEAD = ("FAILED", "UPDATE_UNSUCCESSFUL")
+
+
+def _delete_gateway(gw_id: str) -> None:
+    """删掉一个 Gateway（有 target 时删不掉，所以先清 target）。缺了就算删过。"""
+    for t in _ac_paginate(f"/gateways/{gw_id}/targets/"):
+        try:
+            _ac_call("DELETE", f"/gateways/{gw_id}/targets/{t['targetId']}/")
+        except Exception as exc:  # noqa: BLE001
+            if not _ignore_missing(exc):
+                raise
+    try:
+        _ac_call("DELETE", f"/gateways/{gw_id}/")
+    except Exception as exc:  # noqa: BLE001
+        if not _ignore_missing(exc):
+            raise
+
+
+def _wait_gateway_gone(gw_id: str) -> None:
+    """等到 GetGateway 报「没有这个东西」。
+
+    删除是异步的，而同名 Gateway 并存会让紧接着的 CreateGateway 撞名字失败，
+    所以必须等它真的消失再建。
+    """
+    for _ in range(40):  # 40 × 3s = 2 分钟
+        try:
+            _ac_call("GET", f"/gateways/{gw_id}/")
+        except Exception as exc:  # noqa: BLE001
+            if _ignore_missing(exc):
+                return
+            raise
+        time.sleep(3)
+    raise _AgentCoreError("GatewayStillDeleting", 0, "dead gateway did not go away in 2 min")
+
+
+def _websearch_provision(props: dict, state: dict) -> dict:
+    """幂等建好 Gateway + web-search target。返回 report；归属写进 `state["owned"]`。
+
+    `owned` = 这个 Gateway 是**本栈建的**（而不是复用同账号里 `setup.sh` 留下的同名
+    Gateway）。它编码进 PhysicalResourceId，删栈时据此决定删不删 —— 删掉客户另一条
+    部署路径的 Gateway 属于跨部署的破坏性操作，不能由「删这个栈」隐式触发。
+    归属用**入参 state 就地写**而不是返回值：建完 Gateway 之后的任何一步失败都会把这个
+    函数抛出去，那时调用方仍必须知道"Gateway 已经是我们的了"，否则删栈会漏掉它。
+    Update 时沿用上一次的归属（此时按名字找到的正是我们自己建的那个），
+    否则 own→reuse 一漂移，删栈就漏清理。
+    """
+    name = props["GatewayName"]
+    target_name = props.get("TargetName") or _WEBSEARCH_TARGET_NAME
+
+    gw_id = next((g.get("gatewayId") for g in _ac_paginate("/gateways/")
+                  if g.get("name") == name), None)
+    # 同名 Gateway 停在 FAILED 上时**不能**复用：它不会自己恢复，而按名字复用会让
+    # 「第一次建失败」永久化 —— 之后每次 update 都在同一个死 Gateway 上等 READY，客户
+    # 除了手工去删没有别的出路。FAILED 的 Gateway 服务不了任何请求（另一条部署路径也
+    # 一样用不了它），所以删掉重建不会毁掉任何还在工作的东西。
+    if gw_id and (_ac_call("GET", f"/gateways/{gw_id}/").get("status") in _GATEWAY_DEAD):
+        print(f"replacing dead web-search gateway {gw_id}")
+        _delete_gateway(gw_id)
+        _wait_gateway_gone(gw_id)
+        gw_id = None
+    if gw_id:
+        report = {"Gateway": f"reused {gw_id}"}
+    else:
+        created = _ac_call("POST", "/gateways/", {
+            "name": name,
+            "roleArn": props["ServiceRoleArn"],
+            "protocolType": "MCP",
+            "authorizerType": "AWS_IAM",
+            "description": "NotiOps web search (AWS-native, queries stay in AWS)",
+            "tags": {"auto-delete": "no", "project": "notiops"},
+        })
+        gw_id = created["gatewayId"]
+        state["owned"] = True
+        report = {"Gateway": f"created {gw_id}"}
+
+    gw = _wait_gateway_ready(gw_id)
+
+    targets = _ac_paginate(f"/gateways/{gw_id}/targets/")
+    if any(t.get("name") == target_name for t in targets):
+        report["Target"] = f"reused {target_name}"
+    else:
+        # `connector` 形态见本节顶部注释（为什么不能用 boto3 客户端建）。
+        # parameterValues 留空 = 用连接器默认参数；凭证走 Gateway 自己的服务角色。
+        tgt = _ac_call("POST", f"/gateways/{gw_id}/targets/", {
+            "name": target_name,
+            "description": "AWS-native web search",
+            "targetConfiguration": {"mcp": {"connector": {
+                "source": {"connectorId": "web-search"},
+                "configurations": [{"name": "WebSearch", "parameterValues": {}}],
+            }}},
+            "credentialProviderConfigurations": [{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
+        })
+        report["Target"] = f"created {tgt.get('targetId')}"
+
+    report["GatewayUrl"] = _mcp_url(gw.get("gatewayUrl", ""))
+    report["GatewayId"] = gw_id
+    return report
+
+
+# Gateway 建不出来时给 runtime 的占位值。**不能给空串** —— AgentCore Runtime 拒绝
+# 空字符串的环境变量，而这里已经在部署中途，回不了头去把这个 key 整个删掉。
+# agent 侧 `core/agentcore_search.py` 只认 https:// 开头的值，所以这个占位等价于"未配置"。
+_WEBSEARCH_UNAVAILABLE = "unavailable"
+
+
+def _websearch(props: dict, prior_pid: str) -> tuple[dict, str]:
+    """Phase=WebSearch 的 Create/Update。返回 (Data, PhysicalResourceId)。
+
+    **绝不抛**：联网搜索是可选能力，它挂了不该把整栈拖回滚（客户会失去全部其它功能，
+    却只因为界面上一个开关不能用）。失败就降级成"这个部署没有联网搜索"，理由回在
+    `Status` 里 —— 栈的 `WebSearchStatus` 输出直接给客户看。
+    """
+    state = {"owned": _pid_owns_gateway(prior_pid)}
+    try:
+        report = _websearch_provision(props, state)
+        report["Status"] = "enabled"
+    except Exception as exc:  # noqa: BLE001
+        # 只记错误类型/AWS 错误码，不记服务端原文（团队日志规范）。
+        code = exc.code if isinstance(exc, _AgentCoreError) else type(exc).__name__
+        print(f"websearch provisioning failed: {code}")
+        report = {"Status": f"unavailable ({code})", "GatewayUrl": _WEBSEARCH_UNAVAILABLE}
+    pid = f"notiops-stager-WebSearch-{'own' if state['owned'] else 'reuse'}"
+    return report, pid
+
+
+def _teardown_websearch(props: dict, prior_pid: str) -> dict:
+    """删栈：只删**本栈建的** Gateway（见 `_websearch_provision` 的 owned）。
+
+    Gateway 有 target 时删不掉，所以先删干净 target 再删 Gateway。任何一步失败都只
+    记一笔就返回 —— 删栈阶段抛异常会把栈卡在 DELETE_FAILED，比留一个孤儿 Gateway 糟得多
+    （孤儿带着 `project=notiops` 标签，客户找得到）。
+    """
+    if not _pid_owns_gateway(prior_pid):
+        return {"LeftInPlace": "web-search gateway was pre-existing (not created by this stack)"}
+    name = props["GatewayName"]
+    try:
+        gw_id = next((g.get("gatewayId") for g in _ac_paginate("/gateways/")
+                      if g.get("name") == name), None)
+        if not gw_id:
+            return {"DeletedGateway": "already gone"}
+        _delete_gateway(gw_id)
+        return {"DeletedGateway": gw_id}
+    except Exception as exc:  # noqa: BLE001
+        if _ignore_missing(exc):
+            return {"DeletedGateway": "already gone"}
+        code = exc.code if isinstance(exc, _AgentCoreError) else type(exc).__name__
+        print(f"websearch teardown failed: {code}")
+        return {"DeletedGateway": f"failed ({code}) — delete it by hand if you care"}
+
+
 # ── 入口 ────────────────────────────────────────────────────────────────────
 def handler(event, context):
     # 打日志时剔掉 ResponseURL（里面带签名），其余属性都不含敏感值。
@@ -518,10 +806,14 @@ def handler(event, context):
     # PhysicalResourceId 跨 Update 保持不变 —— 变了 CFN 会在 Update 之后再发一个
     # Delete（把刚建好的东西清掉）。用栈内固定串，不用 log stream 名。
     pid = f"notiops-stager-{phase}"
+    prior_pid = event.get("PhysicalResourceId") or ""
     try:
         if rt == "Delete":
             if phase == "Site":
                 data = _teardown_site(props)
+            elif phase == "WebSearch":
+                data = _teardown_websearch(props, prior_pid)
+                pid = prior_pid or pid
             elif phase == "OrgSetup":
                 # 什么都不做，两条都是刻意的：
                 #   · 信任访问是**组织级**开关，组织里与 NotiOps 无关的 StackSet 也靠它，
@@ -534,6 +826,8 @@ def handler(event, context):
                 data = {"StagingObjectsDeleted": str(_empty_bucket(props["StagingBucket"]))}
         elif phase == "Artifacts":
             data = _artifacts_upsert(props)
+        elif phase == "WebSearch":
+            data, pid = _websearch(props, prior_pid)
         elif phase == "OrgSetup":
             data = _org_setup(props)
         elif phase == "Site":

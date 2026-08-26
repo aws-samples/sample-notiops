@@ -38,8 +38,8 @@
 - **「通知」收件箱里的内容**：界面在，但产生通知的后端（Health 事件转发、告警推送）不在。
 - **CUR + Athena 成本明细数据源**：FinOps 提问仍可用 Cost Explorer 口径，但没有账单明细级下钻。
 - **跨账号的自动巡检与事件推送**：一键部署可以做**跨账号只读排查/调查/开案例**（`DeployMode=MultiAccount`，见 [§2.6](#26-可选多账号组织内跨账号)），但成员账号侧的 **CloudWatch OAM Sink** 与 **跨账号事件转发**（Health / DevOps Agent 调查事件回流）不在这条路径里 —— 那两样要 `setup.sh`。
-- **Web 搜索**（Exa）：需要你自己的 API key，默认关闭。
-  （**DevOps Agent 深度调查**不在此列 —— 它由这个栈自动建好，见 [§2.7](#27-深度调查aws-devops-agent)。）
+
+（**DevOps Agent 深度调查**和**联网搜索**都**不**在此列 —— 这两样都由这个栈自动建好，分别见 [§2.7](#27-深度调查aws-devops-agent) 和 [§2.8](#28-联网搜索agentcore-web-search)。）
 
 ---
 
@@ -137,6 +137,8 @@ notiops-webchat.template.json
 | **DeployModeStatus** | 单账号还是多账号**实际生效**的那个。选了 `MultiAccount` 却忘了填 org id，这里会明说"仍是单账号"。 |
 | **DeepInvestigationStatus** | 深度调查是开着、你自己关了、还是**因为这个区域没有 AWS DevOps Agent 被跳过**。 |
 | **DevOpsAgentSpaceId** | 深度调查开着时才有：栈给你建的 Agent Space id。 |
+| **WebSearchStatus** | 这个区域**支持不支持**联网搜索（不是 us-east-1 就整块跳过，见 [§2.8](#28-联网搜索agentcore-web-search)）。 |
+| **WebSearchProvisioning** | 区域支持时才有：Gateway **到底建成了没有**。`enabled` = 开关可用；`unavailable (<错误码>)` = 建失败，开关点了没结果（栈本身照样成功，见 [§2.8](#28-联网搜索agentcore-web-search)）。 |
 
 打开 `ChatUrl`，用：
 
@@ -176,15 +178,24 @@ notiops-webchat.template.json
 - **区域**：AWS DevOps Agent 只在部分区域可用。**你选的区域没有它，栈不会失败** —— 这一块被静默跳过，其余功能全在，Outputs 的 `DeepInvestigationStatus` 会写明"因为区域跳过"。
 - 事后想改主意：update 栈、把这个参数改掉即可。
 
+### 2.8 联网搜索（AgentCore Web Search）
+
+**没有参数，栈自动建好。** 它会创建一个 **Bedrock AgentCore Gateway**（名字 `notiops-websearch-gw`）并挂上 AWS 内建的 `web-search` 连接器 —— 聊天界面输入框上那个**联网搜索**开关靠的就是它。**不需要任何第三方 API key**，搜索请求也**不出 AWS**。
+
+- **计费**：按**搜索次数**计（只有你打开那个开关提问、且 agent 真的决定去搜时才产生），不搜不收费。所以它没有参数可关 —— 关掉的成本收益为零。
+- **区域**：AgentCore Web Search 目前**只在 us-east-1** 提供。**部署在别的区栈不会失败** —— 这一块整块跳过，其余功能全在，Outputs 的 `WebSearchStatus` 会写明原因。那种情况下界面上的开关还在（前端不做区域判断），点了不报错，只是搜不到东西。
+- **账号里已经有同名 Gateway**（比如你先跑过 `setup.sh`，或者在同一账号里开了第二个栈）：**复用，不重复建**；删栈时也**不会**去删它 —— 只有本栈自己建出来的那个才会被删掉。唯一的例外是那个同名 Gateway 停在 `FAILED` 上：它不会自愈、谁也用不了，栈会删掉它重建一个。
+- **建失败不会让栈失败**：联网搜索是可选能力，它挂了不该让整栈回滚（那样你会为了一个开关失去全部其它功能）。所以要看的是 **`WebSearchProvisioning`** 这个 output：`enabled` 才是真的能用，`unavailable (<错误码>)` 表示这个部署没有联网搜索、开关点了没结果。想知道细节就看栈事件里的 `StagerWebSearch` 与 StagerFn 的日志。
+
 ---
 
 ## 3. 这个栈建了什么
 
-默认参数下 **48 个**资源（关掉深度调查是 44；再选上多账号是 51），都在你自己的账号里：
+默认参数下 **50 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 4 个；选上多账号多 3 个）：
 
 | 类别 | 资源 |
 |---|---|
-| 前端 | S3 网站桶 + CloudFront distribution + CloudWatch RUM |
+| 前端 | S3 网站桶 + CloudFront distribution + CloudWatch RUM；报告下载走另一个 CloudFront distribution（带一个只放行报告路径的 CloudFront Function） |
 | 接口 | 1 个 Lambda（BFF）+ Function URL（`AWS_IAM` 鉴权，流式返回） |
 | Agent | 1 个 Bedrock AgentCore Runtime |
 | 登录 | Cognito User Pool + Client + Identity Pool + 8 个用户组（角色） |
@@ -192,6 +203,7 @@ notiops-webchat.template.json
 | 部署辅助 | 1 个 staging 桶（放搬进来的产物）+ 1 个内联的部署 Lambda + 2 个自定义资源 |
 | 权限 | 5 个 IAM 角色 + 5 个内联策略 |
 | 深度调查（默认开） | 1 个 DevOps Agent Agent Space + 1 个只读关联 + 1 个被 DevOps Agent 假设的角色（+ 它的策略） |
+| 联网搜索（仅 us-east-1） | 1 个自定义资源（去建 AgentCore Gateway）+ 1 个 Gateway 服务角色 + 1 个内联策略 |
 | 多账号（可选） | 1 个自定义资源（去建两个成员账号 StackSet）+ 2 个内联策略 |
 
 **成本量级**（空闲时）：CloudFront + S3 + DynamoDB 按量、Lambda 不调用不计费、AgentCore Runtime 空闲不计费 —— 不用的时候基本只有几毛钱的存储。真正花钱的是**提问时的 Bedrock token**。staging 桶里每个 release 约 **165 MB**（S3 标准存储 ≈ $0.004/月），升级不会自动清掉旧版本，见 [§5](#5-升级到新版本)。
@@ -326,7 +338,7 @@ CloudFormation → 选中栈 → **Delete**。**实测 ~3 分 10 秒**（两种�
 | CloudFront 的访问日志（如果你自己开过） | 不由这个栈管理 | 按需 |
 | **多账号模式下**：`notiops-member-onboarding` / `notiops-member-devops-agent` 两个 StackSet，以及 Organizations 对 StackSets 的信任访问 | **故意留的。** ① StackSet 要先删掉全部 stack instance 才删得掉，而那等于抹掉各成员账号里的跨账号角色 —— 这种跨账号的破坏性动作不该由"删一个栈"隐式触发；② 信任访问是**组织级**开关，删我们的栈就把它关掉会打断组织里别人的 StackSets 部署。 | 确实不要了：先在 CloudFormation → StackSets 里 **Delete stacks from StackSet**（删实例），再删 StackSet 本身。信任访问除非你确认没别人在用，否则别关。 |
 
-**没有**其他孤儿：agent 的日志组、BFF 的日志组、部署 Lambda 的日志组、IAM 角色、Cognito 用户池、RUM app monitor、AgentCore Runtime、网站桶、staging 桶 —— 实测全部随栈删除。深度调查建的 Agent Space 与关联也随栈删除（它是栈里的普通资源）。
+**没有**其他孤儿：agent 的日志组、BFF 的日志组、部署 Lambda 的日志组、IAM 角色、Cognito 用户池、RUM app monitor、AgentCore Runtime、网站桶、staging 桶 —— 实测全部随栈删除。深度调查建的 Agent Space 与关联也随栈删除（它是栈里的普通资源）。联网搜索的 AgentCore Gateway 分两种：**这个栈建出来的**随栈删除；**它复用的别人的**（同账号里已经存在的 `notiops-websearch-gw`，比如 `setup.sh` 建的）留着不动 —— 删一个栈不该顺手拆掉另一条部署路径还在用的东西。
 
 ---
 

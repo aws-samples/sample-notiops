@@ -117,6 +117,11 @@ CJK_ALLOWLIST = {
     "core/resources.py",
     "core/support_cases.py",
     "core/web_search.py",
+    # agentcore_search.py 同组（web-chat agent 专用）。它的 CJK 是**匹配用的 fixture**：
+    # `_NOISE_MARKERS` 里那几个串（"正在加载" / "跳至主要内容"）用来识别 JS 占位页、
+    # 把这类没有正文的命中丢掉。它们是拿去 `in` 比对的模式，不是输出给谁看的文案 ——
+    # 翻译它们只会让判别失效（Exa 移除后这段从 web_search.py 搬来，那边本就在本名单里）。
+    "core/agentcore_search.py",
     # support_logic — language picker LABELS contain native names
     # (中文 / 日本語 / 한국어) by design, since customers choose what
     # language AWS engineers should respond in regardless of bot UI
@@ -186,6 +191,10 @@ CJK_ALLOWLIST = {
     # 不能翻译：那条判据本身就是「客户可见文案里不许有非 ASCII」（CFN 会把它们换成
     # `?`），反例必须真的是中文/破折号才撞得上它。Developer-facing only。
     "scripts/test_postprocess_template.py",
+    # 两条部署路径的 web 功能一致性判据 —— CJK 是套件标题和失败提示（「新增 web 功能时
+    # 两条路径都要落地」/「别把断言删掉，去更新提取器」），写给下一个撞上它的维护者。
+    # Developer-facing only；断言本身比对的是源码里的 IAM 动作名与环境变量键，全是 ASCII。
+    "scripts/test_oneclick_parity.py",
     # Sanitizer denylist — internal blocklist of OpenAI ChatML
     # protocol fragments + Chinese SEO/gambling spam tokens that
     # must NEVER reach end users. These strings are pattern fixtures,

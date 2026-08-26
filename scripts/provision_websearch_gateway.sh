@@ -4,7 +4,8 @@
 # agent-build/.../agentcore/agentcore.json 的 runtime envVars（或 CDK 注入）后重新 agentcore deploy。
 #
 # 背景：AgentCore web search 没有独立 API，必须经 Gateway + web-search connector target 调用。
-# 数据全程不出 AWS（区别于 Exa 第三方）。agent 经 MCP+SigV4 调 Gateway。
+# 数据全程不出 AWS（查询文本不发给任何第三方搜索引擎）。agent 经 MCP+SigV4 调 Gateway。
+# 这是**唯一**的联网搜索来源：没建 Gateway 的部署就是没有联网搜索能力（无第三方兜底）。
 # 详见 memory web-chat-phase1-deploy 的 "AgentCore Web Search" 段。
 set -euo pipefail
 
@@ -54,21 +55,59 @@ aws iam put-role-policy --role-name "$SVC_ROLE" --policy-name NotiOpsWebSearchGa
 ROLE_ARN="arn:aws:iam::${ACCOUNT}:role/${SVC_ROLE}"
 echo "$(t "✓ 服务角色权限就绪：$ROLE_ARN" "✓ Service role permissions ready: $ROLE_ARN")"
 
-# ── 2. Gateway（AWS_IAM 鉴权，MCP 协议）。已存在则复用。──
+# ── 2. Gateway（AWS_IAM 鉴权，MCP 协议）。已存在则复用；停在 FAILED 的删掉重建。──
+gw_status() {
+  aws bedrock-agentcore-control get-gateway --region "$REGION" \
+    --gateway-identifier "$1" --query status --output text 2>/dev/null || echo "GONE"
+}
 GW_ID="$(aws bedrock-agentcore-control list-gateways --region "$REGION" \
   --query "items[?name=='${GW_NAME}'].gatewayId | [0]" --output text 2>/dev/null || echo "None")"
+# 同名 Gateway 停在 FAILED 上时**不能**复用：它不会自己恢复，而按名字复用会让「第一次建
+# 失败」永久化 —— 重跑多少次都是在同一个死 Gateway 上建 target。FAILED 的 Gateway 服务不了
+# 任何请求，删掉重建不会毁掉任何还在工作的东西。
+if [ -n "$GW_ID" ] && [ "$GW_ID" != "None" ]; then
+  case "$(gw_status "$GW_ID")" in
+    FAILED|UPDATE_UNSUCCESSFUL)
+      echo "$(t "⚠️  已有 Gateway ${GW_ID} 建失败且不会自愈，删掉重建…" "⚠️  Existing Gateway ${GW_ID} failed to build and will not self-heal; replacing it…")" >&2
+      # 有 target 时 Gateway 删不掉，先清 target。
+      for TID in $(aws bedrock-agentcore-control list-gateway-targets --region "$REGION" \
+          --gateway-identifier "$GW_ID" --query 'items[].targetId' --output text 2>/dev/null || true); do
+        aws bedrock-agentcore-control delete-gateway-target --region "$REGION" \
+          --gateway-identifier "$GW_ID" --target-id "$TID" >/dev/null 2>&1 || true
+      done
+      aws bedrock-agentcore-control delete-gateway --region "$REGION" \
+        --gateway-identifier "$GW_ID" >/dev/null 2>&1 || true
+      # 删除是异步的，同名并存会让紧接着的 create 撞名字。
+      for _ in $(seq 1 40); do
+        if [ "$(gw_status "$GW_ID")" = "GONE" ]; then break; fi
+        sleep 3
+      done
+      GW_ID="None"
+      ;;
+  esac
+fi
 if [ -z "$GW_ID" ] || [ "$GW_ID" = "None" ]; then
   GW_ID="$(aws bedrock-agentcore-control create-gateway --region "$REGION" \
     --name "$GW_NAME" --role-arn "$ROLE_ARN" --protocol-type MCP --authorizer-type AWS_IAM \
     --description "NotiOps web search (us-east-1)" --tags auto-delete=no,project=notiops \
     --query gatewayId --output text)"
   echo "$(t "✓ 创建 Gateway ${GW_ID}（等待 READY…）" "✓ Created Gateway ${GW_ID} (waiting for READY…)")"
-  for _ in $(seq 1 30); do
-    S="$(aws bedrock-agentcore-control get-gateway --region "$REGION" --gateway-identifier "$GW_ID" --query status --output text)"
-    [ "$S" = "READY" ] && break; sleep 3
-  done
 else
   echo "$(t "✓ 复用已有 Gateway $GW_ID" "✓ Reusing existing Gateway $GW_ID")"
+fi
+# 复用的那个也要等：CREATING 中就去建 target 会失败。
+# **等不到 READY 就直接退出**：接着往下走只会打印一个连不通的 Gateway URL，客户拿它配好
+# agent，之后每次联网搜索都在超时上等 —— 那比这里当场报错难查得多。
+GW_STATUS=""
+for _ in $(seq 1 40); do
+  GW_STATUS="$(gw_status "$GW_ID")"
+  if [ "$GW_STATUS" = "READY" ]; then break; fi
+  case "$GW_STATUS" in FAILED|UPDATE_UNSUCCESSFUL|GONE) break ;; esac
+  sleep 3
+done
+if [ "$GW_STATUS" != "READY" ]; then
+  echo "$(t "✗ Gateway ${GW_ID} 没到 READY（当前 ${GW_STATUS}）。用 aws bedrock-agentcore-control get-gateway --gateway-identifier ${GW_ID} --region ${REGION} 看 statusReasons；最常见的原因是当前身份缺 bedrock-agentcore:CreateWorkloadIdentity 权限。" "✗ Gateway ${GW_ID} never reached READY (now ${GW_STATUS}). Run aws bedrock-agentcore-control get-gateway --gateway-identifier ${GW_ID} --region ${REGION} and read statusReasons; the most common cause is the calling identity lacking bedrock-agentcore:CreateWorkloadIdentity.")" >&2
+  exit 1
 fi
 # 幂等补标签：既有 Gateway（老部署重跑）也补齐项目标签，与 CDK 资源(auto-delete=no + project=notiops)对齐。
 GW_ARN="arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT}:gateway/${GW_ID}"

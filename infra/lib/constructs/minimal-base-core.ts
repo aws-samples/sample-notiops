@@ -23,6 +23,8 @@ import { Construct } from "constructs";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as s3 from "aws-cdk-lib/aws-s3";
+import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
+import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 
 export interface MinimalBase {
   userPool: cognito.UserPool;
@@ -31,6 +33,8 @@ export interface MinimalBase {
   dataBucket: s3.Bucket;
   /** 8 个用户组的构件 —— StagerFn 把管理员加进 `admin` 组，必须等组建好（DependsOn）。 */
   groups: cognito.CfnUserPoolGroup[];
+  /** 报告分发 CDN 的域名（`REPORTS_CDN_DOMAIN`）。与后端栈的 `reportsCdnDomain` 同义。 */
+  reportsCdnDomain: string;
 }
 
 export function createMinimalBase(scope: Construct): MinimalBase {
@@ -122,5 +126,41 @@ export function createMinimalBase(scope: Construct): MinimalBase {
     removalPolicy: cdk.RemovalPolicy.RETAIN,
   });
 
-  return { userPool, userPoolClient, configTable, dataBucket, groups };
+  // ─── 报告分发 CDN（CloudFront + OAC，只暴露 reports/*）───────────────────
+  // 与 `notiops-backend-stack.ts` 的 ReportsCDN 逐字一致（构件 id 也同名）。**不是可选项**：
+  // 缺了它 `REPORTS_CDN_DOMAIN` 为空，core/reports.py 退回 presigned URL（12h 过期），
+  // 而产品承诺与桶生命周期都是 7 天 —— 客户第二天点报告链接就 403，且看不出原因。
+  // BFF 的「深度调查（直连）」更严格：devops_investigate.mjs 没有 presign 分支，
+  // 域名为空时直接不产出报告链接。
+  //
+  // 安全模型：URL 即凭证（与 presigned 一致，只是不过期），key 用不可猜的 UUID；
+  // CloudFront Function 把非 /reports/ 前缀一律 403，避免暴露桶内其它前缀
+  // （skills/、onboarding/ 等）；OAC 只读私有桶，不放开桶的公共访问。
+  //
+  // 一键模板的「不能有 CDK 资产」约束在这里是满足的：`FunctionCode.fromInline` 不产生
+  // 资产，Distribution 也只多出一个 AWS::CloudFront::OriginAccessControl + 桶策略。
+  const reportsPathGuard = new cloudfront.Function(scope, "ReportsPathGuard", {
+    code: cloudfront.FunctionCode.fromInline(
+      "function handler(event){var u=event.request.uri;" +
+      "if(u.indexOf('/reports/')!==0){return {statusCode:403,statusDescription:'Forbidden'};}" +
+      "return event.request;}"
+    ),
+  });
+  const reportsCdn = new cloudfront.Distribution(scope, "ReportsCDN", {
+    comment: "NotiOps DevOps/What's New reports (reports/* only)",
+    defaultBehavior: {
+      origin: origins.S3BucketOrigin.withOriginAccessControl(dataBucket),
+      viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+      cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
+      functionAssociations: [{
+        function: reportsPathGuard,
+        eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
+      }],
+    },
+  });
+
+  return {
+    userPool, userPoolClient, configTable, dataBucket, groups,
+    reportsCdnDomain: reportsCdn.distributionDomainName,
+  };
 }

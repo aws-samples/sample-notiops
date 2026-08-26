@@ -772,7 +772,7 @@ Web Chat offers **two case-filing paths; you pick one**. Both run **deterministi
 
 - **Model switching**: defaults to **Grok 4.6**, with **Claude Sonnet 5**, **Claude Opus 5**, **Claude Haiku 4.5**, **Amazon Nova Pro**, **DeepSeek V3.2**, and the **GPT-5.6** family (Terra / Sol / Luna) also available (all accessed via Amazon Bedrock; third-party models run via Bedrock, not direct vendor APIs). It **remembers your model preference per session**, and **each reply is signed with the model used**.
 - **Multi-account selector**: defaults to the **deployment account**, shared by the team. ⚠️ **In v1, cross-account is locked to the deployment account by default** (switching to arbitrary other accounts isn't open yet).
-- **Web search toggle**: **off by default**; turn it on manually when you want the assistant to reference public web information.
+- **Web search toggle**: **off by default**; turn it on manually when you want the assistant to reference public web information. It uses the AWS built-in AgentCore Web Search (requests never leave AWS). ⚠️ That capability exists **only in `us-east-1`**: in other Regions the toggle still clicks but returns nothing — that's not a fault, check the deployment Region with whoever operates it.
 - **What's New**: view the latest AWS announcements.
 - **"/" commands**: type `/` in the input box to pop up a command menu for quickly invoking Skills and more.
 - **Sources panel**: passes through tool calls and sources so you can verify what the assistant based its answer on.

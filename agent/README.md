@@ -28,12 +28,13 @@ agentcore dev --stream "ALB 和 NLB 的区别"   # 流式测一句
 （us-east-1 时）provision web-search Gateway → `agentcore deploy` → 捕获 Runtime ARN →
 随后 `cdk deploy` 把该 ARN 通过 `-c agentRuntimeArn` 注入 WebChatStack（BFF 调真 agent）。
 - 跳过 agent（只部 web + echo BFF）：`SKIP_AGENT=true ./setup.sh`
-- 关闭 AgentCore Web Search（仍用 Exa 兜底）：`ENABLE_WEBSEARCH=false ./setup.sh`
+- 关闭联网搜索（不建 Gateway，界面开关按无能力处理）：`ENABLE_WEBSEARCH=false ./setup.sh`
 - agent 部署失败不阻断整体；可单独重跑 `DEPLOY_REGION=<region> bash scripts/deploy_agent.sh`。
 > ⚠️ `agentcore.json` 里 `AGENTCORE_WEBSEARCH_GATEWAY_URL` 的值是占位符
-> `__WEBSEARCH_GATEWAY_URL__`，由 `deploy_agent.sh` 在部署时注入真实 URL（或空=用 Exa 兜底）。
-> **不要手动裸跑 `agentcore deploy`**（会把占位符当 URL 部署，联网搜索失效但会回退 Exa）——
-> 用 `scripts/deploy_agent.sh`。
+> `__WEBSEARCH_GATEWAY_URL__`，由 `deploy_agent.sh` 在部署时注入真实 URL（或空）。
+> 2026-08 起**没有第三方兜底**（Exa 已移除）：这个值为空就等于本部署不能联网搜索，
+> web_search 工具返回空结果。**不要手动裸跑 `agentcore deploy`**（会把占位符当 URL
+> 部署 → 联网搜索恒空）—— 用 `scripts/deploy_agent.sh`。
 
 ## 部署到 AgentCore Runtime（手动 / 开发）
 ```bash

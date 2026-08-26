@@ -156,6 +156,7 @@ mode comparison and how to switch — see
 | Resource-health inspection (on demand) | ✅ | ✅ |
 | Incident investigation (instant, read-only tools) | ✅ | ✅ |
 | DevOps Agent deep investigation | ✅ see note ¹ | ✅ |
+| Web search (AgentCore Web Search) | ✅ see note ² | ✅ see note ² |
 | **Cost / FinOps** | | |
 | FinOps dashboard (Cost Explorer data) | ✅ deploy account only | ✅ cross-account |
 | CUR + Athena billing-detail drill-down | ❌ | ✅ |
@@ -165,7 +166,7 @@ mode comparison and how to switch — see
 | Publish a Skill to DevOps Agent | ✅ see note ¹ | ✅ |
 | **Models** | | |
 | Multi-LLM switching + model catalogue | ✅ | ✅ |
-| Bedrock API key as the credential | ❌ (IAM only) | ✅ |
+| Bedrock API key as the credential | ✅ | ✅ |
 | **Proactive / IM** | | |
 | IM channels (Slack / Feishu) | ❌ | ✅ |
 | Proactive push (10 EventBridge sources) | ❌ | ✅ |
@@ -185,6 +186,14 @@ mode comparison and how to switch — see
 > Agent Space — the related toggles are **greyed out with the reason shown**, and the
 > `DeepInvestigationStatus` stack output says whether you turned it off or the Region
 > doesn't support it.
+
+> ² **Web search is us-east-1 only, on both paths.** It uses the AWS built-in
+> AgentCore Web Search (no third-party API key, and search requests never leave AWS);
+> both deployment paths provision that gateway for you, with nothing to configure.
+> Deploying elsewhere still succeeds, just without web search — Option A's
+> `WebSearchStatus` stack output says why, and Option B's `./setup.sh` says so in the
+> deploy log. Note the toggle is **not** greyed out (the UI does no Region check):
+> clicking it doesn't error, you just get no results.
 
 > 📋 **The AWS Support features (create / view / reply / resolve) require the
 > account to be on a Business, Enterprise On-Ramp, or Enterprise support plan** —

@@ -37,8 +37,8 @@ Better said up front than discovered later. These require `setup.sh`:
 - **Content for the Notifications inbox**: the UI is there, but the backend that produces notifications (Health event forwarding, alert push) is not.
 - **CUR + Athena cost detail**: FinOps questions still work at Cost Explorer granularity, but there is no bill-line-level drill-down.
 - **Cross-account scheduled inspection and event forwarding**: one-click *can* do **cross-account read-only inspection / investigation / case creation** (`DeployMode=MultiAccount`, see [§2.6](#26-optional-multi-account-across-an-organization)), but the member-account **CloudWatch OAM Sink** and **cross-account event forwarding** (Health / DevOps Agent investigation events flowing back) are not part of this path — those need `setup.sh`.
-- **Web search** (Exa): needs your own API key, off by default.
-  (**DevOps Agent deep investigation** is *not* in this list — the stack creates it for you, see [§2.7](#27-deep-investigation-aws-devops-agent).)
+
+(**DevOps Agent deep investigation** and **web search** are *not* in this list — the stack creates both for you, see [§2.7](#27-deep-investigation-aws-devops-agent) and [§2.8](#28-web-search-agentcore-web-search).)
 
 ---
 
@@ -135,6 +135,8 @@ Once the stack is **CREATE_COMPLETE**, open the **Outputs** tab:
 | **DeployModeStatus** | Which mode is **actually in effect**. If you picked `MultiAccount` but forgot the org id, this says so plainly. |
 | **DeepInvestigationStatus** | Whether deep investigation is on, off because you said so, or **skipped because this Region has no AWS DevOps Agent**. |
 | **DevOpsAgentSpaceId** | Present only when deep investigation is on: the agent space the stack created. |
+| **WebSearchStatus** | Whether this Region **supports** web search at all (anything other than us-east-1 skips the whole block — see [§2.8](#28-web-search-agentcore-web-search)). |
+| **WebSearchProvisioning** | Present only where the Region supports it: whether the gateway **actually got built**. `enabled` = the toggle works; `unavailable (<code>)` = it failed, so the toggle returns nothing (the stack itself still succeeds — see [§2.8](#28-web-search-agentcore-web-search)). |
 
 Open `ChatUrl` and sign in with:
 
@@ -174,15 +176,24 @@ This path still does **not** include: member-account CloudWatch OAM Sinks, cross
 - **Regions**: AWS DevOps Agent is only available in some Regions. **If yours isn't one of them the stack does not fail** — this piece is silently skipped, everything else works, and `DeepInvestigationStatus` says it was skipped for that reason.
 - Changed your mind later: update the stack and flip the parameter.
 
+### 2.8 Web search (AgentCore Web Search)
+
+**No parameter — the stack just creates it.** You get a **Bedrock AgentCore Gateway** (named `notiops-websearch-gw`) fronting the AWS built-in `web-search` connector. That's what the **web search** toggle above the chat input uses. **No third-party API key**, and the search requests **never leave AWS**.
+
+- **Billing**: charged **per search** (only when you turn the toggle on *and* the agent decides to search); nothing when you don't search. That's why there is no parameter to turn it off — turning it off would save nothing.
+- **Regions**: AgentCore Web Search is currently **us-east-1 only**. **If you deploy elsewhere the stack does not fail** — this piece is skipped whole, everything else works, and `WebSearchStatus` says why. The toggle still shows up in the UI (the frontend does no Region check); clicking it doesn't error, you just get no results.
+- **An identically named gateway already exists** in the account (you ran `setup.sh` first, or deployed a second stack there): it is **reused, not duplicated**, and deleting the stack **will not** delete it — only a gateway this stack created gets deleted. The one exception is a same-named gateway stuck in `FAILED`: it cannot recover and is useless to anyone, so the stack replaces it.
+- **Provisioning failure does not fail the stack**: web search is optional, and it breaking should not roll the whole stack back (you'd lose every other feature over one toggle). So the output to read is **`WebSearchProvisioning`**: only `enabled` means it works; `unavailable (<code>)` means this deployment has no web search and the toggle returns nothing. For details, look at the `StagerWebSearch` resource in the stack events and the StagerFn logs.
+
 ---
 
 ## 3. What the stack creates
 
-**48 resources** with the default parameters (44 with deep investigation off; 51 if you also pick multi-account), all in your own account:
+**50 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 4 fewer with deep investigation off; 3 more if you pick multi-account):
 
 | Category | Resources |
 |---|---|
-| Frontend | S3 website bucket + CloudFront distribution + CloudWatch RUM |
+| Frontend | S3 website bucket + CloudFront distribution + CloudWatch RUM; report downloads go through a second CloudFront distribution (with a CloudFront Function that only lets report paths through) |
 | API | 1 Lambda (BFF) + Function URL (`AWS_IAM` auth, streaming) |
 | Agent | 1 Bedrock AgentCore Runtime |
 | Sign-in | Cognito User Pool + Client + Identity Pool + 8 groups (roles) |
@@ -190,6 +201,7 @@ This path still does **not** include: member-account CloudWatch OAM Sinks, cross
 | Deployment helper | 1 staging bucket (for the staged artifacts) + 1 inline Lambda + 2 custom resources |
 | Permissions | 5 IAM roles + 5 inline policies |
 | Deep investigation (on by default) | 1 DevOps Agent agent space + 1 read-only association + 1 role assumed by DevOps Agent (plus its policy) |
+| Web search (us-east-1 only) | 1 custom resource (creates the AgentCore gateway) + 1 gateway service role + 1 inline policy |
 | Multi-account (optional) | 1 custom resource (creates the two member StackSets) + 2 inline policies |
 
 **Cost, idle**: CloudFront, S3 and DynamoDB are pay-per-use, Lambda costs nothing when not invoked, and an idle AgentCore Runtime costs nothing — idle, this is cents of storage. The real cost is **Bedrock tokens when you ask questions**. Each installed release keeps ~**165 MB** in the staging bucket (≈ $0.004/month in S3 Standard); upgrades don't purge old versions, see [§5](#5-upgrading).
@@ -322,7 +334,7 @@ During deletion the stack's deployment Lambda first **empties** the website and 
 | CloudFront access logs, if you enabled them yourself | Not managed by this stack | As you like |
 | **In multi-account mode**: the `notiops-member-onboarding` / `notiops-member-devops-agent` StackSets, and Organizations trusted access for StackSets | **Deliberate.** (1) A StackSet can only be deleted once every stack instance is gone, and removing those wipes the cross-account roles in your member accounts — a cross-account destructive action shouldn't be triggered implicitly by deleting one stack. (2) Trusted access is an **organization-wide** switch; turning it off with our stack would break other people's StackSet deployments. | If you really want them gone: CloudFormation → StackSets → **Delete stacks from StackSet** (removes the instances), then delete the StackSet itself. Leave trusted access alone unless you're sure nobody else relies on it. |
 
-**No other orphans**: the agent's log group, the BFF's log group, the deployment Lambda's log group, IAM roles, the Cognito user pool, the RUM app monitor, the AgentCore Runtime, the website bucket and the staging bucket were all verified to go away with the stack. The agent space and association created for deep investigation also go away with it (they are ordinary stack resources).
+**No other orphans**: the agent's log group, the BFF's log group, the deployment Lambda's log group, IAM roles, the Cognito user pool, the RUM app monitor, the AgentCore Runtime, the website bucket and the staging bucket were all verified to go away with the stack. The agent space and association created for deep investigation also go away with it (they are ordinary stack resources). The web-search AgentCore gateway splits two ways: one **this stack created** is deleted with the stack; one it **reused** (a pre-existing `notiops-websearch-gw` in the account, e.g. from `setup.sh`) is left alone — deleting one stack shouldn't take down something another deployment path still uses.
 
 ---
 

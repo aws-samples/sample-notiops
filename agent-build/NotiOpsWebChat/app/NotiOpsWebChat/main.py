@@ -39,9 +39,10 @@ from memory.session import get_memory_session_manager
 app = BedrockAgentCoreApp()
 log = app.logger
 
-# 注意：脚手架自带的 Exa MCP client（mcp_client/client.py）已**移除**——
-# 它是一个未受控、始终在线的联网搜索工具，会绕过我们的逐请求开关。
-# 联网搜索统一走下面受 ContextVar 门控的 web_search 工具。
+# 注意：脚手架自带的 Exa MCP client（mcp_client/）已**整个删掉**（2026-08）——
+# 它是一个未受控、始终在线的第三方联网搜索工具，会绕过我们的逐请求开关，
+# 而且查询文本离开 AWS。联网搜索统一走下面受 ContextVar 门控的 web_search 工具
+# （唯一实现 = AgentCore Gateway 的 web-search 连接器，查询不出 AWS）。
 
 DEFAULT_SYSTEM_PROMPT = """你是 NotiOps —— 面向 AWS / 云的 AI 助手，在 web 控制台里与用户对话。
 **语言铁律：始终用【与用户当前这句提问相同的语言】回答**（中文问→中文答，英文问→英文答，
@@ -205,7 +206,7 @@ def aws_docs_read(url: str) -> dict:
 tools.append(aws_docs_read)
 
 
-# ── 联网搜索工具（第三方 Exa，数据出 AWS）──────────────────────────────
+# ── 联网搜索工具（AWS 原生：AgentCore web-search，查询不出 AWS）──────────
 # 仅在用户**本轮主动开启**联网搜索时才允许调用：每请求用 ContextVar 控制开关，
 # Strands 用 asyncio.to_thread 跑同步工具时会拷贝 contextvars，故能逐请求隔离。
 import contextvars as _ctxvars
@@ -221,7 +222,8 @@ def web_search(query: str) -> dict:
     (recent news, pricing pages, third-party comparisons, non-AWS tech).
     Only available when the user has enabled web search for this turn; if
     disabled, it returns a notice and you must answer without it.
-    NOTE: this sends the query to a third-party engine (data leaves AWS)."""
+    NOTE: the query is searched inside AWS (Bedrock AgentCore web search);
+    it is not sent to any third-party engine."""
     if not _web_search_enabled.get():
         return {"text": "", "sources": [],
                 "notice": "Web search is OFF for this turn. Answer from AWS docs "
@@ -2353,7 +2355,7 @@ async def invoke(payload, context):
     forced_sources = []
     if web_on:
         user_q = str(payload.get("prompt") or payload.get("text") or "")
-        # 给搜索 query 补当前年份，让 Exa 偏向最新结果（用户问"最近/最新"时尤其关键）
+        # 给搜索 query 补当前年份，让搜索偏向最新结果（用户问"最近/最新"时尤其关键）
         year = now[:4] if now[:4].isdigit() else ""
         search_q = f"{user_q} {year}".strip() if year and year not in user_q else user_q
         try:

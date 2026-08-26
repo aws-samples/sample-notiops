@@ -127,6 +127,7 @@ cd sample-notiops
 | 资源健康巡检(按需提问) | ✅ | ✅ |
 | 故障调查(即时,只读工具) | ✅ | ✅ |
 | DevOps Agent 深度调查 | ✅ 见下方注 ¹ | ✅ |
+| 联网搜索(AgentCore Web Search) | ✅ 见下方注 ² | ✅ 见下方注 ² |
 | **成本 / FinOps** | | |
 | FinOps 仪表盘(Cost Explorer 口径) | ✅ 仅部署账号 | ✅ 可跨账号 |
 | CUR + Athena 账单明细下钻 | ❌ | ✅ |
@@ -136,7 +137,7 @@ cd sample-notiops
 | 把 Skill 发布到 DevOps Agent | ✅ 见下方注 ¹ | ✅ |
 | **模型** | | |
 | 多模型切换 + 模型目录管理 | ✅ | ✅ |
-| 用 Bedrock API Key 作为凭证 | ❌(只走 IAM) | ✅ |
+| 用 Bedrock API Key 作为凭证 | ✅ | ✅ |
 | **主动化 / IM** | | |
 | IM 渠道(Slack / 飞书) | ❌ | ✅ |
 | 主动推送(10 类 EventBridge 信号源) | ❌ | ✅ |
@@ -154,6 +155,12 @@ cd sample-notiops
 > `eu-central-1` / `eu-west-1` / `eu-west-2`)。别的区域照样开栈成功,只是没有 Agent Space
 > —— 界面上相关开关会**置灰并写清原因**,栈输出 `DeepInvestigationStatus` 会说明是你自己
 > 关的还是该区域不支持。
+
+> ² **联网搜索只有 `us-east-1`,两条路径都一样。** 用的是 AWS 内建的 AgentCore Web
+> Search(不需要任何第三方 API key,搜索请求不出 AWS),两种部署方式都会自动建好那个
+> Gateway,你不用配任何东西。部署在别的区域照样成功,只是没有联网搜索 —— 方式 A 的栈
+> 输出 `WebSearchStatus` 会写明原因,方式 B 的 `./setup.sh` 会在部署日志里说一句。
+> 注意这个开关**不会置灰**(界面不做区域判断),点了不报错,只是搜不到东西。
 
 > 📋 **AWS Support 相关功能(建案 / 查案 / 回复 / 解决)需要账号开通 Business、
 > Enterprise On-Ramp 或 Enterprise 支持计划** —— 这是 AWS Support API 本身的要求,

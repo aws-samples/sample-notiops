@@ -43,6 +43,22 @@ const RUNTIME_NAME = "notiops_web_chat";
  * 故意用一个明显不是版本号的值：万一有人直接部署未经 postprocess 的裸 synth 产物，
  * 报错里会带上 `0.0.0-UNPROCESSED`，一眼看出漏了哪一步。
  */
+/**
+ * Bedrock Mantle（GPT 系模型的调用面）可用区域。
+ *
+ * ⚠️ 这份名单必须 **⊇ Admin 可保存的 Mantle 区域白名单**
+ * （`bff/web-chat/llm_config.mjs::MANTLE_REGIONS` 是权威源）。少一个区，管理员就能存下一条
+ * 该区的 GPT 条目（校验过、保存时的连通性探测也过 —— 探测用的是 BFF 的角色），
+ * 但用户真发消息时是 runtime 的角色在调 → 403。`scripts/test_mantle_regions_consistent.py`
+ * 会断言本文件、agentcore CDK、BFF、grant_mantle_permissions.sh 四处不漂移。
+ */
+const MANTLE_REGIONS = [
+  "us-east-1", "us-east-2", "us-west-2",
+  "ap-northeast-1", "ap-south-1", "ap-southeast-2", "ap-southeast-3",
+  "eu-central-1", "eu-north-1", "eu-south-1", "eu-west-1", "eu-west-2",
+  "sa-east-1", "us-gov-west-1",
+];
+
 const RELEASE_TAG_PLACEHOLDER = "0.0.0-UNPROCESSED";
 const RELEASE_BASEURL_PLACEHOLDER =
   `https://github.com/aws-samples/sample-notiops/releases/download/${RELEASE_TAG_PLACEHOLDER}`;
@@ -238,6 +254,15 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       ),
     });
 
+    // 联网搜索（AgentCore web search，GA 2026）目前**只有 us-east-1**。别的区不是"降级"
+    // 而是根本没有这个 API，所以整块（服务角色 + Gateway）都不建 —— 与深度调查同一套做法：
+    // 不支持就啥也不建、栈照样成功、`WebSearchStatus` 输出说清为什么。
+    // 界面上那个开关是**无条件**渲染的（Composer.tsx，两条部署路径都一样），所以这里
+    // 唯一的差别是"点了以后有没有结果"，不需要往前端传能力位。
+    const webSearchSupported = new cdk.CfnCondition(this, "WebSearchSupported", {
+      expression: cdk.Fn.conditionEquals(cdk.Aws.REGION, "us-east-1"),
+    });
+
     // ══ Mappings：本模板绑定的 Release ═════════════════════════════════════════
     // 为什么用 Mappings 而不是 Parameter：客户**不该**能随便换版本 —— 模板结构与产物
     // 是一套发出去的（agent zip 里的 main.py 要对得上模板给的环境变量、前端要对得上 BFF
@@ -371,6 +396,135 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     });
     stagerArtifacts.addDependency(stagerFn);
 
+    // ══ 联网搜索：AgentCore Web Search Gateway ═════════════════════════════════
+    // AgentCore 的 web search 没有独立 API：只能建一个 **Gateway**（MCP 协议 + AWS_IAM
+    // 鉴权）挂一个 `web-search` connector target，agent 再用自己的身份 SigV4 调它的
+    // /mcp 端点。查询文本全程不出 AWS。`setup.sh` 那条路径靠
+    // `scripts/provision_websearch_gateway.sh` 干这件事；这条路径没有本地 shell，所以搬到
+    // StagerFn 的 Phase=WebSearch（同一套参数，见那边的注释）。
+    //
+    // 为什么必须是自定义资源而不是 L1：CloudFormation **没有** AgentCore Gateway 资源类型，
+    // 而 target 的 `mcp.connector` 配置又新到需要 botocore>=1.43.36 —— 一键部署既不能带
+    // Lambda layer 也不能 pip install，所以 stager 直接手签 SigV4 打 rest-json。
+    const webSearchGatewayRole = new iam.Role(this, "WebSearchGatewayRole", {
+      // **不指定 roleName**：物理名交给 CFN 生成，才不会撞上 `setup.sh` 路径手建的
+      // `notiops-websearch-gateway-role`。两条路径本就不共存于同一账号+区域，但客户完全
+      // 可能先跑过一次 setup.sh 再来试一键部署，留出这点余量比省一个可读名字值。
+      assumedBy: new iam.ServicePrincipal("bedrock-agentcore.amazonaws.com", {
+        // 混淆代理（confused deputy）收口：只有**本账号本区**的 gateway 能扮演它。
+        conditions: {
+          StringEquals: { "aws:SourceAccount": this.account },
+          ArnLike: {
+            "aws:SourceArn": `arn:${this.partition}:bedrock-agentcore:${this.region}:${this.account}:gateway/*`,
+          },
+        },
+      }),
+      description: "NotiOps AgentCore Gateway service role for Web Search",
+      // 内联策略落在 AWS::IAM::Role 资源**内部**，于是下面那行 Condition 一并盖住它，
+      // 不用再操心「策略建好了但角色没建」的顺序问题。
+      inlinePolicies: {
+        NotiOpsWebSearchGateway: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              sid: "InvokeGateway",
+              actions: ["bedrock-agentcore:InvokeGateway"],
+              resources: [`arn:${this.partition}:bedrock-agentcore:${this.region}:${this.account}:gateway/*`],
+            }),
+            // 内建搜索工具是 AWS 拥有的资源（账号位固定写 `aws`），不是客户账号里的东西。
+            new iam.PolicyStatement({
+              sid: "InvokeWebSearch",
+              actions: ["bedrock-agentcore:InvokeWebSearch"],
+              resources: [`arn:${this.partition}:bedrock-agentcore:${this.region}:aws:tool/web-search.v1`],
+            }),
+          ],
+        }),
+      },
+    });
+    (webSearchGatewayRole.node.defaultChild as cdk.CfnResource).cfnOptions.condition = webSearchSupported;
+
+    // 搬运工的建/删权限。同 `StagerOrgSetupPolicy` 一样用**独立的 AWS::IAM::Policy**，
+    // 这样非 us-east-1 的栈里搬运工一条 agentcore 权限都没有。
+    const stagerWebSearchPolicy = new iam.Policy(this, "StagerWebSearchPolicy", {
+      roles: [stagerRole],
+      statements: [
+        new iam.PolicyStatement({
+          // Create/List 这两个动作在授权时还没有资源可指（gateway 尚未存在），只能 `*`。
+          sid: "ProvisionWebSearchGateway",
+          actions: [
+            "bedrock-agentcore:CreateGateway",
+            "bedrock-agentcore:ListGateways",
+            // 建 gateway 时同时打 auto-delete=no / project=notiops 标签（与栈内其它资源一致）。
+            "bedrock-agentcore:TagResource",
+          ],
+          resources: ["*"],
+        }),
+        new iam.PolicyStatement({
+          sid: "ManageWebSearchGateway",
+          actions: [
+            "bedrock-agentcore:GetGateway",
+            "bedrock-agentcore:DeleteGateway",
+            "bedrock-agentcore:CreateGatewayTarget",
+            "bedrock-agentcore:ListGatewayTargets",
+            "bedrock-agentcore:DeleteGatewayTarget",
+          ],
+          resources: [`arn:${this.partition}:bedrock-agentcore:${this.region}:${this.account}:gateway/*`],
+        }),
+        // 建 Gateway 会**顺带**在默认 workload identity 目录里建一条身份（gateway 用它
+        // 换 workload access token）。这一步是服务端拿**调用者的身份**做的，所以少了这条
+        // 权限不会让 CreateGateway 报错 —— 它返回 200，然后 gateway 异步变成 FAILED：
+        // 「Failed to create gateway dependencies: ... not authorized to perform:
+        // bedrock-agentcore:CreateWorkloadIdentity」。`setup.sh` 那条路径踩不到，因为它用的是
+        // 部署者（通常是管理员）的凭证。收口到 `default` 这一个目录。
+        new iam.PolicyStatement({
+          sid: "ManageWebSearchWorkloadIdentity",
+          actions: [
+            "bedrock-agentcore:CreateWorkloadIdentity",
+            "bedrock-agentcore:GetWorkloadIdentity",
+            "bedrock-agentcore:DeleteWorkloadIdentity",
+          ],
+          resources: [
+            `arn:${this.partition}:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/default`,
+            `arn:${this.partition}:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/default/workload-identity/*`,
+          ],
+        }),
+        // CreateGateway 带 roleArn → 必须能把这个角色交给 agentcore。收口到这一个角色 +
+        // 这一个服务，搬运工拿不到「把任意角色交给任意服务」。
+        new iam.PolicyStatement({
+          sid: "PassGatewayServiceRole",
+          actions: ["iam:PassRole"],
+          resources: [webSearchGatewayRole.roleArn],
+          conditions: { StringEquals: { "iam:PassedToService": "bedrock-agentcore.amazonaws.com" } },
+        }),
+      ],
+    });
+    (stagerWebSearchPolicy.node.defaultChild as cdk.CfnResource).cfnOptions.condition = webSearchSupported;
+
+    // 幂等：同名 gateway 已存在就复用（于是先跑过 `setup.sh` 的账号不会多出第二个），
+    // 且删栈时**只删本栈建的那个** —— 归属编码在 PhysicalResourceId 里，见 stager 的
+    // `_pid_owns_gateway`。
+    // Gateway 名与 `scripts/provision_websearch_gateway.sh` 的 `GW_NAME` 保持一致，
+    // 复用判断才认得出对方建的那个。
+    const stagerWebSearch = new cdk.CfnResource(this, "StagerWebSearch", {
+      type: "Custom::NotiOpsStagerWebSearch",
+      properties: {
+        ServiceToken: stagerFn.attrArn,
+        Phase: "WebSearch",
+        GatewayName: "notiops-websearch-gw",
+        // target 名决定 agent 侧看到的工具名（`<target>___WebSearch`），必须与
+        // core/agentcore_search.py 的 `_TOOL_NAME` 默认值一致。
+        TargetName: "web-search-tool",
+        ServiceRoleArn: webSearchGatewayRole.roleArn,
+        // 每个 Release 都重跑一次这个 Phase。没有它，属性一个都不变 → CFN 根本不调
+        // 自定义资源的 Update → 「升级到新版模板」永远拿不到 provisioning 侧的修复，
+        // 上一次建失败的部署也没有任何自愈机会（同 Site Phase 的 ReleaseTag）。
+        ReleaseTag: releaseTag,
+      },
+    });
+    stagerWebSearch.cfnOptions.condition = webSearchSupported;
+    stagerWebSearch.addDependency(stagerFn);
+    stagerWebSearch.addDependency(stagerWebSearchPolicy.node.defaultChild as cdk.CfnResource);
+    if (stagerPolicy) stagerWebSearch.addDependency(stagerPolicy as cdk.CfnResource);
+
     // ══ 深度调查：AWS DevOps Agent Agent Space（可选，同栈资源）════════════════
     // `setup.sh` 那条路径在 notiops-backend-stack.ts 里建同样的三件套；这里必须自己建，
     // 否则 BFF/agent 的 DEVOPS_AGENT_SPACE_ID 为空 → 「深度调查」一按就 no_local_agent_space。
@@ -440,10 +594,13 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // 顺带解掉一个现网痛点：`agentcore deploy` 偶发丢 envVars（见 scripts/deploy_agent.sh §5
     // 的强制回填），CFN 原生声明不存在这个问题。
     //
-    // 执行角色照抄现网那份合成模板（agent-build/.../cdk.out），逐条对齐，
-    // 只去掉 M1 里**没有对应资源**的授权：AgentCore Memory（本栈不建 Memory —— grep 过
-    // core/ 与 agent/，没有任何代码读 MEMORY_* 环境变量）、WebSearch Gateway（M1 不带）、
-    // Bedrock API key secret（M1 不建 secret）、跨账号 AssumeRole（M1 单账号）。
+    // 执行角色与 `setup.sh` 那条路径的 runtime 执行角色**逐条对齐**（权威源是
+    // agent-build/NotiOpsWebChat/agentcore/cdk/lib/cdk-stack.ts:116-396）。两条路径的 web
+    // 功能必须一致 —— 少一条授权的后果不是"功能没做"，而是"界面上有开关、点了静默失败"。
+    // `scripts/test_oneclick_parity.py` 会断言这两份清单不漂移。
+    //
+    // 唯一有意不给的是 AgentCore Memory：本栈不建 Memory 资源，而 grep 过 core/ 与 agent/，
+    // 没有任何代码读 MEMORY_* 环境变量 —— 那条授权在两条路径上都是死权限。
     const runtimeRole = new iam.Role(this, "AgentRuntimeRole", {
       assumedBy: new iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
       description: "AgentCore Runtime execution role",
@@ -498,6 +655,33 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       sid: "NotiOpsBedrockGlobalCris",
       actions: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
       resources: [`arn:${this.partition}:bedrock:::foundation-model/*`],
+    }));
+    // Bedrock Mantle —— 模型目录里的 GPT 系（10 条里 3 条）走 Mantle，不是 bedrock:InvokeModel。
+    // 缺了这两条的失败模式：Admin 里能把 GPT 存成默认模型、保存时的连通性探测也过
+    // （探测用 **BFF** 的角色），但用户一发消息就 401/403 —— 存得进去、调不出去。
+    // CreateInference/GetInference 的资源类型是 `project`（必填），CallWithBearerToken 是
+    // permission-only action（资源类型一列为空）→ 只能 "*"。理由与区域名单见
+    // agent-build/NotiOpsWebChat/agentcore/cdk/lib/cdk-stack.ts:116-156。
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      sid: "NotiOpsBedrockMantleInference",
+      actions: ["bedrock-mantle:CreateInference", "bedrock-mantle:GetInference"],
+      resources: MANTLE_REGIONS.map((r) => `arn:${this.partition}:bedrock-mantle:${r}:${this.account}:*`),
+    }));
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      sid: "NotiOpsBedrockMantleBearer",
+      actions: ["bedrock-mantle:CallWithBearerToken"],
+      resources: ["*"],
+    }));
+    // Bedrock API Key（Admin → 凭证方式选 "API Key"）。写入方是 BFF（web-chat-core.ts 的
+    // `BedrockApiKeySecretAccess`，两条路径都有），读取方是这里：core/llm_config
+    // .get_bedrock_api_key() → model/load.py 注入 AWS_BEARER_TOKEN_BEDROCK。
+    // 缺这一条的失败模式是**静默的**：GetSecretValue 被拒 → 回退 IAM 角色 → 对话照常，
+    // 管理员在 UI 上看不出 Key 从未生效。secret 由 BFF 按需创建（栈里不预建），
+    // 名字尾部有 Secrets Manager 加的 6 位随机后缀，故用 `-*`。
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      sid: "ReadBedrockApiKeySecret",
+      actions: ["secretsmanager:GetSecretValue"],
+      resources: [`arn:${this.partition}:secretsmanager:${this.region}:${this.account}:secret:notiops/bedrock-api-key-*`],
     }));
     // Skills 读 / 报告写 —— 共享数据桶的两个前缀，与 IM 端同一个桶。
     runtimeRole.addToPolicy(new iam.PolicyStatement({
@@ -562,24 +746,44 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       ],
       resources: ["*"],
     }));
+    // 联网搜索：agent 用**自己的**身份 SigV4 调 Gateway 的 MCP 端点
+    // （core/agentcore_search.py）。与 `setup.sh` 路径的 `NotiOpsInvokeWebSearchGateway`
+    // 同一条授权，**同样不带条件** —— 授权本身无副作用，而带上条件反而会让
+    // 「先在别的区部署、之后再迁到 us-east-1」这类情况多出一次 IAM 往返。
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      sid: "NotiOpsInvokeWebSearchGateway",
+      actions: ["bedrock-agentcore:InvokeGateway"],
+      resources: [`arn:${this.partition}:bedrock-agentcore:${this.region}:${this.account}:gateway/*`],
+    }));
     // 模型目录 / RBAC 等配置（agent 侧也要读，例如按角色裁剪工具）。
     runtimeRole.addToPolicy(new iam.PolicyStatement({
       sid: "ReadNotiOpsConfig",
       actions: ["dynamodb:GetItem", "dynamodb:Query"],
       resources: [base.configTable.tableArn, `${base.configTable.tableArn}/index/*`],
     }));
-    // 多账号：agent 唯一需要跨账号的动作 —— 到成员账号的 trigger 角色去发起深度调查
-    // （core/devops_agent.py `_assume_client`，角色 ARN 来自 Admin 接入时写的 da# 配置行）。
-    // 单账号模式下这个资源整块不存在，所以是真的一条权限都不给：
-    // 用**独立的 AWS::IAM::Policy**（不是 role.addToPolicy）才做得到——DefaultPolicy 那份
-    // 文档由 CDK 生成，往里塞 Fn::If 就得跟生成逻辑赛跑。
+    // 多账号：agent 要跨账号的两个动作。单账号模式下这个资源整块不存在，所以是真的一条
+    // 权限都不给：用**独立的 AWS::IAM::Policy**（不是 role.addToPolicy）才做得到——
+    // DefaultPolicy 那份文档由 CDK 生成，往里塞 Fn::If 就得跟生成逻辑赛跑。
     const runtimeCrossAccount = new iam.Policy(this, "AgentRuntimeCrossAccount", {
       roles: [runtimeRole],
-      statements: [new iam.PolicyStatement({
-        sid: "AssumeMemberDevOpsAgentTriggerRole",
-        actions: ["sts:AssumeRole"],
-        resources: [`arn:${this.partition}:iam::*:role/notiops-agent-trigger-*`],
-      })],
+      statements: [
+        // (a) 所有跨账号**取数**（cases / 资源巡检 / FinOps 按目标账号取数）都经这个角色。
+        //     成员账号里的它由 StackSet `notiops-member-onboarding` 下发（见 Phase=OrgSetup）。
+        //     缺这一条：接入向导会成功、目标账号在下拉里能选，但每个跨账号问题都失败 ——
+        //     最坏情况是模型退化用**部署账号**的数据回答（错误归因）。
+        new iam.PolicyStatement({
+          sid: "AssumeMemberIdleDetectionRoles",
+          actions: ["sts:AssumeRole"],
+          resources: [`arn:${this.partition}:iam::*:role/notiops-idle-detection-role*`],
+        }),
+        // (b) 到成员账号的 trigger 角色去发起深度调查（core/devops_agent.py `_assume_client`，
+        //     角色 ARN 来自 Admin 接入时写的 da# 配置行）。
+        new iam.PolicyStatement({
+          sid: "AssumeMemberDevOpsAgentTriggerRole",
+          actions: ["sts:AssumeRole"],
+          resources: [`arn:${this.partition}:iam::*:role/notiops-agent-trigger-*`],
+        }),
+      ],
     });
     (runtimeCrossAccount.node.defaultChild as cdk.CfnResource).cfnOptions.condition = isMultiAccount;
 
@@ -613,11 +817,26 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           // 只给 M1 真的有的那几个。空串在部分 AgentCore 校验下会被拒，
           // 缺省项一律**不写**（agent 侧都是 os.environ.get(..., "")）。
           SKILLS_BUCKET: base.dataBucket.bucketName,
+          // 报告分发 CDN。缺这个键 core/reports.py 退回 12h presigned URL，与「7 天有效」
+          // 的产品承诺和桶生命周期都不符（见 minimal-base-core.ts 的 ReportsCDN）。
+          REPORTS_CDN_DOMAIN: base.reportsCdnDomain,
           // 同上：关掉深度调查时整个键消失，绝不写空串。
           // 不写这个键时 agent 会走 ListAgentSpaces 自动发现（core/devops_agent.py），
           // 显式给了就少一次 API、也不会挑错（同账号里可能还有别的 Agent Space）。
           DEVOPS_AGENT_SPACE_ID: cdk.Fn.conditionIf(
             deepInvestigationEnabled.logicalId, agentSpace.attrAgentSpaceId, cdk.Aws.NO_VALUE,
+          ),
+          // 跨账号闸门（core/aws_session.py `_is_locked_out`）。它是**默认拒绝**的：既没设
+          // LOCKED_ACCOUNT_ID、也没设这个键时，只允许部署账号，跨账号一律拒。所以多账号模式
+          // 必须显式打开 —— 否则接入向导成功、下拉里能选成员账号、每个问题都被闸门挡掉。
+          // 单账号模式下整个键消失（安全默认），与 scripts/deploy_agent.sh 的出厂值一致。
+          NOTIOPS_ALLOW_CROSS_ACCOUNT: cdk.Fn.conditionIf(isMultiAccount.logicalId, "1", cdk.Aws.NO_VALUE),
+          // 联网搜索的 Gateway /mcp 端点（core/agentcore_search.py）。不支持的区里整个键
+          // 消失；us-east-1 里 provision 失败时 stager 回的是字面量 "unavailable"
+          // （**不能**回空串：AgentCore Runtime 拒绝空字符串环境变量，而那时已经在部署
+          // 中途、没法再把这个键整个删掉），agent 侧只认 https:// 开头的值。
+          AGENTCORE_WEBSEARCH_GATEWAY_URL: cdk.Fn.conditionIf(
+            webSearchSupported.logicalId, stagerWebSearch.getAtt("GatewayUrl").toString(), cdk.Aws.NO_VALUE,
           ),
         },
       },
@@ -640,7 +859,12 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       // 「单账号还是多账号」是部署期才知道的，所以传条件而不是布尔 —— 受影响的 6 个
       // BFF 环境变量在 web-chat-core.ts 里落成 Fn::If。
       multiAccount: { organizationId: organizationId.valueAsString, conditionLogicalId: isMultiAccount.logicalId },
-      // M1 不带：IM 巡检控制台、报告 CDN（都属于完整部署）。
+      // 报告分发 CDN（同栈资源，见 minimal-base-core.ts）。BFF 的「深度调查（直连）」
+      // 没有 presign 分支，域名为空就不产出报告链接。
+      reportsCdnDomain: base.reportsCdnDomain,
+      // 不带的只有 `idleConsoleUrl`：它指向完整部署才有的管理仪表盘，而侧边栏那个入口
+      // 本来就被 `SHOW_INSPECTIONS = false` 隐藏（Sidebar.tsx），AdminPanel 里也只是一个
+      // 可选的 ↗ 外链 —— 空串是正确取值，不是缺口。
     });
     // BFF 的代码 zip 也在 staging 桶里（`S3Bucket` 由 postprocess 改写成 !Ref StagingBucket），
     // 所以它也必须等搬完。放在 CDK 里声明而不是让 postprocess 补 DependsOn：
@@ -685,6 +909,14 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       actions: ["s3:ListBucket", "s3:ListBucketVersions", "s3:DeleteBucket"],
       resources: [base.dataBucket.bucketArn],
     }));
+    // Bedrock API Key 的 secret 是 BFF 按需建的、不在栈里（见 web-chat-core.ts 的
+    // `BedrockApiKeySecretAccess`），CFN 不会删它 —— DeleteEverything 时由 StagerFn 收尾。
+    // 精确到这一个名字：不给「删本账号任意 secret」。
+    stagerRole.addToPolicy(new iam.PolicyStatement({
+      sid: "TeardownDeleteBedrockApiKeySecret",
+      actions: ["secretsmanager:DeleteSecret"],
+      resources: [`arn:${this.partition}:secretsmanager:${this.region}:${this.account}:secret:notiops/bedrock-api-key-*`],
+    }));
 
     const stagerSite = new cdk.CfnResource(this, "StagerSite", {
       type: "Custom::NotiOpsStagerSite",
@@ -707,6 +939,9 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         TeardownMode: teardownMode.valueAsString,
         DataBucket: base.dataBucket.bucketName,
         TableNames: cdk.Stack.of(this).toJsonString([base.configTable.tableName, webchat.table.tableName]),
+        // BFF 按需创建的 secret（栈外资源）。名字与 bff/web-chat/llm_config.mjs::SECRET_ID
+        // 和 core/llm_config.py::_BEDROCK_KEY_SECRET 的默认值一致。
+        SecretNames: cdk.Stack.of(this).toJsonString(["notiops/bedrock-api-key"]),
         // 只精确点名本次部署自己那个 AgentCore 运行时日志组 —— **绝不**按前缀扫描后批量删。
         // BFF 与 StagerFn 的日志组都是栈内资源（DESTROY），CFN 自己会删，不用列在这里。
         LogGroupNames: cdk.Stack.of(this).toJsonString([
@@ -828,6 +1063,35 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         ).toString(),
       ).toString(),
     });
+    // 联网搜索同理：不写清楚的话，「开关点了没结果」这种情况客户只能猜。
+    // **拆成两个 Output**，理由和上面 DevOpsAgentSpaceId 一样：真结果只有那个带条件的自定义
+    // 资源知道，而在 Output 的 Value 里引用条件资源、只靠 `Fn::If` 挡着会让 CFN 模板校验告警。
+    // 于是「这个区有没有这个能力」放常在的 WebSearchStatus，「到底建成了没有」放带条件的
+    // WebSearchProvisioning。
+    //
+    // 这里**不能**由 WebSearchStatus 直接说 "Enabled"：provisioning 是**故意不抛异常**的
+    // （联网搜索挂了不该让整栈回滚，见 stager 的 `_websearch`），所以栈 CREATE_COMPLETE
+    // 完全可能配着一个建失败的 gateway —— 静态文案会当着客户的面把失败说成成功。
+    new cdk.CfnOutput(this, "WebSearchStatus", {
+      description: "Web search (AWS-native AgentCore web search)",
+      value: cdk.Fn.conditionIf(
+        webSearchSupported.logicalId,
+        "Supported in this Region: the stack provisions an AgentCore gateway named "
+          + "notiops-websearch-gw (or reuses an existing one) and queries stay inside AWS. "
+          + "Whether that actually succeeded is in the WebSearchProvisioning output: 'enabled' "
+          + "means the toggle works, 'unavailable (<code>)' means it returns nothing.",
+        "Not available: AgentCore web search only exists in us-east-1, so nothing was created. "
+          + "Everything else in this deployment works; the web-search toggle just returns no results.",
+      ).toString(),
+    });
+    // `Status` 是 stager 在成功和失败两条路径上**都会**写的 key（失败时是
+    // `unavailable (<code>)`）；别在这里 GetAtt 别的 key —— 只在成功时才有的 key 会让
+    // Output 解析直接失败，把「可选能力挂了」升级成「整栈挂了」。
+    const webSearchProvisioning = new cdk.CfnOutput(this, "WebSearchProvisioning", {
+      description: "Did the web-search gateway actually get provisioned",
+      value: stagerWebSearch.getAtt("Status").toString(),
+    });
+    webSearchProvisioning.condition = webSearchSupported;
     new cdk.CfnOutput(this, "DeployModeStatus", {
       description: "Single-account or multi-account (AWS Organizations)",
       value: cdk.Fn.conditionIf(

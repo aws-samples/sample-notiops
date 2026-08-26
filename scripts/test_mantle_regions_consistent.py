@@ -1,9 +1,9 @@
-"""Bedrock Mantle 区域名单在五处副本之间必须自洽。
+"""Bedrock Mantle 区域名单在六处副本之间必须自洽。
 
 为什么需要这条断言
 ------------------
 Mantle 端点按区寻址（`bedrock-mantle.<region>.api.aws`），而「哪些区可用」这件事在本仓库
-里被写了五遍，分属三种运行时（Node / Python / TypeScript-CDK）+ 一个 shell 脚本，没有
+里被写了六遍，分属三种运行时（Node / Python / TypeScript-CDK）+ 一个 shell 脚本，没有
 任何一处能 import 另一处。它们的角色不同，因此约束**不是**「全部相等」：
 
     ① bff/web-chat/llm_config.mjs::MANTLE_REGIONS
@@ -17,6 +17,10 @@ Mantle 端点按区寻址（`bedrock-mantle.<region>.api.aws`），而「哪些�
     ④ scripts/grant_mantle_permissions.sh
        —— ③ 的手动补救路径。必须 **== ③**，否则两条部署路径给出不同权限。
     ⑤ 默认区域常量（BFF / Python / 前端各一份）必须同值，且 **∈ ①**。
+    ⑥ infra/lib/notiops-webchat-standalone-stack.ts::MANTLE_REGIONS
+       —— 一键部署（方式 A）单栈里 runtime 执行角色的同一份 IAM。必须 **== ③**：
+          它和 ③ 是同一个 agent 的同一条权限，只是由哪条部署路径落地不同。写成 ⊇ ① 不够 ——
+          两条路径「都能用但能用的区不一样」同样是我们明确不要的不一致。
 
 真实事故（这条断言就是为它写的）
 --------------------------------
@@ -57,6 +61,7 @@ PY_PROVIDER = "shared/llm_provider.py"
 CDK = "agent-build/NotiOpsWebChat/agentcore/cdk/lib/cdk-stack.ts"
 SH = "scripts/grant_mantle_permissions.sh"
 FRONTEND = "frontend/chat-app/src/components/AdminPanel.tsx"
+ONECLICK = "infra/lib/notiops-webchat-standalone-stack.ts"
 
 
 def _check(label: str, cond: bool, detail: str = "") -> None:
@@ -106,6 +111,12 @@ def cdk_regions() -> set[str]:
         _block(_read(CDK), r"const MANTLE_REGIONS = \[", "]", "CDK MANTLE_REGIONS")))
 
 
+def oneclick_regions() -> set[str]:
+    return set(_REGION_RE.findall(
+        _block(_read(ONECLICK), r"const MANTLE_REGIONS = \[", "]",
+               "one-click standalone MANTLE_REGIONS")))
+
+
 def sh_regions() -> set[str]:
     """shell 脚本里的 ARN 列表。只取 bedrock-mantle ARN 的 region 段，避开脚本别处的默认区。"""
     return set(re.findall(r"arn:aws:bedrock-mantle:([a-z0-9-]+):", _read(SH)))
@@ -136,6 +147,16 @@ def test_iam_covers_the_whole_allowlist() -> None:
     _check("AgentCore runtime IAM covers every saveable region",
            not missing,
            f"admin can save these but the runtime role cannot invoke them: {missing}")
+
+
+def test_both_deployment_paths_grant_the_same_regions() -> None:
+    """⑥ == ③。同一个 agent、同一条权限，只是落地路径不同 —— 不许两条路径能用的区不一样。"""
+    print("test_both_deployment_paths_grant_the_same_regions")
+    cdk, oneclick = cdk_regions(), oneclick_regions()
+    _check("one-click standalone stack == setup.sh agentcore CDK",
+           cdk == oneclick,
+           f"only in setup.sh path: {sorted(cdk - oneclick)}; "
+           f"only in one-click path: {sorted(oneclick - cdk)}")
 
 
 def test_manual_grant_script_matches_cdk() -> None:
@@ -182,6 +203,7 @@ def main() -> int:
     try:
         test_allowlist_copies_agree()
         test_iam_covers_the_whole_allowlist()
+        test_both_deployment_paths_grant_the_same_regions()
         test_manual_grant_script_matches_cdk()
         test_default_region_is_named_and_allowlisted()
     except AssertionError as e:

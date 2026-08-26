@@ -1,5 +1,6 @@
 """
-Web search tool —— 联网搜索（第三方 Exa，数据出 AWS）。
+Web search tool —— 联网搜索（AWS 原生：AgentCore Gateway 的 web-search 连接器，
+查询文本**不出 AWS**；2026-08 起没有第三方兜底，见 core/web_search.py）。
 
 作为回答链的**最后一步**（AWS 文档 → 专业知识 → 联网），且**仅在用户本轮主动
 开启**联网搜索时才允许调用。用 ContextVar 逐请求门控：Strands 用 asyncio.to_thread
@@ -35,7 +36,8 @@ def web_search(query: str) -> dict:
 
     Only available when the user has enabled web search for this turn; if
     disabled, returns a notice and you must answer without it.
-    NOTE: this sends the query to a third-party engine (data leaves AWS).
+    NOTE: the query is searched inside AWS (Bedrock AgentCore web search);
+    it is not sent to any third-party engine.
 
     Args:
         query: 要搜索的自然语言查询。

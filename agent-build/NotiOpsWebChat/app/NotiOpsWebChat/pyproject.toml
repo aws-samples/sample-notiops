@@ -8,29 +8,50 @@ version = "0.1.0"
 description = "AgentCore Runtime Application using Strands SDK"
 readme = "README.md"
 requires-python = ">=3.10"
+# ⚠️ 每条依赖都必须有**上界**。
+#
+# 这个文件不是普通的 pyproject:`agentcore deploy` 打 Python CodeZip 时跑的是
+# `uv pip install -r pyproject.toml`（注意 -r pyproject.toml —— 它**不读 uv.lock**),
+# 所以这里的约束就是客户实际装到的版本的唯一闸门。全是裸 `>=` 的话,"客户装到哪个版本"
+# 等于"他哪天跑 setup.sh",而我们验证过的是另一个版本 —— 与 agentcore CLI 不钉版本
+# 同一类问题(见 scripts/deploy_agent.sh 的 AGENTCORE_CLI_VERSION)。
+#
+# 上界取法:**当天能解析出来的那个版本再上一个边界**(>=1.0 取下一个 major,0.x 取下一个
+# minor,因为 0.x 的破坏性变更走 minor)。这样既挡住下一次大版本重写,又不把今天能装上的
+# 版本挡在外面。抬上界的前提是在验证账号真跑一遍 setup.sh 且 agent 能回答。
+#
+# 2026-08-26 实测解析结果(`uv pip compile pyproject.toml --python-version 3.13`):
+#   aws-opentelemetry-distro 0.19.0 · bedrock-agentcore 1.22.0 · botocore 1.43.80
+#   mcp 1.29.1 · strands-agents 1.53.0 · defusedxml 0.7.1 · openai 3.3.1
+#   aws-bedrock-token-generator 1.1.0 · aws-pricing 1.0.34 · billing-cost-mgmt 0.0.33
+#   cloudwatch 0.1.8 · cloudtrail 0.0.18 · aws-api 1.5.1
 dependencies = [
-    "aws-opentelemetry-distro",
-    "bedrock-agentcore >= 1.9.1",
-    "botocore[crt] >= 1.35.0",
-    "mcp >= 1.19.0",
+    # 只影响可观测性(OTel 上报),坏了不影响问答,所以上界放到 major 而不是 minor。
+    "aws-opentelemetry-distro < 1.0.0",
+    "bedrock-agentcore >= 1.9.1, < 2.0.0",
+    "botocore[crt] >= 1.35.0, < 2.0.0",
+    "mcp >= 1.19.0, < 2.0.0",
     # >= 1.50.2：需要 BedrockModel 的 `cache_config` / `CacheToolsConfig`（message 级提示缓存
     # + per-model TTL，见 model/load.py `_bedrock_kwargs`）。1.50.2 就是现网已部署的版本，
     # 抬高下限只是把"恰好装到了新版"变成"保证有"。load.py 仍有守卫导入兜底。
-    "strands-agents >= 1.50.2",
-    # 安全:解析 AWS RSS feed 用 defusedxml 防 XXE(见 core/whats_new.py)
-    "defusedxml >= 0.7.1",
-    # GPT-5.4 via Bedrock Mantle（OpenAI Responses API）所需
-    "openai >= 1.50.0",
-    "aws-bedrock-token-generator",
+    "strands-agents >= 1.50.2, < 2.0.0",
+    # 安全:解析 AWS RSS feed 用 defusedxml 防 XXE(见 core/whats_new.py)。
+    # 这个包多年一个版本,上界给到 major 就够。
+    "defusedxml >= 0.7.1, < 1.0.0",
+    # GPT-5.4 via Bedrock Mantle（OpenAI Responses API）所需。我们**不直接 import 它** ——
+    # 走 strands 的 `OpenAIResponsesModel`,所以实际大版本由 strands 拉着走(今天是 3.x)。
+    # 上界钉在 4.0:挡住下一次重写,又不跟 strands 的下限打架。
+    "openai >= 1.50.0, < 4.0.0",
+    "aws-bedrock-token-generator >= 1.1.0, < 2.0.0",
     # FinOps：官方 awslabs MCP（进程内 stdio 子进程；只读工具白名单见 core/finops_mcp.py）
-    "awslabs.aws-pricing-mcp-server >= 1.0.31",
-    "awslabs.billing-cost-management-mcp-server >= 0.0.24",
+    "awslabs.aws-pricing-mcp-server >= 1.0.31, < 2.0.0",
+    "awslabs.billing-cost-management-mcp-server >= 0.0.24, < 0.1.0",
     # 故障调查：官方 awslabs MCP（进程内 stdio；只读白名单见 core/investigation_mcp.py）
-    "awslabs.cloudwatch-mcp-server >= 0.1.4",
-    "awslabs.cloudtrail-mcp-server >= 0.0.15",
+    "awslabs.cloudwatch-mcp-server >= 0.1.4, < 0.2.0",
+    "awslabs.cloudtrail-mcp-server >= 0.0.15, < 0.1.0",
     # 云上查询兜底：官方 awslabs aws-api-mcp-server（进程内 stdio；READ_OPERATIONS_ONLY=true，
     # 任意 AWS 只读 API 长尾兜底；见 core/aws_api_mcp.py）
-    "awslabs.aws-api-mcp-server >= 1.3.0",
+    "awslabs.aws-api-mcp-server >= 1.3.0, < 2.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -37,6 +37,44 @@ const INFRA_DIR = path.join(__dirname, "..");
 /** AgentCore Runtime 名（只允许字母数字下划线，不能带连字符）。 */
 const RUNTIME_NAME = "notiops_web_chat";
 
+/** `_` 开头的键是**文档键**（里面写的是中文说明），递归剥掉。 */
+function stripDocKeys(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(stripDocKeys);
+  if (node && typeof node === "object") {
+    return Object.fromEntries(
+      Object.entries(node as Record<string, unknown>)
+        .filter(([k]) => !k.startsWith("_"))
+        .map(([k, v]) => [k, stripDocKeys(v)]),
+    );
+  }
+  return node;
+}
+
+/**
+ * synth 期读进来的出厂模型目录，作为 `StagerSite` 的一个属性内联进模板。
+ *
+ * 为什么能内联而不是让 Lambda 去下载：剥掉文档键之后它只有 ~3.5KB，且**纯 ASCII**
+ * （中文全在 `_` 开头的说明键里）。这一点很关键 —— CFN 收模板时会把 `Code.ZipFile`
+ * 之外的非 ASCII 字符换成 `?`，所以这里显式断言一次，宁可 synth 失败也不要发出一份
+ * 客户拿到就是乱码的模板（`scripts/postprocess_template.py` 有同款全局断言，这里是
+ * 更早、错误信息更具体的那一道）。
+ */
+const llmCatalogJson = (() => {
+  const raw = fs.readFileSync(
+    path.join(INFRA_DIR, "..", "config", "llm-model-catalog.json"), "utf-8");
+  const json = JSON.stringify(stripDocKeys(JSON.parse(raw)));
+  // eslint-disable-next-line no-control-regex
+  const bad = json.match(/[^\x00-\x7F]/g);
+  if (bad) {
+    throw new Error(
+      "config/llm-model-catalog.json contains non-ASCII characters outside of " +
+      `underscore-prefixed doc keys (${JSON.stringify(bad.slice(0, 8))}). ` +
+      "CloudFormation replaces those with '?' when a template is submitted, so " +
+      "they cannot be inlined. Move the prose into a \"_\"-prefixed key.");
+  }
+  return json;
+})();
+
 /**
  * `Mappings` 里那份「本模板对应哪个 Release」的占位值。
  * `scripts/postprocess_template.py` 会把它改写成真实的 tag。
@@ -918,6 +956,16 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       resources: [`arn:${this.partition}:secretsmanager:${this.region}:${this.account}:secret:notiops/bedrock-api-key-*`],
     }));
 
+    // 出厂模型目录的种子（`PK=llmcfg / SK=meta`）。`setup.sh` 用
+    // `scripts/seed_llm_catalog.py` 写这一条；一键路径原先**根本不写**，于是管理员
+    // 打开「管理 → 模型」看到的是一张空表（实测 2026-08-26，方式 A 部署的环境）。
+    // 条件写在 handler 里，覆盖不了管理员改过的配置。
+    stagerRole.addToPolicy(new iam.PolicyStatement({
+      sid: "SeedLlmCatalog",
+      actions: ["dynamodb:PutItem"],
+      resources: [base.configTable.tableArn],
+    }));
+
     const stagerSite = new cdk.CfnResource(this, "StagerSite", {
       type: "Custom::NotiOpsStagerSite",
       properties: {
@@ -927,6 +975,8 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         SiteBucket: webchat.siteBucket.bucketName,
         ChatDistKey: chatDistKey,
         ConfigJson: webchat.configJson,
+        ConfigTable: base.configTable.tableName,
+        LlmCatalog: llmCatalogJson,
         DistributionId: webchat.distribution.distributionId,
         UserPoolId: base.userPool.userPoolId,
         AdminEmail: adminEmail.valueAsString,
@@ -1012,6 +1062,13 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         OnboardingTemplateBody: memberTemplate("member-account-onboarding.yaml"),
         DevOpsStackSetName: devopsStackSetName,
         DevOpsTemplateBody: memberTemplate("member-devops-agent.yaml"),
+        // 每个 Release 都重跑一次这个 Phase（同 Site / WebSearch 的 ReleaseTag）。
+        // 少了它，只有**成员账号模板本身**改了才会有属性变化 —— 两份 yaml 是在合成期
+        // 读进来内联的，所以它们变了确实会触发 Update。但 handler 侧的修复（`_org_setup`
+        // / `_stackset_upsert` 里的逻辑）不体现为任何属性变化 → CFN 根本不发 Update →
+        // 已有的多账号部署升级到新模板时拿不到那些修复，也没有任何自愈机会
+        // （上一次 StackSet 建失败的部署尤其：它会一直失败下去）。
+        ReleaseTag: releaseTag,
       },
     });
     stagerOrgSetup.cfnOptions.condition = isMultiAccount;

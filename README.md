@@ -146,7 +146,7 @@ mode comparison and how to switch — see
 | Capability | Option A (one-click) | Option B (`setup.sh`) |
 |---|:---:|:---:|
 | **Prerequisites and timing** | | |
-| Installed locally | nothing (browser only) | git / Node / Python / CDK / container runtime |
+| Installed locally | nothing (browser only) | git / Node / Python / **uv** / CDK / container runtime (IM bot only) |
 | Long-lived access key required | no | yes, credentials that can deploy |
 | Deploy time | about 5 minutes | 10–20 minutes (includes local builds) |
 | One-click teardown | ✅ pick `KeepData` / `DeleteEverything` on delete | ✅ `./teardown.sh` (keeps data by default, `--delete-everything` for a full wipe) |

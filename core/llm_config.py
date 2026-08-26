@@ -116,6 +116,14 @@ _BUILTIN_CATALOG: dict = {
          "model_id": "deepseek.v3.2", "label": "DeepSeek V3.2", "kind": "bedrock_converse",
          "region": None, "hard_output_limit": 8192, "output_override": {},
          "supports_prompt_cache": False, "surfaces": ["webchat"], "enabled": True},
+        # GLM 系列在 `list-inference-profiles` 里一条都没有，裸 id 是唯一调用方式 ——
+        # 也因此**不是全区都有**（us-east-1 / us-west-2 / ap-northeast-1 实测可用，
+        # ap-southeast-1 / eu-west-1 / eu-central-1 没有）。所以它只能当用户主动切换的
+        # 选项，不能当 default_model；判据见种子文件的 `_default_model_note`。
+        {"alias": "zai-glm-5", "short": "glm", "aliases_legacy": [],
+         "model_id": "zai.glm-5", "label": "GLM 5", "kind": "bedrock_converse",
+         "region": None, "hard_output_limit": 202752, "output_override": None,
+         "supports_prompt_cache": False, "surfaces": ["webchat"], "enabled": True},
         {"alias": "gpt-5-6", "short": "gpt", "aliases_legacy": ["gpt"],
          "model_id": "openai.gpt-5.6-terra", "label": "GPT-5.6 Terra",
          "kind": "bedrock_mantle_responses", "region": "us-east-2", "hard_output_limit": 32768,

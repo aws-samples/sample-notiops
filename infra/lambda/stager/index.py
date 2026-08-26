@@ -33,6 +33,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from decimal import Decimal
 from io import BytesIO
 
 import boto3
@@ -313,6 +314,47 @@ def _write_config(props) -> None:
                   Body=props["ConfigJson"].encode(),
                   ContentType="application/json; charset=utf-8", CacheControl=_NO_CACHE)
     print("wrote config.json")
+
+
+def _seed_llm_catalog(props) -> str:
+    """把内置模型目录写进 `notiops-config`（`PK=llmcfg / SK=meta`），只在它还不存在时写。
+
+    这是 `setup.sh` 里 `scripts/seed_llm_catalog.py` 那一步在一键路径上的对应物。
+    缺了它的后果不是"报错"而是**静默降级**：`GET /api/admin/llm` 返回
+    `models: []` / `seeded: false`，管理员打开「管理 → 模型」看到的是一张**空表**
+    （连打包进程序的那些默认模型都不在），只有聊天还能用 —— 因为前端有一份内置兜底
+    目录。实测撞到过（2026-08-26，一个方式 A 部署出来的环境）。
+    两条部署路径的 web 功能必须一致，这一条属于"部署时的数据种子"这个维度，
+    判据在 `scripts/test_oneclick_parity.py::test_deploy_time_seeds_match`。
+
+    目录 JSON 由模板在 synth 期内联进属性（已剥掉 `_` 开头的中文注释键，纯 ASCII，
+    ~3.5KB），所以这里不需要联网、也不需要读 S3。
+
+    **条件写**（`attribute_not_exists(PK)`）与 seeder 脚本口径一致：管理员在控制台里
+    改过的配置绝不能被一次栈升级覆盖回出厂值。已存在 = 成功，不是失败。
+    """
+    raw = props.get("LlmCatalog") or ""
+    table = props.get("ConfigTable") or ""
+    if not raw or not table:
+        return "skipped (no LlmCatalog/ConfigTable)"
+    # DynamoDB 不收 float。目录里当前全是整数，但用 Decimal 解析可以让将来有人加一个
+    # 小数字段时不至于在部署时炸掉。
+    cfg = json.loads(raw, parse_float=Decimal)
+    item = {**cfg, "PK": "llmcfg", "SK": "meta"}
+    # generation 0 = "已 seed，从未被管理员编辑过"。读侧接受它，BFF 的 nextGeneration()
+    # 把 0 当作"没有可用的上一版"，所以管理员第一次保存不会撞版本冲突。
+    item.setdefault("generation", 0)
+    try:
+        boto3.resource("dynamodb").Table(table).put_item(
+            Item=item, ConditionExpression="attribute_not_exists(PK)")
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            print("llm catalogue already present; left untouched")
+            return "already present"
+        raise
+    n = len(cfg.get("models") or [])
+    print(f"seeded llm catalogue: {n} model(s), default={cfg.get('default_model')!r}")
+    return f"seeded ({n} models)"
 
 
 def _invalidate(props) -> None:
@@ -875,9 +917,13 @@ def handler(event, context):
         elif phase == "Site":
             n = _publish_frontend(props)
             _write_config(props)
+            # Create 与 Update 都跑：条件写自己保证不覆盖管理员改过的配置，而在 Update
+            # 上也跑，是为了让"升级到带这个修复的版本"能把种子补进那些**已经建好、
+            # 目录还是空**的存量栈（Site 阶段带 ReleaseTag，每个 release 都会收到 Update）。
+            seeded = _seed_llm_catalog(props)
             _invalidate(props)
             admin = _create_admin(props) if rt == "Create" else "skipped (update)"
-            data = {"ObjectsPublished": str(n), "Admin": admin}
+            data = {"ObjectsPublished": str(n), "Admin": admin, "LlmCatalog": seeded}
         else:
             raise ValueError(f"unknown Phase: {phase!r}")
         _send(event, context, "SUCCESS", data, physical_id=pid)

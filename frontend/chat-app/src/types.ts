@@ -123,6 +123,7 @@ export const MODELS: ModelOption[] = [
   { id: "claude-opus-5", name: "Claude Opus 5", descKey: "model.desc.opus" },
   { id: "claude-sonnet-5", name: "Claude Sonnet 5", descKey: "model.desc.claude" },
   { id: "deepseek-v3-2", name: "DeepSeek V3.2", descKey: "model.desc.deepseek" },
+  { id: "zai-glm-5", name: "GLM 5", descKey: "model.desc.glm" },
   { id: "gpt-5-6-luna", name: "GPT-5.6 Luna", descKey: "model.desc.gptLuna" },
   { id: "gpt-5-6-sol", name: "GPT-5.6 Sol", descKey: "model.desc.gptSol" },
   { id: "gpt-5-6", name: "GPT-5.6 Terra", descKey: "model.desc.gpt" },

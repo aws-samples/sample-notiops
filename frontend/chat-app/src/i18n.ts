@@ -724,6 +724,7 @@ export const STRINGS: Dict = {
   "model.desc.gptSol": { zh: "OpenAI GPT-5.6 Sol · 经 Bedrock", en: "OpenAI GPT-5.6 Sol · via Bedrock" },
   "model.desc.gptLuna": { zh: "OpenAI GPT-5.6 Luna · 经 Bedrock", en: "OpenAI GPT-5.6 Luna · via Bedrock" },
   "model.desc.grok": { zh: "xAI 旗舰 · 500K 上下文 · 长任务/agentic · 经 Bedrock", en: "xAI flagship · 500K context · long-running agentic work · via Bedrock" },
+  "model.desc.glm": { zh: "Z.AI 旗舰 · 工具调用强 · 经 Bedrock", en: "Z.AI flagship · strong tool use · via Bedrock" },
   // 管理员手工添加的模型没有 desc_key，用这句通用描述兜底（避免把 i18n key 原样漏到界面上）
   "model.desc.generic": { zh: "由管理员添加 · 经 Bedrock", en: "Added by an administrator · via Bedrock" },
   "model.flag.exp": { zh: "实验", en: "experimental" },

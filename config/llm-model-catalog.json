@@ -46,6 +46,7 @@
   "generation": 0,
   "provider": "bedrock",
   "credential_mode": "iam",
+  "_default_model_note": "默认模型必须是**带跨区推理 profile 前缀**（global. / us. / eu. / apac. …）的条目，不能是裸 id —— 哪怕那个裸 id 支持按需直调。理由：默认模型的第一职责是「随便哪个区装完都能说第一句话」，而裸 id 是逐区上线的，有洞。2026-08-26 短暂把 zai-glm-5（裸 id，实测 us-east-1 / us-west-2 / ap-northeast-1 有，ap-southeast-1 与 eu-* 没有）设成默认，代价是：装在缺 GLM 5 的区时，客户第一句话就报错，且必须自己摸到 Admin「模型」页换默认才能用 —— 对一个公开 sample，这就是「部署成功但不能用」。同时四份客户文档（docs/DEPLOYMENT{,.en}.md、docs/DEPLOYMENT_ONECLICK{,.en}.md）都写着「默认模型是 Grok 4.6，这一个必须在 Bedrock 开通」，照着做的一键客户只开 Grok 就直接 AccessDeniedException。GLM 5 / DeepSeek V3.2 仍在启用集里，用户可按会话切。这条规则由 scripts/test_llm_catalog_seed.py 的两条断言机器强制：默认必须 profile-prefixed，且它的 model_id 必须出现在那四份客户文档里。",
   "default_model": "xai-grok-4-6",
 
   "models": [
@@ -139,6 +140,26 @@
       "hard_output_limit": 8192,
       "output_override": null,
       "supports_prompt_cache": false,
+      "surfaces": ["webchat"],
+      "enabled": true
+    },
+    {
+      "alias": "zai-glm-5",
+      "short": "glm",
+      "aliases_legacy": [],
+      "_model_id_note": "**裸 model id，没有跨区推理 profile**。2026-08-26 在 us-east-1 实测：bedrock list-foundation-models 里 zai.glm-5 是 ACTIVE，而 list-inference-profiles 里 GLM 一条都没有 —— 所以只能按需直调裸 id。相应地它已登记进 scripts/test_llm_catalog_seed.py 的 _ON_DEMAND_BARE_IDS。",
+      "model_id": "zai.glm-5",
+      "label": "GLM 5",
+      "desc_key": "model.desc.glm",
+      "kind": "bedrock_converse",
+      "region": null,
+      "_region_availability_note": "**它不是全区都有的**（region: null 表示跟随部署区，不是表示到处都有）。2026-08-26 实测：us-east-1 ✓、us-west-2 ✓、ap-northeast-1 ✓;ap-southeast-1 ✗;eu-west-1 / eu-central-1 只有 zai.glm-4.7-flash。所以它**不适合当 default_model**（曾短暂当过，见顶部 _default_model_note），只适合作为用户主动切换的选项：切到它的人是在自己的区里现场验证过的。deepseek-v3-2 同样是裸 id、同样有这个性质。",
+      "_hard_output_limit_note": "202752 是 bedrock-runtime **实测**的拒绝阈值：maxTokens=999999 → ValidationException『exceeds the model limit of 202752』（us-east-1，2026-08-26）。两端的实际上限都远低于它（webchat 32768 / IM 不启用），所以这个值只是别把模型能力砍小。",
+      "hard_output_limit": 202752,
+      "output_override": null,
+      "_supports_prompt_cache_note": "实测**不支持** Converse 显式 cachePoint：带 cachePoint 的请求返回 AccessDeniedException（us-east-1，2026-08-26）。声明 true 会让 load.py 给每个请求插 cachePoint，于是每一次调用都直接失败 —— 与 grok 那条同一个坑。",
+      "supports_prompt_cache": false,
+      "_surfaces_note": "只上 webchat。IM 侧的内置兜底目录（core/model_catalog.py）不含它，也不需要含 —— 加 im 会让 scripts/test_llm_catalog_seed.py 的『种子声明 im 的条目必须在 IM 代码目录里存在』那条断言失败。",
       "surfaces": ["webchat"],
       "enabled": true
     },

@@ -149,6 +149,17 @@ Credential flow: `setup.sh` **does not collect IM credentials** — it only sets
 | Container build tool | finch (recommended) / docker | `finch version` |
 | jq | any version | `jq --version` |
 | Python 3.12+ (local builds) | — | `python3 --version` |
+| **uv** | any version | `uv --version` |
+
+> ⚠️ **uv is not optional** (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or `brew install uv`).
+> `agentcore deploy` invokes `uv pip install` **unconditionally** when it packages the agent's Python
+> dependencies. Missing it does not stop the deployment with an error — it **silently degrades**:
+> the agent deployment fails → no Runtime ARN → the BFF falls back to echo, while the web side
+> deploys fine and the script still prints the Chat URL. What the customer experiences is
+> "deployment succeeded, but every question just echoes my message back".
+> `setup.sh` now blocks on this during preflight (unless `SKIP_AGENT=true`).
+> Note that uv's official installer puts the binary in `~/.local/bin`, which is often not on PATH in
+> non-interactive shells — open a new shell after installing.
 
 ### 2.2 AWS account preparation
 
@@ -325,7 +336,7 @@ After §2 prerequisites (and §3 IM-app registration only if you want IM), this 
 
 ### 5.1 What setup.sh actually does
 
-1. Dependency check: `node` ≥ 22 / `npm` / `npx cdk` / `aws` / `jq` / `python3`. **The container build tool (`finch` or `docker`) is optional** — required only if you chose to deploy an IM platform (the IM bot's ECS image builds locally); not needed for web-only
+1. Dependency check: `node` ≥ 22 / `npm` / `npx cdk` / `aws` / `jq` / `python3` / `uv` (**exits immediately if uv is missing** — otherwise a failed agent deployment silently degrades Web Chat to echo mode; not checked when `SKIP_AGENT=true`). **The container build tool (`finch` or `docker`) is optional** — required only if you chose to deploy an IM platform (the IM bot's ECS image builds locally); not needed for web-only
 2. Lets you pick a deploy Profile from your local `~/.aws` profile list (or keep the current one)
 3. `aws sts get-caller-identity` to detect the account, prompts you to confirm
 4. Lets you pick a deploy region from 6 options (default `ap-northeast-1`; includes a "custom input" choice)
@@ -778,6 +789,8 @@ The **persistent inbox** of Web Chat's "Notifications" topic is fed by EventBrid
 
 | Symptom | Cause / fix |
 |---|---|
+| **Every question comes back as `Got it — you said: … (Echo — AGENT_RUNTIME_ARN not set …)`** | **The agent was never deployed** and the BFF is on its echo fallback. Chain: `deploy_agent.sh` failed → no Runtime ARN → `WebChatStack` got an empty `AGENT_RUNTIME_ARN` → [bff/web-chat/index.mjs](../bff/web-chat/index.mjs) echoes. **One command fixes it: `bash scripts/fix_web_chat_echo.sh --region <region>`** (read-only diagnosis → prints the verdict → after you confirm: installs uv / pins the CLI / restores the CDK harness / redeploys the agent / injects the ARN into the BFF, carrying over the live `organizationId` and CORS allowlist). By hand: **first suspect is a missing `uv`** (see §2.1) → install uv → `DEPLOY_REGION=<region> bash scripts/deploy_agent.sh` → `cd infra && npx cdk deploy WebChatStack --exclusively -c agentRuntimeArn=<ARN>`. Verify: `aws lambda get-function-configuration --function-name <web-chat-bff> --query 'Environment.Variables.AGENT_RUNTIME_ARN'` must be non-empty |
+| **Same symptom, but `uv` IS installed** | Second suspect: the **agentcore CLI version drifted**. `@aws/agentcore` ships roughly weekly, and `agentcore deploy`'s "Sync CDK dependencies" step **rewrites the in-repo, git-tracked** `agent-build/NotiOpsWebChat/agentcore/cdk/package.json` (bumping `@aws/agentcore-cdk`), which then no longer matches the in-repo `lib/cdk-stack.ts` → `tsc` fails → deploy dies in seconds, and **re-running does not self-heal**. The real error only exists in the CLI's own log: `tail -80 "$(ls -t agent-build/NotiOpsWebChat/agentcore/.cli/logs/deploy/*.log \| head -1)"`. Fix: `npm install -g @aws/agentcore@0.24.2` + `git checkout -- agent-build/NotiOpsWebChat/agentcore/cdk/package.json agent-build/NotiOpsWebChat/agentcore/cdk/package-lock.json` + `rm -rf agent-build/NotiOpsWebChat/agentcore/cdk/node_modules`, then re-run `deploy_agent.sh` — that whole sequence is exactly what `bash scripts/fix_web_chat_echo.sh` does. (Since v1.0.15 `deploy_agent.sh` hard-stops on both states before deploying) |
 | **`deploy_agent.sh` times out uploading the CodeZip** | Do **NOT** bundle `.venv` into the agent CodeZip (installed deps balloon to hundreds of MB and the S3 upload times out). Ship source + dependency manifest only and let the AgentCore side install deps |
 | **The two stacks conflict / produce garbled artifacts when synth'd in parallel** | Do **NOT** synth the IM bot stack and `WebChatStack` **in parallel into the same `cdk.out/` directory**; run them separately or use different `--output` directories |
 | **Frontend 403 / signature failure** | The Function URL is `AWS_IAM`; confirm the frontend obtained Identity Pool temporary credentials and SigV4-signed the request, and that `config.json`'s `chatApiBase` points to the correct Function URL |

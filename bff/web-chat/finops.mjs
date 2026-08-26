@@ -486,7 +486,12 @@ Return ONLY the JSON object, no markdown, no prose.`;
       // 若要纳入 Admin 管理，应作为一类 backend_task 加进目录，而不是在这里各自写死。
       modelId: "global.anthropic.claude-sonnet-5",
       messages: [{ role: "user", content: [{ text: prompt }] }],
-      inferenceConfig: { maxTokens: 1000, temperature: 0 },
+      // **不要传 temperature**。Sonnet 5 已弃用该参数（adaptive thinking 常驻），传了
+      // 整个请求 ValidationException:「`temperature` is deprecated for this model」——
+      // 而这一段的异常被兜进 aiError，界面表现只是"洞察是空的"，没有任何报错。
+      // 实测 2026-08-26 确认：带 temperature 必失败，去掉即正常。同一个坑在
+      // llm_config.mjs 的探测里踩过一次，那次至少有枚举态可查，这里连状态都没有。
+      inferenceConfig: { maxTokens: 1000 },
     }));
     const txt = resp.output?.message?.content?.[0]?.text || "";
     const parsed = JSON.parse(txt.slice(txt.indexOf("{"), txt.lastIndexOf("}") + 1));
@@ -572,7 +577,12 @@ Return ONLY the JSON object, no markdown, no prose.`;
       // 若要纳入 Admin 管理，应作为一类 backend_task 加进目录，而不是在这里各自写死。
       modelId: "global.anthropic.claude-sonnet-5",
       messages: [{ role: "user", content: [{ text: prompt }] }],
-      inferenceConfig: { maxTokens: 700, temperature: 0 },
+      // **不要传 temperature**。Sonnet 5 已弃用该参数（adaptive thinking 常驻），传了
+      // 整个请求 ValidationException:「`temperature` is deprecated for this model」——
+      // 而这一段的异常被兜进 aiError，界面表现只是"洞察是空的"，没有任何报错。
+      // 实测 2026-08-26 确认：带 temperature 必失败，去掉即正常。同一个坑在
+      // llm_config.mjs 的探测里踩过一次，那次至少有枚举态可查，这里连状态都没有。
+      inferenceConfig: { maxTokens: 700 },
     }));
     const txt = resp.output?.message?.content?.[0]?.text || "";
     const parsed = JSON.parse(txt.slice(txt.indexOf("{"), txt.lastIndexOf("}") + 1));

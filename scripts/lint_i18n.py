@@ -195,6 +195,10 @@ CJK_ALLOWLIST = {
     # 两条路径都要落地」/「别把断言删掉，去更新提取器」），写给下一个撞上它的维护者。
     # Developer-facing only；断言本身比对的是源码里的 IAM 动作名与环境变量键，全是 ASCII。
     "scripts/test_oneclick_parity.py",
+    # 「setup.sh 不许部署成功但只回显」门禁 —— CJK 是套件标题、断言标签和失败提示
+    # （告诉维护者为什么这条判据存在:客户 2026-08-26 那次静默降级）。其中还引用了
+    # 客户实际看到的那句回显文案作为 fixture。Developer-facing only。
+    "scripts/test_setup_agent_gate.py",
     # Sanitizer denylist — internal blocklist of OpenAI ChatML
     # protocol fragments + Chinese SEO/gambling spam tokens that
     # must NEVER reach end users. These strings are pattern fixtures,

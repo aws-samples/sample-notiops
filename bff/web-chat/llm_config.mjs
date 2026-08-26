@@ -1263,6 +1263,19 @@ export async function apiPutBedrockKey(body, actor = {}) {
  * 与 Converse 探测的差别：Responses API 的参数名是 max_output_tokens（不是 maxTokens）。
  */
 /**
+ * 探测请求的输出上限，Converse 与 Mantle 共用一个值。
+ *
+ * **别为了省几个 token 把它调小。** 各家模型对这个参数有各自的**下限**，而探测把
+ * 「参数被拒」和「模型不可用」映射到了同一个 ValidationException 上：
+ *   · Mantle Responses：传 1 → 400 `integer_below_min_value`，"Expected a value >= 16"；
+ *   · Converse / Grok 4.6：传 8 → ValidationException，"Expected a value >= 16"
+ *     （实测 2026-08-26，us-east-1）。这一条曾让出厂默认模型在 Admin 页**存不下去**，
+ *     且报错说的是"模型无效"，指向完全错误的方向。
+ * 64 远高于已知的所有下限，成本仍可忽略（探测只发一次、输出是 "ping" 的回答）。
+ */
+const PROBE_MAX_TOKENS = 64;
+
+/**
  * 判定 Mantle 的 400 是「我们的请求体不对」还是「这个模型不行」。
  *
  * 起因与 Converse 侧 temperature 那次同类：400 原先一律映射成 `invalid_model`，而
@@ -1310,12 +1323,11 @@ async function probeMantle(modelId, region, cred = { mode: "iam", key: "" }) {
     const path = "/openai/v1/responses";
     // 最小请求：一个 token 的输入 + 极小输出上限，只为换一个 HTTP 状态码。
     // `store: false` —— 探测不该在客户账号里留 30 天的留存记录（默认是 true）。
-    // 16 是实测出的 `max_output_tokens` 下限（传 1 → 400 integer_below_min_value,
-    // "Expected a value >= 16"），所以这里正好卡在边界上。若某个模型的下限更高，
-    // 400 会被 _classifyMantle400 判成 probe_error（放行 + warning），
+    // 上限取 PROBE_MAX_TOKENS（见那里的说明：**不要**贴着实测下限写）。若某个模型的
+    // 下限还更高，400 会被 _classifyMantle400 判成 probe_error（放行 + warning），
     // 而不是像以前那样报"模型 ID 无效"把合法保存硬拦下来。
     const payload = JSON.stringify({
-      model: modelId, input: "ping", max_output_tokens: 16, store: false,
+      model: modelId, input: "ping", max_output_tokens: PROBE_MAX_TOKENS, store: false,
     });
 
     let headers;
@@ -1454,7 +1466,17 @@ async function probeConverse(modelId, region, cred) {
       // Claude 都报"模型无效"，管理员因此无法把它设为默认模型（实测 global.anthropic.
       // claude-sonnet-5：带 temperature 报错，去掉后正常返回）。
       // 探测只为换一个状态码，采样参数一概不传，交给模型默认值。
-      inferenceConfig: { maxTokens: 8 },
+      //
+      // `maxTokens` 这个值本身也踩过同一个坑。它原来是 8，而**有的模型有下限**：
+      // Grok 4.6 要求 >= 16，于是探测得到
+      //   ValidationException: ... integer_below_min_value ... Expected a value >= 16
+      // → 映射成 `invalid_model` → 落进 HARD_FAIL_PROBE_RESULTS → 管理员**无法**把
+      // 出厂默认模型保存下来，而报错说的是"模型无效"（实测 2026-08-26，us-east-1：
+      // maxTokens=8 报错，16 与 200 都正常返回）。
+      // 取 64：远高于已知下限，又小到不值得在意那几个 token 的成本。
+      // 下面的分类器也补了这一类关键词 —— 将来再出现更高的下限时会报成 probe_error
+      // （"探测自己的问题"），而不是继续冤枉模型。
+      inferenceConfig: { maxTokens: PROBE_MAX_TOKENS },
     }));
     return { model_id: modelId, result: "ok", latency_ms: Date.now() - started };
   } catch (e) {
@@ -1475,8 +1497,13 @@ async function probeConverse(modelId, region, cred) {
     // Opus 5 都显示"模型无效"。参数问题是**我们的** bug，得报成 probe_error 让人去查探测，
     // 而不是让管理员以为模型不可用。仍然只回枚举态，不透传上游原文（spec R5.5）。
     const msg = String(e?.message || "");
-    if (name === "ValidationException" && /\bdeprecated\b|inferenceConfig|temperature|topP|topK/i
-        .test(msg)) {
+    // `integer_below_min_value` / `maxTokens` / `>= N` 这一组是「我们填的输出上限低于
+    // 这个模型的下限」——同样是探测自己的问题（见 PROBE_MAX_TOKENS）。列进来是为了
+    // 万一将来又出现更高的下限时，管理员看到的是"探测出错、再试一次"，而不是
+    // "这个模型无效"，从而把人引向正确的那一侧。
+    if (name === "ValidationException"
+        && /\bdeprecated\b|inferenceConfig|temperature|topP|topK|integer_below_min_value|below_min|maxTokens|Expected a value >=/i
+          .test(msg)) {
       result = "probe_error";
     } else if (name === "ValidationException" && /on-demand throughput isn.t supported|inference profile/i
         .test(msg)) {

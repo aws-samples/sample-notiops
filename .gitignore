@@ -1,0 +1,86 @@
+# 对外仓库的 .gitignore（由 scripts/publish-to-github.sh 复制成 public repo 根的 .gitignore）
+#
+# 为什么单独有一份:内部仓的根 .gitignore 里点名了一批内部文档 / 宣传物料 / 评审产物的
+# 文件名,那份**本身就是内部信息**,不能原样外发。而 public 仓完全没有 .gitignore 也不行 ——
+# 客户 fork 后跑一次 setup.sh,`git status` 里就会混进 cdk.out / node_modules / __pycache__,
+# 以及 `bootstrap.env`、`infra/cdk-outputs*.json` 这类**带账号 ID 与 secret ARN**的本地产物;
+# 一不小心 `git add -A` 就提交上去了。这份只保留「客户跑我们的脚本会生成什么」这一类规则。
+#
+# 改这份时的判据:只写客户机器上会出现的再生物/本地配置。任何内部文档名不许进来。
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/
+
+# Node
+node_modules/
+
+# CDK（setup.sh 会生成）
+infra/cdk.out/
+infra/dist/
+infra/cdk.context.json
+infra/cdk-deploy-out*/
+infra/cdk-outputs.json
+infra/cdk-outputs-*.json
+
+# Lambda 依赖层（部署前自动安装）
+lambda_layer/
+
+# 前端本地开发配置
+frontend/frontend-app/.env
+
+# ---- Secrets / env（绝对不要提交）----
+.env
+.env.*
+.envrc
+*.pem
+*.key
+credentials.json
+secrets.yaml
+**/secrets/
+# 本地部署引导文件:含 secret ARN 与目标群 ID
+bootstrap.env
+# payer 账号侧 CUR/Athena 配置脚本的本地状态（含账号 ID / 桶名）
+scripts/.notiops-payer-cur-state.json
+
+# ---- AgentCore 部署产物 ----
+# deploy_agent.sh 每次动态生成,含你自己的账号 ID
+agent-build/**/aws-targets.json
+agent-build/**/.venv/
+agent-build/**/node_modules/
+agent-build/**/cdk.out/
+agent-build/**/dist/
+agent-build/**/build/
+agent-build/**/__pycache__/
+agent-build/**/*.pyc
+agent-build/**/.cache/
+agent-build/**/.cli/
+agent-build/**/.bedrock_agentcore.yaml
+# `agentcore package` 的中间产物（~2GB）。注意只 ignore 这两条,同目录下的
+# cdk/ 与 agentcore.json 是入库的源码。
+agent-build/NotiOpsWebChat/agentcore/NotiOpsWebChat/
+agent-build/NotiOpsWebChat/agentcore/NotiOpsWebChat.zip
+
+# 一键部署产物（scripts/package_artifacts.sh 的输出,~293MB,归宿是 Release 不是 git）
+dist/
+
+# ---- 本地日志 / 缓存 ----
+*.log
+.coverage
+.cache/
+
+# ---- Docker / finch 本地配置 ----
+.docker/
+docker-cfg/
+
+# ---- IDE / OS ----
+.vscode/
+.idea/
+.DS_Store
+.DS_Store?
+Thumbs.db
+desktop.ini
+~$*

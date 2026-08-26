@@ -191,6 +191,59 @@ def test_seed_reproduces_frontend_options():
                f"fe={fe_default.group(1)} seed={SEED['default_model']}")
 
 
+def test_agent_offline_mirror_matches_seed():
+    """`agent/main.py` 的 alias→model_id 表是种子的**离线镜像**，必须跟着种子走。
+
+    它不是运行时权威（部署的 agent 从 DDB 目录解析，见该文件顶部注释），但它是
+    `agent/` 目录能独立跑起来的唯一依据 —— 而 2026-08 加 GLM 5 时它被漏掉了，
+    原因是当时**没有任何判据钉它**：种子、前端、两份 Python 兜底目录之间都有测试
+    双向校验，只有这张表是纯手工同步。本函数补上缺的那一条。
+
+    口径：**enabled 且 webchat 可用**的种子条目必须在表里、且 model_id 一致；
+    表里允许留种子中已 disabled 的条目（给老会话用，如 claude-sonnet-4-6），
+    但不允许出现种子里根本没有的 alias —— 那是拼错或幽灵条目。
+    """
+    print("test_agent_offline_mirror_matches_seed")
+    import ast as _ast
+    tree = _ast.parse(open(os.path.join(ROOT, "agent", "main.py"),
+                           encoding="utf-8").read())
+    mirror: dict[str, str] = {}
+    default_fallback = None
+    for node in tree.body:
+        if not isinstance(node, _ast.Assign) or not isinstance(node.targets[0], _ast.Name):
+            continue
+        name = node.targets[0].id
+        if name == "_MODEL_MAP" and isinstance(node.value, _ast.Dict):
+            mirror = {k.value: v.value
+                      for k, v in zip(node.value.keys, node.value.values)
+                      if isinstance(k, _ast.Constant) and isinstance(v, _ast.Constant)}
+        elif name == "_DEFAULT_MODEL":
+            # os.environ.get("NOTIOPS_DEFAULT_MODEL", "<fallback>")
+            args = getattr(node.value, "args", [])
+            if len(args) == 2 and isinstance(args[1], _ast.Constant):
+                default_fallback = args[1].value
+
+    _check("agent/main.py exposes _MODEL_MAP", bool(mirror))
+    for m in SEED["models"]:
+        if not m["enabled"] or "webchat" not in m["surfaces"]:
+            continue
+        _check(f"offline mirror has {m['alias']!r}", m["alias"] in mirror,
+               "agent/main.py:_MODEL_MAP is missing it -- changing only the seed "
+               "leaves `python agent/main.py` falling back to the default model "
+               "whenever this one is selected")
+        if m["alias"] in mirror:
+            _check(f"{m['alias']}: offline mirror model_id matches seed",
+                   mirror[m["alias"]] == m["model_id"],
+                   f"mirror={mirror[m['alias']]} seed={m['model_id']}")
+    ghosts = sorted(set(mirror) - set(MODELS))
+    _check("offline mirror has no alias absent from the seed", not ghosts, str(ghosts))
+    default = MODELS.get(SEED["default_model"])
+    _check("offline mirror _DEFAULT_MODEL fallback == seed default's model_id",
+           bool(default) and default_fallback == default["model_id"],
+           f"agent/main.py={default_fallback} "
+           f"seed={default['model_id'] if default else '?'}")
+
+
 def test_config_invariants():
     """Invariants the BFF PUT route will enforce server-side (spec R2.7)."""
     print("test_config_invariants")
@@ -256,6 +309,10 @@ def test_config_invariants():
     # 时它照样全绿（反向注入验证确认过）。
     _ON_DEMAND_BARE_IDS = {
         "deepseek.v3.2",   # 东京实测 Converse 直调 200
+        # us-east-1 实测 Converse 直调 200（2026-08-26）。GLM 系列在 list-inference-profiles
+        # 里一条都没有，裸 id 是唯一的调用方式。注意它**不是全区都有** —— 见目录条目里的
+        # _region_availability_note，这条白名单只保证"按需可直调"，不保证"处处存在"。
+        "zai.glm-5",
     }
     _PROFILE_PREFIXES = ("global.", "us.", "eu.", "apac.", "jp.", "au.", "us-gov.")
     for m in SEED["models"]:
@@ -267,6 +324,33 @@ def test_config_invariants():
                f"{mid} is a bare id and is not registered; if it really supports "
                f"on-demand invocation add it to _ON_DEMAND_BARE_IDS, otherwise "
                f"switch to the prefixed cross-Region inference profile")
+
+    # 默认模型另有一条**比上面更严**的要求：它的 model_id 必须带 profile 前缀，
+    # 裸 id 一律不行 —— 即使该裸 id 已登记在 _ON_DEMAND_BARE_IDS 里。
+    # 两件事不是一件事：「能按需直调」说的是协议，「处处都有」说的是区域覆盖。
+    # 裸 id 是逐区上线的，有洞；而默认模型的第一职责是"随便哪个区装完都能说第一句话"。
+    # 2026-08-26 真的发生过：默认被设成 zai.glm-5（裸 id，ap-southeast-1 / eu-* 没有），
+    # 装在那些区的客户第一句话就报错，还得自己摸到 Admin「模型」页换默认才能用。
+    # 对一个公开 sample，这就是最贵的那种缺陷 —— "部署成功但不能用"。
+    if default and default["kind"] != "bedrock_mantle_responses":
+        _check("default_model uses a cross-Region inference profile (not a bare id)",
+               default["model_id"].startswith(_PROFILE_PREFIXES),
+               f"{default['model_id']} is a bare id: it only exists in the Regions it "
+               f"has shipped to, so a deployment in any other Region fails on the very "
+               f"first message. Pick a global./us./… prefixed entry as the default and "
+               f"leave the bare-id models as user-switchable options")
+
+    # 四份客户文档都写着"默认模型是 X，这一个必须在 Bedrock 开通"。默认换了而文档没换，
+    # 后果不是文档过期而是**客户装完不能用**：照着一键文档只开 Grok 的人，第一句话
+    # 就是 AccessDeniedException。所以让文档跟着默认走，由这条断言强制。
+    for doc in ("docs/DEPLOYMENT.md", "docs/DEPLOYMENT.en.md",
+                "docs/DEPLOYMENT_ONECLICK.md", "docs/DEPLOYMENT_ONECLICK.en.md"):
+        with open(os.path.join(ROOT, doc), encoding="utf-8") as fh:
+            body = fh.read()
+        _check(f"{doc} names the default model's model_id",
+               bool(default) and default["model_id"] in body,
+               f"{doc} must tell customers to enable "
+               f"{default['model_id'] if default else '?'} in Bedrock Model access")
 
     _check("surfaces values are valid",
            all(set(m["surfaces"]) <= {"webchat", "im"} for m in SEED["models"]))
@@ -291,6 +375,7 @@ def main() -> int:
     test_seed_reproduces_im_catalogue()
     test_webchat_loader_is_catalogue_driven()
     test_seed_reproduces_frontend_options()
+    test_agent_offline_mirror_matches_seed()
     test_config_invariants()
     if _failed:
         print(f"\n{FAIL} {_failed} check(s) failed")

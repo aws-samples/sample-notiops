@@ -117,7 +117,7 @@ cd sample-notiops
 | 能力 | 方式 A(一键部署) | 方式 B(`setup.sh`) |
 |---|:---:|:---:|
 | **前提与耗时** | | |
-| 本地要装的东西 | 无(只要浏览器) | git / Node / Python / CDK / 容器运行时 |
+| 本地要装的东西 | 无(只要浏览器) | git / Node / Python / **uv** / CDK / 容器运行时(仅 IM bot 需要) |
 | 需要长期 access key | 不需要 | 需要一份能部署的凭证 |
 | 部署耗时 | 大约 5 分钟 | 十几分钟(含本地构建) |
 | 一键删除整个环境 | ✅ 删栈时选 `KeepData` / `DeleteEverything` | ✅ `./teardown.sh`(默认保数据 / `--delete-everything` 全删) |

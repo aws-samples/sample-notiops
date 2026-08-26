@@ -88,6 +88,7 @@ _MODEL_MAP = {
     "claude-sonnet-4-6": "global.anthropic.claude-sonnet-4-6",  # 目录里已 disabled，留给老会话
     "amazon-nova-pro": "apac.amazon.nova-pro-v1:0",
     "deepseek-v3-2": "deepseek.v3.2",  # Bedrock ON_DEMAND，支持流式
+    "zai-glm-5": "zai.glm-5",  # 裸 id（GLM 无跨区推理 profile），非全区可用
     "gpt-5-6": "openai.gpt-5.6-terra",  # 走 Bedrock Mantle（OpenAI Responses API），见下
     "gpt-5-6-sol": "openai.gpt-5.6-sol",    # GPT-5.6 Sol，走 Mantle
     "gpt-5-6-luna": "openai.gpt-5.6-luna",  # GPT-5.6 Luna，走 Mantle

@@ -149,6 +149,14 @@ CDK 部署三个栈,`./setup.sh` 走 `cdk deploy --all` 一次部到位。**Web 
 | 容器构建工具 | finch(推荐) / docker | `finch version` |
 | jq | 任意版本 | `jq --version` |
 | Python 3.12+(本地编译) | — | `python3 --version` |
+| **uv** | 任意版本 | `uv --version` |
+
+> ⚠️ **uv 不是可选的**（`curl -LsSf https://astral.sh/uv/install.sh \| sh`，或 `brew install uv`）。
+> `agentcore deploy` 打 agent 的 Python 依赖包时**无条件**调 `uv pip install`。缺它的后果不是
+> "报错停下",而是**静默降级**:agent 部署失败 → 拿不到 Runtime ARN → BFF 回退 echo,而 web 端
+> 照常部署成功、脚本照常打印 Chat URL。客户体验是「部署成功了,但一提问只把我的话回显回来」。
+> `setup.sh` 现在会在 preflight 就拦住这种情况(除非 `SKIP_AGENT=true`)。
+> 注意 uv 官方安装器装到 `~/.local/bin`,非交互式 shell 常常不在 PATH —— 装完新开一个终端。
 
 ### 2.2 AWS 账号准备
 
@@ -323,7 +331,7 @@ CDK 栈始终通过 ARN 引用这些 secret,**本地不落任何凭据文件**�
 
 ### 5.1 setup.sh 都做了什么
 
-1. 依赖检查:`node` ≥ 22 / `npm` / `npx cdk` / `aws` / `jq` / `python3`。**容器构建工具(`finch` 或 `docker`)是可选的** —— 只有你选了要部署 IM 平台时才强制要求(IM bot 的 ECS 镜像本地构建);只上 web 端不需要
+1. 依赖检查:`node` ≥ 22 / `npm` / `npx cdk` / `aws` / `jq` / `python3` / `uv`(**缺 uv 直接退出** —— 否则 agent 部署失败会让 Web Chat 静默退化成回显;`SKIP_AGENT=true` 时不检查)。**容器构建工具(`finch` 或 `docker`)是可选的** —— 只有你选了要部署 IM 平台时才强制要求(IM bot 的 ECS 镜像本地构建);只上 web 端不需要
 2. 让你从本地 `~/.aws` profile 列表选部署 Profile(或保持当前)
 3. 调 `aws sts get-caller-identity` 检测账号,要你确认
 4. 让你从 6 个选项里选 deploy region(默认 `ap-northeast-1`;含"自定义输入")
@@ -787,6 +795,8 @@ Web Chat「通知」主题的**持久化收件箱**由 EventBridge → `notiops-
 
 | 现象 | 原因 / 修 |
 |---|---|
+| **提问只得到「收到 —— 你说的是：…」/ `(Echo — AGENT_RUNTIME_ARN not set …)`** | **agent 根本没上线**,BFF 走 echo 回退。链条:`deploy_agent.sh` 失败 → 没有 Runtime ARN → `WebChatStack` 的 `AGENT_RUNTIME_ARN` 是空串 → [bff/web-chat/index.mjs](../bff/web-chat/index.mjs) 回显。**一条命令修完:`bash scripts/fix_web_chat_echo.sh --region <region>`**(只读体检 → 打印结论 → 确认后修:补 uv / 钉 CLI 版本 / 还原 CDK harness / 重新部署 agent / 注入 BFF,并自动沿用现网的 `organizationId`、CORS 白名单)。想手工做:**第一嫌疑是缺 `uv`**(见 §2.1)→ 装 uv → `DEPLOY_REGION=<region> bash scripts/deploy_agent.sh` → `cd infra && npx cdk deploy WebChatStack --exclusively -c agentRuntimeArn=<ARN>`。核验:`aws lambda get-function-configuration --function-name <web-chat-bff> --query 'Environment.Variables.AGENT_RUNTIME_ARN'` 必须非空 |
+| **同上,但机器上有 `uv`** | 第二嫌疑是 **agentcore CLI 版本漂了**。`@aws/agentcore` 约每周发一版,而 `agentcore deploy` 的 "Sync CDK dependencies" 步骤会**擅自改写仓库里已入库的** `agent-build/NotiOpsWebChat/agentcore/cdk/package.json`(把 `@aws/agentcore-cdk` 顶到新版),与入库的 `lib/cdk-stack.ts` 不兼容 → `tsc` 报错 → deploy 十几秒即挂,且**重跑不会自愈**。真正的报错只在 CLI 自己的日志里:`tail -80 "$(ls -t agent-build/NotiOpsWebChat/agentcore/.cli/logs/deploy/*.log \| head -1)"`。修:`npm install -g @aws/agentcore@0.24.2` + `git checkout -- agent-build/NotiOpsWebChat/agentcore/cdk/package.json agent-build/NotiOpsWebChat/agentcore/cdk/package-lock.json` + `rm -rf agent-build/NotiOpsWebChat/agentcore/cdk/node_modules`,再重跑 `deploy_agent.sh` —— 这一整串就是 `bash scripts/fix_web_chat_echo.sh` 干的事。(`deploy_agent.sh` 自 v1.0.15 起会在部署前直接拦住这两种状态) |
 | **`deploy_agent.sh` 上传 CodeZip 超时** | agent CodeZip **别把 `.venv` 打进去**(依赖装到几百 MB,S3 上传会超时)。CodeZip 只放源码 + 依赖清单,让 AgentCore 侧装依赖 |
 | **两个 stack 并行 synth 冲突 / 产物错乱** | **不要**让 IM bot 栈和 `WebChatStack` **并行 synth 到同一个 `cdk.out/` 目录**;分开跑或用不同 `--output` 目录 |
 | **前端 403 / 签名失败** | Function URL 是 `AWS_IAM`;确认前端拿到了 Identity Pool 临时凭据并对请求做了 SigV4 签名,`config.json` 的 `chatApiBase` 指向正确的 Function URL |

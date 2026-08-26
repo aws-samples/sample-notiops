@@ -2,7 +2,8 @@
 # 部署 NotiOps Web Chat 的 AgentCore Runtime（Strands agent）。
 #
 # 由 setup.sh 调用（也可单独跑）。流程：
-#   1. 确保 agentcore CLI 可用（公共 npm 包 @aws/agentcore）。
+#   0. 确保 uv 可用（agentcore 打 Python 包的硬依赖，缺它必失败 → 静默退化成 echo）。
+#   1. 确保 agentcore CLI 可用（公共 npm 包 @aws/agentcore，版本钉在 AGENTCORE_CLI_VERSION）。
 #   2. （可选）provision web-search Gateway 并把 URL 注入 agentcore.json 的 envVars。
 #   3. agentcore deploy（CodeZip 构建，无需 docker/finch）。
 #   4. 从 CloudFormation 输出捕获 Runtime ARN，打印 + 写入 $AGENT_ARN_OUT（若设了）。
@@ -14,6 +15,7 @@
 #                         "false" 则跳过 —— **本部署就没有联网搜索能力**（2026-08 起没有
 #                         第三方兜底），界面开关按无能力处理。
 #   AGENT_ARN_OUT         可选，把捕获到的 Runtime ARN 写到这个文件路径。
+#   AGENTCORE_CLI_VERSION 可选，覆盖钉住的 @aws/agentcore 版本（默认见下方）。
 #   NOTIOPS_ALLOW_CROSS_ACCOUNT
 #                         跨账号闸门（默认安全）。"1" = 放开多账号（setup.sh --multi-account
 #                         时传入）；空/未设 = 仅部署账号。**必须显式传空**而非省略，因为
@@ -44,13 +46,62 @@ if [ ! -d "$AGENT_DIR" ]; then
   exit 1
 fi
 
+# ── 0. uv（agentcore 打 Python 包的硬依赖）──
+# @aws/agentcore 的 Python CodeZip packager 无条件调 uv：
+#   dist/lib/packaging/python.js → ensureBinaryAvailable('uv', UV_INSTALL_HINT)
+#   → uv pip install -r pyproject.toml --target <staging> --python-version 3.13 --only-binary :all:
+# 没有 uv 这一步必失败，而失败的**后果是静默的**：setup.sh 只打一行 ⚠ 就继续把 web 端部署
+# 完，BFF 因为拿不到 AGENT_RUNTIME_ARN 回退 echo —— 客户看到"部署成功但只回显"。
+# setup.sh 已在 preflight 拦一次；这里再拦一次，因为本脚本也支持单独跑。
+if ! command -v uv >/dev/null 2>&1; then
+  for _uv_dir in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+    [ -x "$_uv_dir/uv" ] && { PATH="$_uv_dir:$PATH"; export PATH; break; }
+  done
+fi
+if ! command -v uv >/dev/null 2>&1; then
+  echo "  $(t "❌ 缺少 uv —— agentcore 打 Python 依赖包必须用它，部署无法继续。" "❌ uv is missing — the agentcore CLI needs it to package the Python dependencies; cannot continue.")" >&2
+  echo "     curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
+  echo "  $(t "     或: brew install uv / pipx install uv；文档 " "     or: brew install uv / pipx install uv; docs ")https://docs.astral.sh/uv/getting-started/installation/" >&2
+  exit 1
+fi
+
 # ── 1. agentcore CLI ──
+# 版本**必须钉住**。这个包发版约每周一次（0.24.2 → 0.28.0 只隔一个月），而原先的
+# `npm install -g @aws/agentcore` 不带版本：客户装到的是"当天的 latest"，我们验证过的是
+# 另一个版本 —— 一次部署到底能不能成，取决于客户跑脚本的**日期**。那不是可支持的产品。
+# 升级流程：先在验证账号跑一次完整的 setup.sh（agent 必须真起来、能回答），再改这里的默认值。
+# 客户要试新版：AGENTCORE_CLI_VERSION=x.y.z bash scripts/deploy_agent.sh。
+AGENTCORE_CLI_VERSION="${AGENTCORE_CLI_VERSION:-0.24.2}"
 if ! command -v agentcore >/dev/null 2>&1; then
-  echo "  $(t "安装 AgentCore CLI（@aws/agentcore）..." "Installing AgentCore CLI (@aws/agentcore)...")"
-  npm install -g @aws/agentcore >/dev/null 2>&1 || {
-    echo "  $(t "❌ 无法安装 agentcore CLI；请手动 'npm install -g @aws/agentcore' 后重试。" "❌ Failed to install agentcore CLI; run 'npm install -g @aws/agentcore' manually and retry.")" >&2
+  echo "  $(t "安装 AgentCore CLI（@aws/agentcore@$AGENTCORE_CLI_VERSION）..." "Installing AgentCore CLI (@aws/agentcore@$AGENTCORE_CLI_VERSION)...")"
+  npm install -g "@aws/agentcore@$AGENTCORE_CLI_VERSION" >/dev/null 2>&1 || {
+    echo "  $(t "❌ 无法安装 agentcore CLI；请手动 'npm install -g @aws/agentcore@$AGENTCORE_CLI_VERSION' 后重试。" "❌ Failed to install agentcore CLI; run 'npm install -g @aws/agentcore@$AGENTCORE_CLI_VERSION' manually and retry.")" >&2
     exit 1
   }
+else
+  # 版本不一致 = **硬停**。这里最初只打了一行"ℹ 提示差异"，2026-08-26 一位客户就是这样
+  # 挂掉的：他装到当天的 latest(0.28.0)，而 agentcore deploy 的 "Sync CDK dependencies"
+  # 步骤会**擅自改写仓库里已入库的** agentcore/cdk/package.json，把
+  # @aws/agentcore-cdk 0.1.0-alpha.45 顶到 alpha.49；而入库的 lib/cdk-stack.ts 是
+  # 0.24.2 生成的（还写着已被改名的 connectorName 属性）→ tsc TS2561 → deploy 10 秒即挂。
+  # 后果对客户是不可见的：栈没建、没有 Runtime ARN、web 端照常部署完 → Web Chat 只回显。
+  # 也就是说"新 CLI + 入库的旧 harness"是一个**必然失败**的组合,不是"可能失败",
+  # 所以只能硬停。逃生口留给知情的人：AGENTCORE_CLI_ALLOW_MISMATCH=1。
+  HAVE_CLI="$(agentcore --version 2>/dev/null | tr -d '[:space:]' || echo '?')"
+  if [ "$HAVE_CLI" != "$AGENTCORE_CLI_VERSION" ] && [ "${AGENTCORE_CLI_ALLOW_MISMATCH:-}" != "1" ]; then
+    echo "  $(t "❌ agentcore CLI 版本不匹配：当前 $HAVE_CLI，NotiOps 验证过的是 $AGENTCORE_CLI_VERSION。" "❌ agentcore CLI version mismatch: found $HAVE_CLI, NotiOps validated $AGENTCORE_CLI_VERSION.")" >&2
+    echo "  $(t "   更新的 CLI 会改写仓库里入库的 agentcore/cdk/package.json（@aws/agentcore-cdk 版本），" "   A newer CLI rewrites the in-repo agentcore/cdk/package.json (@aws/agentcore-cdk version),")" >&2
+    echo "  $(t "   与入库的 lib/cdk-stack.ts 不匹配 → tsc 编译失败 → agent 上不了线（Web Chat 只回显）。" "   which no longer matches the in-repo lib/cdk-stack.ts → tsc fails → the agent never deploys (Web Chat only echoes).")" >&2
+    echo "     npm install -g @aws/agentcore@$AGENTCORE_CLI_VERSION" >&2
+    echo "  $(t "   若之前已被更新的 CLI 改写过 harness，一并还原：" "   If a newer CLI already rewrote the harness, restore it too:")" >&2
+    echo "     git checkout -- agent-build/NotiOpsWebChat/agentcore/cdk/package.json agent-build/NotiOpsWebChat/agentcore/cdk/package-lock.json" >&2
+    echo "  $(t "   或者一条命令自动搞定（体检 → 降级 → 还原 → 重新部署 → 注入 BFF）：" "   Or fix it all with one command (diagnose → pin → restore → redeploy → inject into the BFF):")" >&2
+    echo "     bash scripts/fix_web_chat_echo.sh --region $REGION" >&2
+    echo "  $(t "   明知风险仍要继续：AGENTCORE_CLI_ALLOW_MISMATCH=1 重跑本脚本。" "   To proceed anyway: re-run this script with AGENTCORE_CLI_ALLOW_MISMATCH=1.")" >&2
+    exit 1
+  elif [ "$HAVE_CLI" != "$AGENTCORE_CLI_VERSION" ]; then
+    echo "  $(t "⚠ agentcore CLI $HAVE_CLI ≠ 验证版本 $AGENTCORE_CLI_VERSION，已按 AGENTCORE_CLI_ALLOW_MISMATCH=1 放行。" "⚠ agentcore CLI $HAVE_CLI != validated $AGENTCORE_CLI_VERSION; proceeding because AGENTCORE_CLI_ALLOW_MISMATCH=1.")" >&2
+  fi
 fi
 
 export AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" CDK_DEFAULT_REGION="$REGION"
@@ -138,9 +189,37 @@ if [ -n "$ACCT" ]; then
 fi
 
 echo "  $(t "agentcore deploy（CodeZip，约 5-10 分钟）..." "agentcore deploy (CodeZip, ~5-10 min)...")"
+# harness 依赖版本必须和入库的 lib/cdk-stack.ts 对得上。更新的 CLI 跑过一次就会把这里
+# 顶到新版（见 §1 的注释），而 package.json 是入库文件 —— 客户的工作树会被留在
+# "package.json 是新版、cdk-stack.ts 是旧版"的必挂状态，且下次重跑不会自愈。
+HARNESS_PIN_EXPECTED="0.1.0-alpha.45"
+HARNESS_PIN_ACTUAL="$(python3 -c "
+import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get('dependencies', {}).get('@aws/agentcore-cdk', ''))
+except Exception:
+    print('')
+" "$AGENT_DIR/agentcore/cdk/package.json" 2>/dev/null || echo '')"
+if [ -n "$HARNESS_PIN_ACTUAL" ] && [ "$HARNESS_PIN_ACTUAL" != "$HARNESS_PIN_EXPECTED" ]; then
+  echo "  $(t "❌ CDK harness 依赖被改动：@aws/agentcore-cdk = $HARNESS_PIN_ACTUAL（应为 $HARNESS_PIN_EXPECTED）。" "❌ The CDK harness dependency was modified: @aws/agentcore-cdk = $HARNESS_PIN_ACTUAL (expected $HARNESS_PIN_EXPECTED).")" >&2
+  echo "  $(t "   几乎一定是更新版的 agentcore CLI 改写过它 —— 与入库的 lib/cdk-stack.ts 不兼容，tsc 会失败。还原：" "   Almost certainly rewritten by a newer agentcore CLI — incompatible with the in-repo lib/cdk-stack.ts; tsc will fail. Restore it:")" >&2
+  echo "     git checkout -- agent-build/NotiOpsWebChat/agentcore/cdk/package.json agent-build/NotiOpsWebChat/agentcore/cdk/package-lock.json" >&2
+  echo "     rm -rf agent-build/NotiOpsWebChat/agentcore/cdk/node_modules && (cd agent-build/NotiOpsWebChat/agentcore/cdk && npm ci)" >&2
+  echo "  $(t "   或者一条命令自动搞定：" "   Or fix it all with one command:")" >&2
+  echo "     bash scripts/fix_web_chat_echo.sh --region $REGION" >&2
+  exit 1
+fi
 # agentcore deploy 内部调 tsc 编译 CDK TypeScript，但不走 npx，要求 PATH 里有 tsc。
 # 这里确保 cdk/ 已装依赖，再把其 node_modules/.bin 临时加入 PATH（不污染用户全局环境）。
-( cd "$AGENT_DIR/agentcore/cdk" && npm install --silent 2>/dev/null )
+# **不要**把这步的 stderr 丢进 /dev/null：它在 set -e 下失败会让整个脚本无声退出
+# （客户看到的就是"agent 部署失败"四个字，没有任何原因）。用 npm ci 走锁文件；
+# 没有锁文件的场景（客户手动删过）回退 npm install。
+if ! ( cd "$AGENT_DIR/agentcore/cdk" \
+       && { [ -f package-lock.json ] && npm ci --no-audit --no-fund || npm install --no-audit --no-fund; } ); then
+  echo "  $(t "❌ 安装 CDK harness 依赖失败（agentcore/cdk）。上面的 npm 输出就是原因。" "❌ Failed to install the CDK harness dependencies (agentcore/cdk). The npm output above is the reason.")" >&2
+  exit 1
+fi
 export PATH="$AGENT_DIR/agentcore/cdk/node_modules/.bin:$PATH"
 # aws-targets.json 必须指向当前账户（不能 hardcode），否则 CDK 会尝试 AssumeRole 到错误账户。
 python3 -c "
@@ -149,7 +228,21 @@ path = sys.argv[1]
 targets = [{'name': 'default', 'account': sys.argv[2], 'region': sys.argv[3]}]
 json.dump(targets, open(path, 'w'), indent=2)
 " "$AGENT_DIR/agentcore/aws-targets.json" "$ACCT" "$REGION"
-( cd "$AGENT_DIR" && agentcore deploy -y )
+# agentcore CLI 自己会把完整的分步日志写到 agentcore/.cli/logs/deploy/deploy-<ts>.log，
+# 但失败时终端上往往只剩一句概括。2026-08-26 那次事故里，真正的原因（tsc TS2561）
+# 只存在于这份文件里 —— 没人知道去看它，于是排查绕了好几轮。失败即把它打出来。
+if ! ( cd "$AGENT_DIR" && agentcore deploy -y ); then
+  CLI_LOG="$(ls -t "$AGENT_DIR/agentcore/.cli/logs/deploy/"*.log 2>/dev/null | head -1 || true)"
+  echo "" >&2
+  echo "  $(t "❌ agentcore deploy 失败。" "❌ agentcore deploy failed.")" >&2
+  if [ -n "$CLI_LOG" ]; then
+    echo "  $(t "── agentcore CLI 自己的日志（$CLI_LOG，最后 60 行）──" "── The agentcore CLI's own log ($CLI_LOG, last 60 lines) ──")" >&2
+    tail -60 "$CLI_LOG" | sed 's/^/    /' >&2
+  else
+    echo "  $(t "（未找到 CLI 日志：$AGENT_DIR/agentcore/.cli/logs/deploy/）" "(No CLI log found under $AGENT_DIR/agentcore/.cli/logs/deploy/)")" >&2
+  fi
+  exit 1
+fi
 
 # 部署已读取注入后的 agentcore.json；这里**还原为出厂值**，保持 git 跟踪文件干净
 # （避免把本部署账号的 gateway URL / 桶名提交进仓库；客户每次部署时脚本会重新注入）。

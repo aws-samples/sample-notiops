@@ -236,8 +236,13 @@ def test_sanity_check_catches_a_broken_seed() -> None:
     for label, mutate in (
         ("empty models", lambda c: c.update(models=[])),
         ("default not in catalogue", lambda c: c.update(default_model="nope")),
-        ("default disabled", lambda c: c["models"].__setitem__(
-            0, {**c["models"][0], "enabled": False})),
+        # 必须按 **alias 找到真正的默认项**再关掉它。这里原来写的是 `models[0]`，
+        # 那只在"默认模型恰好排在第一个"时才真的触发这条规则 —— default_model 从
+        # claude-sonnet-5 换走之后，这个用例就变成了"关掉一个非默认模型，期望被拒绝"，
+        # 于是长期假红（`accepted a broken seed`），而它本该守的那条规则反倒没人守。
+        ("default disabled", lambda c: c.update(models=[
+            {**m, "enabled": False} if m["alias"] == c["default_model"] else m
+            for m in c["models"]])),
         ("duplicate alias", lambda c: c["models"].append(dict(c["models"][0]))),
         ("nothing enabled", lambda c: c.update(
             models=[{**m, "enabled": False} for m in c["models"]])),
@@ -246,7 +251,6 @@ def test_sanity_check_catches_a_broken_seed() -> None:
     ):
         broken = copy.deepcopy(good)
         mutate(broken)
-        # `default disabled` 需要默认项确实是 models[0]
         err = mod._sanity_check(broken)             # noqa: SLF001
         _check(f"rejects: {label}", err is not None, "accepted a broken seed")
 

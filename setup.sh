@@ -155,6 +155,40 @@ command -v python3 >/dev/null 2>&1 || { echo "$(t "错误: 需要安装 Python 3
 command -v aws >/dev/null 2>&1 || { echo "$(t "错误: 需要安装 AWS CLI" "Error: AWS CLI is required")"; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "$(t "错误: 需要安装 jq" "Error: jq is required")"; exit 1; }
 
+# ─── uv：agent 部署的**硬前置**,必须在这里 fail fast ───
+# `agentcore deploy` 打 Python CodeZip 时无条件调 `uv pip install`（@aws/agentcore 的
+# dist/lib/packaging/python.js → ensureBinaryAvailable('uv')）。机器上没有 uv,那一步必失败。
+#
+# 为什么它值得一条独立的前置检查(而不是等 deploy_agent.sh 自己报错):
+# 这条依赖过去只写在 agent-build/NotiOpsWebChat/README.md 里,客户不会读到;而失败的形态是
+# **静默降级** —— agent 部署失败 → 没有 AGENT_RUNTIME_ARN → BFF 回退 echo,而 web 端照常
+# 部署成功、脚本照常打印 Chat URL。客户看到的是"部署成功了,但一提问就回显我说的话"。
+# 实测客户侧就是这么坏的(2026-08-26)。所以:装不上就在**第一分钟**拦住,而不是二十分钟后。
+#
+# 官方安装器把 uv 放在 $HOME/.local/bin(部分平台 ~/.cargo/bin),而非交互式 shell 常常
+# 不在 PATH 里 —— 先捞一把再判定,避免"明明装了却说没装"。
+if [ "${SKIP_AGENT:-false}" != "true" ] && [ -d "$(cd "$(dirname "$0")" && pwd)/agent-build/NotiOpsWebChat" ]; then
+  if ! command -v uv >/dev/null 2>&1; then
+    for _uv_dir in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+      [ -x "$_uv_dir/uv" ] && { PATH="$_uv_dir:$PATH"; export PATH; break; }
+    done
+  fi
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "$(t "错误: 需要安装 uv (Python 包管理器)" "Error: uv (the Python package manager) is required")"
+    echo "$(t "  部署 agent runtime 时,agentcore CLI 用 uv 打 Python 依赖包;缺它会导致" "  The agentcore CLI uses uv to package the agent's Python dependencies; without it")"
+    echo "$(t "  agent 部署失败,而 Web Chat 会退化成【只回显你说的话】。" "  the agent deployment fails and Web Chat degrades to ECHOING YOUR MESSAGE BACK.")"
+    echo ""
+    echo "$(t "  安装(macOS / Linux):" "  Install (macOS / Linux):")"
+    echo "      curl -LsSf https://astral.sh/uv/install.sh | sh"
+    echo "$(t "  或:" "  Or:")  brew install uv   |   pipx install uv   |   pip3 install uv"
+    echo "$(t "  文档: " "  Docs: ")https://docs.astral.sh/uv/getting-started/installation/"
+    echo ""
+    echo "$(t "  装完新开一个终端(或 source ~/.bashrc / ~/.zshrc)让 uv 进 PATH,再重跑本脚本。" "  After installing, open a new shell (or source your rc file) so uv is on PATH, then re-run this script.")"
+    echo "$(t "  （只想先部署 web 端、之后再补 agent:SKIP_AGENT=true ./setup.sh）" "  (To deploy only the web side for now and add the agent later: SKIP_AGENT=true ./setup.sh)")"
+    exit 1
+  fi
+fi
+
 # 容器构建工具仅在部署 IM Bot 时必需(BotStack 的 ECS 容器用 CDK fromAsset 本地构建镜像)。
 # 若客户只部署 web 端、暂不部署 IM,则不需要容器工具。这里只探测,不强制退出;
 # 真正的强制检查移到 IM 平台选择之后(选了 IM 才要求容器工具)。
@@ -762,8 +796,17 @@ echo "  $(t "✓ web chat BFF 依赖安装完成" "✓ Web Chat BFF dependencies
 # 拿到 Runtime ARN 后，下面 CDK 部署 WebChatStack 时通过 -c agentRuntimeArn 注入，
 # BFF 才会调真 agent（否则回退 echo）。agent 部署失败不阻断整体部署（web 端仍可用）。
 # 跳过：SKIP_AGENT=true ./setup.sh（仅部署 web 端 + echo BFF）。
+#
+# AGENT_STATUS 记下这一步的**结局**（deployed / failed / no-arn / skipped / missing-dir）。
+# 为什么需要它：不带 ARN 的部署会一路成功到最后，脚本照常打印 Chat URL，而客户一提问
+# 只能拿到 echo 回显。那句 ⚠ 在几百行日志里翻不到 —— 所以结局要**带到最后的总结里**
+# 大声说一次（见文末 "Agent 未就绪" 块）。这条链上历史上有两个分支**完全不打印**：
+#   · agent 工程目录不存在（elif 只覆盖了 SKIP_AGENT=true）
+#   · deploy_agent.sh 退出码 0 但 ARN 文件是空的
+# 两者都直接落到 echo 模式,且没有任何一行输出提示过。现在每个分支都必须留下痕迹。
 AGENT_RUNTIME_ARN=""
 AGENT_ARN_FLAG=""
+AGENT_STATUS="skipped"
 if [ "${SKIP_AGENT:-false}" != "true" ] && [ -d "$PROJECT_ROOT/agent-build/NotiOpsWebChat" ]; then
   echo ""
   echo "  $(t "── 部署 Web Chat Agent（AgentCore Runtime，约 5-10 分钟）──" "── Deploying Web Chat Agent (AgentCore Runtime, ~5-10 min) ──")"
@@ -776,15 +819,26 @@ if [ "${SKIP_AGENT:-false}" != "true" ] && [ -d "$PROJECT_ROOT/agent-build/NotiO
     AGENT_RUNTIME_ARN=$(cat "$AGENT_ARN_FILE" 2>/dev/null || echo "")
     if [ -n "$AGENT_RUNTIME_ARN" ]; then
       AGENT_ARN_FLAG="-c agentRuntimeArn=$AGENT_RUNTIME_ARN"
+      AGENT_STATUS="deployed"
       echo "  $(t "✓ Agent 已部署，将注入 WebChatStack：" "✓ Agent deployed, injecting into WebChatStack: ")$AGENT_RUNTIME_ARN"
+    else
+      AGENT_STATUS="no-arn"
+      echo "  $(t "⚠ agent 部署脚本返回成功，但没拿到 Runtime ARN（$AGENT_ARN_FILE 为空）——" "⚠ The agent deploy script succeeded but produced no Runtime ARN ($AGENT_ARN_FILE is empty) —")"
+      echo "    $(t "BFF 只能回退 echo。请按文末提示单独重跑 agent 部署。" "the BFF can only fall back to echo. Re-run the agent deployment as shown at the end.")"
     fi
   else
+    AGENT_STATUS="failed"
     echo "  $(t "⚠ Agent 部署失败 —— web 端仍会部署，但 BFF 暂回退 echo。" "⚠ Agent deployment failed — the web UI still deploys, but BFF falls back to echo for now.")"
     echo "    $(t "修复后可单独重跑：" "After fixing, re-run separately: ")DEPLOY_REGION=$DEPLOY_REGION bash scripts/deploy_agent.sh"
     echo "    $(t "然后：" "then: ")cd infra && npx cdk deploy WebChatStack --exclusively -c agentRuntimeArn=<ARN>"
   fi
 elif [ "${SKIP_AGENT:-false}" = "true" ]; then
   echo "  $(t "（SKIP_AGENT=true：跳过 agent 部署，BFF 走 echo 回退。）" "(SKIP_AGENT=true: skipping agent deployment, BFF uses echo fallback.)")"
+else
+  AGENT_STATUS="missing-dir"
+  echo ""
+  echo "  $(t "⚠ 找不到 agent 工程目录 agent-build/NotiOpsWebChat —— 跳过 agent 部署，BFF 会回退 echo。" "⚠ Agent project dir agent-build/NotiOpsWebChat not found — skipping agent deployment; the BFF will fall back to echo.")"
+  echo "    $(t "通常意味着仓库不完整（部分下载 / 只拷了子目录）。请完整 clone 后重跑。" "This usually means an incomplete repo (partial download / only a subdirectory copied). Re-clone in full and re-run.")"
 fi
 
 # 2. 安装 Lambda 依赖
@@ -1375,13 +1429,62 @@ fi
 echo "Bedrock API Key:   $BEDROCK_API_KEY_SECRET"
 echo "Data Bucket:       $DATA_BUCKET"
 echo ""
+# ─── Agent 未就绪:必须在总结里大声说 ───
+# 没有 Runtime ARN 的部署,web 端一切正常、Chat URL 照常打印,但 BFF 只会**回显**用户
+# 说的话("收到 —— 你说的是：…")。这是客户侧最贵的一种失败:看起来部署成功了,
+# 产品的全部价值(问答/调查/成本/案例)其实都不在。所以这里不是一行 ⚠,是一整块,
+# 并且给出可直接粘贴的两条修复命令。
+#
+# 钉住的 CLI 版本的**唯一权威**是 scripts/deploy_agent.sh；这里只是把它读出来印给客户,
+# 而不是在第二个文件里再写一遍版本号(那必然会漏改其中一处)。读不到才回退字面量,
+# 且 scripts/test_setup_agent_gate.py 会断言这个回退值与权威值一致。
+AGENTCORE_CLI_VERSION_EXPECTED="$(grep -oE 'AGENTCORE_CLI_VERSION:-[0-9]+\.[0-9]+\.[0-9]+' \
+  "$PROJECT_ROOT/scripts/deploy_agent.sh" 2>/dev/null | head -1 | cut -d- -f2- || true)"
+[ -n "$AGENTCORE_CLI_VERSION_EXPECTED" ] || AGENTCORE_CLI_VERSION_EXPECTED="0.24.2"
+if [ "$AGENT_STATUS" != "deployed" ]; then
+  echo "  ┌──────────────────────────────────────────────────────────────────┐"
+  echo "  $(t "  │ ⚠️  Agent 未就绪 —— Web Chat 现在只会【回显你说的话】!          │" "  │ ⚠️  AGENT NOT READY — Web Chat will only ECHO YOUR MESSAGE back!       │")"
+  echo "  └──────────────────────────────────────────────────────────────────┘"
+  case "$AGENT_STATUS" in
+    failed)  echo "  $(t "  原因: agent 部署失败(往上翻找 deploy_agent.sh 的报错)。" "  Cause: the agent deployment failed (scroll up for the deploy_agent.sh error).")" ;;
+    no-arn)  echo "  $(t "  原因: agent 部署脚本没产出 Runtime ARN。" "  Cause: the agent deploy script produced no Runtime ARN.")" ;;
+    skipped) echo "  $(t "  原因: SKIP_AGENT=true,本次有意跳过了 agent 部署。" "  Cause: SKIP_AGENT=true — the agent deployment was intentionally skipped.")" ;;
+    *)       echo "  $(t "  原因: 找不到 agent 工程目录 agent-build/NotiOpsWebChat(仓库不完整)。" "  Cause: the agent project dir agent-build/NotiOpsWebChat is missing (incomplete repo).")" ;;
+  esac
+  echo "  $(t "  症状: 任何提问都只会得到「收到 —— 你说的是：…」这种回显,不是真回答。" "  Symptom: every question comes back as \"Got it — you said: ...\" instead of a real answer.")"
+  echo ""
+  echo "  $(t "  真正的报错在 agentcore CLI 自己的日志里(终端上往往只剩一句概括):" "  The real error is in the agentcore CLI's own log (the terminal usually shows only a summary):")"
+  echo "      tail -80 \"\$(ls -t agent-build/NotiOpsWebChat/agentcore/.cli/logs/deploy/*.log | head -1)\""
+  echo ""
+  echo "  $(t "  最省事的修法 —— 一条命令(先只读体检、给出结论,动手前会让你确认):" "  Easiest fix — one command (read-only diagnosis first; asks before changing anything):")"
+  echo "      UI_LANG=$UI_LANG bash scripts/fix_web_chat_echo.sh --region $DEPLOY_REGION"
+  echo ""
+  echo "  $(t "  它查/修的就是已知的两个原因(也可以照下面手工做):" "  It checks/fixes the two known causes (you can also do it by hand):")"
+  echo "  $(t "   ① 缺 uv(agentcore 打 Python 包必须):" "   (1) missing uv (required to package the agent's Python deps):")"
+  echo "      curl -LsSf https://astral.sh/uv/install.sh | sh"
+  echo "  $(t "   ② agentcore CLI 版本不是 $AGENTCORE_CLI_VERSION_EXPECTED(更新的版本会改写入库的 CDK harness → tsc 失败):" "   (2) the agentcore CLI is not $AGENTCORE_CLI_VERSION_EXPECTED (a newer one rewrites the in-repo CDK harness → tsc fails):")"
+  echo "      npm install -g @aws/agentcore@$AGENTCORE_CLI_VERSION_EXPECTED"
+  echo "      git checkout -- agent-build/NotiOpsWebChat/agentcore/cdk/package.json agent-build/NotiOpsWebChat/agentcore/cdk/package-lock.json"
+  echo "      rm -rf agent-build/NotiOpsWebChat/agentcore/cdk/node_modules"
+  echo "  $(t "   然后重跑这两步(不必重建其余资源):" "   Then re-run these two steps (no need to rebuild anything else):")"
+  echo "      DEPLOY_REGION=$DEPLOY_REGION bash scripts/deploy_agent.sh"
+  echo "      $(t "# 上一步会打印 Runtime ARN,填到下面这条里" "# the step above prints the Runtime ARN; paste it below")"
+  echo "      cd infra && npx cdk deploy WebChatStack --exclusively -c agentRuntimeArn=<ARN>"
+  echo ""
+fi
+
 echo "$(t "下一步（全部从 Web Chat 进,不用记别的地址）: " "Next steps (all from Web Chat, no other URL needed):")"
 echo ""
 echo "  $(t "1️⃣  打开 Web Chat(" "1️⃣  Open Web Chat (")$CHAT_URL$(t "),用 admin / 上述密码登录(首次登录需改密码)。" "), log in as admin with the password above (change it on first login).")"
 echo ""
-echo "  $(t "✅ 登录后即可直接用 —— 问答 / 故障调查 / 成本分析 / Support 案例," "✅ Ready to use right after login — Q&A / investigation / cost analysis / Support cases,")"
-echo "     $(t "默认操作【部署账号】本身,无需任何额外配置。左侧菜单能看到" "operating on the [deploy account] itself by default, no extra config. The left menu shows")"
-echo "     $(t "通知 / 调查 / FinOps / 案例 / Skills,以及「更多」里的 安全 / 巡检&报告 / 定制。" "Notifications / Investigation / Cost / Cases / Skills, plus Security / Inspections & Reports / Customize under \"More\".")"
+if [ "$AGENT_STATUS" = "deployed" ]; then
+  echo "  $(t "✅ 登录后即可直接用 —— 问答 / 故障调查 / 成本分析 / Support 案例," "✅ Ready to use right after login — Q&A / investigation / cost analysis / Support cases,")"
+  echo "     $(t "默认操作【部署账号】本身,无需任何额外配置。左侧菜单能看到" "operating on the [deploy account] itself by default, no extra config. The left menu shows")"
+  echo "     $(t "通知 / 调查 / FinOps / 案例 / Skills,以及「更多」里的 安全 / 巡检&报告 / 定制。" "Notifications / Investigation / Cost / Cases / Skills, plus Security / Inspections & Reports / Customize under \"More\".")"
+else
+  # agent 没上线时这句"登录后即可直接用"是**假的** —— 别说。
+  echo "  $(t "⚠ 上面的 Agent 问题修好之前,聊天只会回显,不要按下面的流程验收。" "⚠ Until the agent issue above is fixed, chat only echoes — do not sign off on the steps below yet.")"
+fi
 echo ""
 echo "  $(t "2️⃣  (可选)填 Bedrock API Key —— 跨账号调模型才需要:" "2️⃣  (Optional) Set a Bedrock API Key — only needed for cross-account model calls:")"
 echo "      $(t "Web Chat 左侧「更多 → 巡检 & 报告」打开控制台 →「设置 → AI 配置」填入并保存。" "Open the console via Web Chat \"More → Inspections & Reports\" → \"Settings → AI Config\", enter and save.")"

@@ -798,6 +798,36 @@ await t("the probe never sends sampling params", async () => {
   }
 });
 
+await t("the probe's output cap clears every known per-model minimum", async () => {
+  // 同一个故障的另一半：`maxTokens: 8` 低于 Grok 4.6 的下限（>= 16），于是探测报
+  // ValidationException → invalid_model → 出厂默认模型在 Admin 页**存不下去**，
+  // 而报错说的是"模型无效"。这里钉住那个常量，别再为省 token 把它调回边界值。
+  const src = await import("node:fs").then((fs) =>
+    fs.promises.readFile(new URL("../llm_config.mjs", import.meta.url), "utf8"));
+  const m = src.match(/const PROBE_MAX_TOKENS\s*=\s*(\d+)/);
+  assert.ok(m, "PROBE_MAX_TOKENS must exist and be a literal");
+  assert.ok(Number(m[1]) >= 32,
+            `PROBE_MAX_TOKENS=${m[1]} is too close to the measured per-model minimum (16)`);
+  // Converse 与 Mantle 两条探测都必须用它 —— 一边写死数字就会各自漂移。
+  assert.ok(/inferenceConfig:\s*\{\s*maxTokens:\s*PROBE_MAX_TOKENS\s*\}/.test(src),
+            "the Converse probe must use PROBE_MAX_TOKENS");
+  assert.ok(/max_output_tokens:\s*PROBE_MAX_TOKENS/.test(src),
+            "the Mantle probe must use PROBE_MAX_TOKENS");
+});
+
+await t("an output-cap-too-low rejection is not blamed on the model", async () => {
+  // 实测（2026-08-26，us-east-1）：maxTokens=8 → ValidationException
+  // "... integer_below_min_value ... Expected a value >= 16"。必须落到 probe_error，
+  // 否则它进 HARD_FAIL_PROBE_RESULTS 硬拦保存。
+  state.converseError = "ValidationException";
+  state.converseMessage = "The value of maxTokens is invalid: integer_below_min_value. Expected a value >= 16";
+  const r = await mod.apiTestLlmModel({ model_id: "global.xai.grok-4.6" });
+  state.converseError = null; state.converseMessage = null;
+  assert.equal(r.result, "probe_error");
+  assert.ok(!JSON.stringify(r).includes("integer_below_min_value"),
+            "must not leak upstream text");
+});
+
 await t("on-demand-unsupported is distinguished from an unknown model", async () => {
   // 东京的 amazon.nova-pro-v1:0 只能经 inference profile 调用。报成 invalid_model 会让
   // 管理员以为模型不存在，而正确的下一步是"换成 apac./global. 前缀的那个"。

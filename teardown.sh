@@ -413,6 +413,15 @@ if [ -n "$GW_ID" ]; then
     run aws bedrock-agentcore-control delete-gateway-target --gateway-identifier "$GW_ID" \
       --target-id "$tgt" --region "$REGION" >/dev/null || true
   done
+  # 删 target 是**异步**的：DELETE 返回成功只表示"开始删了"。不等它真的消失就删
+  # Gateway，服务端会以「还挂着 target」拒掉，而上面那个 `|| true` 把失败吞掉 ——
+  # 结果是脚本报告"删完了"，Gateway 却还 READY 留在账号里。
+  for _ in $(seq 1 40); do   # 40 × 3s
+    remaining="$(awsq bedrock-agentcore-control list-gateway-targets \
+      --gateway-identifier "$GW_ID" --query 'length(items)')"
+    if [ -z "$remaining" ] || [ "$remaining" = "0" ] || [ "$remaining" = "None" ]; then break; fi
+    sleep 3
+  done
   run aws bedrock-agentcore-control delete-gateway --gateway-identifier "$GW_ID" --region "$REGION" >/dev/null || true
 fi
 if aws iam get-role --role-name "$GW_ROLE" >/dev/null 2>&1; then

@@ -209,6 +209,30 @@ def _empty_bucket(bucket: str, keep: set[str] | None = None) -> int:
     return deleted
 
 
+def _delete_bucket(bucket: str) -> None:
+    """删桶，`OperationAborted` 要原地重试。
+
+    刚清空一个桶之后，S3 常把紧接着的 DeleteBucket 以「A conflicting conditional
+    operation is currently in progress against this resource」拒掉 —— 前一批删除还在
+    收敛。这条路径上的异常是**要上抛**的（客户选了 DeleteEverything，悄悄留下数据比
+    卡住更糟），所以不重试就等于把删栈直接送进 DELETE_FAILED：实测踩到过一次，客户看到
+    的就是"删栈失败了"，而唯一的处置是自己再点一次 Delete。
+    """
+    for attempt in range(6):  # 6 × 5s
+        try:
+            s3.delete_bucket(Bucket=bucket)
+            print(f"deleted bucket {bucket}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            if _ignore_missing(exc):
+                return
+            code = exc.response.get("Error", {}).get("Code") if isinstance(exc, ClientError) else None
+            if code != "OperationAborted" or attempt == 5:
+                raise
+            print(f"bucket {bucket}: {code} — retrying")
+            time.sleep(5)
+
+
 def _content_type(key: str) -> str:
     guess = mimetypes.guess_type(key)[0]
     if guess:
@@ -381,12 +405,7 @@ def _teardown_site(props) -> dict:
     data_bucket = props.get("DataBucket") or ""
     if data_bucket:
         _empty_bucket(data_bucket)
-        try:
-            s3.delete_bucket(Bucket=data_bucket)
-            print(f"deleted bucket {data_bucket}")
-        except Exception as exc:  # noqa: BLE001
-            if not _ignore_missing(exc):
-                raise
+        _delete_bucket(data_bucket)
     ddb = boto3.client("dynamodb")
     for table in json.loads(props.get("TableNames") or "[]"):
         try:
@@ -648,19 +667,42 @@ def _pid_owns_gateway(pid: str) -> bool:
 _GATEWAY_DEAD = ("FAILED", "UPDATE_UNSUCCESSFUL")
 
 
+def _wait_targets_gone(gw_id: str) -> None:
+    """等 target 真的消失，再去删 Gateway。
+
+    删 target 和删 Gateway 一样是**异步**的：DELETE 返回成功只表示"开始删了"。紧接着
+    删 Gateway 会被服务端以「还挂着 target」拒掉 —— 而删栈路径把这个异常**故意咽掉**
+    （宁可留孤儿也不把栈卡在 DELETE_FAILED），于是失败是**静默**的：栈干干净净删完了，
+    Gateway 还 READY 躺在账号里，跟文档承诺的"本栈建的会随栈删除"正好相反。
+    实测就是这么漏的一个（target 已删掉、gateway 留着）。
+    """
+    for _ in range(40):  # 40 × 3s = 2 分钟
+        if not _ac_paginate(f"/gateways/{gw_id}/targets/"):
+            return
+        time.sleep(3)
+    raise _AgentCoreError("TargetsStillDeleting", 0, "gateway targets did not go away in 2 min")
+
+
 def _delete_gateway(gw_id: str) -> None:
-    """删掉一个 Gateway（有 target 时删不掉，所以先清 target）。缺了就算删过。"""
+    """删掉一个 Gateway（有 target 时删不掉，所以先清 target 并等它真的没了）。缺了就算删过。"""
     for t in _ac_paginate(f"/gateways/{gw_id}/targets/"):
         try:
             _ac_call("DELETE", f"/gateways/{gw_id}/targets/{t['targetId']}/")
         except Exception as exc:  # noqa: BLE001
             if not _ignore_missing(exc):
                 raise
-    try:
-        _ac_call("DELETE", f"/gateways/{gw_id}/")
-    except Exception as exc:  # noqa: BLE001
-        if not _ignore_missing(exc):
-            raise
+    _wait_targets_gone(gw_id)
+    # target 都没了还可能撞上服务端的收敛窗口，重试两次再认输。
+    for attempt in range(3):
+        try:
+            _ac_call("DELETE", f"/gateways/{gw_id}/")
+            return
+        except Exception as exc:  # noqa: BLE001
+            if _ignore_missing(exc):
+                return
+            if attempt == 2:
+                raise
+            time.sleep(5)
 
 
 def _wait_gateway_gone(gw_id: str) -> None:

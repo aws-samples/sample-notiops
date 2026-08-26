@@ -69,11 +69,20 @@ if [ -n "$GW_ID" ] && [ "$GW_ID" != "None" ]; then
   case "$(gw_status "$GW_ID")" in
     FAILED|UPDATE_UNSUCCESSFUL)
       echo "$(t "⚠️  已有 Gateway ${GW_ID} 建失败且不会自愈，删掉重建…" "⚠️  Existing Gateway ${GW_ID} failed to build and will not self-heal; replacing it…")" >&2
-      # 有 target 时 Gateway 删不掉，先清 target。
+      # 有 target 时 Gateway 删不掉，先清 target —— 而且删 target 也是**异步**的，
+      # DELETE 返回成功只表示"开始删了"。不等它真的消失就删 Gateway，会被服务端以
+      # 「还挂着 target」拒掉；这里 `|| true` 又把失败吞了，于是就成了静默失败：
+      # 脚本继续往下跑，那个死 Gateway 其实还在。
       for TID in $(aws bedrock-agentcore-control list-gateway-targets --region "$REGION" \
           --gateway-identifier "$GW_ID" --query 'items[].targetId' --output text 2>/dev/null || true); do
         aws bedrock-agentcore-control delete-gateway-target --region "$REGION" \
           --gateway-identifier "$GW_ID" --target-id "$TID" >/dev/null 2>&1 || true
+      done
+      for _ in $(seq 1 40); do   # 40 × 3s
+        REMAINING="$(aws bedrock-agentcore-control list-gateway-targets --region "$REGION" \
+          --gateway-identifier "$GW_ID" --query 'length(items)' --output text 2>/dev/null || echo 0)"
+        if [ "$REMAINING" = "0" ] || [ "$REMAINING" = "None" ]; then break; fi
+        sleep 3
       done
       aws bedrock-agentcore-control delete-gateway --region "$REGION" \
         --gateway-identifier "$GW_ID" >/dev/null 2>&1 || true

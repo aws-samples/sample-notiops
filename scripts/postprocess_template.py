@@ -47,12 +47,15 @@ DEFAULT_BASE_URL_TEMPLATE = "https://github.com/aws-samples/sample-notiops/relea
 # `Default: {Tag, BaseUrl}` 会被判模板格式错误。cdk synth 不报，validate-template 才报。
 RELEASE_MAP_KEY = "Current"
 
-# 三个 Release 产物。名字就是 Release 里的资产文件名，StagerFn 用
+# 四个 Release 产物。名字就是 Release 里的资产文件名，StagerFn 用
 # `<BaseUrl>/<name>` 拼下载地址。
 # 顺序 = StagerFn 的搬运顺序：小的先搬。144 MiB 的 agent zip 放最后，
 # 前面任何一个失败都能在几秒内暴露，而不是等它传完才发现。
 BFF_ARTIFACT = "bff.zip"
 CHAT_DIST_ARTIFACT = "chat-dist.zip"
+# 「通知」生产端。名字与 infra/lib/constructs/web-notif-sources.ts 的
+# `WEB_NOTIF_ARTIFACT`、scripts/build_web_notif_zip.py 的产出一致。
+NOTIF_ARTIFACT = "web-notif.zip"
 AGENT_ARTIFACT = "agent-code.zip"
 
 # CDK 默认 bootstrap 限定词（qualifier）。出现在资产桶名里。
@@ -197,7 +200,7 @@ def set_release(template: dict, tag: str, base_url: str) -> None:
 
 
 def build_manifest(template: dict, sums: dict[str, str]) -> list[dict]:
-    """从模板里读出三个产物的 S3 key，配上 sha256，组成 StagerFn 要的清单。
+    """从模板里读出四个产物的 S3 key，配上 sha256，组成 StagerFn 要的清单。
 
     key **一律从模板里读**、不在这里重新拼一遍。理由：模板是唯一真源 —— BFF 的
     key 是 CDK 算的资产 hash，agent / 前端的 key 是栈里用 tag 拼的。在脚本里复述
@@ -216,8 +219,12 @@ def build_manifest(template: dict, sums: dict[str, str]) -> list[dict]:
         mappings)
     dist_key = _resolve(resources["StagerSite"]["Properties"]["ChatDistKey"], mappings)
 
+    notif_id = _logical_id_by_cdk_path(resources, "/WebNotifFn")
+    notif_key = _resolve(resources[notif_id]["Properties"]["Code"]["S3Key"], mappings)
+
     manifest = []
-    for name, key in ((BFF_ARTIFACT, bff_key), (CHAT_DIST_ARTIFACT, dist_key), (AGENT_ARTIFACT, agent_key)):
+    for name, key in ((BFF_ARTIFACT, bff_key), (CHAT_DIST_ARTIFACT, dist_key),
+                      (NOTIF_ARTIFACT, notif_key), (AGENT_ARTIFACT, agent_key)):
         if name not in sums:
             raise PostprocessError(f"{name} has no sha256 in the checksum manifest (have: {sorted(sums)})")
         manifest.append({"name": name, "key": key, "sha256": sums[name]})
@@ -351,8 +358,8 @@ def assert_clean(template: dict, tag: str) -> None:
 
     # 每个产物在模板里都得真的被引用到 —— 搬一个没人用的 zip 只是白花时间和流量。
     manifest = json.loads(resources["StagerArtifacts"]["Properties"]["Artifacts"])
-    if len(manifest) != 3:
-        raise PostprocessError(f"expected 3 artifacts in the manifest, got {len(manifest)}")
+    if len(manifest) != 4:
+        raise PostprocessError(f"expected 4 artifacts in the manifest, got {len(manifest)}")
     for entry in manifest:
         for field in ("name", "key", "sha256"):
             if not entry.get(field):

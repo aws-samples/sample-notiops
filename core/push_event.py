@@ -300,7 +300,7 @@ def from_cost_anomaly(event: dict) -> PushEvent | None:
     Cost Anomaly Detection is a global service whose events are emitted in the
     Cost Anomaly Detection home region (us-east-1 for most accounts), so an
     EventBridge rule in another region will never match — see the region note
-    on webNotifSources in infra/lib/notiops-backend-stack.ts.
+    on WEB_NOTIF_SOURCES in infra/lib/constructs/web-notif-sources.ts.
     """
     detail = event.get("detail") or {}
     impact = (detail.get("impact") or {})

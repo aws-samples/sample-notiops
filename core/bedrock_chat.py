@@ -559,7 +559,7 @@ def respond(user_text: str, *, command: str,
                 resolve the per-chat model preference set via
                 `@bot model X`. Optional — when omitted the bot falls
                 back to the catalogue's admin-managed `default_model`
-                (Grok 4.6 today). The old `DEFAULT_LLM_PROVIDER` /
+                (Claude Sonnet 5 today). The old `DEFAULT_LLM_PROVIDER` /
                 SSM levels were removed in 2026-08 (spec R8.2) because
                 they silently out-ranked the admin default; see
                 `core/llm_pref_resolver.py`.

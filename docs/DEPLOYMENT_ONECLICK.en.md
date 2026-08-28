@@ -31,14 +31,13 @@ The repository ships **two** ways to deploy, with different scope. This document
 
 Better said up front than discovered later. These require `setup.sh`:
 
-- **IM bots** (Feishu / Slack / DingTalk), including alert push to IM.
+- **IM bots** (Feishu / Slack / DingTalk), including alert push to IM. (The same 10 signal sources **do** land in the in-browser Notifications inbox — see [§2.9](#29-notifications-inbox); only the IM leg is missing.)
 - **Scheduled daily inspection** (idle-resource detection, cost-anomaly scanning) and its 5 Lambdas.
 - **The admin dashboard** (thresholds, target-account management, Skills management UI). One-click ships the chat UI only.
-- **Content for the Notifications inbox**: the UI is there, but the backend that produces notifications (Health event forwarding, alert push) is not.
 - **CUR + Athena cost detail**: FinOps questions still work at Cost Explorer granularity, but there is no bill-line-level drill-down.
 - **Cross-account scheduled inspection and event forwarding**: one-click *can* do **cross-account read-only inspection / investigation / case creation** (`DeployMode=MultiAccount`, see [§2.6](#26-optional-multi-account-across-an-organization)), but the member-account **CloudWatch OAM Sink** and **cross-account event forwarding** (Health / DevOps Agent investigation events flowing back) are not part of this path — those need `setup.sh`.
 
-(**DevOps Agent deep investigation** and **web search** are *not* in this list — the stack creates both for you, see [§2.7](#27-deep-investigation-aws-devops-agent) and [§2.8](#28-web-search-agentcore-web-search).)
+(**DevOps Agent deep investigation**, **web search** and the **Notifications inbox** are *not* in this list — the stack creates all three for you, see [§2.7](#27-deep-investigation-aws-devops-agent), [§2.8](#28-web-search-agentcore-web-search) and [§2.9](#29-notifications-inbox).)
 
 ---
 
@@ -55,14 +54,14 @@ Your identity needs to be able to create a CloudFormation stack and the resource
 
 The agent runs on **Amazon Bedrock**. **Before creating the stack**, go to the Bedrock console → Model access and confirm the model you want shows **Access granted** in that region.
 
-- **The default model is xAI Grok 4.6** (`global.xai.grok-4.6`) — grant access to that one or the deployment is unusable.
-- Want a different model (Claude Sonnet 5 / Opus 5, Amazon Nova Pro, DeepSeek, the GPT-5.6 family)? Grant those too; users can switch per session from the top-right of the chat page.
+- **The default model is Anthropic Claude Sonnet 5** (`global.anthropic.claude-sonnet-5`) — grant access to that one or the deployment is unusable.
+- Want a different model (Claude Opus 5 / Haiku 4.5, Amazon Nova Pro, DeepSeek, GLM 5, xAI Grok 4.6, the GPT-5.6 family)? Grant those too; users can switch per session from the top-right of the chat page.
 - **us-east-1** or **us-west-2** recommended (best Bedrock AgentCore and model coverage).
 - Without model access the stack still **succeeds**, the site loads and login works — but every question fails with `AccessDeniedException`. This is the most common "it deployed but doesn't work".
 
 ### 1.3 The account must be able to reach GitHub (or bring your own mirror)
 
-During deployment, a Lambda inside the stack downloads three artifacts (frontend, BFF, agent code) from the **GitHub Release** and stages them into your own S3 bucket. Lambda is not in a VPC here and uses AWS-managed egress, so **most accounts satisfy this out of the box**.
+During deployment, a Lambda inside the stack downloads four artifacts (frontend, BFF, notification producer, agent code) from the **GitHub Release** and stages them into your own S3 bucket. Lambda is not in a VPC here and uses AWS-managed egress, so **most accounts satisfy this out of the box**.
 
 If your enterprise egress allowlist does **not** include github.com, you don't have to abandon this path — see [§7 No internet egress: use a private S3 mirror](#7-no-internet-egress-use-a-private-s3-mirror).
 
@@ -78,7 +77,7 @@ From the [Releases](https://github.com/aws-samples/sample-notiops/releases) page
 notiops-webchat.template.json
 ```
 
-The same release also has three artifacts (`bff.zip` / `chat-dist.zip` / `agent-code.zip`) — **you don't need to download those**; the template makes your account fetch them. Their SHA256 digests are baked into the template and verified on arrival; a mismatch fails the stack.
+The same release also has four artifacts (`bff.zip` / `chat-dist.zip` / `web-notif.zip` / `agent-code.zip`) — **you don't need to download those**; the template makes your account fetch them. Their SHA256 digests are baked into the template and verified on arrival; a mismatch fails the stack.
 
 > **Why isn't there a one-click "Launch Stack" link?** CloudFormation's `TemplateURL` only accepts
 > objects in S3, not GitHub URLs. So this costs you two extra clicks (download + upload) and buys
@@ -170,7 +169,18 @@ This path still does **not** include: member-account CloudWatch OAM Sinks, cross
 
 ### 2.7 Deep investigation (AWS DevOps Agent)
 
-**Enable deep investigation** defaults to `Yes`: the stack also creates an **AWS DevOps Agent agent space** (named `notiops-oneclick-<account id>`) and associates this account with it as a **monitor (read-only)** target. That's what powers "deep investigation" in the chat UI — handing a problem to the AWS-managed DevOps Agent for multi-round autonomous triage, which digs deeper than a single question-and-answer round.
+**Enable deep investigation** defaults to `Yes`: the stack also creates an **AWS DevOps Agent agent space** (named `notiops-oneclick-<account id>`) and associates this account with it as a **monitor (read-only)** target. That's what powers **every DevOps Agent capability** in the chat UI — handing a problem to the AWS-managed DevOps Agent for multi-round autonomous triage, which digs deeper than a single question-and-answer round.
+
+Four capabilities depend on this one agent space (without it, the matching toggle is **greyed out with the reason shown**):
+
+| Capability | Who answers that turn | Notes |
+|---|---|---|
+| **Deep investigation** | DevOps Agent (NotiOps first turns your question into an investigation request) | Multi-signal root cause with an HTML report, usually minutes |
+| **Deep investigation (Direct)** | DevOps Agent, calling the API **without an LLM** | The same investigation, **token-free**; the trade-off is that your wording is passed through as-is |
+| **DevOps Chat** | DevOps Agent **answers directly** (pick "conversation object = DevOps Agent" in a general chat) | Streaming Q&A, the same experience as the DevOps Agent's own console; **0 tokens on the NotiOps side** and **no model setup** (nothing to enable in Bedrock); usage is billed to your own DevOps Agent |
+| **Publish a Skill to DevOps Agent** | — | Pushes your own Skill into the agent space so the "deep investigation" path can use it |
+
+> 💡 The middle two are especially useful for a fresh deployment with **no Bedrock models enabled yet**: pick DevOps Agent as the answerer and you can start immediately.
 
 - **Billing**: charged per **agent-second while a task runs**; an **idle agent space costs nothing**. That's why it defaults to on — it won't hand you a monthly bill for doing nothing.
 - **Regions**: AWS DevOps Agent is only available in some Regions. **If yours isn't one of them the stack does not fail** — this piece is silently skipped, everything else works, and `DeepInvestigationStatus` says it was skipped for that reason.
@@ -187,9 +197,33 @@ This path still does **not** include: member-account CloudWatch OAM Sinks, cross
 
 ---
 
+### 2.9 Notifications inbox
+
+**No parameters, the stack sets it up.** The inbox behind the first left-nav item is fed by **10 EventBridge rules** → one Lambda (`notiops-web-notif-handler`, normalizes + dedups within 5 minutes) → the `notiops-web-chat` table. The frontend polls every **60s**, so latency is up to about a minute; the red dot counts **unread only**.
+
+- **On by default (5)** — highest operational value, manageable noise: AWS Health / CloudWatch Alarm / Cost Anomaly / Trusted Advisor / GuardDuty
+- **Off by default (5)** — high volume, or need a paid service turned on first: Backup jobs / EC2 Spot interruptions / Auto Scaling failures / RDS / Config
+- **How to toggle**: **EventBridge console → Rules**, rules prefixed `notiops-web-notif-`, then **Enable / Disable** the one you want. That manual change **survives version upgrades** (the template does not manage the enabled state).
+
+> ⚠️ **3 of the 5 on-by-default sources also need something on your side** — the rule is enabled, but without the prerequisite no events arrive (the empty state in the UI says which one, so it doesn't look like NotiOps is broken):
+>
+> | Source | Prerequisite |
+> |---|---|
+> | GuardDuty | GuardDuty must be **enabled** in the account (paid). Until then there are no findings; the enabled rule costs nothing and starts working the moment you enable it, no redeploy |
+> | Cost Anomaly | Create a **cost anomaly monitor** in Cost Explorer first (free); events are emitted only in `us-east-1` |
+> | Trusted Advisor | Needs a **Business+ / Enterprise / Unified Operations** support plan; events are emitted only in `us-east-1` |
+>
+> Cost Anomaly and Trusted Advisor are **global services that only emit EventBridge events in `us-east-1`**. Deploy the stack elsewhere and those two rules exist but **never fire** (their rule description says so) — to receive them, deploy NotiOps in `us-east-1`, or add your own cross-region forwarding rule in `us-east-1`.
+
+The Notifications topic also has an **AWS Health Dashboard live view** that the BFF queries against the Health API in real time (not persisted); it needs a **Business+ / Enterprise** support plan. Without one it degrades to console links, and its unhandled count is **not** rolled into the red dot.
+
+**Cross-account**: these 10 rules only see events from the **deployment account itself**. Getting member-account events here needs cross-account event forwarding, which is not part of this path (see [§0.1](#01-what-one-click-does-not-include)).
+
+---
+
 ## 3. What the stack creates
 
-**50 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 4 fewer with deep investigation off; 3 more if you pick multi-account):
+**65 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 4 fewer with deep investigation off; 3 more if you pick multi-account):
 
 | Category | Resources |
 |---|---|
@@ -200,6 +234,7 @@ This path still does **not** include: member-account CloudWatch OAM Sinks, cross
 | Data | DynamoDB `notiops-config`, `notiops-web-chat`; 1 data bucket (reports etc.) |
 | Deployment helper | 1 staging bucket (for the staged artifacts) + 1 inline Lambda + 2 custom resources |
 | Permissions | 5 IAM roles + 5 inline policies |
+| Notifications inbox (see [§2.9](#29-notifications-inbox)) | **10 EventBridge rules** (5 ENABLED / 5 DISABLED) + 1 Lambda + its log group + 1 role (plus its policy) + 1 Lambda invoke permission = 15 |
 | Deep investigation (on by default) | 1 DevOps Agent agent space + 1 read-only association + 1 role assumed by DevOps Agent (plus its policy) |
 | Web search (us-east-1 only) | 1 custom resource (creates the AgentCore gateway) + 1 gateway service role + 1 inline policy |
 | Multi-account (optional) | 1 custom resource (creates the two member StackSets) + 2 inline policies |
@@ -340,14 +375,15 @@ During deletion the stack's deployment Lambda first **empties** the website and 
 
 ## 7. No internet egress: use a private S3 mirror
 
-If your account has no internet egress (or policy forbids pulling executable code from github.com), mirror the three artifacts into an S3 bucket and point the stack at it. The bucket can be **fully private** (Block Public Access all on) — the deployment Lambda reads it with its own role over the S3 API, no internet required.
+If your account has no internet egress (or policy forbids pulling executable code from github.com), mirror the four artifacts into an S3 bucket and point the stack at it. The bucket can be **fully private** (Block Public Access all on) — the deployment Lambda reads it with its own role over the S3 API, no internet required.
 
 **One-time setup** (done once by someone with credentials; every account/team can then reuse the mirror):
 
 ```bash
-# Download the three artifacts from the release into a bucket in the SAME region you deploy to
+# Download the four artifacts from the release into a bucket in the SAME region you deploy to
 aws s3 cp bff.zip        s3://my-mirror/notiops/v1.2.3/
 aws s3 cp chat-dist.zip  s3://my-mirror/notiops/v1.2.3/
+aws s3 cp web-notif.zip  s3://my-mirror/notiops/v1.2.3/
 aws s3 cp agent-code.zip s3://my-mirror/notiops/v1.2.3/
 ```
 

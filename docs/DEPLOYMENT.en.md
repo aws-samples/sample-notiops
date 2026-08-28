@@ -166,7 +166,7 @@ Credential flow: `setup.sh` **does not collect IM credentials** — it only sets
 - **AWS account**: admin or equivalent permissions
 - **VPC**: any VPC capable of running ECS Fargate + ≥ 2 AZs of public subnets (**only needed if you enable the IM bot** — Fargate tasks reach IM APIs over the public internet; ignore for web-only)
 - **AWS DevOps Agent**: enabled (required for deep investigation). **No need to bring your own Agent Space** — CDK auto-creates one named `notiops-devops-<account>` in your account (see §5.3.4); you don't pre-create one or supply a space id
-- **Bedrock**: the model behind the catalogue's **default_model** is enabled in your region (Bedrock console → Model access). Today that is **Grok 4.6** (`global.xai.grok-4.6`); enable the others too (Claude Sonnet 5 / Opus 5, Nova Pro, DeepSeek, the GPT-5.6 family) if you want users to be able to switch
+- **Bedrock**: the model behind the catalogue's **default_model** is enabled in your region (Bedrock console → Model access). Today that is **Claude Sonnet 5** (`global.anthropic.claude-sonnet-5`); enable the others too (Claude Opus 5 / Haiku 4.5, Nova Pro, DeepSeek, GLM 5, Grok 4.6, the GPT-5.6 family) if you want users to be able to switch
 
 ### 2.3 Region selection
 
@@ -712,7 +712,7 @@ All tunable parameters live under the `context` block in `infra/cdk.json`. After
 
 | Component | Description |
 |---|---|
-| **Agent Runtime** | Bedrock AgentCore Runtime hosting the Strands agent (default model **Grok 4.6**, taken from the catalogue's `default_model`). Deployed as a CodeZip by `scripts/deploy_agent.sh`, which emits a **Runtime ARN** |
+| **Agent Runtime** | Bedrock AgentCore Runtime hosting the Strands agent (default model **Claude Sonnet 5**, taken from the catalogue's `default_model`). Deployed as a CodeZip by `scripts/deploy_agent.sh`, which emits a **Runtime ARN** |
 | **BFF Lambda** | Node 20 Lambda (`notiops-web-chat-bff`) with a **Function URL** (`AuthType=AWS_IAM`) that responds to the frontend via **SSE streaming**; it calls the Agent Runtime and also handles deterministic operations directly (case creation `/actions/execute`, the `/support/services` catalog, etc.) |
 | **Frontend** | React / Vite single-page app, statically hosted |
 | **Auth** | Cognito (reuses the notiops user pool) + Identity Pool; the frontend gets temporary credentials and **SigV4-signs** requests to the Function URL |
@@ -762,8 +762,32 @@ The frontend build artifact needs a `config.json` (injected at deploy time, not 
 
 The **persistent inbox** of Web Chat's "Notifications" topic is fed by EventBridge → `notiops-web-notif-handler` (reuses the `core/push_event` normalizer, 5-minute dedup) → writes to the `notif#` segment of the `notiops-web-chat` table. Source toggles:
 
-- **On by default**: CloudWatch Alarm / AWS Health / Backup
-- **Off by default**: GuardDuty / Cost Anomaly / Trusted Advisor / RDS / Config
+- **On by default** (5 — highest operational value, manageable noise): AWS Health / CloudWatch Alarm / Cost Anomaly / Trusted Advisor / GuardDuty
+- **Off by default** (5 — turn on with `-c webNotif<Id>=on`): Backup / EC2 Spot / Auto Scaling / RDS / Config
+  - Why off: either high volume that floods the inbox (Backup fires per job, Spot, RDS), or it needs a paid service enabled first and is noisy compliance chatter (Config)
+
+> ⚠️ **3 of the 5 on-by-default sources also depend on something on the customer's side** — the rule is enabled, but without the prerequisite no events arrive. The frontend empty state names the reason, so it doesn't get mistaken for NotiOps being broken:
+>
+> | Source | Prerequisite |
+> |---|---|
+> | GuardDuty | GuardDuty must be **enabled** in the account (paid). Until then there is no detector and no findings; an enabled rule costs nothing and starts working the moment GuardDuty is enabled, no redeploy needed |
+> | Cost Anomaly | A **cost anomaly monitor** must exist in Cost Explorer first (free); and events are emitted only in `us-east-1` |
+> | Trusted Advisor | Needs a **Business+ / Enterprise / Unified Operations** support plan; and events are emitted only in `us-east-1` |
+
+> ⚠️ **Cost Anomaly and Trusted Advisor are global services that only emit EventBridge events in `us-east-1`**
+> (TA: [docs](https://docs.aws.amazon.com/awssupport/latest/user/cloudwatch-events-ta.html); Cost Anomaly emits in its home region, normally `us-east-1`).
+> Deploy NotiOps in another region and those two rules exist but **never fire** — `cdk synth/deploy` prints an explicit warning.
+> To receive them: deploy NotiOps in `us-east-1`, or add a cross-region forwarding rule in `us-east-1` that ships the events to your deployment region.
+> Don't need them? `-c webNotifCostAnomaly=off -c webNotifTrustedAdvisor=off` and the warning goes away.
+
+> 📌 **Both deployment paths ship this whole set, from one shared definition.** The event-source definitions (10 sources, defaults, rule names, rule descriptions, Lambda env) live in
+> [`infra/lib/constructs/web-notif-sources.ts`](../infra/lib/constructs/web-notif-sources.ts), and `setup.sh`'s
+> `notiops-backend-stack.ts` and the one-click `notiops-webchat-standalone-stack.ts` **import the same file**
+> (check ⑤ in `scripts/test_oneclick_parity.py` pins that nobody copies the list back into a stack).
+> **The one intentional difference is how you turn a source off**: the `-c webNotif<Id>=off` above only applies to `setup.sh`.
+> One-click has no `-c`, so you Disable the `notiops-web-notif-*` rule in the **EventBridge console** instead — the template does not
+> manage a rule's enabled state, so that manual change is not reverted by a version upgrade.
+> The customer-facing write-up for one-click is [DEPLOYMENT_ONECLICK.en.md §2.9](DEPLOYMENT_ONECLICK.en.md#29-notifications-inbox).
 
 > Near real-time delivery is via **60s frontend polling** (not WebSocket, so there is up to ~60s latency); the left-nav red dot counts **inbox unread only**. The "Notifications" topic also has an **AWS Health Dashboard live view** that the BFF queries against the Health API in real time (not persisted); it requires a **Business+ / Enterprise Support** plan. Without one it degrades gracefully to console links, and the Health unhandled count is **not** rolled into the red dot.
 

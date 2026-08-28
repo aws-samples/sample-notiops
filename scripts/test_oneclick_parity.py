@@ -4,15 +4,17 @@
 ------------------
 两条部署路径落地的是**同一个** agent：同一份 `agent-build/.../app` 代码、同一个前端。
 它们的差别应该只在「谁把资源建出来」——方式 B 是 `agentcore deploy` + 多个 CDK 栈，
-方式 A 是一个 CloudFormation 单栈。可客户看到的产品是什么样，取决于四件事：
+方式 A 是一个 CloudFormation 单栈。可客户看到的产品是什么样，取决于这几件事：
 
     ① runtime 执行角色有哪些授权
     ② runtime 拿到哪些环境变量
     ③ 部署时往 DynamoDB 写了哪些出厂数据（模型目录等）
     ④ runtime 的生命周期设置（保温多久 / 最长活多久）
+    ⑤ 「通知」生产端（AWS 事件 → Web 收件箱）建没建、订了哪些事件源
 
-①②④ 是运行期行为，③ 是部署期数据 —— 四者在两条路径上各写了一份，没有任何一处能
-import 另一处：
+①②④ 是运行期行为，③ 是部署期数据 —— 三者在两条路径上各写了一份，没有任何一处能
+import 另一处；⑤ 反过来：它现在**只有一份**，两个栈 import 同一个模块，本文件断言的
+是「没有人把它抄回栈里」（见那一节的注释）。
 
     ① 方式 B：agent-build/NotiOpsWebChat/agentcore/cdk/lib/cdk-stack.ts 的 NotiOps 段
        方式 A：infra/lib/notiops-webchat-standalone-stack.ts 的 AgentCore Runtime 段
@@ -23,6 +25,10 @@ import 另一处：
     ④ 方式 B：agentcore.json 的 runtimes[].lifecycleConfig（+ backfill_runtime_env.sh 的
        SET_IDLE 默认值，deploy_agent.sh 部署后靠它强制回填）
        方式 A：同上那个栈里 AgentRuntime 的 LifecycleConfiguration
+    ⑤ 两条路径都 import infra/lib/constructs/web-notif-sources.ts
+       方式 B：notiops-backend-stack.ts 建 Lambda（复用 IM push 的 asset）+ 10 条规则
+       方式 A：notiops-webchat-standalone-stack.ts 建 Lambda（代码走 web-notif.zip 产物）
+       + 10 条规则
 
 漂移的后果**不是**「功能没做」，而是「界面上有开关、点了静默失败」——
 UI 上那些开关（联网搜索 / FinOps / 深度调查）绝大多数是**无条件**渲染的
@@ -304,6 +310,18 @@ def _oneclick_seeds_llm_catalog() -> list[str]:
         # 两条路径必须口径一致，否则"升级"在一条路径上是无害的、在另一条是破坏性的。
         ("the write is conditional on both paths",
          "attribute_not_exists(PK)" in stager and "attribute_not_exists(PK)" in seeder),
+        # 条件写让「已存在」成为每次升级的常态路径，所以两条路径都必须在那一支里把
+        # **后来新增的模型**补上（只增不改，且只在 generation==0 时）。少了这一步，
+        # 首次部署之后加进目录的模型永远到不了那个环境 —— 不报错，只是管理台「模型」页
+        # 和模型选择器里少一个（2026-08-27 现网的 zai-glm-5 就是这么丢的）。
+        # 一条路径补、另一条不补，等于同一个客户换种装法就少几个模型。
+        ("both paths top up models added after the first deploy",
+         "generation = :zero" in stager and "generation = :zero" in seeder
+         and "merge_missing_models" in stager and "merge_missing_models" in seeder),
+        # 补的那一步要读+改，一键路径的 stager role 得有对应权限；只给 PutItem 的话
+        # 这条分支会以 AccessDenied 让整栈升级失败（比静默少一个模型更响，但同样是缺陷）。
+        ("the stager role may read and update the config item too",
+         "dynamodb:GetItem" in stack and "dynamodb:UpdateItem" in stack),
     ):
         if not cond:
             gaps.append(label)
@@ -433,6 +451,104 @@ def test_runtime_lifecycle_matches() -> None:
            "AgentCore 不显式声明时的默认值是 900s。要改先改这句注释和文档。")
 
 
+# ───────────────── 第五个维度：「通知」生产端（AWS 事件 → Web 收件箱）─────────────────
+#
+# 为什么它单独算一个维度：前四条断言全在看 **AgentCore runtime**。「通知」的生产端根本
+# 不在 runtime 里 —— 它是一个独立 Lambda + 一堆 EventBridge 规则，前四条断言结构上
+# 看不见它。而它曾经真的只有方式 B 有：读端（`notif#` 段、BFF 的 `/notifications*`、
+# 侧栏红点）在 `web-chat-core.ts` 里，两条路径自动对等，于是方式 A 部署出来的环境
+# 「通知」页面**永远是空的**：不报错、不写日志，客户只会以为这个功能是假的。
+#
+# 修法不是"两边各写一份再断言相等"，而是把事件源清单/函数名/handler/规则名/环境变量
+# 全提到 `infra/lib/constructs/web-notif-sources.ts`，两个栈 import 同一份。所以这个
+# 维度断言的是**"没有人把它抄回去"**：谁在某个栈里重新声明一份，这里就失败。
+#
+# 已知且**有意**的差异：**怎么关掉某一个事件源**。
+#   · 方式 B：合成期 `-c webNotif<Id>=off`（模板由客户本地 synth，可以有 context）
+#   · 方式 A：EventBridge 控制台上 Disable 那条规则（发布出去的静态模板没有 context，
+#     而给 10 个源各开一个 CFN Parameter 会把参数页淹掉）
+# 这是机制固有的差异，不是功能差异：默认开哪 5 个、规则叫什么名字，两边逐字相同。
+NOTIF_SOURCES_TS = "infra/lib/constructs/web-notif-sources.ts"
+SETUP_BACKEND = "infra/lib/notiops-backend-stack.ts"
+
+#: 两个栈都必须从共享模块 import 的东西。少 import 一个 = 那一项在某条路径上被本地
+#: 硬编码了（或者干脆没有），而症状是静默的。
+NOTIF_SHARED_SYMBOLS = (
+    "WEB_NOTIF_FUNCTION_NAME",   # Lambda 物理名：文档/日志排查按这个名字讲
+    "WEB_NOTIF_HANDLER",         # handler 路径：写错 = 客户账号里 ImportError
+    "WEB_NOTIF_SOURCES",         # 10 个事件源 + 默认开关
+    "webNotifRuleName",          # 规则物理名：客户去控制台找的就是这个名字
+    "webNotifRuleDescription",   # 控制台上那行说明（含 globalOnly 提示）
+    "webNotifEnv",               # 三个环境变量（表名 / 收件箱粒度 / TTL）
+)
+
+
+def _notif_imports(rel: str) -> set[str]:
+    """某个栈从 web-notif-sources 里 import 了哪些符号。"""
+    src = _read(rel)
+    m = re.search(r"import\s*\{([^}]*)\}\s*from\s*\"\./(?:constructs/)?web-notif-sources\";", src)
+    if m is None:
+        raise AssertionError(
+            f"{rel}: no import from ./constructs/web-notif-sources —— 「通知」生产端的定义"
+            "必须来自那份共享模块，不能在栈里自己写一份。")
+    return {s.strip() for s in m.group(1).split(",") if s.strip()}
+
+
+def test_web_notif_producer_parity() -> None:
+    """两条路径的「通知」生产端必须来自同一份定义，且谁也不许自己再写一份。"""
+    print("\ntest_web_notif_producer_parity")
+
+    shared = _read(NOTIF_SOURCES_TS)
+    # 事件源那张表**只能**有一份。判据取 `source: "aws.` 的出现次数：共享模块里
+    # 10 个（每个源一行），任何一个栈里出现 = 有人抄了一份回去。
+    # 判据形状：一条源的定义 = 一个 `{…}` 里既有 `source: "aws.…"` 又有 `on: true|false`
+    # （出厂开关）。**不能**只看 `source: "aws.`：同一个后端栈里还有 IM push 的
+    # `pushRuleSources`（5 条，同样是 `source: "aws.…"` 但没有 `on:`）—— 那是另一个功能
+    # （推到飞书），一键部署整块不含 IM，它本来就不该有方式 A 的对应物，不算漂移。
+    def _source_entries(text: str) -> list[str]:
+        return [b for b in re.findall(r"\{[^{}]*\}", text, re.S)
+                if re.search(r'source:\s*"aws\.', b) and re.search(r"\bon:\s*(?:true|false)\b", b)]
+
+    shared_sources = len(_source_entries(shared))
+    _check("事件源清单只在共享模块里有一份", shared_sources == 10,
+           f"共享模块里数到 {shared_sources} 个事件源 —— 加/删事件源时"
+           "也要更新这条数字判据（和下面那条 5 开 5 关）。")
+    for rel in (ONECLICK, SETUP_BACKEND):
+        text = _strip_comments(_read(rel))
+        _check(f"{os.path.basename(rel)} 没有自己的 web 通知事件源清单",
+               not _source_entries(text),
+               "栈里出现了带 `on:` 开关的 `source: \"aws.…\"` —— web 通知的事件源被抄回栈里了。"
+               "抄一份的代价是：以后加一个源只在一条路径上生效，而症状同样是静默的。")
+
+    for rel in (ONECLICK, SETUP_BACKEND):
+        imported = _notif_imports(rel)
+        for sym in NOTIF_SHARED_SYMBOLS:
+            _check(f"{os.path.basename(rel)} 从共享模块取 {sym}", sym in imported,
+                   f"实际 import 到的是 {sorted(imported)}")
+
+    # 出厂默认：5 开 5 关。两条路径都读同一份 `on:`，所以这里钉的是**产品决定**本身 ——
+    # 上面那些断言只保证"两边一样"，一起被改掉照样通过。
+    on_count = len(re.findall(r"on:\s*true", shared))
+    off_count = len(re.findall(r"on:\s*false", shared))
+    _check("出厂默认仍是 5 开 5 关", (on_count, off_count) == (5, 5),
+           f"数到 {on_count} 开 / {off_count} 关。改默认值要同步 "
+           "WEB_NOTIF_FUNCTION_DESCRIPTION（客户在 Lambda 控制台上看到的那句）"
+           "与 docs/DEPLOYMENT{,.en}.md 的 §12.5 两份清单。")
+
+    # 方式 A 侧的三件必需品。缺任一件 = 规则建了但收不到 / 函数建了但写不进表。
+    oneclick = _strip_comments(_read(ONECLICK))
+    _check("方式 A 建了生产端 Lambda（WebNotifFn）", "new lambda.CfnFunction(this, \"WebNotifFn\"" in oneclick)
+    _check("方式 A 给 EventBridge 开了 invoke 权限",
+           "principal: \"events.amazonaws.com\"" in oneclick,
+           "没有 AWS::Lambda::Permission，规则会静默地调不动函数（EventBridge 不报到客户眼前）。")
+    _check("方式 A 按 WEB_NOTIF_SOURCES 循环建规则",
+           "for (const src of WEB_NOTIF_SOURCES)" in oneclick and "events.CfnRule" in oneclick)
+    # 「怎么关一个源」是两条路径唯一的差别，理由写在共享模块的文件头。方式 B 那个
+    # context 键必须还在（它是方式 B 客户唯一的关法）。
+    _check("方式 B 仍支持 `-c webNotif<Id>=on|off`",
+           "webNotif${src.id}" in _read(SETUP_BACKEND) or "`webNotif${src.id}`" in _read(SETUP_BACKEND))
+
+
 def main() -> int:
     print("=" * 72)
     print("方式 A（一键部署）与方式 B（setup.sh）的 web 功能一致性")
@@ -442,6 +558,7 @@ def main() -> int:
         test_runtime_env_keys_match()
         test_deploy_time_seeds_match()
         test_runtime_lifecycle_matches()
+        test_web_notif_producer_parity()
     except AssertionError as e:
         # 提取器找不到目标 = 有人改了源码的形态。必须失败而不是静默通过 ——
         # 静默通过的断言比没有断言更糟：它让人以为这件事有人守着。

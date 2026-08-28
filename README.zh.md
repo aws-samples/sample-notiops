@@ -14,8 +14,9 @@
 —— 全程在网页里完成,无需切到 AWS 控制台。
 
 同一个助手也能**接入团队已在用的聊天工具(Slack / 飞书)**:在告警群里 `@` 机器人
-即可发起调查,并直接在告警落地的地方读报告。除了即时提问,它还能对六类 AWS 信号源
-做**主动推送**(CloudWatch、AWS Health、Backup、GuardDuty、成本异常、Trusted Advisor)。
+即可发起调查,并直接在告警落地的地方读报告。除了即时提问,它还能对 10 类 AWS 信号源
+做**主动推送**(CloudWatch、AWS Health、Backup、GuardDuty、成本异常、Trusted Advisor、
+EC2 Spot 中断预警、Auto Scaling 启动失败、RDS、Config),每类可独立开关。
 
 所有模型都通过 **Amazon Bedrock** 接入(托管的安全、合规与成本管控),可按会话切换
 模型,并自动做中英文本地化。**只读承诺**由三层防线(入站过滤 → 系统提示 → 出站审计)
@@ -42,6 +43,11 @@
   资源健康巡检、AWS Support 工单管理 —— 大白话进,带引用的答案出
 - 🔍 **即时调查**:一句话提问,拿到完整报告(markdown 摘要 + HTML + trace)——
   内部测试中通常约 1-3 分钟(随问题复杂度、账号规模与模型而变)
+- 🤝 **两种"谁来回答"**:通用聊天开头可选**对话对象** —— NotiOps 自己的 agent(全局视角:巡检、
+  调查、案例、知识库),或**你自己账号里的 AWS DevOps Agent 直答**(深入现场:实时排查)。
+  选后者时 **NotiOps 侧 0 token**、**免模型配置**(不需要在 Bedrock 开通任何模型),流式输出
+  体验与 DevOps Agent 自己的页面一致。调查主题另有 **深度调查(直连)**:同一个深度调查绕过
+  大模型直连 API,同样不耗 token(代价:调查描述按你的原话透传,不做智能改写)
 - 🛎️ **主动观测**:10 类 EventBridge 信号源(CloudWatch / Health / 成本异常 /
   Trusted Advisor / GuardDuty / Backup / EC2 Spot 中断预警 / Auto Scaling 启动失败 /
   RDS / Config),每类可独立开关 —— 其中 5 类默认开启
@@ -127,6 +133,8 @@ cd sample-notiops
 | 资源健康巡检(按需提问) | ✅ | ✅ |
 | 故障调查(即时,只读工具) | ✅ | ✅ |
 | DevOps Agent 深度调查 | ✅ 见下方注 ¹ | ✅ |
+| 深度调查(直连,不耗 token) | ✅ 见下方注 ¹ | ✅ |
+| DevOps 对话(通用聊天里让你自己的 DevOps Agent 直答) | ✅ 见下方注 ¹ | ✅ |
 | 联网搜索(AgentCore Web Search) | ✅ 见下方注 ² | ✅ 见下方注 ² |
 | **成本 / FinOps** | | |
 | FinOps 仪表盘(Cost Explorer 口径) | ✅ 仅部署账号 | ✅ 可跨账号 |
@@ -140,15 +148,16 @@ cd sample-notiops
 | 用 Bedrock API Key 作为凭证 | ✅ | ✅ |
 | **主动化 / IM** | | |
 | IM 渠道(Slack / 飞书) | ❌ | ✅ |
-| 主动推送(10 类 EventBridge 信号源) | ❌ | ✅ |
+| 主动推送**到 IM**(10 类 EventBridge 信号源) | ❌ | ✅ |
 | 每日自动巡检(闲置资源 / 成本异常) | ❌ | ✅ |
-| 通知收件箱 | ⚠️ 界面在,但没有产生通知的后端 | ✅ |
+| 通知收件箱(同样这 10 类信号源,进 Web 收件箱) | ✅ | ✅ |
 | 管理仪表盘(阈值 / 目标账户 / Skills 管理) | ❌ | ✅ |
 | **范围** | | |
 | 多账号(AWS Organizations 跨账号) | ✅ 开栈时选 `DeployMode=MultiAccount` + 填组织 id | ✅ `--multi-account` |
 | 升级 | 换新版模板 update 栈(~1 分钟) | 重跑 `./setup.sh` |
 
-> ¹ **深度调查与「把 Skill 发布到 DevOps Agent」在方式 A 里依赖同一个 Agent Space**:
+> ¹ **所有 DevOps Agent 相关能力(深度调查、深度调查(直连)、DevOps 对话、把 Skill 发布到
+> DevOps Agent)在方式 A 里依赖同一个 Agent Space**:
 > 栈会在部署账号里建它,前提是参数 `EnableDeepInvestigation=Yes`(默认值)**且**部署区域
 > 在 AWS DevOps Agent 已开服的区域内(`us-east-1` / `us-west-2` / `ca-central-1` /
 > `sa-east-1` / `ap-south-1` / `ap-southeast-1` / `ap-southeast-2` / `ap-northeast-1` /

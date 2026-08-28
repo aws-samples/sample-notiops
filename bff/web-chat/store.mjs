@@ -8,7 +8,7 @@
  * 都带 ttl（会话/消息自动过期）。用运行时预装的 AWS SDK v3。
  */
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand, QueryCommand, UpdateCommand, DeleteCommand, BatchWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, GetCommand, QueryCommand, UpdateCommand, DeleteCommand, BatchWriteCommand } from "@aws-sdk/lib-dynamodb";
 
 const TABLE = process.env.WEB_CHAT_TABLE || "notiops-web-chat";
 // 会话保留策略：每次新对话都会刷新 ttl（见 touchConversation），故等价于
@@ -74,6 +74,8 @@ export async function appendMessage(conversationId, msg) {
         sources: msg.sources,
         usage: msg.usage, // 本轮 token 用量 {inputTokens,outputTokens,totalTokens}
         account_id: msg.accountId || msg.account_id,  // 本轮针对的账号(多账号:历史回复标明账号徽标用)
+        via: msg.via,   // 答案来源标记("devops-agent"=客户自己的 DevOps Agent 在答)。缺省=本地模型，
+                        // 署名行据此显示 "AWS DevOps Agent" 而不是 "AWS Bedrock (某模型)"
         ttl: ttl(),
       },
     }),
@@ -101,7 +103,38 @@ export async function listMessages(conversationId) {
       ScanIndexForward: true,
     }),
   );
-  return (r.Items || []).map((i) => ({ role: i.role, text: i.text, ts: i.ts, model: i.model, sources: i.sources, usage: i.usage, account_id: i.account_id }));
+  return (r.Items || []).map((i) => ({ role: i.role, text: i.text, ts: i.ts, model: i.model, sources: i.sources, usage: i.usage, account_id: i.account_id, via: i.via }));
+}
+
+/* ───────── 「DevOps 对话」的 DevOps Agent 会话（多轮上下文）─────────
+ * DevOps Agent 侧的对话历史挂在它自己的 executionId 上 —— 要"接着上一句问"就必须复用同一个
+ * executionId，因此按 NotiOps 会话存一份。放在**消息分区**里（PK=conv#{id} / SK=dachat）：
+ *   · 不占 msg# 段（listMessages 用 begins_with(SK,"msg#")，天然不会把它读成一条消息）；
+ *   · 不需要 sub（消息分区本来就按 conversationId 分），删会话时随分区一起清。
+ * ttl 与消息同策略（30 天）。读写失败一律降级成"新建对话"，不阻断问答。
+ */
+export async function getDevopsChatSession(conversationId) {
+  const r = await ddb.send(new GetCommand({
+    TableName: TABLE,
+    Key: { PK: `conv#${conversationId}`, SK: "dachat" },
+  }));
+  const i = r?.Item;
+  return i ? { executionId: i.executionId, agentSpaceId: i.agentSpaceId, accountId: i.account_id || "" } : null;
+}
+
+export async function setDevopsChatSession(conversationId, s) {
+  await ddb.send(new PutCommand({
+    TableName: TABLE,
+    Item: {
+      PK: `conv#${conversationId}`,
+      SK: "dachat",
+      executionId: s?.executionId,
+      agentSpaceId: s?.agentSpaceId,
+      account_id: s?.accountId || "",
+      updatedAt: Date.now(),
+      ttl: ttl(),
+    },
+  }));
 }
 
 export async function renameConversation(sub, conversationId, title) {
@@ -278,4 +311,9 @@ export async function deleteConversation(sub, conversationId) {
     }
     lastKey = r.LastEvaluatedKey;
   } while (lastKey);
+  // 3) 删「DevOps 对话」的 executionId 记录（同分区、SK 固定，不在上面 msg# 的扫描范围里）。
+  //    留着不删的后果：同名 conversationId 极小概率复用时会接到一条陌生的 DevOps Agent 对话上。
+  await ddb.send(
+    new DeleteCommand({ TableName: TABLE, Key: { PK: `conv#${conversationId}`, SK: "dachat" } }),
+  ).catch(() => {});
 }

@@ -1536,7 +1536,7 @@
             "Arn"
           ]
         },
-        "Runtime": "nodejs20.x",
+        "Runtime": "nodejs24.x",
         "Tags": [
           {
             "Key": "auto-delete",
@@ -1830,7 +1830,10 @@
                 "aidevops:CreateBacklogTask",
                 "aidevops:GetBacklogTask",
                 "aidevops:ListJournalRecords",
-                "aidevops:ListRecommendations"
+                "aidevops:ListRecommendations",
+                "aidevops:CreateChat",
+                "aidevops:SendMessage",
+                "aidevops:ListPendingMessages"
               ],
               "Effect": "Allow",
               "Resource": "arn:aws:aidevops:us-east-1:111122223333:agentspace/*"

@@ -7,7 +7,7 @@ Bedrock model ID and optional agent_prompt with 3-level fallback:
        (fallback on query failure or empty value)
     2. Environment variable DEVOPS_AGENT_SUMMARIZER_MODEL_ID
        (fallback if not set)
-    3. Hardcoded default: global.xai.grok-4.6
+    3. Hardcoded default: global.anthropic.claude-sonnet-5
 
   agent_prompt (optional):
     1. DDB config table: PK="appconfig#devops_agent", SK="agent_prompt"
@@ -31,15 +31,15 @@ logger = logging.getLogger("shared.summarizer_config")
 #
 # Kept in step with config/llm-model-catalog.json's default_model: an unbound
 # backend task means "follow the deployment default", and the deployment default
-# is Grok 4.6. It used to be claude-opus-4-6-v1, which made an unbound task
+# is Claude Sonnet 5. It used to be claude-opus-4-6-v1, which made an unbound task
 # quietly run on a *different* model than the one the console advertises as the
 # default -- visible only as a differently-worded report.
 #
 # Must stay Converse-capable: ``_model_route`` returns ("", "") on the env /
 # hardcoded paths, so a Mantle-only id here would fail every summarisation that
-# runs before an admin has saved the catalogue. Grok 4.6 is
-# ``kind: bedrock_converse``.
-_DEFAULT_MODEL_ID = "global.xai.grok-4.6"
+# runs before an admin has saved the catalogue. Claude Sonnet 5 is
+# ``kind: bedrock_anthropic``, which the Converse path handles.
+_DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-5"
 
 # Environment variable name
 _ENV_MODEL_ID = "DEVOPS_AGENT_SUMMARIZER_MODEL_ID"

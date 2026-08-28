@@ -500,10 +500,18 @@ export const STRINGS: Dict = {
   "cz.skill.descPh": { zh: "一句话说明这个 Skill 适用的场景", en: "One line on when this skill applies" },
   "cz.skill.body": { zh: "内容（流程 / 规范 / 知识）", en: "Content (process / norms / knowledge)" },
   "cz.skill.bodyPh": { zh: "用 Markdown 写清楚步骤、规范或专业知识…", en: "Write the steps, norms, or expertise in Markdown…" },
-  // Composer：开了 DevOps Agent 开关但选中的 skill 尚未发布到 DevOps Agent 时的行内提示。
+  // Composer：开了「深度调查」（经我们的 agent 转交 DevOps Agent）但选中的 skill 尚未发布到
+  // DevOps Agent 时的行内提示 —— 那条路径不传正文，未发布就真的不会被激活。
   "composer.skill.notPublished": {
     zh: "该 Skill 尚未发布到 DevOps Agent，深度调查时不会被激活。到左侧「Skills」里发布后即可生效。",
     en: "This skill isn't published to DevOps Agent yet, so it won't be activated in deep investigation. Publish it from the Skills tab in the sidebar to enable.",
+  },
+  // 两条**直连**路径（「深度调查（直连）」/「DevOps 对话」）：BFF 会把 skill 正文内联进发给
+  // DevOps Agent 的那段话（bff/web-chat/devops_skill.mjs），所以未发布也生效 —— 不能套用上面
+  // 那句「不会被激活」。这里如实说清：谁在执行、无需发布、以及唯一的缺口（references/ 取不到）。
+  "composer.skill.directInline": {
+    zh: "该 Skill 的正文会随本轮内联发给 DevOps Agent 执行，无需发布；若它附带 references/ 参考文件，那部分在这条路径上取不到。",
+    en: "This skill's body is inlined into what we send DevOps Agent this turn, so publishing isn't required; if it ships references/ files, those aren't reachable on this path.",
   },
   "cz.skill.save": { zh: "保存", en: "Save" },
   "cz.skill.cancel": { zh: "取消", en: "Cancel" },
@@ -570,6 +578,9 @@ export const STRINGS: Dict = {
   "conv.busy": { zh: "正在生成回复…", en: "Generating a response…" },
   "conv.unread": { zh: "有新回复未读", en: "New response — unread" },
   "composer.placeholder": { zh: "给 NotiOps 发消息…（/命令 · $skill）", en: "Message NotiOps… (/command · $skill)" },
+  // 开着「DevOps 对话」时的提示语：答话的是客户自己的 DevOps Agent，不是 NotiOps；
+  // 这条路径也不走 /命令 与 skill，所以不重复那两个提示。
+  "composer.placeholder.devopschat": { zh: "跟 DevOps Agent 对话…", en: "Chat with DevOps Agent…" },
   "chip.investigate": { zh: "调查一个资源", en: "Investigate a resource" },
   "chip.cases": { zh: "我的 Support cases", en: "My Support cases" },
   "chip.cost": { zh: "本月成本异常", en: "This month's cost anomalies" },
@@ -619,12 +630,21 @@ export const STRINGS: Dict = {
     zh: "NotiOps 可能出错，重要结论请核实",
     en: "NotiOps can make mistakes — verify important conclusions",
   },
+  // 通用会话选了 DevOps Agent 时的免责声明：答话的不是 NotiOps，主语必须跟着换。
+  "composer.hint.devops": {
+    zh: "DevOps Agent 可能出错，重要结论请核实",
+    en: "DevOps Agent can make mistakes — verify important conclusions",
+  },
   "composer.stop": { zh: "停止生成", en: "Stop generating" },
   // "/" 命令菜单
   "cmd.button.hint": { zh: "命令菜单（/）", en: "Command menu (/)" },
   "cmd.typeToFilter": { zh: "输入以筛选…", en: "Type to filter…" },
   "cmd.filterHint": { zh: "输入以筛选", en: "Type to filter" },
+  // 命令菜单表头：「技能 (27)」。条数如实写出来 —— 列表是**全部** skill、超出高度靠滚动，
+  // 不再随机取 3 个（那让客户以为自己只有 3 个 skill）。
+  "cmd.skills.head": { zh: "技能", en: "Skills" },
   "cmd.skills.empty": { zh: "还没有 Skill", en: "No skills yet" },
+  "cmd.skills.noMatch": { zh: "没有匹配的 Skill", en: "No matching skill" },
   "cmd.skills.manage": { zh: "管理 Skills", en: "Manage skills" },
   "cmd.skills.add": { zh: "新建 Skill", en: "Add skill" },
   "composer.account.default": { zh: "当前账号（部署账号）", en: "Current account (deployment)" },
@@ -650,6 +670,49 @@ export const STRINGS: Dict = {
   "home.card.publics3.desc": { zh: "找出公网可访问的 S3 桶和开放安全组", en: "Find public S3 buckets and open security groups" },
   "home.card.untagged.desc": { zh: "找出未打标签的资源并归类", en: "Find and group untagged resources" },
   "home.card.arch.desc": { zh: "帮我设计一个高可用的应用架构", en: "Help me design a highly available application architecture" },
+  // ── 「对话对象」选择（只在通用会话的新对话主页出现）────────────────────────────
+  // 选谁来答这个会话：NotiOps 自己的 agent，还是客户自己的 DevOps Agent（我们侧 0 token）。
+  // 可跳过（直接打字 = 默认 NotiOps）；发出第一句后本会话的对象**固定**，不再中途切换。
+  // obj.caption 现在**只做 radiogroup 的 aria-label**（读屏用），界面上不显示（产品要求）。
+  "obj.caption": {
+    zh: "选择这个会话由谁来回答（可跳过，默认 NotiOps；发出第一句后本会话就固定了）",
+    en: "Pick who answers this conversation (optional — defaults to NotiOps; locked once you send the first message)",
+  },
+  // 分段控件上只放两个名字（选中态靠填充表达，不写"已选"）。
+  "obj.notiops.name": { zh: "NotiOps", en: "NotiOps" },
+  "obj.devops.name": { zh: "DevOps Agent", en: "DevOps Agent" },
+  // 控件下面那一行提示：说两边**擅长的事**有什么不同，不解释内部机制（谁调谁、谁扣 token）——
+  // 客户在这一步要做的判断是"我这个问题该问谁"，不是"计费怎么走"。
+  "obj.notiops.hint": {
+    zh: "全局视角 · 巡检、调查、案例与知识库",
+    en: "The wider view · inspection, investigation, cases and knowledge",
+  },
+  // 「免模型配置」是这条路径**对客户最实际的一句好处**（产品指定要写）：答话的是他自己的
+  // DevOps Agent，所以不需要在 Bedrock 开通/挑选任何模型 —— 一个还没开通模型的新部署，
+  // 选这边就能直接开始用。说"免模型配置"而不是"0 token / 不经我们的模型"：后者是机制，
+  // 前者才是他这一步要判断的事。
+  "obj.devops.hint": {
+    zh: "深入现场 · 实时排查，免模型配置",
+    en: "On the ground · live diagnostics, no model setup",
+  },
+  // 标题栏的「对话对象」tag：通用会话没有主题 tag，而"谁在答"恰恰是这类会话唯一会变的东西。
+  // 锁定后**只靠这个 tag** 说明身份（输入框上方那条身份条已按产品要求去掉）。
+  "obj.tag.notiops": { zh: "NotiOps", en: "NotiOps" },
+  "obj.tag.devops": { zh: "DevOps Agent", en: "DevOps Agent" },
+  "obj.tag.notiops.hint": {
+    zh: "本会话由 NotiOps 的 agent 回答",
+    en: "This conversation is answered by the NotiOps agent",
+  },
+  "obj.tag.devops.hint": {
+    zh: "本会话由你自己的 DevOps Agent 回答",
+    en: "This conversation is answered by your own DevOps Agent",
+  },
+  // 选中 DevOps Agent 时的启动卡片：与 NotiOps 那 4 张分开 —— 这条路径不做成本/案例/Skills，
+  // 用它们当引导会把客户带到一条答不了的问题上。
+  "obj.dv.card.anomaly": { zh: "这个账号最近有什么异常？", en: "Any anomalies in this account recently?" },
+  "obj.dv.card.ec2": { zh: "帮我看看这台 EC2 为什么重启了", en: "Help me find out why this EC2 instance rebooted" },
+  "obj.dv.card.rds": { zh: "我的 RDS 现在健康吗？", en: "Is my RDS healthy right now?" },
+  "obj.dv.card.change": { zh: "最近有哪些变更可能影响可用性？", en: "Which recent changes could affect availability?" },
   "recents.title": { zh: "该主题下的会话", en: "Conversations in this topic" },
   // 简化、合并后的说明（仅有会话列表时显示）
   "recents.note.basic": {
@@ -666,6 +729,7 @@ export const STRINGS: Dict = {
   "composer.finops.short": { zh: "FinOps", en: "FinOps" },
   "composer.devops.short": { zh: "深度调查", en: "Deep Dive" },
   "composer.devops.direct.short": { zh: "深度调查（直连）", en: "Deep Dive (Direct)" },
+  "composer.devopschat.short": { zh: "DevOps 对话", en: "DevOps Chat" },
   "composer.websearch.hint": {
     zh: "开启后可联网查最新信息（默认走 AWS AgentCore 搜索，数据不出 AWS）",
     en: "Search the web for current info when on (uses AWS AgentCore search by default; data stays in AWS)",
@@ -680,6 +744,20 @@ export const STRINGS: Dict = {
   "composer.devops.direct.hint": {
     zh: "同样的 DevOps Agent 深度调查，但绕过大模型直连 API —— 不消耗 token。代价：调查描述按你的原话透传（不做智能改写），也不会先回答概念问题",
     en: "The same DevOps Agent deep investigation, but calls the API directly without an LLM — costs 0 tokens. Trade-off: your wording is passed through as-is (no smart rewrite), and conceptual questions aren't answered first",
+  },
+  // 「DevOps 对话」：这轮由客户自己的 DevOps Agent 直接回答（不是我们的模型），故 NotiOps 侧 0 token。
+  // 文案要说清两件事：谁在答（客户自己的 DevOps Agent）、代价在哪（额度计他自己那边；不挂我们的工具/技能）。
+  "composer.devopschat": { zh: "DevOps 对话（直连）", en: "DevOps Chat (Direct)" },
+  "composer.devopschat.hint": {
+    zh: "直接和你自己的 AWS DevOps Agent 对话（体验与它自己的页面一致，流式输出）——不消耗 NotiOps 的 token、也免模型配置（不需要在 Bedrock 开通模型），用量计入你自己的 DevOps Agent。代价：本轮不挂 NotiOps 的工具与 Skills，需人工确认的动作要去 DevOps Agent 控制台完成",
+    en: "Chat directly with your own AWS DevOps Agent (same streaming experience as its own console) — costs no NotiOps tokens and needs no model setup (nothing to enable in Bedrock); usage is billed to your DevOps Agent. Trade-off: NotiOps tools and Skills aren't attached this turn, and any action needing approval must be confirmed in the DevOps Agent console",
+  },
+  // objMode（通用会话，对象已是客户自己的 DevOps Agent）里那个「深度调查」勾选的说明。
+  // 只讲这一轮的行为差别（问答 vs 调查、秒级 vs 几分钟），不重复"直连/0 token"这些机制词 ——
+  // 对象已经选定了，机制在选对象那一步就交代过。
+  "composer.devops.obj.hint": {
+    zh: "勾上后这一轮让它做一次完整的深度调查（多信号根因排查、出报告，通常几分钟）；不勾就是即时问答",
+    en: "Have it run a full deep investigation this turn (multi-signal root cause, produces a report, usually minutes); leave it off for instant Q&A",
   },
   "composer.finops.hint": {
     zh: "开启 FinOps Agent 深度分析（更全面的成本归因/优化建议，耗时较长；关闭时走快速成本查询）",

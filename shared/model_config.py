@@ -20,7 +20,7 @@ _SSM_PARAMETER = "/notiops/agent/model_id"
 # `global.*` —— 与 CDK 写入 SSM 的值（global.anthropic.claude-sonnet-5）一致。
 # 此前这里是 us.*，只有在 SSM 与 env 都缺失时才暴露，属于隐蔽的地理路由分叉。
 #
-# ⚠️ **必须是 Claude**，不能跟随模型目录的 default_model（现为 Grok 4.6）。本函数的
+# ⚠️ **必须是 Claude**，不能跟随模型目录的 default_model（现为 Claude Sonnet 5，恰好同值，但那是目录的自由）。本函数的
 # 返回值只喂给一批手搓 Anthropic 原生 body 的 `invoke_model` 调用（bedrock_intent /
 # next_steps / case_analyze / skill_dispatcher / case_classifier / progress_card ×2 /
 # skill_authoring），换非 Claude 模型 = ValidationException。要统一得先把那些调用点

@@ -9,30 +9,23 @@ import { getSupportServices, type SupportService } from "../api/chat";
 // 因为候选集现在由管理员在服务端决定，不再是编译期常量。
 import { modelDisplayName } from "../models";
 
-// 署名行文案："AWS Bedrock (DeepSeek V3.2) · 1,234 tokens · 3 步"
+// 署名文案："AWS Bedrock (DeepSeek V3.2) · 1,234 tokens"
 // 所有模型均经 Amazon Bedrock 提供（GPT-5.6 经 Bedrock Mantle），故 provider 统一。
-// tokens 是本轮真实账单（agentic loop 每个 cycle 都重发上下文、都计费）；当 cycle>1 时
-// 附「N 步」，把大数字解释成"做了多步工具调用/推理"，避免用户误以为一句话就吃了那么多。
-// 署名行拆成「正文 + 可选 steps」两段：steps 单独带 tooltip 解释什么是「步」。
-function modelSignatureParts(model: string | undefined, usage: ChatMessage["usage"], en: boolean):
-  { base: string; steps?: string; stepsTip?: string } {
+// tokens 是本轮真实账单（agentic loop 每个 cycle 都重发上下文、都计费）。
+// 曾经还附一段「N 步」（cycles）+ tooltip 解释什么是「步」，现已去掉：署名与操作按钮
+// 合并成一行后位置紧张，而「步数」不影响用户任何决策（真正要看的是来源与 token）。
+// via="devops-agent"（「DevOps 对话」）：这条回答不是本地模型生成的，而是**客户自己的
+// DevOps Agent** 答的（NotiOps 侧 0 token）。此时署名必须写 "AWS DevOps Agent" —— 沿用
+// "AWS Bedrock (某模型)" 会把答案的来源说错，客户会以为这是我们的模型在答、并按我们的
+// 模型能力去理解结果。也不带 token：DevOps Agent 侧用量计在客户自己的额度里，不在这里显示。
+function modelSignature(model: string | undefined, usage: ChatMessage["usage"], via?: string): string {
+  if (via === "devops-agent") return "AWS DevOps Agent";
   const name = modelDisplayName(model);
-  if (!name) return { base: "" };
+  if (!name) return "";
   let base = `AWS Bedrock (${name})`;
   const tot = usage?.totalTokens;
-  let steps: string | undefined;
-  let stepsTip: string | undefined;
-  if (typeof tot === "number" && tot > 0) {
-    base += ` · ${tot.toLocaleString()} tokens`;
-    const cy = usage?.cycles;
-    if (typeof cy === "number" && cy > 1) {
-      steps = en ? `${cy} steps` : `${cy} 步`;
-      stepsTip = en
-        ? "Steps = how many tool-call / reasoning rounds (agentic loop) this answer took. More steps = a more complex task with more tool calls; tokens accumulate across the rounds."
-        : "步数 = 本次回答中 agent 调用工具 / 推理的轮次（agentic loop）。步数越多说明任务越复杂、调用工具越多；token 是各轮累加的总量。";
-    }
-  }
-  return { base, steps, stepsTip };
+  if (typeof tot === "number" && tot > 0) base += ` · ${tot.toLocaleString()} tokens`;
+  return base;
 }
 
 const CopyIcon = () => (
@@ -654,40 +647,41 @@ export default function Message({ m, onOpenSources, onOpenInvestigation, onConfi
               </div>
             )}
             {!m.streaming && (
-              <>
-                {m.model && (() => {
-                  const sig = modelSignatureParts(m.model, m.usage, locale === "en");
-                  if (!sig.base) return null;
+              /* 回复页脚**只有一行**：复制 / Sources / 署名(模型 · tokens) / 账号 ID。
+                 以前是两行（署名单独一行 + 按钮一行），气泡下面留两条横向噪音；合成一行后
+                 视觉安静得多。顺序按"操作 → 出处 → 谁答的 → 针对哪个账号"。
+                 「DevOps 对话」/「深度调查（直连）」的回复走的也是这个页脚，所以它们同样是一行。 */
+              <div className="msgbar">
+                <button className={"mb-btn" + (copied ? " copied" : "")} title={copied ? t("msg.copied") : t("msg.copy")} onClick={copy}>
+                  <CopyIcon />
+                </button>
+                {m.sources && m.sources.length > 0 && (
+                  <button className="mb-btn" onClick={() => onOpenSources(m)}>
+                    <SourcesIcon /> {t("msg.sources")} <span className="mb-count">{m.sources.length}</span>
+                  </button>
+                )}
+                {/* 门条件带上 m.via：DevOps 对话的回答署名不依赖 m.model（它可能是空的，
+                    因为那轮压根没用本地模型），只看 via 就能署名 "AWS DevOps Agent"。 */}
+                {(m.model || m.via) && (() => {
+                  const sig = modelSignature(m.model, m.usage, m.via);
+                  return sig ? <span className="modelsig">{sig}</span> : null;
+                })()}
+                {/* 账号：多账号可切换,历史回复标明本次提问针对的账号(含 management/部署账号,
+                    频繁切换时才看得出区别)。只显示 12 位 ID —— 账号名在这一行里最长、又最没有
+                    信息量（真正能定位资源的是 ID）。
+                    **不是徽标**：外边框+胶囊底在一行页脚里比署名重得多，读起来像个可点的东西
+                    （它不可点）。改成与署名同款的普通文字，只留一颗小圆点承载"成员账号=橙 /
+                    部署·management=蓝"这唯一一条颜色信息。 */}
+                {accountLabel && (() => {
+                  const tone = accountIsMember ? "var(--orange)" : "var(--blue)";
                   return (
-                    <div className="modelsig">
-                      {sig.base}
-                      {sig.steps && <> · <span className="modelsig-steps" title={sig.stepsTip}>{sig.steps}</span></>}
-                    </div>
+                    <span className="mb-acct" title={locale === "en" ? "This answer is for this AWS account" : "本回复针对该 AWS 账号的提问"}>
+                      <span className="mb-acct-dot" style={{ background: tone }} />
+                      {accountLabel}
+                    </span>
                   );
                 })()}
-                <div className="msgbar">
-                  <button className={"mb-btn" + (copied ? " copied" : "")} title={copied ? t("msg.copied") : t("msg.copy")} onClick={copy}>
-                    <CopyIcon />
-                  </button>
-                  {/* 账号徽标：多账号可切换,历史回复标明本次提问针对的账号(含 management/部署账号,
-                      频繁切换时才看得出区别)。成员账号=橙,部署/management=蓝。 */}
-                  {accountLabel && (() => {
-                    const tone = accountIsMember ? "var(--orange)" : "var(--blue)";
-                    return (
-                      <span className="mb-acct" title={locale === "en" ? "This answer is for this AWS account" : "本回复针对该 AWS 账号的提问"}
-                        style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11.5, fontWeight: 600, color: "var(--muted)", border: `1px solid ${tone}`, borderRadius: 100, padding: "1px 9px" }}>
-                        <span style={{ width: 5, height: 5, borderRadius: 3, background: tone, display: "inline-block" }} />
-                        {accountLabel}
-                      </span>
-                    );
-                  })()}
-                  {m.sources && m.sources.length > 0 && (
-                    <button className="mb-btn" onClick={() => onOpenSources(m)}>
-                      <SourcesIcon /> {t("msg.sources")} <span className="mb-count">{m.sources.length}</span>
-                    </button>
-                  )}
-                </div>
-              </>
+              </div>
             )}
           </>
         )}

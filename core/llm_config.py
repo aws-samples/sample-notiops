@@ -80,7 +80,7 @@ _BUILTIN_CATALOG: dict = {
     "generation": 0,
     "provider": "bedrock",
     "credential_mode": "iam",
-    "default_model": "xai-grok-4-6",
+    "default_model": "claude-sonnet-5",
     "models": [
         {"alias": "claude-sonnet-5", "short": "claude", "aliases_legacy": ["claude"],
          "model_id": "global.anthropic.claude-sonnet-5", "label": "Claude Sonnet 5",

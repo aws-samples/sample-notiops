@@ -46,14 +46,16 @@ function int(v, dflt) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** 只记异常类型 + 错误码，绝不外泄原始 message（对齐 docs/LOGGING_STANDARD.md）。 */
-function safeErr(e) {
+/** 只记异常类型 + 错误码，绝不外泄原始 message（对齐 docs/LOGGING_STANDARD.md）。
+ *  export 是给 devops_chat.mjs（「DevOps 对话」）复用的 —— 同一套日志纪律只留一份实现。 */
+export function safeErr(e) {
   const code = e?.name || e?.$metadata?.httpStatusCode || "unknown";
   return `${e?.constructor?.name || "Error"}/${code}`;
 }
 
-/** DevOps Agent 后台链接。⚠️ deep link 用 **taskId**（不是 executionId）。 */
-function operatorUrls(agentSpaceId, taskId = "") {
+/** DevOps Agent 后台链接。⚠️ deep link 用 **taskId**（不是 executionId）。
+ *  export 给 devops_chat.mjs 复用（它只用 home —— 对话没有 taskId，别猜深链）。 */
+export function operatorUrls(agentSpaceId, taskId = "") {
   if (!agentSpaceId) return { home: "", deepLink: "" };
   const root = `https://${agentSpaceId}.aidevops.global.app.aws`;
   return { home: `${root}/`, deepLink: taskId ? `${root}/investigation/${taskId}` : `${root}/` };
@@ -61,8 +63,9 @@ function operatorUrls(agentSpaceId, taskId = "") {
 
 /** 按目标账号构造 DevOps Agent client（跨账号自动 AssumeRole）。
  * ⚠️ 不要传 requestHandler 强制 IPv4——那是**本地调试**才需要的（本机无 IPv6 路由），
- * Lambda 的 IPv6 是通的，加了反而是无谓限制。也不要传 endpoint（SDK 自己加 `cp.` 前缀）。 */
-async function clientFor(accountId) {
+ * Lambda 的 IPv6 是通的，加了反而是无谓限制。也不要传 endpoint（SDK 自己加 `cp.` 前缀）。
+ * export 给 devops_chat.mjs 复用（跨账号解析 + client 构造只留一份实现）。 */
+export async function clientFor(accountId) {
   const target = await resolveTarget(accountId);
   const { DevOpsAgentClient } = await import("@aws-sdk/client-devops-agent");
   const client = new DevOpsAgentClient({ region: target.region || REGION, credentials: target.credentials });
@@ -693,10 +696,12 @@ export async function deepInvestigationAvailability(accountId, { useCache = true
  * @param {string} p.text        用户原话
  * @param {string} p.locale      "zh" | "en"
  * @param {string} p.accountId   目标账号（空=部署账号自身）
+ * @param {string} [p.skillId]      本轮用 `/` 显式选中的 NotiOps Skill（空=没选）
+ * @param {string} [p.skillVersion] 指定版本（缺省=latest）
  * @param {function} p.emit      (event, data) => void，写一条 SSE（形状与老路径完全一致）
  * @returns {Promise<string>}    落库用的 assistant 正文
  */
-export async function runDirectInvestigation({ text, locale, accountId, emit }) {
+export async function runDirectInvestigation({ text, locale, accountId, skillId, skillVersion, emit }) {
   const en = locale === "en";
   const dv = (zh, enStr) => (en ? enStr : zh);
   let reply = "";
@@ -727,6 +732,11 @@ export async function runDirectInvestigation({ text, locale, accountId, emit }) 
   // 白名单）：只要开关还开着，「查看调查结果」按钮天然仍走直连 → 依旧 0 token。
   const resumeId = extractExecutionId(text);
   if (resumeId) {
+    // 这一轮只是去拉上一场调查的结果，没有新任务可以承载 skill —— 说一句，别让它静默消失。
+    if (skillId) {
+      say(dv(`_（本轮是查看上一场调查的结果，\`/${skillId}\` 未参与。）_\n`,
+             `_(This turn just fetches the previous investigation's result, so \`/${skillId}\` was not applied.)_\n`));
+    }
     await resumeInvestigation({ client, space, executionId: resumeId, locale, emit, say });
     finishUsage();
     return reply;
@@ -734,7 +744,27 @@ export async function runDirectInvestigation({ text, locale, accountId, emit }) 
 
   // —— 发起新调查 ——
   const title = deriveTitle(text);
-  const description = String(text || "").trim();
+  const userText = String(text || "").trim();
+  // `/` 选中的 Skill：把正文并进调查 description（DevOps Agent 那边照它执行）。
+  // 横幅里仍然只回显**用户原话** —— 把整份作业指导抖进气泡是噪音。
+  // 读失败**不静默**：气泡里明说这轮没用上，然后按普通调查继续（见 devops_skill.mjs）。
+  let description = userText;
+  let skillLine = "";
+  if (skillId) {
+    try {
+      const { loadSkillForDirect, buildSkillContent, skillLabel } = await import("./devops_skill.mjs");
+      const skill = await loadSkillForDirect({ skillId, skillVersion, locale });
+      description = buildSkillContent({ text: userText, skill, en, mode: "investigate" });
+      const label = skillLabel(skill) || skillId;
+      const ver = skill.version ? ` v${skill.version}` : "";
+      skillLine = dv(`\n\n_按 Skill「${label}」${ver} 执行。_`,
+                     `\n\n_Running with the skill “${label}”${ver}._`);
+    } catch (e) {
+      console.warn("[direct-investigate] skill_load_failed", skillId, safeErr(e));
+      say(dv(`⚠️ 没能读到 Skill \`${skillId}\`（${safeErr(e)}），本轮按普通调查处理。\n`,
+             `⚠️ Could not load the skill \`${skillId}\` (${safeErr(e)}); running a plain investigation this turn.\n`));
+    }
+  }
   let started;
   try {
     started = await startInvestigation({ client, agentSpaceId: space, title, description });
@@ -753,8 +783,8 @@ export async function runDirectInvestigation({ text, locale, accountId, emit }) 
 
   // 开场横幅：主聊天只放**结论线**（发起了什么 + 后台链接 + 一句"过程在右侧栏看"）；
   // 分析过程走 investigation_step → 右侧「调查过程」面板（与老路径一致）。
-  let open = dv(`\n\n🚀 **深度调查已发起**（直连，0 token）\n\n**${title}**\n\n${description}\n\n`,
-                `\n\n🚀 **Deep investigation started** (direct, 0 tokens)\n\n**${title}**\n\n${description}\n\n`);
+  let open = dv(`\n\n🚀 **深度调查已发起**（直连，0 token）\n\n**${title}**\n\n${userText}${skillLine}\n\n`,
+                `\n\n🚀 **Deep investigation started** (direct, 0 tokens)\n\n**${title}**\n\n${userText}${skillLine}\n\n`);
   open += dv(`（execution_id: \`${executionId}\`）`, `(execution_id: \`${executionId}\`)`);
   if (consoleUrl) {
     open += dv(`\n\n🔗 可点开 DevOps Agent 后台实时查看进度：[${consoleUrl}](${consoleUrl})`,

@@ -33,6 +33,14 @@ import * as fs from "fs";
 const INFRA_DIR = path.join(__dirname, "..", "..");
 const REPO_ROOT = path.join(INFRA_DIR, "..");
 
+/**
+ * Web Chat 单表的物理名。**固定名**（不是 CFN 生成名）：栈外的东西按名字找它 ——
+ * 「通知」生产端那个 Lambda（方式 B 里它在另一个栈，只能拼 ARN，见
+ * `notiops-backend-stack.ts`）、运维时手查数据、文档里的排查步骤。
+ * 导出而不是各处写字面量：改名时必须一处改、全处跟着走。
+ */
+export const WEB_CHAT_TABLE_NAME = "notiops-web-chat";
+
 export interface WebChatCoreProps {
   userPoolId: string;
   userPoolClientId: string;
@@ -144,7 +152,7 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
 
   // ─── DynamoDB：会话/消息单表（§4.3）───
   const table = new dynamodb.Table(scope, "WebChatTable", {
-    tableName: "notiops-web-chat",
+    tableName: WEB_CHAT_TABLE_NAME,
     partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
     sortKey: { name: "SK", type: dynamodb.AttributeType.STRING },
     billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -162,7 +170,13 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   // （setup.sh 会做；本地已装）。免 Docker bundling。
   const bff = new lambda.Function(scope, "WebChatBff", {
     functionName: "notiops-web-chat-bff",
-    runtime: lambda.Runtime.NODEJS_20_X,
+    // nodejs24.x：nodejs20.x 已于 2026-04-30 弃用（CDK synth 的 validation-report 会明确
+    // 报出来），且 **2027-02-01 起禁止新建函数、2027-03-03 起禁止更新** —— 对一个公开
+    // sample 来说那天之后 `./setup.sh` 与一键模板会直接建栈失败，而不是"用着旧 runtime"。
+    // 本仓库其余 Lambda 早已是 nodejs24.x，只有 BFF 落后（见 golden fixture 的对比）。
+    // 这个 construct 被**两条部署路径共用**（setup.sh 的 CDK 与一键模板的 synth 源），
+    // 所以改这一处两边同时生效，不会出现方式 A / 方式 B 的 runtime 不一致。
+    runtime: lambda.Runtime.NODEJS_24_X,
     handler: "index.handler",
     code: lambda.Code.fromAsset(path.join(REPO_ROOT, "bff", "web-chat")),
     timeout: cdk.Duration.minutes(15), // 长任务（调查）需要长超时
@@ -408,12 +422,17 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       // GetBacklogTask 判终态、ListJournalRecords 拉分析过程与最终摘要、ListRecommendations
       // 备缓解建议。这是老「深度调查」链路里 core/devops_agent.py 用的同一组 API（0 token），
       // 只是搬到了 BFF 侧执行。跨 payer 成员账号仍走 AssumeRole（权限在成员模板里）。
+      // 「DevOps 对话」（bff/web-chat/devops_chat.mjs）：BFF 直连 DevOps Agent **控制面对话 API**，
+      // 由客户自己的 DevOps Agent 回答（NotiOps 侧 0 token）—— CreateChat 建会话、SendMessage
+      // 发一轮并接事件流、ListPendingMessages 探"是否在等人工确认"（只提示、绝不代批准）。
+      // 缺 ListPendingMessages 的后果：答案照出，但需要确认的动作会静默卡住、用户不知道要去后台点。
       actions: [
         "aidevops:ListAssociations",
         "aidevops:CreateAsset", "aidevops:UpdateAsset",
         "aidevops:DeleteAsset", "aidevops:ListAssets",
         "aidevops:CreateBacklogTask", "aidevops:GetBacklogTask",
         "aidevops:ListJournalRecords", "aidevops:ListRecommendations",
+        "aidevops:CreateChat", "aidevops:SendMessage", "aidevops:ListPendingMessages",
       ],
       resources: [`arn:aws:aidevops:${stack.region}:${stack.account}:agentspace/*`],
     }),

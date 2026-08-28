@@ -316,6 +316,73 @@ def _write_config(props) -> None:
     print("wrote config.json")
 
 
+def _merge_missing_models(existing, catalog):
+    """把目录里有、库里没有的模型条目补进去，返回 `(合并后的列表, 新增的 alias)`。
+
+    **只增不改**：库里已有的条目逐字段照抄（绝不重新启用、改标签、换 model_id），
+    库里有而目录里没有的留在末尾；唯一的改动是把缺的按目录顺序插进去。
+    与 `scripts/seed_llm_catalog.py::merge_missing_models` 是同一份逻辑的两份实现
+    （一键路径 import 不到仓库脚本），由 `scripts/test_oneclick_parity.py` 钉住。
+    """
+    by_alias = {m.get("alias"): m for m in existing if isinstance(m, dict)}
+    merged, added = [], []
+    for entry in catalog:
+        alias = entry.get("alias")
+        if alias in by_alias:
+            merged.append(by_alias[alias])
+        else:
+            merged.append(entry)
+            added.append(alias)
+    known = {e.get("alias") for e in catalog}
+    merged.extend(m for m in existing
+                  if isinstance(m, dict) and m.get("alias") not in known)
+    return merged, added
+
+
+def _top_up_llm_catalog(table, cfg) -> str:
+    """目录已存在时，把**后来加进目录的**模型补上。
+
+    为什么必须有这一步：条件写让"已存在"成为每次升级的常态路径，于是首次部署之后
+    再加进 `config/llm-model-catalog.json` 的模型**永远到不了已经装好的环境** ——
+    症状不是报错，而是管理台「模型」页和聊天里的模型选择器都缺了它，客户合理地以为
+    "这功能没做"。2026-08-27 现网实际发生：`zai-glm-5` 前一天进了目录，列表里没有。
+
+    闸门是 `generation == 0`（已 seed、从未被管理员编辑过）。管理员一保存这页就归他管：
+    他可能是**故意**没留某个模型，一次升级把它复活跟覆盖整份配置是同一类缺陷。
+    那种情况只打印缺哪几个，把决定权留给他 —— 这里静默无动作正是原缺陷难发现的原因。
+    """
+    item = table.get_item(Key={"PK": "llmcfg", "SK": "meta"}).get("Item") or {}
+    merged, added = _merge_missing_models(item.get("models") or [],
+                                         cfg.get("models") or [])
+    if not added:
+        print("llm catalogue already present and complete; left untouched")
+        return "already present"
+
+    gen = item.get("generation")
+    if gen is not None and int(gen) != 0:
+        print(f"llm catalogue edited in console (generation={int(gen)}); "
+              f"not adding {added}")
+        return f"already present (admin-managed; {len(added)} not added)"
+
+    try:
+        table.update_item(
+            Key={"PK": "llmcfg", "SK": "meta"},
+            # 只动 models：default_model / credential_mode / backend_tasks 一律不碰，
+            # 新模型绝不能顺手变成默认模型。
+            UpdateExpression="SET #m = :m",
+            ExpressionAttributeNames={"#m": "models"},
+            ExpressionAttributeValues={":m": merged, ":zero": 0},
+            ConditionExpression="attribute_not_exists(generation) OR generation = :zero",
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            print(f"llm catalogue edited concurrently; not adding {added}")
+            return "already present (raced; nothing added)"
+        raise
+    print(f"llm catalogue topped up: added {added}")
+    return f"topped up ({len(added)} models)"
+
+
 def _seed_llm_catalog(props) -> str:
     """把内置模型目录写进 `notiops-config`（`PK=llmcfg / SK=meta`），只在它还不存在时写。
 
@@ -331,7 +398,9 @@ def _seed_llm_catalog(props) -> str:
     ~3.5KB），所以这里不需要联网、也不需要读 S3。
 
     **条件写**（`attribute_not_exists(PK)`）与 seeder 脚本口径一致：管理员在控制台里
-    改过的配置绝不能被一次栈升级覆盖回出厂值。已存在 = 成功，不是失败。
+    改过的配置绝不能被一次栈升级覆盖回出厂值。已存在 = 成功，不是失败 ——
+    但"已存在"要走 `_top_up_llm_catalog()` 把后来新增的模型补上（只增不改），
+    否则新模型永远到不了已经装好的环境。
     """
     raw = props.get("LlmCatalog") or ""
     table = props.get("ConfigTable") or ""
@@ -344,13 +413,12 @@ def _seed_llm_catalog(props) -> str:
     # generation 0 = "已 seed，从未被管理员编辑过"。读侧接受它，BFF 的 nextGeneration()
     # 把 0 当作"没有可用的上一版"，所以管理员第一次保存不会撞版本冲突。
     item.setdefault("generation", 0)
+    ddb_table = boto3.resource("dynamodb").Table(table)
     try:
-        boto3.resource("dynamodb").Table(table).put_item(
-            Item=item, ConditionExpression="attribute_not_exists(PK)")
+        ddb_table.put_item(Item=item, ConditionExpression="attribute_not_exists(PK)")
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            print("llm catalogue already present; left untouched")
-            return "already present"
+            return _top_up_llm_catalog(ddb_table, cfg)
         raise
     n = len(cfg.get("models") or [])
     print(f"seeded llm catalogue: {n} model(s), default={cfg.get('default_model')!r}")

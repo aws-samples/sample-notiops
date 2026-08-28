@@ -66,7 +66,7 @@ export interface StreamCallbacks {
  * 头已被 SigV4 占用；BFF 从 body 校验 idToken 拿 sub 做会话隔离。
  */
 export async function streamChat(
-  params: { conversationId?: string; text: string; model?: string; locale?: string; webSearch?: boolean; finopsAgent?: boolean; devopsAgent?: boolean; devopsAgentDirect?: boolean; topic?: string; accountId?: string; skillId?: string; skillVersion?: string },
+  params: { conversationId?: string; text: string; model?: string; locale?: string; webSearch?: boolean; finopsAgent?: boolean; devopsAgent?: boolean; devopsAgentDirect?: boolean; devopsChat?: boolean; topic?: string; accountId?: string; skillId?: string; skillVersion?: string },
   cb: StreamCallbacks,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -99,6 +99,9 @@ export async function streamChat(
     devops_agent: params.devopsAgent === true,
     // 「深度调查（直连）」：BFF 直连 DevOps Agent API（0 token），与 devops_agent 互斥。
     deep_investigate_direct: params.devopsAgentDirect === true,
+    // 「DevOps 对话」：BFF 直连 DevOps Agent 控制面对话 API，由客户自己的 DevOps Agent 回答
+    // （NotiOps 侧 0 token），与上面两个开关三方互斥。
+    devops_chat_direct: params.devopsChat === true,
     topic: params.topic || "general",
     account_id: params.accountId || "",
     skill_id: params.skillId || "",
@@ -171,7 +174,7 @@ export async function streamChat(
 /* ───────────────── 会话持久化 API（SigV4 签名的普通 JSON 请求）───────────────── */
 
 export interface ConversationSummary { id: string; title: string; updatedAt: number; topic?: string; pinned?: boolean; }
-export interface StoredMessage { role: "user" | "assistant"; text: string; ts: number; model?: string; sources?: SourceItem[]; usage?: TokenUsage; account_id?: string; }
+export interface StoredMessage { role: "user" | "assistant"; text: string; ts: number; model?: string; sources?: SourceItem[]; usage?: TokenUsage; account_id?: string; via?: string; }
 
 /** 取 SigV4 客户端 + base + idToken（与 streamChat 同源）。未登录返回 null。 */
 export async function signedClient() {

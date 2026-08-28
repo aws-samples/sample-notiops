@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # 一键部署（Launch Stack）的**发布产物构建**脚本 —— 维护者用，不面向客户。
 #
-# 产出四个东西，一起挂到一个 GitHub Release 上（对客说明见 docs/DEPLOYMENT_ONECLICK.md）：
+# 产出这些东西，一起挂到一个 GitHub Release 上（对客说明见 docs/DEPLOYMENT_ONECLICK.md）：
 #
 #   bff.zip                       Web Chat BFF 的 Lambda 代码（含 node_modules）
 #   chat-dist.zip                 前端构建产物（index.html / assets/… 在 zip 根）
+#   web-notif.zip                 「通知」生产端 Lambda（AWS 事件 → Web 收件箱）
 #   agent-code.zip                AgentCore Runtime 的 CodeZip（含 linux/aarch64 依赖，~144MB）
-#   SHA256SUMS                    上面三个的校验和
+#   SHA256SUMS                    上面四个 zip 的校验和
 #   notiops-webchat.template.json 客户点 "Launch Stack" 打开的那份模板
 #
 # 模板与产物是**一对一绑死**的：tag 进 S3 key、sha256 进模板里的产物清单。
-# 所以这四个文件必须**同一次运行**产出、一起发布；混搭两次运行的产物 =
+# 所以这些文件必须**同一次运行**产出、一起发布；混搭两次运行的产物 =
 # StagerFn 校验 sha256 不通过 = 客户侧开栈失败（这正是我们要的失败方式）。
 #
-# 三个产物为什么各自这样打：
+# 四个产物为什么各自这样打：
 #
 #   · agent-code.zip 用 `agentcore package` 而不是自己 pip vendoring。
 #     AgentCore 托管运行时**不做 pip install**（Step 1 PoC 实测），zip 里必须已经躺着
@@ -24,6 +25,8 @@
 #     排除掉的东西（构建缓存、editor 垃圾）一起发出去，且发的与模板声称的不是一回事。
 #   · chat-dist.zip 从 dist 目录**内部**打（`cd dist && zip -r`），因为 StagerFn 把 zip
 #     里的路径原样当 S3 key 用 —— 多一层 `dist/` 前缀，客户打开就是 404。
+#   · web-notif.zip 由 scripts/build_web_notif_zip.py 从 **import 闭包**算出来打，
+#     不是 zip 一个写死的文件清单。理由见那个脚本的文件头（清单会静默过期）。
 #
 # 用法：
 #   scripts/package_artifacts.sh --release-tag v1.0.11
@@ -103,8 +106,8 @@ echo "  output dir  : $OUT_DIR"
 mkdir -p "$OUT_DIR"
 # 上一轮的产物必须清掉：残留的旧 zip 会被下面的 SHA256SUMS 一起算进去，
 # 于是"清单里有 4 个产物"这种混搭状态要到客户开栈时才暴露。
-rm -f "$OUT_DIR/bff.zip" "$OUT_DIR/chat-dist.zip" "$OUT_DIR/agent-code.zip" \
-      "$OUT_DIR/SHA256SUMS" "$TEMPLATE_OUT"
+rm -f "$OUT_DIR/bff.zip" "$OUT_DIR/chat-dist.zip" "$OUT_DIR/web-notif.zip" \
+      "$OUT_DIR/agent-code.zip" "$OUT_DIR/SHA256SUMS" "$TEMPLATE_OUT"
 
 # ── 1. 前端 → chat-dist.zip ───────────────────────────────────────────────────
 step "frontend build -> chat-dist.zip"
@@ -151,6 +154,10 @@ ASSET_DIR="$SYNTH_DIR/$ASSET_REL"
 echo "  bff asset: $ASSET_REL"
 (cd "$ASSET_DIR" && zip -q -X -r "$OUT_DIR/bff.zip" . -x '*.DS_Store')
 
+# ── 2b. 「通知」生产端 → web-notif.zip ────────────────────────────────────────
+step "web notification handler -> web-notif.zip"
+python3 scripts/build_web_notif_zip.py --out "$OUT_DIR/web-notif.zip"
+
 # ── 3. Agent → agent-code.zip ────────────────────────────────────────────────
 step "agentcore package -> agent-code.zip"
 AGENT_ZIP="$AGENT_DIR/agentcore/NotiOpsWebChat.zip"
@@ -165,7 +172,7 @@ fi
 cp "$AGENT_ZIP" "$OUT_DIR/agent-code.zip"
 
 # ── 4. 逐个产物验形状 ─────────────────────────────────────────────────────────
-# 三个 zip 都是"内容错了也照样能上传、要等客户开栈甚至打开页面才暴露"的类型。
+# 四个 zip 都是"内容错了也照样能上传、要等客户开栈甚至打开页面才暴露"的类型。
 # 这里在发布前把各自的入口文件钉住。
 step "verify artifact shapes"
 python3 - "$OUT_DIR" <<'PY'
@@ -202,6 +209,19 @@ check("chat-dist.zip has an assets/ directory", any(n.startswith("assets/") for 
 check("chat-dist.zip has no nested dist/ prefix", not any(n.startswith("dist/") for n in dist),
       "zip was made from the parent dir; every object would land under dist/ and 404")
 
+# web-notif.zip —— handler 是 shared/report_delivery/web_push_handler.py，且它 import 的
+# core/push_event.py 必须在包里（少了它 = 客户账号里 ImportError，症状是"通知页面一直空着"）。
+# 每层包的 __init__.py 也必须在（少一个就是 ModuleNotFoundError）。
+notif = names("web-notif.zip")
+check("web-notif.zip has the handler module",
+      "shared/report_delivery/web_push_handler.py" in notif)
+check("web-notif.zip bundles core/push_event.py", "core/push_event.py" in notif)
+check("web-notif.zip has every package __init__.py",
+      {"core/__init__.py", "shared/__init__.py", "shared/report_delivery/__init__.py"} <= set(notif))
+check("web-notif.zip carries only python sources",
+      all(n.endswith(".py") for n in notif),
+      "unexpected non-.py entries: " + ", ".join(n for n in notif if not n.endswith(".py")))
+
 # agent-code.zip —— 托管运行时不 pip install，所以依赖必须是已经躺在包里的
 # linux/aarch64 + cp313 wheel。三条各自对应一种真实的失败：
 #   main.py 不在根          → 运行时找不到 EntryPoint
@@ -225,7 +245,7 @@ PY
 
 # ── 5. SHA256SUMS ────────────────────────────────────────────────────────────
 step "SHA256SUMS"
-(cd "$OUT_DIR" && shasum -a 256 bff.zip chat-dist.zip agent-code.zip > SHA256SUMS)
+(cd "$OUT_DIR" && shasum -a 256 bff.zip chat-dist.zip web-notif.zip agent-code.zip > SHA256SUMS)
 cat "$OUT_DIR/SHA256SUMS"
 
 # ── 6. 后处理模板 ─────────────────────────────────────────────────────────────
@@ -237,15 +257,15 @@ python3 scripts/postprocess_template.py "${POST_ARGS[@]}"
 
 # ── 7. 收尾 ──────────────────────────────────────────────────────────────────
 step "done"
-(cd "$OUT_DIR" && ls -lh bff.zip chat-dist.zip agent-code.zip SHA256SUMS \
+(cd "$OUT_DIR" && ls -lh bff.zip chat-dist.zip web-notif.zip agent-code.zip SHA256SUMS \
     notiops-webchat.template.json)
 cat <<EOF
 
-Publish these five files together (they are cryptographically bound to each other):
+Publish these six files together (they are cryptographically bound to each other):
   $OUT_DIR
 
 Next:
-  1. Upload the three zips + SHA256SUMS as assets of release $RELEASE_TAG
+  1. Upload the four zips + SHA256SUMS as assets of release $RELEASE_TAG
      (or to the S3 prefix you passed as --base-url).
   2. Upload notiops-webchat.template.json to S3 and deploy via --template-url
      (it is larger than CloudFormation's 51,200-byte --template-body limit).

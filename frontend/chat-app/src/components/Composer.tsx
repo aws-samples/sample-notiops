@@ -7,7 +7,9 @@ import { useModelCatalog } from "../models";
 import { topicHasDevopsAgent } from "../types";
 import { getCasesSummary, getDeepInvestigationAvailability } from "../api/chat";
 import { listSkills, skillDisplay, isPresetSkill, type Skill } from "../api/skills";
-import { IconInvestigate, IconCases, IconFinOps, IconReports, IconGlobe, IconSecurity, IconSkill, IconWhatsNew, IconChevronRight, IconPlus, IconCustomize, IconGauge, skillIcon } from "./icons";
+// IconSkill 随「/命令菜单」的两层结构一起去掉了：现在根层直接就是 skill 列表，
+// 不再有那条「技能 ▸」父项，所以这个图标已无处使用（留着 tsc 会报未使用导入）。
+import { IconInvestigate, IconCases, IconFinOps, IconReports, IconGlobe, IconSecurity, IconWhatsNew, IconChevronRight, IconPlus, IconCustomize, IconGauge, IconChatBubble, skillIcon } from "./icons";
 
 interface Props {
   model: string;
@@ -27,6 +29,13 @@ interface Props {
   /** 「深度调查（直连）」开关（默认关）：BFF 直连 DevOps Agent API、0 token。与 devopsAgent 互斥。 */
   devopsAgentDirect?: boolean;
   onToggleDevopsAgentDirect?: () => void;
+  /** 「DevOps 对话」开关（默认关；**仅故障调查主题**显示这个平铺开关）：BFF 直连 DevOps Agent
+   *  控制面 CreateChat/SendMessage，由客户自己的 DevOps Agent 回答、NotiOps 侧 0 token。
+   *  与上面两个开关三方互斥（互斥在 ChatApp 侧实现）。
+   *  ⚠️ **通用会话不显示这个开关** —— 那里改成新对话主页上的「对话对象」两张卡
+   *  （ChatObjectPicker），本字段仍然是同一个状态位，只是入口不同。 */
+  devopsChat?: boolean;
+  onToggleDevopsChat?: () => void;
   /** 停止当前会话正在进行的生成。 */
   onStop?: () => void;
   /** 当前会话主题，用于切换专属推荐 prompt。 */
@@ -47,7 +56,7 @@ interface Props {
 
 const EFFORTS = ["model.effort.fast", "model.effort.balanced", "model.effort.deep"] as const;
 
-export default function Composer({ model, onModelChange, onSend, busy, showSuggestions = true, webSearch = false, onToggleWebSearch, devopsAgent = false, onToggleDevopsAgent, devopsAgentDirect = false, onToggleDevopsAgentDirect, onStop, topic = "general", prefill, onManageSkills, onOpenDashboard, convKey, accountId = "" }: Props) {
+export default function Composer({ model, onModelChange, onSend, busy, showSuggestions = true, webSearch = false, onToggleWebSearch, devopsAgent = false, onToggleDevopsAgent, devopsAgentDirect = false, onToggleDevopsAgentDirect, devopsChat = false, onToggleDevopsChat, onStop, topic = "general", prefill, onManageSkills, onOpenDashboard, convKey, accountId = "" }: Props) {
   const t = useT();
   const { locale } = useLocale();
   const [text, setText] = useState("");
@@ -67,17 +76,37 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
   const [skills, setSkills] = useState<Skill[]>([]);
   const [activeSkill, setActiveSkill] = useState<Skill | null>(null);
   const [slashOpen, setSlashOpen] = useState(false);
-  const [skillsSub, setSkillsSub] = useState(false);   // 一级「Skills」展开的二级子菜单
+  // 键盘高亮行（↑/↓ 移动、Enter 选中）。列表现在可能很长且要滚动，光靠鼠标不够用。
+  const [slashIdx, setSlashIdx] = useState(0);
+  const listRef = useRef<HTMLDivElement>(null);
   useEffect(() => { listSkills().then(setSkills).catch(() => {}); }, []);
-  // 当输入恰为 "/..." 且无空格时，视为正在挑命令。text==="/" 为根菜单（分类层），"/xxx" 为过滤层。
+  // 当输入恰为 "/..." 且无空格时，视为正在挑命令。text==="/" 为根层（列全部），"/xxx" 为过滤层。
   const slashQuery = (!activeSkill && text.startsWith("/") && !text.includes(" ")) ? text.slice(1).toLowerCase() : null;
-  const slashRoot = slashQuery === "";   // 恰为 "/" → 显示分类（Skills ▸）
-  const slashMatches = slashQuery
-    ? skills.filter((s) => s.skill_id.toLowerCase().includes(slashQuery) || s.name.toLowerCase().includes(slashQuery)).slice(0, 8)
-    : [];
-  // 根菜单(恰为"/")总是显示分类；过滤层有匹配才显示。
-  useEffect(() => { setSlashOpen(slashQuery !== null && (slashRoot || slashMatches.length > 0)); }, [text, skills.length]); // eslint-disable-line
-  useEffect(() => { if (!slashRoot) setSkillsSub(false); }, [slashRoot]);
+  const slashRoot = slashQuery === "";   // 恰为 "/" → 列出全部 skill
+  const slashMatches = useMemo(() => (slashQuery
+    ? skills.filter((s) => s.skill_id.toLowerCase().includes(slashQuery) || s.name.toLowerCase().includes(slashQuery))
+    : []), [skills, slashQuery]);
+  // 菜单里那份列表：根层 = **全部** skill（不截断、不抽样，超出高度由 .cmd-list 自己滚动）；
+  // 过滤层 = 全部匹配项（同样不截断 —— 以前 slice(0,8) 会把第 9 个匹配静默藏掉）。
+  const slashList = slashRoot ? skills : slashMatches;
+  // 只要在挑命令就弹（含"一个 skill 都没有""一个都没匹配上"两种空态）：菜单里还有「管理/新建」
+  // 两个出口，而且旧行为——打到没匹配就整个菜单消失——会让客户以为自己打错了字，
+  // 而不是"确实没有这个 skill"。空态如实写出是哪一种。
+  useEffect(() => { setSlashOpen(slashQuery !== null); }, [text, skills.length]); // eslint-disable-line
+  // 每次改动查询串都把高亮拉回第一行：留在原位会指向一个已经被过滤掉的 skill。
+  useEffect(() => { setSlashIdx(0); }, [slashQuery]);
+  // 键盘移动时把高亮行滚进可视区（列表最多 ~7 行高，第 8 个之后必须靠滚）。
+  // jsdom 没实现 scrollIntoView → 可选调用，测试里不会炸。
+  useEffect(() => {
+    if (!slashOpen) return;
+    const el = listRef.current?.querySelector(`[data-idx="${slashIdx}"]`) as HTMLElement | null;
+    el?.scrollIntoView?.({ block: "nearest" });
+  }, [slashIdx, slashOpen]);
+  // 打开根层菜单时重拉一次列表：客户刚在「定制 → Skills」新建/删除完就按 "/"，
+  // 只在挂载时拉过一次的话他看到的是旧清单（"我明明刚建好"）。
+  useEffect(() => {
+    if (slashOpen && slashRoot) listSkills().then(setSkills).catch(() => {});
+  }, [slashOpen, slashRoot]);
 
   // ── 深度调查可用性：这个部署/这个账号有没有 DevOps Agent 的 Agent Space ──
   // 此前两个「深度调查」开关只按主题显示，没有 Agent Space 的部署（或没接入 DevOps Agent 的
@@ -85,44 +114,45 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
   // account_not_onboarded_to_devops_agent。这里提前问一次，不可用就置灰 + 写清原因和出路。
   // "" = 可用（或还没问出来 —— 探测不确定一律按可用处理，见 api/chat.ts）。
   const deepShown = topicHasDevopsAgent(topic);
+  // 「DevOps 对话」的**平铺开关**只留给故障调查主题（产品决定：显式列举，不跟随
+  // topicHasDevopsAgent 的"默认提供、按例外排除"口径 —— 那份排除表管的是"给我们的 agent
+  // 挂 DevOps 工具"，与这条根本不经我们 agent 的路径无关）。
+  // 通用会话**不显示这个开关**：那里改由新对话主页的「对话对象」两张卡来选
+  // （ChatObjectPicker），选完发第一句即锁定 —— 一个能力两个入口会让"这段对话谁在答"
+  // 变得不可预期（开关是每轮修饰，对象是整段会话的事实）。
+  const CHAT_TOPICS: ReadonlySet<string> = new Set(["investigate"]);
+  const chatShown = CHAT_TOPICS.has(topic || "general");
+  // 通用会话里选了「DevOps Agent」这个对话对象：这一段对话不经我们的模型，
+  // 模型选择器 / "/" 命令 / 联网搜索**全都与它无关**，留在界面上是在承诺不成立的事。
+  const objMode = devopsChat && (topic || "general") === "general";
   const [deepNa, setDeepNa] = useState("");
   useEffect(() => {
-    if (!deepShown) return;
+    // 通用会话既不显示深度调查、也不显示这个开关 → 不探（可用性由 ChatObjectPicker 自己探，
+    // 两处各探一次等于每进一次主页发两个签名请求）。
+    if (!deepShown && !chatShown) return;
     let stop = false;
     getDeepInvestigationAvailability(accountId)
       .then((r) => { if (!stop) setDeepNa(r.available ? "" : (r.reason || "unavailable")); })
       .catch(() => { /* 探测失败按可用处理 */ });
     return () => { stop = true; };
-  }, [deepShown, accountId]);
+  }, [deepShown, chatShown, accountId]);
   // 切到一个做不了深度调查的账号时，把已经开着的开关自动关掉 —— 否则用户带着一个必然失败的
   // 开关继续发消息（开关置灰后他也点不掉）。
   useEffect(() => {
     if (!deepNa) return;
     if (devopsAgent) onToggleDevopsAgent?.();
     if (devopsAgentDirect) onToggleDevopsAgentDirect?.();
+    if (devopsChat) onToggleDevopsChat?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deepNa, devopsAgent, devopsAgentDirect]);
+  }, [deepNa, devopsAgent, devopsAgentDirect, devopsChat]);
   const deepNaHint = deepNa === "account_not_onboarded_to_devops_agent"
     ? t("composer.devops.na.account") : t("composer.devops.na.self");
 
-  // 二级子菜单只随机展示 3 个 skill（其余靠「输入以筛选」找）。每次展开子菜单重新洗牌。
-  const [subSeed, setSubSeed] = useState(0);
-  useEffect(() => { if (skillsSub) setSubSeed((s) => s + 1); }, [skillsSub]);
-  const subSkills = useMemo(() => {
-    const arr = [...skills];
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-    return arr.slice(0, 3);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [skills.length, subSeed]);
-
-  // 子菜单里点「输入以筛选」：把光标留在输入框，提示用户接着打字过滤（已是 "/" 态）。
-  const focusFilter = () => {
-    setSkillsSub(false);
-    requestAnimationFrame(() => { taRef.current?.focus(); autogrow(); });
-  };
+  // 本轮这个 skill 会不会被交给客户自己的 DevOps Agent 执行 —— 三条路径都算（见芯片处注释）。
+  const devopsHandsOff = devopsAgent || devopsAgentDirect || devopsChat;
+  // 已发布到某个 Agent Space（世界 B）= DevOps Agent 那边有完整一份（含 references/）。
+  const skillPublishedToDevops = !!activeSkill?.devops_agent?.uploads
+    && Object.keys(activeSkill.devops_agent!.uploads!).length > 0;
 
   const pickSkill = (s: Skill) => {
     setActiveSkill(s);
@@ -132,7 +162,6 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
     const prefill = locale === "zh" ? `使用 Skill「${nm}」` : `Use the "${nm}" skill`;
     setText(prefill);
     setSlashOpen(false);
-    setSkillsSub(false);
     requestAnimationFrame(() => {
       const ta = taRef.current;
       if (ta) { ta.focus(); ta.setSelectionRange(prefill.length, prefill.length); }
@@ -142,24 +171,24 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
 
   // 点 "/" 按钮：填入 "/" 并打开命令菜单（再点一次关闭）。
   const toggleCmdMenu = () => {
-    if (slashOpen && slashRoot) { setText(""); setSlashOpen(false); setSkillsSub(false); return; }
+    if (slashOpen && slashRoot) { setText(""); setSlashOpen(false); return; }
     setText("/");
     setSlashOpen(true);
     requestAnimationFrame(() => { taRef.current?.focus(); autogrow(); });
   };
 
   const gotoManageSkills = () => {
-    setText(""); setSlashOpen(false); setSkillsSub(false);
+    setText(""); setSlashOpen(false);
     onManageSkills?.();
   };
 
   // 候选集由管理员在服务端勾选（GET /models），拉取落地后本组件自动重渲染。
   const { models: modelOptions, loading: catalogLoading, source: catalogSource,
           canSend: catalogCanSend, canSendWithoutModel } = useModelCatalog();
-  // 「深度调查（直连）」由 BFF 直连 DevOps Agent API，全程 0 token、不碰 Bedrock，
-  // 所以它不受模型目录门禁约束 —— 否则管理员取消勾选全部 webchat 模型后，唯一不需要
-  // 模型的功能反而发不出去，而提示语还指向一个与它无关的配置项。
-  const sendAllowed = devopsAgentDirect ? canSendWithoutModel : catalogCanSend;
+  // 「深度调查（直连）」和「DevOps 对话」都由 BFF 直连 DevOps Agent API，全程 0 token、
+  // 不碰 Bedrock，所以它们不受模型目录门禁约束 —— 否则管理员取消勾选全部 webchat 模型后，
+  // 唯一不需要模型的功能反而发不出去，而提示语还指向一个与它无关的配置项。
+  const sendAllowed = (devopsAgentDirect || devopsChat) ? canSendWithoutModel : catalogCanSend;
   const modelName = modelOptions.find((m) => m.id === model)?.name ?? model;
 
   useEffect(() => {
@@ -309,9 +338,20 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
     requestAnimationFrame(() => { taRef.current?.focus(); autogrow(); });
   };
 
+  // 已消费过的 prefill seq。**初值取挂载时的 seq，而不是 0** —— 这是"回到主题时输入框里
+  // 还留着上次问过的那句话"的根因（2026-08-27 现网反馈：只有强刷浏览器才会消失）：
+  // prefill 存在 ChatApp 的 `themePrefill[topic]` / `homePrefill[convId]` 里，活得比本组件久；
+  // 而主题 landing 挂在 `view` 上，点主题=整棵子树卸载重挂。若从 0 起算，重挂时下面这个
+  // effect 会认为"seq 变了"，把那条**已经发出去**的问题又填回输入框。
+  // 卡片和输入框在同一棵子树里（卡片点击时本组件必定已挂载），所以"挂载时的 seq 一律视为
+  // 已消费"不会漏掉任何一次真实点击。
+  const appliedPrefillSeqRef = useRef(prefill?.seq ?? 0);
+
   // 外部预填（通用主页启动卡片）：seq 每变一次就填入并聚焦，光标落文末，回车即发。
   useEffect(() => {
     if (!prefill || prefill.seq === 0) return;
+    if (prefill.seq === appliedPrefillSeqRef.current) return;   // 挂载时带进来的旧 seq / 重复渲染
+    appliedPrefillSeqRef.current = prefill.seq;
     setActiveSkill(null);
     setText(prefill.text);
     requestAnimationFrame(() => {
@@ -359,105 +399,107 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
           </div>
         )}
         <div className={"cbox" + (onOpenDashboard ? " has-tab" : "")}>
-          {/* 命令菜单：点 "/" 按钮或手输 "/" 弹出。
-              根层(text==="/")显示分类「Skills ▸」，悬停展开二级子菜单（已有 skills + 管理/新增）；
-              过滤层(text==="/xxx")显示扁平的 skill 匹配列表（type-to-filter）。 */}
+          {/* 命令菜单：点 "/" 按钮或手输 "/" 弹出。**一层扁平列表**（不再是「Skills ▸」+ 悬停子菜单）：
+              根层(text==="/")列出**全部** skill，过滤层(text==="/xxx")列出全部匹配项 —— 两层同一个
+              渲染分支，唯一差别是列表内容。
+              为什么改：旧版子菜单只随机展示 3 个 + 一行「输入以筛选」。客户有 20 个 skill 也只看见 3 个，
+              且那 3 个每次展开都在变 —— 看上去像"我就这么点能力"，想找某个 skill 只能靠猜名字打字。
+              现在条数写在表头、超出高度由列表自己滚动（该藏的是像素，不是能力）。
+              「管理 Skills / 新建 Skill」两个出口留在滚动区**外面**：它们不该被 30 个 skill 挤到看不见。 */}
           {slashOpen && (
-            slashRoot ? (
-              <div className="cmd-menu">
-                <div className="cmd-cat" onMouseEnter={() => setSkillsSub(true)} onMouseLeave={() => setSkillsSub(false)}>
-                  <button type="button" className="cmd-mi" onClick={() => setSkillsSub((v) => !v)}>
-                    <IconSkill size={15} />
-                    <span className="cmd-mi-name">{t("cz.nav.skills")}</span>
-                    <span className="cmd-mi-arrow"><IconChevronRight size={15} /></span>
-                  </button>
-                  {skillsSub && (
-                    <div className="cmd-sub">
-                      {subSkills.length > 0 ? (
-                        subSkills.map((s) => {
-                          const Mi = skillIcon(s.skill_id);
-                          const preset = isPresetSkill(s);
-                          return (
-                          <button key={s.skill_id} type="button" className="skill-mi" onClick={() => pickSkill(s)}>
-                            <Mi size={15} />
-                            <span className="skill-mi-name">/{s.skill_id}</span>
-                            <span className={"skill-mi-tag " + (preset ? "preset" : "mine")}>
-                              {preset ? t("cz.skill.tag.preset") : t("cz.skill.tag.mine")}
-                            </span>
-                            <span className="skill-mi-desc">{skillDisplay(s, locale).name}</span>
-                          </button>
-                          );
-                        })
-                      ) : (
-                        <div className="cmd-sub-empty">{t("cmd.skills.empty")}</div>
-                      )}
-                      {/* 第 4 行用「输入以筛选」替代：其余 skill 靠继续打字过滤 */}
-                      {skills.length > 0 && (
-                        <button type="button" className="cmd-mi cmd-mi-filter" onClick={focusFilter}>
-                          <IconSkill size={15} />
-                          <span className="cmd-mi-name cmd-mi-muted">{t("cmd.filterHint")}</span>
-                        </button>
-                      )}
-                      <div className="cmd-sep" />
-                      <button type="button" className="cmd-mi" onClick={gotoManageSkills}>
-                        <IconCustomize size={15} />
-                        <span className="cmd-mi-name">{t("cmd.skills.manage")}</span>
-                      </button>
-                      <button type="button" className="cmd-mi" onClick={gotoManageSkills}>
-                        <IconPlus size={15} />
-                        <span className="cmd-mi-name">{t("cmd.skills.add")}</span>
-                      </button>
-                    </div>
-                  )}
+            <div className="cmd-menu">
+              <div className="cmd-head">
+                <span className="cmd-head-title">{t("cmd.skills.head")} ({slashList.length})</span>
+                {/* 根层才提示「输入以筛选」：过滤层里用户已经在筛了。 */}
+                {slashRoot && slashList.length > 0 && <span className="cmd-head-hint">{t("cmd.filterHint")}</span>}
+              </div>
+              {slashList.length > 0 ? (
+                <div className="cmd-list" ref={listRef}>
+                  {slashList.map((s, i) => {
+                    const Mi = skillIcon(s.skill_id);
+                    const preset = isPresetSkill(s);
+                    const d = skillDisplay(s, locale);
+                    return (
+                    <button key={s.skill_id} type="button" data-idx={i}
+                      className={"skill-mi" + (i === slashIdx ? " active" : "")}
+                      title={d.description ? `${d.name} — ${d.description}` : d.name}
+                      onMouseEnter={() => setSlashIdx(i)}
+                      onClick={() => pickSkill(s)}>
+                      <Mi size={15} />
+                      <span className="skill-mi-name">/{s.skill_id}</span>
+                      <span className={"skill-mi-tag " + (preset ? "preset" : "mine")}>
+                        {preset ? t("cz.skill.tag.preset") : t("cz.skill.tag.mine")}
+                      </span>
+                      <span className="skill-mi-desc">{d.name}</span>
+                      {/* 描述（「什么时候用它」）：选哪个 skill 靠的是这句，不是 id。整行放不下就截断，
+                          完整内容在 title 里（悬停可见）。 */}
+                      {d.description && <span className="skill-mi-sub">{d.description}</span>}
+                    </button>
+                    );
+                  })}
                 </div>
-              </div>
-            ) : slashMatches.length > 0 ? (
-              <div className="skill-menu">
-                {slashMatches.map((s) => {
-                  const Mi = skillIcon(s.skill_id);
-                  const preset = isPresetSkill(s);
-                  return (
-                  <button key={s.skill_id} type="button" className="skill-mi" onClick={() => pickSkill(s)}>
-                    <Mi size={15} />
-                    <span className="skill-mi-name">/{s.skill_id}</span>
-                    <span className={"skill-mi-tag " + (preset ? "preset" : "mine")}>
-                      {preset ? t("cz.skill.tag.preset") : t("cz.skill.tag.mine")}
-                    </span>
-                    <span className="skill-mi-desc">{skillDisplay(s, locale).name}</span>
-                  </button>
-                  );
-                })}
-              </div>
-            ) : null
+              ) : (
+                <div className="cmd-empty">{t(slashRoot ? "cmd.skills.empty" : "cmd.skills.noMatch")}</div>
+              )}
+              <div className="cmd-sep" />
+              <button type="button" className="cmd-mi" onClick={gotoManageSkills}>
+                <IconCustomize size={15} />
+                <span className="cmd-mi-name">{t("cmd.skills.manage")}</span>
+              </button>
+              <button type="button" className="cmd-mi" onClick={gotoManageSkills}>
+                <IconPlus size={15} />
+                <span className="cmd-mi-name">{t("cmd.skills.add")}</span>
+              </button>
+            </div>
           )}
-          {/* 已激活的 skill 芯片（发送时随本轮强制使用该 skill）。DevOps Agent 标记只看本轮开关：
-              开 → 这轮会把该 skill 交给 DevOps Agent 深度调查。所有 skill 本地都能跑，无需声明执行方式。*/}
+          {/* 已激活的 skill 芯片（发送时随本轮强制使用该 skill）。「DevOps Agent」标记的含义是
+              **这一轮谁来执行这个 skill**，所以三条交给 DevOps Agent 的路径都要打上：
+                · 深度调查（devopsAgent）      → 我们的 agent 转交 DevOps Agent；
+                · 深度调查（直连）（devopsAgentDirect）→ BFF 直连 CreateBacklogTask；
+                · DevOps 对话（devopsChat）    → BFF 直连 CreateChat/SendMessage。
+              以前只认第一个，于是勾了「深度调查（直连）」的客户在界面上**看不出**这个 skill 会被
+              交给 DevOps Agent —— 同一件事，界面说法却随路径变。 */}
           {activeSkill && (() => { const ChipIcon = skillIcon(activeSkill.skill_id); return (
             <div className="skill-active">
               <ChipIcon size={14} /> <span>{skillDisplay(activeSkill, locale).name}</span>
-              {devopsAgent && (
+              {devopsHandsOff && (
                 <span className="skill-active-mode" title={t("composer.devops")}><IconInvestigate size={12} /> DevOps Agent</span>
               )}
               <button type="button" className="skill-active-x" onClick={() => setActiveSkill(null)} title="移除">×</button>
             </div>
           ); })()}
-          {/* 开了 DevOps Agent 开关，但选中的 skill 尚未发布到 DevOps Agent → 行内提醒：
-              深度调查时这个 skill 不会被激活，先去「定制 → Skills」发布。补上"选未发布 skill 静默不生效"的缺口。 */}
-          {activeSkill && devopsAgent && !(activeSkill.devops_agent?.uploads && Object.keys(activeSkill.devops_agent.uploads).length > 0) && (
+          {/* 未发布到 DevOps Agent 的 skill，在两类路径上的后果**不一样**，所以提示分两句写：
+              · 「深度调查」：我们的 agent 只是转交一个任务描述，正文不过去 → 这个 skill 真的不会被激活，必须先发布；
+              · 两条**直连**路径：BFF 把正文内联进发给 DevOps Agent 的那段话（devops_skill.mjs）→ 无需发布也生效，
+                唯一缺口是 references/ 附属文件取不到。
+              这里以前只有第一句、且只在 devopsAgent 时出现：直连路径既没提示（客户不知道谁在执行），
+              而把第一句套上去更糟 —— 那是在说一件不成立的事（"不会被激活"）。 */}
+          {activeSkill && devopsHandsOff && !skillPublishedToDevops && (
             <div className="skill-needs-devops">
-              <IconInvestigate size={13} /> {t("composer.skill.notPublished")}
+              <IconInvestigate size={13} /> {t(devopsAgent ? "composer.skill.notPublished" : "composer.skill.directInline")}
             </div>
           )}
+          {/* 开着「DevOps 对话」时提示语必须换：这一轮答话的**不是 NotiOps**，而是客户自己的
+              DevOps Agent（我们侧 0 token）—— 还写 "给 NotiOps 发消息…" 是在说错谁在答。
+              （/skill 在这条路径上是生效的，所以提示语里不必否认它。） */}
           <div className="ta-wrap">
             <textarea
               ref={taRef}
               rows={1}
-              placeholder={activeSkill ? `使用 Skill「${skillDisplay(activeSkill, locale).name}」…` : t("composer.placeholder")}
+              placeholder={activeSkill
+                ? `使用 Skill「${skillDisplay(activeSkill, locale).name}」…`
+                : t(devopsChat ? "composer.placeholder.devopschat" : "composer.placeholder")}
               value={text}
               onChange={(e) => { setText(e.target.value); autogrow(); }}
               onKeyDown={(e) => {
-                if (slashOpen && e.key === "Enter" && slashMatches.length) { e.preventDefault(); pickSkill(slashMatches[0]); return; }
-                if (e.key === "Escape" && slashOpen) { setSlashOpen(false); setSkillsSub(false); return; }
+                // 命令菜单开着时先让键盘归它：↑/↓ 选行、Enter 选中高亮那个、Esc 关。
+                // 列表现在可能有几十行且要滚动，"Enter = 第一个匹配"已经不够用了。
+                if (slashOpen && slashList.length) {
+                  if (e.key === "ArrowDown") { e.preventDefault(); setSlashIdx((i) => (i + 1) % slashList.length); return; }
+                  if (e.key === "ArrowUp") { e.preventDefault(); setSlashIdx((i) => (i - 1 + slashList.length) % slashList.length); return; }
+                  if (e.key === "Enter") { e.preventDefault(); pickSkill(slashList[Math.min(slashIdx, slashList.length - 1)]); return; }
+                }
+                if (e.key === "Escape" && slashOpen) { setSlashOpen(false); return; }
                 if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
               }}
             />
@@ -471,7 +513,12 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
             )}
           </div>
           <div className="cbar">
-            {/* "/" 命令菜单按钮：点开两层菜单（Skills ▸ 子菜单 / 管理 / 新增），并填入 "/" 进入过滤态 */}
+            {/* objMode（通用会话选了 DevOps Agent）下**只**去掉联网搜索与模型选择器：联网搜索
+                由 DevOps Agent 自己决定、模型跟这条路径完全无关（见下方 cbar-right），留着等于
+                给客户点了不生效的控件。
+                "/" 则保留 —— 它现在是真生效的：BFF 会把 skill 正文内联进发给 DevOps Agent 的
+                那段话（bff/web-chat/devops_skill.mjs），DevOps Agent 按它执行，我们侧仍 0 token。 */}
+            {/* "/" 命令菜单按钮：填入 "/" 并弹出扁平 skill 列表（全部 + 管理 / 新建） */}
             <button
               type="button"
               className={"cmd-btn" + (slashOpen ? " on" : "")}
@@ -481,15 +528,37 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
             >
               /
             </button>
-            <button
-              type="button"
-              className={"websearch-toggle" + (webSearch ? " on" : "")}
-              onClick={onToggleWebSearch}
-              title={t("composer.websearch") + " — " + t("composer.websearch.hint")}
-              aria-pressed={webSearch}
-            >
-              <IconGlobe size={15} /> {t("composer.websearch.short")}
-            </button>
+            {!objMode && (
+              <button
+                type="button"
+                className={"websearch-toggle" + (webSearch ? " on" : "")}
+                onClick={onToggleWebSearch}
+                title={t("composer.websearch") + " — " + t("composer.websearch.hint")}
+                aria-pressed={webSearch}
+              >
+                <IconGlobe size={15} /> {t("composer.websearch.short")}
+              </button>
+            )}
+            {/* 「DevOps 对话」：这轮直接由**客户自己的 DevOps Agent** 回答（BFF 直连控制面
+                CreateChat/SendMessage 并逐 delta 转发），NotiOps 侧 **0 token**。
+                位置固定在联网搜索之后（产品指定）；在**故障调查 + 通用会话**两个主题显示
+                （chatShown 显式列举，不跟 topicHasDevopsAgent 走）。同样依赖 Agent Space，故复用
+                deepNa 的置灰与提示。与两个「深度调查」三方互斥（互斥在 ChatApp 侧）。
+                ⚠️ 关着时前端不传 devops_chat_direct，后端行为与从前逐字节一致。 */}
+            {chatShown && (
+              <button
+                type="button"
+                className={"websearch-toggle" + (devopsChat ? " on" : "") + (deepNa ? " disabled" : "")}
+                onClick={deepNa ? undefined : onToggleDevopsChat}
+                disabled={!!deepNa}
+                title={deepNa ? deepNaHint : t("composer.devopschat") + " — " + t("composer.devopschat.hint")}
+                aria-pressed={devopsChat}
+                aria-disabled={deepNa ? "true" : undefined}
+              >
+                <IconChatBubble size={15} /> {t("composer.devopschat.short")}
+                {deepNa && <span className="toggle-soon">{t("composer.devops.na")}</span>}
+              </button>
+            )}
             {/* FinOps Agent 深度模式开关：仅 FinOps 主题显示。**暂不可用**(功能未完善)——
                 置灰禁用,提示"即将上线"。客户可改用下面的 DevOps Agent 分析成本/用量。 */}
             {topic === "finops" && (
@@ -539,7 +608,31 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
                 {deepNa && <span className="toggle-soon">{t("composer.devops.na")}</span>}
               </button>
             )}
+            {/* objMode（通用会话，对话对象已是客户自己的 DevOps Agent）下**唯一保留**的开关：
+                「深度调查」。对象不变，它只决定**这一轮**走哪一条：不勾 = 直接问答（秒级回话）；
+                勾上 = 让它发起一次完整的深度调查（多信号排查，出报告，通常几分钟）。两者都不经
+                我们的模型，所以这里不需要模型选择器/联网/命令（见上面的瘦身注释）。
+                **默认不勾**（产品指定）：深度调查要跑几分钟，不能替客户默认选上。
+                不置灰：能进 objMode 就说明这个账号已接入 DevOps Agent（可用性已由
+                ChatObjectPicker 探过），这里再探一次只是多一个签名请求。
+                互斥由 ChatApp 的 toggleDevopsAgentDirect 保证 —— 勾它**不会**把对话对象换掉。 */}
+            {objMode && (
+              <button
+                type="button"
+                className={"websearch-toggle" + (devopsAgentDirect ? " on" : "")}
+                onClick={onToggleDevopsAgentDirect}
+                title={t("composer.devops.short") + " — " + t("composer.devops.obj.hint")}
+                aria-pressed={devopsAgentDirect}
+              >
+                <IconInvestigate size={15} /> {t("composer.devops.short")}
+              </button>
+            )}
             <div className="cbar-right" style={{ marginLeft: "auto" }} ref={selRef}>
+              {/* 模型选择器：objMode 下**不显示** —— 这段对话由客户自己的 DevOps Agent 回答，
+                  一个字都不经我们的 Bedrock 模型（NotiOps 侧 0 token）。显示一个"当前模型"
+                  会让客户以为自己选的模型在答这些问题，那是纯粹的假信息。
+                  发送按钮不受影响：sendAllowed 对直连路径走 canSendWithoutModel。 */}
+              {!objMode && (
               <div className="modelsel" onClick={(e) => {
                 e.stopPropagation();
                 // 开菜单前判断方向:菜单约 ~420px 高,若选择器上方空间不足就向下弹。
@@ -556,6 +649,7 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
                 <span className="effort">{t(EFFORTS[effortIdx])}</span>
                 <span className="caret">▾</span>
               </div>
+              )}
               {busy ? (
                 /* 生成中：显示停止按钮（方块），点击中止本会话生成 */
                 <button className="send stop" onClick={() => onStop?.()} aria-label="Stop" title={t("composer.stop")}>
@@ -574,7 +668,9 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
                 </button>
               )}
 
-              {menuOpen && (
+              {/* !objMode 也要挡：菜单开着时客户去点了「DevOps Agent」那张卡，选择器会消失，
+                  菜单却会留在原地悬空。 */}
+              {!objMode && menuOpen && (
                 <div className={"modelmenu" + (menuDropUp ? "" : " drop-down")} onClick={(e) => e.stopPropagation()}>
                   {/* 这一份清单不是管理员配的那一份 —— 读服务端目录失败时会静默退回打包内置
                       清单，于是用户看到的模型多于（甚至完全不同于）管理员启用的那些。
@@ -636,8 +732,12 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
             </div>
           </div>
         </div>
-        {/* 免责声明仅在已开始对话时显示；空对话居中态隐藏 */}
-        {!showSuggestions && <div className="chint">{t("composer.hint")}</div>}
+        {/* 免责声明仅在已开始对话时显示；空对话居中态隐藏。
+            通用会话选了 DevOps Agent（objMode）时必须换主语：这段对话答话的不是 NotiOps，
+            把"NotiOps 可能出错"挂在别人的答案下面既张冠李戴、也让客户不知道该找谁核实。 */}
+        {!showSuggestions && (
+          <div className="chint">{t(objMode ? "composer.hint.devops" : "composer.hint")}</div>
+        )}
       </div>
     </div>
   );

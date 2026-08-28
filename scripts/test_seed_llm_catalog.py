@@ -65,11 +65,13 @@ def _load_seeder():
 
 
 class _FakeTable:
-    """Minimal Table stand-in honouring attribute_not_exists(PK)."""
+    """Minimal Table stand-in honouring attribute_not_exists(PK) and the
+    generation condition the top-up path writes with."""
 
     def __init__(self, existing: dict | None = None):
         self.item = existing
         self.puts = 0
+        self.updates = 0
         self.conditions: list[str] = []
 
     def put_item(self, **kw):
@@ -78,12 +80,28 @@ class _FakeTable:
         if cond:
             self.conditions.append(cond)
         if cond == "attribute_not_exists(PK)" and self.item is not None:
-            from botocore.exceptions import ClientError
-            raise ClientError(
-                {"Error": {"Code": "ConditionalCheckFailedException", "Message": "exists"}},
-                "PutItem")
+            raise self._conflict("PutItem")
         self.item = kw["Item"]
         return {}
+
+    def get_item(self, **_kw):
+        return {"Item": self.item} if self.item is not None else {}
+
+    def update_item(self, **kw):
+        self.updates += 1
+        self.conditions.append(kw.get("ConditionExpression"))
+        gen = (self.item or {}).get("generation")
+        if gen is not None and int(gen) != 0:
+            raise self._conflict("UpdateItem")   # 与真表一致：条件不满足就抛
+        self.item = {**(self.item or {}),
+                     "models": kw["ExpressionAttributeValues"][":m"]}
+        return {}
+
+    @staticmethod
+    def _conflict(op: str):
+        from botocore.exceptions import ClientError
+        return ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException", "Message": "exists"}}, op)
 
 
 def _run_seeder(mod, table, argv):
@@ -285,6 +303,74 @@ def test_idempotent_and_force() -> None:
            f"rc={rc} conds={forced.conditions}")
 
 
+def test_tops_up_models_added_after_the_first_deploy() -> None:
+    """Models added to the catalogue later must reach already-seeded environments.
+
+    The conditional write makes "already present" the normal path on every
+    re-deploy, so before the top-up existed a new catalogue entry simply never
+    arrived: the admin console's model table and the chat model picker kept
+    showing the old list, with no error anywhere. That is exactly how `zai-glm-5`
+    was missing from production a day after being added (2026-08-27).
+
+    The top-up is additive and gated on `generation == 0`: an administrator who
+    has saved that page may have dropped a model deliberately, and a deploy
+    resurrecting it would be the same defect as overwriting their config.
+    """
+    print("test_tops_up_models_added_after_the_first_deploy")
+    mod = _load_seeder()
+    cfg = mod._load(SEED_FILE)                      # noqa: SLF001
+    aliases = [m["alias"] for m in cfg["models"]]
+
+    # 老环境：seed 的时候目录里还没有最后那个模型
+    stale = {"PK": "llmcfg", "SK": "meta", "generation": 0,
+             "default_model": cfg["default_model"],
+             "models": [dict(m) for m in cfg["models"][:-1]]}
+    table = _FakeTable(existing=dict(stale, models=[dict(m) for m in stale["models"]]))
+    rc = _run_seeder(mod, table, ["--table", "t", "--region", "us-east-1"])
+    _check("stale catalogue: exits 0", rc == 0, f"rc={rc}")
+    _check("stale catalogue: the missing model is added",
+           [m["alias"] for m in table.item["models"]] == aliases,
+           str([m["alias"] for m in table.item["models"]]))
+    _check("stale catalogue: default_model untouched",
+           table.item["default_model"] == cfg["default_model"])
+    _check("stale catalogue: the top-up write is conditional on generation",
+           any("generation = :zero" in (c or "") for c in table.conditions),
+           str(table.conditions))
+
+    # 已经齐了 → 一个写都不该有
+    complete = _FakeTable(existing={"PK": "llmcfg", "SK": "meta", "generation": 0,
+                                    "default_model": cfg["default_model"],
+                                    "models": [dict(m) for m in cfg["models"]]})
+    rc = _run_seeder(mod, complete, ["--table", "t", "--region", "us-east-1"])
+    _check("complete catalogue: no update at all",
+           rc == 0 and complete.updates == 0, f"rc={rc} updates={complete.updates}")
+
+    # 管理员改过（generation>0）→ 不补，只提示
+    edited = _FakeTable(existing={"PK": "llmcfg", "SK": "meta",
+                                  "generation": 1760000000000,
+                                  "default_model": cfg["default_model"],
+                                  "models": [dict(m) for m in cfg["models"][:-1]]})
+    rc = _run_seeder(mod, edited, ["--table", "t", "--region", "us-east-1"])
+    _check("admin-edited catalogue: nothing is added back",
+           rc == 0 and edited.updates == 0
+           and len(edited.item["models"]) == len(cfg["models"]) - 1, f"rc={rc}")
+
+    # 只增不改：库里已有的条目（哪怕被关掉了）逐字段保留，目录里没有的留在末尾
+    kept = [dict(m) for m in cfg["models"][:-1]]
+    kept[0] = {**kept[0], "enabled": False, "label": "renamed by admin"}
+    kept.append({"alias": "custom-model", "enabled": True})
+    additive = _FakeTable(existing={"PK": "llmcfg", "SK": "meta", "generation": 0,
+                                    "default_model": cfg["default_model"],
+                                    "models": kept})
+    _run_seeder(mod, additive, ["--table", "t", "--region", "us-east-1"])
+    merged = additive.item["models"]
+    first = next(m for m in merged if m["alias"] == aliases[0])
+    _check("existing entries are copied verbatim (a disabled model stays disabled)",
+           first["enabled"] is False and first["label"] == "renamed by admin")
+    _check("entries absent from the catalogue survive at the end",
+           merged[-1]["alias"] == "custom-model", str([m["alias"] for m in merged]))
+
+
 def test_setup_sh_wires_it_up() -> None:
     """setup.sh must actually call the seeder, and tolerate its failure."""
     print("test_setup_sh_wires_it_up")
@@ -304,6 +390,7 @@ def main() -> int:
     test_both_readers_normalise_the_seeded_item()
     test_sanity_check_catches_a_broken_seed()
     test_idempotent_and_force()
+    test_tops_up_models_added_after_the_first_deploy()
     test_setup_sh_wires_it_up()
     if _failed:
         print(f"\n{FAIL} {_failed} check(s) failed")

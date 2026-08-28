@@ -35,7 +35,8 @@ export default function InvestigationDashboardBrowser({
 }: {
   data?: AlarmDashboardData;
   can?: (key: string) => boolean;
-  onInvestigate?: (query: string) => void;
+  // opts 原样转给 ChatApp：事件收件箱卡片会带 { deep: true } 要求开「深度调查（直连）」。
+  onInvestigate?: (query: string, opts?: { deep?: boolean }) => void;
   onNotify?: (query: string) => void;
   initial?: string;
   accountId?: string;

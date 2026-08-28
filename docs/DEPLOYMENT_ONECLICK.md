@@ -32,14 +32,13 @@
 
 说清楚比事后惊讶好。下面这些**这条路径不部署**，需要 `setup.sh`：
 
-- **IM bot**（飞书 / Slack / 钉钉）——包括往 IM 推送告警。
+- **IM bot**（飞书 / Slack / 钉钉）——包括往 IM 推送告警。（同样这 10 类信号源**会**进浏览器里的「通知」收件箱，见 [§2.9](#29-通知收件箱)；不进的只是 IM。）
 - **每日自动巡检**（闲置资源检测、成本异常扫描）与它的 5 个 Lambda。
 - **管理仪表盘**（阈值配置、目标账户管理、Skills 管理界面）——一键部署只有聊天界面。
-- **「通知」收件箱里的内容**：界面在，但产生通知的后端（Health 事件转发、告警推送）不在。
 - **CUR + Athena 成本明细数据源**：FinOps 提问仍可用 Cost Explorer 口径，但没有账单明细级下钻。
 - **跨账号的自动巡检与事件推送**：一键部署可以做**跨账号只读排查/调查/开案例**（`DeployMode=MultiAccount`，见 [§2.6](#26-可选多账号组织内跨账号)），但成员账号侧的 **CloudWatch OAM Sink** 与 **跨账号事件转发**（Health / DevOps Agent 调查事件回流）不在这条路径里 —— 那两样要 `setup.sh`。
 
-（**DevOps Agent 深度调查**和**联网搜索**都**不**在此列 —— 这两样都由这个栈自动建好，分别见 [§2.7](#27-深度调查aws-devops-agent) 和 [§2.8](#28-联网搜索agentcore-web-search)。）
+（**DevOps Agent 深度调查**、**联网搜索**、**「通知」收件箱**都**不**在此列 —— 这三样都由这个栈自动建好，分别见 [§2.7](#27-深度调查aws-devops-agent)、[§2.8](#28-联网搜索agentcore-web-search)、[§2.9](#29-通知收件箱)。）
 
 ---
 
@@ -56,14 +55,14 @@
 
 agent 跑在 **Amazon Bedrock** 上。**先去 Bedrock 控制台 → Model access，确认你要用的模型在这个区域是「Access granted」**，再来开栈。
 
-- **默认模型是 xAI 的 Grok 4.6**（`global.xai.grok-4.6`）—— 这一个必须开通，否则装完不能用。
-- 想用别的模型（Claude Sonnet 5 / Opus 5、Amazon Nova Pro、DeepSeek、GPT-5.6 系列）就把对应的也一起开通；用户在聊天页右上角可以按会话切换。
+- **默认模型是 Anthropic 的 Claude Sonnet 5**（`global.anthropic.claude-sonnet-5`）—— 这一个必须开通，否则装完不能用。
+- 想用别的模型（Claude Opus 5 / Haiku 4.5、Amazon Nova Pro、DeepSeek、GLM 5、xAI Grok 4.6、GPT-5.6 系列）就把对应的也一起开通；用户在聊天页右上角可以按会话切换。
 - 推荐 **us-east-1** 或 **us-west-2**（Bedrock AgentCore 与模型覆盖最全）。
 - 没开通模型访问时，栈会**开成功**、页面能打开、登录也没问题，但一提问就报 `AccessDeniedException`。这是最常见的"部署完了不能用"。
 
 ### 1.3 这个账号要能访问 GitHub（或者准备一个私有镜像）
 
-部署过程中，栈里的一个 Lambda 会去 **GitHub Release** 下三个产物（前端、BFF、agent 代码）搬进你自己的 S3 桶。Lambda 默认不在 VPC 里、走 AWS 托管的公网出口，**绝大多数账号天然满足**。
+部署过程中，栈里的一个 Lambda 会去 **GitHub Release** 下四个产物（前端、BFF、「通知」生产端、agent 代码）搬进你自己的 S3 桶。Lambda 默认不在 VPC 里、走 AWS 托管的公网出口，**绝大多数账号天然满足**。
 
 企业环境如果**出口白名单不含 github.com**，不必放弃这条路径 —— 见 [§7 无公网出口：用私有 S3 镜像](#7-无公网出口用私有-s3-镜像)。
 
@@ -79,7 +78,7 @@ agent 跑在 **Amazon Bedrock** 上。**先去 Bedrock 控制台 → Model acces
 notiops-webchat.template.json
 ```
 
-同一个 release 里还有三个产物（`bff.zip` / `chat-dist.zip` / `agent-code.zip`）——**不用下**，模板会让你的账号自己去取。模板里写死了这三个文件的 SHA256，下载后当场校验，不匹配就让开栈失败。
+同一个 release 里还有四个产物（`bff.zip` / `chat-dist.zip` / `web-notif.zip` / `agent-code.zip`）——**不用下**，模板会让你的账号自己去取。模板里写死了这四个文件的 SHA256，下载后当场校验，不匹配就让开栈失败。
 
 > **为什么不是"点一下就开栈"的 Launch Stack 链接？** CloudFormation 的 `TemplateURL` 只接受
 > S3 上的对象，不接受 GitHub 的 URL。所以这里多两步点击（下载 + 上传），换来的是我们
@@ -172,7 +171,18 @@ notiops-webchat.template.json
 
 ### 2.7 深度调查（AWS DevOps Agent）
 
-**Enable deep investigation** 默认 `Yes`：栈会顺手建一个 **AWS DevOps Agent Agent Space**（名字 `notiops-oneclick-<账号 id>`）并把本账号以 **monitor（只读）** 身份关联进去。有了它，聊天界面里的「深度调查」才能用 —— 那是把一个问题交给 AWS 托管的 DevOps Agent 去多轮自主排查，比一次问答挖得深。
+**Enable deep investigation** 默认 `Yes`：栈会顺手建一个 **AWS DevOps Agent Agent Space**（名字 `notiops-oneclick-<账号 id>`）并把本账号以 **monitor（只读）** 身份关联进去。有了它，聊天界面里**所有 DevOps Agent 相关能力**才能用 —— 那是把一个问题交给 AWS 托管的 DevOps Agent 去多轮自主排查，比一次问答挖得深。
+
+具体是这四样，都依赖这同一个 Agent Space（没有它，对应的开关会**置灰并写清原因**）：
+
+| 能力 | 这一轮谁在答 | 说明 |
+|---|---|---|
+| **深度调查** | DevOps Agent（NotiOps 先把你的问题整理成调查请求） | 多信号根因排查、出 HTML 报告，通常几分钟 |
+| **深度调查（直连）** | DevOps Agent（**绕过大模型**直连 API） | 同一个深度调查，**不消耗 token**；代价是调查描述按你的原话透传 |
+| **DevOps 对话** | DevOps Agent **直接回答**（通用聊天里选「对话对象 = DevOps Agent」） | 流式问答，体验与 DevOps Agent 自己的页面一致；**NotiOps 侧 0 token**、**免模型配置**（不需要在 Bedrock 开通任何模型），用量计入你自己的 DevOps Agent |
+| **把 Skill 发布到 DevOps Agent** | — | 把自建 Skill 推到 Agent Space，供上面「深度调查」那条路径使用 |
+
+> 💡 后两样对**还没在 Bedrock 开通模型**的新部署特别有用：选 DevOps Agent 直答就能先跑起来。
 
 - **计费**：按**任务运行的 agent-秒**收费，**闲置的 Agent Space 不收费**。所以默认开着不会给你带来一笔"什么都没做的月费"。
 - **区域**：AWS DevOps Agent 只在部分区域可用。**你选的区域没有它，栈不会失败** —— 这一块被静默跳过，其余功能全在，Outputs 的 `DeepInvestigationStatus` 会写明"因为区域跳过"。
@@ -189,9 +199,33 @@ notiops-webchat.template.json
 
 ---
 
+### 2.9 「通知」收件箱
+
+**没有参数，栈自动建好。** 左侧导航第一项「通知」里那个收件箱，内容由 **10 条 EventBridge 规则** → 一个 Lambda（`notiops-web-notif-handler`，归一化 + 5 分钟去重）→ 写进 `notiops-web-chat` 表来的。前端 **60s 轮询**一次，所以最长约 1 分钟延迟；左侧红点只统计**未读**。
+
+- **默认开 5 类**（运维价值最高、噪音可控）：AWS Health / CloudWatch 告警 / 成本异常 / Trusted Advisor / GuardDuty
+- **默认关 5 类**（量大容易刷屏，或需先开通付费服务）：Backup 作业 / EC2 Spot 中断 / Auto Scaling 失败 / RDS / Config
+- **怎么开关**：进 **EventBridge 控制台 → Rules**，规则名前缀 `notiops-web-notif-`，直接 **Enable / Disable** 那一条。这个手动改动**不会被版本升级覆盖回去**（模板不改规则的启用状态）。
+
+> ⚠️ **默认开的 5 类里有 3 类还依赖你账号侧的前置条件** —— 规则是开的，但缺前置条件时收不到事件（界面空态会写明原因，不是 NotiOps 坏了）：
+>
+> | 源 | 前置条件 |
+> |---|---|
+> | GuardDuty | 账号需已**启用 GuardDuty**（付费）。未启用时不产生任何 finding；规则开着零成本，启用后立即生效、无需重新部署 |
+> | 成本异常 | 需先在 Cost Explorer 建一个**成本异常监控器**（免费）；且只在 `us-east-1` 发事件 |
+> | Trusted Advisor | 需 **Business+ / Enterprise / Unified Operations** 支持计划；且只在 `us-east-1` 发事件 |
+>
+> 成本异常与 Trusted Advisor 是**全局服务，只在 `us-east-1` 发 EventBridge 事件**。把栈部署在别的区，这两条规则建了也**永不触发**（规则描述里写着这句）—— 想收就把 NotiOps 部署在 `us-east-1`，或自己在 `us-east-1` 建一条跨区转发规则。
+
+「通知」主题里另有一块 **AWS Health Dashboard 实时视图**，由 BFF 实时查 Health API（不落库），需 **Business+ / Enterprise** 支持计划；没有该计划时降级为控制台链接，且它的未处理数**不叠进**红点。
+
+**跨账号**：这 10 条规则只收**部署账号自己**的事件。成员账号的事件要回流到这里需要跨账号事件转发，那个不在这条路径里（见 [§0.1](#01-一键部署不包含什么)）。
+
+---
+
 ## 3. 这个栈建了什么
 
-默认参数下 **50 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 4 个；选上多账号多 3 个）：
+默认参数下 **65 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 4 个；选上多账号多 3 个）：
 
 | 类别 | 资源 |
 |---|---|
@@ -202,6 +236,7 @@ notiops-webchat.template.json
 | 数据 | DynamoDB `notiops-config`、`notiops-web-chat`；1 个数据桶（报告等） |
 | 部署辅助 | 1 个 staging 桶（放搬进来的产物）+ 1 个内联的部署 Lambda + 2 个自定义资源 |
 | 权限 | 5 个 IAM 角色 + 5 个内联策略 |
+| 「通知」收件箱（见 [§2.9](#29-通知收件箱)） | **10 条 EventBridge 规则**（5 条 ENABLED / 5 条 DISABLED）+ 1 个 Lambda + 它的日志组 + 1 个角色（+ 策略）+ 1 条 Lambda 调用许可 = 15 个 |
 | 深度调查（默认开） | 1 个 DevOps Agent Agent Space + 1 个只读关联 + 1 个被 DevOps Agent 假设的角色（+ 它的策略） |
 | 联网搜索（仅 us-east-1） | 1 个自定义资源（去建 AgentCore Gateway）+ 1 个 Gateway 服务角色 + 1 个内联策略 |
 | 多账号（可选） | 1 个自定义资源（去建两个成员账号 StackSet）+ 2 个内联策略 |
@@ -344,14 +379,15 @@ CloudFormation → 选中栈 → **Delete**。**实测 ~3 分 10 秒**（两种�
 
 ## 7. 无公网出口：用私有 S3 镜像
 
-如果你的账号出不了公网（或企业策略不允许从 github.com 拉可执行代码），可以把三个产物**先镜像到一个 S3 桶**，让栈从那里取。桶**可以完全私有**（Block Public Access 全开）——部署 Lambda 用它自己的角色签名去读，走的是 S3 API，不需要公网。
+如果你的账号出不了公网（或企业策略不允许从 github.com 拉可执行代码），可以把四个产物**先镜像到一个 S3 桶**，让栈从那里取。桶**可以完全私有**（Block Public Access 全开）——部署 Lambda 用它自己的角色签名去读，走的是 S3 API，不需要公网。
 
 **一次性准备**（由一个有凭证的人做，之后所有账号/团队都能复用这一份镜像）：
 
 ```bash
-# 从 release 下三个产物，放进一个桶（桶要和你开栈的区域同区）
+# 从 release 下四个产物，放进一个桶（桶要和你开栈的区域同区）
 aws s3 cp bff.zip        s3://my-mirror/notiops/v1.2.3/
 aws s3 cp chat-dist.zip  s3://my-mirror/notiops/v1.2.3/
+aws s3 cp web-notif.zip  s3://my-mirror/notiops/v1.2.3/
 aws s3 cp agent-code.zip s3://my-mirror/notiops/v1.2.3/
 ```
 

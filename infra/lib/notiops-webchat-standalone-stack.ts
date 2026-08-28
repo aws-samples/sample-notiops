@@ -23,6 +23,7 @@
  */
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
+import * as events from "aws-cdk-lib/aws-events";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as logs from "aws-cdk-lib/aws-logs";
@@ -31,6 +32,17 @@ import * as fs from "fs";
 import * as path from "path";
 import { createMinimalBase } from "./constructs/minimal-base-core";
 import { createWebChatCore } from "./constructs/web-chat-core";
+// 「通知」生产端 —— 与 `notiops-backend-stack.ts`（方式 B）**共用同一份**事件源定义。
+import {
+  WEB_NOTIF_ARTIFACT,
+  WEB_NOTIF_FUNCTION_DESCRIPTION,
+  WEB_NOTIF_FUNCTION_NAME,
+  WEB_NOTIF_HANDLER,
+  WEB_NOTIF_SOURCES,
+  webNotifEnv,
+  webNotifRuleDescription,
+  webNotifRuleName,
+} from "./constructs/web-notif-sources";
 
 const INFRA_DIR = path.join(__dirname, "..");
 
@@ -324,6 +336,10 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     const releaseBaseUrl = cdk.Fn.findInMap("NotiOpsRelease", "Current", "BaseUrl");
     const chatDistKey = `frontend/${releaseTag}/chat-dist.zip`;
     const agentCodeKey = `agent/${releaseTag}/agent-code.zip`;
+    // 「通知」生产端的代码（见下方 WebNotifFn）。它只有 5 个文件、几十 KB，本来最想内联
+    // 成 `Code.ZipFile` 省掉一次搬运 —— 但内联只能放**单文件**源码，而这个 handler
+    // `from core import push_event`（679 行）。所以走和 BFF 一样的产物路径。
+    const webNotifKey = `notif/${releaseTag}/${WEB_NOTIF_ARTIFACT}`;
 
     // ══ Staging 桶：Release 产物在客户账号里的落脚点 ═══════════════════════════
     // Lambda 的 `Code.S3Bucket` 与 AgentCore 的 `Code.S3.Bucket` 都只接受**同区域**的
@@ -960,9 +976,12 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // `scripts/seed_llm_catalog.py` 写这一条；一键路径原先**根本不写**，于是管理员
     // 打开「管理 → 模型」看到的是一张空表（实测 2026-08-26，方式 A 部署的环境）。
     // 条件写在 handler 里，覆盖不了管理员改过的配置。
+    // GetItem/UpdateItem 是给"已存在时补新增模型"那一步用的（`_top_up_llm_catalog`）：
+    // 只有 PutItem 的话，首次部署之后再进目录的模型永远到不了这个环境 —— 不报错，
+    // 只是管理台和模型选择器里少一个（2026-08-27 现网的 zai-glm-5 就是这么丢的）。
     stagerRole.addToPolicy(new iam.PolicyStatement({
       sid: "SeedLlmCatalog",
-      actions: ["dynamodb:PutItem"],
+      actions: ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"],
       resources: [base.configTable.tableArn],
     }));
 
@@ -1004,6 +1023,85 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // `Ref userPoolId` 的隐式依赖，与本资源之间没有，必须显式声明。
     base.groups.forEach((g) => stagerSite.addDependency(g));
     if (stagerPolicy) stagerSite.addDependency(stagerPolicy as cdk.CfnResource);
+
+    // ══ 「通知」生产端 ═════════════════════════════════════════════════════════
+    // 读端（`notif#` 段、BFF 的 `/notifications*`、侧栏红点）本来就在 createWebChatCore
+    // 里，两条部署路径自动对等；**生产端过去只有方式 B 有** —— 于是一键部署出来的环境
+    // 里「通知」页面永远是空的：不报错、不写日志，客户只会以为这个功能是假的
+    // （实测 2026-08-27 的现网一键模板，0 条 EventBridge 规则）。
+    //
+    // 事件源清单、Lambda 名、handler、规则名、环境变量全部 import 自
+    // `constructs/web-notif-sources.ts`，与方式 B 逐字同源。两条路径**唯一**的差别是
+    // 「怎么关掉某一个源」：方式 B 是合成期 `-c webNotif<Id>=off`，这里没有 context
+    // （模板是预先合成发布的），客户去 EventBridge 控制台 Disable 那条规则即可 ——
+    // 升级模板不会把它改回来，因为规则属性本身不随版本变化，CFN 判定为无变更。
+    const webNotifLogs = new logs.LogGroup(this, "WebNotifLogs", {
+      logGroupName: `/aws/lambda/${WEB_NOTIF_FUNCTION_NAME}`,
+      retention: logs.RetentionDays.TWO_WEEKS,
+      // 栈内资源 → 删栈一并删掉。同 StagerLogs：必须**先**于函数建好，否则 Lambda
+      // 首次被调用时会自己建一个同名的，CFN 后手就 already exists。
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const webNotifRole = new iam.Role(this, "WebNotifRole", {
+      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+      description: "NotiOps web notification producer",
+    });
+    webNotifRole.addToPolicy(new iam.PolicyStatement({
+      sid: "WebNotifOwnLogStreams",
+      actions: ["logs:CreateLogStream", "logs:PutLogEvents"],
+      resources: [webNotifLogs.logGroupArn, `${webNotifLogs.logGroupArn}:*`],
+    }));
+    // 只给 PutItem，且只给这一张表。handler 只做两件写操作：去重标记与收件箱条目，
+    // 两者都是 PutItem（去重那次带 ConditionExpression，条件写不需要额外权限）。
+    webNotifRole.addToPolicy(new iam.PolicyStatement({
+      sid: "WebNotifWriteInbox",
+      actions: ["dynamodb:PutItem"],
+      resources: [webchat.table.tableArn],
+    }));
+    const webNotifRolePolicy = webNotifRole.node.tryFindChild("DefaultPolicy")?.node.defaultChild;
+
+    // L1：代码在 staging 桶里（同 BFF），而 L2 的 `Code.fromBucket` 会引入
+    // 版本参数/资产语义上的额外包袱；这里直接给 s3Bucket/s3Key 最省事也最好读。
+    const webNotifFn = new lambda.CfnFunction(this, "WebNotifFn", {
+      functionName: WEB_NOTIF_FUNCTION_NAME,
+      role: webNotifRole.roleArn,
+      runtime: "python3.13",
+      handler: WEB_NOTIF_HANDLER,
+      code: { s3Bucket: stagingBucket.bucketName, s3Key: webNotifKey },
+      // 一次调用 = 解析一个事件 + 最多两次 PutItem。60s/256MB 与方式 B 一致
+      // （方式 B 走的是 commonLambdaProps + 显式覆盖，值相同）。
+      timeout: 60,
+      memorySize: 256,
+      environment: { variables: webNotifEnv(webchat.table.tableName) },
+      description: WEB_NOTIF_FUNCTION_DESCRIPTION,
+    });
+    webNotifFn.addDependency(webNotifLogs.node.defaultChild as cdk.CfnResource);
+    webNotifFn.addDependency(webNotifRole.node.defaultChild as cdk.CfnResource);
+    if (webNotifRolePolicy) webNotifFn.addDependency(webNotifRolePolicy as cdk.CfnResource);
+    // 代码在 staging 桶里 → 必须等 StagerFn 搬完。
+    // （`scripts/postprocess_template.py::assert_clean` 也会强制校验这条依赖存在。）
+    webNotifFn.addDependency(stagerArtifacts);
+
+    // 一条通配 Permission 覆盖全部规则，而不是每条规则一个 ——
+    // 10 个 `AWS::Lambda::Permission` 换成 1 个，且以后加事件源不用再动这里。
+    // 通配只到我们自己的规则名前缀，不是「本账号任意 EventBridge 规则都能调它」。
+    new lambda.CfnPermission(this, "WebNotifInvokeByEvents", {
+      action: "lambda:InvokeFunction",
+      functionName: webNotifFn.attrArn,
+      principal: "events.amazonaws.com",
+      sourceArn: `arn:${this.partition}:events:${this.region}:${this.account}:rule/${webNotifRuleName("")}*`,
+    });
+
+    for (const src of WEB_NOTIF_SOURCES) {
+      new events.CfnRule(this, `WebNotifRule${src.id}`, {
+        name: webNotifRuleName(src.id),
+        description: webNotifRuleDescription(src),
+        eventPattern: { source: [src.source], "detail-type": [src.detailType] },
+        state: src.on ? "ENABLED" : "DISABLED",
+        targets: [{ id: "WebNotifTarget", arn: webNotifFn.attrArn }],
+      });
+    }
 
     // ══ 多账号落地（Phase=OrgSetup，仅 MultiAccount）═══════════════════════════
     // 两个成员账号 StackSet 的模板在**合成期**读进来、当字符串内联 —— 不是 CDK 资产

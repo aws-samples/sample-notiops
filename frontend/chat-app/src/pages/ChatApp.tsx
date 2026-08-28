@@ -18,11 +18,12 @@ import { getSecurityDashboard, type SecurityDashboardData } from "../api/securit
 import InvestigationDashboardBrowser from "../components/InvestigationDashboardBrowser";
 import { getAlarmDashboard, type AlarmDashboardData } from "../api/alarms";
 import ErrorBoundary from "../components/ErrorBoundary";
+import ChatObjectPicker from "../components/ChatObjectPicker";
 import Logo from "../components/Logo";
 import { unreadCount } from "../api/notifications";
 import { streamChat, listConversations, getMessages, deleteConversationApi, renameConversationApi, setPinnedApi, executeActionApi, getAccountsFull, type SourceItem, type AccountInfo } from "../api/chat";
 import { useLocale, useT } from "../i18n";
-import { topicDef, type ChatMessage, type Conversation, type TopicKey } from "../types";
+import { topicDef, deepDiveTogglesFor, type ChatMessage, type Conversation, type TopicKey } from "../types";
 import { defaultModelId, modelDisplayName, refreshModelCatalog, isSelectableModel, useModelCatalog } from "../models";
 import { IconInvestigate, IconFinOps, IconCases, IconSecurity, IconWhatsNew, IconReports, IconDatabase, IconGauge, IconPercent, IconCluster } from "../components/icons";
 
@@ -41,6 +42,17 @@ const HOME_CARD_POOL: { key: string; Icon: React.FC<{ size?: number }>; descKey:
   { key: "publics3",  Icon: IconSecurity,    descKey: "home.card.publics3.desc" },
   { key: "untagged",  Icon: IconFinOps,      descKey: "home.card.untagged.desc" },
   { key: "arch",      Icon: IconCluster,     descKey: "home.card.arch.desc" },
+];
+
+// 选中「DevOps Agent」这个对话对象时的启动卡片（固定 4 张，不随机 —— 这条路径的能力面
+// 比 NotiOps 窄得多，池子里没有更多同等质量的引导）。**不能复用上面那 4 张**：成本分析 /
+// Support 案例 / Skills / What's New 都不是这条路径做的事，拿它们引导等于把客户带到一个
+// 答不了的问题上。
+const DEVOPS_HOME_CARDS: { key: string; Icon: React.FC<{ size?: number }>; descKey: string }[] = [
+  { key: "dv-anomaly", Icon: IconInvestigate, descKey: "obj.dv.card.anomaly" },
+  { key: "dv-ec2",     Icon: IconInvestigate, descKey: "obj.dv.card.ec2" },
+  { key: "dv-rds",     Icon: IconDatabase,    descKey: "obj.dv.card.rds" },
+  { key: "dv-change",  Icon: IconReports,     descKey: "obj.dv.card.change" },
 ];
 
 // 主题空态主页（与通用主页同一套视觉：脉冲 N logo + 主题标题 + 每主题独立 prompt 池随机 4 卡）。
@@ -426,16 +438,40 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   // 「深度调查（直连）」：同一能力的 0-token 版本。两个开关**互斥** —— 点亮一个自动灭另一个
   // （同时开会同时走两条路：一条烧 token 的 + 一条直连的）。
   const devopsAgentDirect = active.devopsAgentDirect ?? false;
-  const toggleDevopsAgent = () => setConversations((prev) => prev.map((c) => (c.id === activeId
-    ? { ...c, devopsAgent: !(c.devopsAgent ?? false), devopsAgentDirect: false } : c)));
-  const toggleDevopsAgentDirect = () => setConversations((prev) => prev.map((c) => (c.id === activeId
-    ? { ...c, devopsAgentDirect: !(c.devopsAgentDirect ?? false), devopsAgent: false } : c)));
+  // 「DevOps 对话」：直连 DevOps Agent 控制面对话 API，由**客户自己的 DevOps Agent** 回答
+  // （NotiOps 侧 0 token）。仅故障调查主题显示。
+  const devopsChat = active.devopsChat ?? false;
+  /** 三个 DevOps 开关是**单选**（three-way exclusive）：点亮一个自动灭其余两个。
+   *  同时开的后果不是"更强"，而是同一个问题被送上两三条互不相干的链路。
+   *  写成显式三个布尔（而不是计算 key 的展开）是为了让 TS 精确校验字段名。 */
+  const setDevopsMode = (mode: "agent" | "direct" | "chat" | "off") =>
+    setConversations((prev) => prev.map((c) => (c.id === activeId
+      ? { ...c, devopsAgent: mode === "agent", devopsAgentDirect: mode === "direct", devopsChat: mode === "chat" }
+      : c)));
+  const toggleDevopsAgent = () => setDevopsMode(devopsAgent ? "off" : "agent");
+  /** 「深度调查（直连）」有**两种语义**，按会话类型分：
+   *  · 故障调查等主题：它是三个 DevOps 开关之一 → 单选（点亮它灭掉其余两个）；
+   *  · 通用会话且对话对象已是 DevOps Agent（objMode）：它是**这一轮的修饰** —— 对象没变，
+   *    只是这一轮从"直接问答"换成"发起一次深度调查"，所以**绝不能**把 devopsChat 一起灭掉
+   *    （灭了就等于客户勾一下深度调查、这段对话的对象被悄悄换回 NotiOps 来答，而标题栏的
+   *    tag 也会跟着跳）。两个字段同时为真时由 BFF 让深度调查优先
+   *    （index.mjs：`chatDirect = objDevops && !deepDirectAsked`）。 */
+  const toggleDevopsAgentDirect = () => {
+    if (devopsChat && (active.topic ?? "general") === "general") {
+      setConversations((prev) => prev.map((c) => (c.id === activeId
+        ? { ...c, devopsAgentDirect: !(c.devopsAgentDirect ?? false), devopsAgent: false }
+        : c)));
+      return;
+    }
+    setDevopsMode(devopsAgentDirect ? "off" : "direct");
+  };
+  const toggleDevopsChat = () => setDevopsMode(devopsChat ? "off" : "chat");
 
   // ── 主题 landing 页的开关草稿（per-topic，互不影响）──
   // BUG 修复：各主题 landing 页共用同一个 active 会话，直接读写 active.webSearch 会导致
   // 「一个主题开联网 → 所有主题都变」。landing 页改用按 topic 存的草稿状态，真正发消息时
   // 通过 convPatch 带进新会话。（真实会话内的开关仍走上面的 active.* per-会话逻辑。）
-  type LandingToggle = { webSearch?: boolean; finopsAgent?: boolean; devopsAgent?: boolean; devopsAgentDirect?: boolean };
+  type LandingToggle = { webSearch?: boolean; finopsAgent?: boolean; devopsAgent?: boolean; devopsAgentDirect?: boolean; devopsChat?: boolean };
   const [landingToggles, setLandingToggles] = useState<Record<string, LandingToggle>>({});
   // 各主题 landing 开关的默认值 —— 必须与 emptyConversation 的默认保持一致，否则
   // landing 开关显示的状态与新会话实际发送的状态脱节（曾导致：investigate 深度调查
@@ -549,8 +585,19 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
           sources: m.sources,
           usage: m.usage,
           accountId: m.account_id,  // 历史回复的账号徽标(刷新后仍显示)
+          via: m.via,               // 答案来源(devops-agent → 署名行显示 "AWS DevOps Agent")
         }));
-        setConversations((prev) => prev.map((c) => (c.id === activeId ? { ...c, messages: mapped } : c)));
+        // 「对话对象」的锁要**跨刷新**成立：devopsChat 只活在前端内存里，刷新后回落 false ——
+        // 那样一个由客户自己的 DevOps Agent 答过的会话，接着问会**静默换成 NotiOps 来答**
+        // （客户看不出来，只会觉得答案风格突然变了）。历史消息里的 via="devops-agent" 是
+        // 持久化的事实（store.mjs 存了这个字段），用它把锁恢复回来。
+        // 只恢复通用会话：故障调查主题仍是"每轮开关"语义，这里一行不动。
+        const relock = mapped.some((m) => m.via === "devops-agent");
+        setConversations((prev) => prev.map((c) => {
+          if (c.id !== activeId) return c;
+          const lock = relock && (c.topic ?? "general") === "general";
+          return { ...c, messages: mapped, ...(lock ? { devopsChat: true, devopsAgent: false, devopsAgentDirect: false } : {}) };
+        }));
       })
       .catch(() => { /* ignore */ })
       // 必须放在 then 之后：先落消息再摘水合标记，否则中间会有一帧
@@ -644,7 +691,10 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     const sendModel = targetConv?.model ?? model;
     // 本轮提问的目标账号（与下方 streamChat 同源）——存进 assistant 消息,让历史回复能标明针对哪个账号。
     const sendAccountId = targetConv?.accountId ?? (conversations.find(findConv)?.accountId) ?? "";
-    const botMsg: ChatMessage = { id: botId, role: "assistant", text: "", ts: Date.now(), thinking: true, thinkElapsed: 0, streaming: true, model: modelDisplayName(sendModel), accountId: sendAccountId };
+    // 「DevOps 对话」开着时这轮由客户自己的 DevOps Agent 回答 —— 从第一帧就署名成
+    // "AWS DevOps Agent"（否则流式期间会先挂着本地模型名，答完才跳变）。
+    const sendDevopsChat = targetConv?.devopsChat ?? (conversations.find(findConv)?.devopsChat) ?? false;
+    const botMsg: ChatMessage = { id: botId, role: "assistant", text: "", ts: Date.now(), thinking: true, thinkElapsed: 0, streaming: true, model: modelDisplayName(sendModel), accountId: sendAccountId, via: sendDevopsChat ? "devops-agent" : undefined };
 
     // upsert:通常会话已在列表里(map 命中);但从通知卡发起时,新会话可能还没被
     // React flush 进 conversations（setConversations 与本 setTimeout 的时序不定）——
@@ -678,7 +728,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
 
     try {
       await streamChat(
-        { conversationId: convId, text, model: sendModel, locale, webSearch: (conversations.find(findConv)?.webSearch) ?? false, finopsAgent: (conversations.find(findConv)?.finopsAgent) ?? false, devopsAgent: targetConv?.devopsAgent ?? (conversations.find(findConv)?.devopsAgent) ?? false, devopsAgentDirect: targetConv?.devopsAgentDirect ?? (conversations.find(findConv)?.devopsAgentDirect) ?? false, topic: convTopic, accountId: targetConv?.accountId ?? (conversations.find(findConv)?.accountId) ?? "", skillId },
+        { conversationId: convId, text, model: sendModel, locale, webSearch: (conversations.find(findConv)?.webSearch) ?? false, finopsAgent: (conversations.find(findConv)?.finopsAgent) ?? false, devopsAgent: targetConv?.devopsAgent ?? (conversations.find(findConv)?.devopsAgent) ?? false, devopsAgentDirect: targetConv?.devopsAgentDirect ?? (conversations.find(findConv)?.devopsAgentDirect) ?? false, devopsChat: sendDevopsChat, topic: convTopic, accountId: targetConv?.accountId ?? (conversations.find(findConv)?.accountId) ?? "", skillId },
         {
           onToken: (delta) => {
             if (firstToken) { firstToken = false; clearInterval(tk); }
@@ -880,8 +930,14 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     setActiveId(c.id);
   };
 
-  // 通知卡「深入调查」：起一个「故障调查」会话（默认开 DevOps Agent），把事件的
-  // dispatch_query 作为首条消息自动发出。「就此提问」：起普通会话问技术解释。
+  // 通知卡「深入调查」：起一个「故障调查」会话，把事件的 dispatch_query 作为首条消息自动发出。
+  // 「就此提问」：起普通会话问技术解释。
+  // ⚠️ 深度调查开关**不在这里默认打开**，由调用方通过 convPatch 显式带进来
+  // （`...deepDiveTogglesFor(topic)`，见 types.ts）。事件卡的 dispatch_query 本来就是后端
+  // 给 DevOps Agent 写的调查描述，所以那类入口必须带；而 landing Composer 等入口发起的
+  // 普通提问不该被强行升级成深度调查。此处一度写着"默认开 DevOps Agent"，但代码从未设置过
+  // 任何一个开关 —— 于是从「通知 → 事件通知」点「深入调查」，Composer 里
+  // 「深度调查（直连）」是没勾的，那一轮实际走的是普通问答。
   // skillId：从 landing/主题起始页的 Composer 用 `/` 选中 skill 发起**新会话第一句**时透传，
   // 否则起始页发起的调查会丢掉 skill（Composer.onSend 的第二参数）——见 handleSend 透传。
   const startFromNotification = (query: string, topic: TopicKey, convPatch?: Partial<Conversation>, skillId?: string) => {
@@ -960,13 +1016,16 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
             })}
           </div>
         </div>
+        {/* 三个 DevOps 开关在 landing 也是**单选**（与会话内 setDevopsMode 同口径）：
+            点亮一个必须显式把另两个置 false，否则草稿会带着两个开关进新会话、后端同时收到两个 flag。 */}
         <Composer model={lm(topicKey)} onModelChange={(id) => setLm(topicKey, id)}
           onSend={(text, skillId) => startFromNotification(text, topicKey, { ...lt(topicKey), accountId: dashAccountId }, skillId)}
           busy={false} /* landing 是发起新会话入口,永远可发送 */ showSuggestions={false} prefill={themePrefill[topicKey]}
           webSearch={lt(topicKey).webSearch ?? false} onToggleWebSearch={() => setLt(topicKey, { webSearch: !(lt(topicKey).webSearch ?? false) })}
           finopsAgent={lt(topicKey).finopsAgent ?? false} onToggleFinopsAgent={() => setLt(topicKey, { finopsAgent: !(lt(topicKey).finopsAgent ?? false) })}
-          devopsAgent={lt(topicKey).devopsAgent ?? false} onToggleDevopsAgent={() => setLt(topicKey, { devopsAgent: !(lt(topicKey).devopsAgent ?? false), devopsAgentDirect: false })}
-          devopsAgentDirect={lt(topicKey).devopsAgentDirect ?? false} onToggleDevopsAgentDirect={() => setLt(topicKey, { devopsAgentDirect: !(lt(topicKey).devopsAgentDirect ?? false), devopsAgent: false })}
+          devopsAgent={lt(topicKey).devopsAgent ?? false} onToggleDevopsAgent={() => setLt(topicKey, { devopsAgent: !(lt(topicKey).devopsAgent ?? false), devopsAgentDirect: false, devopsChat: false })}
+          devopsAgentDirect={lt(topicKey).devopsAgentDirect ?? false} onToggleDevopsAgentDirect={() => setLt(topicKey, { devopsAgentDirect: !(lt(topicKey).devopsAgentDirect ?? false), devopsAgent: false, devopsChat: false })}
+          devopsChat={lt(topicKey).devopsChat ?? false} onToggleDevopsChat={() => setLt(topicKey, { devopsChat: !(lt(topicKey).devopsChat ?? false), devopsAgent: false, devopsAgentDirect: false })}
           onStop={stopGen} topic={topicKey} onOpenDashboard={openDash} convKey={"landing:" + topicKey} accountId={dashAccountId}
           onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
       </div>
@@ -1032,7 +1091,12 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               <div className="title">{t("notif.title")}</div>{dashAcctPickerRight}
             </div>
             <NotificationsPanel
-              onInvestigate={(query) => startFromNotification(query, "investigate", { accountId: dashAccountId })}
+              // 事件卡的「深入调查」（opts.deep）→ 新会话直接开「深度调查（直连）」，
+              // 因为它发的正文就是后端给 DevOps Agent 备好的 dispatch_query。
+              onInvestigate={(query, _title, opts) => startFromNotification(query, "investigate", {
+                accountId: dashAccountId,
+                ...(opts?.deep ? deepDiveTogglesFor("investigate") : {}),
+              })}
               onAsk={(query) => startFromNotification(query, "general")}
               onLoaded={() => setNotifUnread(0)}
               can={can}
@@ -1123,7 +1187,9 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
             </div>
             <InvestigationDashboardBrowser data={alarmData ?? undefined} initial={investigateDash} can={can}
               accountId={dashAccountId} accounts={accounts} onAccountChange={setDashAccountId}
-              onInvestigate={(q) => startFromNotification(q, "investigate")} onNotify={(q) => startFromNotification(q, "general")} />
+              onInvestigate={(q, opts) => startFromNotification(q, "investigate",
+                opts?.deep ? deepDiveTogglesFor("investigate") : undefined)}
+              onNotify={(q) => startFromNotification(q, "general")} />
           </>
         ) : view === "investigate" ? (
           <>
@@ -1192,6 +1258,24 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                 </span>
               );
             })()}
+            {/* 「对话对象」tag（只有通用会话有）：通用会话没有主题 tag（topicDef("general")=null），
+                而"谁在答"恰恰是这类会话唯一会变的东西 —— 翻回一个旧会话时靠它一眼认出这段是
+                NotiOps 答的还是客户自己的 DevOps Agent 答的。输入框上方那条身份条已按产品要求
+                去掉，所以锁定之后**只剩这个 tag** 承担身份说明。
+                ⚠️ 水合中（历史还没到）不渲染：devopsChat 不落库，锁是靠历史里的 via="devops-agent"
+                恢复的（见上面的 relock），历史到达前渲染出来必然是 "NotiOps" —— 对一段 DevOps
+                会话就是**标错**，比不标更糟。 */}
+            {(active.topic ?? "general") === "general" && !hydratingIds.has(active.id) && (
+              devopsChat ? (
+                <span className="topbar-topic" style={{ color: "var(--ok)" }} title={t("obj.tag.devops.hint")}>
+                  <IconInvestigate size={13} />{t("obj.tag.devops")}
+                </span>
+              ) : (
+                <span className="topbar-topic" style={{ color: "var(--orange)" }} title={t("obj.tag.notiops.hint")}>
+                  <Logo size={13} />{t("obj.tag.notiops")}
+                </span>
+              )
+            )}
             {/* 会话账号选择器：与 landing 一致的下拉，让用户在会话中也能看到/切换当前账号。
                 切换后本会话后续消息即用新账号(每条消息发送时读会话当前 accountId)。
                 右上角对齐(仿 AWS 控制台;逻辑不变,仅位置)。多账号可用时才显示。 */}
@@ -1211,18 +1295,22 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                     onConfirmAction={(idx, editedParams) => confirmAction(m.id, idx, editedParams)}
                     onCancelAction={(idx) => cancelAction(m.id, idx)}
                     onFollowup={(prompt) => handleSend(prompt)}
-                    /* 多账号模式下每条回复都标账号：成员账号=名·id(橙)；management/部署账号(accountId 空)=部署信息(蓝)。
-                       单账号部署(accounts 为空)不显示徽标,避免噪音。 */
+                    /* 多账号模式下每条回复都标账号：成员账号=橙，management/部署账号(accountId 空)=蓝。
+                       单账号部署(accounts 为空)不显示徽标,避免噪音。
+                       **只给 12 位 ID，不给账号名** —— 页脚已合并成一行，账号名在里面最长又最没用
+                       （能定位资源、能贴进 case 的是 ID）。极端情况下部署账号 ID 拿不到，才退回名字，
+                       否则徽标会整个消失、丢掉"这条回答针对哪个账号"这个信息。 */
                     accountLabel={accounts.length > 0
                       ? (m.accountId
-                          ? `${accounts.find((a) => a.accountId === m.accountId)?.accountName || m.accountId} · ${m.accountId}`
-                          : `${deployment.accountName || "Management account"}${deployment.accountId ? " · " + deployment.accountId : ""}`)
+                          || deployment.accountId
+                          || deployment.accountName
+                          || "Management account")
                       : undefined}
                     accountIsMember={!!m.accountId} />
                 ))}
               </div>
             </div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id} accountId={accountId}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id} accountId={accountId}
 
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
           </>
@@ -1246,18 +1334,26 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                 </div></div>
               </div>
             </div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id} accountId={accountId}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id} accountId={accountId}
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
           </>
         ) : (active.topic ?? "general") === "general" ? (
-          /* 通用对话主页（Codex 式）：居中 logo + 项目化标题 + 4 张启动卡片，composer 停在下方。
+          /* 通用对话主页（Codex 式）：居中 logo + 项目化标题 + 「对话对象」分段控件 + 4 张启动卡片，
+             composer 停在下方。
+             对话对象（ChatObjectPicker）= 这段对话由谁来答：NotiOps 自己的 agent，还是客户自己的
+             DevOps Agent（我们侧 0 token）。**可跳过**：不选直接打字就是 NotiOps（老用户零回归）；
+             发出第一句后本会话就固定（锁定后由标题栏的「对话对象」tag 说明谁在答）。
+             启动卡片按选中的对象换池子：DevOps Agent 那条路径不做成本/案例/Skills，
+             拿 NotiOps 那 4 张引导等于把客户带到答不了的问题上。
              卡片点击 = 把代表性 prompt 填入输入框（停留在通用对话，不切主题），用户可再改写后发送。 */
           <div className="empty-center home">
             <div className="home-hero">
               <div className="home-logo"><Logo size={104} variant="hero" /></div>
               <div className="home-headline">{t("home.headline")}</div>
+              <ChatObjectPicker devopsChat={devopsChat} accountId={accountId}
+                onPick={(obj) => setDevopsMode(obj === "devops" ? "chat" : "off")} />
               <div className="home-cards">
-                {homeCards.map((c) => {
+                {(devopsChat ? DEVOPS_HOME_CARDS : homeCards).map((c) => {
                   const desc = t(c.descKey);
                   return (
                     <button key={c.key} type="button" className="home-card"
@@ -1269,7 +1365,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                 })}
               </div>
             </div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} onStop={stopGen} topic={active.topic ?? "general"} prefill={homePrefill[active.id]} convKey={active.id} accountId={accountId}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} onStop={stopGen} topic={active.topic ?? "general"} prefill={homePrefill[active.id]} convKey={active.id} accountId={accountId}
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
           </div>
         ) : (active.topic ?? "general") === "whats-new" ? (
@@ -1293,13 +1389,13 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                 })}
               </div>
             </div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} onStop={stopGen} topic={active.topic ?? "general"} prefill={homePrefill[active.id]} convKey={active.id} accountId={accountId}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} onStop={stopGen} topic={active.topic ?? "general"} prefill={homePrefill[active.id]} convKey={active.id} accountId={accountId}
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
           </div>
         ) : (
           <div className="empty-center">
             <div className="empty-greeting">{greeting(active.topic, locale)}</div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={true} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id} accountId={accountId}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={true} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id} accountId={accountId}
 
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
             {(() => {

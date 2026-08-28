@@ -32,6 +32,17 @@ import * as cr from "aws-cdk-lib/custom-resources";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as ssm from "aws-cdk-lib/aws-ssm";
 import * as path from "path";
+import { WEB_CHAT_TABLE_NAME } from "./constructs/web-chat-core";
+// 「通知」生产端的唯一真源 —— 一键部署（方式 A）的单栈 import 的是同一份。
+import {
+  WEB_NOTIF_FUNCTION_DESCRIPTION,
+  WEB_NOTIF_FUNCTION_NAME,
+  WEB_NOTIF_HANDLER,
+  WEB_NOTIF_SOURCES,
+  webNotifEnv,
+  webNotifRuleDescription,
+  webNotifRuleName,
+} from "./constructs/web-notif-sources";
 
 export class NotiOpsBackendStack extends cdk.Stack {
   public readonly dataBucketName: string;
@@ -460,10 +471,10 @@ export class NotiOpsBackendStack extends cdk.Stack {
       description: "RDS/ElastiCache AI 智能巡检 — Bedrock 分析与报告生成（路径 C）",
     } as lambda.FunctionProps);
 
-    // 与 config/llm-model-catalog.json 的 default_model 一致（Grok 4.6）。
+    // 与 config/llm-model-catalog.json 的 default_model 一致（Claude Sonnet 5）。
     // lambda3 走 `client.converse()`（见 lambda3_health_checker/bedrock_invoker.py），
-    // Grok 的目录 kind 是 bedrock_converse，协议对得上。
-    lambda3.addEnvironment("BEDROCK_MODEL_ID", "global.xai.grok-4.6");
+    // Converse 对 Anthropic 模型同样适用，协议对得上。
+    lambda3.addEnvironment("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5");
     apiLambda.addEnvironment("HEALTH_CHECKER_FUNCTION_NAME", lambda3.functionName);
     apiLambda.addEnvironment("COLLECTOR_FUNCTION_NAME", "notiops-collector");
 
@@ -904,7 +915,8 @@ export class NotiOpsBackendStack extends cdk.Stack {
     });
     llmProviderParam.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
-    // ⚠️ 这一条**故意不跟随** config/llm-model-catalog.json 的 default_model（现为 Grok 4.6）。
+    // ⚠️ 这一条**故意不跟随** config/llm-model-catalog.json 的 default_model
+    // （现为 Claude Sonnet 5 —— 恰好同值，但那是目录的自由，改目录默认时别顺手改这里）。
     // 它不是"对话默认模型"，而是 IM 侧一批**内部工具调用**的模型：意图分类 / 下一步建议 /
     // 进度卡叙述 / 案例分类 / 技能派发 / 技能编写（shared/model_config.py::get_bot_model_id
     // 的 8 个调用点）。那 8 处都是手搓 Anthropic 原生 `invoke_model` body
@@ -1514,61 +1526,40 @@ def handler(event, context):
     // web chat 页面 60s 轮询 BFF 拿增量;离线时事件仍在库里,进来即可回顾。
     const webNotifLambda = new lambda.Function(this, "WebNotifHandlerLambda", {
       ...commonLambdaProps,
-      functionName: "notiops-web-notif-handler",
-      handler: "shared.report_delivery.web_push_handler.lambda_handler",
+      functionName: WEB_NOTIF_FUNCTION_NAME,
+      handler: WEB_NOTIF_HANDLER,
       code: pushLambdaCode, // 与 IM push 同一份 asset(含 core/)
       timeout: cdk.Duration.seconds(60),
       memorySize: 256,
-      environment: {
-        ...lambdaEnv,
-        WEB_CHAT_TABLE: "notiops-web-chat",
-        NOTIF_INBOX_KEY: "account", // 一期:账号级共享一份收件箱
-        NOTIF_TTL_DAYS: "90",
-      },
-      description: "多源 AWS 事件 → Web Chat 通知收件箱(默认开:Health / CloudWatch Alarm / Cost Anomaly / Trusted Advisor / GuardDuty;可选:Backup / Spot / Auto Scaling / RDS / Config)",
+      environment: { ...lambdaEnv, ...webNotifEnv(WEB_CHAT_TABLE_NAME) },
+      description: WEB_NOTIF_FUNCTION_DESCRIPTION,
     } as lambda.FunctionProps);
 
     // 授权写 notiops-web-chat 表(表在 WebChatStack;用固定名拼 ARN,避免跨 stack 依赖)。
     webNotifLambda.addToRolePolicy(new iam.PolicyStatement({
       actions: ["dynamodb:PutItem"],
-      resources: [`arn:aws:dynamodb:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:table/notiops-web-chat`],
+      resources: [`arn:aws:dynamodb:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:table/${WEB_CHAT_TABLE_NAME}`],
     }));
 
-    // Web 通知的 EventBridge 规则。
+    // Web 通知的 EventBridge 规则。事件源那张表在
+    // `infra/lib/constructs/web-notif-sources.ts` —— **一键部署（方式 A）import 的是同一份**，
+    // 别把它抄回这里（抄一份 = 以后加源只在一条路径上生效，而症状是静默的）。
     //
-    // 默认开这 5 个(运维价值最高、噪音可控):
-    //   AWS Health · CloudWatch 告警 · Cost Anomaly · Trusted Advisor · GuardDuty
-    // 其余 5 个默认关:Backup / EC2 Spot / Auto Scaling / RDS / Config
-    //   —— 要么量大易刷屏(Backup 每次作业、Spot、RDS),要么需客户先开通付费服务
-    //   且合规类噪音大(Config)。需要时 -c webNotif<Id>=on 单独打开。
+    // 这条路径独有的是「开关方式」：合成期 `-c webNotif<Id>=on|off`。
+    // 方式 A 的静态模板没有 context，它的开关是 EventBridge 控制台上 Enable/Disable
+    // 那条规则（同名同源，见那份共享模块的文件头）。
     //
-    // GuardDuty 默认开但**需客户先启用 GuardDuty**(付费服务)。没启用时
-    // 没有 detector、不会有任何 finding,规则处于"开着但收不到事件"的状态 ——
-    // 无害且零成本,一旦客户启用就立刻生效,不用再回来改部署。
-    //
-    // globalOnly 标记:这两个是**全局服务**,只在 us-east-1 发 EventBridge 事件
+    // globalOnly 的那两个是**全局服务**，只在 us-east-1 发 EventBridge 事件
     // (TA 见 https://docs.aws.amazon.com/awssupport/latest/user/cloudwatch-events-ta.html;
     //  Cost Anomaly 事件的 region = 其 home region,通常 us-east-1)。
     // 部署在别的 region 时规则建了也永不触发,所以下面会 addWarning 明确告知,
     // 而不是让用户以为"开了就有"。
-    const webNotifSources = [
-      { id: "Health", source: "aws.health", detailType: "AWS Health Event", on: true },
-      { id: "CloudWatchAlarm", source: "aws.cloudwatch", detailType: "CloudWatch Alarm State Change", on: true },
-      { id: "CostAnomaly", source: "aws.ce", detailType: "Anomaly Detected", on: true, globalOnly: true },
-      { id: "TrustedAdvisor", source: "aws.trustedadvisor", detailType: "Trusted Advisor Check Item Refresh Notification", on: true, globalOnly: true },
-      { id: "GuardDuty", source: "aws.guardduty", detailType: "GuardDuty Finding", on: true },
-      { id: "BackupJob", source: "aws.backup", detailType: "Backup Job State Change", on: false },
-      { id: "Ec2Spot", source: "aws.ec2", detailType: "EC2 Spot Instance Interruption Warning", on: false },
-      { id: "AutoScalingFail", source: "aws.autoscaling", detailType: "EC2 Instance Launch Unsuccessful", on: false },
-      { id: "Rds", source: "aws.rds", detailType: "RDS DB Instance Event", on: false },
-      { id: "Config", source: "aws.config", detailType: "Config Rules Compliance Change", on: false },
-    ];
-
-    for (const src of webNotifSources) {
+    for (const src of WEB_NOTIF_SOURCES) {
       const override = this.node.tryGetContext(`webNotif${src.id}`) as string | undefined;
       const enabled = override ? override === "on" : src.on;
       const rule = new events.Rule(this, `WebNotifRule${src.id}`, {
-        ruleName: `notiops-web-notif-${src.id.toLowerCase()}`,
+        ruleName: webNotifRuleName(src.id),
+        description: webNotifRuleDescription(src),
         eventPattern: { source: [src.source], detailType: [src.detailType] },
         targets: [new targets.LambdaFunction(webNotifLambda)],
         enabled,
@@ -1683,7 +1674,7 @@ def handler(event, context):
           // MODEL_ID 现在只是**兜底**：真值走 DDB appconfig#phd（Admin「后端任务模型」写入，
           // 由 BFF 从模型目录解析 alias 后投影过去）。保留 env 是为了 DDB 不可用 / 未 seed
           // 时仍能推送，见 shared/phd_config.py 的三级降级。
-          MODEL_ID: "global.xai.grok-4.6",
+          MODEL_ID: "global.anthropic.claude-sonnet-5",
           CONFIG_TABLE: configTable.tableName,
         },
         description: "PHD 事件转发 — SNS 触发,LLM 翻译摘要(Bedrock/LiteLLM 可切换),推送飞书",

@@ -5,6 +5,15 @@ Called by `setup.sh`. Idempotent: the write is conditional on the item not
 existing, so re-running a deploy never overwrites what an administrator has
 configured in the console.
 
+When the item already exists the catalogue is **topped up**: entries that this
+file has and the stored item does not are appended (see `_top_up`). Without that
+step "already present" -- the normal path on every re-deploy -- silently means
+*models added to the catalogue after the first deploy never reach the
+environment*. That really happened: `zai-glm-5` was added on 2026-08-26 and was
+still missing from the production admin console (and therefore from the model
+picker) a day later, which reads as "the feature was never built". The top-up is
+additive only, and only while nobody has edited the catalogue in the console.
+
 Why a Python helper instead of `aws dynamodb put-item` in the shell: the
 catalogue is nested (a list of maps, with maps inside those), and the CLI's
 low-level form needs every value wrapped in its DynamoDB attribute type
@@ -20,7 +29,7 @@ first save is hard to complete, because the console can only add models it can
 enumerate and connectivity-test. See docs/DEPLOYMENT.md.
 
 Exit codes:
-  0  seeded, or already present (both are success for a deploy script)
+  0  seeded, topped up, or already present (all are success for a deploy script)
   1  the file is missing / invalid, or the write failed for another reason
 """
 from __future__ import annotations
@@ -89,6 +98,85 @@ def _sanity_check(cfg: dict) -> str | None:
     return None
 
 
+def merge_missing_models(existing: list, catalog: list) -> tuple[list, list[str]]:
+    """Return (merged models, aliases added). **Additive only.**
+
+    Kept deliberately dumb: an entry already in the stored item is copied over
+    byte-for-byte (never re-enabled, re-labelled or re-pointed at another
+    model_id), and entries the stored item has but this file does not are kept at
+    the end. The only edit is appending the missing ones, positioned where the
+    catalogue puts them so the admin console's ordering stays intentional.
+
+    Mirrored in `infra/lambda/stager/index.py::_merge_missing_models` (the
+    one-click path cannot import from this repo); kept honest by
+    `scripts/test_oneclick_parity.py`.
+    """
+    by_alias = {m.get("alias"): m for m in existing if isinstance(m, dict)}
+    merged: list = []
+    added: list[str] = []
+    for entry in catalog:
+        alias = entry.get("alias")
+        if alias in by_alias:
+            merged.append(by_alias[alias])
+        else:
+            merged.append(entry)
+            added.append(alias)
+    known = {e.get("alias") for e in catalog}
+    merged.extend(m for m in existing
+                  if isinstance(m, dict) and m.get("alias") not in known)
+    return merged, added
+
+
+def _top_up(table, cfg: dict) -> int:
+    """Add catalogue entries the stored item is missing. Returns an exit code.
+
+    Gated on `generation == 0` ("seeded, never edited by an admin"). Once an
+    administrator has saved the page it is theirs: they may have removed a model
+    on purpose, and a deploy resurrecting it would be the same class of bug as
+    overwriting the whole item. In that case say which aliases are missing and
+    leave the decision to them -- a silent no-op here is what made the original
+    problem so hard to spot.
+    """
+    from botocore.exceptions import ClientError
+
+    item = table.get_item(Key={"PK": _PK, "SK": _SK}).get("Item") or {}
+    merged, added = merge_missing_models(item.get("models") or [],
+                                        cfg.get("models") or [])
+    if not added:
+        print("seed_llm_catalog: catalogue already present and complete, left untouched")
+        return 0
+
+    gen = item.get("generation")
+    if gen is not None and int(gen) != 0:
+        print(f"seed_llm_catalog: catalogue was edited in the console "
+              f"(generation={int(gen)}); not adding {added}. Add them from "
+              f"the admin console if you want them.")
+        return 0
+
+    try:
+        table.update_item(
+            Key={"PK": _PK, "SK": _SK},
+            # Only `models` is touched: default_model / credential_mode /
+            # backend_tasks stay exactly as they are. A new model must never
+            # become the default by accident.
+            UpdateExpression="SET #m = :m",
+            ExpressionAttributeNames={"#m": "models"},
+            ExpressionAttributeValues={":m": merged, ":zero": 0},
+            ConditionExpression=(
+                "attribute_not_exists(generation) OR generation = :zero"),
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            print("seed_llm_catalog: catalogue was edited concurrently; "
+                  f"not adding {added}")
+            return 0
+        print(f"seed_llm_catalog: top-up failed: "
+              f"{e.response.get('Error', {}).get('Code')}", file=sys.stderr)
+        return 1
+    print(f"seed_llm_catalog: catalogue already present; added missing model(s) {added}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--table", default=os.environ.get("CONFIG_TABLE", "notiops-config"))
@@ -132,8 +220,7 @@ def main() -> int:
         table.put_item(**put)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            print("seed_llm_catalog: catalogue already present, left untouched")
-            return 0
+            return _top_up(table, cfg)
         print(f"seed_llm_catalog: write failed: "
               f"{e.response.get('Error', {}).get('Code')}", file=sys.stderr)
         return 1

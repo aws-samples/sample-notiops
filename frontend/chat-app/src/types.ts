@@ -31,6 +31,9 @@ export interface ChatMessage {
   investigationSteps?: InvestigationStep[]; // 调查分析过程（走右侧「调查过程」面板，不在气泡里）
   investigationConsoleUrl?: string;         // 本次调查的 DevOps Agent 后台深链（面板顶部）
   usage?: TokenUsage;    // 本轮 token 用量（显示在署名行）
+  // 答案来源标记。"devops-agent" = 这条回答由**客户自己的 DevOps Agent** 生成（「DevOps 对话」
+  // 开关），署名行显示 "AWS DevOps Agent" 而不是 "AWS Bedrock (某模型)"。缺省=本地模型。
+  via?: string;
   accountId?: string;    // 本轮提问的目标 AWS 账号（多账号可切换，故按条记录，让历史回复能标明针对哪个账号）
   streaming?: boolean;   // 正在流式输出
   thinking?: boolean;    // 思考态（尚无 token）
@@ -84,6 +87,31 @@ const DEVOPS_TOPICS_EXCLUDED: ReadonlySet<string> = new Set(["general", "cases",
 export const topicHasDevopsAgent = (k?: string): boolean =>
   !DEVOPS_TOPICS_EXCLUDED.has(k || "general");
 
+/**
+ * 从「事件通知」类卡片的「深入调查」发起会话时，新会话要带的两个深度调查开关。
+ *
+ * 为什么需要：这类卡片发出去的正文是后端 `core/push_event.py` 的 `dispatch_query`，
+ * 那个字段的注释写的就是 "text to send to DevOps Agent for follow-up investigation" ——
+ * 按钮从一开始就是深度调查的入口。但前端只起了一个「故障调查」主题的会话、两个开关都没开
+ * （ChatApp 的注释甚至写着"默认开 DevOps Agent"，与代码不符），于是用户点完「深入调查」，
+ * Composer 里「深度调查（直连）」是没勾的，那一轮走的其实是普通问答。
+ * 把这个决定收成纯函数，才能在测试里钉住，不再靠每个调用点手工同步（漂了一次了）。
+ *
+ * 口径：
+ *   · 只开**直连**那个（BFF 直连 DevOps Agent API、0 token），并显式关掉计费那个 ——
+ *     两者互斥，同时开会同时走两条路。
+ *   · 主题不提供深度调查（general / cases / whats-new）→ 两个都关：开了也没有开关可显示，
+ *     用户既看不到也关不掉。
+ *   · **不**在这里做能力探测。账号没接入 DevOps Agent 时直连路径自己会回一句
+ *     「无法定位该账号的 Agent Space，请确认已接入」并以 0 token 收尾
+ *     （devops_investigate.mjs），Composer 随后也会把开关置灰写明原因。
+ *     先探测再发意味着点击后多等一个往返、以及"点了没反应"，而代价只是一句真实报错——
+ *     这与仓库既有取舍一致（"宁可让用户点进去看到真实报错"）。
+ */
+export function deepDiveTogglesFor(topic?: string): { devopsAgent: boolean; devopsAgentDirect: boolean } {
+  return { devopsAgent: false, devopsAgentDirect: topicHasDevopsAgent(topic) };
+}
+
 export interface Conversation {
   id: string;
   title: string;
@@ -97,6 +125,10 @@ export interface Conversation {
   // 本会话是否启用「深度调查（直连）」：BFF 直连 DevOps Agent API、**0 token**（默认关）。
   // 与 devopsAgent **互斥**（同时开会同时走两条路），互斥逻辑在 ChatApp 的 toggle 里。
   devopsAgentDirect?: boolean;
+  // 本会话是否启用「DevOps 对话」：BFF 直连 DevOps Agent 控制面 CreateChat/SendMessage，
+  // 由**客户自己的 DevOps Agent** 回答（NotiOps 侧 **0 token**，默认关）。
+  // 与上面两个开关**三方互斥**（同时开会同时走多条路），互斥逻辑在 ChatApp 的 setDevopsMode 里。
+  devopsChat?: boolean;
   messages: ChatMessage[];
   updatedAt: number;
   pinned?: boolean;
@@ -104,7 +136,7 @@ export interface Conversation {
 
 // 新对话默认模型的**兜底**值。真值由 GET /models 下发（管理员在「管理 → 模型」里定），
 // 见 models.ts 的 defaultModelId()。这里保留是为了首帧渲染和接口读不到时不至于没模型可用。
-export const DEFAULT_MODEL = "xai-grok-4-6";
+export const DEFAULT_MODEL = "claude-sonnet-5";
 
 export interface ModelOption {
   id: string;

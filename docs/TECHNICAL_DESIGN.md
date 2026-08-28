@@ -272,7 +272,7 @@ BFF 把 AgentCore Runtime 的产出转成一条 SSE 事件流,前端按类型分
 
 #### 2.4.5 左侧主题导航(有序)
 
-通知(Notifications) / 调查(Investigate) / FinOps / 案例(Cases) / Skills(一级) / 更多(安全 · 巡检报告外链 · 定制)。新对话默认模型 **Grok 4.6**;另可切 Claude Sonnet 5、Claude Opus 5、Claude Haiku 4.5、Amazon Nova Pro、DeepSeek V3.2、GPT-5.6(Terra / Sol / Luna)。默认模型与启用集都由管理员在 Admin「模型」页定(真源:`config/llm-model-catalog.json` → DDB `llmcfg`)。每会话记忆模型偏好,每条回复署名所用模型。多账号选择器默认部署账号(团队共享);联网搜索开关默认关。
+通知(Notifications) / 调查(Investigate) / FinOps / 案例(Cases) / Skills(一级) / 更多(安全 · 巡检报告外链 · 定制)。新对话默认模型 **Claude Sonnet 5**;另可切 Claude Opus 5、Claude Haiku 4.5、Amazon Nova Pro、DeepSeek V3.2、GPT-5.6(Terra / Sol / Luna)。默认模型与启用集都由管理员在 Admin「模型」页定(真源:`config/llm-model-catalog.json` → DDB `llmcfg`)。每会话记忆模型偏好,每条回复署名所用模型。多账号选择器默认部署账号(团队共享);联网搜索开关默认关。
 
 > ⚠️ **FinOps Agent 深度分析当前置灰禁用(即将上线,暂未完善)**:DevOps Agent 开关现在在「调查」与「FinOps」两个主题都显示,FinOps 里可开它做成本 / 用量深度分析;但 **FinOps Agent 开关目前置灰禁用**,前端提示"即将上线"。进入 FinOps 主题时该开关默认关(仅「调查」主题默认开)。
 
@@ -437,6 +437,22 @@ DevOps Agent 深度调查(实时流式)
   · 后台纯前端切 tab、无法深链直达 Root cause tab,
     故文案提示"打开后切到 Root cause tab"
 ```
+
+### 3.6 Web Chat · 两条「BFF 直连 DevOps Agent」路径(0 token)
+
+除了 §3.5 那条经我们 agent 转交的深度调查,Web Chat 还有两条**完全绕过 agent runtime 与 Bedrock** 的路径:BFF 用 SigV4 直接调客户自己账号里的 **AWS DevOps Agent 控制面 API**,NotiOps 只当传输层。三条路径**互斥**(前端单选)。
+
+| 路径 | 前端标志 | BFF 落点 | 这一轮谁在答 |
+|---|---|---|---|
+| 深度调查 | `devops_agent` | agent runtime → `investigate_live` → `CreateBacklogTask` | DevOps Agent(NotiOps 的模型先把问题整理成调查请求,烧 token) |
+| 深度调查(直连) | `deep_investigate_direct` | `devops_investigate.mjs` → `CreateBacklogTask` + journal 增量轮询 / `GetBacklogTask` 判终态 | DevOps Agent(不经模型) |
+| DevOps 对话 | `devops_chat_direct` | `devops_chat.mjs` → `CreateChat` + `SendMessage` | DevOps Agent **直答** |
+
+- **为什么走控制面 API,而不是远端 MCP(`/mcp`)/ A2A(`/a2a/*`)**:后两条是给"外部模型"用的**工具面** —— 一接上,回答就重新由 Bedrock 模型生成,token 只会**更多**。控制面 `CreateChat` / `SendMessage` 是 DevOps Agent **自己**在答,因此不需要模型、也不需要新密钥(沿用 BFF Role / 跨账号 AssumeRole 的 SigV4)。
+- **SSE 事件与 §3.5 同形**(`token` / `progress` / `investigation_step` / `usage`),前端渲染与右侧「调查过程」面板**零改动复用**;两条直连路径也**复用同一条 `/stream` 路由**(不新增路由 → 不动 authz / capabilities)。`usage` 恒为 `{totalTokens: 0, direct: true}`,前端据此不渲染 token 徽章;DevOps Agent 侧的真实用量只落 CloudWatch(客户在自己的 DevOps Agent 账单里看)。
+- **流式体验对齐"客户直接开 DevOps Agent 网页聊"**(硬要求):正文 `textDelta` **逐 delta 转发**不缓冲;工具调用 / 思考 / 子代理等非正文块进右侧面板,正文未开始时补一条瞬态 `progress` 避免首答空白;**未知类型的块按正文处理**(失败安全 —— 宁可多显示,也不能把答案藏进面板)。
+- **单轮上限 840s**(BFF Lambda 平台硬顶 900s 内的保守取值,`NOTIOPS_DEVOPS_CHAT_MAX_WAIT_SEC` 可调)。超时**不算失败**:已流出的正文照样落库,并提示去 DevOps Agent 后台继续看。
+- **Skill 的转移方式两条路径不同**:两条直连路径由 `bff/web-chat/devops_skill.mjs` 把选中 Skill 的**正文内联**进本轮请求,所以**不需要先发布**(代价:`references/` 参考文件取不到);而转交路径(深度调查)用的是 Agent Space 里的那一份,**必须先发布**才会被激活。界面对这两句如实分开写。
 
 ---
 
@@ -672,12 +688,12 @@ def respond(user_text, *, command, chitchat_count, locale="en") -> str:
 每条 LLM 产出的回复尾部会追加单行模型署名,让用户清楚看到回复来自哪个模型(而不是被当成"标准答案"信赖):
 
 ```
-By Grok 4.6 (via Amazon Bedrock)
+By Claude Sonnet 5 (via Amazon Bedrock)
 ```
 
 - 实现:`core/bedrock_chat.py::respond()` 直接用本轮解析出的目录条目 label(`model_entry.label`)拼 `By <label> (via Amazon Bedrock)`
 - **只有一张模型名表 —— 模型目录本身**(DynamoDB,Admin「模型」页可改)。早期还有一张硬编码的 `_MODEL_FRIENDLY_NAMES` / `_friendly_model_name()` / `_model_footer()`,2026-08 已删(spec task 4.4):它没有调用方了,而且子串匹配不严谨(needle `claude-sonnet-5` 也会命中未来的 `claude-sonnet-5x`)。目录里查不到的 alias 由 `core/model_catalog.py` 兜底
-- 署名跟随本群 / 本 DM 当前选的模型(默认 Grok 4.6),不是写死 Claude
+- 署名跟随本群 / 本 DM 当前选的模型(默认 Claude Sonnet 5),不是写死某一个模型
 - 纯文本格式(不用 markdown italic),原因:飞书 `reply_text` 路径不渲染 markdown,`_..._` 字面会显示出来
 
 代码:[core/bedrock_chat.py](../core/bedrock_chat.py)
@@ -1196,7 +1212,7 @@ Lambda 这一侧(report-handler / push-handler)拿到的事件里没有 user_id,
 用户问 "ALB 和 NLB 什么区别"
    │
    ▼  bedrock_chat.respond(...) 走 Bedrock Tool Use
-Bedrock 会话模型(默认 Grok 4.6)
+Bedrock 会话模型(默认 Claude Sonnet 5)
    │  自主决定要不要调 tool
    ├── aws_docs_search(query)    ← MCP tool 1
    ├── aws_docs_read(url)         ← MCP tool 2

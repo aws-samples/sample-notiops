@@ -19,8 +19,10 @@ the web UI or touching the AWS Console.
 The same assistant is also available **inside your team's chat tools (Slack /
 Feishu)**: `@mention` the bot in an alert channel to run an investigation and
 read the report where the alert already landed. On top of on-demand questions,
-it does **proactive push** across six AWS signal sources (CloudWatch, AWS
-Health, Backup, GuardDuty, Cost Anomaly, Trusted Advisor).
+it does **proactive push** across 10 AWS signal sources (CloudWatch, AWS
+Health, Backup, GuardDuty, Cost Anomaly, Trusted Advisor, EC2 Spot
+interruption, Auto Scaling launch failure, RDS, Config), each independently
+switchable.
 
 All models are served through **Amazon Bedrock** (managed security, compliance,
 and cost controls), with per-session model switching and automatic
@@ -51,6 +53,14 @@ on-call engineers without granting write access.
 - 🔍 **Ad-hoc investigation**: ask a single sentence, get a complete report
   (markdown summary + HTML + trace) — typically ~1-3 minutes in internal testing
   (varies with query complexity, account size, and model)
+- 🤝 **Two answerers**: a general chat opens with a **conversation-object** picker — the
+  NotiOps agent (the wider view: inspection, investigation, cases, knowledge) or **the AWS
+  DevOps Agent in your own account answering directly** (on the ground: live diagnostics).
+  Pick the latter and it costs **0 NotiOps tokens** and needs **no model setup** (nothing to
+  enable in Bedrock), with the same streaming experience as the DevOps Agent's own console.
+  The Investigate topic also offers **deep investigation (Direct)**: the same deep
+  investigation calling the API without an LLM, also token-free (trade-off: your wording is
+  passed through as-is, with no smart rewrite)
 - 🛎️ **Proactive observation**: 10 EventBridge sources (CloudWatch / Health /
   Cost Anomaly / Trusted Advisor / GuardDuty / Backup / EC2 Spot interruption /
   Auto Scaling launch failure / RDS / Config), each independently switchable —
@@ -156,6 +166,8 @@ mode comparison and how to switch — see
 | Resource-health inspection (on demand) | ✅ | ✅ |
 | Incident investigation (instant, read-only tools) | ✅ | ✅ |
 | DevOps Agent deep investigation | ✅ see note ¹ | ✅ |
+| Deep investigation (Direct — token-free) | ✅ see note ¹ | ✅ |
+| DevOps Chat (your own DevOps Agent answers a general chat directly) | ✅ see note ¹ | ✅ |
 | Web search (AgentCore Web Search) | ✅ see note ² | ✅ see note ² |
 | **Cost / FinOps** | | |
 | FinOps dashboard (Cost Explorer data) | ✅ deploy account only | ✅ cross-account |
@@ -169,16 +181,17 @@ mode comparison and how to switch — see
 | Bedrock API key as the credential | ✅ | ✅ |
 | **Proactive / IM** | | |
 | IM channels (Slack / Feishu) | ❌ | ✅ |
-| Proactive push (10 EventBridge sources) | ❌ | ✅ |
+| Proactive push **to IM** (10 EventBridge sources) | ❌ | ✅ |
 | Daily scheduled inspection (idle resources / cost anomalies) | ❌ | ✅ |
-| Notification inbox | ⚠️ UI present, no backend to produce notifications | ✅ |
+| Notification inbox (the same 10 sources, into the web inbox) | ✅ | ✅ |
 | Admin dashboard (thresholds / target accounts / Skills management) | ❌ | ✅ |
 | **Scope** | | |
 | Multi-account (across an AWS Organization) | ✅ set `DeployMode=MultiAccount` + your organization id | ✅ `--multi-account` |
 | Upgrade | update the stack with the new template (~1 min) | re-run `./setup.sh` |
 
-> ¹ **Deep investigation and "publish a Skill to DevOps Agent" share one Agent Space
-> on Option A.** The stack creates it in the deploy account provided that
+> ¹ **Every DevOps Agent capability (deep investigation, deep investigation Direct, DevOps
+> Chat, and "publish a Skill to DevOps Agent") shares one Agent Space on Option A.** The
+> stack creates it in the deploy account provided that
 > `EnableDeepInvestigation=Yes` (the default) **and** the deploy Region is one where
 > AWS DevOps Agent is available (`us-east-1`, `us-west-2`, `ca-central-1`, `sa-east-1`,
 > `ap-south-1`, `ap-southeast-1`, `ap-southeast-2`, `ap-northeast-1`, `eu-central-1`,

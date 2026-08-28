@@ -6,7 +6,7 @@
   "private": true,
   "main": "index.mjs",
   "scripts": {
-    "test": "node tests/authz.test.mjs && node tests/admin_role_perms.test.mjs && node tests/agentcore.test.mjs && node tests/llm_config.test.mjs && node tests/llmcfg_disabled.test.mjs && node tests/deep_investigation_availability.test.mjs && node tests/dashboard_insight_requests.test.mjs"
+    "test": "node tests/authz.test.mjs && node tests/admin_role_perms.test.mjs && node tests/agentcore.test.mjs && node tests/llm_config.test.mjs && node tests/llmcfg_disabled.test.mjs && node tests/deep_investigation_availability.test.mjs && node tests/dashboard_insight_requests.test.mjs && node tests/devops_chat.test.mjs && node tests/devops_skill.test.mjs"
   },
   "dependencies": {
     "@aws-crypto/sha256-js": "^5.2.0",

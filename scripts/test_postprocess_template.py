@@ -52,6 +52,7 @@ BFF_KEY = "d" * 64 + ".zip"
 SUMS = {
     "bff.zip": "a" * 64,
     "chat-dist.zip": "b" * 64,
+    "web-notif.zip": "e" * 64,
     "agent-code.zip": "c" * 64,
 }
 TAG = "v9.9.9"
@@ -165,6 +166,20 @@ def synth_template() -> dict:
                     "S3Key": BFF_KEY,
                 }},
             },
+            # 「通知」生产端。代码同样躺在 staging 桶里（不是 CDK 资产），所以它也必须
+            # DependsOn StagerArtifacts —— 见 ③ 里那条反例。
+            "WebNotifFn": {
+                "Type": "AWS::Lambda::Function",
+                "DependsOn": ["StagerArtifacts"],
+                "Metadata": {"aws:cdk:path": "NotiOps/WebNotifFn"},
+                "Properties": {"Code": {
+                    "S3Bucket": {"Ref": "StagingBucket9644C37C"},
+                    "S3Key": {"Fn::Join": ["", [
+                        "notif/",
+                        {"Fn::FindInMap": ["NotiOpsRelease", pp.RELEASE_MAP_KEY, "Tag"]},
+                        "/web-notif.zip"]]},
+                }},
+            },
             "AgentRuntime": {
                 "Type": "AWS::BedrockAgentCore::Runtime",
                 "DependsOn": ["StagerArtifacts"],
@@ -214,10 +229,12 @@ manifest = json.loads(out["Resources"]["StagerArtifacts"]["Properties"]["Artifac
 _check("清单是 JSON **字符串**而不是嵌套对象（自定义资源属性到 Lambda 那边全是字符串）",
        isinstance(out["Resources"]["StagerArtifacts"]["Properties"]["Artifacts"], str))
 _check("清单顺序 = 搬运顺序：144MiB 的 agent zip 放最后（前面失败能秒级暴露）",
-       [e["name"] for e in manifest] == ["bff.zip", "chat-dist.zip", "agent-code.zip"])
-_check("三个 key 都是从模板里读出来的（intrinsic 求值），不是脚本里重拼的",
+       [e["name"] for e in manifest]
+       == ["bff.zip", "chat-dist.zip", "web-notif.zip", "agent-code.zip"])
+_check("四个 key 都是从模板里读出来的（intrinsic 求值），不是脚本里重拼的",
        [e["key"] for e in manifest]
-       == [BFF_KEY, f"frontend/{TAG}/chat-dist.zip", f"agent/{TAG}/agent-code.zip"],
+       == [BFF_KEY, f"frontend/{TAG}/chat-dist.zip", f"notif/{TAG}/web-notif.zip",
+           f"agent/{TAG}/agent-code.zip"],
        str([e["key"] for e in manifest]))
 _check("sha256 逐个对上", {e["name"]: e["sha256"] for e in manifest} == SUMS)
 _check("模板里不再有 tag 占位符", pp.RELEASE_TAG_PLACEHOLDER not in blob)
@@ -298,6 +315,7 @@ def _mappings_default() -> None:
     }
     pp.inject_manifest(t, [{"name": "bff.zip", "key": f"agent/{TAG}/x", "sha256": "a" * 64},
                            {"name": "chat-dist.zip", "key": "b", "sha256": "b" * 64},
+                           {"name": "web-notif.zip", "key": "d", "sha256": "e" * 64},
                            {"name": "agent-code.zip", "key": "c", "sha256": "c" * 64}])
     pp.rewrite_asset_bucket(t)
     pp.strip_bootstrap(t)
@@ -318,10 +336,24 @@ _expect_error("从 staging 桶取代码却不 DependsOn StagerArtifacts → 报�
               _no_depends_on, "does not DependsOn StagerArtifacts")
 
 
+def _notif_no_depends_on() -> None:
+    # 单独钉「通知」那个函数：它是第二个从 staging 桶取代码的资源，而它漏掉这条依赖
+    # 的后果最难看出来 —— 栈能建成功（S3 404 只在极窄的竞态里发生），坏掉的只是
+    # 「通知」这一个功能，症状是收件箱一直空着。
+    t = synth_template()
+    del t["Resources"]["WebNotifFn"]["DependsOn"]
+    pp.postprocess(t, TAG, dict(SUMS), "https://example.invalid/x")
+
+
+_expect_error("「通知」生产端漏掉 DependsOn StagerArtifacts → 报错并点名 WebNotifFn",
+              _notif_no_depends_on, "WebNotifFn")
+
+
 def _tagless_keys() -> None:
     t = synth_template()
     # key 里不带版本：CFN 看不见 S3 对象内容变化，客户升级后跑的还是旧代码。
     t["Resources"]["StagerSite"]["Properties"]["ChatDistKey"] = "frontend/chat-dist.zip"
+    t["Resources"]["WebNotifFn"]["Properties"]["Code"]["S3Key"] = "notif/web-notif.zip"
     t["Resources"]["AgentRuntime"]["Properties"]["AgentRuntimeArtifact"]["CodeConfiguration"][
         "Code"]["S3"]["Prefix"] = "agent/agent-code.zip"
     pp.postprocess(t, TAG, dict(SUMS), "https://example.invalid/x")
@@ -368,6 +400,7 @@ with tempfile.TemporaryDirectory() as d:
         # 三种真会出现的写法：裸文件名、`*` 前缀（sha256sum 二进制模式）、带目录。
         fh.write(f"{'a' * 64}  bff.zip\n")
         fh.write(f"{'b' * 64} *chat-dist.zip\n")
+        fh.write(f"{'e' * 64}  web-notif.zip\n")
         fh.write(f"# 注释行\n\n{'c' * 64}  dist/oneclick/agent-code.zip\n")
     _check("接受 `*` 前缀 / 目录前缀 / 注释与空行，key 取 basename",
            pp._read_sha256sums(pp.Path(good)) == SUMS)
@@ -384,9 +417,15 @@ ts = open(STANDALONE_TS, encoding="utf-8").read()
 _check(f"TS 里写着同一个 tag 占位值 {pp.RELEASE_TAG_PLACEHOLDER!r}", pp.RELEASE_TAG_PLACEHOLDER in ts)
 _check(f"TS 里的 Mappings 顶层键是 {pp.RELEASE_MAP_KEY!r}（不是 CFN 保留的 Default）",
        pp.RELEASE_MAP_KEY in ts and '"Default":' not in ts)
-_check("三个产物名与 TS/StagerFn 侧一致",
+_check("四个产物名与 TS/StagerFn 侧一致",
        all(n in ts or n in json.dumps(out) for n in
-           (pp.BFF_ARTIFACT, pp.CHAT_DIST_ARTIFACT, pp.AGENT_ARTIFACT)))
+           (pp.BFF_ARTIFACT, pp.CHAT_DIST_ARTIFACT, pp.NOTIF_ARTIFACT, pp.AGENT_ARTIFACT)))
+# 「通知」产物名在 TS 侧是常量（web-notif-sources.ts 的 WEB_NOTIF_ARTIFACT），
+# 单栈里只出现 `${WEB_NOTIF_ARTIFACT}`，所以这里对着那份源文件核。
+_check(f"web-notif-sources.ts 里的产物名与 {pp.NOTIF_ARTIFACT!r} 一致",
+       f'"{pp.NOTIF_ARTIFACT}"' in open(
+           os.path.join(ROOT, "infra", "lib", "constructs", "web-notif-sources.ts"),
+           encoding="utf-8").read())
 
 # 模板体积：`--template-body` / 控制台粘贴上限 51,200 字节，传 S3 上限 1MB。
 # 真产物现在 ~95KB，所以 CLI 必须走 --template-url —— 这两个常量别被人"顺手放宽"。

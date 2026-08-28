@@ -640,11 +640,26 @@ async function streamChat(event, responseStream, { sub, groups }) {
       console.error(`[BFF] /stream escalate-detect import failed — ${e?.name || ""}: ${e?.message || e}`);
     }
   }
+  // 「DevOps 对话」：BFF 直连 DevOps Agent 控制面 CreateChat/SendMessage —— 由**客户自己的
+  // DevOps Agent** 回答（计他自己的 DevOps Agent 额度），NotiOps 侧 0 token、不经 Bedrock。
+  // 与上面两个开关三方互斥（前端单选；这里再兜一层，防手搓请求同时开两个走两条路）。
+  // 老客户端不传此字段 → 永远走老路，行为逐字节不变。
+  // `objDevops` = 这段会话的**对话对象**是客户自己的 DevOps Agent（通用会话在落地页选的，
+  // 或故障调查里的平铺开关）。它与「深度调查（直连）」**不是简单互斥**：通用会话里客户可以
+  // 在 DevOps Agent 对话中把「深度调查」勾上 —— 那是**这一轮**的修饰（对象没变，只是这一轮
+  // 从"直接问答"换成"发起一次调查"），所以 deep 被勾上时它优先，否则勾了也照样走
+  // CreateChat/SendMessage（现象：点了深度调查、答回来的还是普通对话，且不报错）。
+  const objDevops = body.devops_chat_direct === true;
+  const deepDirectAsked = body.deep_investigate_direct === true;
   const devopsAgent = body.devops_agent === true || escalateFallback; // DevOps Agent 深度调查（仅故障调查主题）
-  const directInvestigate = body.deep_investigate_direct === true && !escalateFallback;
+  const directInvestigate = deepDirectAsked && !escalateFallback;
+  const chatDirect = objDevops && !deepDirectAsked;
   const topic = (body.topic || "general").toString(); // 会话主题（用于分类 + 未来按主题微调）
   const accountId = (body.account_id || "").toString(); // 多账号：本轮目标 AWS 账号（缺省=部署账号）
-  const skillId = (body.skill_id || "").toString();     // 显式 /skill：本轮强制使用的 skill
+  // 显式 /skill：本轮强制使用的 skill。**三条路径都要用它** —— agent runtime 走 payload 注入，
+  // 两条直连（DevOps 对话 / 深度调查（直连））把正文内联进发给 DevOps Agent 的那段话
+  // （见 devops_skill.mjs）。少接一条 = 客户点了 skill 但那一路悄悄没生效。
+  const skillId = (body.skill_id || "").toString();
   const skillVersion = (body.skill_version || "").toString(); // 可选：指定 skill 版本（缺省=latest）
 
   const stream = awslambda.HttpResponseStream.from(responseStream, {
@@ -685,7 +700,7 @@ async function streamChat(event, responseStream, { sub, groups }) {
   // runtime 侧 TTL 兜底失效 + 放大 DDB 读）。
   // 失败安全：目录读不出来（DDB 抖动 / 尚未 seed）不阻断对话 —— 退回客户端值 + generation 0，
   // 由 runtime 侧内置兜底 + TTL 自行收敛。宁可用旧模型，不可让聊天不可用。
-  let model = requestedModel || "xai-grok-4-6";
+  let model = requestedModel || "claude-sonnet-5";
   let generation = 0;
   try {
     const picked = await resolveForStream(requestedModel, "webchat");
@@ -710,7 +725,31 @@ async function streamChat(event, responseStream, { sub, groups }) {
   const collectedSources = [];
   let usage; // 本轮 token 用量（agent 收尾发来）
 
-  if (directInvestigate) {
+  if (chatDirect) {
+    // ── DevOps 对话：0 token 路径（由**客户自己的 DevOps Agent** 回答）──
+    // 不经 agent runtime / Bedrock，BFF 直接调 DevOps Agent 控制面 CreateChat + SendMessage，
+    // 把事件流逐 delta 转成 SSE（token/progress/investigation_step），体验对齐"直接开 DevOps
+    // Agent 网页聊"。SSE 事件与老路径同形 → 前端渲染/右侧面板零改动复用。
+    // ⚠️ 开关关闭时（老客户端不传此字段）本分支永不进入，老路径一行未改。
+    try {
+      const { runDevopsChat } = await import("./devops_chat.mjs");
+      reply = await runDevopsChat({
+        text, locale, accountId, conversationId, skillId, skillVersion,
+        emit: (evt, data) => {
+          if (evt === "usage") usage = data?.usage;
+          stream.write(sse(evt, data || {}));
+        },
+      });
+    } catch (e) {
+      console.error(`[BFF] /stream devops chat failed — ${e?.name || ""}: ${e?.message || e}`, e?.stack || "");
+      if (!reply) {
+        reply = locale === "en"
+          ? "⚠️ “DevOps Chat” failed to run. Please retry, or turn it off to use the standard chat."
+          : "⚠️ 「DevOps 对话」执行失败。请重试，或关闭该开关改用普通对话。";
+        stream.write(sse("token", { delta: reply }));
+      }
+    }
+  } else if (directInvestigate) {
     // ── 深度调查（直连）：0 token 路径 ──
     // 不经 agent runtime / Bedrock，BFF 直接调 DevOps Agent API（发起 + 轮询 journal + 读摘要
     // + 落 HTML 报告）。SSE 事件与老路径同形，故前端渲染/右侧「调查过程」面板零改动复用。
@@ -718,7 +757,7 @@ async function streamChat(event, responseStream, { sub, groups }) {
     try {
       const { runDirectInvestigation } = await import("./devops_investigate.mjs");
       reply = await runDirectInvestigation({
-        text, locale, accountId,
+        text, locale, accountId, skillId, skillVersion,
         emit: (evt, data) => {
           // sources 与老路径一致地累积，供落库复用（历史回显时报告链接不丢）。
           if (evt === "sources") {
@@ -877,6 +916,12 @@ async function streamChat(event, responseStream, { sub, groups }) {
     sources: collectedSources.length ? collectedSources : undefined,
     usage: usage || undefined, // 持久化本轮用量，刷新后仍显示
     accountId: accountId || undefined, // 本轮针对账号(历史回复账号徽标用)
+    // 答案来源：对话对象是客户自己的 DevOps Agent 时（普通直答**或**这一轮的直连深度调查），
+    // 署名行不能写成 "AWS Bedrock (某模型)"。例外是「转人工支持」那一轮真的回落到我们的 agent
+    // （escalateFallback → devopsAgent），那轮就该署我们的模型名。
+    // 不落这个字段的后果：刷新页面后历史回复被错误署名成本地模型，且通用会话「对话对象」的
+    // 重新上锁失去唯一依据。
+    via: objDevops && !escalateFallback ? "devops-agent" : undefined,
   });
   await touchConversation(sub, conversationId, accountId);
 

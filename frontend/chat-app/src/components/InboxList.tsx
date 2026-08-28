@@ -26,7 +26,9 @@ function InboxEventCard({
   isNew: boolean;
   locale: string;
   t: (k: string) => string;
-  onInvestigate: (query: string, title: string) => void;
+  // opts.deep=true 表示这条正文是后端给 DevOps Agent 准备的调查描述（dispatchQuery），
+  // 接收方应把新会话的「深度调查（直连）」开关一起打开。见 types.ts:deepDiveTogglesFor。
+  onInvestigate: (query: string, title: string, opts?: { deep?: boolean }) => void;
   onAsk: (query: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -54,7 +56,8 @@ function InboxEventCard({
           </div>
         )}
         <div className="notif-card-actions">
-          <button className="notif-act primary" onClick={() => onInvestigate(n.dispatchQuery || n.title, n.title)}>
+          <button className="notif-act primary"
+                  onClick={() => onInvestigate(n.dispatchQuery || n.title, n.title, { deep: true })}>
             <IconInvestigate size={14} /> {t("notif.investigate")}
           </button>
           <button className="notif-act" onClick={() => onAsk(`${n.title}\n\n${n.description || ""}`)}>
@@ -87,7 +90,7 @@ export default function InboxList({
   sources, onInvestigate, onAsk, markReadOnMount = false, onLoaded, emptyHint,
 }: {
   sources?: string[];
-  onInvestigate: (query: string, title: string) => void;
+  onInvestigate: (query: string, title: string, opts?: { deep?: boolean }) => void;
   onAsk: (query: string) => void;
   markReadOnMount?: boolean;
   onLoaded?: () => void;

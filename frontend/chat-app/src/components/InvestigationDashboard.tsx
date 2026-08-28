@@ -21,8 +21,11 @@ interface Props {
   onAccountChange?: (id: string) => void;
   data?: AlarmDashboardData;
   can?: (key: string) => boolean;
-  /** 「调查」：以告警上下文发起 DevOps Agent 调查（复用 startFromNotification(query,"investigate")）。 */
-  onInvestigate?: (query: string) => void;
+  /** 「调查」：以告警上下文发起 DevOps Agent 调查（复用 startFromNotification(query,"investigate")）。
+   *  opts.deep=true 表示 query 是后端给 DevOps Agent 备好的调查描述（事件收件箱卡片的
+   *  dispatchQuery），新会话应直接开「深度调查（直连）」；本面板自己那几个「调查」按钮的
+   *  文案是写给大模型看的（要它列受影响资源、给下一步建议），故不带 deep。 */
+  onInvestigate?: (query: string, opts?: { deep?: boolean }) => void;
   /** 「通知」：以告警上下文生成摘要草稿（复用聊天）。 */
   onNotify?: (query: string) => void;
 }
@@ -347,7 +350,7 @@ export default function InvestigationDashboard({ dashboardId, onOpenDashboard, d
       <SectionTitle>{zh ? "事件收件箱" : "Event Inbox"}</SectionTitle>
       <InboxList
         sources={["CloudWatch", "Backup", "EC2 Spot", "Auto Scaling", "Config"]}
-        onInvestigate={(q) => onInvestigate?.(q)}
+        onInvestigate={(q, _title, opts) => onInvestigate?.(q, opts)}
         onAsk={(q) => onNotify?.(q)}
         emptyHint={zh ? "暂无运维事件（CloudWatch/Backup 等 push 会出现在这里）。" : "No ops events yet (CloudWatch/Backup pushes appear here)."}
       />

@@ -32,7 +32,7 @@ const RED = "#d13212";
  * 一致(那是落库字段,也是这里的分组键)。新增 normalizer 时要同步往这里加一项,
  * 否则该类型的事件会落到末尾的 evt:other 兜底组(不会丢,但没有专属分组)。
  *
- * defaultOn 对应 infra/lib/notiops-backend-stack.ts 中 webNotifSources 的 on 字段
+ * defaultOn 对应 infra/lib/constructs/web-notif-sources.ts 中 WEB_NOTIF_SOURCES 的 on 字段
  * (即 EventBridge 规则出厂是 ENABLED 还是 DISABLED)。仅用于空态文案:默认关的源
  * 空着是"没开",默认开的源空着是"真没发生过" —— 两者对用户的含义完全不同。
  *
@@ -41,7 +41,7 @@ const RED = "#d13212";
  * 一定是"没发生",所以给一条专属文案指出要先做什么,避免用户以为 NotiOps 坏了。
  */
 const EVENT_TYPES: { key: string; source: string; labelKey: string; subKey: string; defaultOn: boolean; prereqKey?: string; icon: React.ReactNode }[] = [
-  // 顺序 = 侧栏展示顺序,与 CDK webNotifSources 一致:默认开的 5 个在前。
+  // 顺序 = 侧栏展示顺序,与 CDK WEB_NOTIF_SOURCES 一致:默认开的 5 个在前。
   { key: "health",      source: "AWS Health",       labelKey: "notif.evt.health",      subKey: "notif.evt.health.sub",      defaultOn: true,  icon: <IconHeartPulse size={16} /> },
   { key: "cloudwatch",  source: "CloudWatch Alarm", labelKey: "notif.evt.cloudwatch",  subKey: "notif.evt.cloudwatch.sub",  defaultOn: true,  icon: <IconGauge size={16} /> },
   { key: "cost",        source: "Cost Anomaly",     labelKey: "notif.evt.cost",        subKey: "notif.evt.cost.sub",        defaultOn: true,  prereqKey: "notif.evt.emptyPrereq.cost",      icon: <IconCostSpike size={16} /> },
@@ -145,25 +145,32 @@ function HealthEventCard({
     onInvestigate(q, e.eventTypeCode);
   };
 
-  // 「Ask about this」：拉详情(含 affected entities)后，让 agent 先检查客户环境里哪些资源
-  // 可能受此 Health 事件影响，给受影响清单 + 下一步建议(只读)。
+  // 「就此提问」：拉详情后起一个**普通会话**(topic=general)问"这事件是什么、要不要管"。
+  //
+  // 这里曾与 doInvestigate 逐字节相同(连注释都是拷的) —— 于是卡片上两个按钮问的是
+  // 同一个问题,差别只剩落在哪个主题里,而按钮文案承诺的是两件事。清资源清单归
+  // 「深入调查」(那条要用到只读巡检工具);这条只要解释与判断,所以显式告诉 agent
+  // **不要**去枚举账号资源,并把"想看我账号里具体哪些资源受影响"指回另一个按钮。
   const doAsk = async () => {
     const d = await ensureDetail();
     const zh = locale !== "en";
     const svc = e.service || "the affected service";
-    const region = e.region || (zh ? "所有区域" : "all regions");
     const base = d ? detailContext(d) : `AWS Health event ${e.eventTypeCode} (${e.category}) for service ${e.service} in ${e.region || "global"}.`;
     const q = zh
-      ? `${base}\n\n请检查我当前 AWS 环境里哪些资源可能受此事件影响：\n`
-        + `1) 若有受影响实体(affected entities)，优先列出；\n`
-        + `2) 再按受影响服务(${svc})和区域(${region})列出我账号里的相关资源；\n`
-        + `3) 交叉判断出「可能受影响的资源清单」（资源 ID/名称、类型、区域）；\n`
-        + `4) 给出针对性的下一步建议。全程只读，不修改任何资源。`
-      : `${base}\n\nCheck which resources in my current AWS environment may be affected by this event:\n`
-        + `1) If affected entities are available, list them first;\n`
-        + `2) Then list my account's resources for the affected service (${svc}) in ${region};\n`
-        + `3) Cross-reference to produce a "likely affected resources" list (ID/name, type, region);\n`
-        + `4) Give targeted next-step recommendations. Read-only; do not modify any resource.`;
+      ? `${base}\n\n请就这个 AWS Health 事件给我解释：\n`
+        + `1) 它到底是什么 —— AWS 侧发生了什么(故障/计划变更/账号通知)；\n`
+        + `2) 通常影响哪类资源与使用方式，影响面和持续时间大概是什么；\n`
+        + `3) 我这边**是否需要采取行动**、有没有截止时间窗；\n`
+        + `4) 如需行动，给出该类事件的常见做法与注意事项。\n`
+        + `本轮只要解释与判断，不用去枚举我账号里的资源；`
+        + `要「我账号里具体哪些资源受影响」请用卡片上的「深入调查」。`
+      : `${base}\n\nExplain this AWS Health event:\n`
+        + `1) What it actually is -- what happened on the AWS side (outage / planned change / account notice);\n`
+        + `2) Which kinds of resources and usage patterns it typically affects, how broad and how long;\n`
+        + `3) Whether **I** need to act, and by when;\n`
+        + `4) If action is needed, the usual approach for this class of ${svc} event and what to watch out for.\n`
+        + `Explanation and judgement only -- no need to enumerate resources in my account; `
+        + `for "which of my resources are affected" use the Investigate button on the card.`;
     onAsk(q);
   };
 
@@ -250,7 +257,9 @@ function InboxEventCard({
   isNew: boolean;
   locale: string;
   t: (k: string) => string;
-  onInvestigate: (query: string, title: string) => void;
+  // opts.deep=true 表示这条正文是后端给 DevOps Agent 准备的调查描述（dispatchQuery），
+  // 接收方应把新会话的「深度调查（直连）」开关一起打开。见 types.ts:deepDiveTogglesFor。
+  onInvestigate: (query: string, title: string, opts?: { deep?: boolean }) => void;
   onAsk: (query: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -278,7 +287,8 @@ function InboxEventCard({
           </div>
         )}
         <div className="notif-card-actions">
-          <button className="notif-act primary" onClick={() => onInvestigate(n.dispatchQuery || n.title, n.title)}>
+          <button className="notif-act primary"
+                  onClick={() => onInvestigate(n.dispatchQuery || n.title, n.title, { deep: true })}>
             <IconInvestigate size={14} /> {t("notif.investigate")}
           </button>
           <button className="notif-act" onClick={() => onAsk(`${n.title}\n\n${n.description || ""}`)}>
@@ -304,7 +314,8 @@ function InboxEventCard({
 export default function NotificationsPanel({
   onInvestigate, onAsk, onLoaded, can = () => true, accountId = "", accounts = [], onAccountChange,
 }: {
-  onInvestigate: (query: string, title: string) => void;
+  // 第三个参数见 InboxEventCard：deep=true → 新会话要开「深度调查（直连）」。
+  onInvestigate: (query: string, title: string, opts?: { deep?: boolean }) => void;
   onAsk: (query: string) => void;
   onLoaded?: () => void;
   can?: (key: string) => boolean;

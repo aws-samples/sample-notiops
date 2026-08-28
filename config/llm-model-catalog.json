@@ -46,8 +46,8 @@
   "generation": 0,
   "provider": "bedrock",
   "credential_mode": "iam",
-  "_default_model_note": "默认模型必须是**带跨区推理 profile 前缀**（global. / us. / eu. / apac. …）的条目，不能是裸 id —— 哪怕那个裸 id 支持按需直调。理由：默认模型的第一职责是「随便哪个区装完都能说第一句话」，而裸 id 是逐区上线的，有洞。2026-08-26 短暂把 zai-glm-5（裸 id，实测 us-east-1 / us-west-2 / ap-northeast-1 有，ap-southeast-1 与 eu-* 没有）设成默认，代价是：装在缺 GLM 5 的区时，客户第一句话就报错，且必须自己摸到 Admin「模型」页换默认才能用 —— 对一个公开 sample，这就是「部署成功但不能用」。同时四份客户文档（docs/DEPLOYMENT{,.en}.md、docs/DEPLOYMENT_ONECLICK{,.en}.md）都写着「默认模型是 Grok 4.6，这一个必须在 Bedrock 开通」，照着做的一键客户只开 Grok 就直接 AccessDeniedException。GLM 5 / DeepSeek V3.2 仍在启用集里，用户可按会话切。这条规则由 scripts/test_llm_catalog_seed.py 的两条断言机器强制：默认必须 profile-prefixed，且它的 model_id 必须出现在那四份客户文档里。",
-  "default_model": "xai-grok-4-6",
+  "_default_model_note": "默认模型必须是**带跨区推理 profile 前缀**（global. / us. / eu. / apac. …）的条目，不能是裸 id —— 哪怕那个裸 id 支持按需直调。理由：默认模型的第一职责是「随便哪个区装完都能说第一句话」，而裸 id 是逐区上线的，有洞。2026-08-26 短暂把 zai-glm-5（裸 id，实测 us-east-1 / us-west-2 / ap-northeast-1 有，ap-southeast-1 与 eu-* 没有）设成默认，代价是：装在缺 GLM 5 的区时，客户第一句话就报错，且必须自己摸到 Admin「模型」页换默认才能用 —— 对一个公开 sample，这就是「部署成功但不能用」。同时四份客户文档（docs/DEPLOYMENT{,.en}.md、docs/DEPLOYMENT_ONECLICK{,.en}.md）都写着「默认模型是 X，这一个必须在 Bedrock 开通」，照着做的一键客户只开 X 就直接 AccessDeniedException。GLM 5 / DeepSeek V3.2 / Grok 4.6 仍在启用集里，用户可按会话切。这条规则由 scripts/test_llm_catalog_seed.py 的两条断言机器强制：默认必须 profile-prefixed，且它的 model_id 必须出现在那四份客户文档里。2026-08-27 默认从 Grok 4.6 改回 Claude Sonnet 5：Grok 不支持 Converse 显式 cachePoint（长会话 input 成本更高），且 2026-08-25 现网出过连续 InternalServerException 的一轮；Sonnet 5 是 profile-prefixed、支持显式 cachePoint，且已经是 bot 侧那批手搓 Anthropic body 的调用点（shared/model_config.py）钉死的模型 —— 让目录默认与它一致，少一处需要解释的分叉。",
+  "default_model": "claude-sonnet-5",
 
   "models": [
     {

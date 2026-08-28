@@ -41,7 +41,7 @@
 | **管理 Support case** | 创建 / 列出 / 查看 / 回复 / **智能分析** / 关闭 AWS Support case | `@bot 帮我开个 case 处理 RDS 故障` / `@bot 分析 case 12345` |
 | **回答 AWS 概念问题** | 引用 AWS 官方文档解释概念、最佳实践、API 用法 | `@bot ALB 和 NLB 有什么区别` |
 | **主动观察告警** | CloudWatch / Health / Backup / GuardDuty / Cost / TA 6 类事件源,自动派发调查 | (无需操作,告警自动触发)|
-| **多 LLM 切换** | 在管理员启用的模型之间任意切换(默认 **Grok 4.6**,另有 Claude Sonnet 5 / Opus 5 / Haiku 4.5、Amazon Nova Pro、DeepSeek V3.2、GPT-5.6 系列;均经 Amazon Bedrock 访问),per-chat / per-DM 记忆偏好 | `@bot model nova` / `@bot model claude` / `@bot model list` |
+| **多 LLM 切换** | 在管理员启用的模型之间任意切换(默认 **Claude Sonnet 5**,另有 Claude Opus 5 / Haiku 4.5、Amazon Nova Pro、DeepSeek V3.2、GLM 5、Grok 4.6、GPT-5.6 系列;均经 Amazon Bedrock 访问),per-chat / per-DM 记忆偏好 | `@bot model nova` / `@bot model claude` / `@bot model list` |
 | **语言切换** | 中 / 英文切换,记住你的偏好 | `language zh` / `language en` / `请帮我切换到英文` |
 
 ### bot 不会做什么 ❌
@@ -314,7 +314,7 @@ bot 会先发"正在分析 case xxx…"提示,5-15 秒后返回**紫色智能分
 
 ### 5.2 回答样式
 
-bot 调用 **AWS Knowledge MCP** 检索官方文档,然后用本群当前的对话模型(默认 **Grok 4.6**,见 §7)回答,**附带可验证的来源**:
+bot 调用 **AWS Knowledge MCP** 检索官方文档,然后用本群当前的对话模型(默认 **Claude Sonnet 5**,见 §7)回答,**附带可验证的来源**:
 
 ```
 ALB (Application Load Balancer) 工作在 OSI Layer 7,理解 HTTP/HTTPS 协议,
@@ -337,13 +337,13 @@ Layer 4,只看 TCP/UDP,不解析应用层。
 - aws_docs_search("ALB vs NLB difference")
 - aws_docs_read(...)
 
-By Grok 4.6
+By Claude Sonnet 5
 ```
 
 **重点**:
 - **"📚 来源"块** = 实际被 LLM 看过的 URL,不是凭空编的
 - **"🔧 调用的 MCP 工具"** = 透明展示 LLM 用了哪些工具
-- **"By Grok 4.6"**(署名跟随本群当前模型)= 标明这是模型生成的回答,不是固化的"标准答案"
+- **"By Claude Sonnet 5"**(署名跟随本群当前模型)= 标明这是模型生成的回答,不是固化的"标准答案"
 
 ### 5.3 概念问题样例
 
@@ -427,8 +427,8 @@ bot 支持的别名 = 管理员在模型目录里勾选的 IM 启用集(下表�
 
 | alias | 模型 | 说明 |
 |---|---|---|
-| `grok` | **Grok 4.6** | **默认值**(模型目录 `default_model`)。Bedrock Converse;⚠️ 不支持显式提示缓存,长会话的 input 成本比 Claude 高 |
-| `claude` | **Claude Sonnet 5** | 内部测试中工具调用较稳、中英文都好;支持提示缓存 |
+| `claude` | **Claude Sonnet 5** | **默认值**(模型目录 `default_model`)。内部测试中工具调用较稳、中英文都好;支持提示缓存 |
+| `grok` | **Grok 4.6** | Bedrock Converse;⚠️ 不支持显式提示缓存,长会话的 input 成本比 Claude 高 |
 | `nova` | **Amazon Nova Pro** | Bedrock Converse,单价约为 Claude Sonnet 的 1/4(据 Bedrock 公开定价,截至 2026-07),中文够用,合规白名单常见 |
 | `gpt` / `gpt_sol` / `gpt_luna` | **GPT-5.6** Terra / Sol / Luna(实验性)| 走 Bedrock Mantle Responses API,工具调用稳定性弱于上面两个,建议仅作尝鲜 |
 
@@ -443,7 +443,7 @@ bot 支持的别名 = 管理员在模型目录里勾选的 IM 启用集(下表�
 @bot model list         # 列出所有可用别名
 @bot model nova         # 切到 Nova(整个群从此用 Nova)
 @bot model claude       # 切到 Claude Sonnet 5
-@bot model default      # 清除偏好,回到管理员设的 default_model(当前 Grok 4.6)
+@bot model default      # 清除偏好,回到管理员设的 default_model(当前 Claude Sonnet 5)
 ```
 
 ### 7.2 切换的范围
@@ -561,7 +561,7 @@ DDB TTL 自动清理,不需要人工干预。
 ### Q6: bot 回的内容是模型生成的吗?会不会胡编?
 
 - **调查报告**:DevOps Agent 真实读你的资源生成,有 trace.html 可查,不会编
-- **概念问答**:Bedrock 上的对话模型(默认 Grok 4.6)+ AWS 官方文档检索(Knowledge MCP),回答附带 📚 来源 URL,可点击验证
+- **概念问答**:Bedrock 上的对话模型(默认 Claude Sonnet 5)+ AWS 官方文档检索(Knowledge MCP),回答附带 📚 来源 URL,可点击验证
 - **意图判断 / 进度叙事**:LLM 生成,可能会有偏差,但不影响调查结果本身的真实性
 
 如果 bot 给的概念回答跟你认知不符,**点 📚 来源 URL 自己看 AWS 官方文档**——这是 ground truth。
@@ -693,12 +693,32 @@ bot 在飞书 / Slack 上完整可用的功能,在钉钉上**当前处于分阶�
 
 - **登录**:Web Chat 走 Cognito 登录(复用 notiops 用户池)。打开管理员发给你的网址,用你的账号登录即可。
 - **左侧导航(主题)**:按顺序是 **通知(Notifications) / 调查(Investigate) / FinOps / 案例(Cases) / Skills / 更多(More)**。点某个主题即进入对应对话场景。
-- **默认模型**:新对话默认使用 **Grok 4.6**(具体默认值由管理员在「管理 → 模型」页设定)。
-- **右侧 Sources / 调查过程面板**:展示工具调用、出处透传,以及调查主题下的"调查过程"实时面板(见 §12.3)。
+- **通用聊天**:不进任何主题时的新对话。它开头会让你选**对话对象**(NotiOps / 你自己的 DevOps Agent),见 §12.2。
+- **默认模型**:新对话默认使用 **Claude Sonnet 5**(具体默认值由管理员在「管理 → 模型」页设定)。
+- **右侧 Sources / 调查过程面板**:展示工具调用、出处透传,以及调查主题下的"调查过程"实时面板(见 §12.4)。
 
-顶部/工具区可用的开关:**多账号选择器**、**多模型切换**、**联网搜索开关**(见 §12.7)。
+顶部/工具区可用的开关:**多账号选择器**、**多模型切换**、**联网搜索开关**(见 §12.8)。
 
-### 12.2 通知(Notifications)主题:Health Dashboard + 收件箱红点
+### 12.2 通用聊天:先选「对话对象」(NotiOps / 你自己的 DevOps Agent)
+
+**通用聊天**(不进左侧任何主题时的新对话)开头会出现一个两段式的**对话对象**选择,决定**这个会话由谁来回答**:
+
+| 对话对象 | 谁在回答 | 擅长什么 | 代价 / 前提 |
+|---|---|---|---|
+| **NotiOps**(默认) | NotiOps 自己的 agent(模型经 Amazon Bedrock) | 全局视角 —— 巡检、调查、案例、官方文档检索、Skills、联网搜索、成本 | 消耗本部署配置的 Bedrock 模型额度 |
+| **DevOps Agent** | **你自己账号里的 AWS DevOps Agent**,内容原样透传 | 深入现场 —— 对单个资源 / 事件做实时排查 | **NotiOps 侧 0 token**(用量计入你自己的 DevOps Agent);**免模型配置** —— 不需要在 Bedrock 开通任何模型,一个还没配模型的新部署选这边就能直接用 |
+
+**要点:**
+
+- **可跳过** —— 不选、直接打字就是 NotiOps。
+- **发出第一句后本会话的对象就固定了**,中途不能换;要换请开一个新对话。会话标题栏上的 **NotiOps / DevOps Agent** 标签就是当前对象。
+- 选了 DevOps Agent 之后,输入框工具栏会**瘦身**:**联网搜索**与**模型选择器**不再显示(这一轮不经我们的模型,选模型没有意义),只保留一枚 **「深度调查」** 勾选 ——
+  - **不勾**(默认):即时问答 + **流式输出**,体验与 DevOps Agent 自己的页面一致;
+  - **勾上**:这一轮让它做一次完整的多信号根因排查并出报告(通常几分钟)。
+- **这条路径不挂 NotiOps 的工具与 Skills**;需要人工确认的动作请到 DevOps Agent 控制台完成。启动卡片也换成 4 张排查类问题(近期异常 / EC2 为什么重启 / RDS 是否健康 / 近期变更),不再引导到成本、案例、Skills —— 那些请用 NotiOps 或对应主题。
+- **前提**:该账号已接入 AWS DevOps Agent。没接入时这一段会**置灰并写明原因**(本部署账号没有 Agent Space / 所选账号未接入),而不是让你点进去发一轮再吃报错。
+
+### 12.3 通知(Notifications)主题:Health Dashboard + 收件箱红点
 
 通知主题分**两块**,分别回答"AWS 现在有没有影响我的事件"和"过去发生过哪些事件":
 
@@ -717,9 +737,16 @@ bot 在飞书 / Slack 上完整可用的功能,在钉钉上**当前处于分阶�
 - **左侧红点** = 收件箱**未读数**,前端每 **60 秒轮询**一次刷新(注意:是轮询,不是实时 WebSocket 推送)。Health Dashboard 的未处理数**不计入**红点。
 - **每张通知卡上的操作**:**深入调查**(把这条通知作为起点,转到调查主题发起 DevOps Agent 深度调查)/ **就此提问**(围绕这条通知继续对话)/ **控制台链接**(跳 AWS 控制台看原始事件)。
 
-### 12.3 调查(Investigate)主题:实时过程面板 + 缓解跳后台 + 转人工
+### 12.4 调查(Investigate)主题:实时过程面板 + 缓解跳后台 + 转人工
 
 调查主题接入 **DevOps Agent 深度调查**,发起后**同步执行 + 实时流式**返回,你能"边看边等"。
+
+**两种发起方式(开关都在输入框工具栏,同一时间只生效一个):**
+
+- **深度调查** —— 先由 NotiOps 的模型理解你的问题、整理成一份调查请求再派发(你没说清的地方它会补齐,也会先回答夹带的概念问题)。
+- **深度调查(直连)** —— 同一个 DevOps Agent 深度调查,但**绕过大模型直连 API**,因此**不消耗 token**。代价:调查描述**按你的原话透传**(不做智能改写),也不会先回答概念问题。
+
+两条路径的报告、右侧「调查过程」面板和结论后的按钮完全一样;直连路径的回复不显示 token 用量(本来就是 0)。
 
 **操作与你会看到什么:**
 1. 描述你的问题(或从通知卡点"深入调查"带入起点),发起调查。
@@ -731,13 +758,13 @@ bot 在飞书 / Slack 上完整可用的功能,在钉钉上**当前处于分阶�
 
 > Web Chat **忠实透传 DevOps Agent 的内容**,NotiOps 不对调查结论做二次 LLM 加工。
 
-### 12.4 FinOps 主题
+### 12.5 FinOps 主题
 
 - FinOps 主题面向成本 / 用量类问题。
 - **DevOps Agent 开关**现在在**调查**和 **FinOps** 两个主题都会显示(在 FinOps 里可用它做成本/用量的深度分析)。**进入 FinOps 时该开关默认关**(只有调查主题默认开)。
 - ⚠️ **FinOps Agent 深度分析当前置灰禁用**:该功能尚未完善,界面会提示 **"即将上线"**。当前请不要把它当作已可用功能。
 
-### 12.5 案例(Cases)主题:两种建案方式
+### 12.6 案例(Cases)主题:两种建案方式
 
 Web Chat 提供**两条建案路径,客户二选一**。两种方式都走**确定性执行**(通过 BFF 的 `/actions/execute`,**不经 LLM**),并在真正建案前给你预览确认。
 
@@ -755,25 +782,30 @@ Web Chat 提供**两条建案路径,客户二选一**。两种方式都走**确�
 
 > 两种方式都是"提议 → 确认 → 执行"的严谨流程,不会跳过确认直接建案。
 
-### 12.6 Skills(自建技能)
+### 12.7 Skills(自建技能)
 
 - **Skills 是客户自建的技能**,在左侧有**一级导航入口**,也可通过 **"/" 命令菜单**在对话里调用。
 - Skills 存放在 **S3 的 `skills/` 前缀**下(与 IM 端**共享**同一份存储)。
 - 支持**版本历史 / 回滚 / zip 导入**,便于管理与复用。
+- **选中某个 Skill 后,谁来执行它**:如果这一轮交给你自己的 DevOps Agent(深度调查 / 深度调查(直连) / 通用聊天里选了 DevOps Agent),输入框上方的 Skill 芯片会打一个 **DevOps Agent** 标记。两者行为不同,界面会如实写出来:
+  - **深度调查**(转交):DevOps Agent 用的是**它那边的一份** Skill,所以**必须先在「Skills」页把这个 Skill 发布到 DevOps Agent**,否则这一轮它不会被激活。
+  - **两条直连路径**:Skill **正文会随本轮内联发过去**,**无需发布**;但如果它附带 `references/` 参考文件,那部分在直连路径上取不到。
 
-### 12.7 多账号 / 多模型 / 联网搜索 / What's New / "/" 命令
+### 12.8 多账号 / 多模型 / 联网搜索 / What's New / "/" 命令
 
-- **多模型切换**:默认 **Grok 4.6**,另可选 **Claude Sonnet 5**、**Claude Opus 5**、**Claude Haiku 4.5**、**Amazon Nova Pro**、**DeepSeek V3.2**、**GPT-5.6(Terra / Sol / Luna)**(均经 Amazon Bedrock 访问,第三方模型非直连厂商 API;实际可选项 = 管理员勾的启用集)。**每会话记忆你的模型偏好**,**每条回复都会署名所用模型**。
+- **多模型切换**:默认 **Claude Sonnet 5**,另可选 **Claude Opus 5**、**Claude Sonnet 4.6**、**Claude Haiku 4.5**、**Amazon Nova Pro**、**DeepSeek V3.2**、**GLM 5**、**Grok 4.6**、**GPT-5.6(Terra / Sol / Luna)**(均经 Amazon Bedrock 访问,第三方模型非直连厂商 API;实际可选项 = 管理员勾的启用集)。**每会话记忆你的模型偏好**,**每条回复都会署名所用模型**。
 - **多账号选择器**:默认使用**部署账号**,团队共享。⚠️ **v1 跨账号默认锁定在部署账号**(尚未开放任意切换到其他账号)。
 - **联网搜索开关**:**默认关闭**,需要时手动打开,让助手参考公网信息。用的是 AWS 内建的 AgentCore Web Search(搜索请求不出 AWS)。⚠️ 这个能力**只在 `us-east-1` 提供**:部署在别的区域时开关照样能点,但搜不到东西 —— 这不是故障,问运维方确认部署区域即可。
 - **What's New**:查看 AWS 新发布内容。
-- **"/" 命令**:在输入框输入 `/` 会弹出命令菜单,可快速调用 Skills 等。
+- **"/" 命令**:在输入框输入 `/` 会弹出命令菜单,列出**你全部的 Skill**(表头写着总条数,列表可滚动,不抽样也不截断),继续打字即按 id / 名称筛选;**↑ / ↓** 移动高亮、**Enter** 选中、**Esc** 关闭。菜单底部固定「管理 Skills」「新建 Skill」两个出口。选中后输入框会预填一句"使用 Skill「××」",可直接回车发送。
 - **Sources 面板**:透传工具调用与出处,便于你核验助手的依据。
 - **只读安全**:Web Chat 沿用后端的严格只读约束(三层防御),不会替你变更 AWS 环境。
 
-### 12.8 使用须知(务必知晓)
+### 12.9 使用须知(务必知晓)
 
 - **FinOps Agent 深度分析暂禁用**,界面提示"即将上线",当前不可用。
 - **v1 跨账号默认锁定部署账号**,暂不能自由切换到其他账号。
 - **通知实时性靠 60 秒轮询**(非 WebSocket),红点可能有最多约 1 分钟延迟。
+- **通用聊天的对话对象一旦发出第一句就固定**,不能中途切换;选了 DevOps Agent 的会话**不挂 NotiOps 的工具与 Skills**,需要人工确认的动作要去 DevOps Agent 控制台完成。
+- **DevOps Agent 相关能力(深度调查 / 直连 / 通用聊天里的 DevOps Agent 对象)都要求该账号已接入 AWS DevOps Agent**,未接入时对应开关会置灰并写明原因。
 - **Health Dashboard 实时视图需 Business+ / Enterprise Support 计划**,否则降级为控制台链接。

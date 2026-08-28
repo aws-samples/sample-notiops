@@ -163,7 +163,7 @@ CDK 部署三个栈,`./setup.sh` 走 `cdk deploy --all` 一次部到位。**Web 
 - **AWS 账号**:有 admin 或同等权限
 - **VPC**:任何能跑 ECS Fargate 的 VPC + ≥ 2 个 AZ 的 public subnet(**仅当你启用 IM bot 时需要** —— Fargate task 出公网调 IM API;只用 web 端可忽略)
 - **AWS DevOps Agent**:已开通(深度调查功能需要)。**无需自备 Agent Space** —— CDK 会在你账号下自动新建一个 `notiops-devops-<account>` space(详见 §5.3.4),你不用先手动创建或提供 space id
-- **Bedrock**:模型目录里**默认模型**对应的 model 在你的 region 已 enable(Bedrock 控制台 → Model access)。当前默认是 **Grok 4.6**(`global.xai.grok-4.6`);想让用户能切别的(Claude Sonnet 5 / Opus 5、Nova Pro、DeepSeek、GPT-5.6 系列)就把对应的一并 enable
+- **Bedrock**:模型目录里**默认模型**对应的 model 在你的 region 已 enable(Bedrock 控制台 → Model access)。当前默认是 **Claude Sonnet 5**(`global.anthropic.claude-sonnet-5`);想让用户能切别的(Claude Opus 5 / Haiku 4.5、Nova Pro、DeepSeek、GLM 5、Grok 4.6、GPT-5.6 系列)就把对应的一并 enable
 
 ### 2.3 Region 选择
 
@@ -705,7 +705,7 @@ aws dynamodb delete-item --table-name <conv-table> \
 
 | 组件 | 说明 |
 |---|---|
-| **Agent Runtime** | Bedrock AgentCore Runtime,承载 Strands agent(默认模型 **Grok 4.6**,取自模型目录的 `default_model`)。由 `scripts/deploy_agent.sh` 以 CodeZip 方式部署,产出一个 **Runtime ARN** |
+| **Agent Runtime** | Bedrock AgentCore Runtime,承载 Strands agent(默认模型 **Claude Sonnet 5**,取自模型目录的 `default_model`)。由 `scripts/deploy_agent.sh` 以 CodeZip 方式部署,产出一个 **Runtime ARN** |
 | **BFF Lambda** | Node 20 Lambda(`notiops-web-chat-bff`),挂 **Function URL**(`AuthType=AWS_IAM`),以 **SSE 流式**响应前端;调 Agent Runtime,并直接处理确定性操作(建案 `/actions/execute`、`/support/services` 目录等) |
 | **前端** | React / Vite 单页应用,静态托管 |
 | **鉴权** | Cognito(复用 notiops 的 user pool)+ Identity Pool,前端拿临时凭据对 Function URL 做 **SigV4** 签名 |
@@ -754,6 +754,15 @@ cd infra && npx cdk deploy WebChatStack -c agentRuntimeArn=<上一步的 ARN>
 ### 12.5 通知事件源(持久化收件箱)
 
 Web Chat「通知」主题的**持久化收件箱**由 EventBridge → `notiops-web-notif-handler`(复用 `core/push_event` 归一化,5 分钟去重)→ 写 `notiops-web-chat` 表 `notif#` 段。事件源开关:
+
+> 📌 **这一整套两条部署路径都有,清单同源。** 事件源定义(10 类、默认开关、规则名、规则描述、Lambda 环境变量)在
+> [`infra/lib/constructs/web-notif-sources.ts`](../infra/lib/constructs/web-notif-sources.ts),`setup.sh` 的
+> `notiops-backend-stack.ts` 与一键部署的 `notiops-webchat-standalone-stack.ts` **import 同一份**
+> (`scripts/test_oneclick_parity.py` 的第 ⑤ 项钉住"没有人把清单抄回某个栈里")。
+> **唯一的差别是怎么关掉某一源**:本节的 `-c webNotif<Id>=off` 只对 `setup.sh` 有效;
+> 一键部署没有 `-c`,改成在 **EventBridge 控制台**上 Disable 那条 `notiops-web-notif-*` 规则 ——
+> 模板不管规则的启用状态,所以这个手动改动不会被版本升级覆盖回去。
+> 一键部署侧的对客说明见 [DEPLOYMENT_ONECLICK.md §2.9](DEPLOYMENT_ONECLICK.md#29-通知收件箱)。
 
 - **默认开**(5 个,运维价值最高、噪音可控):AWS Health / CloudWatch Alarm / Cost Anomaly / Trusted Advisor / GuardDuty
 - **默认关**(5 个,按需 `-c webNotif<Id>=on` 打开):Backup / EC2 Spot / Auto Scaling / RDS / Config

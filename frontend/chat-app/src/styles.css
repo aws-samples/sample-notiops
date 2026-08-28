@@ -32,6 +32,7 @@
   --menu-hover: rgba(255,255,255,.06);
   --link: #5aa7ff;       /* 正文超链接：深色背景上要够亮，#006ce0 在近黑背景上偏暗、像普通文字 */
   --sk-bg: #1c2129;      /* 骨架屏灰块：比 --line 略亮一点，在近黑背景上才看得见 */
+  --ok: #3ecf8e;         /* 正向/零成本提示色（"0 token"、DevOps 直答身份条）：品牌 --green(#00802f) 在近黑背景上几乎看不见 */
 }
 
 /* ===== Light 主题 —— 侧栏浅白、主区纯白 ===== */
@@ -56,6 +57,7 @@
   --menu-hover: #f3f5f7;
   --link: #006ce0;       /* 浅色背景沿用品牌蓝 */
   --sk-bg: #e9ecf0;      /* 骨架屏灰块 */
+  --ok: #00802f;         /* 正向/零成本提示色：浅色背景用品牌绿 */
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body, #root { height: 100%; }
@@ -206,7 +208,16 @@ a.um-item:visited { color: var(--text); }
 .row:hover .msg .ts { opacity: 1; }
 .row.user .msg .bubble { background: var(--bubble-user); color: var(--bubble-user-text); border-radius: 16px; padding: 11px 16px; display: inline-block; text-align: left; }
 .row.user .msg .bubble code { background: rgba(0,0,0,.12); color: inherit; }
-.msg .modelsig { font-size: 12px; color: var(--muted); margin-top: 8px; }
+/* 署名（模型 · tokens）现在住在 .msgbar 那一行里，所以不能再带 margin-top —— 否则会把
+   自己顶出基线、和左边的按钮错开。 */
+.msgbar .modelsig { font-size: 12px; color: var(--muted); margin-left: 4px; }
+/* 账号 ID：与署名同款的普通文字（曾经是带外边框的胶囊徽标 —— 在这一行页脚里比周围都重，
+   还像个能点的按钮）。颜色信息只剩那颗点：橙=成员账号，蓝=部署/management。 */
+.msgbar .mb-acct {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin-left: 10px; font-size: 12px; color: var(--muted);
+}
+.msgbar .mb-acct-dot { width: 5px; height: 5px; border-radius: 3px; display: inline-block; }
 
 /* ===== 历史水合骨架屏 =====
    套在真实的 .stream/.thread/.row/.msg 里，只把文字换成灰块，所以历史到达时
@@ -391,8 +402,9 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 .reasoning-body { margin-top: 6px; padding: 8px 11px; border-left: 2px solid var(--line);
   color: #7d8794; font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
 
-/* 消息操作栏 */
-.msgbar { display: flex; align-items: center; gap: 2px; margin-top: 8px; }
+/* 消息页脚（一行：复制 / Sources / 署名 / 账号 ID）。
+   窄屏放不下就换行(flex-wrap)——挤成一行会把账号徽标压变形或撑出气泡。 */
+.msgbar { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; row-gap: 4px; margin-top: 8px; }
 .mb-btn { display: inline-flex; align-items: center; gap: 5px; border: none; background: transparent; color: #8a96a3; cursor: pointer; padding: 5px 7px; border-radius: 7px; font-size: 12.5px; font-family: inherit; }
 .mb-btn:hover { background: var(--menu-hover); color: var(--text); }
 .mb-count { font-size: 11px; color: #fff; background: #aab3bd; border-radius: 9px; padding: 0 6px; min-width: 17px; text-align: center; line-height: 16px; }
@@ -407,8 +419,15 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
    有分割线、可拖拽调宽（.src-resize）。移动端退回覆盖式抽屉（见 @media）。 */
 .src-overlay { display: none; }  /* 桌面不需要遮罩（不夺焦点） */
 .src-panel { flex-shrink: 0; width: 0; overflow: hidden; height: 100%; background: var(--page);
-  border-left: 1px solid var(--line); display: flex; flex-direction: column; }
-.src-panel.open { /* width 由内联 style 控制（可拖拽） */ }
+  display: flex; flex-direction: column; }
+/* 分割线**只在打开时**画，且用左侧栏那条线的颜色（`--sidebar-border`），让左右两条分割线
+   长得一样 —— 产品要求。
+   为什么不写在 `.src-panel` 上：面板关着也一直挂在 DOM 里（只是 `width:0`），而 border
+   不受 `overflow:hidden` 裁剪，于是**每个关着的面板都在右缘留一条 1px 竖线**。聊天页同时
+   挂着 Sources 与「调查过程」两个面板 → 现网看到的就是"两条并行的竖线"，而且开着一个时
+   仍有第二条陪着。左侧栏没这个毛病，因为 `.sidebar.collapsed` 显式 `border-right: none`。 */
+.src-panel.open { /* width 由内联 style 控制（可拖拽） */
+  border-left: 1px solid var(--sidebar-border); }
 /* Sources 面板左侧的可拖拽分割线（对称于左侧栏的 .resize-handle） */
 .src-resize { width: 5px; flex-shrink: 0; cursor: col-resize; background: transparent; margin-right: -3px; z-index: 5; position: relative; }
 .src-resize:hover, .src-resize:active { background: var(--orange); opacity: .5; }
@@ -536,6 +555,46 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 @media (max-width: 480px) {
   .home-cards { grid-template-columns: 1fr; }
   .home-headline { font-size: 22px; }
+}
+/* ── 「对话对象」选择（通用会话新对话主页）──
+   刻意**不做成卡片**：下面那 4 张启动卡就是同样的"描边矩形"，两排卡片叠在一起会读成
+   "8 个同级入口"，而这一排其实是**页面的模式开关**（选谁来答，顺带换掉下面 4 张卡）。
+   所以做成一枚居中的分段控件（pill 轨道 + 选中段填充），层级上明显轻于卡片、又只用
+   现成的 --card/--line/--orange，不引入新配色。
+   选中态靠**填充**表达，不写"已选"二字；置灰态（这个部署/账号没接入 DevOps Agent）
+   把原因放到下面那行提示里 —— 那是唯一真正需要文字解释的情况。 */
+.obj-pick { width: 100%; padding: 0 24px; margin-bottom: 18px; }
+.obj-seg {
+  display: flex; justify-content: center; align-items: center; gap: 2px;
+  width: max-content; max-width: 100%; margin: 0 auto; padding: 3px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 999px;
+}
+.obj-seg-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 15px; border: none; border-radius: 999px; background: transparent;
+  font-family: inherit; font-size: 12.5px; font-weight: 600; color: var(--muted);
+  white-space: nowrap; cursor: pointer; transition: background .12s, color .12s;
+}
+.obj-seg-btn > svg { flex-shrink: 0; }
+.obj-seg-btn:hover:not(.sel):not(.disabled) { color: var(--text); }
+/* 深色外观下 12% 橙压在 --card(#171b21) 上只是一层暖雾（≈#332a1d），选中段和轨道分不太开
+   —— 而这排控件不写"已选"、全靠填充说话。2026-08-28 现网观感反馈：加深一档 → .20（≈#45341a），
+   与浅色那档的**可见强度**也更接近。 */
+.obj-seg-btn.sel { background: rgba(255, 153, 0, .20); color: var(--text); }
+/* 浅色外观下同一层橙色几乎看不出来（白底 + 12% 橙 ≈ 一层雾），选中态就失去了唯一的表达手段
+   —— 这排控件不写"已选"，全靠填充说话。故 light 单独加深。 */
+:root[data-theme="light"] .obj-seg-btn.sel { background: rgba(255, 153, 0, .26); }
+.obj-seg-btn.sel > svg { color: var(--orange); }
+.obj-seg-btn.disabled { cursor: not-allowed; opacity: .45; }
+/* 提示行：一句话说清两边的差别（选中态变化时跟着换）。固定最小高度 —— 否则切换时
+   整个 hero 会上下跳一行。 */
+.obj-hint {
+  margin-top: 9px; min-height: 17px;
+  text-align: center; font-size: 12px; line-height: 1.4; color: var(--muted);
+}
+@media (max-width: 480px) {
+  .obj-pick { padding: 0 12px; }
+  .obj-seg-btn { padding: 6px 11px; font-size: 12px; }
 }
 /* 主题页：紧贴输入框左上角的一体化「打开 Dashboard」标签。
    标签行左对齐；标签底边与 .cbox 顶边相接（负 margin 压 1px），底部圆角抹平 → 与输入框连成一体。 */
@@ -815,16 +874,19 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 }
 
 /* ── Composer: /skill 选择器 + 激活芯片 ── */
-.skill-menu {
-  position: absolute; bottom: 100%; left: 0; margin-bottom: 8px; min-width: 280px; max-width: 420px;
-  background: var(--menu-bg); border: 1px solid var(--line); border-radius: 12px;
-  box-shadow: 0 8px 28px rgba(0,0,0,.18); padding: 6px; z-index: 30; max-height: 260px; overflow-y: auto;
-}
 .skill-mi { display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; border: none;
   background: transparent; color: var(--text); padding: 8px 10px; border-radius: 8px; cursor: pointer; font-size: 13.5px; }
-.skill-mi:hover { background: var(--menu-hover); }
+/* 高亮用 --sidebar-hover 而不是 --menu-hover：菜单底色改成跟聊天框一致（--sidebar）后，
+   浅色主题下 --menu-hover(#f3f5f7) 压在 --sidebar(#f7f8fa) 上几乎看不出来 —— 而这一行高亮
+   是键盘 ↑/↓ 选择的唯一反馈，看不见等于键盘导航废了。 */
+.skill-mi:hover, .skill-mi.active { background: var(--sidebar-hover); }
 .skill-mi-name { font-weight: 600; color: var(--orange2); flex-shrink: 0; }
-.skill-mi-desc { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+/* 展示名：给它一个上限，长名字不能把「什么时候用它」那句整条挤掉 */
+.skill-mi-desc { color: var(--text); flex-shrink: 0; max-width: 180px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 描述（选哪个 skill 主要靠它）：吃掉剩下的宽度，放不下就截断（完整内容在 title 里） */
+.skill-mi-sub { color: var(--muted); flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 预置/自建小徽标（与 Customize 列表同色系）：一眼区分 /命令菜单里的两类 skill */
 .skill-mi-tag { flex-shrink: 0; font-size: 9.5px; font-weight: 600; line-height: 1; padding: 2px 6px; border-radius: 999px; letter-spacing: .02em; }
 .skill-mi-tag.preset { color: var(--orange2); background: color-mix(in srgb, var(--orange) 15%, transparent); border: 1px solid color-mix(in srgb, var(--orange) 35%, transparent); }
@@ -839,25 +901,31 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
   font-size: 12px; color: var(--blue, #4493f8); background: color-mix(in srgb, var(--blue, #4493f8) 10%, transparent);
   border: 1px solid color-mix(in srgb, var(--blue, #4493f8) 30%, transparent); border-radius: 9px; }
 
-/* ── Composer: "/" 命令菜单按钮 + 两层菜单 ── */
+/* ── Composer: "/" 命令菜单按钮 + 单层可滚动 skill 列表 ── */
 .cmd-btn { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px;
   border: 1px solid var(--line); border-radius: 9px; background: var(--card); color: var(--muted);
   font-size: 15px; font-weight: 700; line-height: 1; cursor: pointer; font-family: inherit; transition: all .15s; }
 .cmd-btn:hover { color: var(--text); border-color: var(--muted); }
 .cmd-btn.on { color: var(--orange2); border-color: var(--orange); background: color-mix(in srgb, var(--orange) 12%, transparent); }
-.cmd-menu { position: absolute; bottom: 100%; left: 0; margin-bottom: 8px; min-width: 240px;
-  background: var(--menu-bg); border: 1px solid var(--line); border-radius: 12px;
+/* 菜单本体：左右边缘与聊天框（.cbox）**外沿对齐**、底色圆角也跟它一致 —— 视觉上是聊天框
+   长出来的一截，而不是浮在旁边的另一块东西。
+   left/right 取 -1px 而不是 0：绝对定位的偏移量是相对 .cbox 的 padding box（描边内侧）算的，
+   要让菜单自己的描边压在聊天框描边同一条竖线上，就得再往外让出这 1px 边框。
+   ⚠️ 不要在这里写 min-width/max-width —— 那会让它在窄屏上比聊天框宽（溢出）或在宽屏上比它窄。 */
+.cmd-menu { position: absolute; bottom: 100%; left: -1px; right: -1px; margin-bottom: 8px;
+  background: var(--sidebar); border: 1px solid var(--line); border-radius: 16px;
   box-shadow: 0 8px 28px rgba(0,0,0,.18); padding: 6px; z-index: 30; }
-.cmd-cat { position: relative; }
+/* 表头「技能 (N)」：N 是**全部**条数，不是可见条数 —— 客户得知道自己一共有多少 */
+.cmd-head { display: flex; align-items: baseline; gap: 8px; padding: 6px 10px 7px; }
+.cmd-head-title { font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: .02em; }
+.cmd-head-hint { font-size: 11.5px; color: var(--muted); opacity: .7; margin-left: auto; }
+/* 只在这里滚：管理/新建两条固定在下面，滚多远都点得到 */
+.cmd-list { max-height: 300px; overflow-y: auto; }
+.cmd-empty { color: var(--muted); font-size: 13px; padding: 8px 10px; }
 .cmd-mi { display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; border: none;
   background: transparent; color: var(--text); padding: 8px 10px; border-radius: 8px; cursor: pointer; font-size: 13.5px; }
-.cmd-mi:hover { background: var(--menu-hover); }
+.cmd-mi:hover { background: var(--sidebar-hover); }   /* 同上：底色改了，hover 也得跟着换 */
 .cmd-mi-name { flex: 1; font-weight: 500; }
-.cmd-mi-arrow { display: inline-flex; color: var(--muted); }
-.cmd-sub { position: absolute; left: calc(100% + 6px); bottom: 0; min-width: 240px; max-width: 380px;
-  background: var(--menu-bg); border: 1px solid var(--line); border-radius: 12px;
-  box-shadow: 0 8px 28px rgba(0,0,0,.18); padding: 6px; max-height: 300px; overflow-y: auto; }
-.cmd-sub-empty { color: var(--muted); font-size: 13px; padding: 8px 10px; }
 .cmd-sep { height: 1px; background: var(--line); margin: 5px 6px; }
 
 /* 输入框内联提示：点 "/" 后在聊天框里 "/" 后面显示「输入以筛选」，打字即消失。
@@ -870,8 +938,6 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 }
 .ta-ghost-slash { visibility: hidden; }        /* 占位对齐真实的 "/" */
 .ta-ghost-hint { color: var(--muted); opacity: .7; }
-.cmd-mi-muted { color: var(--muted); font-weight: 400; }
-.cmd-mi-filter:hover .cmd-mi-muted { color: var(--text); }
 
 /* ── Customize: 版本历史 ── */
 .cz-versions { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 16px; display: flex; flex-direction: column; gap: 8px; }
@@ -940,9 +1006,6 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 .cz-btn-danger { border: 1px solid color-mix(in srgb, #e5484d 45%, var(--line)); background: transparent; color: #e5484d; border-radius: 9px; padding: 9px 16px; font-family: inherit; font-weight: 600; cursor: pointer; transition: background .12s; }
 .cz-btn-danger:hover { background: color-mix(in srgb, #e5484d 12%, transparent); }
 .cz-btn-danger:disabled { opacity: .5; cursor: default; }
-
-/* 署名行的「N 步」带 tooltip：虚线下划线提示可悬停查看说明 */
-.modelsig-steps { border-bottom: 1px dotted currentColor; cursor: help; }
 
 /* ── 侧栏 What's New 卡片入口（仿 Claude Cowork）── */
 .sb-whatsnew { display: flex; align-items: center; gap: 11px; width: calc(100% - 24px); margin: 8px 12px; padding: 11px 12px; border: 1px solid var(--sidebar-border); border-radius: 12px; background: transparent; color: var(--sidebar-text); cursor: pointer; text-align: left; font-family: inherit; transition: border-color .12s, background .12s; }

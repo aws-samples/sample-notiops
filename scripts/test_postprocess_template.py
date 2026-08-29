@@ -166,19 +166,35 @@ def synth_template() -> dict:
                     "S3Key": BFF_KEY,
                 }},
             },
+            # 「通知」的日志组：**没有 LogGroupName**（CFN 自己命名），函数靠
+            # LoggingConfig 指过来。写死名字会撞上 Lambda 服务自建的同名组，见下面
+            # 「日志组名字」那两条。
+            "WebNotifLogs389A7992": {
+                "Type": "AWS::Logs::LogGroup",
+                "Properties": {"RetentionInDays": 14},
+            },
+            # 部署 Lambda 的日志组：名字里带 StackName → 随栈唯一，允许。
+            "StagerLogs36CB7680": {
+                "Type": "AWS::Logs::LogGroup",
+                "Properties": {"LogGroupName": {"Fn::Join": [
+                    "", ["/aws/lambda/", {"Ref": "AWS::StackName"}, "-stager"]]}},
+            },
             # 「通知」生产端。代码同样躺在 staging 桶里（不是 CDK 资产），所以它也必须
             # DependsOn StagerArtifacts —— 见 ③ 里那条反例。
             "WebNotifFn": {
                 "Type": "AWS::Lambda::Function",
                 "DependsOn": ["StagerArtifacts"],
                 "Metadata": {"aws:cdk:path": "NotiOps/WebNotifFn"},
-                "Properties": {"Code": {
-                    "S3Bucket": {"Ref": "StagingBucket9644C37C"},
-                    "S3Key": {"Fn::Join": ["", [
-                        "notif/",
-                        {"Fn::FindInMap": ["NotiOpsRelease", pp.RELEASE_MAP_KEY, "Tag"]},
-                        "/web-notif.zip"]]},
-                }},
+                "Properties": {
+                    "Code": {
+                        "S3Bucket": {"Ref": "StagingBucket9644C37C"},
+                        "S3Key": {"Fn::Join": ["", [
+                            "notif/",
+                            {"Fn::FindInMap": ["NotiOpsRelease", pp.RELEASE_MAP_KEY, "Tag"]},
+                            "/web-notif.zip"]]},
+                    },
+                    "LoggingConfig": {"LogGroup": {"Ref": "WebNotifLogs389A7992"}},
+                },
             },
             "AgentRuntime": {
                 "Type": "AWS::BedrockAgentCore::Runtime",
@@ -361,6 +377,29 @@ def _tagless_keys() -> None:
 
 _expect_error("产物 key 里不含 release tag → 报错（否则客户升级后还跑旧代码）",
               _tagless_keys, "without a version in the key")
+
+# ── 日志组名字：写死 = 整栈开不起来 ─────────────────────────────────────────────
+print("\n   日志组名字")
+_check("模板里没有任何写死名字的日志组（含 StackName 的动态名不算）",
+       all(not isinstance(r.get("Properties", {}).get("LogGroupName"), str)
+           for r in out["Resources"].values() if r["Type"] == "AWS::Logs::LogGroup"))
+_check("「通知」函数用 LoggingConfig 指向栈内日志组，而不是靠同名约定",
+       out["Resources"]["WebNotifFn"]["Properties"].get("LoggingConfig", {}).get("LogGroup")
+       == {"Ref": "WebNotifLogs389A7992"})
+
+
+def _hardcoded_log_group_name() -> None:
+    # 2026-08-28 实测过的真事故：这个名字的日志组 **Lambda 服务自己也会建**
+    #（方式 B 留下的那个不属于任何栈），CFN 的 NAME_CONFLICT_VALIDATION 预检直接
+    # 把整栈判死，报错里只有日志组，看不出跟「通知」有关。
+    t = synth_template()
+    t["Resources"]["WebNotifLogs389A7992"]["Properties"]["LogGroupName"] = \
+        "/aws/lambda/notiops-web-notif-handler"
+    pp.postprocess(t, TAG, dict(SUMS), "https://example.invalid/x")
+
+
+_expect_error("日志组写死 LogGroupName → 报错（NAME_CONFLICT_VALIDATION 会让整栈失败）",
+              _hardcoded_log_group_name, "hardcodes LogGroupName")
 
 # ── 非 ASCII：客户可见字段一律拒，资源属性里的中文（内联代码/注释）照旧放行 ──
 print("\n   非 ASCII 文案（CFN 会把它们换成 '?'）")

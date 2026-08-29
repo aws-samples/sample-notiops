@@ -110,7 +110,7 @@ Everything else has a safe default. For a first deployment, **leave them all alo
 | **On stack delete** | `KeepData` | Decides what happens to your data when the stack is deleted. See [§6](#6-deleting-the-stack) — **there is a gotcha; read it before you delete**. |
 | **Deployment mode** | `SingleAccount` | Pick `MultiAccount` (and fill in the org id below) to let it also see **other** accounts in your organization. There are prerequisites — see [§2.6](#26-optional-multi-account-across-an-organization). |
 | **AWS Organizations id (MultiAccount only)** | empty | Only needed with `MultiAccount` (starts with `o-`). **Half a choice does nothing**: `MultiAccount` with an empty org id stays single-account, and the `DeployModeStatus` output says so. |
-| **Enable deep investigation (AWS DevOps Agent)?** | `Yes` | See [§2.7](#27-deep-investigation-aws-devops-agent). An idle agent space costs nothing, which is why it defaults to on; pick `No` if you don't want it. |
+| **Enable AWS DevOps Agent features (deep investigation, DevOps Chat)?** | `Yes` | One switch, **four** capabilities — see [§2.7](#27-deep-investigation-aws-devops-agent). An idle agent space costs nothing, which is why it defaults to on; pick `No` if you don't want it (all four are then greyed out). |
 | **Artifact base URL override** / **Artifact mirror bucket name (s3:// only)** | empty | Only when you can't reach GitHub — see [§7](#7-no-internet-egress-use-a-private-s3-mirror). |
 
 ### 2.4 Acknowledge IAM, create
@@ -169,7 +169,7 @@ This path still does **not** include: member-account CloudWatch OAM Sinks, cross
 
 ### 2.7 Deep investigation (AWS DevOps Agent)
 
-**Enable deep investigation** defaults to `Yes`: the stack also creates an **AWS DevOps Agent agent space** (named `notiops-oneclick-<account id>`) and associates this account with it as a **monitor (read-only)** target. That's what powers **every DevOps Agent capability** in the chat UI — handing a problem to the AWS-managed DevOps Agent for multi-round autonomous triage, which digs deeper than a single question-and-answer round.
+**Enable AWS DevOps Agent features** (the template parameter is still named `EnableDeepInvestigation`) defaults to `Yes`: the stack also creates an **AWS DevOps Agent agent space** (named `notiops-oneclick-<account id>`) and associates this account with it as a **monitor (read-only)** target. That's what powers **every DevOps Agent capability** in the chat UI — handing a problem to the AWS-managed DevOps Agent for multi-round autonomous triage, which digs deeper than a single question-and-answer round.
 
 Four capabilities depend on this one agent space (without it, the matching toggle is **greyed out with the reason shown**):
 
@@ -182,6 +182,8 @@ Four capabilities depend on this one agent space (without it, the matching toggl
 
 > 💡 The middle two are especially useful for a fresh deployment with **no Bedrock models enabled yet**: pick DevOps Agent as the answerer and you can start immediately.
 
+- **Nothing to click in the console**: the stack enables the agent space's **operator app (web app)** at the same time it creates the space — the console step called “Agent Space → Access → Operator access → **Configure web app**”. That click used to be mandatory and manual; without it all four capabilities above fail with `Invalid or unregistered domain`, an error that points nowhere near “you missed a button”. The stack now does it for you: one extra role assumed by the DevOps Agent service (`AIDevOpsOperatorAppAccessPolicy`), disabled and deleted with the stack.
+  > ⚠️ **Only relevant when upgrading from an older version** ([§5](#5-upgrading)): if your stack was created by an older version and you **clicked Configure web app yourself**, this update makes CloudFormation call Enable again while the service already considers it enabled. **That case has not been tested yet.** If the update fails because of it, run `aws devops-agent disable-operator-app --agent-space-id <space id> --region <region>` (the space id is in the `DevOpsAgentSpaceId` output) and update again — the web app domain is derived from the space id, so this **doesn't change the URL**. Fresh deployments are unaffected.
 - **Billing**: charged per **agent-second while a task runs**; an **idle agent space costs nothing**. That's why it defaults to on — it won't hand you a monthly bill for doing nothing.
 - **Regions**: AWS DevOps Agent is only available in some Regions. **If yours isn't one of them the stack does not fail** — this piece is silently skipped, everything else works, and `DeepInvestigationStatus` says it was skipped for that reason.
 - Changed your mind later: update the stack and flip the parameter.
@@ -223,7 +225,7 @@ The Notifications topic also has an **AWS Health Dashboard live view** that the 
 
 ## 3. What the stack creates
 
-**65 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 4 fewer with deep investigation off; 3 more if you pick multi-account):
+**66 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 5 fewer with deep investigation off; 3 more if you pick multi-account):
 
 | Category | Resources |
 |---|---|
@@ -235,7 +237,7 @@ The Notifications topic also has an **AWS Health Dashboard live view** that the 
 | Deployment helper | 1 staging bucket (for the staged artifacts) + 1 inline Lambda + 2 custom resources |
 | Permissions | 5 IAM roles + 5 inline policies |
 | Notifications inbox (see [§2.9](#29-notifications-inbox)) | **10 EventBridge rules** (5 ENABLED / 5 DISABLED) + 1 Lambda + its log group + 1 role (plus its policy) + 1 Lambda invoke permission = 15 |
-| Deep investigation (on by default) | 1 DevOps Agent agent space + 1 read-only association + 1 role assumed by DevOps Agent (plus its policy) |
+| Deep investigation (on by default) | 1 DevOps Agent agent space (**with its operator app enabled automatically**) + 1 read-only association + 1 role assumed by DevOps Agent (plus its policy) + 1 operator app role = 5 |
 | Web search (us-east-1 only) | 1 custom resource (creates the AgentCore gateway) + 1 gateway service role + 1 inline policy |
 | Multi-account (optional) | 1 custom resource (creates the two member StackSets) + 2 inline policies |
 
@@ -340,8 +342,23 @@ The `TeardownMode` parameter decides the fate of three things:
 | Everything else (frontend, CloudFront, Lambda, agent, **Cognito user pool**) | deleted | deleted |
 
 > ⚠️ **The Cognito user pool is deleted in both modes** — users and passwords are gone.
-> `KeepData` preserves **data**, not accounts. After redeploying you sign in again with a fresh
-> temporary password (your data is still there).
+> `KeepData` preserves **data**, not accounts.
+
+> ⚠️ **`KeepData` is not "keep it for next time"** — what it keeps will **block your next
+> deployment**. Those names are fixed (`notiops-config` / `notiops-web-chat` /
+> `notiops-data-…`), and CloudFormation runs a `NAME_CONFLICT_VALIDATION` pre-flight check
+> before it creates anything: if a resource with that name already exists, **the whole stack
+> fails** in about 9 seconds without creating a single resource (measured 2026-08-28; the error
+> is `Resource of type 'AWS::DynamoDB::Table' with identifier 'notiops-config' already
+> exists.`, and the console's Events tab only shows "Validation failed with 1 error(s)" — the
+> detail is only visible via `aws cloudformation describe-events`).
+> So `KeepData` is for **leaving the data in place so you can export it / keep it for
+> forensics**, not for carrying it into a redeployment:
+> - to **redeploy**: delete those three first (empty the bucket first), or just use
+>   `DeleteEverything` as described in §6.2 from the start;
+> - to **keep the data**: export it yourself before deleting (DynamoDB Export to S3 for the
+>   tables, `aws s3 sync` for the bucket) and import it back once the new stack is up. The
+>   stack has no way to adopt a pre-existing table.
 
 ### 6.2 ⚠️ To use `DeleteEverything`: update first, then delete
 
@@ -356,7 +373,7 @@ Getting the order wrong fails silently: the stack goes away, the tables and buck
 
 ### 6.3 Delete
 
-CloudFormation → select the stack → **Delete**. **Measured ~3m10s** (identical in both modes).
+CloudFormation → select the stack → **Delete**. **Measured**: `KeepData` ~**3m10s**; `DeleteEverything` ~**6m47s** (the extra time is emptying and deleting the two buckets and two tables). Don't expect `DeleteEverything` to finish in three minutes.
 
 During deletion the stack's deployment Lambda first **empties** the website and staging buckets (a non-empty bucket can't be deleted and would stall the whole delete), then honours `TeardownMode` for the two tables and the data bucket. Measured: **zero `DELETE_FAILED`** in both modes.
 
@@ -365,11 +382,11 @@ During deletion the stack's deployment Lambda first **empties** the website and 
 | Left behind | Why | Recommendation |
 |---|---|---|
 | Log group `/aws/vendedlogs/RUMService_<stack>-web-chat<hash>` | Created by CloudWatch RUM itself; not owned by the stack | **Fine to ignore**: measured at 0 bytes, expires after 30 days. To clean up, delete it in CloudWatch by its **full name** (don't bulk-delete by prefix) |
-| The two tables + data bucket under `KeepData` | That is what `KeepData` **means** | Delete manually when you're done with them (empty the bucket first) |
+| The two tables + data bucket under `KeepData` | That is what `KeepData` **means** | Delete manually when you're done with them (empty the bucket first). **You must delete them before you can redeploy into this account** — see the second warning in §6.1 |
 | CloudFront access logs, if you enabled them yourself | Not managed by this stack | As you like |
 | **In multi-account mode**: the `notiops-member-onboarding` / `notiops-member-devops-agent` StackSets, and Organizations trusted access for StackSets | **Deliberate.** (1) A StackSet can only be deleted once every stack instance is gone, and removing those wipes the cross-account roles in your member accounts — a cross-account destructive action shouldn't be triggered implicitly by deleting one stack. (2) Trusted access is an **organization-wide** switch; turning it off with our stack would break other people's StackSet deployments. | If you really want them gone: CloudFormation → StackSets → **Delete stacks from StackSet** (removes the instances), then delete the StackSet itself. Leave trusted access alone unless you're sure nobody else relies on it. |
 
-**No other orphans**: the agent's log group, the BFF's log group, the deployment Lambda's log group, IAM roles, the Cognito user pool, the RUM app monitor, the AgentCore Runtime, the website bucket and the staging bucket were all verified to go away with the stack. The agent space and association created for deep investigation also go away with it (they are ordinary stack resources). The web-search AgentCore gateway splits two ways: one **this stack created** is deleted with the stack; one it **reused** (a pre-existing `notiops-websearch-gw` in the account, e.g. from `setup.sh`) is left alone — deleting one stack shouldn't take down something another deployment path still uses.
+**No other orphans**: the agent's log group, the BFF's log group, the notification handler's log group, the deployment Lambda's log group, IAM roles, the Cognito user pool, the RUM app monitor, the AgentCore Runtime, the website bucket and the staging bucket were all verified to go away with the stack. The agent space and association created for deep investigation also go away with it (they are ordinary stack resources). The web-search AgentCore gateway splits two ways: one **this stack created** is deleted with the stack; one it **reused** (a pre-existing `notiops-websearch-gw` in the account, e.g. from `setup.sh`) is left alone — deleting one stack shouldn't take down something another deployment path still uses.
 
 ---
 

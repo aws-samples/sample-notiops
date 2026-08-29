@@ -162,7 +162,7 @@ CDK 部署三个栈,`./setup.sh` 走 `cdk deploy --all` 一次部到位。**Web 
 
 - **AWS 账号**:有 admin 或同等权限
 - **VPC**:任何能跑 ECS Fargate 的 VPC + ≥ 2 个 AZ 的 public subnet(**仅当你启用 IM bot 时需要** —— Fargate task 出公网调 IM API;只用 web 端可忽略)
-- **AWS DevOps Agent**:已开通(深度调查功能需要)。**无需自备 Agent Space** —— CDK 会在你账号下自动新建一个 `notiops-devops-<account>` space(详见 §5.3.4),你不用先手动创建或提供 space id
+- **AWS DevOps Agent**:已开通(深度调查功能需要)。**无需自备 Agent Space** —— CDK 会在你账号下自动新建一个 `notiops-devops-<account>` space(详见 §5.3.5),你不用先手动创建或提供 space id
 - **Bedrock**:模型目录里**默认模型**对应的 model 在你的 region 已 enable(Bedrock 控制台 → Model access)。当前默认是 **Claude Sonnet 5**(`global.anthropic.claude-sonnet-5`);想让用户能切别的(Claude Opus 5 / Haiku 4.5、Nova Pro、DeepSeek、GLM 5、Grok 4.6、GPT-5.6 系列)就把对应的一并 enable
 
 ### 2.3 Region 选择
@@ -277,7 +277,7 @@ CDK 部署不需要 `bootstrap.env` —— `./setup.sh` 第一次跑会**交互�
 | **Multi-account** | 业务账号白名单 | `--multi-account` 标志单独走;默认单账号 |
 | **IM 平台**(可选,默认跳过) | 选项 | `0` 暂不部署(默认,只上 web 端)/ `1` 飞书 / `2` Slack(可多选)。**只设 `enabledPlatforms` 开关,不问凭据** |
 
-> **Agent Space id 不是交互项** —— CDK 自动新建 `notiops-devops-<account>`(见 §5.3.4),你无需提供。
+> **Agent Space id 不是交互项** —— CDK 自动新建 `notiops-devops-<account>`(见 §5.3.5),你无需提供。
 
 ### 4.2 IM 凭据存哪 / 什么时候填
 
@@ -393,7 +393,15 @@ npx cdk diff --all
 | **跨账号 onboarding**(调查别的业务账号资源) | ✅ 影响 | 业务账号需要部署 `notiops-agent-trigger-<account_id>` IAM role + 在 NotiOps 这边的 DDB 注册业务账号(用 `./setup.sh --multi-account` 或控制台「账户接入」页) |
 | **AWS 原生服务 ReadOnly**(EC2 / RDS / Lambda / CloudWatch 等) | ❌ 不影响 | `AIDevOpsAgentAccessPolicy` 已自动授权,开箱即用 |
 
-#### 5.3.3 推荐的最小验证流程
+#### 5.3.3 Web 应用(Operator App)已自动开好 — 不需要手点
+
+控制台上那一步「Agent Space → Access → Operator access → **Configure web app**」(API 是 `aidevops:EnableOperatorApp`)**由 CDK 在建 space 的同时完成**,你不需要去点。为此栈里多了一个角色 `notiops-agent-webapp-<account_id>`(信任 `aidevops.amazonaws.com`、挂 AWS 托管策略 `AIDevOpsOperatorAppAccessPolicy`),删栈时随 space 一起关闭并删除。多账号模式下,成员账号那份 StackSet(`infra/member-devops-agent.yaml`)同样自动开 —— 否则接 N 个账号就要登进 N 个成员账号的控制台各点一次。
+
+**没开过它的症状**:发起调查 / 连接调查 / DevOps 对话 / 发布 Skill 一律报 `Invalid or unregistered domain`(错误信息完全不指向"少点了一个按钮")。现在还能撞上这个报错的只有两种 space:**本版本之前建的老 space**,和你**自己手工建的 space** —— 这两种进控制台点一次 Configure web app 即可。
+
+> ⚠️ **老部署升级到本版本时**(space 已存在、当初是在控制台手点开的 web app):模板里这条属性从"没有"变成"有",CloudFormation 会去 Enable 一次,而服务侧其实已经是 enabled。**这一情形尚未实测**(幂等 or 报冲突)。若 `NotiOpsBackendStack` 更新因此失败,先 `aws devops-agent disable-operator-app --agent-space-id <space id> --region <region>` 再重跑 `./setup.sh` —— web app 域名由 space id 派生,关掉重开**不会换 URL**。
+
+#### 5.3.4 推荐的最小验证流程
 
 ```bash
 # 1. 进 DevOps Agent Console,找你的新 space
@@ -408,7 +416,7 @@ npx cdk diff --all
 #    重复一次: console → 新 space → 重新 add
 ```
 
-#### 5.3.4 为什么不复用你已有的 space
+#### 5.3.5 为什么不复用你已有的 space
 
 CDK 模板默认 `CfnAgentSpace` 是 **CREATE 一个新的**,理由:
 
@@ -681,7 +689,7 @@ aws dynamodb delete-item --table-name <conv-table> \
 
 | context key | 默认 | 说明 |
 |---|---|---|
-| `agentSpaceId` | (自动) | DevOps Agent space id。**无需手动提供** —— CDK 自动新建 `notiops-devops-<account>`(见 §5.3.4);此 context 仅供高级覆盖 |
+| `agentSpaceId` | (自动) | DevOps Agent space id。**无需手动提供** —— CDK 自动新建 `notiops-devops-<account>`(见 §5.3.5);此 context 仅供高级覆盖 |
 | `devOpsAgentRegion` | `us-east-1` | DevOps Agent 服务所在 region(用于 IAM Resource ARN),目前只有 `us-east-1` |
 | `pushTargetChatIds` | `{}` | 每平台一个 chat id,留空 = Lambda short-circuit 不发卡 |
 | `enableCloudWatchAlarmPush` | `true` | CloudWatch alarm |

@@ -165,7 +165,7 @@ Credential flow: `setup.sh` **does not collect IM credentials** — it only sets
 
 - **AWS account**: admin or equivalent permissions
 - **VPC**: any VPC capable of running ECS Fargate + ≥ 2 AZs of public subnets (**only needed if you enable the IM bot** — Fargate tasks reach IM APIs over the public internet; ignore for web-only)
-- **AWS DevOps Agent**: enabled (required for deep investigation). **No need to bring your own Agent Space** — CDK auto-creates one named `notiops-devops-<account>` in your account (see §5.3.4); you don't pre-create one or supply a space id
+- **AWS DevOps Agent**: enabled (required for deep investigation). **No need to bring your own Agent Space** — CDK auto-creates one named `notiops-devops-<account>` in your account (see §5.3.5); you don't pre-create one or supply a space id
 - **Bedrock**: the model behind the catalogue's **default_model** is enabled in your region (Bedrock console → Model access). Today that is **Claude Sonnet 5** (`global.anthropic.claude-sonnet-5`); enable the others too (Claude Opus 5 / Haiku 4.5, Nova Pro, DeepSeek, GLM 5, Grok 4.6, the GPT-5.6 family) if you want users to be able to switch
 
 ### 2.3 Region selection
@@ -280,7 +280,7 @@ CDK deployment doesn't need `bootstrap.env` — `./setup.sh` walks you through t
 | **Multi-account** | Business account allowlist | Triggered separately via `--multi-account`; single-account by default |
 | **IM platforms** (optional, skipped by default) | Choice | `0` skip (default, web UI only) / `1` Feishu / `2` Slack (multi-select). **Only sets the `enabledPlatforms` flag — no credential prompt** |
 
-> **Agent Space id is not a prompt** — CDK auto-creates `notiops-devops-<account>` (see §5.3.4); you don't supply one.
+> **Agent Space id is not a prompt** — CDK auto-creates `notiops-devops-<account>` (see §5.3.5); you don't supply one.
 
 ### 4.2 Where IM credentials live / when you fill them
 
@@ -398,7 +398,15 @@ Walk through the list based on what your existing space has:
 | **Cross-account onboarding** (investigate resources in other business accounts) | ✅ Yes | Business accounts need a `notiops-agent-trigger-<account_id>` role deployed + a row registered in NotiOps's config DDB (use `./setup.sh --multi-account`, or the console "Account Onboarding" page) |
 | **AWS-native ReadOnly** (EC2 / RDS / Lambda / CloudWatch ...) | ❌ Not affected | `AIDevOpsAgentAccessPolicy` is auto-attached, ready out of the box |
 
-#### 5.3.3 Recommended minimal verification
+#### 5.3.3 The web app (operator app) is enabled automatically — nothing to click
+
+The console step "Agent Space → Access → Operator access → **Configure web app**" (the API is `aidevops:EnableOperatorApp`) is **done by CDK at the same time it creates the space**; you don't click it. That adds one role, `notiops-agent-webapp-<account_id>` (trusts `aidevops.amazonaws.com`, carries the AWS managed policy `AIDevOpsOperatorAppAccessPolicy`), disabled and deleted together with the space when you delete the stack. In multi-account mode the member-account StackSet (`infra/member-devops-agent.yaml`) enables it too — otherwise onboarding N accounts would mean signing into N member-account consoles and clicking once in each.
+
+**Symptom when it hasn't been enabled**: starting an investigation, connecting to one, DevOps Chat and publishing a skill all fail with `Invalid or unregistered domain` (an error that points nowhere near "you missed a button"). The only spaces that can still hit this are **spaces created before this version** and **spaces you created by hand** — for those, click Configure web app once in the console.
+
+> ⚠️ **Upgrading an existing deployment to this version** (the space already exists and its web app was enabled by hand in the console): this property goes from absent to present, so CloudFormation will call Enable once while the service already considers it enabled. **This case has not been tested yet** (idempotent, or a conflict?). If the `NotiOpsBackendStack` update fails because of it, run `aws devops-agent disable-operator-app --agent-space-id <space id> --region <region>` and re-run `./setup.sh` — the web app domain is derived from the space id, so disabling and re-enabling **does not change the URL**.
+
+#### 5.3.4 Recommended minimal verification
 
 ```bash
 # 1. Open the DevOps Agent Console, locate your new space
@@ -413,7 +421,7 @@ Walk through the list based on what your existing space has:
 #    repeat: console → new space → re-add each item
 ```
 
-#### 5.3.4 Why we don't reuse your existing space
+#### 5.3.5 Why we don't reuse your existing space
 
 The CDK template uses `CfnAgentSpace` to **create a new one**, by design:
 
@@ -688,7 +696,7 @@ All tunable parameters live under the `context` block in `infra/cdk.json`. After
 
 | context key | Default | Description |
 |---|---|---|
-| `agentSpaceId` | (auto) | DevOps Agent space id. **No need to supply one** — CDK auto-creates `notiops-devops-<account>` (see §5.3.4); this context is for advanced override only |
+| `agentSpaceId` | (auto) | DevOps Agent space id. **No need to supply one** — CDK auto-creates `notiops-devops-<account>` (see §5.3.5); this context is for advanced override only |
 | `devOpsAgentRegion` | `us-east-1` | Region of the DevOps Agent service (used in IAM Resource ARN); today `us-east-1` only |
 | `pushTargetChatIds` | `{}` | Per-platform target chat id; empty = Lambda short-circuits and posts no card |
 | `enableCloudWatchAlarmPush` | `true` | CloudWatch alarm |

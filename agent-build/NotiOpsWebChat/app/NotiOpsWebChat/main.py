@@ -957,6 +957,14 @@ def _progress_for_tool(name: str) -> str:
 
 _devops_tools = []
 
+# 调查结束后那个「🆘 转人工支持（AWS Support）」快捷按钮：**暂时隐藏**（2026-08-28）。
+# 只藏按钮，能力一点没动 —— escalate_to_support 工具照常注册、用户直接说
+# 「把这个转人工 / 帮我开个 case」照样能建案，BFF 侧 isEscalateRequest() 的分流也保留。
+# ⚠️ 想放回来必须**两处一起改**：这个按钮由两条路径各自发出，
+# 老（agent）路径在本文件，直连路径在 bff/web-chat/devops_investigate.mjs 的
+# SHOW_ESCALATE_FOLLOWUP —— 只改一处等于只藏一半。
+_SHOW_ESCALATE_FOLLOWUP = False
+
 @tool
 def start_investigation(title: str, description: str) -> dict:
     """Start a DEEP AWS DevOps Agent investigation (async; returns task/execution id immediately).
@@ -1032,8 +1040,9 @@ def get_investigation_result(execution_id: str) -> dict:
                     "🛠️ Generate a mitigation plan in the DevOps Agent console "
                     "(open, then switch to the Root cause tab)")),
                 "url": _console})
-        _fups.append({"label": _dv("🆘 转人工支持（AWS Support）", "🆘 Escalate to human support (AWS Support)"),
-                      "prompt": _esc_prompt})
+        if _SHOW_ESCALATE_FOLLOWUP:
+            _fups.append({"label": _dv("🆘 转人工支持（AWS Support）", "🆘 Escalate to human support (AWS Support)"),
+                          "prompt": _esc_prompt})
         _add_followups(_fups)
     return res
 _devops_tools.append(get_investigation_result)
@@ -1343,9 +1352,11 @@ async def investigate_live(title: str, description: str):
                     "🛠️ Generate a mitigation plan in the DevOps Agent console "
                     "(open, then switch to the Root cause tab)")),
                 "url": console_url})
-        _fups.append({"label": _dv("🆘 转人工支持（AWS Support）", "🆘 Escalate to human support (AWS Support)"),
-                      "prompt": _esc_prompt})
-        yield {"followups": _fups}
+        if _SHOW_ESCALATE_FOLLOWUP:
+            _fups.append({"label": _dv("🆘 转人工支持（AWS Support）", "🆘 Escalate to human support (AWS Support)"),
+                          "prompt": _esc_prompt})
+        if _fups:
+            yield {"followups": _fups}
     else:
         yield _dv("\n\n调查结束，但暂未取到摘要内容。可稍后再查。\n",
                   "\n\nThe investigation finished, but no summary was available yet. You can check again shortly.\n")

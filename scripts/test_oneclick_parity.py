@@ -11,10 +11,12 @@
     ③ 部署时往 DynamoDB 写了哪些出厂数据（模型目录等）
     ④ runtime 的生命周期设置（保温多久 / 最长活多久）
     ⑤ 「通知」生产端（AWS 事件 → Web 收件箱）建没建、订了哪些事件源
+    ⑥ 建 Agent Space 时有没有把 Operator App（web app）一并开好
 
 ①②④ 是运行期行为，③ 是部署期数据 —— 三者在两条路径上各写了一份，没有任何一处能
 import 另一处；⑤ 反过来：它现在**只有一份**，两个栈 import 同一个模块，本文件断言的
-是「没有人把它抄回栈里」（见那一节的注释）。
+是「没有人把它抄回栈里」（见那一节的注释）。⑥ 比前五条还多一条路径：成员账号那份
+StackSet payload（`infra/member-devops-agent.yaml`）也自己建 space，三处都得开。
 
     ① 方式 B：agent-build/NotiOpsWebChat/agentcore/cdk/lib/cdk-stack.ts 的 NotiOps 段
        方式 A：infra/lib/notiops-webchat-standalone-stack.ts 的 AgentCore Runtime 段
@@ -29,6 +31,9 @@ import 另一处；⑤ 反过来：它现在**只有一份**，两个栈 import 
        方式 B：notiops-backend-stack.ts 建 Lambda（复用 IM push 的 asset）+ 10 条规则
        方式 A：notiops-webchat-standalone-stack.ts 建 Lambda（代码走 web-notif.zip 产物）
        + 10 条规则
+    ⑥ 方式 B：notiops-backend-stack.ts 的 DevOpsAgentSpace 段
+       方式 A：notiops-webchat-standalone-stack.ts 的 DevOpsAgentSpace 段
+       成员账号：infra/member-devops-agent.yaml 的 AgentSpace 资源
 
 漂移的后果**不是**「功能没做」，而是「界面上有开关、点了静默失败」——
 UI 上那些开关（联网搜索 / FinOps / 深度调查）绝大多数是**无条件**渲染的
@@ -549,6 +554,74 @@ def test_web_notif_producer_parity() -> None:
            "webNotif${src.id}" in _read(SETUP_BACKEND) or "`webNotif${src.id}`" in _read(SETUP_BACKEND))
 
 
+# ⑥ Operator App（控制台上那一步叫「Agent Space → Access → Operator access →
+# Configure web app」，API 是 aidevops:EnableOperatorApp）。
+#
+# 为什么这条要有断言：**不开它，四样 DevOps Agent 能力全废，而失败信息毫不指向这里**。
+# 没开过 web app 的 space 没有 `https://<spaceId>.aidevops.global.app.aws` 域名，
+# CreateBacklogTask / CreateChat 一律回 `Invalid or unregistered domain` ——
+# 深度调查、深度调查（直连）、DevOps 对话、发布 Skill 一起挂。以前的补救是让客户
+# 登控制台手点一次；现在三条路径都在建 space 的同时把它开好。
+#
+# 比前五条多的那条路径：成员账号。多账号客户要点 N 次（每个成员账号自己的控制台里点
+# 一次），所以 `infra/member-devops-agent.yaml` 漏掉的代价最大 —— 它也最容易被漏，
+# 因为它既不是方式 A 也不是方式 B。
+MEMBER_DA_YAML = "infra/member-devops-agent.yaml"
+
+#: 那个角色的三件必需品。少任一件的症状都是**部署成功、功能报错**：
+#:   · session tag（`sts:TagSession`）—— AIDevOpsOperatorAppAccessPolicy 把资源写成
+#:     `agentspace/${aws:PrincipalTag/AgentSpaceId}`，session tag 就是授权依据；
+#:     少了它 EnableOperatorApp 本身能过，web app 起来后一切 aidevops 调用被拒。
+#:   · aidevops.amazonaws.com 信任 —— 服务 assume 不进来。
+#:   · AIDevOpsOperatorAppAccessPolicy —— 权限从哪来。
+#: 前两件在两种源码里长得不一样：CDK 侧的 session tag 是 `.withSessionTags()`
+#: （TS 里**不会**出现 `sts:TagSession` 这个字面量 —— 按字面量断言等于永远失败），
+#: raw CFN 侧才是信任策略里的那个 action 字面量。
+_OPERATOR_ROLE_MUSTS_TS = (".withSessionTags()", "aidevops.amazonaws.com",
+                           "AIDevOpsOperatorAppAccessPolicy")
+_OPERATOR_ROLE_MUSTS_CFN = ("sts:TagSession", "aidevops.amazonaws.com",
+                            "AIDevOpsOperatorAppAccessPolicy")
+
+
+def test_operator_app_enabled_everywhere() -> None:
+    """凡是建 Agent Space 的地方，都必须同时把 Operator App 开好。"""
+    print("\ntest_operator_app_enabled_everywhere")
+
+    # 两个 TS 栈：CDK 属性名是 camelCase 的 `operatorApp: { iam: { operatorAppRoleArn }}`。
+    for rel in (ONECLICK, SETUP_BACKEND):
+        src = _strip_comments(_read(rel))
+        name = os.path.basename(rel)
+        _check(f"{name} 建 space 时开了 Operator App",
+               re.search(r"operatorApp:\s*\{\s*iam:\s*\{", src) is not None,
+               "CfnAgentSpace 少了 `operatorApp: { iam: { operatorAppRoleArn: … } }` —— "
+               "客户部署完还得自己登控制台点一次 Configure web app，不点则深度调查/直连/"
+               "DevOps 对话/发布 Skill 全报 `Invalid or unregistered domain`。")
+        _check(f"{name} 传的是自己建的 Operator App 角色",
+               "operatorAppRoleArn:" in src and "DevOpsAgentOperatorAppRole" in src,
+               "角色 ARN 不是本栈里那个 DevOpsAgentOperatorAppRole —— 硬编码/外部传入的 ARN "
+               "会让删栈留下悬空引用，也无法保证下面那三件必需品。")
+        for must in _OPERATOR_ROLE_MUSTS_TS:
+            _check(f"{name} 的 Operator App 角色带 {must}", must in src,
+                   "见本节注释：这三件少任一件都是「部署成功、功能报错」。"
+                   "注意 sts:TagSession 在 CDK 侧就是 `.withSessionTags()` —— 别改成手写 "
+                   "`addPropertyOverride(\"AssumeRolePolicyDocument.Statement.0.Action\")`，"
+                   "那个依赖语句下标，CDK 换了顺序就静默失效。")
+
+    # 成员账号那份 raw CFN：属性名是 PascalCase。
+    member = _read(MEMBER_DA_YAML)
+    _check("成员账号 StackSet 建 space 时开了 Operator App",
+           re.search(r"OperatorApp:\s*\n\s*Iam:\s*\n\s*OperatorAppRoleArn:", member) is not None,
+           "多账号客户要为每个成员账号登进它自己的控制台点一次 —— 这是三条路径里漏掉代价最大的一条。")
+    for must in _OPERATOR_ROLE_MUSTS_CFN:
+        _check(f"member-devops-agent.yaml 的 Operator App 角色带 {must}", must in member)
+    # 成员账号里可能同时存在一套**独立 NotiOps 部署**（无 -m 后缀的同名角色）。
+    # 后缀是共存的前提，不是风格问题。
+    _check("成员账号的角色名带 -m<SystemAccountId> 后缀",
+           re.search(r"RoleName:\s*!Sub\s*\"notiops-agent-webapp-\$\{AWS::AccountId\}-m\$\{SystemAccountId\}\"",
+                     member) is not None,
+           "少了后缀会和成员账号内自建的 NotiOps 部署撞名，StackSet 实例直接 CREATE_FAILED。")
+
+
 def main() -> int:
     print("=" * 72)
     print("方式 A（一键部署）与方式 B（setup.sh）的 web 功能一致性")
@@ -559,6 +632,7 @@ def main() -> int:
         test_deploy_time_seeds_match()
         test_runtime_lifecycle_matches()
         test_web_notif_producer_parity()
+        test_operator_app_enabled_everywhere()
     except AssertionError as e:
         # 提取器找不到目标 = 有人改了源码的形态。必须失败而不是静默通过 ——
         # 静默通过的断言比没有断言更糟：它让人以为这件事有人守着。

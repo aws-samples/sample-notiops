@@ -42,8 +42,15 @@ def _safe_err(e: Exception) -> str:
 
 
 def _is_unregistered_domain(e: Exception) -> bool:
-    """服务端在 Web 应用域名未在 DevOps Agent 控制台『Configure web app』注册时，
-    create_backlog_task 会返回 "Invalid or unregistered domain"。这里仅【就地分类】该错误
+    """space 没开过 Operator App（web app）时，create_backlog_task 会返回
+    "Invalid or unregistered domain"。
+
+    ⚠️ 这条路径现在是**兜底**：两条部署路径与成员账号 StackSet 都在建 space 的同时调
+    EnableOperatorApp 把它开好了（见 infra/lib/notiops-backend-stack.ts、
+    infra/lib/notiops-webchat-standalone-stack.ts、infra/member-devops-agent.yaml）。
+    还能撞上它的只有两种 space：本版本之前建的老 space，和客户自己手工建的 space。
+
+    这里仅【就地分类】该错误
     以便给出可操作提示——不返回、不记录原始 message（遵守 docs/LOGGING_STANDARD.md：
     原文可能含请求负载/用户数据）。判定后调用方只输出固定的引导文案。"""
     resp = getattr(e, "response", None)
@@ -229,10 +236,11 @@ def start_investigation(title: str, description: str, account_id: str | None = N
         if _is_unregistered_domain(e):
             logger.warning("devops_agent start failed: unregistered_domain")
             return {"error": "unregistered_domain",
-                    "message": ("DevOps Agent 尚未注册本 Web 应用域名，暂时无法发起调查。"
-                                "请到 DevOps Agent 控制台（https://console.aws.amazon.com/aidevops/home#/agent-spaces）"
-                                "→ 你的 space → Configure web app，把本 Web Chat 的域名登记为允许的 web app 域名后重试。"
-                                "（详见 docs/DEPLOYMENT.md §5.3。）")}
+                    "message": ("这个 Agent Space 还没开启 Web 应用（Operator App），暂时无法发起调查。"
+                                "新部署会自动开好，所以你多半用的是旧 space 或手工建的 space。"
+                                "去 DevOps Agent 控制台（https://console.aws.amazon.com/aidevops/home#/agent-spaces）"
+                                "→ 你的 space → Access → Configure web app 点一次即可。"
+                                "（详见 docs/DEPLOYMENT.md §5.3.3。）")}
         logger.warning("devops_agent start failed: %s", _safe_err(e))
         return {"error": "start_failed", "message": f"发起调查失败：{_safe_err(e)}"}
 

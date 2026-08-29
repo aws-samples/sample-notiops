@@ -110,7 +110,7 @@ notiops-webchat.template.json
 | **On stack delete** | `KeepData` | 决定删栈时你的数据怎么办。见 [§6 删除](#6-删除这个栈)——**改这个值有个坑，删栈前先读那一节**。 |
 | **Deployment mode** | `SingleAccount` | 想让它同时看组织里**其它**账号，就选 `MultiAccount` 并填下面的 org id。有前置条件，见 [§2.6](#26-可选多账号组织内跨账号)。 |
 | **AWS Organizations id (MultiAccount only)** | 空 | 只有选了 `MultiAccount` 才填（`o-` 开头）。**只填一半不生效**（选了 MultiAccount 但 org id 留空 = 仍是单账号），Outputs 的 `DeployModeStatus` 会告诉你。 |
-| **Enable deep investigation (AWS DevOps Agent)?** | `Yes` | 见 [§2.7](#27-深度调查aws-devops-agent)。闲置不计费，所以默认开着；不想要就选 `No`。 |
+| **Enable AWS DevOps Agent features (deep investigation, DevOps Chat)?** | `Yes` | 一个开关管**四样**能力，见 [§2.7](#27-深度调查aws-devops-agent)。闲置不计费，所以默认开着；不想要就选 `No`（那四样会置灰）。 |
 | **Artifact base URL override** / **Artifact mirror bucket name (s3:// only)** | 空 | 只有拿不到 GitHub 时才填，见 [§7](#7-无公网出口用私有-s3-镜像)。 |
 
 ### 2.4 勾 IAM 确认框，开栈
@@ -171,7 +171,7 @@ notiops-webchat.template.json
 
 ### 2.7 深度调查（AWS DevOps Agent）
 
-**Enable deep investigation** 默认 `Yes`：栈会顺手建一个 **AWS DevOps Agent Agent Space**（名字 `notiops-oneclick-<账号 id>`）并把本账号以 **monitor（只读）** 身份关联进去。有了它，聊天界面里**所有 DevOps Agent 相关能力**才能用 —— 那是把一个问题交给 AWS 托管的 DevOps Agent 去多轮自主排查，比一次问答挖得深。
+**Enable AWS DevOps Agent features**（模板里的参数名仍是 `EnableDeepInvestigation`）默认 `Yes`：栈会顺手建一个 **AWS DevOps Agent Agent Space**（名字 `notiops-oneclick-<账号 id>`）并把本账号以 **monitor（只读）** 身份关联进去。有了它，聊天界面里**所有 DevOps Agent 相关能力**才能用 —— 那是把一个问题交给 AWS 托管的 DevOps Agent 去多轮自主排查，比一次问答挖得深。
 
 具体是这四样，都依赖这同一个 Agent Space（没有它，对应的开关会**置灰并写清原因**）：
 
@@ -184,6 +184,8 @@ notiops-webchat.template.json
 
 > 💡 后两样对**还没在 Bedrock 开通模型**的新部署特别有用：选 DevOps Agent 直答就能先跑起来。
 
+- **不用你去控制台点任何东西**：建 Agent Space 的同时，栈把它的 **Operator App（web app）**一并开好了（控制台上那一步叫「Agent Space → Access → Operator access → **Configure web app**」）。这一步以前必须客户自己手点一次，不点则上面四样**全部**报 `Invalid or unregistered domain` —— 而报错信息完全不指向"你少点了一个按钮"。现在栈替你开：多一个被 DevOps Agent 服务假设的角色（`AIDevOpsOperatorAppAccessPolicy`），删栈时随栈关闭并删除。
+  > ⚠️ **只影响从旧版本升级**（[§5](#5-升级到新版本)）：如果你之前用旧版本开的栈、并且**自己在控制台点过** Configure web app，这次 update 会让 CloudFormation 再 Enable 一次，而服务侧已经是 enabled。**这一情形尚未实测**。真因此 update 失败：先 `aws devops-agent disable-operator-app --agent-space-id <space id> --region <region>`（space id 见 Outputs 的 `DevOpsAgentSpaceId`）再 update —— web app 域名由 space id 派生，关掉重开**不换 URL**。全新部署没有这个问题。
 - **计费**：按**任务运行的 agent-秒**收费，**闲置的 Agent Space 不收费**。所以默认开着不会给你带来一笔"什么都没做的月费"。
 - **区域**：AWS DevOps Agent 只在部分区域可用。**你选的区域没有它，栈不会失败** —— 这一块被静默跳过，其余功能全在，Outputs 的 `DeepInvestigationStatus` 会写明"因为区域跳过"。
 - 事后想改主意：update 栈、把这个参数改掉即可。
@@ -225,7 +227,7 @@ notiops-webchat.template.json
 
 ## 3. 这个栈建了什么
 
-默认参数下 **65 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 4 个；选上多账号多 3 个）：
+默认参数下 **66 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 5 个；选上多账号多 3 个）：
 
 | 类别 | 资源 |
 |---|---|
@@ -237,7 +239,7 @@ notiops-webchat.template.json
 | 部署辅助 | 1 个 staging 桶（放搬进来的产物）+ 1 个内联的部署 Lambda + 2 个自定义资源 |
 | 权限 | 5 个 IAM 角色 + 5 个内联策略 |
 | 「通知」收件箱（见 [§2.9](#29-通知收件箱)） | **10 条 EventBridge 规则**（5 条 ENABLED / 5 条 DISABLED）+ 1 个 Lambda + 它的日志组 + 1 个角色（+ 策略）+ 1 条 Lambda 调用许可 = 15 个 |
-| 深度调查（默认开） | 1 个 DevOps Agent Agent Space + 1 个只读关联 + 1 个被 DevOps Agent 假设的角色（+ 它的策略） |
+| 深度调查（默认开） | 1 个 DevOps Agent Agent Space（**含自动开好的 Operator App**）+ 1 个只读关联 + 1 个被 DevOps Agent 假设的角色（+ 它的策略）+ 1 个 Operator App 角色 = 5 个 |
 | 联网搜索（仅 us-east-1） | 1 个自定义资源（去建 AgentCore Gateway）+ 1 个 Gateway 服务角色 + 1 个内联策略 |
 | 多账号（可选） | 1 个自定义资源（去建两个成员账号 StackSet）+ 2 个内联策略 |
 
@@ -345,7 +347,20 @@ aws cloudformation create-stack --stack-name notiops \
 | 其他一切（前端、CloudFront、Lambda、agent、**Cognito 用户池**） | 删除 | 删除 |
 
 > ⚠️ **两种模式下 Cognito 用户池都会被删除** —— 也就是用户和密码都没了。`KeepData` 保的是
-> **数据**，不是账号。重新部署后需要用新收到的临时密码重新登录（数据还在）。
+> **数据**，不是账号。
+
+> ⚠️ **`KeepData` 不是"留着下次接着用"** —— 保留下来的表和桶会**挡住下一次部署**。
+> 表名和桶名是固定的（`notiops-config` / `notiops-web-chat` / `notiops-data-…`），而
+> CloudFormation 建栈前会做 `NAME_CONFLICT_VALIDATION` 预检：同名资源已存在就**整栈失败**，
+> 约 9 秒，一个资源都不建（2026-08-28 实测，报错是
+> `Resource of type 'AWS::DynamoDB::Table' with identifier 'notiops-config' already exists.`；
+> 控制台的 Events 里只有一句 "Validation failed with 1 error(s)"，细节得用
+> `aws cloudformation describe-events` 才看得到）。
+> 所以 `KeepData` 的用途是**留一份数据在原地供你导出/取证**，不是给重新部署续命：
+> - 想**重新部署**：先把这三样删掉（桶要先清空），或者干脆一开始就走 §6.2 的
+>   `DeleteEverything`；
+> - 想**保住数据**：删栈前先自己导出（表用 DynamoDB 的 Export to S3，桶用 `aws s3 sync`），
+>   新栈起来后再导回去。栈本身没有"接管已存在的表"这种能力。
 
 ### 6.2 ⚠️ 想用 `DeleteEverything`：必须先 update，再 delete
 
@@ -360,7 +375,7 @@ CloudFormation 在删栈时交给自定义资源的是**上一次成功部署时
 
 ### 6.3 删除
 
-CloudFormation → 选中栈 → **Delete**。**实测 ~3 分 10 秒**（两种模式都一样）。
+CloudFormation → 选中栈 → **Delete**。**实测**：`KeepData` ~**3 分 10 秒**；`DeleteEverything` ~**6 分 47 秒**（多出来的是清空并删掉两个桶 + 两张表那一段）。别照着 3 分钟的预期去等 `DeleteEverything`。
 
 删栈过程中，栈里的部署 Lambda 会先把网站桶和 staging 桶**清空**（非空的桶删不掉，会把整个删栈卡住），然后按 `TeardownMode` 决定要不要删那两张表和数据桶。实测两种模式都是**零 `DELETE_FAILED`**。
 
@@ -369,11 +384,11 @@ CloudFormation → 选中栈 → **Delete**。**实测 ~3 分 10 秒**（两种�
 | 留下的 | 为什么 | 建议 |
 |---|---|---|
 | `/aws/vendedlogs/RUMService_<栈名>-web-chat<hash>` 日志组 | CloudWatch RUM 自己建的，不属于这个栈 | **可以不管**：实测 0 字节，30 天后自动过期。想清就在 CloudWatch 里按这个**完整名字**删（别按前缀批量删） |
-| `KeepData` 下的两张表 + 数据桶 | 这是 `KeepData` 的**本意** | 不再用了就手工删（桶要先清空） |
+| `KeepData` 下的两张表 + 数据桶 | 这是 `KeepData` 的**本意** | 不再用了就手工删（桶要先清空）。**想在这个账号里重新部署就必须先删** —— 见 §6.1 的第二条警告 |
 | CloudFront 的访问日志（如果你自己开过） | 不由这个栈管理 | 按需 |
 | **多账号模式下**：`notiops-member-onboarding` / `notiops-member-devops-agent` 两个 StackSet，以及 Organizations 对 StackSets 的信任访问 | **故意留的。** ① StackSet 要先删掉全部 stack instance 才删得掉，而那等于抹掉各成员账号里的跨账号角色 —— 这种跨账号的破坏性动作不该由"删一个栈"隐式触发；② 信任访问是**组织级**开关，删我们的栈就把它关掉会打断组织里别人的 StackSets 部署。 | 确实不要了：先在 CloudFormation → StackSets 里 **Delete stacks from StackSet**（删实例），再删 StackSet 本身。信任访问除非你确认没别人在用，否则别关。 |
 
-**没有**其他孤儿：agent 的日志组、BFF 的日志组、部署 Lambda 的日志组、IAM 角色、Cognito 用户池、RUM app monitor、AgentCore Runtime、网站桶、staging 桶 —— 实测全部随栈删除。深度调查建的 Agent Space 与关联也随栈删除（它是栈里的普通资源）。联网搜索的 AgentCore Gateway 分两种：**这个栈建出来的**随栈删除；**它复用的别人的**（同账号里已经存在的 `notiops-websearch-gw`，比如 `setup.sh` 建的）留着不动 —— 删一个栈不该顺手拆掉另一条部署路径还在用的东西。
+**没有**其他孤儿：agent 的日志组、BFF 的日志组、「通知」函数的日志组、部署 Lambda 的日志组、IAM 角色、Cognito 用户池、RUM app monitor、AgentCore Runtime、网站桶、staging 桶 —— 实测全部随栈删除。深度调查建的 Agent Space 与关联也随栈删除（它是栈里的普通资源）。联网搜索的 AgentCore Gateway 分两种：**这个栈建出来的**随栈删除；**它复用的别人的**（同账号里已经存在的 `notiops-websearch-gw`，比如 `setup.sh` 建的）留着不动 —— 删一个栈不该顺手拆掉另一条部署路径还在用的东西。
 
 ---
 

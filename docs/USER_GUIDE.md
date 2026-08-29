@@ -731,8 +731,10 @@ bot 在飞书 / Slack 上完整可用的功能,在钉钉上**当前处于分阶�
 
 **(B) 持久化收件箱(红点来源)**
 - 收件箱汇总来自多个事件源的通知(经 EventBridge 采集、5 分钟去重后写入):
-  - **默认开启**:CloudWatch Alarm、AWS Health、AWS Backup
-  - **默认关闭**(需管理员开启):GuardDuty、Cost Anomaly、Trusted Advisor、RDS、Config
+  - **默认开启**(5 类,运维价值最高、噪音可控):AWS Health、CloudWatch Alarm、Cost Anomaly、Trusted Advisor、GuardDuty
+    - 其中 GuardDuty / Cost Anomaly / Trusted Advisor 要你**先启用对应的服务**(GuardDuty detector、成本异常监控器、Business+ 支持计划)才会真的有事件流进来。没启用时规则处于「开着但收不到」的状态 —— 无害、零成本,你哪天启用了立刻生效,不用回来改部署。
+  - **默认关闭**(5 类,要么量大易刷屏、要么噪音高):AWS Backup、EC2 Spot 中断预警、Auto Scaling 启动失败、RDS、Config
+    - 怎么打开:`setup.sh` 路径在部署时加 `-c webNotifBackupJob=on`(id 见 [DEPLOYMENT.md](DEPLOYMENT.md));一键部署路径去 EventBridge 控制台把 `notiops-web-notif-backupjob` 这条规则 **Enable** 即可。
 - 通知在收件箱**保留约 90 天**(TTL),按账号级共享。
 - **左侧红点** = 收件箱**未读数**,前端每 **60 秒轮询**一次刷新(注意:是轮询,不是实时 WebSocket 推送)。Health Dashboard 的未处理数**不计入**红点。
 - **每张通知卡上的操作**:**深入调查**(把这条通知作为起点,转到调查主题发起 DevOps Agent 深度调查)/ **就此提问**(围绕这条通知继续对话)/ **控制台链接**(跳 AWS 控制台看原始事件)。

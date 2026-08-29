@@ -192,15 +192,21 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // 深度调查（AWS DevOps Agent）—— 要在本账号建一个 Agent Space。
     // 给开关而不是一律建：DevOps Agent 只在部分区域可用，且它是**另一个计费服务**
     // （按 agent-second 计费；空 Agent Space 不产生费用，但客户仍有权选择不建）。
+    // 参数名留作 EnableDeepInvestigation（改名会让已部署的栈更新时丢值），但它现在
+    // 是**全部四项** DevOps Agent 能力的总闸 —— 描述里必须说清，否则客户以为关掉它
+    // 只是少一个「深度调查」，实际连「DevOps 对话」也一起没了（置灰、不报错）。
     const enableDeepInvestigation = new cdk.CfnParameter(this, "EnableDeepInvestigation", {
       type: "String",
       default: "Yes",
       allowedValues: ["Yes", "No"],
       description:
-        "Create an AWS DevOps Agent Agent Space so the assistant can run deep root-cause " +
-        "investigations. Billed per agent-second only while an investigation runs; an idle " +
-        "Agent Space costs nothing. Silently skipped in Regions where AWS DevOps Agent is not " +
-        "available yet -- the stack still deploys and everything else works.",
+        "Create an AWS DevOps Agent Agent Space. One Agent Space powers every DevOps Agent " +
+        "capability in the chat: deep root-cause investigation, its token-free Direct variant, " +
+        "DevOps Chat (your own agent answers a general chat directly), and publishing a Skill " +
+        "to DevOps Agent. Choose No and all four stay greyed out. Billed per agent-second only " +
+        "while your agent is working; an idle Agent Space costs nothing. Silently skipped in " +
+        "Regions where AWS DevOps Agent is not available yet -- the stack still deploys and " +
+        "everything else works.",
     });
 
     // ── 单账号 / 多账号 ──
@@ -252,7 +258,11 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           [adminEmail.logicalId]: { default: "Administrator email" },
           [deployMode.logicalId]: { default: "Deployment mode" },
           [organizationId.logicalId]: { default: "AWS Organizations id (MultiAccount only)" },
-          [enableDeepInvestigation.logicalId]: { default: "Enable deep investigation (AWS DevOps Agent)?" },
+          // 标签只影响控制台显示（不是改参数名，栈更新不会丢值）—— 写成「所有
+          // AWS DevOps Agent 能力」，因为 v1.0.16 起它管的不只是「深度调查」。
+          [enableDeepInvestigation.logicalId]: {
+            default: "Enable AWS DevOps Agent features (deep investigation, DevOps Chat)?",
+          },
           [agentReadOnlyAccess.logicalId]: { default: "Give the agent account-wide read-only access?" },
           [allowedOrigins.logicalId]: { default: "CORS allowed origins" },
           [teardownMode.logicalId]: { default: "On stack delete" },
@@ -590,9 +600,45 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     //   · PrimaryRole **不指定 roleName**（交给 CFN 生成）：同理，固定名会和
     //     `notiops-agent-primary-<account>` 撞。角色名没有任何东西按字面引用它。
     const devopsAgent = require("aws-cdk-lib/aws-devopsagent");
+
+    // Operator App(web app)的角色。这一条替客户免掉了控制台上的
+    // 「Agent Space → Access → Operator access → Configure web app」那一次手点 ——
+    // 没点过的话 `https://<spaceId>.aidevops.global.app.aws` 域名不存在，
+    // CreateBacklogTask / CreateChat 一律报 `Invalid or unregistered domain`，
+    // 四样 DevOps Agent 能力(深度调查、直连、DevOps 对话、发布 Skill)全废。
+    //
+    // 形状是从控制台自己建的那个角色反推来的(两个账号各取一份、逐字段一致)：
+    //   · `sts:TagSession` **不能省** —— AIDevOpsOperatorAppAccessPolicy 把资源写成
+    //     `agentspace/${aws:PrincipalTag/AgentSpaceId}`，session tag 就是它的授权依据，
+    //     少了这条动作，web app 一开就是 AccessDenied。
+    //   · `ArnLike .../agentspace/*` 而**不是**控制台那样的 `ArnEquals <精确 ARN>`：
+    //     精确 ARN 会让角色引用 space、space 引用角色，CFN 直接判循环依赖。收口靠
+    //     `aws:SourceAccount` + 服务/区域前缀，与上面 daPrimaryRole 同一套写法。
+    //   · 不指定 roleName：同 daPrimaryRole，固定名会挡住同账号里的第二个栈。
+    //
+    // 权限范围值得说清楚(客户安全 review 会问)：该托管策略的主体是 `aidevops:*` 且
+    // 收口在本账号自己的那一个 agentspace 上，**碰不到客户其它资源**；另有三条
+    // Resource:* 的旁支(support 读、transcribe 流、secretsmanager:CreateSecret)——
+    // 最后一条是写权限。这个角色只被 aidevops 服务用于它自己的 web app，不是 agent
+    // 用的角色；且与客户手点那个按钮建出来的角色**完全一致**，自动化没有让姿态变差。
+    const daOperatorAppRole = new iam.Role(this, "DevOpsAgentOperatorAppRole", {
+      assumedBy: new iam.ServicePrincipal("aidevops.amazonaws.com", {
+        conditions: {
+          StringEquals: { "aws:SourceAccount": cdk.Aws.ACCOUNT_ID },
+          ArnLike: { "aws:SourceArn": `arn:${this.partition}:aidevops:${this.region}:${this.account}:agentspace/*` },
+        },
+      }).withSessionTags(),  // ← 这就是那条 sts:TagSession
+      description: "Assumed by AWS DevOps Agent for its per-Agent-Space operator web app",
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName("AIDevOpsOperatorAppAccessPolicy")],
+    });
+
     const agentSpace = new devopsAgent.CfnAgentSpace(this, "DevOpsAgentSpace", {
       name: `notiops-oneclick-${cdk.Aws.ACCOUNT_ID}`,
       description: "NotiOps deep investigation (one-click deployment)",
+      // 建 space 的同时把 web app 开好(CFN 的 create handler 替我们调
+      // aidevops:EnableOperatorApp，delete handler 调 DisableOperatorApp —— 删栈自动收尾)。
+      // 只走 `iam` 认证流：我们的 BFF 是 SigV4 直连；IdC / IdP 是客户自己的选择，不替他们定。
+      operatorApp: { iam: { operatorAppRoleArn: daOperatorAppRole.roleArn } },
     });
     agentSpace.cfnOptions.condition = deepInvestigationEnabled;
 
@@ -625,6 +671,9 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       if (inlinePolicy) (inlinePolicy as cdk.CfnResource).cfnOptions.condition = condition;
     };
     applyCondition(daPrimaryRole, deepInvestigationEnabled);
+    // Operator App 角色同理 —— 它没有内联策略（只挂托管策略），helper 里的
+    // tryFindChild("DefaultPolicy") 拿不到东西就跳过，不用特殊照顾。
+    applyCondition(daOperatorAppRole, deepInvestigationEnabled);
 
     const daAssociation = new devopsAgent.CfnAssociation(this, "DevOpsAgentAssociation", {
       agentSpaceId: agentSpace.attrAgentSpaceId,
@@ -1035,12 +1084,18 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // 「怎么关掉某一个源」：方式 B 是合成期 `-c webNotif<Id>=off`，这里没有 context
     // （模板是预先合成发布的），客户去 EventBridge 控制台 Disable 那条规则即可 ——
     // 升级模板不会把它改回来，因为规则属性本身不随版本变化，CFN 判定为无变更。
+    // 日志组**不写死名字**，而是让 CFN 自己命名、再用 LoggingConfig 把函数指过来
+    // （同 BFF 的做法）。写死 `/aws/lambda/<函数名>` 的代价是致命的：Lambda 服务
+    // 自己建的那种同名组**不属于任何栈**（方式 B 就是这样留下的），于是同一个账号里
+    // 只要曾经跑过 setup.sh，一键部署就在 CFN 的 NAME_CONFLICT_VALIDATION 上
+    // **9 秒内整栈失败**："Resource of type 'AWS::Logs::LogGroup' with identifier
+    // '/aws/lambda/notiops-web-notif-handler' already exists."（2026-08-28 实测，
+    // v1.0.16 模板；错误里只有日志组，客户完全看不出这跟「通知」有什么关系。）
+    // LoggingConfig 一并解决了原先写死名字要解决的那件事：函数只会往这个组里写，
+    // 不会再在首次调用时自建一个同名组。
     const webNotifLogs = new logs.LogGroup(this, "WebNotifLogs", {
-      logGroupName: `/aws/lambda/${WEB_NOTIF_FUNCTION_NAME}`,
       retention: logs.RetentionDays.TWO_WEEKS,
-      // 栈内资源 → 删栈一并删掉。同 StagerLogs：必须**先**于函数建好，否则 Lambda
-      // 首次被调用时会自己建一个同名的，CFN 后手就 already exists。
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // 栈内资源 → 删栈一并删掉
     });
 
     const webNotifRole = new iam.Role(this, "WebNotifRole", {
@@ -1075,6 +1130,8 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       memorySize: 256,
       environment: { variables: webNotifEnv(webchat.table.tableName) },
       description: WEB_NOTIF_FUNCTION_DESCRIPTION,
+      // 指到上面那个 CFN 命名的日志组 —— 见 WebNotifLogs 处的注释。
+      loggingConfig: { logGroup: webNotifLogs.logGroupName },
     });
     webNotifFn.addDependency(webNotifLogs.node.defaultChild as cdk.CfnResource);
     webNotifFn.addDependency(webNotifRole.node.defaultChild as cdk.CfnResource);

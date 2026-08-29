@@ -33,6 +33,43 @@ Resources:
     Properties:
       Name: !Sub "notiops-devops-${AWS::AccountId}-m${SystemAccountId}"
       Description: !Sub "NotiOps managed member agent space (management account ${SystemAccountId})"
+      # 建 space 时一并开好 Operator App(web app)。这一条对多账号客户尤其要紧：
+      # 没有它，管理侧对本成员账号发起的 CreateBacklogTask / CreateChat 会一律报
+      # `Invalid or unregistered domain`，而补救动作是**登进这个成员账号的控制台**
+      # 点 Agent Space → Access → Configure web app —— 接 N 个账号就要点 N 次。
+      # CFN 的 create handler 替我们调 aidevops:EnableOperatorApp，delete handler 调
+      # DisableOperatorApp（StackSet 摘实例时自动收尾）。
+      OperatorApp:
+        Iam:
+          OperatorAppRoleArn: !GetAtt OperatorAppRole.Arn
+
+  # DevOps Agent 服务跑它自己那个 per-space web app 用的角色。
+  # 两个细节（都是实测反推控制台建出来的角色得到的）：
+  #   · sts:TagSession 不能省 —— AIDevOpsOperatorAppAccessPolicy 把资源写成
+  #     agentspace/${aws:PrincipalTag/AgentSpaceId}，session tag 就是授权依据。
+  #   · aws:SourceArn 用 ArnLike + agentspace/* 而非精确 ARN —— 精确 ARN 会让本角色
+  #     引用 AgentSpace、AgentSpace 又 !GetAtt 本角色，CFN 直接判循环依赖。
+  OperatorAppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "notiops-agent-webapp-${AWS::AccountId}-m${SystemAccountId}"
+      Description: "Assumed by AWS DevOps Agent for its per-Agent-Space operator web app"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsOperatorAppAccessPolicy
 
   # DevOps Agent 服务读本账号资源的角色（与部署账号 PrimaryRole 权限一致）
   PrimaryRole:

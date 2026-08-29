@@ -770,11 +770,13 @@ export async function runDirectInvestigation({ text, locale, accountId, skillId,
     started = await startInvestigation({ client, agentSpaceId: space, title, description });
   } catch (e) {
     const msg = String(e?.message || "").toLowerCase();
+    // 这条分支现在是**兜底**：两条部署路径与成员账号 StackSet 都在建 space 时就调
+    // EnableOperatorApp 把 Operator App 开好了，还能撞上它的只有旧 space / 手工建的 space。
     const unregistered = msg.includes("unregistered domain") || (msg.includes("invalid") && msg.includes("domain"));
     console.warn("[direct-investigate] start_failed", safeErr(e), unregistered ? "unregistered_domain" : "");
     say(unregistered
-      ? dv("\n⚠️ 该 Agent Space 还没有注册域名，无法发起调查。请到 DevOps Agent 控制台（https://console.aws.amazon.com/aidevops/home#/agent-spaces）→ 你的 Agent Space → Configure web app 完成配置后重试。\n",
-           "\n⚠️ This Agent Space has no registered domain yet, so the investigation cannot start. Open the DevOps Agent console (https://console.aws.amazon.com/aidevops/home#/agent-spaces) → your Agent Space → Configure web app, then retry.\n")
+      ? dv("\n⚠️ 这个 Agent Space 还没开启 Web 应用（Operator App），无法发起调查。新部署会自动开好，所以你多半用的是旧 space 或手工建的 space —— 去 DevOps Agent 控制台（https://console.aws.amazon.com/aidevops/home#/agent-spaces）→ 你的 Agent Space → Access → Configure web app 点一次即可。\n",
+           "\n⚠️ This Agent Space doesn't have its web app (operator app) enabled, so the investigation cannot start. New deployments enable it automatically, so this is most likely an older or hand-created space — open the DevOps Agent console (https://console.aws.amazon.com/aidevops/home#/agent-spaces) → your Agent Space → Access → Configure web app, once.\n")
       : dv(`\n⚠️ 发起调查失败：${safeErr(e)}\n`, `\n⚠️ Failed to start the investigation: ${safeErr(e)}\n`));
     finishUsage();
     return reply;
@@ -962,6 +964,14 @@ async function finishAndReport({ client, space, executionId, taskId, status, tit
                   hasMitigation: Boolean(summary.hasMitigation) });
 }
 
+/** 调查结束后那个「🆘 转人工支持（AWS Support）」按钮：**暂时隐藏**（2026-08-28）。
+ * 只藏按钮，能力一点没动 —— 下面 ③ 的 prompt、`isEscalateRequest()` 的服务端分流、
+ * agent 侧的 `escalate_to_support` 工具全部保留，用户直接说「把这个转人工」照样能建案。
+ * ⚠️ 想放回来必须**两处一起改**：这个按钮由两条路径各自发出，直连路径在本文件，
+ * 老（agent）路径在 agent-build/NotiOpsWebChat/app/NotiOpsWebChat/main.py 的
+ * `_SHOW_ESCALATE_FOLLOWUP` —— 只改一处等于只藏一半。 */
+const SHOW_ESCALATE_FOLLOWUP = false;
+
 /** 末尾快捷操作。
  * ① 生成缓解方案 → 跳 DevOps Agent 后台（url 型，新标签打开；与老路径一致）。
  * ② 查看调查结果 → prompt 带 execution_id，仍走**直连**路径的续查分支 → 0 token。
@@ -1002,7 +1012,7 @@ function emitFollowups({ emit, locale, consoleUrl, executionId, title, descripti
                  `Check the result of this investigation, execution_id=${executionId}`),
     });
   }
-  if (executionId) {
+  if (executionId && SHOW_ESCALATE_FOLLOWUP) {
     // ⚠️ prompt 里必须**自带** problem_title/background：点击后走的是老路径，但那是一条
     // 全新的模型回合，它看不到本次直连调查的任何上下文（直连不经过 agent runtime，
     // AgentCore Memory 里没有历史）——不能写"从上面的结论归纳"，那样只会得到空话。

@@ -1545,13 +1545,15 @@ echo ""
 echo "  $(t "详见 docs/DEPLOYMENT.md §5.3 部署后必读 — Agent Space 重新配置." "See docs/DEPLOYMENT.md §5.3 Post-deploy must-read — Agent Space reconfiguration.")"
 
 echo ""
-echo "  $(t "── ⚠️ 必做一步:在 DevOps Agent 控制台注册 Web 应用域名 ──" "── ⚠️ Required step: register the web app domain in the DevOps Agent console ──")"
-echo "  $(t "否则在 Web Chat 里点『发起调查/连接调查』会报错:" "Otherwise clicking 'investigate / connect investigation' in Web Chat will error with:")"
-echo "    \"Invalid or unregistered domain\""
-echo "  $(t "步骤:进 DevOps Agent 控制台 → 你的 space(notiops-devops-${CDK_ACCOUNT:-<account>}) → Configure web app" "Steps: open the DevOps Agent console → your space (notiops-devops-${CDK_ACCOUNT:-<account>}) → Configure web app")"
+# 以前这里是「⚠️ 必做一步:去控制台 Configure web app」。现在 CDK 建 space 时就把
+# Operator App(web app)开好了(notiops-backend-stack.ts 的 DevOpsAgentOperatorAppRole
+# + operatorApp),所以这一步**不再需要客户手点**。留一句排错提示:老部署(本版本之前建的
+# space)可能还没开过,症状就是下面那个报错。
+echo "  $(t "── Web 应用(Operator App)已自动开好 ──" "── The web app (operator app) is enabled automatically ──")"
+echo "  $(t "CDK 建 Agent Space 时已顺手开启 Operator App,你不需要再去控制台点 Configure web app." "CDK enables the operator app when it creates the agent space — you don't need to click Configure web app in the console.")"
+echo "  $(t "如果发起调查时仍报 \"Invalid or unregistered domain\"(通常是本版本之前建的老 space):" "If starting an investigation still errors with \"Invalid or unregistered domain\" (usually a space created before this version):")"
+echo "    $(t "进 DevOps Agent 控制台 → space(notiops-devops-${CDK_ACCOUNT:-<account>}) → Configure web app 点一次即可" "open the DevOps Agent console → space (notiops-devops-${CDK_ACCOUNT:-<account>}) → Configure web app, once")"
 echo "        https://console.aws.amazon.com/aidevops/home#/agent-spaces"
-echo "  $(t "把下面这个 Web Chat 域名登记为允许的 web app 域名(注册后即可正常发起调查):" "and register the Web Chat domain below as an allowed web app domain (investigations work once registered):")"
-echo "    ${CHAT_URL}"
 
 echo ""
 echo "  $(t "── DevOps Agent 多账户集成 ──" "── DevOps Agent Multi-Account Integration ──")"

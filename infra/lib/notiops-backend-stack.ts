@@ -1009,9 +1009,48 @@ export class NotiOpsBackendStack extends cdk.Stack {
     // 部署账号的 Agent Space 由 CDK 自动创建,无需手动 onboard。
     // 其他业务账号仍需 Dashboard 手动上车(跨账号 onboarding 流程)。
     const devopsAgentModule = require("aws-cdk-lib/aws-devopsagent");
+
+    // Operator App(web app)角色：免掉控制台上「Agent Space → Access →
+    // Operator access → Configure web app」那一次手点。没点过的话
+    // `https://<spaceId>.aidevops.global.app.aws` 域名不存在，CreateBacklogTask /
+    // CreateChat 一律报 `Invalid or unregistered domain`，深度调查/直连/DevOps 对话/
+    // 发布 Skill 四样全废。形状照控制台自己建的那个角色(两个账号各取一份核对过)：
+    //   · `sts:TagSession` 不能省 —— AIDevOpsOperatorAppAccessPolicy 的资源写成
+    //     `agentspace/${aws:PrincipalTag/AgentSpaceId}`，靠 session tag 授权。
+    //   · `ArnLike .../agentspace/*` 而不是精确 ARN —— 后者会让角色与 space 互相
+    //     引用，CFN 判循环依赖。收口靠 aws:SourceAccount，与下面 primaryRole 同一套。
+    const operatorAppRole = new iam.Role(this, "DevOpsAgentOperatorAppRole", {
+      roleName: `notiops-agent-webapp-${cdk.Aws.ACCOUNT_ID}`,
+      assumedBy: new iam.ServicePrincipal("aidevops.amazonaws.com", {
+        conditions: {
+          StringEquals: {
+            "aws:SourceAccount": cdk.Aws.ACCOUNT_ID,
+          },
+          ArnLike: {
+            "aws:SourceArn": `arn:aws:aidevops:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:agentspace/*`,
+          },
+        },
+      }).withSessionTags(),  // ← 这就是那条 sts:TagSession
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName("AIDevOpsOperatorAppAccessPolicy"),
+      ],
+      description: "Assumed by AWS DevOps Agent for its per-Agent-Space operator web app",
+    });
+
     const agentSpace = new devopsAgentModule.CfnAgentSpace(this, "DevOpsAgentSpace", {
       name: `notiops-devops-${cdk.Aws.ACCOUNT_ID}`,
       description: "NotiOps - auto-created by CDK for the deploy account",
+      // 建 space 时一并开好 web app：CFN 的 create handler 替我们调
+      // aidevops:EnableOperatorApp，delete handler 调 DisableOperatorApp。
+      // 只走 `iam` 认证流（BFF 是 SigV4 直连）；IdC / IdP 留给客户自己选。
+      //
+      // ⚠️ **老部署升级到本版本**（space 已存在、且当初是**在控制台手点**开的 web app）：
+      // 模板里这条属性从「没有」变成「有」，CFN 会走 update handler 去 Enable 一次。
+      // 此时服务侧其实已经 enabled（角色是控制台建的 `DevOpsAgentRole-WebappAdmin-*`），
+      // 未实测该 update 是幂等还是报冲突。真撞上冲突就先 `aws devops-agent
+      // disable-operator-app --agent-space-id <id>` 再 deploy —— 域名由 spaceId 派生，
+      // 关掉重开不换 URL。新部署无此问题（create handler 一把开好）。
+      operatorApp: { iam: { operatorAppRoleArn: operatorAppRole.roleArn } },
     });
     this.agentSpaceId = agentSpace.attrAgentSpaceId;
 
@@ -1524,9 +1563,19 @@ def handler(event, context):
     // 与 IM push 复用同一 core.push_event normalizer,但 sink 是写 notiops-web-chat
     // 表的 notif# 段(账号级共享收件箱),不自动发起调查。
     // web chat 页面 60s 轮询 BFF 拿增量;离线时事件仍在库里,进来即可回顾。
+    // 日志组显式建、由本栈管:否则 Lambda 服务会自己建一个 `/aws/lambda/<函数名>`,
+    // 那个组**不属于任何栈** —— 永不过期(白留日志费),删栈也不消失,而且方式 A 的模板
+    // 里同名日志组是栈内资源,于是同一账号里跑过 setup.sh 之后一键部署会在
+    // NAME_CONFLICT_VALIDATION 上整栈失败(2026-08-28 实测)。给了 logGroup,CDK 会
+    // 写 LoggingConfig,函数只往这个组里写,不再自建同名组。
+    const webNotifLogs = new logs.LogGroup(this, "WebNotifHandlerLogs", {
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
     const webNotifLambda = new lambda.Function(this, "WebNotifHandlerLambda", {
       ...commonLambdaProps,
       functionName: WEB_NOTIF_FUNCTION_NAME,
+      logGroup: webNotifLogs,
       handler: WEB_NOTIF_HANDLER,
       code: pushLambdaCode, // 与 IM push 同一份 asset(含 core/)
       timeout: cdk.Duration.seconds(60),

@@ -371,6 +371,24 @@ def assert_clean(template: dict, tag: str) -> None:
             f"no artifact key contains the release tag {tag!r} — without a version in the key, "
             "CloudFormation cannot tell that the code changed and customers keep running the old build")
 
+    # 日志组不许写死名字。理由不是洁癖:`/aws/lambda/<函数名>` 这种组 **Lambda 服务
+    # 自己也会建**(方式 B 就留下这样一个不属于任何栈的组),而 CFN 从 2026 起有
+    # NAME_CONFLICT_VALIDATION 预检 —— 同名组已存在就**整栈 9 秒内失败**,报错只提
+    # 日志组,客户完全看不出这跟「通知」有什么关系(v1.0.16 实测)。
+    # 正确写法:不给 LogGroupName(CFN 自己命名)+ 函数上写 LoggingConfig 指过来。
+    # 允许含 StackName 的动态名(Fn::Join/Sub) —— 那种名字随栈唯一,不会撞。
+    for name, res in resources.items():
+        if res.get("Type") != "AWS::Logs::LogGroup":
+            continue
+        log_name = res.get("Properties", {}).get("LogGroupName")
+        if isinstance(log_name, str):
+            raise PostprocessError(
+                f"{name} hardcodes LogGroupName={log_name!r}. A literal log group name collides with "
+                "the group the Lambda service creates on its own (and with any leftover from another "
+                "deployment path): CloudFormation's NAME_CONFLICT_VALIDATION then fails the whole "
+                "stack in seconds with 'already exists'. Drop LogGroupName and point the function at "
+                "the group via LoggingConfig instead.")
+
 
 # ── main ─────────────────────────────────────────────────────────────────────
 def postprocess(template: dict, tag: str, sums: dict[str, str], base_url: str) -> dict:

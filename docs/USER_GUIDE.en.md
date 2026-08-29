@@ -738,8 +738,10 @@ The Notifications topic has **two parts**, answering "is there any AWS event aff
 
 **(B) Persistent inbox (source of the red dot)**
 - The inbox aggregates notifications from multiple event sources (collected via EventBridge, deduplicated over 5 minutes, then written to the inbox):
-  - **On by default**: CloudWatch Alarm, AWS Health, AWS Backup
-  - **Off by default** (admin must enable): GuardDuty, Cost Anomaly, Trusted Advisor, RDS, Config
+  - **On by default** (5 sources: highest operational value, manageable noise): AWS Health, CloudWatch Alarm, Cost Anomaly, Trusted Advisor, GuardDuty
+    - GuardDuty / Cost Anomaly / Trusted Advisor only produce events once **you enable the underlying service** (a GuardDuty detector, a cost anomaly monitor, a Business+ support plan). Until then the rule is on but receives nothing -- harmless and free, and it starts working the day you enable the service, with no redeployment.
+  - **Off by default** (5 sources: either high volume or noisy): AWS Backup, EC2 Spot interruption warnings, Auto Scaling launch failures, RDS, Config
+    - To turn one on: on the `setup.sh` path pass `-c webNotifBackupJob=on` at deploy time (ids are listed in [DEPLOYMENT.en.md](DEPLOYMENT.en.md)); on the one-click path just **Enable** the `notiops-web-notif-backupjob` rule in the EventBridge console.
 - Notifications are retained in the inbox for **about 90 days** (TTL), shared at the account level.
 - **The left-side red dot** = the inbox **unread count**, refreshed by the frontend **polling every 60 seconds** (note: polling, not real-time WebSocket push). Health Dashboard's unhandled counts **do not** contribute to the red dot.
 - **Actions on each notification card**: **Investigate** (use this notification as the starting point and go to the Investigate topic to launch a DevOps Agent deep investigation) / **Ask about this** (keep the conversation going around this notification) / **Console link** (jump to the AWS console for the raw event).

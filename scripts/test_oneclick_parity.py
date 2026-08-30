@@ -378,7 +378,7 @@ def test_deploy_time_seeds_match() -> None:
 # 为什么它单独算一个维度：AgentCore 的 idle 默认值是 **900 秒**，而 NotiOps 要的是
 # 1 小时。这个数字不属于 IAM、不属于 env、也不是 DynamoDB 里的数据 —— 前三条断言
 # 结构上都看不见它。而它漂移的症状同样是「产品变差但不报错」：用户离开十几分钟回来
-# 提问就吃一次冷启动（~30s），只能靠 BFF 那句「再发一次」兜。
+# 提问就吃一次冷启动（实测 ~10s），只能靠 BFF 那句「再发一次」兜。
 #
 # 两条路径各写了一份，谁也 import 不了谁：
 #   · 方式 B：agentcore.json 的 runtimes[].lifecycleConfig（`agentcore deploy` 读它），
@@ -441,7 +441,7 @@ def test_runtime_lifecycle_matches() -> None:
 
     _check("idle / max lifetime are identical on both paths", setup == oneclick,
            f"setup.sh: {setup}, one-click: {oneclick} —— 数字不一样意味着两条路径部署出来的"
-           "产品「保温时长」不同：短的那条上，用户离开一会儿回来就多吃一次 ~30s 冷启动。")
+           "产品「保温时长」不同：短的那条上，用户离开一会儿回来就多吃一次 ~10s 冷启动。")
 
     # 方式 B 有两处写这个数（agentcore.json 声明 + 部署后强制回填），它们自己也会漂。
     idle = setup.get("idleRuntimeSessionTimeout")

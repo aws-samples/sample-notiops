@@ -205,6 +205,22 @@ export class AgentCoreStack extends Stack {
           ],
         })
       );
+      // ── NotiOps MCP 规格快照：把 MCP 工具 schema 缓存在 mcp-snapshots/ 前缀 ──
+      // 冷启动优化（core/mcp_snapshot.py）：AgentCore 按 session 隔离，每个新会话都是一次
+      // 真冷启动，而挂工具前必须先拿到 schema —— 今天的唯一办法是把 5 个 stdio MCP server
+      // 全拉起来再 list_tools（现网实测最慢那个 9.3s，整段落在首字之前）。把 schema 快照到
+      // S3 后，新会话直接读快照挂工具、子进程推到后台预热时再起。
+      // 键含包版本指纹，任何一个 MCP server 版本变了自动 cache miss 重建，所以要 Put 不只是 Get。
+      // 读写都失败安全：拿不到就回到"先拉起子进程"的老路（慢但对）。
+      env.runtime.role.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          sid: 'NotiOpsMcpSnapshotCache',
+          actions: ['s3:GetObject', 's3:PutObject'],
+          resources: [
+            `arn:aws:s3:::notiops-data-${this.account}-${this.region}/mcp-snapshots/*`,
+          ],
+        })
+      );
       // ── NotiOps FinOps：官方 awslabs cost+pricing MCP 所需的**只读**权限 ──
       // 覆盖白名单工具用到的服务：Cost Explorer（含 RI/SP 利用率）、Cost Optimization Hub、
       // Compute Optimizer、Budgets、AWS Pricing（Price List）、Free Tier、S3 Storage Lens、

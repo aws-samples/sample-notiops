@@ -113,6 +113,10 @@ CJK_ALLOWLIST = {
     "core/devops_agent.py",
     "core/finops_mcp.py",
     "core/investigation_mcp.py",
+    # mcp_snapshot.py 同组（web-chat agent 专用，上面三个 MCP 模块共用的启动解耦层）。
+    # 它的 CJK 全在注释/docstring 里；唯一面向模型的字符串 `_UNAVAILABLE` 是英文
+    # （给 LLM 看的改道指令，不是给用户看的文案）。
+    "core/mcp_snapshot.py",
     "core/aws_docs_mcp.py",
     "core/resources.py",
     "core/support_cases.py",
@@ -134,6 +138,13 @@ CJK_ALLOWLIST = {
     # The lint script + tests can mention Chinese for assertions.
     "scripts/lint_i18n.py",
     "scripts/test_aws_docs_mcp.py",
+    # 冷启动延迟探针 —— **开发/运维自用工具，不在任何客户路径上**。它的 CJK 是
+    # argparse help、终端表头（"ttfb (首帧)"）和一句探针 prompt（"你好"）。没有客户会
+    # 看到这些字，也没有 locale 可以 thread：它是本地手工跑的一次性度量脚本
+    # （scripts/measure_cold_start.py --runs 5），产出是 stdout 表格和一个 json 文件。
+    # 其中那句 prompt 甚至是**参数**（--prompt），默认值只是选了句最短的中文寒暄，
+    # 目的是量首字延迟而不触发任何工具调用。
+    "scripts/measure_cold_start.py",
     # Sanitizer self-test asserts on the exact CJK spam tokens that
     # GPT leaked in the 2026-06-05 incident. The strings ARE the
     # regression fixtures; routing them through i18n would defeat

@@ -797,6 +797,17 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       actions: ["s3:GetObject", "s3:PutObject"],
       resources: [base.dataBucket.arnForObjects("reports/*")],
     }));
+    // MCP 规格快照（core/mcp_snapshot.py）—— 冷启动优化的落盘位置。
+    // AgentCore 按 session 隔离，每个新会话都是真冷启动；而挂工具前必须先有 schema，
+    // 今天只能把 5 个 stdio MCP server 全拉起来再 list_tools（最慢那个现网实测 9.3s，
+    // 整段落在用户看到第一个字之前）。快照到 S3 之后，新会话直接读快照挂工具，子进程
+    // 推到后台预热。键里含包版本指纹 → 某个 MCP server 升版就自动 miss 重建，所以
+    // Put 与 Get 都要。全失败安全：读不到/写不了都只是回到今天的慢路径。
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      sid: "NotiOpsMcpSnapshotCache",
+      actions: ["s3:GetObject", "s3:PutObject"],
+      resources: [base.dataBucket.arnForObjects("mcp-snapshots/*")],
+    }));
     // FinOps / 资源巡检 / 故障调查三块只读工具面。**只读**是产品承诺，不是省事：
     // 客户交出来的是生产账号，任何写动作都得走「先提议、人确认」而不是靠 IAM 放开。
     runtimeRole.addToPolicy(new iam.PolicyStatement({
@@ -907,7 +918,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         NetworkConfiguration: { NetworkMode: "PUBLIC" },
         RoleArn: runtimeRole.roleArn,
         // 必须显式写：AgentCore 的默认 idle 是 **900 秒**，而 NotiOps 要的是 1 小时。
-        // 900 秒下，用户离开十几分钟回来提问就吃一次冷启动（~30s，BFF 那边只能靠
+        // 900 秒下，用户离开十几分钟回来提问就吃一次冷启动（实测 ~10s，BFF 那边只能靠
         // "再发一次"的提示兜），体验明显退化。老路径（setup.sh）靠部署后
         // `scripts/backfill_runtime_env.sh SET_IDLE=3600` 纠偏；这条路径是原生 CFN
         // 属性（非 createOnly，可原地更新），直接在模板里定死，不需要部署后补。

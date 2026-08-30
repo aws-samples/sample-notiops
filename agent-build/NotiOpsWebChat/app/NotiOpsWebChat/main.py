@@ -34,10 +34,25 @@ _MODEL_CALL_ERRORS = (
 )
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from model.load import load_model, resolve_model_id
-from memory.session import get_memory_session_manager
+from memory.session import get_memory_session_manager, set_retrieval_query
 
 app = BedrockAgentCoreApp()
 log = app.logger
+
+
+def _safe_err(e: Exception) -> str:
+    """Sensitive-data handling: return the exception *type* (plus the AWS error
+    code for botocore ClientError), never the raw message / response body which
+    can embed the request payload — account IDs, ARNs, or the user's own prompt.
+    See docs/LOGGING_STANDARD.md; same helper as core/*.py.
+
+    这里格外要紧：本文件是 web 对话的入口，几乎每个 except 都在处理**带用户输入的**
+    调用（skill 正文、搜索词、报告内容、模型响应）。把 `str(e)` 写进 CloudWatch
+    等于把用户提问原文落进日志。要完整报错就 DEBUG 打，别在 WARNING 打。
+    """
+    resp = getattr(e, "response", None)
+    code = (resp.get("Error", {}) or {}).get("Code") if isinstance(resp, dict) else None
+    return f"{type(e).__name__}/{code}" if code else type(e).__name__
 
 # 注意：脚手架自带的 Exa MCP client（mcp_client/）已**整个删掉**（2026-08）——
 # 它是一个未受控、始终在线的第三方联网搜索工具，会绕过我们的逐请求开关，
@@ -776,7 +791,7 @@ def _finops_tools_for(topic):
     try:
         return list(_finops_mcp.get_tools(core_only=(topic or "general") != "finops"))
     except Exception as _e:  # noqa: BLE001 — 任何启动问题都不阻断 agent
-        log.warning("finops_mcp.get_tools failed: %s", _e)
+        log.warning("finops_mcp.get_tools failed: %s", _safe_err(_e))
         return []
 
 
@@ -1144,7 +1159,7 @@ def escalate_to_support(execution_id: str, problem_title: str = "", background: 
         if isinstance(saved, dict) and saved.get("ok"):
             report_url = saved.get("url", "")
     except Exception as e:  # noqa: BLE001
-        log.warning("escalate report save failed: %s", e)
+        log.warning("escalate report save failed: %s", _safe_err(e))
     # 3) 主题按**客户问题**组织（一眼看清是什么问题），而非泛化 execution-id。
     title = (problem_title or "").strip() or f"Investigation {execution_id}"
     subject = f"[NotiOps] {title}"[:255]
@@ -1375,7 +1390,7 @@ def _investigation_tools_for(topic):
     try:
         return list(_investigation_mcp.get_tools(core_only=(topic or "general") != "investigate"))
     except Exception as _e:  # noqa: BLE001
-        log.warning("investigation_mcp.get_tools failed: %s", _e)
+        log.warning("investigation_mcp.get_tools failed: %s", _safe_err(_e))
         return []
 
 
@@ -1389,8 +1404,14 @@ def _aws_api_tools():
     try:
         return list(_aws_api_mcp.get_tools())
     except Exception as _e:  # noqa: BLE001
-        log.warning("aws_api_mcp.get_tools failed: %s", _e)
+        log.warning("aws_api_mcp.get_tools failed: %s", _safe_err(_e))
         return []
+
+
+# —— MCP 规格快照（P0-A 懒挂载）——
+# 上面三个 MCP 模块都会先试着从 S3 快照挂工具、把子进程推迟到真要用时；`invoke()` 在
+# 寒暄闸门之后调 `warm_now()` 在后台把它们拉起来。见 core/mcp_snapshot.py。
+from core import mcp_snapshot as _mcp_snapshot  # noqa: E402
 
 
 def _is_cross_account(account_id: str | None) -> bool:
@@ -1451,10 +1472,18 @@ def _tools_for_topic(topic, account_id: str | None = None, devops_deep: bool = F
         # 跨账号:MCP 子进程会串号 → 全部不挂;用原生 boto3 只读兜底代替 call_aws。
         _t += _xacct_fallback_tools
     else:
-        # 部署账号:MCP 工具全挂(能力最全)。**并行**启动 3 个 MCP 子进程 —— 每个 get_tools()
-        # 内部 client.start() 是同步阻塞(拉起 FastMCP 子进程,各 ~4-9s);串行累加 ~18s 冷启动,
-        # 并行后 ≈ 最慢那个(~9s),冷启动砍掉约一半。用线程池并发(start 是 IO 阻塞、释放 GIL)。
-        # 结果按固定顺序拼接(工具顺序不影响功能,保持确定性)。首次启动后子进程常驻,后续走缓存秒回。
+        # 部署账号:MCP 工具全挂(能力最全)。**并行**启动 MCP 子进程 —— 每个 get_tools()
+        # 内部 client.start() 是同步阻塞(拉起 FastMCP 子进程);串行累加会把每个新会话的首字
+        # 延迟直接堆高。用线程池并发(start 是 IO 阻塞、释放 GIL)。
+        #
+        # ⚠️ 这里是 3 路,但底下是 **5 个** server:finops 内含 pricing + billing、
+        # investigation 内含 cloudwatch + cloudtrail。它们各自在 _load_all_tools() 里**也已并行**
+        # (见 core/finops_mcp.py / core/investigation_mcp.py 的 _start_servers)——所以实际是
+        # 5 路并发,总耗时 ≈ 最慢那个 server。现网实测各 server:pricing 4.6s / billing 5.4s /
+        # cloudwatch 9.3s / cloudtrail 2.8s / aws-api 7.2s(cloudwatch 慢是因为它启动时拉
+        # 1100+ 条 metric 元数据)。
+        # 结果按固定顺序拼接(顺序进 prompt,抖动会让 prompt 缓存失效)。首次启动后子进程常驻,
+        # 后续走缓存秒回。
         import concurrent.futures as _cf
         with _cf.ThreadPoolExecutor(max_workers=3) as _ex:
             _futs = {
@@ -1466,7 +1495,7 @@ def _tools_for_topic(topic, account_id: str | None = None, devops_deep: bool = F
                 try:
                     _t += _futs[_k].result()
                 except Exception as _e:  # noqa: BLE001 — 单个 MCP 起不来不阻断其它/整体
-                    log.warning("MCP %s tools load failed (parallel): %s", _k, _e)
+                    log.warning("MCP %s tools load failed (parallel): %s", _k, _safe_err(_e))
     # DevOps Agent 深度调查工具:凡提供该能力的主题都挂(执行仍受开关 ContextVar 门控)。
     if _topic_has_devops(topic):
         _t += _devops_tools
@@ -2156,6 +2185,11 @@ async def invoke(payload, context):
     # 中文提问也带偏）；无 CJK 即视为英文。这样框架文案与模型正文语言保持一致。
     _raw_q_for_locale = str(payload.get("prompt") or payload.get("text") or "")
     _ui_locale.set("en" if _is_probably_english(_raw_q_for_locale) else "zh")
+    # 长期记忆检索用的查询串 = 用户**原话**，而不是下面拼出来的那个大 prompt。
+    # AgentCore Memory 的 searchQuery 上限 10000 字符，大 prompt 动辄几十 KB ——
+    # 四个 namespace 会齐刷刷 ValidationException 被 SDK 吞掉、返回空，记忆等于没开。
+    # 见 memory/session.py 里的 _NotiOpsMemorySessionManager。
+    set_retrieval_query(_raw_q_for_locale)
     # 重置本轮"待确认写操作提议"收集器（逐请求隔离）。
     _proposed_actions.set([])
     # 重置本轮"快捷操作按钮"收集器（续查等非流式工具往里塞，收尾统一发出）。
@@ -2207,7 +2241,17 @@ async def invoke(payload, context):
                 pass
             return
         except Exception as e:  # noqa: BLE001 — 快路径出问题就回退正常流程
-            log.warning("greeting fast-path failed, falling back: %s", e)
+            log.warning("greeting fast-path failed, falling back: %s", _safe_err(e))
+
+    # ── 懒挂载的 MCP server 后台预热（P0-A）──
+    # 工具是从 S3 快照挂上的，子进程还没起。放在这里而**不是** get_or_create_agent 里，
+    # 就为了让上面那个寒暄快路径先 return：只说了句"你好"的会话不该白起 5 个子进程。
+    # `warm_now()` 幂等且立即返回（真正的启动在 daemon 线程里），预热与「模型出字 +
+    # 用户读字」重叠；预热中途来了真调用会在同一个 Future 上等，不会起第二份。
+    try:
+        _mcp_snapshot.warm_now()
+    except Exception as e:  # noqa: BLE001 — 预热失败只是回到"用时现起"，不影响本轮回答
+        log.warning("mcp warm kick failed: %s", _safe_err(e))
 
     prompt = _extract_prompt(payload)
 
@@ -2314,7 +2358,7 @@ async def invoke(payload, context):
             if _dir:
                 prompt = _dir + prompt
     except Exception as e:  # noqa: BLE001 — skill 读取失败不阻断对话
-        log.warning("skills inject failed: %s", e)
+        log.warning("skills inject failed: %s", _safe_err(e))
     # FinOps Agent 深度模式（占位）：注入说明，让模型先用快档成本工具尽力回答，
     # 并诚实告知"深度分析模式即将上线"。等 AWS 开放 FinOps Agent 远程调用后替换此分支。
     if finops_deep:
@@ -2372,7 +2416,7 @@ async def invoke(payload, context):
         try:
             res = _web_search.search(search_q)
         except Exception as e:  # 搜索失败不阻断回答
-            log.warning("forced web_search failed: %s", e)
+            log.warning("forced web_search failed: %s", _safe_err(e))
             res = {}
         if res.get("text"):
             forced_sources = res.get("sources", []) or []
@@ -2447,7 +2491,8 @@ async def invoke(payload, context):
                 yield _out
     except MaxTokensReachedException as e:  # 见顶部 import（撞输出上限，非故障）
         # 撞输出上限：不是故障，是回答太长。保留已生成内容，收尾照常走（下方补提示 + sources）。
-        log.warning("stream hit max_tokens, finishing gracefully with partial answer: %s", e)
+        log.warning("stream hit max_tokens, finishing gracefully with partial answer: %s",
+                    _safe_err(e))
         _truncated_by_max_tokens = True
     except _MODEL_CALL_ERRORS as e:  # 模型调用失败（Bedrock 5xx / 限流 / 超时）
         # 客户实测事故（2026-08-25，现网）：Grok 4.6 这轮 ConverseStream 连续 4 次
@@ -2513,7 +2558,7 @@ async def invoke(payload, context):
                           f"\n\n---\n📥 [Download full report (Markdown, link {_valid_en})]({_dl['url']})\n")
             yield {"event": {"contentBlockDelta": {"delta": {"text": _label}, "contentBlockIndex": 0}}}
     except Exception as e:  # noqa: BLE001
-        log.warning("append report download link failed: %s", e)
+        log.warning("append report download link failed: %s", _safe_err(e))
 
     # 收尾：把本轮用到的来源作为最后一个事件发出（前端据此显示 Sources 按钮）。
     # 合并：强制预搜的网页来源 + 模型额外调工具产生的来源，去重。
@@ -2533,7 +2578,7 @@ async def invoke(payload, context):
             sources = [_model_knowledge_source(payload.get("model"))]
         yield {"sources": sources}
     except Exception as e:  # 收集失败不影响正文
-        log.warning("collect sources failed: %s", e)
+        log.warning("collect sources failed: %s", _safe_err(e))
 
     # 收尾：把本轮待确认的写操作提议发给前端（渲染确认卡；用户点确认后由 BFF 执行）。
     try:
@@ -2541,7 +2586,7 @@ async def invoke(payload, context):
         if actions:
             yield {"actions": actions}
     except Exception as e:  # noqa: BLE001
-        log.warning("emit actions failed: %s", e)
+        log.warning("emit actions failed: %s", _safe_err(e))
 
     # 收尾：把本轮收集到的快捷操作按钮发给前端（续查等非流式工具产出的 followups，
     # 与 investigate_live 的实时 yield 互补——保证"续查完成"也带同样的两个按钮）。
@@ -2550,7 +2595,7 @@ async def invoke(payload, context):
         if _fups_tail:
             yield {"followups": _fups_tail}
     except Exception as e:  # noqa: BLE001
-        log.warning("emit followups failed: %s", e)
+        log.warning("emit followups failed: %s", _safe_err(e))
 
     # 收尾：把**本轮净消耗**的 token 用量发给前端（消息末尾显示）。
     # accumulated_usage / cycle_count 是 agent 实例跨请求的累计值（缓存复用、只增不减），
@@ -2584,7 +2629,7 @@ async def invoke(payload, context):
                                  "totalTokens": tot, "cycles": cycles,
                                  "cacheReadInputTokens": cr, "cacheWriteInputTokens": cw}}
     except Exception as e:  # noqa: BLE001 — 用量统计失败不影响正文
-        log.warning("emit usage failed: %s", e)
+        log.warning("emit usage failed: %s", _safe_err(e))
 
 
 if __name__ == "__main__":

@@ -200,6 +200,21 @@ def test_ssm_only_denied_with_decryption() -> None:
            not mod.is_denied_command("aws ssm get-parameter --name /a --no-with-decryption"))
 
 
+def _inner_tool_result(res) -> dict:
+    """从 `_denied_result()` 的返回值里取出**内层** ToolResult。
+
+    两种合法形状（见 `core/mcp_snapshot.py` 的 `tool_error_event()`）：
+      · 装了 strands → `ToolResultEvent`，内层挂在 `.tool_result`；
+      · 没装 strands（CI 的 llm-catalog-tests 就是这种）→ 裸的内层 dict。
+    第三种形状 —— 外层信封 `{"type": "tool_result", "tool_result": {...}}` —— 是
+    **不合法**的，下面 `test_refusal_is_not_the_outer_envelope` 专门钉它。
+    """
+    tr = getattr(res, "tool_result", None)
+    if isinstance(tr, dict):
+        return tr
+    return res if isinstance(res, dict) else {}
+
+
 def test_refusal_leaks_nothing() -> None:
     """拒绝结果不得含命令内容 —— 命令本身可能带 secret 名 / KMS key id。"""
     print("test_refusal_leaks_nothing")
@@ -209,16 +224,52 @@ def test_refusal_leaks_nothing() -> None:
         mod = _load(path, f"_mcp_leak_{label}")
         res = mod._denied_result("tu-123")                    # noqa: SLF001
         blob = repr(res)
+        inner = _inner_tool_result(res)
         _check(f"{label}: result is an error status",
-               res.get("tool_result", {}).get("status") == "error", blob[:160])
+               inner.get("status") == "error", blob[:160])
         _check(f"{label}: carries the toolUseId back",
-               res.get("tool_result", {}).get("toolUseId") == "tu-123")
+               inner.get("toolUseId") == "tu-123", blob[:160])
         for leaky in ("notiops/bedrock-api-key", "get-secret-value", "secretsmanager",
                       "--secret-id", "kms", "alias/"):
             _check(f"{label}: refusal text does not mention {leaky!r}",
                    leaky.lower() not in blob.lower(), blob[:200])
         _check(f"{label}: the message is fixed text, not a template of the input",
                "{" not in mod._DENY_MESSAGE and "%" not in mod._DENY_MESSAGE)  # noqa: SLF001
+
+
+def test_refusal_is_not_the_outer_envelope() -> None:
+    """拒绝结果必须是**内层** ToolResult，不能是外层信封 —— 否则这条拒绝会打死整轮对话。
+
+    这是现网真实踩过的形状 bug，所以单独立一条：`_denied_result()` 曾经 yield
+    `{"type": "tool_result", "tool_result": {...}}`。strands 的工具终端只对
+    `ToolResultEvent` 短路（`strands/tools/executors/_executor.py`，末行
+    `yield ToolResultEvent(cast(ToolResult, last_raw_event))`），裸 dict 会被**整个**
+    当成 ToolResult —— 顶层没有 toolUseId / status / content，于是回到对话历史里是一个
+    非法的 Bedrock `toolResult` 块，下一次 Converse 直接 ValidationException，前端表现
+    为「(no response)」。也就是说：模型没收到"被拒绝"，用户看到的是整轮对话消失。
+
+    判据取"顶层必须自己带 toolUseId / status / content"，而不是"顶层不许有 type 键" ——
+    前者对 ToolResultEvent（dict 子类，本身带 `type`）与裸 inner dict 都成立，
+    只对外层信封不成立。
+    """
+    print("test_refusal_is_not_the_outer_envelope")
+    for label, path in COPIES:
+        if not os.path.exists(path):
+            continue
+        mod = _load(path, f"_mcp_env_{label}")
+        res = mod._denied_result("tu-123")                    # noqa: SLF001
+        inner = _inner_tool_result(res)
+        _check(f"{label}: the inner ToolResult is reachable",
+               inner is not res or isinstance(res, dict), repr(res)[:160])
+        for field in ("toolUseId", "status", "content"):
+            _check(f"{label}: the ToolResult carries {field} at its top level",
+                   field in inner, repr(inner)[:200])
+        _check(f"{label}: content is a list of blocks",
+               isinstance(inner.get("content"), list) and bool(inner["content"]),
+               repr(inner)[:200])
+        _check(f"{label}: the refusal text is in the first content block",
+               inner["content"][0].get("text") == mod._DENY_MESSAGE,  # noqa: SLF001
+               repr(inner)[:200])
 
 
 def test_check_runs_before_execution() -> None:
@@ -309,6 +360,7 @@ def main() -> int:
     test_operator_can_extend_but_not_shrink()
     test_ssm_only_denied_with_decryption()
     test_refusal_leaks_nothing()
+    test_refusal_is_not_the_outer_envelope()
     test_check_runs_before_execution()
     test_subprocess_env_strips_injected_credentials()
     test_header_no_longer_overclaims()

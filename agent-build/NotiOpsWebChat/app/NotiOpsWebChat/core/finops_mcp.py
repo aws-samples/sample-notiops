@@ -21,8 +21,13 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import threading
+
+from core import mcp_snapshot as _snap
 
 logger = logging.getLogger(__name__)
+
+_GROUP = "finops"   # 快照分组名（见 core/mcp_snapshot.py）
 
 
 def _safe_err(e: Exception) -> str:
@@ -83,6 +88,7 @@ _DISABLED = os.environ.get("NOTIOPS_DISABLE_FINOPS_MCP", "").strip().lower() in 
 
 _clients = []      # 常驻 MCPClient 单例
 _tools_cache = None  # 合并后的白名单工具列表（缓存）
+_LOAD_LOCK = threading.Lock()  # 守住"子进程只起一次"（_load_all_tools 可能被并发进入）
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +175,15 @@ def _resolve_cmd(console_script: str, module: str) -> list[str] | None:
     import sys
     if module == "awslabs.billing_cost_management_mcp_server.server":
         try:
-            with open(_BILLING_BOOTSTRAP_PATH, "w", encoding="utf-8") as f:
+            # **原子落盘**：先写临时名再 os.replace()。裸 open(path,"w") 会先把目标文件
+            # 截断成 0 字节 —— 这里是「写完就交给另一个进程 exec」的模式，一旦有第二次
+            # 写入与前一次 spawn 的解释器读取重叠，前者会读到空文件、billing server 以
+            # SyntaxError 死掉，FinOps 成本工具静默消失。今天 _LOAD_LOCK 已经保证只写一次，
+            # 但这个前提在未来任何一次重构里都可能被拿掉，原子 rename 是零成本的保险。
+            tmp = f"{_BILLING_BOOTSTRAP_PATH}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 f.write(_BILLING_BOOTSTRAP_SRC)
+            os.replace(tmp, _BILLING_BOOTSTRAP_PATH)
             return [sys.executable, _BILLING_BOOTSTRAP_PATH]
         except Exception as e:  # noqa: BLE001 — 写不了就回退普通启动（至少 pricing 可用）
             logger.warning("finops_mcp: write billing bootstrap failed: %s", _safe_err(e))
@@ -206,48 +219,166 @@ def get_tools(core_only: bool = False):
 
 
 def _load_all_tools():
-    """启动两个 stdio 子进程、list_tools、按全白名单过滤、缓存全量工具（只跑一次）。"""
+    """拿到全量白名单工具并缓存（只跑一次）。两条路：
+
+    ① **快照路径**（有快照时）：从 S3 读回工具 schema，直接挂成懒工具，**不起任何子进程**。
+       随后 `main.py` 会在寒暄闸门之后调 `mcp_snapshot.warm_now()` 在后台把它们真正拉起来。
+    ② **同步路径**（首次 / 版本变了 / 快照不可用）：并行启动子进程 + list_tools（今天的行为），
+       成功后顺手把快照写回 S3，于是**下一个新会话**就能走 ①。
+
+    为什么并行（②）：每个 server 的启动 = 一次 Python 解释器冷启 + server 自身初始化，
+    几秒量级且几乎全是等待。串行启动把这些时间**直接累加**到每个新会话的首字延迟上
+    （现网实测 pricing 4.6s + billing 5.4s ≈ 10s，并行后 ≈ 最慢那个）。
+
+    并发安全：MCPClient 每个实例自带后台线程 + 独立事件循环，模块级只有 logger/常量，
+    实例间无共享可变状态（strands/tools/mcp/mcp_client.py: start() 里 `threading.Thread`
+    + 每实例 `_init_future`）；工具的实际调用本来就发生在别的线程上。
+
+    顺序按 `_SERVERS` 固定（结果写进按下标预分配的槽位），**不随线程完成先后变化** ——
+    工具顺序会进 prompt，抖动会让 prompt 缓存整段失效。快照路径同样按 `_SERVERS` 顺序
+    拼接，与同步路径逐项一致。
+    """
     global _tools_cache
     if _tools_cache is not None:
         return _tools_cache
+    # 双检 + 锁：并发的首轮请求（Agent 实例缓存未命中时可能同时构造）不能各起一遍子进程。
+    with _LOAD_LOCK:
+        if _tools_cache is not None:
+            return _tools_cache
+        lazy = _lazy_all_tools()
+        if lazy is not None:
+            _tools_cache = lazy
+            logger.info("finops_mcp: total %d FinOps tools exposed (from snapshot, "
+                        "no subprocess started)", len(lazy))
+            return lazy
+        per_server = _start_servers()
+        _tools_cache = _post(per_server)
+        logger.info("finops_mcp: total %d FinOps tools exposed", len(_tools_cache))
+        # 落盘存**原始** list_tools 输出（不是过滤后的）：这样以后改白名单立刻生效，
+        # 不必让白名单参与快照指纹。
+        _snap.save(_GROUP, per_server)
+        return _tools_cache
 
+
+def _post(per_server: list) -> list:
+    """白名单过滤 + 按 server 原顺序拼接。**快照路径与同步路径共用这一段** ——
+    两条路产出的工具集合与包装必须逐项一致，否则会出现「只有走某条路时才少一层过滤」
+    这种最难查的分叉。"""
+    merged: list = []
+    for console_script, tools in per_server:
+        kept = [t for t in tools if t.tool_name in _WHITELIST]
+        logger.info("finops_mcp: %s → %d/%d tools kept (whitelist)",
+                    console_script, len(kept), len(tools))
+        merged.extend(kept)
+    return merged
+
+
+def _lazy_all_tools():
+    """用 S3 快照挂载工具（不起子进程）。拿不到 / 对不上 → 返回 None，调用方走同步路径。"""
+    snap = _snap.snapshot_for(_GROUP)
+    if not snap:
+        return None
+    # server 集合与顺序必须与当前 `_SERVERS` 完全一致。对不上说明代码增删了 server 而
+    # 包版本没变（指纹抓不到这种改动）—— 宁可回到同步路径重建，也不要挂一份过时清单。
+    if [k for k, _ in snap] != [s[0] for s in _SERVERS]:
+        logger.warning("finops_mcp: snapshot server set differs from _SERVERS, ignoring snapshot")
+        return None
+    per_server = _snap.lazy_tools(_GROUP, snap, _connector_for)
+    if per_server is None:
+        return None
+    return _post(per_server)
+
+
+def _connector_for(console_script: str):
+    """给懒客户端用：返回一个「把这个 server 拉起来并交出 MCPClient」的阻塞可调用。"""
+    def _connect():
+        for server in _SERVERS:
+            if server[0] == console_script:
+                return _connect_one(server, _server_env())
+        logger.warning("finops_mcp: unknown server %s", console_script)
+        return None
+    return _connect
+
+
+def _start_servers() -> list:
+    """并行启动 `_SERVERS`，按其原顺序返回 `[(console_script, 该 server 的全部工具)]`
+    （起不来的那个是空列表）。"""
+    import concurrent.futures as _cf
+
+    env = _server_env()
+    slots: list = [(s[0], []) for s in _SERVERS]
+    if len(_SERVERS) < 2:
+        for i, server in enumerate(_SERVERS):
+            slots[i] = (server[0], _start_one(server, env))
+        return slots
+    with _cf.ThreadPoolExecutor(max_workers=len(_SERVERS),
+                               thread_name_prefix="finops-mcp") as ex:
+        futs = {ex.submit(_start_one, server, env): i for i, server in enumerate(_SERVERS)}
+        for fut, i in futs.items():
+            try:
+                slots[i] = (_SERVERS[i][0], fut.result())
+            except Exception as e:  # noqa: BLE001 — _start_one 已自吞；这里是兜底
+                logger.warning("finops_mcp: server slot %d failed: %s", i, _safe_err(e))
+    return slots
+
+
+def _start_one(server: tuple, env: dict) -> list:
+    """启动单个 server 并返回它 `list_tools` 的**全部**工具（不过滤 —— 过滤在 `_post`）。
+    任何失败都只记日志、返回空列表。"""
+    client = _connect_one(server, env)
+    if client is None:
+        return []
+    try:
+        return client.list_tools_sync()
+    except Exception as e:  # noqa: BLE001 — 单个 server 列不出工具不影响另一个/整体
+        logger.warning("finops_mcp: list_tools failed for %s: %s", server[0], _safe_err(e))
+        return []
+
+
+def _connect_one(server: tuple, env: dict):
+    """启动单个 server 子进程并返回常驻的 `MCPClient`（失败返回 None，只记日志不抛）。
+
+    同步路径与懒路径**共用**这一个函数，所以两条路起出来的子进程环境、命令解析、
+    日志文件、诊断行为完全相同。
+    """
     from mcp import StdioServerParameters
     from mcp.client.stdio import stdio_client
     from strands.tools.mcp import MCPClient
 
-    merged = []
-    env = _server_env()
-    for console_script, module in _SERVERS:
-        cmd = _resolve_cmd(console_script, module)
-        if not cmd:
-            logger.warning("finops_mcp: cannot resolve command for %s", console_script)
-            continue
-        try:
-            client = MCPClient(lambda c=cmd: stdio_client(
-                StdioServerParameters(command=c[0], args=c[1:], env=env)))
-            client.start()  # 常驻；不进入 with（生命周期 = 容器）
-            _clients.append(client)
-            tools = client.list_tools_sync()
-            kept = [t for t in tools if t.tool_name in _WHITELIST]
-            logger.info("finops_mcp: %s → %d/%d tools kept (whitelist)",
-                        console_script, len(kept), len(tools))
-            merged.extend(kept)
-        except Exception as e:  # noqa: BLE001 — 单个 server 起不来不影响另一个/整体
-            # Security: WARNING 只记异常类型（不含 traceback/原始消息，可能含 payload）；
-            # 完整 traceback + 子进程 stderr 仅在 DEBUG 下输出，供本地排障。见 docs/LOGGING_STANDARD.md。
-            logger.warning("finops_mcp: failed to start %s: %s", console_script, _safe_err(e))
-            if logger.isEnabledFor(logging.DEBUG):
-                import traceback as _tb
-                logger.debug("finops_mcp: %s start traceback:\n%s", console_script, _tb.format_exc())
-                # 诊断：直接 spawn server 进程、抓它的 stderr（MCPClient 后台线程吞掉了真实报错）。
-                try:
-                    import subprocess as _sp
-                    p = _sp.run(cmd, input=b"", env=env, capture_output=True, timeout=20)  # nosec B603 - cmd is a fixed [sys.executable,'-m',<hardcoded module>] / console-script path from _resolve_cmd(); no shell, no user input  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-                    err = (p.stderr or b"").decode("utf-8", "replace")[-1500:]
-                    logger.debug("finops_mcp: %s direct-spawn stderr tail:\n%s", console_script, err)
-                except Exception as e2:  # noqa: BLE001
-                    logger.debug("finops_mcp: %s direct-spawn diag failed: %s", console_script, _safe_err(e2))
-
-    _tools_cache = merged
-    logger.info("finops_mcp: total %d FinOps tools exposed", len(merged))
-    return merged
+    console_script, module = server
+    # 每个 server 一份**独立的** env 副本，并给它单独的 FASTMCP_LOG_FILE。
+    # 两个原因：① _start_one 现在是**并发**跑的，共享一个可变 dict 是白送出去的隐患
+    # （我们自己不改它，但 env 会一路传进 mcp 库，下游怎么用不在我们手里）；
+    # ② 原来一组里两个 server 共写同一个日志文件 —— 串行启动时只是先后追加，并发启动
+    # 会让两个 server 的启动期 traceback 逐行交织，正好毁掉排查并行问题最需要的那份日志。
+    # 运营方若显式设了 FASTMCP_LOG_FILE，尊重它（沿用 _server_env 的 setdefault 语义）。
+    env = dict(env)
+    if not os.environ.get("FASTMCP_LOG_FILE"):
+        env["FASTMCP_LOG_FILE"] = f"/tmp/notiops-mcp-{console_script.replace('.', '-')}.log"
+    cmd = _resolve_cmd(console_script, module)
+    if not cmd:
+        logger.warning("finops_mcp: cannot resolve command for %s", console_script)
+        return None
+    try:
+        client = MCPClient(lambda c=cmd: stdio_client(
+            StdioServerParameters(command=c[0], args=c[1:], env=env)))
+        client.start()  # 常驻；不进入 with（生命周期 = 容器）
+        _clients.append(client)  # 仅保活引用，无人按下标读；append 在 GIL 下原子
+        logger.info("finops_mcp: %s started", console_script)
+        return client
+    except Exception as e:  # noqa: BLE001 — 单个 server 起不来不影响另一个/整体
+        # Security: WARNING 只记异常类型（不含 traceback/原始消息，可能含 payload）；
+        # 完整 traceback + 子进程 stderr 仅在 DEBUG 下输出，供本地排障。见 docs/LOGGING_STANDARD.md。
+        logger.warning("finops_mcp: failed to start %s: %s", console_script, _safe_err(e))
+        if logger.isEnabledFor(logging.DEBUG):
+            import traceback as _tb
+            logger.debug("finops_mcp: %s start traceback:\n%s", console_script, _tb.format_exc())
+            # 诊断：直接 spawn server 进程、抓它的 stderr（MCPClient 后台线程吞掉了真实报错）。
+            try:
+                import subprocess as _sp
+                p = _sp.run(cmd, input=b"", env=env, capture_output=True, timeout=20)  # nosec B603 - cmd is a fixed [sys.executable,'-m',<hardcoded module>] / console-script path from _resolve_cmd(); no shell, no user input  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                err = (p.stderr or b"").decode("utf-8", "replace")[-1500:]
+                logger.debug("finops_mcp: %s direct-spawn stderr tail:\n%s", console_script, err)
+            except Exception as e2:  # noqa: BLE001
+                logger.debug("finops_mcp: %s direct-spawn diag failed: %s", console_script, _safe_err(e2))
+        return None

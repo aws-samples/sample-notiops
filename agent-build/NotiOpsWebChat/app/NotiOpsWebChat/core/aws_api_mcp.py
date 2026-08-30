@@ -41,8 +41,23 @@ import json
 import logging
 import os
 import shutil
+import threading
+
+from core import mcp_snapshot as _snap
 
 logger = logging.getLogger(__name__)
+
+_GROUP = "aws_api"   # 快照分组名（见 core/mcp_snapshot.py）
+
+
+def _safe_err(e: Exception) -> str:
+    """Sensitive-data handling: return the exception *type* (plus the AWS
+    error code for botocore ClientError), never the raw message / response body
+    which can embed request payloads or user data. See docs/LOGGING_STANDARD.md."""
+    resp = getattr(e, "response", None)
+    code = (resp.get("Error", {}) or {}).get("Code") if isinstance(resp, dict) else None
+    return f"{type(e).__name__}/{code}" if code else type(e).__name__
+
 
 # 只挂这两个：通用执行 + 命令建议。get_execution_plan 是实验性、不挂。
 _WHITELIST = {
@@ -179,9 +194,13 @@ def _truncate_text(s: str) -> str:
 
 _clients = []        # 常驻 MCPClient 单例
 _tools_cache = None  # 白名单工具列表（缓存）
+_LOAD_LOCK = threading.Lock()  # 守住"子进程只起一次"（get_tools 可能被并发进入）
 
 # 官方包：console script 名 + 模块回退路径。
 _SERVER = ("awslabs.aws-api-mcp-server", "awslabs.aws_api_mcp_server.server")
+# 与 finops_mcp / investigation_mcp 同构的列表形式（这里只有一个 server）。快照分组、
+# 懒挂载、`_post()` 都按 `[(console_script, tools)]` 的形状走，三个模块一致。
+_SERVERS = [_SERVER]
 
 _WORKDIR = "/tmp/aws-api-mcp-workdir"
 
@@ -363,29 +382,38 @@ def is_denied_command(command: str) -> bool:
     return False
 
 
-def _denied_result(tool_use_id: str) -> dict:
+def _denied_result(tool_use_id: str):
     """固定文案的拒绝结果。**不回显命令内容** —— 被拒的命令可能本身就带敏感标识
-    （secret 名、KMS key id），把它转述回模型上下文等于自己造一次泄漏。"""
-    return {
-        "type": "tool_result",
-        "tool_result": {
-            "toolUseId": tool_use_id,
-            "status": "error",
-            "content": [{"text": _DENY_MESSAGE}],
-        },
-    }
+    （secret 名、KMS key id），把它转述回模型上下文等于自己造一次泄漏。
+
+    形状交给 `mcp_snapshot.tool_error_event()`：它返回**内层** ToolResult 包成
+    `ToolResultEvent`。这里原来 yield 的是**外层信封** `{"type":..., "tool_result":...}`
+    的裸 dict —— strands 的工具终端只对 `ToolResultEvent` 短路，裸 dict 会掉到
+    `yield ToolResultEvent(cast(ToolResult, last_raw_event))`，于是整个信封被当成
+    ToolResult（顶层没有 toolUseId/status/content）→ 非法 Bedrock `toolResult` 块
+    → 下一次 Converse ValidationException → 前端 "(no response)"。也就是说这条拒绝
+    不但没告诉模型，还把整轮对话打死了。见 mcp_snapshot.tool_error_event 的注释。
+    """
+    return _snap.tool_error_event({"toolUseId": tool_use_id}, _DENY_MESSAGE)
 
 
 def _wrap_capped(tool):
     """把 MCP 工具包一层：在结果回给模型前，对每个 text 块做体积上限截断。
     在工具的 stream() 拦截 ToolResultEvent，改写其 content 里的 text。失败安全：
     包装出错就返回原工具（不阻断）。"""
+    # 已经包过就别再包：`_CappedTool(_CappedTool)` 会让 denylist 与截断各跑两遍
+    # （截断两遍还会把"已截断"提示语再截一次）。investigation_mcp 也调这个函数，
+    # 将来任何一次「两条路都包一下」的重构都可能撞上重复包装。
+    if getattr(tool, "_notiops_capped", False):
+        return tool
     try:
         from strands.tools.mcp.mcp_agent_tool import MCPAgentTool
     except Exception:  # noqa: BLE001 — 拿不到基类就不包，原样返回
         return tool
 
     class _CappedTool(type(tool)):  # 继承实际类（MCPAgentTool 子类），复用其全部行为
+        _notiops_capped = True      # 重复包装的哨兵（见上）
+
         async def stream(self, tool_use, invocation_state, **kwargs):
             # ── 防线 3：执行**前**拦 denylist（spec R6.5.1）──
             # 必须在 super().stream() 之前 —— 一旦进了子进程，密文明文已经拿到了。
@@ -421,7 +449,7 @@ def _wrap_capped(tool):
                             if isinstance(block, dict) and isinstance(block.get("text"), str):
                                 block["text"] = _truncate_text(block["text"])
                 except Exception as e:  # noqa: BLE001 — 截断失败不影响结果传递
-                    logger.warning("aws_api_mcp: truncate failed: %s", e)
+                    logger.warning("aws_api_mcp: truncate failed: %s", _safe_err(e))
                 yield event
 
     # 用同样的构造参数重建为 _CappedTool（保留 mcp_tool / client / name / timeout）
@@ -429,7 +457,13 @@ def _wrap_capped(tool):
         return _CappedTool(tool.mcp_tool, tool.mcp_client,
                            name_override=tool.tool_name, timeout=getattr(tool, "timeout", None))
     except Exception as e:  # noqa: BLE001
-        logger.warning("aws_api_mcp: wrap failed (%s), using raw tool", e)
+        # 这条分支返回的是**未包装**的原工具，也就是：denylist（只读三重防线第 3 层）与
+        # 40000 字符结果上限一起消失。对 call_aws 来说那是安全相关的静默降级，必须是
+        # ERROR 而不是 WARNING —— 现网只有这一条日志能说明防线掉了。
+        name = getattr(tool, "tool_name", "?")
+        log = logger.error if name == "call_aws" else logger.warning
+        log("aws_api_mcp: wrap failed for %s (%s), using raw tool "
+            "— denylist and result cap are NOT active on it", name, _safe_err(e))
         return tool
 
 
@@ -438,38 +472,130 @@ def get_tools():
     子进程只启动一次（首次调用时）并缓存。任何失败：记日志、返回空，不抛 —— agent 照常运行。"""
     if _DISABLED:
         return []
+    return _load_all_tools()
+
+
+def _load_all_tools():
+    """拿到白名单工具并缓存（只跑一次）。与 finops_mcp / investigation_mcp 同构，两条路：
+
+    ① **快照路径**：从 S3 读回工具 schema 直接挂成懒工具，**不起子进程**；`main.py` 在
+       寒暄闸门之后调 `mcp_snapshot.warm_now()` 在后台真正拉起来。
+    ② **同步路径**（首次 / 版本变了 / 快照不可用）：启动 + list_tools（今天的行为），
+       成功后把快照写回 S3，于是**下一个新会话**走 ①。
+
+    这个 server 的冷启在现网实测约 7.2s，而它是**全主题**挂载的（每个新会话都要付），
+    所以它是懒挂载收益最大的一个。
+    """
     global _tools_cache
     if _tools_cache is not None:
         return _tools_cache
+    # 双检 + 锁：并发的首轮请求（Agent 实例缓存未命中时可能同时构造）不能各起一遍子进程。
+    with _LOAD_LOCK:
+        if _tools_cache is not None:
+            return _tools_cache
+        lazy = _lazy_all_tools()
+        if lazy is not None:
+            _tools_cache = lazy
+            logger.info("aws_api_mcp: %d tools exposed (from snapshot, no subprocess started)",
+                        len(lazy))
+            return _tools_cache
+        per_server = _start_servers()
+        _tools_cache = _post(per_server)
+        # 存**原始** list_tools 输出（不是过滤/包装后的）：白名单与 `_wrap_capped` 的改动
+        # 因此立刻生效，不必参与快照指纹。
+        _snap.save(_GROUP, per_server)
+        return _tools_cache
 
+
+def _post(per_server: list) -> list:
+    """白名单过滤 + 结果上限/denylist 包装 + 按 server 原顺序拼接。
+    **快照路径与同步路径共用这一段** —— 否则会出现「只有走某条路时 call_aws 才带
+    denylist」这种最危险的分叉（安全防线随路径消失，且现场没有任何异常）。"""
+    merged: list = []
+    for console_script, tools in per_server:
+        kept = [t for t in tools if t.tool_name in _WHITELIST]
+        wrapped = [_wrap_capped(t) for t in kept]
+        logger.info("aws_api_mcp: %s → %d/%d tools kept (whitelist, result cap=%d chars)",
+                    console_script, len(wrapped), len(tools), _MAX_RESULT_CHARS)
+        merged.extend(wrapped)
+    return merged
+
+
+def _lazy_all_tools():
+    """用 S3 快照挂载工具（不起子进程）。拿不到 / 对不上 → 返回 None，调用方走同步路径。"""
+    snap = _snap.snapshot_for(_GROUP)
+    if not snap:
+        return None
+    # server 集合与顺序必须与当前 `_SERVERS` 完全一致（见 finops_mcp 同款判据）。
+    if [k for k, _ in snap] != [s[0] for s in _SERVERS]:
+        logger.warning("aws_api_mcp: snapshot server set differs from _SERVERS, ignoring snapshot")
+        return None
+    per_server = _snap.lazy_tools(_GROUP, snap, _connector_for)
+    if per_server is None:
+        return None
+    return _post(per_server)
+
+
+def _connector_for(console_script: str):
+    """给懒客户端用：返回一个「把这个 server 拉起来并交出 MCPClient」的阻塞可调用。"""
+    def _connect():
+        if console_script == _SERVER[0]:
+            return _connect_one()
+        logger.warning("aws_api_mcp: unknown server %s", console_script)
+        return None
+    return _connect
+
+
+def _start_servers() -> list:
+    """启动 `_SERVERS` 并返回 `[(console_script, 该 server 的全部工具)]`（起不来是空列表）。
+    这里只有一个 server，故不需要线程池。"""
+    return [(_SERVER[0], _start_one())]
+
+
+def _start_one() -> list:
+    """启动 server 并返回它 `list_tools` 的**全部**工具（过滤/包装在 `_post`）。"""
+    client = _connect_one()
+    if client is None:
+        return []
+    try:
+        return client.list_tools_sync()
+    except Exception as e:  # noqa: BLE001 — 列不出工具不阻断 agent
+        logger.warning("aws_api_mcp: list_tools failed: %s", _safe_err(e))
+        return []
+
+
+def _connect_one():
+    """启动 server 子进程并返回常驻的 `MCPClient`（失败返回 None，只记日志不抛）。
+
+    同步路径与懒路径**共用**这一个函数，所以两条路起出来的子进程环境（含
+    `READ_OPERATIONS_ONLY` 与凭证剥离）、命令解析、诊断行为完全相同。
+    """
     from mcp import StdioServerParameters
     from mcp.client.stdio import stdio_client
     from strands.tools.mcp import MCPClient
 
     env = _server_env()
     cmd = _resolve_cmd()
-    merged = []
     try:
         client = MCPClient(lambda: stdio_client(
             StdioServerParameters(command=cmd[0], args=cmd[1:], env=env)))
         client.start()  # 常驻；生命周期 = 容器
         _clients.append(client)
-        tools = client.list_tools_sync()
-        kept = [t for t in tools if t.tool_name in _WHITELIST]
-        merged = [_wrap_capped(t) for t in kept]
-        logger.info("aws_api_mcp: %d/%d tools kept (whitelist, result cap=%d chars)",
-                    len(merged), len(tools), _MAX_RESULT_CHARS)
+        logger.info("aws_api_mcp: %s started", _SERVER[0])
+        return client
     except Exception as e:  # noqa: BLE001 — 起不来不阻断 agent
-        import traceback as _tb
-        logger.warning("aws_api_mcp: failed to start: %s\n%s", e, _tb.format_exc())
-        # 诊断：直接 spawn 抓 stderr（MCPClient 后台线程会吞掉真实报错）。
-        try:
-            import subprocess as _sp
-            p = _sp.run(cmd, input=b"", env=env, capture_output=True, timeout=25)  # nosec B603 - cmd is a fixed [sys.executable,'-m',<hardcoded module>] / console-script path from _resolve_cmd(); no shell, no user input  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-            err = (p.stderr or b"").decode("utf-8", "replace")[-1500:]
-            logger.warning("aws_api_mcp: direct-spawn stderr tail:\n%s", err)
-        except Exception as e2:  # noqa: BLE001
-            logger.warning("aws_api_mcp: direct-spawn diag failed: %s", e2)
-
-    _tools_cache = merged
-    return merged
+        # Security: WARNING 只记异常类型；traceback / 子进程 stderr 可能带 payload 或用户数据，
+        # 只在 DEBUG 下输出（与 finops_mcp 一致，见 docs/LOGGING_STANDARD.md）。
+        logger.warning("aws_api_mcp: failed to start: %s", _safe_err(e))
+        if logger.isEnabledFor(logging.DEBUG):
+            import traceback as _tb
+            logger.debug("aws_api_mcp: start traceback:\n%s", _tb.format_exc())
+            # 诊断：直接 spawn 抓 stderr（MCPClient 后台线程会吞掉真实报错）。
+            try:
+                import subprocess as _sp
+                p = _sp.run(cmd, input=b"", env=env, capture_output=True, timeout=25)  # nosec B603 - cmd is a fixed [sys.executable,'-m',<hardcoded module>] / console-script path from _resolve_cmd(); no shell, no user input  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                err = (p.stderr or b"").decode("utf-8", "replace")[-1500:]
+                logger.debug("aws_api_mcp: direct-spawn stderr tail:\n%s", err)
+            except Exception as e2:  # noqa: BLE001
+                logger.debug("aws_api_mcp: direct-spawn diag failed: %s", _safe_err(e2))
+    return None

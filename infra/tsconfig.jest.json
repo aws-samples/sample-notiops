@@ -1,0 +1,25 @@
+// jest（ts-jest）专用的 tsconfig —— 只为把**类型检查**从 jest 进程里挪出去。
+//
+// 为什么需要这个文件：ts-jest 默认起一个 TypeScript LanguageService，对整个程序（含
+// aws-cdk-lib 那套巨大的 .d.ts）建类型图，光这一份就吃 ~700 MB 堆。CDK 合成本身只要
+// ~60-120 MB。CI runner（node:22-alpine，amd64 small）的默认老生代上限约 990 MB，于是
+// `npm test` 直接 `Reached heap limit ... heap out of memory`（exit 134）而本机不挂 ——
+// 本机核多，jest 起了两个 worker，每个进程只装一个 suite，恰好压在上限之下。
+//
+// `isolatedModules: true` 让 ts-jest 走 transpileModule（不建 LanguageService，见
+// node_modules/ts-jest/dist/legacy/compiler/ts-compiler.js 里 `if (!this.configSet.isolatedModules)`）。
+// 实测两个 suite 的峰值堆：774 MB → 64 MB、799 MB → 117 MB。
+//
+// 代价是 jest 不再报类型错。所以 CI 里的 `tsc --noEmit` 改成跑**这个** config ——
+// include 比 tsconfig.json 多了 test/**，覆盖面反而比原来大（原来 test/ 的类型只有
+// ts-jest 在看，而 tsconfig.json 的 include 里压根没有 test/）。
+//
+// 不要把这些放进 tsconfig.json：那份要产 dist/ 的声明文件，isolatedModules 会给它带上
+// 额外约束；两边的用途本来就不同。
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "isolatedModules": true
+  },
+  "include": ["lib/**/*", "bin/**/*", "test/**/*"]
+}

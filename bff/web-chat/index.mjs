@@ -786,15 +786,20 @@ async function streamChat(event, responseStream, { sub, groups }) {
     // （第二次实例已在预热/已热）。streamedAny 守住"已吐内容就绝不重试"，避免重复输出。
     let streamedAny = false;
 
-    // ── 冷启动"心跳"：runtime 空闲回收后首个请求要冷启动 ~30-40s（client.send 阻塞、期间
-    // 一片空白，客户只能干等）。这里在**首个真实产出前**周期性发一条瞬态 progress（分阶段文案），
+    // ── 冷启动"心跳"：runtime 空闲回收后首个请求要冷启动（client.send 阻塞、期间一片空白，
+    // 客户只能干等）。这里在**首个真实产出前**周期性发一条瞬态 progress（分阶段文案），
     // 让等待有反馈。热启动首 token 通常 <5s，故延迟 5s 才开始发，避免热路径闪现"加载中"；
     // 之后每 10s 一条。任何来自 agent 的真实产出（token/progress/reasoning/…）即停并交还给
     // agent 自己的进度行。纯瞬态：走 progress 通道 → 前端收到正文即清空，不入库、不置 streamedAny，
     // 冷启动重试仍安全。 */
+    // 文案里的秒数按实测走：2026-08-30 做完 MCP 规格快照 + 懒挂载后，冷启动首字
+    // general 10.14s / finops 10.32s（n=5，每轮换 runtimeSessionId；口径见
+    // scripts/measure_cold_start.py），此前是 23-24s，更早的 ~30-40s 是并行启动之前的数。
+    // 第三条"马上就好"专门兜长尾 —— **刚部署新版本**的头一个会话仍可能 ~30s（要拉新镜像），
+    // 所以第二条只说"约 10 秒"、不写死上限，长尾由第三条接住而不是把所有人都吓一跳。
     const COLD_MSGS = locale === "en"
-      ? ["Loading session…", "Starting up the service (first request after idle, ~30s)…", "Almost ready — warming up the model…"]
-      : ["会话加载中…", "正在启动服务（空闲后的首次请求，约需 30 秒）…", "马上就好，正在预热模型…"];
+      ? ["Loading session…", "Starting up the service (first request after idle, ~10s)…", "Almost ready — warming up the model…"]
+      : ["会话加载中…", "正在启动服务（空闲后的首次请求，约 10 秒）…", "马上就好，正在预热模型…"];
     let sawAgentOutput = false;   // agent 已有任何真实产出 → 冷启动已过，停心跳
     let hbIdx = 0, hbFirst = null, hbTick = null;
     const beat = () => {

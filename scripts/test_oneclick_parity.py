@@ -12,11 +12,17 @@
     ④ runtime 的生命周期设置（保温多久 / 最长活多久）
     ⑤ 「通知」生产端（AWS 事件 → Web 收件箱）建没建、订了哪些事件源
     ⑥ 建 Agent Space 时有没有把 Operator App（web app）一并开好
+    ⑦ AgentCore Memory（长期记忆）建没建、四个 namespace 对不对
+    ⑧ 首次登录交付：部署者拿到临时密码时，是不是同时拿到了 Web Chat 地址
 
 ①②④ 是运行期行为，③ 是部署期数据 —— 三者在两条路径上各写了一份，没有任何一处能
 import 另一处；⑤ 反过来：它现在**只有一份**，两个栈 import 同一个模块，本文件断言的
 是「没有人把它抄回栈里」（见那一节的注释）。⑥ 比前五条还多一条路径：成员账号那份
 StackSet payload（`infra/member-devops-agent.yaml`）也自己建 space，三处都得开。
+⑦ 有第三方参与：写入端（strategy 的 namespace）和读取端（`memory/session.py` 的
+retrieval_config）必须逐字对上，对不上时**不报错**，只是永远检索不到东西。
+⑧ 是唯一**机制天生不同**的一条（方式 B 有终端可打印，方式 A 只有一封邮件），所以断言的
+是不变量「密码与地址同时到手」，不是"两边写法一样"。
 
     ① 方式 B：agent-build/NotiOpsWebChat/agentcore/cdk/lib/cdk-stack.ts 的 NotiOps 段
        方式 A：infra/lib/notiops-webchat-standalone-stack.ts 的 AgentCore Runtime 段
@@ -34,18 +40,30 @@ StackSet payload（`infra/member-devops-agent.yaml`）也自己建 space，三�
     ⑥ 方式 B：notiops-backend-stack.ts 的 DevOpsAgentSpace 段
        方式 A：notiops-webchat-standalone-stack.ts 的 DevOpsAgentSpace 段
        成员账号：infra/member-devops-agent.yaml 的 AgentSpace 资源
+    ⑦ 方式 B：agentcore.json 的 memories[]（AgentCore CLI 建资源 + 注入 memory id）
+       方式 A：notiops-webchat-standalone-stack.ts 的 AgentCore Memory 段
+       读取端（两条路径共用）：agent-build/…/memory/session.py 的 retrieval_config
+    ⑧ 方式 B：setup.sh 建 admin（`--message-action SUPPRESS`）+ 部署总结那块打印
+       方式 A：notiops-webchat-standalone-stack.ts 的 Cognito 邀请邮件模板
 
 漂移的后果**不是**「功能没做」，而是「界面上有开关、点了静默失败」——
 UI 上那些开关（联网搜索 / FinOps / 深度调查）绝大多数是**无条件**渲染的
 （frontend/chat-app/src/components/Composer.tsx），前端并不知道后端少了一条 IAM。
 于是客户看到的是「这个产品时好时坏」，而排查要一路走到 CloudTrail 的 AccessDenied。
 
+一条修好的漂移，留着当教训（判据已经是第 ⑦ 节的真断言）
+------------------------------------------------------------------------
+  · **AgentCore Memory 曾在方式 A 上整个不存在**（长期记忆静默失效），而本文件曾把它
+    列成"有意的差异"，理由写的是「grep 过 core/ 与 agent/，没有任何代码读 MEMORY_*
+    环境变量 —— 两条路径上都是死权限」。那次 grep **没覆盖 agent-build/**，而读它的代码
+    (`memory/session.py`) 正好只在那里 —— 于是这个漂移躲过了本判据整整多个版本。
+    教训一：判断"这个环境变量没人读"时，搜索范围必须包含 **agent-build/**（那才是真正
+    跑在 AgentCore Runtime 里的那份源码），不能只搜 core/ 与 agent/。
+    教训二：**别把"我查过了"写成"这是有意的"** —— 前者会过期，后者不会有人再查。
+
 已知且**有意**的差异（不体现在 ①② 两个维度里，故不需要 allowlist；③ 的排除项
 带理由记在 `SEED_CLASSIFICATION` 里）
 ------------------------------------------------------------------------
-  · AgentCore Memory：方式 A 不建 Memory 资源。方式 B 那条授权来自 agentcore CLI 生成的
-    默认策略（不在本文件扫的那份源码里），且 grep 过 core/ 与 agent/，没有任何代码读
-    MEMORY_* 环境变量 —— 两条路径上都是死权限。
   · 跨账号 AssumeRole：方式 A 把它放进带 Condition 的独立 Policy（只有 MultiAccount 模式
     才存在），方式 B 无条件给。本断言比较的是**动作集合**而非条件，所以两者视作一致 ——
     方式 A 更紧，且单账号模式下本来就没有可 assume 的对象。
@@ -86,6 +104,17 @@ SID_ALIASES = {
     # 都是「读 notiops-config」。方式 B 的名字带 ForCrossAccount 是历史包袱：这条授权同时
     # 服务模型目录 / RBAC 读取，并不只为跨账号，所以方式 A 的名字才是对的。
     "ReadNotiOpsConfigForCrossAccount": "ReadNotiOpsConfig",
+}
+
+# 方式 A 独有的 Sid，但**不是漂移**：方式 B 的同一批授权是 AgentCore CLI 在部署时生成的
+# （不在仓库里，所以源码比对看不见它们），且生成的语句**没有 Sid**。
+# 值 = 为什么它在这张表里。判据落在别处（见值里写的那一条），不是"就这么算了"。
+CLI_GENERATED_SIDS = {
+    "NotiOpsMemoryRetrieve":
+        "方式 B 由 AgentCore CLI 按 agentcore.json 的 memories[] 生成同等授权（无 Sid）。"
+        "两条路径的 Memory 形状本身由 test_agentcore_memory_parity 断言。",
+    "NotiOpsMemoryRetrieveByPath": "同上（namespacePath 条件键那半边）。",
+    "NotiOpsMemoryEvents": "同上（事件读写那组，无 namespace 条件键可用）。",
 }
 
 # runtime 执行角色的授权段。两个 marker 都是文件里的章节注释 —— 挑它们而不是行号，
@@ -195,6 +224,17 @@ def _env_keys_oneclick() -> set[str]:
     return keys
 
 
+def _memory_env_key(memory_name: str) -> str:
+    """AgentCore CLI 从 memory 名推导 runtime 环境变量名的规则。
+
+    `MEMORY_` + 名字里的字母数字大写 + `_ID`。**这个函数是本文件存在的理由之一**：
+    方式 B 的这个键在 `agentcore.json` 里**根本不出现**（CLI 在部署时才算出来注进去），
+    所以只比对 `envVars[]` 的话，方式 A 加了这个键会被判成「只有方式 A 有」，
+    而方式 A 忘了加又会被判成「两边都没有」—— 两种都是错的结论。
+    """
+    return "MEMORY_" + re.sub(r"[^A-Za-z0-9]", "", memory_name).upper() + "_ID"
+
+
 def _env_keys_setup() -> set[str]:
     data = json.loads(_read(SETUP_AGENTCORE_JSON))
     keys = {
@@ -205,6 +245,8 @@ def _env_keys_setup() -> set[str]:
     }
     if not keys:
         raise AssertionError(f"{SETUP_AGENTCORE_JSON}: no runtimes[].envVars[].name found")
+    # CLI 隐式注入的那批（见 _memory_env_key）。
+    keys |= {_memory_env_key(m["name"]) for m in data.get("memories", []) if m.get("name")}
     return keys
 
 
@@ -226,10 +268,16 @@ def test_runtime_role_grants_match() -> None:
            "the one-click deployment is missing these grants entirely "
            f"(UI shows the feature, clicking it fails silently): {missing_in_oneclick}")
 
-    missing_in_setup = sorted(set(oneclick) - set(setup))
+    missing_in_setup = sorted(set(oneclick) - set(setup) - set(CLI_GENERATED_SIDS))
     _check("setup.sh has every statement one-click has",
            not missing_in_setup,
            f"only the one-click path grants these: {missing_in_setup}")
+    # 别让 allowlist 变成垃圾桶：列进去的 Sid 必须真的在方式 A 里存在，
+    # 否则删掉授权时这张表会替它掩护。
+    stale = sorted(set(CLI_GENERATED_SIDS) - set(oneclick))
+    _check("CLI_GENERATED_SIDS 里每条都还在方式 A 的角色上",
+           not stale,
+           f"这些 Sid 已经不在 {ONECLICK} 里了，要么改名了要么被删了：{stale}")
 
     for sid in sorted(set(setup) & set(oneclick)):
         gap_a = sorted(a for a in setup[sid] if not _covers(oneclick[sid], a))
@@ -622,6 +670,252 @@ def test_operator_app_enabled_everywhere() -> None:
            "少了后缀会和成员账号内自建的 NotiOps 部署撞名，StackSet 实例直接 CREATE_FAILED。")
 
 
+# ───────────────── 第七个维度：AgentCore Memory（长期记忆） ─────────────────
+#
+# 为什么单独一节：长期记忆坏掉的样子**完全静默**。BFF 每轮只发 `prompt`
+# （bff/web-chat/agentcore.mjs 的 buildRuntimePayload 里没有历史），所以模型接得上上文靠
+# 两件事之一 —— 容器里那个 Agent 对象还在 LRU 缓存里，或者 Memory 把历史读回来。
+# 没有后者时，缓存那一格一被顶掉（换模型 / 换主题 / 换账号 / 存一次 Admin 配置 / 闲置 1 小时
+# / 重新部署 …）模型就当场失忆，而界面上历史还在（历史存 DynamoDB）。
+# 客户看到的是「它刚刚还知道，现在突然不认了」，日志里什么都没有。
+#
+# 这一节比前六节多一个参与方：**读取端**。写入端（strategy 的 namespace）和读取端
+# （`memory/session.py` 的 retrieval_config）对不上时也不报错，只是永远检索不到东西。
+# 所以这里断言三方一致，而不是两方。
+MEMORY_SESSION_PY = "agent-build/NotiOpsWebChat/app/NotiOpsWebChat/memory/session.py"
+
+#: CFN 的 strategy wrapper 键 → agentcore.json 的 `type`。
+#: schema 里每个 wrapper 只能带一个 strategy（maxProperties=1），所以键本身就是类型。
+_STRATEGY_WRAPPER_TO_TYPE = {
+    "SemanticMemoryStrategy": "SEMANTIC",
+    "UserPreferenceMemoryStrategy": "USER_PREFERENCE",
+    "SummaryMemoryStrategy": "SUMMARIZATION",
+    "CustomMemoryStrategy": "CUSTOM",
+    "EpisodicMemoryStrategy": "EPISODIC",
+}
+
+
+def _balanced_end(text: str, open_idx: int) -> int:
+    """`text[open_idx]` 是一个 `{`，返回与它配对的 `}` 的下标。"""
+    if text[open_idx] != "{":
+        raise AssertionError(f"_balanced_end: {text[open_idx]!r} is not an opening brace")
+    depth = 0
+    for k in range(open_idx, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return k
+    raise AssertionError("_balanced_end: unbalanced braces")
+
+
+def _memory_setup() -> dict:
+    """方式 B：agentcore.json 的 memories[0]。"""
+    data = json.loads(_read(SETUP_AGENTCORE_JSON))
+    mems = data.get("memories") or []
+    if len(mems) != 1:
+        raise AssertionError(
+            f"{SETUP_AGENTCORE_JSON}: 期望恰好 1 个 memory，实际 {len(mems)} 个 —— "
+            "本节的三方对照假设只有一个，多了要先决定 session.py 读哪个")
+    m = mems[0]
+    strategies = {}
+    for s in m.get("strategies", []):
+        strategies[s["type"]] = tuple(sorted(s.get("namespaceTemplates", [])))
+    return {
+        "name": m["name"],
+        "expiry": m.get("eventExpiryDuration"),
+        "strategies": strategies,
+        "reflection": tuple(sorted(
+            ns
+            for s in m.get("strategies", [])
+            for ns in s.get("reflectionNamespaceTemplates", [])
+        )),
+    }
+
+
+def _memory_oneclick() -> dict:
+    """方式 A：栈里那个 `AWS::BedrockAgentCore::Memory` 资源。
+
+    按花括号深度切出 properties 块再按行取值 —— 和 `_env_keys_oneclick` 同一套办法，
+    理由一样：不依赖缩进/行号，但一旦有人把资源整块改写成别的形态，提取器会**失败**
+    （抛 AssertionError），不会静默通过。
+    """
+    src = _strip_comments(_read(ONECLICK))
+    i = src.find('type: "AWS::BedrockAgentCore::Memory"')
+    if i < 0:
+        raise AssertionError(
+            f"{ONECLICK}: 找不到 AWS::BedrockAgentCore::Memory 资源 —— "
+            "长期记忆在方式 A 上又没了（这正是本节要守的那个漂移）")
+    j = src.index("properties: {", i)
+    depth, end = 0, None
+    for k in range(j, len(src)):
+        if src[k] == "{":
+            depth += 1
+        elif src[k] == "}":
+            depth -= 1
+            if depth == 0:
+                end = k
+                break
+    if end is None:
+        raise AssertionError(f"{ONECLICK}: Memory 的 properties 块没闭合")
+    block = src[j:end]
+
+    name_const = re.search(r'const MEMORY_NAME = "([^"]+)"', _read(ONECLICK))
+    if not name_const:
+        raise AssertionError(f"{ONECLICK}: 找不到 MEMORY_NAME 常量")
+    expiry = re.search(r"EventExpiryDuration:\s*(\d+)", block)
+    if not expiry:
+        raise AssertionError(f"{ONECLICK}: Memory 少了 EventExpiryDuration")
+
+    # 每个 wrapper 一段：从 `{ XxxMemoryStrategy: {` 到下一个 wrapper 之前。
+    strategies: dict[str, tuple[str, ...]] = {}
+    reflection: list[str] = []
+    wrappers = list(re.finditer(r"(\w+MemoryStrategy):\s*\{", block))
+    for n, w in enumerate(wrappers):
+        seg = block[w.end(): wrappers[n + 1].start() if n + 1 < len(wrappers) else len(block)]
+        kind = _STRATEGY_WRAPPER_TO_TYPE.get(w.group(1))
+        if kind is None:
+            raise AssertionError(f"{ONECLICK}: 未知的 strategy wrapper {w.group(1)!r}")
+        # `ReflectionConfiguration` 里也有一个 NamespaceTemplates —— 先把它切出去，
+        # 否则反思的 namespace 会被算成 strategy 自己的写入 namespace。
+        # 切法必须数括号：namespace 模板里的 `{actorId}` 自带花括号，
+        # 用 `\{(.*?)\}` 这种非贪婪匹配会停在 `{actorId` 那个 `}` 上（实测踩过）。
+        refl = re.search(r"ReflectionConfiguration:\s*\{", seg)
+        if refl:
+            refl_end = _balanced_end(seg, refl.end() - 1)
+            reflection += re.findall(r'"(/[^"]+)"', seg[refl.end(): refl_end])
+            seg = seg[: refl.start()] + seg[refl_end + 1:]
+        ns = re.search(r"NamespaceTemplates:\s*\[(.*?)\]", seg, re.S)
+        if not ns:
+            raise AssertionError(f"{ONECLICK}: {w.group(1)} 少了 NamespaceTemplates")
+        strategies[kind] = tuple(sorted(re.findall(r'"(/[^"]+)"', ns.group(1))))
+    return {
+        "name": name_const.group(1),
+        "expiry": int(expiry.group(1)),
+        "strategies": strategies,
+        "reflection": tuple(sorted(reflection)),
+    }
+
+
+def _memory_namespaces_read() -> set[str]:
+    """读取端：`memory/session.py` 的 retrieval_config 里那几个 namespace。
+
+    把 Python 的占位符名归一到 AgentCore 的写法（`{actor_id}` → `{actorId}`）——
+    两边指的是同一个东西，只是一个是本地变量名、一个是服务端模板变量。
+    """
+    src = _read(MEMORY_SESSION_PY)
+    i = src.find("retrieval_config = {")
+    if i < 0:
+        raise AssertionError(f"{MEMORY_SESSION_PY}: 找不到 retrieval_config")
+    end = src.index("\n    }", i)
+    found = re.findall(r'f"(/[^"]+)"', src[i:end])
+    if not found:
+        raise AssertionError(f"{MEMORY_SESSION_PY}: retrieval_config 里没解析出 namespace")
+    return {ns.replace("{actor_id}", "{actorId}").replace("{session_id}", "{sessionId}")
+            for ns in found}
+
+
+def test_agentcore_memory_parity() -> None:
+    """长期记忆：两条路径的 Memory 形状一致，且写入端与读取端的 namespace 对得上。"""
+    print("\ntest_agentcore_memory_parity")
+    setup, oneclick = _memory_setup(), _memory_oneclick()
+
+    _check("两条路径的 strategy 类型集合相同",
+           set(setup["strategies"]) == set(oneclick["strategies"]),
+           f"方式 B: {sorted(setup['strategies'])}; 方式 A: {sorted(oneclick['strategies'])}")
+    for kind in sorted(set(setup["strategies"]) & set(oneclick["strategies"])):
+        _check(f"{kind}: namespace 模板相同",
+               setup["strategies"][kind] == oneclick["strategies"][kind],
+               f"方式 B: {setup['strategies'][kind]}; 方式 A: {oneclick['strategies'][kind]}")
+    _check("EPISODIC 的反思 namespace 相同",
+           setup["reflection"] == oneclick["reflection"],
+           f"方式 B: {setup['reflection']}; 方式 A: {oneclick['reflection']}")
+    _check("事件保留期（天）相同",
+           setup["expiry"] == oneclick["expiry"],
+           f"方式 B: {setup['expiry']}; 方式 A: {oneclick['expiry']}")
+
+    # 名字**故意不同**（方式 B 的由 CLI 加了应用名前缀，而 Memory 的 Name 是 createOnly
+    # 且账号内唯一，同名就没法两条路径共存）。真正必须一致的是**推导出来的环境变量键**。
+    key_setup, key_oneclick = _memory_env_key(setup["name"]), _memory_env_key(oneclick["name"])
+    _check("两条路径推导出同一个 runtime 环境变量键",
+           key_setup == key_oneclick,
+           f"方式 B → {key_setup}; 方式 A → {key_oneclick} —— "
+           "键不一致时 get_memory_session_manager() 返回 None，长期记忆**静默**失效")
+    _check(f"消费方写死读的就是这个键（{key_setup}）",
+           key_setup in _read(MEMORY_SESSION_PY),
+           f"{MEMORY_SESSION_PY} 读的键和两条路径注入的键不是一个")
+    _check("方式 A 真的把这个键注给了 runtime",
+           key_oneclick in _env_keys_oneclick(),
+           "Memory 资源建了但没注入 id —— 这是最容易漏的一半，且症状与完全没做一模一样")
+
+    # 写入端 ∩ 读取端：strategy 往哪写、session.py 就得从哪读。
+    written = {ns for nss in oneclick["strategies"].values() for ns in nss}
+    read = _memory_namespaces_read()
+    _check("读取端的每个 namespace 都有 strategy 在往里写",
+           not (read - written),
+           f"session.py 检索这些 namespace，但没有任何 strategy 写它们（永远检索不到）：{sorted(read - written)}")
+    _check("每个 strategy 写的 namespace 都有人读",
+           not (written - read),
+           f"这些 strategy 在抽取、但 session.py 从不检索它们（白花抽取成本）：{sorted(written - read)}")
+
+
+def _invite_template_oneclick() -> str:
+    """方式 A 的 Cognito 邀请邮件那一段源码（地址常量 + `addPropertyOverride` 的模板对象）。
+
+    连地址常量一起截：正文里的地址是那个常量拼出来的，只看模板对象会看不到它从哪来。
+
+    用 `_balanced_end` 而不是正则截断：邮件正文里有 `{username}` / `{####}`，
+    非贪婪匹配会停在第一个 `}` 上（`_memory_oneclick` 已经踩过一次同样的坑）。
+    这两个占位符各自自带一对括号，所以按深度扫是平衡的。
+    """
+    text = _read(ONECLICK)
+    anchor = '"AdminCreateUserConfig.InviteMessageTemplate"'
+    i = text.find(anchor)
+    assert i > 0, f"{ONECLICK} 里找不到 {anchor} —— 邀请邮件模板被删了或换了写法"
+    j = text.find("{", i)
+    assert j > 0, f"{anchor} 之后找不到模板对象"
+    url_const = "const chatUrlForEmail"
+    k = text.rfind(url_const, 0, i)
+    assert k > 0, f"{ONECLICK} 里找不到 `{url_const}` —— 地址常量被改名了，本提取器要跟着改"
+    return text[k:_balanced_end(text, j)]
+
+
+def test_first_login_handoff_parity() -> None:
+    """首次登录交付：两条路径都必须让部署者**在拿到临时密码的同时拿到 Web Chat 地址**。
+
+    这一条的机制天生不同，所以不能按"模板要一模一样"来断言：
+      · 方式 B 有终端 —— `setup.sh` 用 `--message-action SUPPRESS` 建 admin（**不发邮件**），
+        把地址和临时密码一起打印在部署总结里。
+      · 方式 A 没有终端 —— 客户手里只有一个 CFN 模板，收到的唯一东西就是 Cognito 那封邮件，
+        所以地址必须写进邮件正文（Cognito 只认 `{username}` / `{####}` 两个占位符，
+        地址只能由 CFN 在部署期拼成字面量）。
+    断言的是**不变量**（密码与地址同时到手），不是实现。
+    """
+    print("\ntest_first_login_handoff_parity")
+    invite = _invite_template_oneclick()
+
+    for ph in ("{username}", "{####}"):
+        _check(f"方式 A 的邀请邮件带 {ph}",
+               ph in invite,
+               "Cognito 硬性要求这两个占位符都出现，缺一个 CFN 直接拒掉整个用户池")
+    _check("方式 A 的邀请邮件里带 ChatUrl",
+           "distributionDomainName" in invite,
+           "邮件里没有引用 ChatCDN 的域名 —— 客户又得回控制台翻 Outputs 才知道去哪登录")
+    _check("方式 A 的邮件文案是纯 ASCII",
+           invite.isascii(),
+           "客户可见文案里的非 ASCII 会被 CFN 收模板时换成 `?`"
+           "（scripts/postprocess_template.py 的全局断言同样会拦）")
+
+    setup_sh = _read(SETUP_SH)
+    _check("方式 B 建 admin 时明确不发邮件（--message-action SUPPRESS）",
+           "--message-action SUPPRESS" in setup_sh,
+           "方式 B 改成发邮件了 —— 那它也需要一份带地址的邀请模板，本断言要跟着改")
+    _check("方式 B 的部署总结把地址和临时密码一起打印",
+           "$CHAT_URL" in setup_sh and "$ADMIN_PASSWORD_MSG" in setup_sh,
+           "少了任何一半，方式 B 的部署者就得自己去找另一半")
+
+
 def main() -> int:
     print("=" * 72)
     print("方式 A（一键部署）与方式 B（setup.sh）的 web 功能一致性")
@@ -633,6 +927,8 @@ def main() -> int:
         test_runtime_lifecycle_matches()
         test_web_notif_producer_parity()
         test_operator_app_enabled_everywhere()
+        test_agentcore_memory_parity()
+        test_first_login_handoff_parity()
     except AssertionError as e:
         # 提取器找不到目标 = 有人改了源码的形态。必须失败而不是静默通过 ——
         # 静默通过的断言比没有断言更糟：它让人以为这件事有人守着。

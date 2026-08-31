@@ -99,7 +99,7 @@ Exactly **one parameter is required**:
 
 | Parameter | What it does |
 |---|---|
-| **Administrator email** | Your email. After the stack completes, Cognito emails a **temporary password** here. It must be a real mailbox — **this is the only way in**. |
+| **Administrator email** | Your email. After the stack completes, Cognito emails you the **sign-in URL (ChatUrl) + username + temporary password**. It must be a real mailbox — **this is the only way in**. |
 
 Everything else has a safe default. For a first deployment, **leave them all alone**:
 
@@ -137,13 +137,13 @@ Once the stack is **CREATE_COMPLETE**, open the **Outputs** tab:
 | **WebSearchStatus** | Whether this Region **supports** web search at all (anything other than us-east-1 skips the whole block — see [§2.8](#28-web-search-agentcore-web-search)). |
 | **WebSearchProvisioning** | Present only where the Region supports it: whether the gateway **actually got built**. `enabled` = the toggle works; `unavailable (<code>)` = it failed, so the toggle returns nothing (the stack itself still succeeds — see [§2.8](#28-web-search-agentcore-web-search)). |
 
-Open `ChatUrl` and sign in with:
+The link in that email **is** `ChatUrl` (the same address as in the table above — no need to cross-check them). Sign in with:
 
 - **Username: `admin`** (not the email address — though the email works too, it's configured as an alias)
 - **Password**: the temporary one from the email; you'll be asked to set a new one on first login
 
 > 📧 **No email?** The sender is `no-reply@verificationemail.com` (Cognito's default email delivery),
-> subject `Your temporary password`. **Corporate mail systems often tag it `[EXTERNAL]` or drop it
+> subject `Your NotiOps sign-in details`. **Corporate mail systems often tag it `[EXTERNAL]` or drop it
 > into junk** — check there first. Measured delivery: about a minute after stack completion in us-east-1.
 >
 > Truly lost: Cognito console → that user pool → Users → `admin` → reset the password.
@@ -221,21 +221,38 @@ The Notifications topic also has an **AWS Health Dashboard live view** that the 
 
 **Cross-account**: these 10 rules only see events from the **deployment account itself**. Getting member-account events here needs cross-account event forwarding, which is not part of this path (see [§0.1](#01-what-one-click-does-not-include)).
 
+### 2.10 Long-term memory (AgentCore Memory)
+
+**No parameter — the stack creates it for you.** The stack contains one **Bedrock AgentCore Memory**, which is how the agent remembers context across sessions: preferences you stated ("keep answers short", "I care most about cost"), facts about your environment, and a summary of each session. Four extractions each write to their own namespace:
+
+| Extraction | Namespace | What it holds |
+|---|---|---|
+| Semantic | `/users/<actor>/facts` | Facts about you and your environment |
+| User preference | `/users/<actor>/preferences` | How you want it to answer |
+| Summarization | `/summaries/<actor>/<session>` | What a single session was about |
+| Episodic | `/episodes/<actor>/<session>` | One complete troubleshooting / analysis run |
+
+- ⚠️ **In this release `<actor>` is a single identity shared by the whole deployment** (`default-user`) — **not** one per signed-in user. So when several people use the same deployment, "preferences" and "facts" are **shared**: a preference A stated will shape the answers B gets. Session-scoped summaries and episodes stay per-session and don't bleed across. If that matters to you, give each person their own deployment, or keep it single-user for now.
+- **Events expire after 30 days** (raw turns don't live here forever; the chat history itself is stored separately in the `notiops-web-chat` table).
+- **This is not "chat history"**: history lives in DynamoDB and is always visible in the UI; memory decides what the **model** still remembers. Without it, switch models / switch topics / come back an hour later and the history is still on screen — but the model is a stranger.
+- **Deleted with the stack**, events and extracted records together.
+- Billed by usage (events written + records extracted), and it's orders of magnitude smaller than the Bedrock tokens of the questions themselves.
+
 ---
 
 ## 3. What the stack creates
 
-**66 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 5 fewer with deep investigation off; 3 more if you pick multi-account):
+**68 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 5 fewer with deep investigation off; 3 more if you pick multi-account):
 
 | Category | Resources |
 |---|---|
 | Frontend | S3 website bucket + CloudFront distribution + CloudWatch RUM; report downloads go through a second CloudFront distribution (with a CloudFront Function that only lets report paths through) |
 | API | 1 Lambda (BFF) + Function URL (`AWS_IAM` auth, streaming) |
-| Agent | 1 Bedrock AgentCore Runtime |
+| Agent | 1 Bedrock AgentCore Runtime + 1 AgentCore Memory (long-term memory, see [§2.10](#210-long-term-memory-agentcore-memory)) |
 | Sign-in | Cognito User Pool + Client + Identity Pool + 8 groups (roles) |
 | Data | DynamoDB `notiops-config`, `notiops-web-chat`; 1 data bucket (reports etc.) |
 | Deployment helper | 1 staging bucket (for the staged artifacts) + 1 inline Lambda + 2 custom resources |
-| Permissions | 5 IAM roles + 5 inline policies |
+| Permissions | 6 IAM roles + 5 inline policies (the AgentCore Memory execution role has **no policy at all** — it is just a shell for the service to trust) |
 | Notifications inbox (see [§2.9](#29-notifications-inbox)) | **10 EventBridge rules** (5 ENABLED / 5 DISABLED) + 1 Lambda + its log group + 1 role (plus its policy) + 1 Lambda invoke permission = 15 |
 | Deep investigation (on by default) | 1 DevOps Agent agent space (**with its operator app enabled automatically**) + 1 read-only association + 1 role assumed by DevOps Agent (plus its policy) + 1 operator app role = 5 |
 | Web search (us-east-1 only) | 1 custom resource (creates the AgentCore gateway) + 1 gateway service role + 1 inline policy |
@@ -293,7 +310,8 @@ A new CloudFront distribution takes a few minutes to propagate. Wait 2–3 minut
 You can, with two catches:
 
 ```bash
-# The template is ~140 KB > the 51,200-byte --template-body limit, so it must go via S3 + --template-url
+# The template is over 200 KB (it grows with the resource count each release), well past the
+# 51,200-byte --template-body limit, so it must go via S3 + --template-url
 aws s3 cp notiops-webchat.template.json s3://<your-bucket>/notiops-webchat.template.json
 aws cloudformation create-stack --stack-name notiops \
   --template-url https://<your-bucket>.s3.<region>.amazonaws.com/notiops-webchat.template.json \
@@ -386,7 +404,7 @@ During deletion the stack's deployment Lambda first **empties** the website and 
 | CloudFront access logs, if you enabled them yourself | Not managed by this stack | As you like |
 | **In multi-account mode**: the `notiops-member-onboarding` / `notiops-member-devops-agent` StackSets, and Organizations trusted access for StackSets | **Deliberate.** (1) A StackSet can only be deleted once every stack instance is gone, and removing those wipes the cross-account roles in your member accounts — a cross-account destructive action shouldn't be triggered implicitly by deleting one stack. (2) Trusted access is an **organization-wide** switch; turning it off with our stack would break other people's StackSet deployments. | If you really want them gone: CloudFormation → StackSets → **Delete stacks from StackSet** (removes the instances), then delete the StackSet itself. Leave trusted access alone unless you're sure nobody else relies on it. |
 
-**No other orphans**: the agent's log group, the BFF's log group, the notification handler's log group, the deployment Lambda's log group, IAM roles, the Cognito user pool, the RUM app monitor, the AgentCore Runtime, the website bucket and the staging bucket were all verified to go away with the stack. The agent space and association created for deep investigation also go away with it (they are ordinary stack resources). The web-search AgentCore gateway splits two ways: one **this stack created** is deleted with the stack; one it **reused** (a pre-existing `notiops-websearch-gw` in the account, e.g. from `setup.sh`) is left alone — deleting one stack shouldn't take down something another deployment path still uses.
+**No other orphans**: the agent's log group, the BFF's log group, the notification handler's log group, the deployment Lambda's log group, IAM roles, the Cognito user pool, the RUM app monitor, the AgentCore Runtime, the website bucket and the staging bucket were all verified to go away with the stack. The agent space and association created for deep investigation also go away with it (they are ordinary stack resources). Same for the long-term-memory AgentCore Memory ([§2.10](#210-long-term-memory-agentcore-memory)) — an ordinary stack resource with **no** retention policy, deleted with the stack, taking the accumulated facts / preferences / summaries with it (this one is what the template declares; unlike the list above, it has not yet been verified by an actual stack deletion). The web-search AgentCore gateway splits two ways: one **this stack created** is deleted with the stack; one it **reused** (a pre-existing `notiops-websearch-gw` in the account, e.g. from `setup.sh`) is left alone — deleting one stack shouldn't take down something another deployment path still uses.
 
 ---
 

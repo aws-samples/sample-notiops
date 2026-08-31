@@ -99,7 +99,7 @@ notiops-webchat.template.json
 
 | 参数 | 说明 |
 |---|---|
-| **Administrator email** | 你的邮箱。栈开完后 Cognito 会往这里发一封带**临时密码**的邮件。必须是真实可收的邮箱 —— **这是唯一的入口**。 |
+| **Administrator email** | 你的邮箱。栈开完后 Cognito 会往这里发一封邮件，里面有**登录地址（ChatUrl）+ 用户名 + 临时密码**。必须是真实可收的邮箱 —— **这是唯一的入口**。 |
 
 其余都有安全的默认值，第一次部署**建议全部不动**：
 
@@ -139,13 +139,13 @@ notiops-webchat.template.json
 | **WebSearchStatus** | 这个区域**支持不支持**联网搜索（不是 us-east-1 就整块跳过，见 [§2.8](#28-联网搜索agentcore-web-search)）。 |
 | **WebSearchProvisioning** | 区域支持时才有：Gateway **到底建成了没有**。`enabled` = 开关可用；`unavailable (<错误码>)` = 建失败，开关点了没结果（栈本身照样成功，见 [§2.8](#28-联网搜索agentcore-web-search)）。 |
 
-打开 `ChatUrl`，用：
+邮件里那个链接就是 `ChatUrl`（和上面这张表里的 `ChatUrl` 是同一个地址，不用两边对），用：
 
 - **用户名：`admin`**（不是邮箱；邮箱也能登，它被配成了别名）
 - **密码**：邮件里的临时密码，首次登录会要求你改成新密码
 
 > 📧 **收不到邮件？** 发件人是 `no-reply@verificationemail.com`（Cognito 默认发信），
-> 主题 `Your temporary password`。**企业邮箱常常给它打上 `[EXTERNAL]` 标记或直接丢进垃圾邮件**
+> 主题 `Your NotiOps sign-in details`。**企业邮箱常常给它打上 `[EXTERNAL]` 标记或直接丢进垃圾邮件**
 > —— 先翻垃圾箱。实测在 us-east-1 从栈完成到收信约 1 分钟。
 >
 > 真的丢了：Cognito 控制台 → 该 user pool → Users → `admin` → 重设密码。
@@ -223,21 +223,38 @@ notiops-webchat.template.json
 
 **跨账号**：这 10 条规则只收**部署账号自己**的事件。成员账号的事件要回流到这里需要跨账号事件转发，那个不在这条路径里（见 [§0.1](#01-一键部署不包含什么)）。
 
+### 2.10 长期记忆（AgentCore Memory）
+
+**没有参数，栈自动建好。** 栈里有一个 **Bedrock AgentCore Memory**，agent 靠它记住跨会话的上下文：你说过的偏好（比如"回答短一点""我更关心成本"）、关于你环境的事实、以及每个会话的摘要。四类抽取各写各的命名空间：
+
+| 抽取 | 写到哪 | 记的是什么 |
+|---|---|---|
+| 语义 | `/users/<actor>/facts` | 关于你和你环境的事实 |
+| 用户偏好 | `/users/<actor>/preferences` | 你希望它怎么回答 |
+| 摘要 | `/summaries/<actor>/<会话>` | 单个会话讲了什么 |
+| 情节 | `/episodes/<actor>/<会话>` | 一次完整的排查/分析过程 |
+
+- ⚠️ **当前版本的 `<actor>` 是整个部署共用的一个身份**（`default-user`），**不是**每个登录用户一个。也就是说：同一个部署里多人使用时，"偏好"和"事实"是**共享**的 —— A 说过的偏好会影响 B 得到的回答。会话级的摘要/情节按会话隔离，不会串。介意这一点就一人一个部署，或者暂时只给单人用。
+- **事件 30 天后自动过期**（对话原文不会无限留在这里；聊天记录本身另存在 `notiops-web-chat` 表里）。
+- **它不是"对话历史"**：历史在 DynamoDB 里、界面上一直看得见；Memory 决定的是**模型还记不记得**。没有它，你切模型 / 切主题 / 隔一小时再回来，界面上历史还在，但模型是"新人"。
+- **删栈时随栈删除**，事件与抽取结果一起消失。
+- 计费按用量（写入的事件 + 抽取出的记录），量级远小于提问本身的 Bedrock token。
+
 ---
 
 ## 3. 这个栈建了什么
 
-默认参数下 **66 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 5 个；选上多账号多 3 个）：
+默认参数下 **68 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 5 个；选上多账号多 3 个）：
 
 | 类别 | 资源 |
 |---|---|
 | 前端 | S3 网站桶 + CloudFront distribution + CloudWatch RUM；报告下载走另一个 CloudFront distribution（带一个只放行报告路径的 CloudFront Function） |
 | 接口 | 1 个 Lambda（BFF）+ Function URL（`AWS_IAM` 鉴权，流式返回） |
-| Agent | 1 个 Bedrock AgentCore Runtime |
+| Agent | 1 个 Bedrock AgentCore Runtime + 1 个 AgentCore Memory（长期记忆，见 [§2.10](#210-长期记忆agentcore-memory)） |
 | 登录 | Cognito User Pool + Client + Identity Pool + 8 个用户组（角色） |
 | 数据 | DynamoDB `notiops-config`、`notiops-web-chat`；1 个数据桶（报告等） |
 | 部署辅助 | 1 个 staging 桶（放搬进来的产物）+ 1 个内联的部署 Lambda + 2 个自定义资源 |
-| 权限 | 5 个 IAM 角色 + 5 个内联策略 |
+| 权限 | 6 个 IAM 角色 + 5 个内联策略（其中 AgentCore Memory 的执行角色**一条策略都没有** —— 它只是给服务用来信任的壳） |
 | 「通知」收件箱（见 [§2.9](#29-通知收件箱)） | **10 条 EventBridge 规则**（5 条 ENABLED / 5 条 DISABLED）+ 1 个 Lambda + 它的日志组 + 1 个角色（+ 策略）+ 1 条 Lambda 调用许可 = 15 个 |
 | 深度调查（默认开） | 1 个 DevOps Agent Agent Space（**含自动开好的 Operator App**）+ 1 个只读关联 + 1 个被 DevOps Agent 假设的角色（+ 它的策略）+ 1 个 Operator App 角色 = 5 个 |
 | 联网搜索（仅 us-east-1） | 1 个自定义资源（去建 AgentCore Gateway）+ 1 个 Gateway 服务角色 + 1 个内联策略 |
@@ -297,7 +314,7 @@ CloudFront 分发要几分钟才在全球生效。先等 2–3 分钟、强刷�
 可以，但有两个坑：
 
 ```bash
-# 模板 ~140 KB > --template-body 的 51,200 字节上限 ⇒ 必须先传 S3、用 --template-url
+# 模板 200 KB 出头（随资源数逐版增长），远超 --template-body 的 51,200 字节上限 ⇒ 必须先传 S3、用 --template-url
 aws s3 cp notiops-webchat.template.json s3://<你的桶>/notiops-webchat.template.json
 aws cloudformation create-stack --stack-name notiops \
   --template-url https://<你的桶>.s3.<区域>.amazonaws.com/notiops-webchat.template.json \
@@ -388,7 +405,7 @@ CloudFormation → 选中栈 → **Delete**。**实测**：`KeepData` ~**3 分 1
 | CloudFront 的访问日志（如果你自己开过） | 不由这个栈管理 | 按需 |
 | **多账号模式下**：`notiops-member-onboarding` / `notiops-member-devops-agent` 两个 StackSet，以及 Organizations 对 StackSets 的信任访问 | **故意留的。** ① StackSet 要先删掉全部 stack instance 才删得掉，而那等于抹掉各成员账号里的跨账号角色 —— 这种跨账号的破坏性动作不该由"删一个栈"隐式触发；② 信任访问是**组织级**开关，删我们的栈就把它关掉会打断组织里别人的 StackSets 部署。 | 确实不要了：先在 CloudFormation → StackSets 里 **Delete stacks from StackSet**（删实例），再删 StackSet 本身。信任访问除非你确认没别人在用，否则别关。 |
 
-**没有**其他孤儿：agent 的日志组、BFF 的日志组、「通知」函数的日志组、部署 Lambda 的日志组、IAM 角色、Cognito 用户池、RUM app monitor、AgentCore Runtime、网站桶、staging 桶 —— 实测全部随栈删除。深度调查建的 Agent Space 与关联也随栈删除（它是栈里的普通资源）。联网搜索的 AgentCore Gateway 分两种：**这个栈建出来的**随栈删除；**它复用的别人的**（同账号里已经存在的 `notiops-websearch-gw`，比如 `setup.sh` 建的）留着不动 —— 删一个栈不该顺手拆掉另一条部署路径还在用的东西。
+**没有**其他孤儿：agent 的日志组、BFF 的日志组、「通知」函数的日志组、部署 Lambda 的日志组、IAM 角色、Cognito 用户池、RUM app monitor、AgentCore Runtime、网站桶、staging 桶 —— 实测全部随栈删除。深度调查建的 Agent Space 与关联也随栈删除（它是栈里的普通资源）。长期记忆的 AgentCore Memory（[§2.10](#210-长期记忆agentcore-memory)）同理 —— 它是栈里的普通资源、**没有**保留策略，随栈删除，里面攒的 facts / preferences / 摘要一起消失（这条是按模板声明说的，还没像上面那串一样删栈实测过）。联网搜索的 AgentCore Gateway 分两种：**这个栈建出来的**随栈删除；**它复用的别人的**（同账号里已经存在的 `notiops-websearch-gw`，比如 `setup.sh` 建的）留着不动 —— 删一个栈不该顺手拆掉另一条部署路径还在用的东西。
 
 ---
 

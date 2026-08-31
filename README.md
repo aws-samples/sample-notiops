@@ -169,6 +169,7 @@ mode comparison and how to switch — see
 | Deep investigation (Direct — token-free) | ✅ see note ¹ | ✅ |
 | DevOps Chat (your own DevOps Agent answers a general chat directly) | ✅ see note ¹ | ✅ |
 | Web search (AgentCore Web Search) | ✅ see note ² | ✅ see note ² |
+| Long-term memory (remembers your preferences and facts across sessions) | ✅ see note ³ | ✅ see note ³ |
 | **Cost / FinOps** | | |
 | FinOps dashboard (Cost Explorer data) | ✅ deploy account only | ✅ cross-account |
 | CUR + Athena billing-detail drill-down | ❌ | ✅ |
@@ -207,6 +208,20 @@ mode comparison and how to switch — see
 > `WebSearchStatus` stack output says why, and Option B's `./setup.sh` says so in the
 > deploy log. Note the toggle is **not** greyed out (the UI does no Region check):
 > clicking it doesn't error, you just get no results.
+
+> ³ **Long-term memory needs v1.0.19 or later on both paths.** It uses four AgentCore
+> Memory namespaces: facts extracted from your conversations, preferences you state
+> explicitly, a summary per session, and episodes. Extraction is **asynchronous** — after
+> you state a preference, give it a minute or two before starting a new session to see it
+> honoured. ⚠️ The memory actor is currently **one identity shared by the whole
+> deployment**: facts and preferences extracted from any user's conversations are visible
+> to every signed-in user of that deployment (session summaries and episodes stay within
+> their own session, and chat history remains per user). If that is not acceptable, deploy
+> separate stacks. The memory resource carries **no retention policy**: deleting the stack
+> deletes it and everything accumulated in it. Before v1.0.19 Option A never created the
+> resource at all, and Option B had it but discarded every retrieval behind a relevance
+> threshold — both paths need this release for the feature to actually work. See the
+> release notes for details.
 
 > 📋 **The AWS Support features (create / view / reply / resolve) require the
 > account to be on a Business, Enterprise On-Ramp, or Enterprise support plan** —

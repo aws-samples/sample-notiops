@@ -23,6 +23,7 @@
  */
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
+import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as events from "aws-cdk-lib/aws-events";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
@@ -48,6 +49,20 @@ const INFRA_DIR = path.join(__dirname, "..");
 
 /** AgentCore Runtime 名（只允许字母数字下划线，不能带连字符）。 */
 const RUNTIME_NAME = "notiops_web_chat";
+
+/**
+ * AgentCore Memory 名。**这个字面量决定了 agent 侧要读哪个环境变量**：
+ * `setup.sh` 那条路上是 AgentCore CLI 按 `agentcore.json` 里声明的 memory 名推导出
+ * `MEMORY_<名字大写去掉非字母数字>_ID` 注入的，而消费方 `memory/session.py` 写死读
+ * `MEMORY_NOTIOPSWEBCHATMEMORY_ID`。所以这里必须叫 `NotiOpsWebChatMemory` ——
+ * 名字一改，env 键就对不上，长期记忆会**静默**失效（`get_memory_session_manager()`
+ * 返回 None，对话照常，只是不再有服务端记忆）。判据在 scripts/test_oneclick_parity.py。
+ *
+ * 与方式 B 现网那个 Memory 的名字（`NotiOpsWebChat_NotiOpsWebChatMemory`，CLI 加了应用名
+ * 前缀）**故意不同**：Memory 的 `Name` 是 createOnly 且账号内唯一，同名会让两条路径没法
+ * 共存在一个账号里 —— 那是 CREATE_FAILED，不是降级。Runtime 名也是这么处理的。
+ */
+const MEMORY_NAME = "NotiOpsWebChatMemory";
 
 /** `_` 开头的键是**文档键**（里面写的是中文说明），递归剥掉。 */
 function stripDocKeys(node: unknown): unknown {
@@ -690,6 +705,72 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       deepInvestigationEnabled.logicalId, agentSpace.attrAgentSpaceId, "",
     ).toString();
 
+    // ══ AgentCore Memory（长期记忆）════════════════════════════════════════════
+    // 这是**产品功能**，不是基础设施细节：BFF 每一轮只发 `prompt`（bff/web-chat/
+    // agentcore.mjs 的 buildRuntimePayload 里没有任何历史），所以模型能接上上文全靠两件事
+    // 之一 —— ① 容器里那个 Agent 对象还活在 LRU 缓存里（core/agent_cache.py），
+    // ② Memory 的 session manager 把历史读回来（memory/session.py）。
+    // 没有 ② 的时候，只要缓存那一格被顶掉，模型就**当场失忆**，而界面上历史还在
+    // （历史存 DynamoDB，跟模型看得见什么无关）—— 换模型、换主题、换账号、开关深度调查、
+    // 管理员存一次配置、凭证轮换、闲置 1 小时、8 小时最长寿命、重新部署，全都会顶掉那一格。
+    // 客户看到的症状是「它刚刚还知道，现在突然不认了」。
+    //
+    // 方式 B 的真源是 agent-build/NotiOpsWebChat/agentcore/agentcore.json 的 `memories` 块，
+    // 由 AgentCore CLI 建资源、并把 memory id 注进 runtime 环境变量。这里逐条对齐它：
+    // 4 个 strategy、同样的 namespace 模板、同样的 30 天事件保留期。
+    // 判据在 scripts/test_oneclick_parity.py（第 ⑦ 个维度）。
+    //
+    // 刻意**不设** RemovalPolicy.RETAIN（跟 Runtime 一样随栈删）。两个理由：
+    // `Name` 是 createOnly 且账号内唯一 —— 留下来的话，删栈重建会撞同名而 CREATE_FAILED；
+    // 而 Memory 里的事件本来就只留 30 天，长期价值远低于 DynamoDB 里的对话记录
+    // （那三个资源才是 `Retain` + `TeardownMode` 管的对象）。
+    const memoryRole = new iam.Role(this, "AgentMemoryRole", {
+      assumedBy: new iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
+      description: "AgentCore Memory execution role",
+      // **故意没有任何权限**。4 个 strategy 都是 AgentCore 托管的抽取（没有自定义模型
+      // 覆盖），抽取用的是服务自己的身份；这个角色只是 CreateMemory 要求的一个句柄。
+      // 与方式 B 现网那个 CLI 建出来的角色逐条一致（实测：0 条内联策略、0 条托管策略，
+      // 而 /users/default-user/facts 下确实有抽取出来的 memory record）。
+      // 想给它加权限之前先问一句「哪个 API 会用这个身份去调什么」——答不出来就别加。
+    });
+
+    const memory = new cdk.CfnResource(this, "AgentMemory", {
+      type: "AWS::BedrockAgentCore::Memory",
+      properties: {
+        Name: MEMORY_NAME,
+        Description: "NotiOps Web Chat long-term memory (one-click deployment)",
+        // 事件保留期（天）。与 agentcore.json 的 eventExpiryDuration 一致。
+        EventExpiryDuration: 30,
+        MemoryExecutionRoleArn: memoryRole.roleArn,
+        // 每个 wrapper 对象只能带**一个** strategy（schema 里 maxProperties=1）。
+        // 只写 `NamespaceTemplates`（不写 `Namespaces`）——与 agentcore.json 用的是同一个
+        // 输入字段，服务端会把它镜像到 Namespaces（现网那个 Memory 就是这么来的）。
+        // 这四个 namespace 必须与 memory/session.py 的 retrieval_config **逐字**对上：
+        // 写入端和读取端对不上时不报错，只是永远检索不到东西。
+        MemoryStrategies: [
+          { SemanticMemoryStrategy: {
+            Name: `${MEMORY_NAME}_Semantic`,
+            NamespaceTemplates: ["/users/{actorId}/facts"],
+          } },
+          { UserPreferenceMemoryStrategy: {
+            Name: `${MEMORY_NAME}_Userpreference`,
+            NamespaceTemplates: ["/users/{actorId}/preferences"],
+          } },
+          { SummaryMemoryStrategy: {
+            Name: `${MEMORY_NAME}_Summarization`,
+            NamespaceTemplates: ["/summaries/{actorId}/{sessionId}"],
+          } },
+          { EpisodicMemoryStrategy: {
+            Name: `${MEMORY_NAME}_Episodic`,
+            NamespaceTemplates: ["/episodes/{actorId}/{sessionId}"],
+            // 反思（把多个 episode 归纳成跨会话的经验）落在**去掉 sessionId** 的
+            // 上一层 namespace 上 —— 对应 agentcore.json 的 reflectionNamespaceTemplates。
+            ReflectionConfiguration: { NamespaceTemplates: ["/episodes/{actorId}"] },
+          } },
+        ],
+      },
+    });
+
     // ══ AgentCore Runtime（同栈资源）══════════════════════════════════════════
     // 这是一键部署与 `setup.sh` 路径最大的结构差异：那条路上 agent 是用
     // `agentcore deploy` 单独部署、再把 ARN 用 `-c agentRuntimeArn=` 传回 CDK 的（两步、
@@ -701,9 +782,6 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // agent-build/NotiOpsWebChat/agentcore/cdk/lib/cdk-stack.ts:116-396）。两条路径的 web
     // 功能必须一致 —— 少一条授权的后果不是"功能没做"，而是"界面上有开关、点了静默失败"。
     // `scripts/test_oneclick_parity.py` 会断言这两份清单不漂移。
-    //
-    // 唯一有意不给的是 AgentCore Memory：本栈不建 Memory 资源，而 grep 过 core/ 与 agent/，
-    // 没有任何代码读 MEMORY_* 环境变量 —— 那条授权在两条路径上都是死权限。
     const runtimeRole = new iam.Role(this, "AgentRuntimeRole", {
       assumedBy: new iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
       description: "AgentCore Runtime execution role",
@@ -869,6 +947,43 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       actions: ["bedrock-agentcore:InvokeGateway"],
       resources: [`arn:${this.partition}:bedrock-agentcore:${this.region}:${this.account}:gateway/*`],
     }));
+    // AgentCore Memory（上面那个资源）—— 长期记忆的读写面，与方式 B 现网那个 CLI 生成的
+    // 执行角色**逐条一致**（实测抄自方式 B 那条路径上 CLI 生成的 runtime 执行角色内联策略）。
+    // 分成三条不是洁癖：ListMemoryRecords 走 `namespacePath`（按前缀列），
+    // RetrieveMemoryRecords 走 `namespace`（精确检索），两个条件键不能写在一条里；
+    // 第三条那组 API 没有 namespace 条件键可用，只能落在 Memory 资源本身上。
+    // 条件里的四个前缀 = memory/session.py 那四个 namespace，收得比 `*` 紧。
+    //
+    // 注意 CreateEvent / DeleteEvent / DeleteMemoryRecord 是**写**动作，但**不违反只读承诺**：
+    // 写的对象是 agent 自己的会话记忆，不是客户的 AWS 资源。少了 CreateEvent 的失败模式最
+    // 隐蔽 —— 检索照常（历史读得回来），但这一轮的对话永远存不进去，于是"记忆只到某天为止"。
+    const memoryNamespacePrefixes = [
+      "/users/*/facts", "/users/*/preferences", "/summaries/*/*", "/episodes/*/*",
+    ];
+    const memoryArn = memory.getAtt("MemoryArn").toString();
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      sid: "NotiOpsMemoryRetrieve",
+      actions: ["bedrock-agentcore:ListMemoryRecords", "bedrock-agentcore:RetrieveMemoryRecords"],
+      resources: [memoryArn],
+      conditions: { StringLike: { "bedrock-agentcore:namespace": memoryNamespacePrefixes } },
+    }));
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      sid: "NotiOpsMemoryRetrieveByPath",
+      actions: ["bedrock-agentcore:ListMemoryRecords", "bedrock-agentcore:RetrieveMemoryRecords"],
+      resources: [memoryArn],
+      conditions: { StringLike: { "bedrock-agentcore:namespacePath": memoryNamespacePrefixes } },
+    }));
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      sid: "NotiOpsMemoryEvents",
+      actions: [
+        "bedrock-agentcore:CreateEvent", "bedrock-agentcore:DeleteEvent",
+        "bedrock-agentcore:DeleteMemoryRecord", "bedrock-agentcore:GetEvent",
+        "bedrock-agentcore:GetMemory", "bedrock-agentcore:GetMemoryRecord",
+        "bedrock-agentcore:ListActors", "bedrock-agentcore:ListEvents",
+        "bedrock-agentcore:ListSessions",
+      ],
+      resources: [memoryArn],
+    }));
     // 模型目录 / RBAC 等配置（agent 侧也要读，例如按角色裁剪工具）。
     runtimeRole.addToPolicy(new iam.PolicyStatement({
       sid: "ReadNotiOpsConfig",
@@ -931,6 +1046,11 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           // 只给 M1 真的有的那几个。空串在部分 AgentCore 校验下会被拒，
           // 缺省项一律**不写**（agent 侧都是 os.environ.get(..., "")）。
           SKILLS_BUCKET: base.dataBucket.bucketName,
+          // 长期记忆。键名不是随便起的：它是 AgentCore CLI 从 memory 名推导出来的形式
+          // （`MEMORY_` + 名字大写去掉非字母数字 + `_ID`），而 memory/session.py 写死读它。
+          // 键错/缺 → `get_memory_session_manager()` 返回 None → 对话照常但**没有记忆**，
+          // 不报错、不写日志。所以这里**不加任何条件**：长期记忆不是可选功能。
+          MEMORY_NOTIOPSWEBCHATMEMORY_ID: memory.getAtt("MemoryId").toString(),
           // 报告分发 CDN。缺这个键 core/reports.py 退回 12h presigned URL，与「7 天有效」
           // 的产品承诺和桶生命周期都不符（见 minimal-base-core.ts 的 ReportsCDN）。
           REPORTS_CDN_DOMAIN: base.reportsCdnDomain,
@@ -984,6 +1104,47 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // 所以它也必须等搬完。放在 CDK 里声明而不是让 postprocess 补 DependsOn：
     // 依赖关系属于栈的语义，越少交给正则改写越好。
     (webchat.bff.node.defaultChild as lambda.CfnFunction).addDependency(stagerArtifacts);
+
+    // ══ 邀请邮件里带上 ChatUrl ═════════════════════════════════════════════════
+    // 方式 A 的客户手里只有一个模板：部署完他收到的**唯一**东西就是 Cognito 那封临时密码
+    // 邮件。默认文案只有「用户名 + 临时密码」，地址得他自己回控制台翻 Outputs —— 所以把
+    // ChatUrl 直接写进邮件。
+    //
+    // 三个约束决定了这里只能这么写：
+    // 1. **占位符只有两个**（`{username}` / `{####}`，见 Cognito 文档「Customizing user
+    //    invitation messages」，两个都是**必须出现**的）。没有 `{url}` 这种东西，所以
+    //    地址必须在部署期由 CFN 拼成字面量。
+    // 2. **HTML**。Cognito 的邮件按 HTML 渲染（文档原文：may use HTML tags in your email
+    //    messages），裸 `\n` 不会换行。所以用 `<p>` / `<br>` / `<a href>` —— 顺带让链接可点。
+    // 3. **纯 ASCII**。客户可见文案里的非 ASCII 会被 CFN 收模板时换成 `?`
+    //    （`scripts/postprocess_template.py` 的全局断言就是为这个）。
+    //
+    // 为什么是 `addPropertyOverride` 而不是建 UserPool 时的 `userInvitation`：地址来自
+    // `ChatCDN`，而 UserPool 在 `createMinimalBase()` 里、比 `createWebChatCore()` 早建。
+    // override 只改渲染出来的模板 JSON，与构造顺序无关；用嵌套路径写是为了**不覆盖**
+    // 同一个 `AdminCreateUserConfig` 里 CDK 自己放的 `AllowAdminCreateUserOnly: true`。
+    //
+    // 依赖方向变成 UserPool → ChatCDN。**不成环**：ChatCDN 只依赖网站桶与 OAI，两者都不
+    // 碰 Cognito（`cdk synth` 会替我们把这件事钉死 —— 成环的话它直接报错）。
+    //
+    // 方式 B 不需要对等改动：那条路 `setup.sh` 用 `--message-action SUPPRESS` 建 admin，
+    // **根本不发邮件**，而是把 Web Chat 地址和临时密码一起打印在部署总结里（setup.sh
+    // 「👉 从这里开始」那块）。所以两条路径上「拿到密码的同时就拿到地址」这件事是一致的。
+    const chatUrlForEmail = `https://${webchat.distribution.distributionDomainName}`;
+    (base.userPool.node.defaultChild as cognito.CfnUserPool).addPropertyOverride(
+      "AdminCreateUserConfig.InviteMessageTemplate",
+      {
+        EmailSubject: "Your NotiOps sign-in details",
+        EmailMessage: cdk.Fn.join("", [
+          "<p>Your NotiOps deployment is ready.</p>",
+          '<p><b>Open NotiOps:</b> <a href="', chatUrlForEmail, '">', chatUrlForEmail, "</a></p>",
+          "<p><b>Username:</b> {username}<br>",
+          "<b>Temporary password:</b> {####}</p>",
+          "<p>You will be asked to choose a new password when you sign in for the first time. ",
+          "You can also sign in with the email address this message was sent to.</p>",
+        ]),
+      },
+    );
 
     // ── Phase=Site：前端 + config.json + 第一个管理员 ──
     // 为什么必须与 Artifacts 分成两个自定义资源：`configJson` 里含 BFF 的 Function URL
@@ -1247,9 +1408,9 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     new cdk.CfnOutput(this, "NextSteps", {
       description: "How to log in",
       value: cdk.Fn.join("", [
-        "Cognito emailed a temporary password to ",
+        "Cognito emailed the ChatUrl and a temporary password to ",
         adminEmail.valueAsString,
-        ". Open the ChatUrl output and sign in as 'admin' (or with that email address), ",
+        ". Open that link and sign in as 'admin' (or with that email address), ",
         "then set a new password.",
       ]),
     });
@@ -1285,6 +1446,14 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           "Off (EnableDeepInvestigation=No). Update the stack to turn it on later.",
         ).toString(),
       ).toString(),
+    });
+    // 长期记忆：这个 Output 的价值不是让客户去用这个 id，而是给发布回归一个**能核对的判据**。
+    // 历史教训是「长期记忆没生效」完全是静默的 ——
+    // 界面上历史照常显示，只有模型不记得了。把 id 摊出来，就能一条命令核对：
+    // 这个 id 和 runtime 环境变量 MEMORY_NOTIOPSWEBCHATMEMORY_ID 的值必须相同。
+    new cdk.CfnOutput(this, "MemoryId", {
+      description: "AgentCore Memory backing long-term memory (must match the runtime's MEMORY_NOTIOPSWEBCHATMEMORY_ID)",
+      value: memory.getAtt("MemoryId").toString(),
     });
     // 联网搜索同理：不写清楚的话，「开关点了没结果」这种情况客户只能猜。
     // **拆成两个 Output**，理由和上面 DevOpsAgentSpaceId 一样：真结果只有那个带条件的自定义

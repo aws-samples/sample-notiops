@@ -257,7 +257,7 @@ export class BotStack extends cdk.Stack {
 
     // S3 — MCP 规格快照（mcp-snapshots/ 前缀，见 core/mcp_snapshot.py）
     // 为什么 IM 侧也要：三个 MCP 模块（finops / investigation / aws_api）是**两棵树共用
-    // 同一份源码**（tests/test_core_tree_parity.py 锁字节一致），所以 IM 容器同样会先试着
+    // 同一份源码**（有单元测试锁两棵树字节一致），所以 IM 容器同样会先试着
     // 读快照。没有这条授权时它会 AccessDenied → 失败安全退回"先拉起子进程"（慢但对），
     // 但每次容器启动会留下 6 条 AccessDenied，看起来像故障而其实不是。
     // 收益比 web 侧小得多（Fargate 容器长驻，冷启动只在部署/换任务时付一次），但同样是真的。

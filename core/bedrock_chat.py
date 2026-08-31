@@ -2053,7 +2053,7 @@ def _invoke_with_tools_responses(user_text: str, locale: str,
 # Test hooks (importable, no AWS calls)
 # ---------------------------------------------------------------------------
 def _is_change_request_for_test(text: str) -> bool:
-    """Public-by-convention alias used by unit tests in
-    `tests/test_bedrock_chat.py`. Mirrors `_is_change_request` but lives
-    under a non-underscore name so test imports are self-documenting."""
+    """Public-by-convention alias used by the unit tests. Mirrors
+    `_is_change_request` but lives under a non-underscore name so test
+    imports are self-documenting."""
     return _is_change_request(text)

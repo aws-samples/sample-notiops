@@ -1,27 +1,64 @@
 AWSTemplateFormatVersion: "2010-09-09"
+
+# 🔴 **所有 `Description:` 字段必须是纯 ASCII 英文。**
+#
+# 2026-08-26 实测：CloudFormation 把 Description 里的非 ASCII 全部渲染成 `?`，
+# 客户在「快速创建堆栈」页上看到的是一屏问号 —— 看不出模板建什么、参数填什么，
+# 而且不报错。（先怀疑是 S3 content-type 少 charset=utf-8，加上仍是问号，
+# 所以是 CFN 服务端行为。）
+#
+# ⚠️ 这个模板**给客户看**（跨账号接入时客户在自己账号里点开部署），客户可能是
+#    任何语言环境，所以英文也是对的。中文判据留在 `#` 注释里，不进 CFN。
+#
+# 中文原文（本模板做什么）：
+#   在业务账号内创建 NotiOps 多账号接入所需的全部资源：
+#   1. notiops-idle-detection-role — 系统账号跨账号只读采集角色
+#      （RDS/ElastiCache/CW/TA/CE/COH 等）——**巡检采集就靠它**
+#   2. DevOps Agent 事件转发 — EventBridge Rule + Role，把 aws.aidevops
+#      调查事件转发到系统账号 Custom Bus
+#   3. (可选) PHD 事件转发 — 把 AWS Health 事件转发到系统账号 SNS Topic
+#   4. (可选) CloudWatch OAM Link — 把 metrics/logs/traces 共享给管理账号
+#   通过 StackSets 从管理账号批量下发；也可在单个业务账号手动部署。
 Description: >
-  NotiOps member account onboarding (StackSet payload).
-  在业务账号内创建 NotiOps 多账号接入所需的全部资源：
-  1. notiops-idle-detection-role — 系统账号跨账号只读采集角色（RDS/ElastiCache/CW/TA/CE/COH 等）
-  2. (可选) DevOps Agent 事件转发 — EventBridge Rule + Role，把 aws.aidevops 调查事件转发到系统账号 Custom Bus
-  3. (可选) PHD 事件转发 — EventBridge Rule + Role，把 AWS Health 事件转发到系统账号 SNS Topic
-  通过 CloudFormation StackSets (service-managed) 从管理账号批量下发；
-  也可在单个业务账号手动部署（aws cloudformation deploy）。
+  NotiOps member-account onboarding (StackSet payload). Creates everything
+  NotiOps needs to inspect and investigate this account from the management
+  account:
+  (1) a cross-account READ-ONLY role the management account assumes to collect
+  RDS / ElastiCache / CloudWatch / Trusted Advisor / Cost data - resource
+  inspection depends on this role;
+  (2) optionally, an EventBridge rule + role that forwards AWS DevOps Agent
+  investigation events to the management account's custom event bus;
+  (3) optionally, forwarding of AWS Health (PHD) events to a management-account
+  SNS topic;
+  (4) optionally, a CloudWatch OAM link sharing metrics/logs/traces.
+  Deployed via StackSets (service-managed) from the management account, or
+  manually in a single account (aws cloudformation deploy).
+  No write permissions are granted to any resource in this account.
 
 Parameters:
   SystemAccountId:
     Type: String
-    Description: NotiOps 系统部署账号 ID（12 位数字）
+    # 中文：NotiOps 系统部署账号 ID（12 位数字）
+    Description: >
+      Account id of the NotiOps deployment (the management account). The
+      read-only role created here will trust this account.
     AllowedPattern: "[0-9]{12}"
     ConstraintDescription: Must be a 12-digit AWS account ID
 
   OrganizationId:
     Type: String
     Default: ""
+    # 中文：(可选但强烈建议) AWS Organizations ID (o-xxxx)。非空时给跨账号信任策略加
+    #       aws:PrincipalOrgID 条件做纵深防御：即便信任了系统账号 root，也只有本组织内的
+    #       principal 能 AssumeRole，杜绝跨组织混淆代理（confused deputy）。
+    # ⚠️ 跨 Org 接入时**必须留空** —— 填了条件永远不成立，AssumeRole 全部被拒。
     Description: >
-      (可选但强烈建议) AWS Organizations ID (o-xxxx)。非空时给跨账号信任策略加
-      aws:PrincipalOrgID 条件做纵深防御：即便信任了系统账号 root，也只有本组织内的
-      principal 能 AssumeRole，杜绝跨组织混淆代理（confused deputy）。
+      Optional but recommended when this account is in the SAME AWS Organization
+      as the NotiOps deployment: the organization id (o-xxxx). It adds an
+      aws:PrincipalOrgID condition to the trust policies as defense in depth
+      against the confused-deputy problem.
+      LEAVE EMPTY if this account is in a different organization - otherwise the
+      condition can never be satisfied and every AssumeRole will be denied.
     AllowedPattern: "^(o-[a-z0-9]{10,32})?$"
     ConstraintDescription: Must be an AWS Organizations ID (o-xxxx) or empty
 
@@ -29,34 +66,45 @@ Parameters:
     Type: String
     Default: ""
     Description: >
-      (可选) 系统账号 Custom Event Bus ARN
-      (e.g. arn:aws:events:us-east-1:<system-account-id>:event-bus/notiops-devops-events)。
-      留空则不部署 DevOps Agent 调查事件转发 —— 一键部署(Web Chat only)那条路径上
-      系统账号里没有这条总线，也没有消费它的回调 Lambda，只需要本模板的跨账号只读角色。
+      Optional. ARN of the custom EventBridge bus in the management account that
+      DevOps Agent investigation events are forwarded to.
+      Example: arn:aws:events:ap-northeast-1:123456789012:event-bus/notiops-devops-events
+      Leave empty to skip the forwarding rule entirely - the one-click
+      (Web Chat only) deployment has no such bus and no callback Lambda
+      consuming it, so it only needs the cross-account read-only role below.
     AllowedPattern: "^(arn:aws:events:[a-z0-9-]+:[0-9]{12}:event-bus/.+)?$"
     ConstraintDescription: Must be a valid EventBridge event bus ARN, or empty
 
   PhdSnsTopicArn:
     Type: String
     Default: ""
+    # 中文：(可选) 系统账号 PHD SNS Topic ARN。留空则不部署 PHD 转发。
     Description: >
-      (可选) 系统账号 PHD SNS Topic ARN (e.g. arn:aws:sns:us-east-1:<system-account-id>:phd-events)。
-      留空则不部署 PHD 转发。
+      Optional. ARN of the management-account SNS topic that AWS Health (PHD)
+      events are forwarded to. Leave empty to skip PHD forwarding.
+      Example: arn:aws:sns:ap-northeast-1:123456789012:phd-events
 
   ObservabilitySinkArn:
     Type: String
     Default: ""
+    # 中文：(可选) 管理账号 CloudWatch OAM Sink ARN。非空时创建 oam:Link，把本账号
+    #       metrics/logs/traces 共享给管理账号（跨账号 observability / 调查关联分析）。
     Description: >
-      (可选) 管理账号 CloudWatch OAM Sink ARN。非空时创建 oam:Link，把本账号
-      metrics/logs/traces 共享给管理账号（跨账号 observability / 调查关联分析）。
+      Optional. ARN of a CloudWatch Observability Access Manager sink in the
+      management account. When set, an OAM link is created so this account's
+      metrics, logs and traces can be read cross-account. Leave empty to skip.
 
   PrimaryRegion:
     Type: String
     Default: "us-east-1"
+    # 中文：主 Region（=系统部署 Region）。IAM 角色是全局资源，只在主 Region 的
+    #       stack instance 创建；其余 Region 的 instance 只创建 EventBridge 转发规则
+    #       （引用同名角色 ARN）。借此同一 StackSet 可按账号多 Region 下发。
     Description: >
-      主 Region（=系统部署 Region）。IAM 角色是全局资源，只在主 Region 的 stack instance
-      创建；其余 Region 的 instance 只创建 EventBridge 转发规则（引用同名角色 ARN）。
-      借此同一 StackSet 可按账号多 Region 下发（跨 Region 事件也能转发回系统总线）。
+      The region where NotiOps is deployed. IAM roles are global, so they are
+      created only by the stack instance in this region; instances in other
+      regions create just the EventBridge forwarding rules and reference the
+      same role. Set this to the NotiOps deployment region.
 
 Conditions:
   EnableOamLink: !And
@@ -117,8 +165,20 @@ Resources:
                 Action:
                   - rds:DescribeDBInstances
                   - rds:ListTagsForResource
+                  # 资源巡检的变更事件抑制（R2.5）：刚扩容/刚重启的实例本轮不报。
+                  # 缺它巡检不会失败，但抑制条件恒不成立 —— 客户在维护窗口后
+                  # 第一天会收到一批本该被压掉的告警。
+                  # 注：rds:DescribeDBClusters 已在下方 EOS 那段声明（Aurora 巡检也用它）。
+                  - rds:DescribeEvents
+                  # 引擎 EOL 判定（结构性风险页）。缺它那一整类 finding
+                  # 永远为空，而页面上与「没有 EOL 风险」无法区分。
+                  - rds:DescribeDBMajorEngineVersions
+                  # CA 证书到期规则。缺它那条规则永远不命中，而与「没有证书
+                  # 风险」无法区分。RDS CA 到期是硬期限（到点连不上）。
+                  - rds:DescribeCertificates
                   - elasticache:DescribeCacheClusters
                   - elasticache:DescribeReplicationGroups
+                  - elasticache:DescribeEvents
                   - elasticache:ListTagsForResource
                   - cloudwatch:GetMetricData
                   - cloudwatch:GetMetricStatistics
@@ -147,6 +207,23 @@ Resources:
                   - cloudformation:DescribeStacks
                   # Lifecycle/EOS 仪表盘跨账号扫描（版本生命周期盘点，全部只读）
                   - ec2:DescribeRegions
+                  # 🔴 **内存类判定的分母。** `freeable_memory_pct` /
+                  # `database_memory_usage_pct` 都是「占实例规格的百分比」
+                  # （R2.1.2），分母来自 `ec2:DescribeInstanceTypes` 的
+                  # `MemoryInfo.SizeInMiB`（RDS/EC 的规格名去掉 db./cache.
+                  # 前缀就是 EC2 机型）。
+                  #
+                  # 缺它的表现：`resolved memory for 0/N instance types` →
+                  # 全部 attrs 的 memory_bytes 留 None → **内存类规则一条都
+                  # 不命中**，而看板上与「内存都很健康」完全无法区分。
+                  # 整轮 status=success / completeness=100%，零错误码。
+                  # 这一条是在真实账号上实测出来的（缺它 = 内存类规则全静默）。
+                  #
+                  # ⚠️ 这两份模板此前**都漏了它**（部署账号侧的 lambdaRole 有）。
+                  # 多 region 之后那条 AccessDenied 会每轮重复 17 次 ——
+                  # 后果没变，只是日志噪声乘上去了。
+                  # ⚠️ 不支持资源级限定（API 要求 `*`）。只读、静态公共目录。
+                  - ec2:DescribeInstanceTypes
                   - rds:DescribeDBClusters
                   - rds:DescribeDBEngineVersions
                   - eks:ListClusters
@@ -221,6 +298,10 @@ Resources:
           - "Investigation Timed Out"
           - "Investigation Cancelled"
           - "Investigation Linked"
+          # SKIPPED 是终态且**不该重投**（重投必然同样结果）。
+          # 判据取自官方文档的 detail-type 清单 —— EventBridge schema registry
+          # 里没有 InvestigationSkipped（registry 滞后）。
+          - "Investigation Skipped"
       Targets:
         - Arn: !Ref DevOpsEventBusArn
           Id: notiops-devops-bus-target
@@ -282,5 +363,9 @@ Resources:
 Outputs:
   IdleDetectionRoleArn:
     Condition: IsPrimaryRegion
-    Description: 跨账号只读角色 ARN（登记到系统账号目标账户配置的 role_arn）
+    # 中文：跨账号只读角色 ARN（登记到系统账号目标账户配置的 role_arn）
+    Description: >
+      ARN of the cross-account read-only role. NotiOps registers this so
+      resource inspection can assume it. You normally do not need to copy it
+      manually - the admin page derives it and verifies with a real AssumeRole.
     Value: !GetAtt IdleDetectionRole.Arn

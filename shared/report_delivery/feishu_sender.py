@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 import boto3
 
 from core import i18n
+from core.feishu_card import card_config
 
 logger = logging.getLogger(__name__)
 
@@ -518,7 +519,7 @@ def _header_card(status: str, priority: str, detail_type: str, task_id: str,
                 ],
             })
     return {
-        "config": {"wide_screen_mode": True},
+        "config": card_config(wide_screen_mode=True),
         "header": {
             "title": {"tag": "plain_text",
                       "content": i18n.t("report.header.title", locale, emoji=emoji)},
@@ -661,20 +662,22 @@ def _summary_card_v2_from_blocks(blocks: list[dict],
                                   header_suffix: str = "") -> dict:
     """Wrap a list of v2 elements into a Report Summary card.
 
-    `width_mode: fill` makes the card stretch to the chat container's
-    full width on desktop / mobile — required so wide markdown tables
-    don't get squeezed into a narrow column with truncated cells. v1's
-    equivalent flag is `wide_screen_mode: true` (set in the v1 fallback).
+    `width_mode: fill` (from `core.feishu_card.card_config`) makes the card
+    stretch to the chat container's full width on desktop / mobile — required
+    so wide markdown tables don't get squeezed into a narrow column with
+    truncated cells. v1's equivalent flag is `wide_screen_mode: true` (set in
+    the v1 fallback).
+
+    Until 2026-09-03 this was the *only* card that set `width_mode`, so it
+    looked conspicuously wider than every other panel; now all cards go
+    through `card_config()` and share this width.
     """
     title = "📝 Report Summary"
     if header_suffix:
         title = f"{title} · {header_suffix}"
     return {
         "schema": "2.0",
-        "config": {
-            "streaming_mode": False,
-            "width_mode": "fill",
-        },
+        "config": card_config(streaming_mode=False),
         "header": {
             "title": {"tag": "plain_text", "content": title},
             "template": "blue",
@@ -694,7 +697,7 @@ def _summary_card_v1_fallback(summary_md: str) -> dict:
                      "text": {"tag": "lark_md",
                               "content": summary_md or "(no summary)"}}]
     return {
-        "config": {"wide_screen_mode": True},
+        "config": card_config(wide_screen_mode=True),
         "header": {
             "title": {"tag": "plain_text", "content": "📝 Report Summary"},
             "template": "blue",
@@ -829,7 +832,7 @@ def _build_live_card(*, incident_id: str, deep_link: str,
         ],
     })
     return {
-        "config": {"wide_screen_mode": True},
+        "config": card_config(wide_screen_mode=True),
         "header": {
             "title": {"tag": "plain_text", "content": title},
             "template": "green" if is_final else "blue",
@@ -992,7 +995,7 @@ def send_push_headsup(chat_id: str, event: dict,
             ],
         })
     card = {
-        "config": {"wide_screen_mode": True},
+        "config": card_config(wide_screen_mode=True),
         "header": {
             "title": {"tag": "plain_text", "content": title},
             "template": template,
@@ -1065,8 +1068,13 @@ def _normalize_md_tables(md: str) -> str:
 
 
 def _send_summary_cards(chat_id: str, root_message_id: str,
-                        summary_md: str, locale: str = "zh") -> None:
+                        summary_md: str, locale: str = "zh") -> bool:
     """Send the report summary as one or more v2 interactive cards.
+
+    Returns True when delivery succeeded (either the v2 cards or the v1
+    fallback). `send_report` ignores the return value; the inspection
+    broadcast layer needs it because a fan-out has to report per-chat
+    success — a silent None makes "which group didn't get it?" unanswerable.
 
     Why v2 cards (and not `msg_type: text` or v2 single-`markdown`)?
       - For Feishu **application bots** (this project), `msg_type: text`
@@ -1126,12 +1134,12 @@ def _send_summary_cards(chat_id: str, root_message_id: str,
             first_ok = ok
         if not ok and idx == 1:
             logger.warning("v2 summary card rejected — falling back to v1 schema")
-            _send_card(chat_id, root_message_id,
-                       _summary_card_v1_fallback(summary_md))
-            return
+            return _try_send_card(chat_id, root_message_id,
+                                  _summary_card_v1_fallback(summary_md))
     if not first_ok:
-        _send_card(chat_id, root_message_id,
-                   _summary_card_v1_fallback(summary_md))
+        return _try_send_card(chat_id, root_message_id,
+                              _summary_card_v1_fallback(summary_md))
+    return True
 
 
 def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
@@ -1172,3 +1180,29 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
                             linked_case_display_id=linked_case_display_id,
                             next_steps=next_steps,
                             locale=locale))
+
+def send_markdown(chat_id: str, markdown: str, *, locale: str = "zh") -> bool:
+    """Post a standalone markdown body into a chat. Returns True on success.
+
+    Added for the inspection broadcast layer . Why not reuse
+    `send_report`:
+
+      - `send_report` renders a SECOND "header card" carrying status /
+        priority / task_id / report-link buttons. A daily inspection digest
+        has none of those — the card would read "Investigation Completed ·
+        UNKNOWN priority · task_id: " which looks like a broken report.
+      - `send_report` returns None, so a fan-out cannot tell which chats
+        actually received the message.
+
+    This is a thin wrapper over the existing `_send_summary_cards` rendering
+    path (markdown → v2 blocks → native tables → chunked cards → v1
+    fallback), so there is exactly one markdown renderer per platform.
+
+    `root_message_id` is intentionally not a parameter: a cron broadcast has
+    no thread to reply into, and Feishu renders thread replies in a side
+    panel that some mobile clients show as a DM-like view (see `_send_card`).
+    """
+    if not is_configured():
+        logger.warning("Feishu not configured — skipping send_markdown")
+        return False
+    return _send_summary_cards(chat_id, "", markdown, locale=locale)

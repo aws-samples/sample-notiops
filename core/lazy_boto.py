@@ -2,7 +2,10 @@
 
 Why this exists
 ---------------
-Nine modules under `core/` used to build their Bedrock client at *import* time:
+Nine modules under `core/` used to build their Bedrock client at *import* time
+(as of 2026-09-01 only `core/bedrock_chat.py` still holds one — the other eight
+moved to `core/bot_llm.py` → `shared/llm_provider.py::invoke_llm`, which builds
+its client per call and does the setenv-then-construct dance itself; see below):
 
     _bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
 
@@ -43,8 +46,11 @@ Design: a `__getattr__`-forwarding proxy, mirroring `core/ddb_state._LazyTable`
 which does the same for a DynamoDB Table. The point of the proxy (rather than a
 `_bedrock()` accessor function) is that **call sites do not change**:
 `_bedrock.invoke_model(...)` and `bedrock_client or _bedrock` both keep working,
-so nine modules and their ~13 call sites stay untouched — no chance of missing
-one and leaving a half-migrated module behind.
+so nine modules and their ~13 call sites stayed untouched — no chance of missing
+one and leaving a half-migrated module behind. (2026-09-01: eight of the nine
+have since been migrated off `invoke_model` entirely, so `core/bedrock_chat.py`
+is the sole remaining user. This module stays because that one is enough: it is
+the IM chat path, and it is exactly where api_key mode has to keep working.)
 
 Not thread-safe by design, in the benign sense: two threads racing on first use
 may each build a client and one wins. boto3 clients are cheap to construct and

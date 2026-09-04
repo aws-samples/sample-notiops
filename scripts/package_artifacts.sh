@@ -6,15 +6,22 @@
 #   bff.zip                       Web Chat BFF 的 Lambda 代码（含 node_modules）
 #   chat-dist.zip                 前端构建产物（index.html / assets/… 在 zip 根）
 #   web-notif.zip                 「通知」生产端 Lambda（AWS 事件 → Web 收件箱）
+#   im-code.zip                   IM（飞书/Slack）三个 Lambda 的业务代码
+#   im-layer.zip                  IM 依赖层（lark-oapi + slack-sdk + boto3，manylinux2014）
 #   agent-code.zip                AgentCore Runtime 的 CodeZip（含 linux/aarch64 依赖，~144MB）
-#   SHA256SUMS                    上面四个 zip 的校验和
+#   SHA256SUMS                    上面六个 zip 的校验和
 #   notiops-webchat.template.json 客户点 "Launch Stack" 打开的那份模板
 #
 # 模板与产物是**一对一绑死**的：tag 进 S3 key、sha256 进模板里的产物清单。
 # 所以这些文件必须**同一次运行**产出、一起发布；混搭两次运行的产物 =
 # StagerFn 校验 sha256 不通过 = 客户侧开栈失败（这正是我们要的失败方式）。
 #
-# 四个产物为什么各自这样打：
+# 两个 im-*.zip **必须始终产出**，与客户选不选装 IM 无关：`InstallOption` 是**部署期**
+# 参数（客户在参数页下拉框里选 web / web+feishu / web+slack），发布时不知道他会选什么。
+# 客户选「只装 web」时 StagerFn 按 `im-` 前缀跳过下载（infra/lambda/stager/index.py），
+# 所以不装 IM 的客户不为这两个 zip 付流量。
+#
+# 六个产物为什么各自这样打：
 #
 #   · agent-code.zip 用 `agentcore package` 而不是自己 pip vendoring。
 #     AgentCore 托管运行时**不做 pip install**（Step 1 PoC 实测），zip 里必须已经躺着
@@ -27,6 +34,13 @@
 #     里的路径原样当 S3 key 用 —— 多一层 `dist/` 前缀，客户打开就是 404。
 #   · web-notif.zip 由 scripts/build_web_notif_zip.py 从 **import 闭包**算出来打，
 #     不是 zip 一个写死的文件清单。理由见那个脚本的文件头（清单会静默过期）。
+#   · im-code.zip / im-layer.zip 由 scripts/build_im_zips.py 按
+#     infra/im-code-exclude.txt 打 —— 那份排除清单**方式B（infra/lib/im-stack.ts）
+#     读的是同一个文件**，所以两条路径的 IM 代码不可能漂（2026-09-01 拿现网
+#     notiops-im-worker-feishu 的代码包对过，差集只有 6 个点文件，已在清单里补掉）。
+#     代码与依赖层分开：层只在依赖升版时变，没必要每次发布重传 26MiB。
+#     ⚠️ 打层需要 lambda_layer_im/ 已构建（bash scripts/build_im_layer.sh）；缺包
+#     直接失败，不做"跳过 IM"的降级 —— 那会静默发布一个装不上 IM 的 Release。
 #
 # 用法：
 #   scripts/package_artifacts.sh --release-tag v1.0.11
@@ -105,8 +119,9 @@ echo "  output dir  : $OUT_DIR"
 
 mkdir -p "$OUT_DIR"
 # 上一轮的产物必须清掉：残留的旧 zip 会被下面的 SHA256SUMS 一起算进去，
-# 于是"清单里有 4 个产物"这种混搭状态要到客户开栈时才暴露。
+# 于是"清单里混着上一轮的产物"这种状态要到客户开栈时才暴露。
 rm -f "$OUT_DIR/bff.zip" "$OUT_DIR/chat-dist.zip" "$OUT_DIR/web-notif.zip" \
+      "$OUT_DIR/im-code.zip" "$OUT_DIR/im-layer.zip" \
       "$OUT_DIR/agent-code.zip" "$OUT_DIR/SHA256SUMS" "$TEMPLATE_OUT"
 
 # ── 1. 前端 → chat-dist.zip ───────────────────────────────────────────────────
@@ -158,6 +173,10 @@ echo "  bff asset: $ASSET_REL"
 step "web notification handler -> web-notif.zip"
 python3 scripts/build_web_notif_zip.py --out "$OUT_DIR/web-notif.zip"
 
+# ── 2c. IM（飞书 / Slack）加装项 → im-code.zip + im-layer.zip ─────────────────
+step "im code + deps layer -> im-code.zip / im-layer.zip"
+python3 scripts/build_im_zips.py --out-dir "$OUT_DIR"
+
 # ── 3. Agent → agent-code.zip ────────────────────────────────────────────────
 step "agentcore package -> agent-code.zip"
 AGENT_ZIP="$AGENT_DIR/agentcore/NotiOpsWebChat.zip"
@@ -172,7 +191,7 @@ fi
 cp "$AGENT_ZIP" "$OUT_DIR/agent-code.zip"
 
 # ── 4. 逐个产物验形状 ─────────────────────────────────────────────────────────
-# 四个 zip 都是"内容错了也照样能上传、要等客户开栈甚至打开页面才暴露"的类型。
+# 六个 zip 都是"内容错了也照样能上传、要等客户开栈甚至打开页面才暴露"的类型。
 # 这里在发布前把各自的入口文件钉住。
 step "verify artifact shapes"
 python3 - "$OUT_DIR" <<'PY'
@@ -222,6 +241,43 @@ check("web-notif.zip carries only python sources",
       all(n.endswith(".py") for n in notif),
       "unexpected non-.py entries: " + ", ".join(n for n in notif if not n.endswith(".py")))
 
+# im-code.zip —— 三个 handler 的模块路径与 infra/lib/constructs/im-core.ts 的
+# `handler:` 逐字对应；混进 node_modules / dist 说明排除清单没读到
+# （build_im_zips.py 自己也查这两条，这里是发布前最后一道，防的是"有人绕过那个脚本"）。
+im_code = names("im-code.zip")
+check("im-code.zip has the Feishu ingress handler", "platforms/feishu/lambda_ingress.py" in im_code)
+check("im-code.zip has the Feishu worker handler", "platforms/feishu/lambda_worker.py" in im_code)
+check("im-code.zip has the Slack ingress handler", "platforms/slack/lambda_ingress.py" in im_code)
+check("im-code.zip has the Slack worker handler", "platforms/slack/lambda_worker.py" in im_code)
+check("im-code.zip has the progress poller handler", "platforms/common/lambda_progress.py" in im_code)
+check("im-code.zip has the deterministic router", "platforms/common/router.py" in im_code)
+check("im-code.zip has core/devops_agent.py", "core/devops_agent.py" in im_code)
+check("im-code.zip carries no node_modules / dist / infra",
+      not any(n.startswith(("node_modules/", "dist/", "infra/", "frontend/")) or "/node_modules/" in n
+              for n in im_code),
+      "the exclude list (infra/im-code-exclude.txt) did not apply")
+
+# im-layer.zip —— LayerVersion 要求依赖躺在 zip 根的 `python/` 下，且必须是
+# manylinux 的 wheel（Mac 上装的那份在 Lambda 上 import 直接炸）。
+im_layer = names("im-layer.zip")
+check("im-layer.zip puts deps under python/", any(n.startswith("python/") for n in im_layer))
+check("im-layer.zip bundles lark_oapi", any(n.startswith("python/lark_oapi/") for n in im_layer))
+check("im-layer.zip bundles slack_sdk", any(n.startswith("python/slack_sdk/") for n in im_layer))
+check("im-layer.zip bundles botocore", any(n.startswith("python/botocore/") for n in im_layer))
+# 原生扩展必须是 **Linux x86_64 的 ELF**。不按文件名判（pycryptodome 装出来的是
+# `_raw_aes.abi3.so`，名字里没有架构，Mac 上装的那份长得一模一样），直接读 ELF 头：
+# e_ident 魔数 + e_machine==0x3E。Mac wheel 是 Mach-O（魔数 0xcffaedfe），
+# 症状是 Lambda 上 `import lark_oapi` 直接崩，而飞书侧只看到超时。
+so_names = sorted(n for n in im_layer if n.endswith(".so"))
+check("im-layer.zip has native extensions at all", bool(so_names))
+if so_names:
+    with zipfile.ZipFile(out / "im-layer.zip") as zf:
+        head = zf.read(so_names[0])[:20]
+    check("im-layer.zip native extensions are Linux x86_64 ELF",
+          head[:4] == b"\x7fELF" and head[18:20] == b"\x3e\x00",
+          f"{so_names[0]} is not an x86_64 ELF (magic={head[:4]!r}, e_machine={head[18:20]!r}) — "
+          "rebuild with scripts/build_im_layer.sh (--platform manylinux2014_x86_64)")
+
 # agent-code.zip —— 托管运行时不 pip install，所以依赖必须是已经躺在包里的
 # linux/aarch64 + cp313 wheel。三条各自对应一种真实的失败：
 #   main.py 不在根          → 运行时找不到 EntryPoint
@@ -245,7 +301,8 @@ PY
 
 # ── 5. SHA256SUMS ────────────────────────────────────────────────────────────
 step "SHA256SUMS"
-(cd "$OUT_DIR" && shasum -a 256 bff.zip chat-dist.zip web-notif.zip agent-code.zip > SHA256SUMS)
+(cd "$OUT_DIR" && shasum -a 256 bff.zip chat-dist.zip web-notif.zip \
+    im-code.zip im-layer.zip agent-code.zip > SHA256SUMS)
 cat "$OUT_DIR/SHA256SUMS"
 
 # ── 6. 后处理模板 ─────────────────────────────────────────────────────────────
@@ -257,15 +314,15 @@ python3 scripts/postprocess_template.py "${POST_ARGS[@]}"
 
 # ── 7. 收尾 ──────────────────────────────────────────────────────────────────
 step "done"
-(cd "$OUT_DIR" && ls -lh bff.zip chat-dist.zip web-notif.zip agent-code.zip SHA256SUMS \
-    notiops-webchat.template.json)
+(cd "$OUT_DIR" && ls -lh bff.zip chat-dist.zip web-notif.zip im-code.zip im-layer.zip \
+    agent-code.zip SHA256SUMS notiops-webchat.template.json)
 cat <<EOF
 
-Publish these six files together (they are cryptographically bound to each other):
+Publish these eight files together (they are cryptographically bound to each other):
   $OUT_DIR
 
 Next:
-  1. Upload the four zips + SHA256SUMS as assets of release $RELEASE_TAG
+  1. Upload the six zips + SHA256SUMS as assets of release $RELEASE_TAG
      (or to the S3 prefix you passed as --base-url).
   2. Upload notiops-webchat.template.json to S3 and deploy via --template-url
      (it is larger than CloudFormation's 51,200-byte --template-body limit).

@@ -3,7 +3,7 @@
 # header comment for context — same workaround.
 # Base image from ECR Public (AWS-hosted mirror of the official Docker library
 # python image) rather than Docker Hub, per BuilderHub container security guidance.
-FROM public.ecr.aws/docker/library/python:3.12-slim
+FROM public.ecr.aws/docker/library/python:3.14-slim
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \

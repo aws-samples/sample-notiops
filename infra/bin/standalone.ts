@@ -6,8 +6,9 @@
  *   1. `bin/app.ts` 开头就 fail-fast 要求 `CDK_DEFAULT_ACCOUNT` / region（那是对的：
  *      真部署时静默部错账号是灾难）。而这里要的恰恰相反 —— **不能**绑定账号/区域，
  *      模板要在任意客户账号任意区域都能用。
- *   2. app.ts 还会顺带实例化 BotStack / NotiOpsBackendStack，合成一次好几分钟
- *      （BotStack 的 asset 要扫整个仓库）。发模板不需要它们。
+ *   2. app.ts 还会顺带实例化 NotiOpsBackendStack / ImStack，发模板不需要它们。
+ *      （M2 / 2026-09-03 之前还会实例化 BotStack，那时合成一次要好几分钟 —— 它的
+ *      `ContainerImage.fromAsset("../")` 要把整个仓库当 Docker context 算 hash。）
  *
  * 用法：
  *   npm run synth:standalone            # 产物在 /tmp/notiops-cdk-out/

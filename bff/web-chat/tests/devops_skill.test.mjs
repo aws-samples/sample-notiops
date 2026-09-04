@@ -18,8 +18,9 @@ import { readFileSync } from "node:fs";
 import { buildSkillContent, skillLabel, isPublishedToDevopsAgent, MAX_SKILL_BODY } from "../devops_skill.mjs";
 
 let fails = 0;
+let ok = 0;
 async function t(name, fn) {
-  try { await fn(); console.log(`  ok   ${name}`); }
+  try { await fn(); ok++; console.log(`  ok   ${name}`); }
   catch (e) { fails++; console.log(`  FAIL ${name}\n       ${e?.message || e}`); }
 }
 
@@ -131,5 +132,5 @@ await t("调查气泡回显用户原话，而不是把整份 skill 正文倒进�
     "banner 又用回了 description —— 整份 skill 正文会出现在聊天气泡里");
 });
 
-console.log(fails ? `\n${fails} failed` : "\nall passed");
+console.log(fails ? `\n${fails} failed` : `\n${ok} ok, 0 failed`);
 process.exit(fails ? 1 : 0);

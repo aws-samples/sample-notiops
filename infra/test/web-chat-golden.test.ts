@@ -18,7 +18,7 @@
  *     cd infra && UPDATE_GOLDEN=1 npx jest test/web-chat-golden.test.ts
  * 提交时必须在 MR 里说明模板差异是预期的哪一处改动。
  *
- * fixture 里的账号是 **111122223333**（RFC 5737 风格的示例账号），不是真账号 ——
+ * fixture 里的账号是 **444455556666**（RFC 5737 风格的示例账号），不是真账号 ——
  * `publish/include.txt` 把整个 `infra/` 目录列入公开发布白名单，这个 fixture 会
  * 原样进 aws-samples 的公开仓。
  *
@@ -37,7 +37,7 @@ import { WebChatStack } from "../lib/web-chat-stack";
 const FIXTURE = path.join(__dirname, "fixtures", "web-chat-stack.golden.json");
 
 /** 与 bin/app.ts 保持一致的示例环境（固定值，保证可复现）。 */
-const FIXTURE_ACCOUNT = "111122223333";
+const FIXTURE_ACCOUNT = "444455556666";
 const FIXTURE_REGION = "us-east-1";
 
 const ASSET_HASH = /^[0-9a-f]{64}(\.zip)?$/;

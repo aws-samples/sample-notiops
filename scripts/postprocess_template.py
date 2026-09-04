@@ -47,7 +47,7 @@ DEFAULT_BASE_URL_TEMPLATE = "https://github.com/aws-samples/sample-notiops/relea
 # `Default: {Tag, BaseUrl}` 会被判模板格式错误。cdk synth 不报，validate-template 才报。
 RELEASE_MAP_KEY = "Current"
 
-# 四个 Release 产物。名字就是 Release 里的资产文件名，StagerFn 用
+# 六个 Release 产物。名字就是 Release 里的资产文件名，StagerFn 用
 # `<BaseUrl>/<name>` 拼下载地址。
 # 顺序 = StagerFn 的搬运顺序：小的先搬。144 MiB 的 agent zip 放最后，
 # 前面任何一个失败都能在几秒内暴露，而不是等它传完才发现。
@@ -56,6 +56,11 @@ CHAT_DIST_ARTIFACT = "chat-dist.zip"
 # 「通知」生产端。名字与 infra/lib/constructs/web-notif-sources.ts 的
 # `WEB_NOTIF_ARTIFACT`、scripts/build_web_notif_zip.py 的产出一致。
 NOTIF_ARTIFACT = "web-notif.zip"
+# IM（飞书 / Slack）加装项：业务代码 + 依赖层。**必须以 `im-` 开头** ——
+# StagerFn 在 `InstallOption=web`（只装 web）时按这个前缀跳过它们
+# （infra/lambda/stager/index.py `_artifacts_upsert`）。
+IM_CODE_ARTIFACT = "im-code.zip"
+IM_LAYER_ARTIFACT = "im-layer.zip"
 AGENT_ARTIFACT = "agent-code.zip"
 
 # CDK 默认 bootstrap 限定词（qualifier）。出现在资产桶名里。
@@ -222,9 +227,20 @@ def build_manifest(template: dict, sums: dict[str, str]) -> list[dict]:
     notif_id = _logical_id_by_cdk_path(resources, "/WebNotifFn")
     notif_key = _resolve(resources[notif_id]["Properties"]["Code"]["S3Key"], mappings)
 
+    # IM 加装项。三个 IM 函数共用同一份代码，随便读哪一个都一样 —— 取 FeishuWorker
+    # 是因为它是 im-core.ts 里第一个建的（`platforms.feishu` 分支）。
+    # 层读的是 `Content`（不是 `Code`）：`AWS::Lambda::LayerVersion` 的代码属性叫
+    # Content，`assert_clean` 的 DependsOn 判据也因此要同时认这两个名字。
+    im_code_id = _logical_id_by_cdk_path(resources, "/FeishuWorker/Resource")
+    im_code_key = _resolve(resources[im_code_id]["Properties"]["Code"]["S3Key"], mappings)
+    im_layer_id = _logical_id_by_cdk_path(resources, "/ImDepsLayer/Resource")
+    im_layer_key = _resolve(resources[im_layer_id]["Properties"]["Content"]["S3Key"], mappings)
+
     manifest = []
     for name, key in ((BFF_ARTIFACT, bff_key), (CHAT_DIST_ARTIFACT, dist_key),
-                      (NOTIF_ARTIFACT, notif_key), (AGENT_ARTIFACT, agent_key)):
+                      (NOTIF_ARTIFACT, notif_key),
+                      (IM_CODE_ARTIFACT, im_code_key), (IM_LAYER_ARTIFACT, im_layer_key),
+                      (AGENT_ARTIFACT, agent_key)):
         if name not in sums:
             raise PostprocessError(f"{name} has no sha256 in the checksum manifest (have: {sorted(sums)})")
         manifest.append({"name": name, "key": key, "sha256": sums[name]})
@@ -337,13 +353,17 @@ def assert_clean(template: dict, tag: str) -> None:
 
     # 所有把 staging 桶**当代码来源**的资源都必须等 StagerArtifacts 跑完 ——
     # 少一条 DependsOn 就是「代码还没搬到就去创建函数」，客户侧一个 S3 404。
-    # 判定按「Ref 出现在 `Code…` 路径下」，不是「资源里提到过这个桶」：桶自己的
-    # BucketPolicy、两个 Stager 自定义资源都会提到它，那些不算代码来源。
+    # 判定按「Ref 出现在 `Code…` / `Content…` 路径下」，不是「资源里提到过这个桶」：
+    # 桶自己的 BucketPolicy、两个 Stager 自定义资源都会提到它，那些不算代码来源。
+    # `Content` 是 `AWS::Lambda::LayerVersion` 的代码字段（IM 依赖层 ImDepsLayer）——
+    # 只认 `Code` 会漏掉它，而漏掉的症状是**偶发**的：CFN 并行创建时层可能比产物先到，
+    # 于是 `NoSuchKey` 有时才出现（选了 web+飞书/Slack 才有这个资源）。
     staging_id = _logical_id_by_cdk_path(resources, "/StagingBucket/Resource")
+    code_fields = ("Code", "Content")
     code_consumers = set()
     for name, res in resources.items():
         for path, _c, key, value in _walk(res.get("Properties", {})):
-            if key == "Ref" and value == staging_id and any(p.startswith("Code") for p in path):
+            if key == "Ref" and value == staging_id and any(p.startswith(code_fields) for p in path):
                 code_consumers.add(name)
     if not code_consumers:
         raise PostprocessError(
@@ -358,8 +378,8 @@ def assert_clean(template: dict, tag: str) -> None:
 
     # 每个产物在模板里都得真的被引用到 —— 搬一个没人用的 zip 只是白花时间和流量。
     manifest = json.loads(resources["StagerArtifacts"]["Properties"]["Artifacts"])
-    if len(manifest) != 4:
-        raise PostprocessError(f"expected 4 artifacts in the manifest, got {len(manifest)}")
+    if len(manifest) != 6:
+        raise PostprocessError(f"expected 6 artifacts in the manifest, got {len(manifest)}")
     for entry in manifest:
         for field in ("name", "key", "sha256"):
             if not entry.get(field):

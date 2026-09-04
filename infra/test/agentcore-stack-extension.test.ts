@@ -6,10 +6,8 @@
  *  - RemovalPolicy.DESTROY resolves to DeletionPolicy=Delete
  *  - 只有 API Lambda 角色能**写** model_id 参数（其它角色一律不得 PutParameter）
  *
- * Requirements: 6.1, 6.2, 6.3, 6.5
- *
  * ⚠️ 本文件在 2026-08-22 修过一次腐坏 —— 此前它从未被任何 CI job 跑过
- * （`.gitlab-ci.yml` 里没有 infra 的 job），于是烂在了两个地方：
+ * （CI 里当时没有 infra 的 job），于是烂在了两个地方：
  *   ① 断言 SSM 默认值等于一个**写死的型号**（`global.anthropic.claude-opus-4-7`），
  *      目录默认模型一换就红。改为只断言"是 global.* CRIS 形态"，不钉具体型号。
  *   ② 断言 `AgentRuntimeRole` + Sid `SSMReadModelIdParam` —— 这两个标识符
@@ -36,7 +34,6 @@ describe("agent-model-config-integration — CDK assertions", () => {
 
   // ---------------------------------------------------------------------
   // SSM Parameter existence + defaults + RemovalPolicy.DESTROY
-  // Requirements 6.1, 6.5
   // ---------------------------------------------------------------------
 
   test("SSM Parameter /notiops/agent/model_id exists with a global.* CRIS default", () => {
@@ -59,7 +56,6 @@ describe("agent-model-config-integration — CDK assertions", () => {
 
   // ---------------------------------------------------------------------
   // 写权限边界：只有 API Lambda 角色能改 model_id
-  // Requirements 6.2, 6.3
   // ---------------------------------------------------------------------
 
   test("只有 API Lambda 角色对 model_id 参数有 ssm:PutParameter", () => {

@@ -32,7 +32,7 @@ def _health_event(category: str, type_code: str = "AWS_TEST_FAULT") -> dict:
         "source": "aws.health",
         "detail-type": "AWS Health Event",
         "region": "us-east-1",
-        "account": "111122223333",
+        "account": "444455556666",
         "detail": {
             "eventTypeCategory": category,
             "eventTypeCode": type_code,

@@ -105,6 +105,25 @@ const Label = ({ children }: { children: React.ReactNode }) => (
   <div style={{ color: "var(--muted)", fontSize: 11, textTransform: "uppercase", letterSpacing: ".07em", fontWeight: 600, marginBottom: 6 }}>{children}</div>
 );
 
+/**
+ * 某个 dashboard 面板对该用户是否可见（group 卡在任一子卡可见时显示）。
+ *
+ * 导出是为了让 FinopsDashboardBrowser 的左侧列表与本组件的卡片网格用**同一判据** ——
+ * 两处各写一份的结果是「侧栏列了个条目、点进去空白」，那是坏体验也是难查的漂移。
+ * 未登记的 id 默认可见（如 anomaly-inbox 这类无独立 capability key 的面板）。
+ */
+export function finopsPanelVisible(id: string, can: (k: string) => boolean): boolean {
+  const deepDive = ["cloudwatch", "datatransfer", "ec2", "s3"].some((k) => can(`nav:finops:deep-dive:${k}`));
+  return ({
+    spend: can("nav:finops:spend-overview") || can("nav:finops:marketplace") || can("nav:finops:top5"),
+    optimization: can("nav:finops:potential-savings") || can("nav:finops:anomalies") || can("nav:finops:ri-sp"),
+    progress: can("nav:finops:commitment") || can("nav:finops:devops-credit") || can("nav:finops:ai-spend"),
+    movers: can("nav:finops:movers"),
+    deepdive: deepDive,
+    "tag-explorer": can("nav:finops:tag-explorer"),
+  } as Record<string, boolean>)[id] ?? true;
+}
+
 export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: dataProp, can = () => true, onAsk }: Props) {
   const { locale } = useLocale();
   const zh = locale !== "en";
@@ -235,14 +254,8 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
     aiSpend: can("nav:finops:ai-spend"),
     movers: can("nav:finops:movers"),
   };
-  const cardVisible = (id: string): boolean => ({
-    spend: canCard.spendOverview || canCard.marketplace || canCard.top5,
-    optimization: canCard.savings || canCard.anomalies || canCard.riSp,
-    progress: canCard.commitment || canCard.devopsCredit || canCard.aiSpend,
-    movers: canCard.movers,
-    deepdive: canDeepDive,
-    "tag-explorer": canTagExplorer,
-  } as Record<string, boolean>)[id] ?? true;
+  // 与左侧列表同源（见 finopsPanelVisible 的注释）。
+  const cardVisible = (id: string): boolean => finopsPanelVisible(id, can);
 
   return (
     <div style={{ maxWidth: dashboardId ? 1200 : 900, margin: "0 auto", padding: dashboardId ? "4px 14px 20px" : "8px 24px 40px", width: "100%" }}>

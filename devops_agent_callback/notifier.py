@@ -1,8 +1,6 @@
 """IM notification module (DevOps Agent Callback).
 
 Uses shared.feishu_sender to push DevOps Agent investigation results to Feishu.
-
-Requirements: 4.5, 4.9, 4.11
 """
 
 import logging

@@ -1,6 +1,6 @@
 """Catalogue of LLM aliases the bot supports — **adapter over the DDB catalogue**.
 
-Since 2026-08 (spec task 4.1) this module no longer owns a model list. The
+Since 2026-08 this module no longer owns a model list. The
 single source of truth is DynamoDB `PK=llmcfg`, read through
 `core/llm_config.py`, which the admin edits in the web console
 ("Admin → Models"). This module keeps the small, stable surface that the IM
@@ -75,22 +75,32 @@ class ModelEntry:
 
 
 # Last-resort alias. Deliberately the *short* form: it is also the `short` of
-# the seed's default (`claude-sonnet-5`), and `llm_config` accepts short
-# aliases, so this resolves even when DynamoDB is unreachable.
-DEFAULT_ALIAS = "claude"
+# the seed's default (`xai-grok-4-6`), and `llm_config` accepts short aliases,
+# so this resolves even when DynamoDB is unreachable.
+DEFAULT_ALIAS = "grok"
 
 # Absolute floor, used only if `llm_config` itself somehow fails (it is written
 # not to raise, but `get()` is on the critical path of every reply and must not
 # be the thing that breaks it).
-# `max_output_tokens` is the IM surface target, not the model's ceiling: Sonnet
-# 5's documented hard limit is 128000 and its catalogue entry carries
-# `output_override.im = 6000`, so the normal path resolves to 6000 — the floor
-# must match that, not the model card.
+#
+# ⚠️ `model_id` and `kind` are **one pair, never edit one alone**. `kind` is what
+# decides which wire protocol `bedrock_chat` speaks; a Grok id under
+# `bedrock_anthropic` sends a hand-rolled `anthropic_version` body to a model
+# that does not speak it, and the whole IM reply path dies on ValidationException
+# exactly when the catalogue is already unreachable — i.e. at the worst moment,
+# with no second fallback behind it.
+#
+# `max_output_tokens` is the IM surface target, not the model's ceiling: Grok
+# 4.6's documented hard limit is 524288 and it carries no `output_override`, so
+# the normal path resolves to `llm_config._OUTPUT_TARGET` = 6000 — the floor must
+# match what the normal path produces, not the model card.
+#
+# 2026-09-01: follows the catalogue default from Claude Sonnet 5 to Grok 4.6.
 _FLOOR = ModelEntry(
     alias=DEFAULT_ALIAS,
-    model_id="global.anthropic.claude-sonnet-5",
-    label="Claude Sonnet 5",
-    kind="bedrock_anthropic",
+    model_id="global.xai.grok-4.6",
+    label="Grok 4.6",
+    kind="bedrock_converse",
     max_output_tokens=6000,
 )
 

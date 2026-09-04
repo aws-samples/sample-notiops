@@ -18,10 +18,21 @@ The user types something like "分析 case 12345" / "summarize case 67890" /
      a card.
 
 This module is **read-only**. It never writes to the case (no
-`add_communication`, no `resolve_case`). The L1 zero-change defense in
-`bedrock_chat._is_change_request` is bypassed here because the user's
-intent has already been classified as `case_analyze`, but the L3
-outbound audit on the LLM's reply still runs (see `_audit_response`).
+`add_communication`, no `resolve_case`).
+
+WARNING -- stale claim corrected 2026-09-03: this docstring used to say
+the L3 outbound audit "still runs (see `_audit_response`)". It does not,
+and there is no `_audit_response` anywhere in the repo. The only outbound
+audit is `bedrock_chat._audit_response_for_change`, called from exactly
+one place -- `bedrock_chat.respond()` -- and this module goes through
+`core.bot_llm` instead, which has no audit.
+`bedrock_chat._is_change_request` (L1) is likewise not on this path.
+
+Why that is tolerable but still worth fixing: the hard boundary is the
+read-only IAM role, this path's output is a case summary rather than
+runnable commands, and after M2 this is the *only* capability on the IM
+webhook path that calls an LLM at all. Wiring an outbound audit into
+`bot_llm` is an open item -- see docs/TECHNICAL_DESIGN.md section 5.3.
 
 Output language follows the conversation locale (zh / en) — independent
 of the case's own language (AWS engineers usually reply in English even
@@ -31,24 +42,20 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 
-import boto3
-from core.lazy_boto import LazyClient
-
+from core import bot_llm
 from core import case_management
-from shared.model_config import get_bot_model_id
 
 logger = logging.getLogger(__name__)
 
-BEDROCK_REGION = os.environ.get("BEDROCK_REGION", os.environ.get("AWS_REGION", "us-east-1"))
-# 惰性构造（core/lazy_boto.py）：botocore 在**构造时**快照凭证，import 期建好的
-# client 会让后续 setenv AWS_BEARER_TOKEN_BEDROCK 完全失效（Bedrock API Key 模式
-# 因此无法生效）。代理转发属性访问，所有调用点写法不变。
-_bedrock = LazyClient("bedrock-runtime", region=BEDROCK_REGION)
-
+# 2026-09-01：本模块那几处「一个 system prompt + 一段文本 → 一段（通常是 JSON 的）
+# 文本」的调用，从手搓 Anthropic body 的 invoke_model 换成 core/bot_llm 的 Converse
+# 统一入口。理由与取舍全在 core/bot_llm.py 的模块 docstring 里。
+# 顺带删掉 `_bedrock` / `BEDROCK_REGION`：`invoke_llm` 每次调用自己建 client（比
+# LazyClient 更不会拿到过期凭证），而 BEDROCK_REGION 在三条部署路径里恒等于
+# `cdk.Aws.REGION` = Lambda 自己的区域 = boto3 默认区域，去掉是**零行为变化**。
 
 # Cap communications fed into the prompt. AWS Support cases occasionally
 # accumulate 50+ messages; a Sonnet 5 input window is 200K tokens but
@@ -199,38 +206,15 @@ def analyze(display_id: str, *, locale: str = "en") -> AnalyzeResult:
     system_prompt = _system_prompt_for_locale(locale)
 
     try:
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 1500,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": prompt_payload}],
-        }
-        resp = _bedrock.invoke_model(
-            modelId=get_bot_model_id(),
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(body),
-        )
-        data = json.loads(resp["body"].read())
-        text = ""
-        for block in data.get("content", []):
-            if block.get("type") == "text":
-                text = block["text"].strip()
-                break
+        # 围栏剥离在 bot_llm 里（模型被要求只输出 JSON 时仍常常裹一层 ```json）。
+        text = bot_llm.invoke_bot_text(system_prompt, prompt_payload, max_tokens=1500)
         if not text:
-            logger.warning("case_analyze: Bedrock returned no text block: %s", data)
             return AnalyzeResult(case_summary=case, comm_count=len(comms),
                                  error="llm_empty_response")
     except Exception as e:
         logger.error("case_analyze: Bedrock invoke failed: %s", e)
         return AnalyzeResult(case_summary=case, comm_count=len(comms),
                              error=f"llm_invoke_failed:{e.__class__.__name__}")
-
-    # The model occasionally wraps JSON in markdown fences; strip defensively.
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lstrip().lower().startswith("json"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[4:]
 
     try:
         parsed = json.loads(text)

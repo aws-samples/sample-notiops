@@ -42,6 +42,10 @@
         {
           "name": "NOTIOPS_ALLOW_CROSS_ACCOUNT",
           "value": ""
+        },
+        {
+          "name": "COST_AGENT_MCP_URL",
+          "value": "__COST_AGENT_MCP_URL__"
         }
       ]
     }
@@ -50,35 +54,7 @@
     {
       "name": "NotiOpsWebChatMemory",
       "eventExpiryDuration": 30,
-      "strategies": [
-        {
-          "type": "SEMANTIC",
-          "namespaceTemplates": [
-            "/users/{actorId}/facts"
-          ]
-        },
-        {
-          "type": "USER_PREFERENCE",
-          "namespaceTemplates": [
-            "/users/{actorId}/preferences"
-          ]
-        },
-        {
-          "type": "SUMMARIZATION",
-          "namespaceTemplates": [
-            "/summaries/{actorId}/{sessionId}"
-          ]
-        },
-        {
-          "type": "EPISODIC",
-          "namespaceTemplates": [
-            "/episodes/{actorId}/{sessionId}"
-          ],
-          "reflectionNamespaceTemplates": [
-            "/episodes/{actorId}"
-          ]
-        }
-      ]
+      "strategies": []
     }
   ],
   "knowledgeBases": [],

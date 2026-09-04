@@ -1,8 +1,6 @@
 """消息格式化模块。
 
 将 PHD 事件和 Bedrock 摘要格式化为 IM 推送消息。
-
-Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7
 """
 
 from phd_event_forwarder.event_parser import PHDEvent

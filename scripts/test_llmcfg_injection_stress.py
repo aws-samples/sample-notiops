@@ -1,5 +1,5 @@
 """
-generation 注入压测（spec task 8.4 验收）。
+generation 注入压测（验收）。
 
 与 `test_llm_config_reader.py::test_generation_validation` 的分工：那里验的是**单值**语义
 （`-1 / "abc" / 1e308 / None / bool / far-future` 一律忽略且不触发强刷）；这里验的是
@@ -323,8 +323,34 @@ def test_bff_never_reads_client_generation():
                if ("generation =" in ln or "generation=" in ln)
                and "==" not in ln and "generation_" not in ln
                and not ln.strip().startswith(("*", "//"))]
-    _check("no other assignment to the stream generation",
-           len(assigns) == 2, str(assigns))
+    # 🔴 判据是「**每一条**赋值都是这两种合法形态之一」，**不是**「一共两条」。
+    #
+    #    上一版写的是 `len(assigns) == 2`，那是照当时只有 `streamChat` 一处
+    #    的现状钉的。2026-09-02 的会话预热（`POST /warmup`）照同一形态又写了
+    #    一对**完全正确**的赋值（`let generation = 0` + 从 `picked.generation`
+    #    读），于是这条断言从那天起就红着 —— 而 CI 的 `llm-catalog-tests`
+    #    整个 job 跟着红。
+    #
+    # ⚠️ 一条长期红着的断言比没有断言更糟：它让「我这次改坏了」与「它本来就
+    #    是红的」无法区分，最后所有人都学会忽略这个 job。而这条要守的东西
+    #    （generation 绝不来自客户端）是真的重要 —— 客户端能塞 generation
+    #    就等于把前面五套限速全部拱手让人。
+    #
+    # ⚠️ 所以不要再改回计数：下一个人加第三个走模型解析的端点时，这条应当
+    #    照常通过；而 `generation = body.generation` 必须立刻红。
+    LEGAL = ("let generation = 0;", "generation = Number(picked.generation) || 0;")
+    illegal = [a for a in assigns if a not in LEGAL]
+    _check("every assignment to generation is a server-side form",
+           not illegal, str(illegal))
+    # 形态齐全性：两种形态都必须真的出现过（上面两条 `in src` 已保证），
+    # 且赋值总数是偶数对 —— 每个端点都该「先置 0 再由目录读覆盖」，
+    # 只有 `= 0` 而没有目录读意味着那个端点的 generation 恒 0（TTL 兜底失效）。
+    zeros = [a for a in assigns if a == LEGAL[0]]
+    reads = [a for a in assigns if a == LEGAL[1]]
+    _check(f"each endpoint pairs an init with a catalog read "
+           f"({len(zeros)} init / {len(reads)} read)",
+           len(zeros) == len(reads) and len(zeros) >= 1,
+           f"init={len(zeros)} read={len(reads)}")
 
 
 def main() -> int:

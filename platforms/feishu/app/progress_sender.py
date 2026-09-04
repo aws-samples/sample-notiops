@@ -13,6 +13,7 @@ import json
 import logging
 
 from core import i18n
+from core.feishu_card import card_config
 
 from platforms.feishu.app import feishu_utils
 
@@ -123,7 +124,7 @@ def _build_card(*, incident_id: str, deep_link: str, operator_home: str,
         ],
     })
     return {
-        "config": {"wide_screen_mode": True},
+        "config": card_config(wide_screen_mode=True),
         "header": {
             "title": {"tag": "plain_text", "content": title},
             "template": "green" if is_final else "blue",

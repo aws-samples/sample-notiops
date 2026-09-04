@@ -12,8 +12,6 @@ SNS 触发，编排完整处理流程：
 环境变量：
   - FEISHU_SECRET_ARN: Feishu credentials Secret ARN
   - BEDROCK_API_KEY_SECRET_ARN: Bedrock API Key Secret ARN
-
-Requirements: 3.1, 4.1, 4.5, 5.4, 6.4, 6.6, 11.1, 11.2, 11.3, 11.4, 11.5
 """
 
 import json

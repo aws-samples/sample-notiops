@@ -2,7 +2,8 @@
  * CloudWatch RUM（前端 APM/RUM）初始化。
  * 自动采集 JS 未捕获异常、性能、HTTP 失败、会话/页面浏览，写入 CloudWatch RUM
  * （+ cwLogEnabled 写 CloudWatch Logs，便于与 BFF 日志关联定位根因）。
- * 配置由 config.json 注入（见 infra/lib/web-chat-stack.ts RUM 段）。未配置则静默跳过。
+ * 配置由 config.json 注入（见 infra/lib/constructs/web-chat-core.ts 的 RUM 段
+ * —— 2026-09 那次重构把资源定义从 web-chat-stack.ts 搬到了这里）。未配置则静默跳过。
  */
 import { AwsRum, type AwsRumConfig } from "aws-rum-web";
 import { getConfig } from "./config";

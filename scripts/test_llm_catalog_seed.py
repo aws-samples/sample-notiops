@@ -1,5 +1,5 @@
 """
-三端模型目录一致性测试（spec task 1.1 验收标准）。
+三端模型目录一致性测试（验收标准）。
 
 校验 `config/llm-model-catalog.json`（规范种子）能**逐字段复现**三个消费端当前的
 实际行为，确保引入 DDB 目录不产生任何回归：
@@ -79,7 +79,7 @@ def test_seed_im_surface_claims_are_real():
 
     只做正向校验（IM 条目都在种子里）会漏掉一类真实故障：种子把某模型标成 IM 可用、
     但 `core/model_catalog.py` 并无该条目 —— admin 选它当默认，IM 侧解析不到就静默
-    回落硬编码默认，admin 的选择被吞掉（2026-08 实际发生，由 task 0.2 测试抓到）。
+    回落硬编码默认，admin 的选择被吞掉（2026-08 实际发生，由 测试抓到）。
     """
     print("test_seed_im_surface_claims_are_real")
     im_aliases = set(mc.list_aliases())
@@ -138,7 +138,7 @@ def _code_only(src: str) -> str:
 def test_webchat_loader_is_catalogue_driven():
     """webchat 侧已无硬编码模型清单 —— 断言它不会悄悄回来。
 
-    task 3.1 之前这里逐字段比对 `load.py` 的 `_MODEL_MAP` / `_MANTLE_MODELS` /
+     之前这里逐字段比对 `load.py` 的 `_MODEL_MAP` / `_MANTLE_MODELS` /
     `_DEFAULT`（当时它们是真源）。现在真源是目录，`load.py` 只负责按目录条目构造模型，
     **构造参数的正确性由 `scripts/test_webchat_load_model.py` 校验**（它 stub 掉 Strands
     后断言 model_id / max_tokens / prompt cache / Mantle region 逐项匹配目录）。

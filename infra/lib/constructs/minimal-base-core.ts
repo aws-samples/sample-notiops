@@ -122,6 +122,9 @@ export function createMinimalBase(scope: Construct): MinimalBase {
       { id: "expire-onboarding-templates-7d", prefix: "onboarding/", expiration: cdk.Duration.days(7) },
       // 报告 7 天生命周期：兑现「报告链接 7 天内有效」的承诺，也避免报告长期堆积。
       { id: "expire-reports-7d", prefix: "reports/", expiration: cdk.Duration.days(7) },
+      // 客户 CUR 仪表盘的当天缓存（与方式 B 的 notiops-backend-stack.ts 同一条规则）。
+      // 缓存 key 带日期，次日失效但对象不会自己消失；不清理就是纯垃圾常年堆着。
+      { id: "expire-cur-dash-cache-3d", prefix: "cur-dash-cache/", expiration: cdk.Duration.days(3) },
     ],
     removalPolicy: cdk.RemovalPolicy.RETAIN,
   });

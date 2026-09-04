@@ -74,6 +74,28 @@ PY_DIRS = ["core", "platforms", "lambda", "scripts"]
 CJK_ALLOWLIST = {
     # The translation table itself — by definition contains Chinese.
     "core/i18n.py",
+    # The 0-token IM intent router. Its CJK literals are INPUT-matching
+    # regexes (matching what the user typed: 「开案例」「深度调查」…), not
+    # user-facing OUTPUT text — they cannot route through i18n.t any more than
+    # core/i18n.py's own `_NL_LANGUAGE_SWITCH_PATTERNS` can (same reason that
+    # module is allowlisted). All OUTPUT this router produces goes through
+    # i18n.t (help.*, router.*).
+    "core/nl_router.py",
+    # DevOps 对话直连 —— IM 端口自 bff/web-chat/devops_chat.mjs（现网踩过 bug 之后
+    # 长成现在这样，见 §13.2）。CJK 字面量与事件流处理紧耦合、只在这一条路径出现，
+    # 拆成 20 个 i18n key 会让"和 JS 端逐行对照"不再可能 —— 语义偏差就出来了。
+    "core/devops_chat.py",
+    # 变更请求/prompt-injection 二道门。CJK 字面量是**输入匹配正则**（匹配用户键入
+    # 的「删除实例」「忽略以上指令」），不是输出文案 —— 与 core/nl_router.py 同源
+    # 同理。输出（拒绝话术）走 i18n.t('out_of_scope.change_request', locale)。
+    "platforms/common/router.py",
+    # IM 端 markdown 降级器（标题 → 粗体、GFM 表格 → 带标签的列表）。它**不产出
+    # 任何自己的文案** —— 只做结构变换，一个字都不新增；唯一的 CJK 字面量是
+    # `_EMPTY_CELLS` 里的「无」，那是**输入匹配**（认出模型填的空占位格好丢掉，
+    # 与 "-" / "n/a" 并列），与 core/nl_router.py / platforms/common/router.py
+    # 同源同理。表格的**标签**取自模型自己写的表头文字，所以译文天然跟随原文的
+    # 语言；搬进 core/i18n.py 反而会把中文表头硬配上英文标签。见 §3.48。
+    "platforms/common/im_markdown.py",
     # Bedrock prompts that are deliberately bilingual / CJK-aware
     # (semantic detection rules need Chinese examples). The OUTPUT
     # language is controlled separately via _locale_directive().
@@ -90,6 +112,68 @@ CJK_ALLOWLIST = {
     # case_management — server-shape labels mostly already routed
     # through other layers. Whitelist for this MVP, revisit later.
     "core/case_management.py",
+    # 资源巡检的端到端测试驱动器。里面的 CJK 全是**断言标签与失效说明**
+    # （"coverage 不足时不判定（不是判成健康）"），只出现在开发者跑测试时的
+    # 终端输出里，不进任何用户界面、报告或 IM 消息。
+    #
+    # ⚠️ 把它们搬进 core/i18n.py 是有害的：那张表是**产品文案**的单一来源，
+    # 混进几百条测试断言会让真正要翻译的条目被淹掉，而这些标签的价值恰恰
+    # 在于「一句话说清这条失败意味着什么」—— 那需要写得长、写得具体，
+    # 与 UI 文案的要求正好相反。
+    #
+    # ⚠️ 这里原本写着「同理 `scripts/upload_inspection_skills.py` 选择全英文
+    # 输出」—— **那句话与代码不符**（2026-08-25 核对）：那个脚本从第一版起
+    # 就是中文输出的，而且它压根不在这份清单里，于是 15 条违规一直挂在
+    # NEW 里。项目规范是「交互均使用中文」，所以按中文留，
+    # 把它加进清单（下面那一项），并把这句错的注释改掉。
+    "scripts/inspection_e2e.py",
+    # 判读 skill 的上传工具。输出是给中文维护者看的部署日志。
+    "scripts/upload_inspection_skills.py",
+    # 同一类：巡检的**真实资源**验证工具，只在开发者终端里跑。
+    #
+    #   inspection_testbed.py         建/查/删一批验证用的 RDS/Aurora/EC
+    #   inspection_verify_collect.py  拿那批资源验采集层（API → ResourceAttrs）
+    #
+    # 后者的 CJK 全是断言标签，与 `inspection_e2e.py` 同理 ——
+    # 「🔴 Aurora MySQL 走 5ms 档（不是社区版的 15ms）」这种话的价值就在于
+    # 长且具体，搬进产品文案表会把真要翻译的条目淹掉。
+    #
+    # ⚠️ 前者（testbed）里的中文还有一层作用：那几段 `🔴 保留删除保护关闭
+    # 是刻意的` / `⚠️ 不要把这行抄到真实环境的模板里` 是**给人看的护栏**，
+    # 必须紧贴代码。
+    "scripts/inspection_testbed.py",
+    "scripts/inspection_verify_collect.py",
+    # 触发一轮真实巡检并逐层核对落库。与上面两个同类 —— 断言标签，
+    # 只在开发者终端里出现（「🔴 dispatched == mapped（taskId 接住了）」
+    # 这种话的价值就在于长且具体）。
+    "scripts/inspection_verify_live.py",
+    # 接线检查（domain 层算好了但调用方没取）。与上面三个同类：**开发者工具**，
+    # 输出只在终端与 CI 日志里出现，客户永远看不到。
+    #
+    # ⚠️ 它的输出必须长且具体才有用 —— 一句「seams: 1 violation」等于没说。
+    #    真正有价值的是「`evaluable` 的 docstring 写着『调用方 SHALL 用它』，
+    #    而调用方零读点 —— 那个判据算了没人取」这一整句：它同时给出了症状、
+    #    判据来源和为什么这是缺陷。搬进 core/i18n.py 会让这类话被压成键名。
+    "scripts/lint_seams.py",
+    # 一次性数据迁移：给存量 finding 补 GSI 索引键（跨账号统一视图）。
+    # 同上 —— **运维工具**，运维自己在终端里跑，输出只有他看。
+    #
+    # ⚠️ 它有一段中文是**护栏**，必须紧贴代码：这台机器的 shell 里
+    #    `AWS_REGION=us-east-1` 而表在东京，脚本会先拦一次并把正确命令原样
+    #    打出来。搬进 core/i18n.py 之后那行命令就成了一个 `.replace()` 模板，
+    #    而它的全部价值就在于能直接复制粘贴。
+    "scripts/backfill_finding_gsi.py",
+    # 一次性探针：验 `ArnLike aws:PrincipalArn` 在 event bus 资源策略上的形态
+    # （iam 还是 sts）以及保留前缀 source 能不能被跨账号转发。
+    # 同上 —— **开发者工具**，只在终端里跑一次，客户永远看不到。
+    #
+    # ⚠️ 它的中文有两处是护栏，必须紧贴代码：
+    #    ① 「不能用手工 put-events 验」的理由（那时 aws:PrincipalArn 是发起人
+    #      自己的，必然不匹配，而不匹配分不清是策略写错还是测试方法错）
+    #    ② 「B 段是反面对照」—— 只验 A 到了不够，两种都到说明 Condition 整个
+    #      没起作用、A 的绿是假的
+    #    搬进 core/i18n.py 之后这两条会被压成键名，而它们的价值就在于原地可读。
+    "scripts/probe_arnlike_bus_policy.py",
     # ── WEB-CHAT AGENT-side core modules (whole group) ──────────────────────
     # These run INSIDE the Bedrock AgentCore Runtime (mirrored under
     # agent-build/NotiOpsWebChat/app/NotiOpsWebChat/core/, where there is NO
@@ -138,6 +222,19 @@ CJK_ALLOWLIST = {
     # The lint script + tests can mention Chinese for assertions.
     "scripts/lint_i18n.py",
     "scripts/test_aws_docs_mcp.py",
+    # 两份**人工** UI 回归文档的账号占位号一致性判据。与 `lint_seams.py` /
+    # `inspection_verify_live.py` 同类：**开发者/CI 工具**，输出只在终端与 CI
+    # 日志里，客户永远看不到。
+    #
+    # ⚠️ 它的 CJK 有两种，都必须留在原地：
+    #   ① **正则本身**含中文（`成员账号 \*\*(号) \(workload-prod\)\*\*`）——
+    #      被检查的文档是中文写的，正则不可能不含中文。搬进 i18n 表更是荒谬：
+    #      那是判据的一部分，不是给人读的文案。
+    #   ② **失败说明**要长且具体才有用。「短号对不上」等于没说；有价值的是
+    #      「文档里写的是 X。正文用短号 444 指代它 —— 只改长号不改短号，照这份
+    #      文档做验收的人会卡住（2026-09-03 就是这么坏的）」——
+    #      症状 + 判据 + 为什么是缺陷。压成键名就没了。
+    "scripts/test_ui_doc_account_consistency.py",
     # 冷启动延迟探针 —— **开发/运维自用工具，不在任何客户路径上**。它的 CJK 是
     # argparse help、终端表头（"ttfb (首帧)"）和一句探针 prompt（"你好"）。没有客户会
     # 看到这些字，也没有 locale 可以 thread：它是本地手工跑的一次性度量脚本
@@ -206,6 +303,13 @@ CJK_ALLOWLIST = {
     # 两条路径都要落地」/「别把断言删掉，去更新提取器」），写给下一个撞上它的维护者。
     # Developer-facing only；断言本身比对的是源码里的 IAM 动作名与环境变量键，全是 ASCII。
     "scripts/test_oneclick_parity.py",
+    # 一键部署的 IM zip 打包器 —— **维护者切版本时在自己机器上跑的构建脚本**
+    # （scripts/package_artifacts.sh 调它产出 im-code.zip / im-layer.zip），不在任何
+    # 客户路径上、也没有 locale 可以 thread。它的 CJK 全是 argparse help 和写给维护者的
+    # **失败诊断**：排除清单没读全、层里缺模块、解压体积逼近 Lambda 250 MB 上限、
+    # zip 里混进了 dist/ —— 每一条都对应一次"方式 A 装出来直接 ImportModuleError 而
+    # 方式 B 完全正常"的事故，翻成英文只会让下一个维护者更难对上号。Developer-facing only。
+    "scripts/build_im_zips.py",
     # 「setup.sh 不许部署成功但只回显」门禁 —— CJK 是套件标题、断言标签和失败提示
     # （告诉维护者为什么这条判据存在:客户 2026-08-26 那次静默降级）。其中还引用了
     # 客户实际看到的那句回显文案作为 fixture。Developer-facing only。
@@ -474,6 +578,118 @@ def _save_baseline(violations: list[str]) -> None:
     BASELINE_FILE.write_text("\n".join(body) + "\n", encoding="utf-8")
 
 
+def check_frontend_keys() -> list[str]:
+    """前端 `t("a.b.c")` 引用的键必须在 `frontend/*/src/i18n.ts` 里存在。
+
+    🔴 2026-08-26：`admin.accounts.noOneClick` 漏加了，页面上直接印出
+    ``admin.accounts.noOneClick`` 这一串原文给客户看 —— 而这个脚本原来只查
+    ``core/i18n.py``（Python 侧），前端的键**从来没被检查过**。
+
+    ``t()`` 找不到键就返回键名本身：不抛、不告警、不进日志。所以这一类缺陷
+    只能靠客户截图发现，而它长得像「系统坏了」。
+
+    ⚠️ 只认**字面量**调用 ``t("literal")``。动态键（``t(`x.${v}`)`` 或
+       ``t(someVar)``）跳过 —— 静态查不了，硬报会全是假阳性。
+    """
+    import re
+
+    out: list[str] = []
+    for i18n_file in sorted(REPO.glob("frontend/*/src/i18n.ts")):
+        root = i18n_file.parent
+        src = i18n_file.read_text(encoding="utf-8")
+        # 形如   "a.b.c": {      /      'a.b.c': {
+        defined = set(re.findall(
+            r'^\s*["\']([\w.\-]+)["\']\s*:\s*\{', src, re.M))
+        if not defined:
+            out.append(f"{i18n_file.relative_to(REPO)}: 解析不出任何 i18n 键 —— "
+                       "键的写法变了？这个检查会静默失效，先修解析")
+            continue
+        for f in sorted(root.rglob("*.ts*")):
+            if f.name == "i18n.ts":
+                continue
+            text = f.read_text(encoding="utf-8")
+            for m in re.finditer(r'\bt\(\s*["\']([\w.\-]+)["\']', text):
+                key = m.group(1)
+                if key in defined:
+                    continue
+                line = text[:m.start()].count("\n") + 1
+                out.append(
+                    f"{f.relative_to(REPO)}:{line}: t({key!r}) —— 这个键在 "
+                    f"{i18n_file.relative_to(REPO).name} 里不存在，页面上会"
+                    f"直接显示键名本身")
+    return out
+
+
+def check_frontend_orphans() -> list[str]:
+    """反方向：`i18n.ts` 里定义了却**没人引用**的键。
+
+    🔴 只查「引用了但没定义」是单向的。反方向的孤儿键会一直堆着，而它们的
+    害处不是占空间：
+
+    ```
+    · 改文案时会去改一个不生效的键，然后奇怪为什么界面没变
+    · 删功能时留下的键让人以为那个功能还在（2026-09-02 清掉 7 个，
+      其中 `insp.empty.clean` / `insp.empty.noRun` 是空态重做前的遗留，
+      而新空态的判据完全换了一套）
+    · 它们会被当成「已有译文」而在下一次改动里被复用，把老语义带回来
+    ```
+
+    ⚠️ 判据里 `t("literal")` 之外还要认 `` t(`x.${v}`) `` 这类**动态前缀**：
+       动态拼的键静态查不出全名，但前缀能查。漏了它会把
+       `insp.sev.CRITICAL`（`t(\\`insp.sev.${sev}\\`)` 拼出来的）报成孤儿 ——
+       那是假阳性，而一个会误报的检查等于没有检查。
+
+    ⚠️ 带基线：仓库里已有的孤儿键先记账不报（同这个脚本其它检查的做法），
+       否则这条一上线就是上百条噪音，没人会去看。
+    """
+    import re
+
+    out: list[str] = []
+    for i18n_file in sorted(REPO.glob("frontend/*/src/i18n.ts")):
+        root = i18n_file.parent
+        src = i18n_file.read_text(encoding="utf-8")
+        defined = set(re.findall(
+            r'^\s*["\']([\w.\-]+)["\']\s*:\s*\{', src, re.M))
+        if not defined:
+            continue          # 解析失效已由 check_frontend_keys 报过
+        used: set[str] = set()
+        prefixes: set[str] = set()
+        for f in sorted(root.rglob("*.ts*")):
+            if f.name == "i18n.ts":
+                continue
+            # ⚠️ **测试文件不算「被用到」。** 一条断言「这个键存在」不让那个键
+            #    在产品里生效 —— 而孤儿键最常见的形态恰恰是「功能删了、
+            #    键留着、测试还在断言它」。把测试算进来会让这个检查对那种
+            #    形态完全失效（实测：删掉的 `insp.judge.addNote` 加回来
+            #    不报，因为测试文件里提到了它）。
+            if re.search(r"\.(test|spec)\.tsx?$", f.name):
+                continue
+            text = f.read_text(encoding="utf-8")
+            used.update(re.findall(r'\bt\(\s*["\']([\w.\-]+)["\']', text))
+            # 🔴 键名**作为字面量出现在任何地方**都算被用到，不只是
+            #    直接写在 `t(...)` 里。实测的假阳性：
+            #
+            #      types.ts:    { labelKey: "topic.general", … }
+            #      Sidebar.tsx: { labelKey: "topic.general", … }
+            #      渲染处:       t(section.labelKey)
+            #
+            #    键经一个字段绕了一圈才进 `t()`，只扫 `t("…")` 会把它报成孤儿。
+            #    而一个会误报的检查等于没有检查（人会开始忽略它）。
+            used.update(re.findall(r'["\'`]([\w\-]+(?:\.[\w\-]+)+)["\'`]', text))
+            # 动态键：`t(`insp.sev.${sev}`)` → 前缀 `insp.sev.`
+            prefixes.update(re.findall(r'\bt\(\s*`([\w.\-]+?)\$\{', text))
+            # 键名也可能被拼在别处（例如 `insp.precision.` + rank），
+            # 所以任何出现过的字面前缀都算「可能被用到」。
+            prefixes.update(re.findall(r'["\'`]([\w.\-]+\.)["\'`]', text))
+        for key in sorted(defined - used):
+            if any(key.startswith(p) for p in prefixes):
+                continue
+            out.append(
+                f"{i18n_file.relative_to(REPO)}: {key!r} 定义了但没有任何"
+                f" t() 引用 —— 改它不会生效，留着会让人以为那个功能还在")
+    return out
+
+
 def main(argv: list[str]) -> int:
     update_baseline = "--update-baseline" in argv[1:]
     explicit_files = [a for a in argv[1:] if not a.startswith("--")]
@@ -482,6 +698,8 @@ def main(argv: list[str]) -> int:
     violations += check_i18n_table()
     violations += check_cjk_literals(files)
     violations += check_call_sites(files)
+    violations += check_frontend_keys()
+    violations += check_frontend_orphans()
 
     if update_baseline:
         _save_baseline(violations)

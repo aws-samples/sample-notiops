@@ -20,6 +20,7 @@ from slack_bolt import App, Ack
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from core import bedrock_intent
+from core import nl_router
 from core import chat_history
 from core import ddb_state
 from core import dispatch_compose
@@ -147,8 +148,10 @@ def _channel_allowed(channel_id: str) -> bool:
     return channel_id in ALLOWED_CHANNEL_IDS
 
 
+# ASCII-only regex (see CJK-lint note in platforms/feishu/app/main.py).
+# The zh command alias `/语言` is folded in via `nl_router.parse_command`.
 _LANGUAGE_CMD_RE = re.compile(
-    r"^\s*/?\s*language(?:\s+(\S+))?\s*$",
+    r"^\s*/?\s*(?:language|lang)(?:\s+(\S+))?\s*$",
     re.IGNORECASE,
 )
 
@@ -175,8 +178,15 @@ def _maybe_handle_language_command(client, channel_id: str,
     plumbing and let the user change locale from anywhere.
     """
     m = _LANGUAGE_CMD_RE.match(raw_text or "")
-    nl_target = "" if m else i18n.parse_language_switch_intent(raw_text or "")
-    if not m and not nl_target:
+    # zh command alias `/语言` via the shared router (kept out of the ASCII
+    # regex above for i18n-lint hygiene).
+    zh_cmd_arg: str = ""
+    if not m:
+        _route = nl_router.parse_command(raw_text or "")
+        if _route.kind == "language":
+            zh_cmd_arg = _route.arg
+    nl_target = "" if (m or zh_cmd_arg) else i18n.parse_language_switch_intent(raw_text or "")
+    if not m and not zh_cmd_arg and not nl_target:
         return False
     if not user_id:
         client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
@@ -187,8 +197,10 @@ def _maybe_handle_language_command(client, channel_id: str,
     # (= "show current").
     if nl_target:
         arg = nl_target
-    else:
+    elif m:
         arg = i18n.normalize_locale(m.group(1)) if m.group(1) else ""
+    else:
+        arg = i18n.normalize_locale(zh_cmd_arg) if zh_cmd_arg else ""
 
     if not arg:
         # Show current. We have a real `locale` already (resolved upstream
@@ -237,6 +249,8 @@ def _maybe_handle_language_command(client, channel_id: str,
 # `@bot model [alias|list|default]` — anyone in the channel can switch
 # the model used for that channel (no admin gate, per product decision
 # 2026-06-05). Same short-circuit pattern as the language command.
+# ASCII-only regex; `/模型` is folded in via nl_router.parse_command (see
+# feishu main.py for the CJK-lint rationale).
 _MODEL_CMD_RE = re.compile(
     r"^\s*/?\s*model(?:\s+(\S+))?\s*$",
     re.IGNORECASE,
@@ -255,11 +269,28 @@ def _maybe_handle_model_command(client, channel_id: str,
     everything else writes to the chat-level pref row so all members
     of the channel see the same model from then on."""
     m = _MODEL_CMD_RE.match(raw_text or "")
-    if not m:
-        return False
-
     is_dm = channel_type == "im"
-    arg = (m.group(1) or "").strip().lower()
+    zh_cmd_arg: str = ""
+    if not m:
+        _route = nl_router.parse_command(raw_text or "")
+        if _route.kind == "model":
+            zh_cmd_arg = _route.model_arg
+    if not m and not zh_cmd_arg:
+        # NL "换个模型" / "switch model" — no specific alias nameable, so show
+        # the list and let the user pick. 0 token (pure regex, pre-Bedrock).
+        if not nl_router.parse_model_switch_intent(raw_text or ""):
+            return False
+        rows = "\n".join(
+            i18n.t("model.list_row", locale, alias=e.alias, label=e.label)
+            for e in model_catalog.all_entries()
+        )
+        text = (i18n.t("model.switch_nl_hint", locale) + "\n" + rows
+                + "\n\n" + i18n.t("model.usage", locale))
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                text=text)
+        return True
+
+    arg = ((m.group(1) if m else zh_cmd_arg) or "").strip().lower()
 
     if not arg:
         alias, source = llm_pref_resolver.resolve(
@@ -319,6 +350,29 @@ def _maybe_handle_model_command(client, channel_id: str,
         channel=channel_id, thread_ts=thread_ts,
         text=i18n.t(msg_key, locale, label=entry.label),
     )
+    return True
+
+
+def _help_text(locale: str) -> str:
+    """Bilingual command menu (rendered from i18n `help.*`). Lists BOTH
+    language forms of every command."""
+    rows = "\n".join(
+        i18n.t(f"help.row.{feature}", locale)
+        for feature, _en, _zh in nl_router.HELP_COMMANDS
+    )
+    return (f"*{i18n.t('help.title', locale)}*\n\n"
+            f"{i18n.t('help.intro', locale)}\n\n"
+            f"{rows}\n\n"
+            f"{i18n.t('help.footer', locale)}")
+
+
+def _maybe_handle_help_command(client, channel_id: str, thread_ts: str | None,
+                               raw_text: str, locale: str) -> bool:
+    """`/help` / `/帮助` / `怎么用` — the command menu. 0 token."""
+    if nl_router.parse_command(raw_text or "").kind != "help":
+        return False
+    client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                            text=_help_text(locale))
     return True
 
 
@@ -466,6 +520,11 @@ def on_app_mention(event: dict, say, client) -> None:
                                     raw_text, _pre_locale):
         return
 
+    # `/help` / `/帮助` / `怎么用` — command menu (deterministic, 0 token).
+    if _maybe_handle_help_command(client, channel_id, thread_ts,
+                                  raw_text, _pre_locale):
+        return
+
     # Resolve the conversation locale BEFORE writing the event row so
     # the entire response chain (ack / refusal / chat / dispatch card /
     # downstream incident lock) is language-consistent. Priority chain:
@@ -532,6 +591,56 @@ def on_app_mention(event: dict, say, client) -> None:
                 text=i18n.t("skill.author.denied", locale))
         return
 
+    # ── Deterministic 0-token routing (core.nl_router) ───────────────────
+    # Explicit / clearly-worded case requests route straight to the case flow
+    # with NO Bedrock classify. Explicit investigate commands force the
+    # investigate route. Guard: a strong-change request falls through to the
+    # normal hybrid refusal so the read-only guarantee still holds. Mirror of
+    # platforms/feishu/app/main.py.
+    _route = nl_router.classify(raw_text)
+    _force_investigate = False
+    if _route.kind in ("case", "investigate") and not _looks_strongly_change(raw_text):
+        if _route.kind == "case":
+            from platforms.slack.app import case_flow
+            cc, cid = _route.case_command, _route.case_id
+            logger.info("nl_router: case route command=%s id=%s form=%s (0 token)",
+                        cc, cid, _route.form)
+            if cc == "case_view":
+                case_flow.start_view(client, channel_id, thread_ts, cid,
+                                     locale=locale)
+            elif cc == "case_reply":
+                case_flow.start_reply(client, channel_id, thread_ts, cid,
+                                      raw_text, user_id, locale=locale)
+            elif cc == "case_resolve":
+                case_flow.start_resolve(client, channel_id, thread_ts, cid,
+                                        locale=locale)
+            elif cc == "case_analyze":
+                case_flow.start_analyze(client, channel_id, thread_ts, cid,
+                                        locale=locale)
+            elif cc == "case_create":
+                case_flow.start_create(client, channel_id, raw_text, user_id,
+                                       thread_ts, locale=locale)
+            else:  # case_list + any unmapped canonical
+                case_flow.start_list(client, channel_id, thread_ts,
+                                     status_filter="recent", locale=locale)
+            return
+        # investigate — only the explicit COMMAND form forces the route; NL
+        # deep-dive phrasings still flow through analyze_intent (suggestions).
+        if _route.form == "command":
+            _inv = _route.arg.strip()
+            if _inv:
+                raw_text = _inv
+                try:
+                    ddb_state._table.update_item(
+                        Key={"lookup_key": f"event#{event_id}"},
+                        UpdateExpression="SET raw_text = :t",
+                        ExpressionAttributeValues={":t": raw_text},
+                    )
+                except Exception as e:
+                    logger.warning("nl_router: persist investigate text failed: %s", e)
+            _force_investigate = True
+            logger.info("nl_router: investigate command route (forced)")
+
     # Quick acknowledgement so the user sees we got it.
     say(channel=channel_id, thread_ts=thread_ts,
         text=i18n.t("ack.understanding", locale))
@@ -544,6 +653,9 @@ def on_app_mention(event: dict, say, client) -> None:
     intent = analysis["intent"]
     suggestions = analysis.get("suggestions", [])
     command = analysis.get("command", "investigate")
+    # Explicit `/调查 …` command overrides the classifier — user named the route.
+    if _force_investigate:
+        command = "investigate"
     case_display_id = analysis.get("case_display_id", "")
     needs_diagnosis = analysis.get("needs_diagnosis", True)
     # Multi-turn rewrite (#1) was retired — kept as constants so the
@@ -2016,7 +2128,7 @@ def _handle_next_step_dispatch(body: dict, client) -> None:
 # Entrypoint
 # ---------------------------------------------------------------------------
 def main() -> None:
-    # Bedrock API Key 注入（spec task 4.5）：注册 bedrock 客户端的构造前钩子并做一次
+    # Bedrock API Key 注入：注册 bedrock 客户端的构造前钩子并做一次
     # 初次收敛。必须在任何 Bedrock 调用之前 —— botocore 在**构造时**快照 token provider，
     # 设晚了会 NoAuthTokenError 硬失败而非回退 IAM。之后每条消息 / 每轮轮询各自 refresh()。
     try:

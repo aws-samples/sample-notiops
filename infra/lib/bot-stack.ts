@@ -274,7 +274,7 @@ export class BotStack extends cdk.Stack {
     }));
 
     // Secrets Manager read (Feishu credentials via Dashboard UI)
-    // Bedrock API Key（spec R5.2 / task 4.5）：Admin 在 webchat 管理页存进 Secrets Manager，
+    // Bedrock API Key（spec R5.2）：Admin 在 webchat 管理页存进 Secrets Manager，
     // IM 侧 `core/bedrock_credentials` 读它并在 bedrock 客户端构造前注入
     // `AWS_BEARER_TOKEN_BEDROCK`。缺此授权的失败模式是**静默的**：读 secret 被拒 → 回退
     // IAM 角色 → 对话照常但 Key 永不生效。只读、只到这一个 secret（写入方是 BFF）。
@@ -430,7 +430,7 @@ export class BotStack extends cdk.Stack {
       actions: ["secretsmanager:GetSecretValue"],
       resources: [
         `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/slack-*`,
-        // Bedrock API Key（task 4.5）—— 见 Feishu 角色处的说明（失败模式为静默回退 IAM）。
+        // Bedrock API Key —— 见 Feishu 角色处的说明（失败模式为静默回退 IAM）。
         `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/bedrock-api-key-*`,
       ],
     }));
@@ -563,7 +563,7 @@ export class BotStack extends cdk.Stack {
       actions: ["secretsmanager:GetSecretValue"],
       resources: [
         `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/dingtalk-*`,
-        // Bedrock API Key（task 4.5）—— 见 Feishu 角色处的说明（失败模式为静默回退 IAM）。
+        // Bedrock API Key —— 见 Feishu 角色处的说明（失败模式为静默回退 IAM）。
         `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/bedrock-api-key-*`,
       ],
     }));

@@ -4,8 +4,12 @@
 webchat 每请求新建一个 BedrockModel（AgentCore 单会话进程），所以它只需在构造前 set/pop
 一次 env。IM 侧在两个维度上不同：
 
-  1. **缓存的客户端**：8 个模块级 `core/lazy_boto.LazyClient("bedrock-runtime")` 单例，
+  1. **缓存的客户端**：模块级 `core/lazy_boto.LazyClient("bedrock-runtime")` 单例，
      首次使用时构造一次、之后一直复用。所以「每请求 set env」对它们无效——除非同时重建。
+     （2026-09-01：这类单例从 8 个减到 1 个 —— 只剩 `core/bedrock_chat.py`。另外 7 个模块
+     的调用点迁到了 `core/bot_llm.py` → `shared/llm_provider.py::invoke_llm`，那条路每次
+     调用自己 set env + 建 client，并在 401/403 时主动失效 Key 缓存，本模块管不着也不必管。
+     但机制**不能删**：`bedrock_chat` 是 IM 对话主路径，恰恰是 api_key 模式必须能用的地方。）
   2. **多会话并发**：飞书/Slack 进程里，入站消息 handler + 每次派发的后台线程 +
      进度轮询 daemon 会**并发**调用 Bedrock。任何「set env + 重建」都必须串行化。
 
@@ -14,7 +18,7 @@ webchat 每请求新建一个 BedrockModel（AgentCore 单会话进程），所�
     构造前（首建或重建）都会先跑它，把 `AWS_BEARER_TOKEN_BEDROCK` 摆正。botocore 在构造时
     快照 token provider、每请求再读 env 决定签名，两者必须一致，否则 NoAuthTokenError
     硬失败而非静默回退 IAM（见 core/lazy_boto 与 scripts/test_lazy_bedrock_client.py）。
-    这一步保证「构造时 env 正确」，与调用入口无关（覆盖全部 8 个模块）。
+    这一步保证「构造时 env 正确」，与调用入口无关（覆盖所有仍走 lazy_boto 的模块）。
   · `refresh()`    —— 在每条 IM 消息 / 每轮轮询前调用。若 Key 相比上次**变了**（轮换 /
     清空 / 首次），就 `reset_all("bedrock-runtime")` 让缓存客户端下次使用时重建；重建时钩子
     施加新 Key。加锁、幂等：Key 没变就是廉价 no-op。

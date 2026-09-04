@@ -110,6 +110,9 @@ ACCOUNT="$(aws sts get-caller-identity --query Account --output text 2>/dev/null
 
 # ─── 资源清单(全部来自 setup.sh / CDK 里写死的名字)───
 STACK_MAIN="NotiOpsBackendStack"
+STACK_IM="ImStack"          # IM 的 Webhook + Lambda（现役）
+# BotStack = ECS 长连接（2026-09-03 / M2 退役，已不再由 infra/bin/app.ts 实例化）。
+# 名字**必须留着**：M2 之前装过的账号里这个栈还在，卸载要能把它一起清掉。
 STACK_BOT="BotStack"
 STACK_WEBCHAT="WebChatStack"
 STACK_AGENT="AgentCore-NotiOpsWebChat-default"
@@ -151,7 +154,7 @@ owner_stack() {
 }
 is_our_stack() {
   case "$1" in
-    "$STACK_MAIN"|"$STACK_BOT"|"$STACK_WEBCHAT"|"$STACK_AGENT"|"$STACK_CUR_ATHENA") return 0 ;;
+    "$STACK_MAIN"|"$STACK_IM"|"$STACK_BOT"|"$STACK_WEBCHAT"|"$STACK_AGENT"|"$STACK_CUR_ATHENA") return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -184,7 +187,7 @@ echo ""
 
 FOUND_ANY=false
 echo "$(t "CloudFormation 栈:" "CloudFormation stacks:")"
-for s in "$STACK_AGENT" "$STACK_BOT" "$STACK_WEBCHAT" "$STACK_MAIN" "$STACK_CUR_ATHENA"; do
+for s in "$STACK_AGENT" "$STACK_IM" "$STACK_BOT" "$STACK_WEBCHAT" "$STACK_MAIN" "$STACK_CUR_ATHENA"; do
   st="$(stack_status "$s")"
   if [ -n "$st" ] && [ "$st" != "None" ]; then
     echo "  · $s  ($st)"; FOUND_ANY=true
@@ -383,8 +386,11 @@ fi
 # CLI 走完也确认栈真没了(agentcore 版本差异:destroy / delete 行为不完全一致)。
 delete_stack_wait "$STACK_AGENT"
 
-step "$(t "2/8 IM Bot 栈 / Web Chat 栈" "2/8 IM bot stack / Web Chat stack")"
+step "$(t "2/8 IM 栈(Webhook + 老 ECS) / Web Chat 栈" "2/8 IM stacks (webhook + legacy ECS) / Web Chat stack")"
 empty_bucket "$BUCKET_CHAT_FRONTEND"
+# ImStack 先删:它是 IM 的现役实现(API Gateway HTTP API + ingress/worker Lambda)。
+# 漏了它 = 卸载完 webhook 端点还活着,IM 里发消息还会被处理(拿不到表,报错刷日志)。
+delete_stack_wait "$STACK_IM"
 delete_stack_wait "$STACK_BOT"
 delete_stack_wait "$STACK_WEBCHAT"
 
@@ -542,7 +548,7 @@ fi
 # =============================================================================
 step "$(t "删完清点" "Post-deletion inventory")"
 LEFT=false
-for s in "$STACK_AGENT" "$STACK_BOT" "$STACK_WEBCHAT" "$STACK_MAIN" "$STACK_CUR_ATHENA"; do
+for s in "$STACK_AGENT" "$STACK_IM" "$STACK_BOT" "$STACK_WEBCHAT" "$STACK_MAIN" "$STACK_CUR_ATHENA"; do
   st="$(stack_status "$s")"
   if [ -n "$st" ] && [ "$st" != "None" ]; then echo "  · $(t "仍在: " "still there: ")$s ($st)"; LEFT=true; fi
 done

@@ -22,7 +22,7 @@
    - 4.1 [Intent classifier `bedrock_intent`](#41-intent-classifier-bedrock_intent)
    - 4.2 [General chat + three-layer defense `bedrock_chat`](#42-general-chat--three-layer-defense-bedrock_chat)
    - 4.3 [Webhook dispatch `webhook_dispatch`](#43-webhook-dispatch-webhook_dispatch)
-   - 4.4 [Live progress card `progress_poller` + `progress_card`](#44-live-progress-card-progress_poller--progress_card)
+   - 4.4 [Live progress card `progress_poller` + `progress_card` (⚠️ retired, rollback path)](#44-live-progress-card-progress_poller--progress_card)
    - 4.5 [Next-step suggestions `next_steps`](#45-next-step-suggestions-next_steps)
    - 4.6 [Push mode `push_event` + `push_handler`](#46-push-mode-push_event--push_handler)
    - 4.7 [Case management `case_management`](#47-case-management-case_management)
@@ -104,25 +104,30 @@ for the AWS-resource-inventory view see [architecture.md](architecture.md).
 │  │ Feishu  │  │  Slack  │  │ DingTalk │  │  Teams  │   ← future   │
 │  └────┬────┘  └────┬────┘  └─────────┘  └─────────┘              │
 └───────┼────────────┼───────────────────────────────────────────────┘
-        │  long WS   │ Socket Mode
+        │  webhook   │ webhook
+        │  (HTTPS)   │ (Events / Interactivity / Slash)
         ▼            ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │                    NotiOps (this project)                 │
 │                                                                    │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐         │
-│  │  Feishu Bot  │    │  Slack Bot   │    │ Other plats  │         │
-│  │  ECS Fargate │    │  ECS Fargate │    │ (extend on   │         │
-│  │  (lark-oapi) │    │  (slack_bolt)│    │  demand)     │         │
+│  │  Feishu      │    │  Slack       │    │ Other plats  │         │
+│  │  ingress λ   │    │  ingress λ   │    │ (extend on   │         │
+│  │  + worker λ  │    │  + worker λ  │    │  demand)     │         │
+│  │  (ImStack)   │    │  (ImStack)   │    │              │         │
 │  └──────┬───────┘    └──────┬───────┘    └──────────────┘         │
+│   ingress: fronted by an API GW HTTP API; verify + async invoke     │
+│   (the old ECS Fargate long connection was retired on 2026-09-03 /  │
+│    M2; only the source stays as a rollback path)                    │
 │         │                   │                                       │
 │         └─────────┬─────────┘                                       │
 │                   ▼                                                 │
 │  ┌─────────────────────────────────────────────────────┐           │
 │  │           core/  platform-agnostic shared code       │           │
 │  │  • bedrock_intent   (intent classification)          │           │
-│  │  • bedrock_chat     (general chat + 3-layer defense) │           │
-│  │  • progress_poller  (progress-card polling daemon)   │           │
-│  │  • progress_card    (progress-card IR + Bedrock summary) │      │
+│  │  • bedrock_chat  (general chat + 3-layer, rollback)  │           │
+│  │  • nl_router        (0-token bilingual intent route) │           │
+│  │  • devops_agent     (dispatch + progress polling)    │           │
 │  │  • next_steps       (post-report suggestion gen)     │           │
 │  │  • case_management  (Support case management)        │           │
 │  │  • push_event       (alert event normalization)      │           │
@@ -152,11 +157,11 @@ for the AWS-resource-inventory view see [architecture.md](architecture.md).
 
 | Layer | Physical location | Responsibility | Code |
 |---|---|---|---|
-| **L1 platform adapter** | ECS Fargate (1 task per platform) | Receive IM events, route card callbacks, maintain long-lived connections | `platforms/feishu/app/`, `platforms/slack/app/` |
-| **L2 shared business logic** | Same process as L1 or inside Lambda | Intent classification, chat, progress polling, case, push, signed dispatch | `core/` |
+| **L1 platform adapter** | Lambda (one pair per platform: ingress + worker, in `ImStack`) | ingress: signature check + idempotent de-dup + async hand-off; worker: message / card-callback routing and handling | `platforms/{feishu,slack}/lambda_ingress.py` + `lambda_worker.py` (the rollback-only long-connection entrypoints live in `platforms/*/app/`) |
+| **L2 shared business logic** | Same process as L1 or inside Lambda | Deterministic intent routing (`core/nl_router`, 0 tokens), chat, progress polling, case, push, signed dispatch | `core/` |
 | **L3 background jobs** | AWS Lambda (stateless) | Receive EventBridge events, render reports, deliver to IM | `shared/report_delivery/report_handler.py`, `shared/report_delivery/push_handler.py`, `shared/report_delivery/feishu_sender.py`, `shared/report_delivery/slack_sender.py` |
 
-L2 is shared by two callers — ECS tasks (in-process import) and Lambda (`core/` + `shared/` are included in the Lambda deployment package at packaging time by CDK).
+L2 is shared by two kinds of callers — the IM worker / background Lambdas (`core/` + `shared/` are included in the deployment package at packaging time by CDK); before M2 there were also the ECS tasks on the rollback path (in-process import), and that path is now retired.
 
 ### 2.3 Deployment topology
 
@@ -164,16 +169,16 @@ L2 is shared by two callers — ECS tasks (in-process import) and Lambda (`core/
                     ┌─────────────────────────────────┐
                     │       AWS Account               │
                     │                                 │
-   IM ── long WS ─→ │  ┌──────────────┐              │
-                    │  │  ECS Fargate │  Feishu bot  │
-                    │  │  Cluster     │  (1 task,    │
-                    │  │              │   512/1024MB) │
+Feishu ─ webhook →  │  ┌──────────────┐              │
+                    │  │ API GW HTTP  │  Feishu      │
+                    │  │ API + ingress│  (128MB /    │
+                    │  │ λ + worker λ │   900MB×900s)│
                     │  └──────┬───────┘              │
                     │         │                      │
                     │  ┌──────▼───────┐              │
-   IM ── Socket ──→ │  │  ECS Fargate │  Slack bot   │
-                    │  │  Cluster     │  (1 task,    │
-                    │  │              │   512/1024MB) │
+ Slack ─ webhook →  │  │ API GW HTTP  │  Slack       │
+                    │  │ API + ingress│  (same)      │
+                    │  │ λ + worker λ │              │
                     │  └──────┬───────┘              │
                     │         │                      │
                     │   ┌─────▼────────────────────┐ │
@@ -188,13 +193,15 @@ L2 is shared by two callers — ECS tasks (in-process import) and Lambda (`core/
                     └─────────────────────────────────┘
 ```
 
-**Key design:** each IM platform gets its own ECS cluster + its own CFN stack, but **all platforms share the same `core/` code + shared DDB / Lambda / S3**. Customers can deploy Feishu only, Slack only, or both.
+**Key design:** each IM platform gets its own HTTP API + its own ingress/worker Lambda + its own execution role (all inside the same `ImStack`), but **all platforms share the same `core/` code + shared DDB / Lambda / S3 + the same progress-polling Lambda**. Customers can deploy Feishu only, Slack only, or both.
+
+> ⚠️ Before 2026-09-03 (M2) this was one ECS Fargate Service per platform (512 CPU / 1024 MB, long connection / Socket Mode) deployed by `BotStack` — now retired; `infra/lib/bot-stack.ts` is kept only as a source-level rollback path.
 
 ---
 
 ### 2.4 Web Chat architecture (agentic AI assistant)
 
-> **Positioning**: Web Chat is NotiOps's **primary surface** — a browser-based agentic assistant you talk to the AWS ops agent from, with the IM surfaces (Feishu / Slack / DingTalk) as a necessary supplement for alert-channel response. It has its own agent runtime, BFF, frontend, and auth chain, and shares some backend constraints and storage with the IM side (e.g. the Skills S3 prefix, the read-only defense philosophy), but it **does not reuse the IM side's `core/` / ECS bot / EventBridge dispatch chain**.
+> **Positioning**: Web Chat is NotiOps's **primary surface** — a browser-based agentic assistant you talk to the AWS ops agent from, with the IM surfaces (Feishu / Slack / DingTalk) as a necessary supplement for alert-channel response. It has its own agent runtime, BFF, frontend, and auth chain, and shares some backend constraints and storage with the IM side (e.g. the Skills S3 prefix, the read-only defense philosophy), but it **does not reuse the IM side's `core/` / IM worker Lambda / EventBridge dispatch chain**.
 
 #### 2.4.1 Four-layer components
 
@@ -225,7 +232,7 @@ L2 is shared by two callers — ECS tasks (in-process import) and Lambda (`core/
 │    async-gen)                                                  │
 │  • create_case_from_template (deterministic case creation      │
 │    against the real catalog)                                   │
-│  • strictly read-only (inherits backend defense constraints)  │
+│  • strictly read-only (defense in depth, see 5.3)             │
 └───────────────────────────────────────────────────────────────┘
 
 Side path: EventBridge sources → notiops-web-notif-handler (Lambda)
@@ -291,39 +298,39 @@ Notifications / Investigate / FinOps / Cases / Skills (top-level) / More (securi
 ```mermaid
 sequenceDiagram
     participant U as User (Feishu)
-    participant Bot as Feishu Bot (ECS)
-    participant H as Bedrock Haiku
+    participant GW as API GW HTTP API
+    participant IN as ingress λ
+    participant W as worker λ
     participant Agent as AWS DevOps Agent
+    participant P as notiops-im-progress λ
+    participant H as Bedrock Haiku
     participant L as Lambda<br/>(report-handler)
     participant S3 as S3
     participant DDB as DynamoDB
 
-    U->>Bot: @bot check CPU on i-0123
-    Bot->>DDB: put_new_event (conditional, idempotent dedup)
-    Bot->>U: 🤔 Understanding your request…
-    Bot->>Bot: _is_change_request(text) → False
-    Bot->>H: analyze_intent(text)
-    H-->>Bot: {command:"investigate", intent, suggestions}
-    Bot->>U: confirmation card [✅ Dispatch] [❌ Cancel]
+    U->>GW: @bot deep dive on i-0123 CPU
+    GW->>IN: $default catch-all (unauthenticated; verification happens on the body)
+    IN->>IN: lark_oapi decrypt + signature check
+    IN->>W: async invoke (InvocationType=Event)
+    IN->>U: 👀 reaction (**must come after the invoke**)
+    IN-->>GW: 200 (instant ACK — Feishu has a ~3s hard timeout)
 
-    U->>Bot: click ✅ Dispatch
-    Bot->>DDB: read event row, validate state
-    Bot->>Agent: generic webhook dispatch<br/>(HMAC signed + incident_id embedded in description)
-    Agent-->>Bot: task_id
-    Bot->>DDB: link_incident (incident#xxx → chat_id)
-    Bot->>DDB: put progress#xxx (start polling)
-    Bot->>U: ✅ Dispatched, investigation starting
+    W->>DDB: put_new_event (event_id idempotent dedup)
+    W->>W: nl_router.route(text) → investigate<br/>(regex, **0 tokens**) + strong-change gate passes
+    W->>Agent: CreateBacklogTask(title, description)
+    Agent-->>W: task_id + execution_id
+    W->>U: "dispatched" card → message_id
+    W->>DDB: put imtask# (execution_id / task_id / message_id / seen_ids)
+    W->>DDB: link_incident (incident#xxx / task#xxx → chat_id)
 
-    Note over Bot,DDB: progress_poller daemon scans DDB every 10s
+    Note over P,DDB: EventBridge rate(1 minute) → scan imtask#
 
-    Bot->>Agent: ListJournalRecords (poll)
-    Agent-->>Bot: thinking + tool_use records
-    Bot->>Bot: extract_recent_tools<br/>extract_latest_thinking
-    Bot->>H: translate_thinking_zh<br/>summarize_progress (every 4 ticks)
-    H-->>Bot: localized summary + thoughts
-    Bot->>U: chat_update on the same card (progress update)
+    P->>Agent: ListJournalRecords + GetBacklogTask
+    Agent-->>P: new journal records + status
+    P->>P: compute new_lines from the seen_ids cursor (**0 tokens**)
+    P->>U: update_card on the same card (append progress lines)
 
-    Note over Agent: investigation completes
+    Note over Agent: investigation completes → P writes the "done" card and deletes the imtask# row
 
     Agent->>L: EventBridge "Investigation Completed"
     L->>Agent: ListJournalRecords (pull full journal)
@@ -332,9 +339,18 @@ sequenceDiagram
     L->>H: next_steps.generate(summary_md)
     H-->>L: [{type, label, query/url}, ...]
     L->>DDB: lookup incident#xxx → routing info
-    L->>Bot: deliver via sender back to original channel
-    Bot->>U: 📝 Report Summary + ✅ NotiOps Report<br/>(View report / Trace / 🤖 next-step / 🆘 escalate Support)
+    L->>U: deliver via sender back to the original channel: 📝 Report Summary + ✅ NotiOps Report<br/>(View report / Trace / 🤖 next-step / 🆘 escalate Support)
 ```
+
+> ⚠️ **Before M2 / M3 this pipeline looked different** — troubleshoot older installs
+> against the old diagram: the entrypoint was a long-connection process on ECS Fargate
+> (no API GW / ingress / worker split), intent went through one Haiku call
+> (`bedrock_intent.analyze_intent()`) and a "confirm dispatch" card (**spending tokens**),
+> dispatch used the HMAC generic webhook in `webhook_dispatch`, and progress came from the
+> resident ECS daemon `progress_poller` scanning `progress#` rows every 10s plus one Haiku
+> call every 4 ticks to write the narrative (§4.4). All four are **replaced** now:
+> deterministic regex routing, `CreateBacklogTask`, `imtask#` + a once-a-minute Lambda,
+> and progress text passed through verbatim.
 
 ### 3.2 Identifiers that thread through the pipeline
 
@@ -507,7 +523,7 @@ The `locale` parameter (`"zh"` / `"en"`) lets the LLM produce the `intent` parap
 | `chitchat` | ⚠️ only on `enabled` tier | Small talk | "hi" / "what can you do" |
 | `general_qa` | ⚠️ only on `qa_only` / `enabled` tier | AWS conceptual Q&A | "what's the difference between ALB and NLB" |
 
-`chitchat` / `general_qa` are gated by the three-tier `AGENTIC_CHAT_MODE` master switch, **defaulting to `enabled`** (all 10 commands available). Set the parameter to `disabled` to fall back to investigate / case_* / query only. See §4.2 for the tier semantics.
+`chitchat` / `general_qa` are gated by the three-tier `AGENTIC_CHAT_MODE` main switch, **defaulting to `enabled`** (all 10 commands available). Set the parameter to `disabled` to fall back to investigate / case_* / query only. See §4.2 for the tier semantics.
 
 #### 4.1.4 Three-stage classification decision
 
@@ -555,7 +571,7 @@ good morning / good afternoon
 
 Code: [core/bedrock_intent.py](../core/bedrock_intent.py) `_is_obvious_chitchat()` + `_CHITCHAT_SHORTCUT_RE` + `_RESOURCE_ID_HINT_RE`
 
-#### 4.1.7 Master switch `AGENTIC_CHAT_MODE`
+#### 4.1.7 Mode switch `AGENTIC_CHAT_MODE`
 
 CFN parameter, propagated through task definition env, **changing it requires no rebuild**:
 
@@ -570,6 +586,13 @@ Code: [core/bedrock_intent.py:53](../core/bedrock_intent.py) `_agentic_chat_mode
 ---
 
 ### 4.2 General chat + three-layer defense `bedrock_chat`
+
+> ⚠️ **Scope note (updated 2026-09-03)**: this section describes `core/bedrock_chat.py`.
+> Its only caller is `platforms/{feishu,slack,dingtalk}/app/main.py` — after M2 those
+> resident ECS apps retired together with `BotStack` (`infra/bin/app.ts:66`), and the
+> source is kept only so that a rollback stays possible.
+> **Neither production entry point (web console / IM Webhook) runs these three layers**;
+> for the defenses that actually apply to each of them, see §5.3.
 
 #### 4.2.1 Zero-change promise
 
@@ -697,7 +720,7 @@ By Claude Sonnet 5 (via Amazon Bedrock)
 ```
 
 - Implementation: `core/bedrock_chat.py::respond()` builds `By <label> (via Amazon Bedrock)` straight from the catalogue entry resolved for this turn (`model_entry.label`)
-- **There is exactly one model-name table — the catalogue itself** (DynamoDB, editable on the Admin "Models" page). An earlier hardcoded `_MODEL_FRIENDLY_NAMES` / `_friendly_model_name()` / `_model_footer()` trio was deleted in 2026-08 (spec task 4.4): it had no callers left, and its substring matching was unsound (the needle `claude-sonnet-5` also matches a future `claude-sonnet-5x`). Aliases missing from the catalogue fall back inside `core/model_catalog.py`
+- **There is exactly one model-name table — the catalogue itself** (DynamoDB, editable on the Admin "Models" page). An earlier hardcoded `_MODEL_FRIENDLY_NAMES` / `_friendly_model_name()` / `_model_footer()` trio was deleted in 2026-08: it had no callers left, and its substring matching was unsound (the needle `claude-sonnet-5` also matches a future `claude-sonnet-5x`). Aliases missing from the catalogue fall back inside `core/model_catalog.py`
 - The byline follows the model currently selected for this chat / DM (Claude Sonnet 5 by default) — it is not pinned to any one model
 - Plain-text format (no markdown italics), because Feishu's `reply_text` path does not render markdown — `_..._` would show up literally
 
@@ -813,6 +836,22 @@ Code: [core/webhook_dispatch.py](../core/webhook_dispatch.py) `dispatch()`
 ---
 
 ### 4.4 Live progress card `progress_poller` + `progress_card`
+
+> ⚠️ **Since 2026-09-03 (M2) this whole section describes the rollback path, not production.**
+> `core/progress_poller.py` (the resident ECS daemon that scans `progress#` rows),
+> `core/progress_card.py` (journal extraction + Bedrock narrative) and
+> `platforms/*/app/progress_sender.py` are wired up only by `platforms/*/app/main.py`,
+> so all three retired together with `BotStack` — which means the 4.4.2 environment
+> variables have **no effect** in production.
+>
+> Production runs the `notiops-im-progress` Lambda
+> ([`platforms/common/lambda_progress.py`](../platforms/common/lambda_progress.py)):
+> EventBridge fires it every minute, it scans `imtask#` rows and calls
+> `core.devops_agent.poll_investigation()` per row (stateless incremental, `seen_ids`
+> cursor); card refresh pacing comes from the backoff in
+> `platforms/common/live_card.py` (see §10.3).
+> The section is kept because it records the complete long-connection design — a
+> rollback has to follow it.
 
 #### 4.4.1 Why this layer exists
 
@@ -1092,7 +1131,9 @@ A single shared table `notiops-devops-conversations` (deletion policy: Retain) h
 | `incident#<incident_id>` | Cross-link routing (IM ↔ DevOps Agent ↔ Lambda). incident_id format: `<platform>-<event_id>` | 7 days |
 | `task#<task_id>` | DevOps Agent task fallback routing (when incident_id extraction fails) | 7 days |
 | `support#<incident_id>` | Case-creation context (links case_display_id with incident_id) | 7 days |
-| `progress#<incident_id>` | Progress-card polling state (tick_count / last_polled_at / last_summary_md) | Auto-deleted on report completion |
+| `imtask#<incident_id>` | **Current (since M2)**: everything about one dispatched deep investigation plus its progress cursor (`message_id` / `execution_id` / `task_id` / `seen_ids` / `console_url`); `notiops-im-progress` scans it every minute | 30 min (row deleted immediately on a terminal state) |
+| `imchat#<platform>:<chat_id>` | A conversation's DevOps Agent `execution_id` (IM multi-turn context lives here, not in model memory) | 12 hours |
+| `progress#<incident_id>` | ⚠️ **Retired (M2)**: the ECS daemon's progress-card polling state (tick_count / last_polled_at / last_summary_md) | Auto-deleted on report completion |
 | `push_dedup#<resource>:<event_type>` | 5-minute dedup for push events | 5 min |
 | `locale#user#<user_id>` | User-explicit language preference (written via §4.9 `set_user_pref`) | 90 days |
 | `locale#dm#<platform>:<user_id>` | DM auto-lock (written after auto-detect on the first message; follow-ups inherit) | 30 days |
@@ -1241,13 +1282,25 @@ body text + 📚 sources block (each cited URL)
 | `core/aws_docs_mcp.py` | Exposes AWS Knowledge MCP to Bedrock's `tool_use` protocol: `get_tool_definitions()` / `dispatch_tool_call(name, args)` |
 | `core/mcp_http_client.py` | Generic streamable-HTTP MCP client (JSON-RPC 2.0 over POST + SSE), shared by `aws_docs_mcp` and the three sidecar wrappers |
 | `core/aws_pricing_mcp.py` | (optional) Pricing-related tool definitions, wired via a sidecar to `awslabs/aws-pricing-mcp-server` running locally in the customer's account |
-| `sidecars/aws-pricing-mcp/` | Wraps the awslabs official MCP server as streamable-http, runs in an ECS task as a sidecar (127.0.0.1:8001) |
+| `sidecars/aws-pricing-mcp/` | ⚠️ **Retired** (with `BotStack` / M2, 2026-09-03): wraps the awslabs official MCP server as streamable-http, runs in an ECS task as a sidecar (127.0.0.1:8001) |
 
-> **About cost / pricing / WA MCP** (current state, 2026-06-10):
+> **About cost / pricing / WA MCP** (current state):
 >
-> - **Pricing MCP** (`sidecars/aws-pricing-mcp/`): **bundled with BotStack by default**; the bot answers price questions with real AWS Pricing API data.
-> - **Cost MCP** (`sidecars/aws-cost-mcp/`): briefly retired on 2026-05-30 (cost preview snapshots + service alias unstable for single-shot answers), **re-enabled by default on 2026-06-10**; the bot answers cost / usage / budget / optimization questions with real Cost Explorer data.
-> - **WA MCP** (`sidecars/aws-wa-mcp/`): still **disabled by default**; code retained for future re-enablement.
+> ⚠️ **Since 2026-09-03 (M2) all three sidecars are unavailable on the IM side** — they
+> only ever existed as Fargate sidecar containers inside `BotStack`, and `BotStack` is
+> retired. The IM Lambda path explicitly pins
+> `AWS_MCP_PRICING_ENABLED=false` / `AWS_MCP_COST_ENABLED=false`
+> (`infra/lib/constructs/im-core.ts`), because **there is no sidecar to connect to**.
+> The two "default on" values inside `core/bedrock_chat._sidecar_enabled()` therefore
+> never take effect in production — they are kept for the long-connection rollback path
+> and for running a sidecar by hand locally.
+>
+> History (the 2026-06-10 state): Pricing MCP shipped with `BotStack` by default;
+> Cost MCP was briefly retired on 2026-05-30 and re-enabled by default on 06-10;
+> WA MCP (`sidecars/aws-wa-mcp/`) was always disabled by default.
+>
+> Web Chat's price / cost capabilities are **unaffected** — they use the official awslabs
+> cost+pricing MCP over in-process stdio, unrelated to the sidecars (see §2.4).
 >
 > See §4.10 + `core/aws_pricing_mcp.py` / `core/aws_cost_mcp.py` / `core/bedrock_chat._sidecar_enabled()` for details.
 
@@ -1285,7 +1338,7 @@ Code: [core/aws_docs_mcp.py](../core/aws_docs_mcp.py), [core/mcp_http_client.py]
 
 ### 5.1 IAM Least Privilege
 
-**bot ECS task role** can only call:
+**The IM worker Lambda execution role** (before M2 this was the bot ECS task role; same permission set) can only call:
 
 ```
 ✅ bedrock-runtime:InvokeModel              (Haiku invocations)
@@ -1309,9 +1362,40 @@ Design principle: even if the bot is fully compromised (IM token leaked + prompt
 - Headers: `x-amzn-event-timestamp` + `x-amzn-event-signature` (AWS standard)
 - The DevOps Agent side verifies the signature and rejects forgeries
 
-### 5.3 Three-Layer Zero-Change Defense (see §4.2 for details)
+### 5.3 Zero-Change Defense: One Hard Boundary Plus Defense in Depth per Entry Point
 
-L1 inbound regex + L2 system prompt + L3 outbound audit — even prompt injection cannot break through. **All 38 comprehensive case unit tests pass**.
+The hard boundary is the **read-only IAM role** (§5.1): whichever entry point is in play, the
+customer account is reached through a read-only role, so a mutating call simply has no
+permission. On top of that boundary sits defense in depth — and **the layers differ between
+the two entry points**, so do not read them as one single scheme:
+
+| Layer | Web console | IM (after M2 = Webhook + Lambda) |
+|---|---|---|
+| Tool / model-level read-only | `READ_OPERATIONS_ONLY=true` (official aws-api-mcp) + a curated read-only MCP allow list (FinOps / Investigation / RDS·CloudWatch inspection / Cases) | a direct call to the **read-only agent** of DevOps Agent; NotiOps runs no model of its own (0 token) |
+| Command-level denylist | ✅ `is_denied_command()` — blocks `secretsmanager get-secret-value` / `ssm get-parameter --with-decryption` / `kms decrypt`, i.e. actions that are reads in themselves but should not be read | — |
+| Read-only system prompt constraint | ✅ | owned by the DevOps Agent side |
+| Inbound regex | — | ✅ `platforms/common/router.py::_STRONG_CHANGE_RE`, matching strong-mutation wording only (never widened to soft phrasing such as "改一下 / 调整") |
+| Outbound audit | — | — |
+| Mutating actions | creating / replying to / resolving a case only produces a **preview**, executed only after the user confirms | same as the left column (confirmed through the `case_flow` card) |
+
+⚠️ **The "three-layer defense" of §4.2 (L1 inbound regex → L2 system prompt → L3 outbound
+audit) is not the production story.** It is the implementation inside `core/bedrock_chat.py`,
+and the only caller of `bedrock_chat.respond()` is the resident ECS app that retired together
+with `BotStack`; after M2 it runs on the rollback path only. The historical "all 38
+comprehensive case unit tests pass" refers to exactly those three layers — the tests are still
+there, and what they cover is the rollback path.
+
+⚠️ **Known gap (not done):** `core/case_analyze.py` is the **only capability still calling an
+LLM** on the IM Webhook path (`platforms/feishu/caps.py` → `case_flow.start_analyze` →
+`case_analyze.analyze`). It goes through `core/bot_llm.py`, and `bot_llm` has **no** outbound
+audit — `case_analyze.py`'s own docstring once claimed "L3 outbound audit still runs (see
+`_audit_response`)", which is a stale statement (there is no `_audit_response` anywhere in the
+repo; the only audit function, `bedrock_chat._audit_response_for_change`, is called from
+`bedrock_chat.respond()` and nowhere else); that docstring was corrected in place on 2026-09-03.
+Adding that audit means wiring it into `bot_llm`. The risk is bounded: this path's output
+is a case summary rather than runnable commands, and the hard boundary (the read-only role)
+holds as before — but "the docs claim it exists while the code does not" has to go, hence this
+note.
 
 ### 5.4 Data Retention and Privacy
 
@@ -1336,7 +1420,7 @@ DDB rows carry a `platform` field, and all queries must filter by `platform` (pr
 Quick orientation:
 
 - **Single deploy entry point**: `./setup.sh` (interactive CDK deploy). The original `deploy.sh` / SAM workflow has been retired
-- **Three CDK stacks**: `WebChatStack` (the primary surface: AgentCore Runtime agent + BFF Lambda + Function URL SSE + the `notiops-web-chat` table + notif handler + Cognito Identity Pool — see §6.1) + `NotiOpsBackendStack` (shared backend Lambda + DDB + S3 + EventBridge) + `BotStack` (IM bot platform stack — VPC + ECS + ECR)
+- **Two CDK stacks, plus one more if you pick an IM platform**: `WebChatStack` (the primary surface: AgentCore Runtime agent + BFF Lambda + Function URL SSE + the `notiops-web-chat` table + notif handler + Cognito Identity Pool — see §6.1) + `NotiOpsBackendStack` (shared backend Lambda + DDB + S3 + EventBridge) + `ImStack` (only created when an IM platform is selected: one API Gateway HTTP API + ingress/worker Lambda per platform). ~~`BotStack`~~ (VPC + ECS + ECR) was **retired on 2026-09-03 / M2 and is no longer deployed**
 - **Credential flow**: `setup.sh` calls `secretsmanager:CreateSecret` directly with the IM credentials you paste in; CDK stacks reference them by ARN. **Nothing persists locally on disk.**
 - **Multi-platform**: Feishu / Slack / DingTalk are picked interactively by `setup.sh`, multi-select.
 
@@ -1374,9 +1458,13 @@ Key env vars (BFF / Agent):
 
 | Component | CloudWatch Log Group (naming pattern) | Notes |
 |---|---|---|
-| Feishu bot | `/ecs/<bot-stack>-feishu-bot-*` | long connection + card callbacks |
-| Slack bot | `/ecs/<bot-stack>-slack-bot-*` | Socket Mode |
-| DingTalk bot | `/ecs/<bot-stack>-dingtalk-bot-*` | Stream Mode + custom robot writeback |
+| Feishu ingress | `/aws/lambda/notiops-im-ingress-feishu` | signature check + idempotent de-dup + async hand-off (**start here when messages don't arrive**) |
+| Feishu worker | `/aws/lambda/notiops-im-worker-feishu` | actual message / card-callback handling |
+| Slack ingress | `/aws/lambda/notiops-im-ingress-slack` | same (Events / Interactivity / Slash all land here) |
+| Slack worker | `/aws/lambda/notiops-im-worker-slack` | actual message / interaction handling |
+| IM progress poller | `/aws/lambda/notiops-im-progress` | investigation progress-card refresh |
+| Feishu / Slack bot (rollback path) | `/ecs/<bot-stack>-{feishu,slack}-bot-*` | long-connection / Socket Mode containers; traffic only after a rollback |
+| DingTalk bot | `/ecs/<bot-stack>-dingtalk-bot-*` | Stream Mode + custom robot writeback (⏳ Phase 2) |
 | DevOps Callback | `/aws/lambda/notiops-devops-callback` | investigation result callback |
 | Lambda4 Notifier | `/aws/lambda/notiops-notifier` | scheduled push (6 sources) |
 | Health Checker | `/aws/lambda/notiops-health-checker` | AWS Health sweep |
@@ -1434,7 +1522,7 @@ push_handler: dispatched feishu-push-<dedupe_key>
 
 Adding a new IM platform (DingTalk / Teams / WeCom / any platform that supports bots) takes only three things, and **`core/` is not touched at all**.
 
-> **This section only covers adding a supplementary IM platform; the primary Web Chat surface is a separate integration surface** (see §2.4): it is not an IM platform adapter but a browser-based agentic assistant, with its own AgentCore Runtime + BFF Function URL SSE + React frontend + Cognito/SigV4 auth. It shares some backend constraints and storage with the IM side (e.g. the Skills S3 `skills/` prefix, the read-only defense philosophy), but does not reuse this section's `core/` + ECS bot adapter layer or the sender contract.
+> **This section only covers adding a supplementary IM platform; the primary Web Chat surface is a separate integration surface** (see §2.4): it is not an IM platform adapter but a browser-based agentic assistant, with its own AgentCore Runtime + BFF Function URL SSE + React frontend + Cognito/SigV4 auth. It shares some backend constraints and storage with the IM side (e.g. the Skills S3 `skills/` prefix, the read-only defense philosophy), but does not reuse this section's `core/` + IM adapter layer (ingress/worker Lambda) or the sender contract.
 
 ### 8.1 Three-Step Guide
 
@@ -1460,7 +1548,7 @@ def is_configured() -> bool: ...                         # check that env vars a
 def send_live_console_link(chat_id, root_message_id,
                             agent_space_id, execution_id,
                             incident_id, task_id, intent_summary) -> dict: ...
-def update_live_card(message_ref: dict, ir) -> None: ... # used by progress_poller
+def update_live_card(message_ref: dict, ir) -> None: ... # ⚠️ rollback path only (progress_poller)
 def send_report(chat_id, root_message_id, status, priority,
                 detail_type, task_id, report_url, trace_url,
                 summary_md, incident_id, linked_case_display_id, next_steps) -> None: ...
@@ -1471,18 +1559,30 @@ Refer to `shared/report_delivery/feishu_sender.py` and `shared/report_delivery/s
 
 #### Step 3: Add the CDK Service Definition
 
-`platforms/<name>/template.yaml` is retired — all platform stacks now live in CDK. Add a new ECS Fargate service in [`infra/lib/bot-stack.ts`](../infra/lib/bot-stack.ts) following the pattern used by Feishu / Slack / DingTalk:
+`platforms/<name>/template.yaml` is retired — all platform stacks now live in CDK. ⚠️ **After 2026-09-03 (M2) a new platform goes webhook + Lambda; do not copy the Fargate recipe.** Add a set in [`infra/lib/constructs/im-core.ts`](../infra/lib/constructs/im-core.ts) following the pattern used by Feishu / Slack:
 
-- `new ecs.FargateTaskDefinition` (Fargate, 512 CPU / 1024 MB, X86_64)
-- `taskDef.addContainer(...)` with `image: ecs.ContainerImage.fromAsset("../", { file: "platforms/<name>/Dockerfile" })`
-- CloudWatch Logs driver with `streamPrefix: "<name>-bot"`
-- `taskDef.taskRole.addToPrincipalPolicy(...)` for DDB / Bedrock / sts:AssumeRole / aidevops permissions (mirror what feishu/slack already declare)
-- `new ecs.FargateService(...)` placed in the public-subnet VPC the stack already provisions, with `desiredCount: enabledPlatforms.includes("<name>") ? 1 : 0`
-- A new `notiops/im-bot-<name>` Secret entry (`setup.sh` writes it; CDK wires the ARN as an env var)
+- one `createIngressHttpApi(...)` (`$default` catch-all, unauthenticated — auth is the platform signature)
+- an `ingress` Lambda (128 MB / short timeout, `reservedConcurrentExecutions=10`): signature check + idempotency + `InvocationType='Event'` hand-off to the worker + reaction ack
+- a `worker` Lambda (900 s): normalize into `ImMessage` → `platforms.common.router.dispatch` → the new platform's `Caps` implementation
+- both functions share the dependency Layer built by `scripts/build_im_layer.sh` (**no container build needed**)
+- add DDB / Bedrock / sts:AssumeRole / aidevops permissions to the execution role (mirror what feishu/slack already declare)
+- a new `notiops/im-bot-<name>` Secret (`NotiOpsBackendStack` creates it empty; fill it in after deploy)
+- ⚠️ Do not set an `AWS_REGION` environment variable on a Lambda (reserved name, CFN rejects it outright; the Fargate era had no such limit)
 
 No CFN templates anywhere — CDK synthesizes the CloudFormation under the hood.
 
+The historical recipe (long connection / rollback path) is still readable in [`infra/lib/bot-stack.ts`](../infra/lib/bot-stack.ts): `new ecs.FargateTaskDefinition` (512 CPU / 1024 MB) + `ContainerImage.fromAsset("../", { file: "platforms/<name>/Dockerfile" })` + `new ecs.FargateService(...)` with `desiredCount: enabledPlatforms.includes("<name>") ? 1 : 0`.
+
 ### 8.2 Interface Contract
+
+> ⚠️ **`ProgressCardIR` only lives on the rollback path.** In production (post-M2) the progress
+> card is rendered directly by
+> [`platforms/common/lambda_progress.py`](../platforms/common/lambda_progress.py), which carries
+> its own `_RENDERERS` / `_UPDATERS` platform dispatch tables and never goes through
+> `ProgressCardIR`. A new platform **must** add one row to each of those two tables (a missing
+> row is logged as `unknown platform` and the row is dropped — never silently skipped);
+> `update_live_card` + `ProgressCardIR` are only needed if you intend to use the Fargate
+> rollback path.
 
 The contract that `core/` exposes to senders (in [core/progress_card.py](../core/progress_card.py) `ProgressCardIR`):
 
@@ -1523,10 +1623,10 @@ Current progress:
 | 5 | Scheduled inspection cron | ⏳ Not started | Daily scans of IAM / SG / cost anomalies |
 | 6 | Multi-LLM switching (Claude / Nova / GPT) | ✅ Implemented (2026-06-05) | `core/model_catalog.py` alias table + `core/llm_pref_resolver.py` per-chat preference + per-model `max_output_tokens`; `@bot model nova` flips at any time |
 | 7 | Cross-investigation memory / FAQ library | ⏳ Long-term | OpenSearch / S3 Vectors |
-| 8 | General conversation capability | ✅ Implemented (2026-05-27) | Three-layer defense + three-tier toggle + 17 / 23 / 38 case unit tests |
+| 8 | General conversation capability | ✅ Implemented (2026-05-27) | Three-layer defense (⚠️ rollback path only, see §5.3) + three-tier toggle + 17 / 23 / 38 case unit tests |
 | 9 | Skill orchestration | ✅ Feishu / Slack implemented / ⏳ DingTalk Phase 2c | DevOps Agent skill selection + self-upload (authoring) |
 | 10 | Bilingual support (zh / en) | ✅ Implemented (2026-05-31) | Auto-detection + 4-layer locking + `language` command + natural-language switching; see §4.9 |
-| 11 | AWS MCP (docs / pricing / cost) | ✅ All enabled by default (2026-06-10) | Tier-1 hosted Knowledge MCP + Pricing/Cost sidecars (bundled with BotStack); WA sidecar code retained but disabled |
+| 11 | AWS MCP (docs / pricing / cost) | ⚠️ docs only on the IM side (2026-09-03 / M2) | The Tier-1 hosted Knowledge MCP is still there; the Pricing/Cost/WA **sidecars retired with `BotStack`** and the IM Lambda pins them off (Web Chat uses in-process stdio MCP and is unaffected) |
 | 12 | DingTalk platform support | ⚠️ Phase 1/1.5/1.6/2a/2b implemented (2026-06-05) | Chat / dispatch / conversational case CRUD / push delivery / markdown report writeback. Phase 2c (live progress card / Skill / Next-step buttons) blocked on customer-side `cardTemplateId` registration |
 
 ### 9.1 Short Term (this quarter)
@@ -1558,10 +1658,12 @@ Current progress:
 ```
 notiops/
 ├── core/                              # platform-agnostic shared code
+│   ├── nl_router.py                   # ★ bilingual regex intent route (6 lanes, 0 token)
+│   ├── devops_agent.py                # ★ dispatch (CreateBacklogTask) + stateless progress poll
 │   ├── bedrock_intent.py              # intent classification (8 command classes + mode toggles)
-│   ├── bedrock_chat.py                # general conversation + 3-layer defense + model footer
-│   ├── progress_card.py               # progress card IR + Bedrock summary + translation
-│   ├── progress_poller.py             # daemon polling scheduler
+│   ├── bedrock_chat.py                # general conversation + 3-layer defense (rollback path only) + model footer
+│   ├── progress_card.py               # ⚠️ retired (M2): progress card IR + Bedrock summary
+│   ├── progress_poller.py             # ⚠️ retired (M2): ECS daemon polling scheduler
 │   ├── next_steps.py                  # post-report suggestion generation (URL allowlist)
 │   ├── case_management.py             # AWS Support case CRUD
 │   ├── case_classifier.py             # service-code classification (~324 candidates)
@@ -1571,7 +1673,7 @@ notiops/
 │   ├── i18n.py                        # central translation table + locale detection + NL switching regex
 │   ├── locale_resolver.py             # 7-layer priority resolver + 4-class lock rows
 │   ├── aws_docs_mcp.py                # AWS Knowledge MCP tool definition (Bedrock tool_use)
-│   ├── aws_pricing_mcp.py             # optional: Pricing MCP wrapper (via sidecar)
+│   ├── aws_pricing_mcp.py             # optional: Pricing MCP wrapper (sidecar; off on IM since M2)
 │   ├── mcp_http_client.py             # generic streamable-HTTP MCP client
 │   ├── dispatch_compose.py            # edit-mode composer for user_text (details + start point + logs)
 │   ├── chat_history.py                # (kept for backward compat; feature reverted)
@@ -1599,8 +1701,18 @@ notiops/
 ├── api/                               # API Lambda (route dispatch)
 ├── mcp_server/                        # MCP server (21 tools)
 ├── platforms/
+│   ├── common/                        # adapter layer shared by all three platforms
+│   │   ├── router.py                  # deterministic dispatch (0 token) + injection 2nd gate
+│   │   ├── quick_ack.py               # 👀 reaction right after the question (never raises)
+│   │   ├── live_card.py               # self-refreshing progress-card abstraction
+│   │   ├── lambda_progress.py         # ★ notiops-im-progress entry (scans imtask# rows)
+│   │   └── long_answer.py             # overflow answers → HTML report (no truncation)
 │   ├── feishu/
-│   │   ├── app/                       # bot process (runs on ECS Fargate)
+│   │   ├── lambda_ingress.py          # ★ webhook entry: verify + de-dup + async hand-off
+│   │   ├── lambda_worker.py           # ★ actual message / card-callback handling
+│   │   ├── webhook_adapter.py         # event body → platform-agnostic handler args
+│   │   ├── im_cards.py                # card construction
+│   │   ├── app/                       # ⚠️ retired (M2): long-connection bot process, kept as rollback
 │   │   │   ├── main.py                # lark-oapi long connection + card routing
 │   │   │   ├── feishu_utils.py        # tenant_access_token caching
 │   │   │   ├── progress_sender.py     # progress IR → Feishu v2 cards
@@ -1608,7 +1720,10 @@ notiops/
 │   │   │   └── support_flow.py        # escalate-to-Support form card
 │   │   └── Dockerfile
 │   ├── slack/                         # symmetric structure
-│   │   ├── app/
+│   │   ├── lambda_ingress.py          # ★ Events / Interactivity / Slash share one entry
+│   │   ├── lambda_worker.py           # ★
+│   │   ├── im_blocks.py
+│   │   ├── app/                       # ⚠️ retired (M2): Socket Mode bot process, kept as rollback
 │   │   │   ├── main.py                # slack_bolt Socket Mode + routing
 │   │   │   ├── blocks.py              # Block Kit factory methods
 │   │   │   ├── progress_sender.py
@@ -1617,7 +1732,7 @@ notiops/
 │   │   ├── Dockerfile
 │   │   └── requirements.txt
 │   └── dingtalk/                      # DingTalk H5 Stream Mode
-├── sidecars/                          # ECS sidecar images (MCP server wrappers)
+├── sidecars/                          # ⚠️ retired (M2): ECS sidecar images (MCP server wrappers)
 │   ├── aws-pricing-mcp/               # awslabs/aws-pricing-mcp-server (in production)
 │   ├── aws-cost-mcp/                  # enabled by default (re-enabled 2026-06-10)
 │   └── aws-wa-mcp/                    # disabled by default, code retained
@@ -1672,9 +1787,11 @@ See §4.8.2 for the detailed prefix list.
 
 ### 10.3 Full Configuration Reference
 
-The full CDK context list (BotStack + NotiOpsBackendStack) lives in [DEPLOYMENT.en.md §11](DEPLOYMENT.en.md#11-full-cdk-context-reference). Not duplicated here.
+The full CDK context list (`ImStack` + `NotiOpsBackendStack`) lives in [DEPLOYMENT.en.md §11](DEPLOYMENT.en.md#11-full-cdk-context-reference). Not duplicated here.
 
-ECS Task progress-polling tuning environment variables (injected via `environment:` in `bot-stack.ts`; deploy `cdk deploy BotStack` after editing):
+⚠️ Since M2 (2026-09-03) progress polling is the `notiops-im-progress` **Lambda** (EventBridge, one tick a minute, scanning `imtask#` rows) and has **no tunable environment variables** — the cadence comes from the rule in `im-core.ts` plus constants inside the function.
+
+The three variables below tune the **retired** resident ECS daemon (`core/progress_poller.py`, which scanned `progress#` rows) and only mean anything on the long-connection rollback path (injected via `environment:` in `bot-stack.ts`):
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -1696,26 +1813,32 @@ Tests currently run as inline Python scripts (no pytest dependency); migration t
 
 ### 10.5 Common Operational Commands
 
-> Placeholders `<bot-log>` / `<lambda-log>` / `<cluster>` / `<service>` / `<conv-table>` resolve to the names in `cdk-outputs.json` / `aws ecs list-clusters` (see [DEPLOYMENT.en.md §6](DEPLOYMENT.en.md#6-smoke-tests)).
+> Placeholders `<platform>` (`feishu` / `slack`) and `<conv-table>` resolve to real names (see
+> [DEPLOYMENT.en.md §6](DEPLOYMENT.en.md#6-smoke-tests)). Since M2 (2026-09-03) there is **no ECS
+> cluster or service** — the IM side is all Lambda, and the log-group names are the fixed
+> `/aws/lambda/notiops-im-*`.
 
 ```bash
 # === Live observation ===
-aws logs tail <bot-log> --since 5m --follow                       # bot ECS task
+aws logs tail /aws/lambda/notiops-im-ingress-<platform> --since 5m --follow  # nothing arrives / signature fails
+aws logs tail /aws/lambda/notiops-im-worker-<platform> --since 5m --follow   # arrived but answered wrong
+aws logs tail /aws/lambda/notiops-im-progress --since 5m --follow            # card stuck on "thinking"
 aws logs tail /aws/lambda/notiops-devops-callback --since 5m --follow
 aws logs tail /aws/lambda/notiops-notifier --since 5m --follow
 
 # === Targeted queries (key log patterns) ===
-aws logs tail <bot-log> --since 1h --filter-pattern "intent_classify"   # intent classification
-aws logs tail <bot-log> --since 1h --filter-pattern "change-request"    # change-request interception
-aws logs tail <bot-log> --since 1h --filter-pattern "progress tick"     # progress polling
+aws logs tail /aws/lambda/notiops-im-worker-<platform> --since 1h --filter-pattern "nl_router"       # deterministic route result
+aws logs tail /aws/lambda/notiops-im-worker-<platform> --since 1h --filter-pattern "change-request"  # change-request interception
+aws logs tail /aws/lambda/notiops-im-progress --since 1h --filter-pattern "progress"                 # progress polling
 
 # === Configuration changes (after editing infra/cdk.json) ===
-cd infra && npx cdk deploy BotStack       # bot-side context (agenticChatMode / locale / llmProvider, ...)
+cd infra && npx cdk deploy ImStack               # IM context (ImStack reads 3 context keys; see DEPLOYMENT.en.md §11.1)
 cd infra && npx cdk deploy NotiOpsBackendStack   # push / backend context
 
-# === Force restart ECS task (no config change) ===
-aws ecs update-service --cluster <cluster> --service <service> \
-  --force-new-deployment
+# === Cycle the IM Lambda's execution environments (re-read the Secret) ===
+# Lambda reads Secrets on cold start only; touching any environment variable forces new envs.
+# ⚠️ update-function-configuration --environment **replaces the whole env map** —
+#    get-function-configuration first and send the full set back. See DEPLOYMENT.en.md §8.2
 
 # === Deploy the whole project ===
 ./setup.sh                  # full path (bootstrap → build → CDK deploy --all)
@@ -1726,7 +1849,7 @@ aws dynamodb get-item --table-name <conv-table> \
   --key '{"lookup_key":{"S":"event#<event_id>"}}'
 aws dynamodb scan --table-name <conv-table> \
   --filter-expression "begins_with(lookup_key, :p)" \
-  --expression-attribute-values '{":p":{"S":"progress#"}}'
+  --expression-attribute-values '{":p":{"S":"imtask#"}}'   # in-flight investigations post-M2 (was progress#)
 ```
 
 ---

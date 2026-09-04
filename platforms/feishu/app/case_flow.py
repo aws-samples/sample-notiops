@@ -29,7 +29,6 @@ callers that haven't been updated).
 from __future__ import annotations
 
 import logging
-import os
 import re
 import threading
 from typing import Optional
@@ -39,17 +38,20 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 )
 
 from core import case_analyze
+from core import case_classifier
 from core import case_management
 from core import ddb_state
 from core import i18n
 from core import support_logic
 from core import webhook_dispatch  # noqa: F401 — reserved for future skill paths
-from shared.devops_agent import create_investigation
 from core.case_management import CaseSummary, Communication
+from core.feishu_card import card_config
 from core.support_logic import (
-    DEFAULT_LANGUAGE, DEFAULT_SEVERITY,
+    DEFAULT_ISSUE_TYPE, DEFAULT_LANGUAGE, DEFAULT_SEVERITY,
+    ISSUE_TYPE_CODES,
     LANGUAGE_CODES, LANGUAGE_LABELS,
-    SEVERITY_CODES, severity_label, severity_labels,
+    SEVERITY_CODES, issue_type_label, issue_type_labels,
+    severity_label, severity_labels,
 )
 
 from platforms.feishu.app import feishu_utils
@@ -517,7 +519,7 @@ def handle(action_tag: str, action_value: dict, event,
         sync_locale = _locale_from_event(incident_id=incident_id,
                                          fallback=locale)
         return _handle_sync_report(chat_id, display_id, incident_id,
-                                   message_id, locale=sync_locale)
+                                   locale=sync_locale)
 
     return _toast(i18n.t("case.toast.unknown_action", locale))
 
@@ -538,6 +540,15 @@ def _handle_create_submit(action_value: dict, event, operator_name: str,
     contact = (form.get("contact") or "").strip()
     severity = form.get("severity_select") or DEFAULT_SEVERITY
     language = form.get("language_select") or DEFAULT_LANGUAGE
+    # 服务名称 / 类别 / 案例类型（2026-09-03 补服务与类型、2026-09-04 补类别，与 web 端
+    # 案例面板对齐）。三项都**不拦提交**：服务名与类别留空 = 交给分类器（历史行为）；
+    # 类型拿不到就退回默认。
+    service_text = _picked_service_code(form.get("service_select") or "",
+                                        form.get("service_text") or "")
+    category_text = (form.get("category_text") or "").strip()
+    issue_type = form.get("issue_type_select") or DEFAULT_ISSUE_TYPE
+    if issue_type not in ISSUE_TYPE_CODES:
+        issue_type = DEFAULT_ISSUE_TYPE
     chat_id = _extract_chat_id(event)
 
     if not subject or not body:
@@ -568,6 +579,8 @@ def _handle_create_submit(action_value: dict, event, operator_name: str,
             target=_create_worker,
             args=(card_message_id, ctx, severity, language, operator_name,
                   chat_id, dispatch_after, extra, locale),
+            kwargs={"service_text": service_text, "issue_type": issue_type,
+                    "category_text": category_text},
             daemon=True,
         ).start()
         msg = i18n.t(
@@ -580,6 +593,8 @@ def _handle_create_submit(action_value: dict, event, operator_name: str,
     result = support_logic.create_case(
         ctx, platform=PLATFORM, severity=severity, language=language,
         extra=extra, operator_name=operator_name,
+        service_text=service_text, issue_type=issue_type,
+        category_text=category_text,
     )
     if dispatch_after and result.ok and chat_id:
         _dispatch_investigation_inline(chat_id, result.display_id, subject, body,
@@ -594,12 +609,16 @@ def _handle_create_submit(action_value: dict, event, operator_name: str,
 def _create_worker(card_message_id: str, ctx: dict,
                    severity: str, language: str, operator_name: str,
                    chat_id: str, dispatch_after: bool, extra: str,
-                   locale: str = "zh") -> None:
+                   locale: str = "zh", *,
+                   service_text: str = "", issue_type: str = "",
+                   category_text: str = "") -> None:
     locale = _normalize_locale(locale)
     try:
         result = support_logic.create_case(
             ctx, platform=PLATFORM, severity=severity, language=language,
             extra=extra, operator_name=operator_name,
+            service_text=service_text, issue_type=issue_type,
+            category_text=category_text,
         )
         # Body / subject for the result card
         subject = ctx.get("intent_summary", "")
@@ -627,9 +646,32 @@ def _create_worker(card_message_id: str, ctx: dict,
 # Sync DevOps Agent investigation report to the linked AWS Support case.
 # Triggered from the "📎 同步到案例" button on a report card whose
 # investigation was kicked off by a "create case + dispatch" flow.
+#
+# ⚠️ **结果必须以一条新消息发出去，不许"就地改那张报告卡"**（2026-09-03 现网反馈：
+#    「确实同步成功了，但是飞书里面没有任何的信息反馈」）。原来的写法是
+#    `update_card(<报告卡的 message_id>, 结果卡)`，两处都错：
+#
+#      1. 报告卡（`shared/report_delivery/feishu_sender.py::_header_card`）是一张
+#         **v1** 卡（顶层 `elements`），而这里的结果卡 / pending 卡是 **v2**
+#         （`"schema": "2.0"` + `body.elements`）。往 v1 消息上 PATCH 一份 v2 正文，
+#         飞书**不报错也不渲染** —— 现网日志实证：`add_communication` 成功、整个
+#         invocation 里一条 `Feishu API non-zero` / HTTP 错误都没有，用户屏幕上零变化。
+#      2. 就算渲染出来了也是错的：报告卡被结果卡**顶掉**，报告正文和那两个
+#         presigned「查看完整报告 / 调查过程」链接一起没了。
+#
+#    这个 bug 能活这么久，是因为 `feishu_utils.call_openapi` 对业务错误码只
+#    warning、不抛 —— 所以 `_sync_report_worker` 里那圈 try/except 对"API 说不行"
+#    根本不生效（那是死代码）。修法有三条，缺一不可：
+#      · 结果走 `send_card`（新消息 → 有通知、不可能看不见，也不动报告卡）；
+#      · pending 只回 toast：webhook 下 toast 到不了客户端，`lambda_worker`
+#        会把它补成一条文本（见那边 `_handle_card_action` 的 toast 兜底），
+#        所以这句 toast 要带案例号，别用干巴巴的「正在同步…」；
+#      · 发不出去要**显式判 code** 再退纯文本（`_tell_chat`），不许静默。
+#
+#    Slack 侧一直就是"发新消息"（`platforms/slack/app/support_flow.py`），
+#    这次是飞书补齐对等，不是新发明。
 # ---------------------------------------------------------------------------
 def _handle_sync_report(chat_id: str, display_id: str, incident_id: str,
-                        card_message_id: str,
                         locale: str = "zh"
                         ) -> P2CardActionTriggerResponse:
     locale = _normalize_locale(locale)
@@ -647,21 +689,17 @@ def _handle_sync_report(chat_id: str, display_id: str, incident_id: str,
     if not ctx:
         return _toast(i18n.t("case.toast.report_expired", locale))
 
-    if card_message_id:
+    if chat_id:
         threading.Thread(
             target=_sync_report_worker,
-            args=(card_message_id, chat_id, display_id, incident_id, ctx,
-                  locale),
+            args=(chat_id, display_id, ctx, locale),
             daemon=True,
         ).start()
-        return _build_card_response(
-            i18n.t("case.toast.syncing", locale),
-            _pending_simple_card(
-                i18n.t("case.pending.sync", locale, display_id=display_id),
-                locale=locale,
-            ),
-        )
+        return _toast(i18n.t("case.pending.sync", locale,
+                             display_id=display_id))
 
+    # 卡片回调里拿不到 chat_id（正常点击不会走到这里）。此时唯一还能说话的通道是
+    # trigger 响应本身 —— 同步做完直接把结果卡回过去，宁可慢几秒也不能没反馈。
     body = _build_sync_body(ctx)
     ok = case_management.add_communication(display_id, body)
     return _build_card_response(
@@ -671,14 +709,15 @@ def _handle_sync_report(chat_id: str, display_id: str, incident_id: str,
     )
 
 
-def _sync_report_worker(card_message_id: str, chat_id: str, display_id: str,
-                        incident_id: str, ctx: dict,
+def _sync_report_worker(chat_id: str, display_id: str, ctx: dict,
                         locale: str = "zh") -> None:
     locale = _normalize_locale(locale)
     try:
         body = _build_sync_body(ctx)
         ok = case_management.add_communication(display_id, body)
         new_card = _sync_result_card(display_id, ok, locale=locale)
+        fallback = i18n.t("case.sync.success_title" if ok
+                          else "case.sync.fail_title", locale)
     except Exception as e:
         logger.exception("sync_report worker crashed")
         new_card = _info_card(
@@ -686,10 +725,31 @@ def _sync_report_worker(card_message_id: str, chat_id: str, display_id: str,
             i18n.t("case.create.internal_error", locale,
                    kind=type(e).__name__),  # Security: type only; detail → CloudWatch
             "red")
+        fallback = i18n.t("case.sync.fail_title", locale)
+    _tell_chat(chat_id, new_card, fallback)
+
+
+def _tell_chat(chat_id: str, card: dict, fallback_text: str) -> None:
+    """把一张卡发进会话，并且**确认飞书真的收下了**。
+
+    `feishu_utils.send_card` 底下的 `call_openapi` 对业务错误码只 warning、不抛，
+    所以"发失败"在调用方看来和成功一模一样 —— 正是上面那个 bug 的成因。这里显式
+    判 `code`：卡片被拒就退一条纯文本（至少告诉用户成/败），纯文本也不行才记 error。
+    `code` 缺省视为成功（飞书成功响应里 `code` 恒为 0，缺字段只会出现在测试替身里）。
+    """
     try:
-        feishu_utils.update_card(card_message_id, new_card)
+        resp = feishu_utils.send_card(chat_id=chat_id, card=card) or {}
+        if resp.get("code", 0) == 0:
+            return
+        logger.error("sync result card rejected: code=%s", resp.get("code"))
     except Exception as e:
-        logger.error("update_card failed: %s", e)
+        logger.error("sync result card send failed: %s", type(e).__name__)
+    try:
+        resp = feishu_utils.send_text_to_chat(chat_id, fallback_text) or {}
+        if resp.get("code", 0) != 0:
+            logger.error("sync result text rejected: code=%s", resp.get("code"))
+    except Exception as e:
+        logger.error("sync result text failed: %s", type(e).__name__)
 
 
 def _build_sync_body(ctx: dict) -> str:
@@ -743,7 +803,7 @@ def _sync_result_card(display_id: str, ok: bool, locale: str = "zh") -> dict:
     case_url = case_management._case_console_url(display_id)
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {"title": {"tag": "plain_text",
                              "content": i18n.t("case.sync.success_title", locale)},
                    "template": "green"},
@@ -810,8 +870,29 @@ def _dispatch_for_case(chat_id: str, display_id: str,
 
     Records the originating chat in DDB so the report-handler routes the
     eventual investigation report back into the same Feishu thread.
+
+    ── 2026-09-03：从 Fargate 那条老路径切到 IM Lambda 路径 ─────────────────────
+    以前这里走 `shared.devops_agent.create_investigation` + `put_new_event` +
+    `link_incident`，那一套是给 Fargate 长连接时代写的，切到 webhook 之后有三个问题：
+      1. `link_incident()` **要求先有一行 `event#`**（Fargate 时代由 `put_event` 写），
+         webhook 路径上没有，所以要先造一个合成 `event#` 行来凑；
+      2. 派发完只发一条**纯文本**「已发起」，没有进度卡 —— 用户在案例流程里看不到
+         调查跑到哪了，而 `/调查` 那条路径早就有实时刷新的卡片了（体验不对等）；
+      3. 依赖 `DEFAULT_INVESTIGATION_ACCOUNT_ID` 环境变量，没配就静默跳过整个调查
+         （用户点了「开案例 + 起调查」，案例开了、调查没起，也没人告诉他）。
+
+    现在与 `platforms/feishu/caps.py::investigate` 完全同款：
+    `start_investigation` → 发 `dispatch_card` → `put_im_task`（进度 Lambda 每分钟
+    PATCH 这张卡）→ `link_im_investigation`（最终报告卡回到这个会话）。
+
+    `incident_id` 仍然是 `feishu-case-<display_id>`：report_handler 的
+    `_extract_case_display_id()` 靠这个形状认出「这次调查是某个案例带起来的」，
+    从而在报告卡上给出「同步到案例」按钮。**别改成 `feishu-<event_id>`**。
     """
     locale = _normalize_locale(locale)
+    from core import devops_agent
+    from platforms.feishu import im_cards
+
     incident_id = f"feishu-case-{display_id}"
     # English user_text is intentional — the agent's reasoning prompt
     # should stay in English regardless of UI locale; the agent chooses
@@ -825,71 +906,84 @@ def _dispatch_for_case(chat_id: str, display_id: str,
         f"customer gets a faster diagnostic. Reference the case as needed."
     )
 
-    # Stage 1: register the incident in DDB so the report-handler can route
-    # the eventual report back into THIS chat. We synthesize an event_id
-    # from the case display id (cases are unique).
-    synthetic_event_id = f"case-{display_id}"
+    # 幂等：一个案例只起一次调查。`imtask#` 那行的 TTL 覆盖整个调查生命周期，比
+    # `claim_inflight` 的短时效在飞（几秒）更可靠 —— 用户隔一分钟再点一次也拦得住。
     try:
-        # Best-effort dedupe — if user clicks "dispatch" twice, the second
-        # call's put_new_event returns False and we skip.
-        is_new = ddb_state.put_new_event(
-            synthetic_event_id, platform=PLATFORM, chat_id=chat_id,
-            root_message_id="", user_id="", raw_text=user_text,
-            locale=locale,
-        )
-        if not is_new:
+        if ddb_state.get_im_task(incident_id):
             logger.info("Investigation already dispatched for case %s — skipping",
                         display_id)
             return {"ok": True, "status": 200, "body": "duplicate-skipped",
                     "task_id": None}
     except Exception as e:
-        logger.warning("DDB put_new_event for case dispatch failed: %s", e)
+        # 查不到就当没派过 —— 宁可重复派一次，也不能因为 DDB 抖动就把调查吞掉。
+        logger.warning("get_im_task for case dispatch failed: %s", e)
 
-    # Dispatch via STS AssumeRole + create_investigation (the post-fusion
-    # primary path). incident_id gets embedded as <!--notiops:...--> in the
-    # description so report-handler can recover routing context from journal.
-    target_account_id = os.environ.get("DEFAULT_INVESTIGATION_ACCOUNT_ID", "")
-    if not target_account_id:
-        logger.warning("DEFAULT_INVESTIGATION_ACCOUNT_ID not configured; "
-                       "case %s investigation skipped", display_id)
-        return {"ok": False, "status": 0,
-                "body": "DEFAULT_INVESTIGATION_ACCOUNT_ID not configured",
-                "task_id": None}
-
-    raw_result = create_investigation(
-        title=f"[{PLATFORM.capitalize()}#case-{display_id}] {subject[:50]}",
-        description=user_text,
-        priority="MEDIUM",
-        source=f"{PLATFORM}-case-create-dispatch",
-        target_account_id=target_account_id,
-        incident_id=incident_id,
+    title = f"[{PLATFORM.capitalize()}#case-{display_id}] {subject[:50]}"
+    raw_result = devops_agent.start_investigation(
+        title=title, description=user_text, priority="MEDIUM",
+        source=f"notiops-im-{PLATFORM}-case",
     )
-
-    # Translate the create_investigation result shape into the legacy
-    # {ok, status, body, task_id} shape that this function's callers
-    # (and the toast handler upstream) already understand.
-    if not raw_result.get("success"):
-        err = raw_result.get("error") or ""
+    if raw_result.get("error"):
+        err = str(raw_result.get("message") or raw_result["error"])
         logger.error("Investigation dispatch for case %s failed: %s",
-                     display_id, err)
+                     display_id, raw_result["error"])
+        # 与老实现同一个返回形状（`{ok, status, body, task_id}`）—— 上游 toast 处理
+        # 认的是这个，改形状会静默丢掉错误提示。
         return {"ok": False, "status": 0, "body": err, "task_id": None}
 
-    result = {"ok": True, "status": 200, "body": "",
-              "task_id": raw_result.get("task_id")}
+    task_id = raw_result.get("task_id") or ""
+    home = raw_result.get("console_home") or ""
+    deep = raw_result.get("console_url") or ""
+    result = {"ok": True, "status": 200, "body": "", "task_id": task_id}
 
+    # 进度卡（取代原来那条纯文本）—— 与 `/调查` 那条路径同一张卡。
+    body_text = i18n.t("case.dispatch.inline_chat_msg", locale,
+                       display_id=display_id)
+    card_message_id = ""
     try:
-        ddb_state.link_incident(synthetic_event_id, incident_id,
-                                platform=PLATFORM,
-                                task_id=result.get("task_id"))
+        resp = feishu_utils.send_card(
+            chat_id,
+            im_cards.dispatch_card(body_text, locale, deep_link=deep, home=home,
+                                   state="dispatched"))
+        card_message_id = im_cards.message_id_of(resp)
     except Exception as e:
-        logger.warning("DDB link_incident for case dispatch failed: %s", e)
+        logger.error("case dispatch card send failed: %s", type(e).__name__)
+    if not card_message_id:
+        # 卡片发不出去 → 没有 PATCH 落点。**不落 `imtask#`**（否则进度 Lambda 会对着
+        # 空 message_id 重试 30 分钟）。调查本身已经起来了，退纯文本把这件事说清楚。
+        logger.error("case %s: dispatch card failed; falling back to text",
+                     display_id)
+        line = body_text
+        if deep:
+            line += f"\n{i18n.t('progress.btn.open_link', locale)}: {deep}"
+        elif home:
+            line += f"\n{i18n.t('progress.btn.open_home', locale)}: {home}"
+        feishu_utils.send_text_to_chat(chat_id, line)
+    else:
+        ddb_state.put_im_task(
+            incident_id,
+            platform=PLATFORM, chat_id=chat_id, message_id=card_message_id,
+            locale=locale, account_id=raw_result.get("account_id") or "",
+            task_id=task_id,
+            execution_id=raw_result.get("execution_id") or "",
+            agent_space_id=raw_result.get("agent_space_id") or "",
+            title=title, console_url=deep, console_home=home,
+        )
+
+    # 第二行路由：最终报告卡走 EventBridge → notiops-devops-callback →
+    # report_handler，它只认 `incident#` / `task#`。少了这一步，进度卡会一路刷到
+    # 「已完成」，但报告只躺在 S3 里 —— 而且案例流程还会因此失去「同步到案例」按钮。
+    try:
+        ddb_state.link_im_investigation(
+            incident_id, task_id, platform=PLATFORM, chat_id=chat_id,
+            root_message_id=card_message_id, locale=locale,
+            raw_text=user_text[:1000],
+        )
+    except Exception as e:
+        logger.warning("link_im_investigation for case dispatch failed: %s", e)
 
     logger.info("Dispatched investigation for case %s incident_id=%s task_id=%s",
-                display_id, incident_id, result.get("task_id"))
-    feishu_utils.send_text_to_chat(
-        chat_id,
-        i18n.t("case.dispatch.inline_chat_msg", locale, display_id=display_id),
-    )
+                display_id, incident_id, task_id)
     return result
 
 
@@ -1009,6 +1103,145 @@ def _resolve_worker(card_message_id: str, display_id: str,
 # ===========================================================================
 # Card builders (Feishu v2 schema)
 # ===========================================================================
+#: 「不指定，你们自己判断」那一项的值。用哨兵而不是空串：飞书 `select_static` 的
+#: option value 为空时表单回传的形态不确定，而空串又与"用户没选"无法区分。
+#: 提交时 `_picked_service_code()` 把它折回空串。
+SERVICE_AUTO = "__auto__"
+
+
+def _service_select_elements(locale: str) -> list[dict]:
+    """常用服务选择器（拿不到目录就换成一句说明，不给空选择器）。
+
+    ⚠️ 目录读不到（`describe_services` 要 Business/Enterprise 支持计划）时**不许**留
+    一个只有"自动判断"的选择器：那看着像功能坏了，而客户其实还有下面的自由文本。
+    """
+    try:
+        services = case_classifier.popular_services()
+    except Exception as e:                            # noqa: BLE001
+        # 面板不能因为拉目录失败就打不开 —— 案例是客户出事时才开的东西。
+        logger.warning("popular_services failed: %s", type(e).__name__)
+        services = []
+    if not services:
+        return [{"tag": "markdown",
+                 "content": i18n.t("case.create.service_catalog_unavailable",
+                                   locale)}]
+    options = [{"text": {"tag": "plain_text",
+                         "content": i18n.t("case.create.service_select_auto",
+                                           locale)},
+                "value": SERVICE_AUTO}]
+    options += [{"text": {"tag": "plain_text", "content": s["name"]},
+                 "value": s["code"]} for s in services]
+    return [
+        {"tag": "markdown",
+         "content": i18n.t("case.create.service_select_label", locale)},
+        {"tag": "select_static",
+         "name": "service_select",
+         "placeholder": {"tag": "plain_text",
+                         "content": i18n.t(
+                             "case.create.service_select_placeholder", locale)},
+         # ⚠️ `initial_index` 是 **1-based**（同款注释见下面 issue_type_select）：
+         # 「自动判断」是第一项，所以是 1 —— 写 0 会默认选中第一个真实服务，
+         # 等于替客户瞎猜一个服务，比不选更糟。
+         "initial_index": 1,
+         "options": options,
+         "type": "default",
+         "width": "fill",
+         # 留成非必填：客户可以完全不碰这一栏（默认就是"自动判断"）。
+         "required": False},
+    ]
+
+
+def _picked_service_code(dropdown: str, free_text: str) -> str:
+    """选择器优先、自由文本兜底 —— 汇成一个交给 `resolve_service` 的字符串。
+
+    选择器给的是真实 code（第 1 级精确命中），自由文本走模糊反查；两个都空 = 分类器
+    自动判断（历史行为）。
+    """
+    picked = (dropdown or "").strip()
+    if picked and picked != SERVICE_AUTO:
+        return picked
+    return (free_text or "").strip()
+
+
+def picked_service_code(dropdown: str, free_text: str) -> str:
+    """`_picked_service_code` 的公开别名 —— 给另一个面板（`support_flow`）用。"""
+    return _picked_service_code(dropdown, free_text)
+
+
+def service_and_type_elements(locale: str) -> list[dict]:
+    """「服务名称」+「类别」+「案例类型」这一组表单元素 —— **两个开案例面板共用同一份**。
+
+    为什么抽出来:开案例有**两个**入口 —— `/案例` 面板(`_create_form_card`)和调查报告卡
+    上的「🆘 升级到 AWS Support」(`support_flow._form_card`)。这两项当初只加在前一个上,
+    后一个就少了 —— 复制一份的话下次改动照样长歪(选项不同 / 默认值不同 / 目录挂了的
+    退化行为不同),而这种不一致**不报错**,只是同一个操作从两个入口进去开出不同的案例。
+    所以两边都调这一个函数,并有测试钉住"两个面板都调了它"。
+
+    四件东西按客户填写顺序:常用服务选择器 → 长尾自由文本 → 类别 → 案例类型。
+    「类别」是**手打**而不是像 web 那样跟着服务联动的下拉:联动要在面板中途回一趟服务端
+    重绘卡片,而**表单容器里的数据只在点提交按钮时才回调**(飞书官方文档原话:"在表单
+    容器中,输入框组件的数据为异步提交的形式,即用户填写完所有表单项后,点击表单容器中
+    绑定提交事件的按钮,才会将包括输入框组件的所有数据一次回调至开发者的服务端"),
+    也就是说选择器自己的回调拿不到用户已经打进去的主题/描述,中途重绘就等于把它们清空。
+    所以两端统一"手打 + 服务端在该服务名下反查",理由与实测数据见
+    `core.case_classifier.resolve_category_detail`。
+    """
+    it_labels = issue_type_labels(locale)
+    issue_type_options = [
+        {"text": {"tag": "plain_text", "content": it_labels[c]},
+         "value": c}
+        for c in ISSUE_TYPE_CODES
+    ]
+    return [
+        # 服务名称 —— 常用**选择器** + 长尾**自由文本**，两个都不填就交给分类器自动
+        # 判断。选择器里只放二十条常用的：真实目录 323 条塞不进卡片选择器。选中的
+        # value 是真实 code（`popular_services()` 从现网目录反查），提交时原样交给
+        # `resolve_service` 精确命中。匹配不上（自由文本那条路）就退回分类器并在结果
+        # 卡上说明（不静默）。
+        *_service_select_elements(locale),
+        {"tag": "markdown",
+         "content": i18n.t("case.create.service_label", locale)},
+        {"tag": "input",
+         "name": "service_text",
+         "placeholder": {"tag": "plain_text",
+                         "content": i18n.t("case.create.service_placeholder",
+                                           locale)},
+         "default_value": "",
+         "max_length": 100,
+         "required": False,
+         "width": "fill"},
+        # 类别 —— 留空就按服务挑一个通用类别（`resolve_category_detail`），填了就在
+        # **该服务名下**反查，所以怎么填都不可能拼出 CreateCase 拒收的非法组合。
+        {"tag": "markdown",
+         "content": i18n.t("case.create.category_label", locale)},
+        {"tag": "input",
+         "name": "category_text",
+         "placeholder": {"tag": "plain_text",
+                         "content": i18n.t("case.create.category_placeholder",
+                                           locale)},
+         "default_value": "",
+         "max_length": 100,
+         "required": False,
+         "width": "fill"},
+        # 案例类型 —— 与 web 端案例面板同三项（`core.support_logic.ISSUE_TYPE_CODES`）。
+        {"tag": "markdown",
+         "content": i18n.t("case.create.issue_type_label", locale)},
+        {"tag": "select_static",
+         "name": "issue_type_select",
+         "placeholder": {"tag": "plain_text",
+                         "content": i18n.t("case.create.issue_type_placeholder",
+                                           locale)},
+         # ⚠️ 飞书 `initial_index` 是 **1-based**（见
+         # platforms/feishu/app/main.py:1321 的同款注释）——
+         # 写成 0-based 会默认选中下一项，正是本次要修的"类型猜错"。
+         "initial_index": ISSUE_TYPE_CODES.index(DEFAULT_ISSUE_TYPE) + 1,
+         "options": issue_type_options,
+         "type": "default",
+         "width": "fill",
+         "required": True},
+    ]
+
+
 def _create_form_card(subject: str = "", locale: str = "zh") -> dict:
     locale = _normalize_locale(locale)
     # Language picker labels are deliberately bilingual / native form
@@ -1028,7 +1261,7 @@ def _create_form_card(subject: str = "", locale: str = "zh") -> dict:
     ]
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {
             "title": {"tag": "plain_text",
                       "content": i18n.t("case.create.title", locale)},
@@ -1067,6 +1300,9 @@ def _create_form_card(subject: str = "", locale: str = "zh") -> dict:
                       "rows": 6,
                       "required": True,
                       "width": "fill"},
+                     # 服务名称 + 案例类型 —— 与调查报告卡上的「🆘 升级到 AWS
+                     # Support」面板**共用**同一份控件，两个入口不会长歪。
+                     *service_and_type_elements(locale),
                      {"tag": "markdown",
                       "content": i18n.t("case.create.severity_label", locale)},
                      {"tag": "select_static",
@@ -1186,8 +1422,24 @@ def _create_result_card(result: support_logic.CaseResult, severity: str,
         if cls.get("serviceCode") or cls.get("categoryCode"):
             block = i18n.t("case.create.classification_block", locale,
                            service=cls.get("serviceCode", ""),
-                           category=cls.get("categoryCode", ""),
-                           issue_type=cls.get("issueType", ""))
+                           # 类别后面跟一句"你指定"还是"自动挑选"，四张结果卡同口径
+                           # （`support_logic.category_display`）。
+                           category=support_logic.category_display(cls, locale),
+                           # 显示本地化标签而不是 `technical` 这种 API code ——
+                           # 用户在面板里选的是标签。
+                           issue_type=issue_type_label(
+                               cls.get("issueType", ""), locale))
+        # 用户填了服务名但目录里没有 → **必须说出来**。静默忽略最坑：用户以为自己
+        # 指定了服务，案例却落在分类器挑的（可能是 general-info）那条上。
+        if cls.get("serviceUnmatched"):
+            block += i18n.t("case.create.service_unmatched_block", locale,
+                            text=str(cls["serviceUnmatched"]))
+        # 类别同理：填了但这个服务名下没有 → 说清用的是哪个，别让人以为按自己填的走了。
+        if cls.get("categoryUnmatched"):
+            block += i18n.t("case.create.category_unmatched_block", locale,
+                            text=str(cls["categoryUnmatched"]),
+                            service=cls.get("serviceCode", ""),
+                            category=cls.get("categoryCode", ""))
         # ID first so the user can copy it without scrolling, subject second
         # for context, link last as the primary action target.
         subject_block = (
@@ -1212,40 +1464,29 @@ def _create_result_card(result: support_logic.CaseResult, severity: str,
                  + i18n.t("case.create.support_will_reply", locale))},
         ]
         # If we already kicked off the investigation when the case was
-        # created, mention it instead of the dispatch button.
+        # created, say so. Otherwise the card ends here: the case is open and
+        # the only two useful actions are "look at it" and "see all of them".
+        #
+        # ⚠️ There is deliberately **no** "start an Agent investigation" button
+        # any more (removed 2026-09-02). Opening a case and investigating are
+        # two separate decisions; offering the second one on the success card of
+        # the first made the card read like the case wasn't enough. Users who do
+        # want an investigation say so (`/调查` / 「帮我调查…」) — that path is
+        # unchanged. `case_create_dispatch_after` stays wired up in the action
+        # handler so cards already sitting in a chat don't dead-click.
         if dispatched:
             elements.append({"tag": "markdown",
                              "content": i18n.t(
                                  "case.create.dispatched_note", locale)})
-            elements.append(_action_row([
-                _open_url_button(i18n.t("case.create.btn.open_case", locale),
-                                 result.case_url, primary=True),
-                _callback_button(i18n.t("case.create.btn.my_cases", locale),
-                                 {"action": "case_list_open"}),
-            ]))
-        else:
-            elements.append({"tag": "markdown",
-                             "content": i18n.t(
-                                 "case.create.dispatch_prompt", locale)})
-            # Dispatch button carries the case context as action value so
-            # the click handler can synthesize the investigation request.
-            elements.append(_action_row([
-                _callback_button(
-                    i18n.t("case.create.btn.dispatch_agent", locale),
-                    {"action": "case_create_dispatch_after",
-                     "case_display_id": result.display_id,
-                     "subject": subject[:200],
-                     "body": body[:1000]},
-                    primary=True,
-                ),
-                _open_url_button(i18n.t("case.create.btn.open_case", locale),
-                                 result.case_url),
-                _callback_button(i18n.t("case.create.btn.my_cases", locale),
-                                 {"action": "case_list_open"}),
-            ]))
+        elements.append(_action_row([
+            _open_url_button(i18n.t("case.create.btn.open_case", locale),
+                             result.case_url, primary=True),
+            _callback_button(i18n.t("case.create.btn.my_cases", locale),
+                             {"action": "case_list_open"}),
+        ]))
         return {
             "schema": "2.0",
-            "config": {"streaming_mode": False},
+            "config": card_config(streaming_mode=False),
             "header": {"title": {"tag": "plain_text",
                                  "content": i18n.t(
                                      "case.create.success_title", locale)},
@@ -1273,7 +1514,7 @@ def _list_card(cases: list[CaseSummary], status_filter: str = "recent",
         empty_msg = i18n.t(empty_key, locale)
         return {
             "schema": "2.0",
-            "config": {"streaming_mode": False},
+            "config": card_config(streaming_mode=False),
             "header": {"title": {"tag": "plain_text",
                                  "content": i18n.t(
                                      "case.list.title_with_label", locale,
@@ -1357,7 +1598,7 @@ def _list_card(cases: list[CaseSummary], status_filter: str = "recent",
     ]))
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {"title": {"tag": "plain_text",
                              "content": i18n.t("case.list.card_title", locale)},
                    "template": "blue"},
@@ -1423,7 +1664,7 @@ def _view_card(c: CaseSummary, comms: list[Communication],
     elements.append(_action_row(actions))
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {"title": {"tag": "plain_text",
                              "content": i18n.t("case.view.title", locale,
                                                display_id=c.display_id)},
@@ -1440,7 +1681,7 @@ def _reply_form_card(display_id: str, internal_id: str = "",
                     "case_internal_id": internal_id}
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {"title": {"tag": "plain_text",
                              "content": i18n.t("case.reply.title", locale,
                                                display_id=display_id)},
@@ -1504,7 +1745,7 @@ def _reply_result_card(display_id: str, body: str, ok: bool,
     case_url = case_management._case_console_url(display_id)
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {"title": {"tag": "plain_text",
                              "content": i18n.t("case.reply.success_title",
                                                locale)},
@@ -1533,7 +1774,7 @@ def _resolve_confirm_card(display_id: str, internal_id: str = "",
                   "case_internal_id": internal_id}
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {"title": {"tag": "plain_text",
                              "content": i18n.t("case.resolve.confirm_title",
                                                locale)},
@@ -1564,7 +1805,7 @@ def _resolve_result_card(display_id: str, final_status: str,
     case_url = case_management._case_console_url(display_id)
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {"title": {"tag": "plain_text",
                              "content": i18n.t("case.resolve.success_title",
                                                locale)},
@@ -1594,7 +1835,7 @@ def _pending_card(severity: str, language: str,
     lang_label = LANGUAGE_LABELS.get(language, language)
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {"title": {"tag": "plain_text", "content": title},
                    "template": "blue"},
         "body": {"elements": [{
@@ -1610,7 +1851,7 @@ def _pending_simple_card(text: str, locale: str = "zh") -> dict:
     locale = _normalize_locale(locale)
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {"title": {"tag": "plain_text", "content": text},
                    "template": "blue"},
         "body": {"elements": [{
@@ -1689,7 +1930,7 @@ def _analyze_card(result: case_analyze.AnalyzeResult,
 
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {"title": {"tag": "plain_text",
                              "content": i18n.t("case.analyze.title", locale,
                                                display_id=c.display_id)},
@@ -1701,7 +1942,7 @@ def _analyze_card(result: case_analyze.AnalyzeResult,
 def _info_card(title: str, body: str, color: str = "blue") -> dict:
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {"title": {"tag": "plain_text", "content": title},
                    "template": color},
         "body": {"elements": [{"tag": "markdown", "content": body}]},

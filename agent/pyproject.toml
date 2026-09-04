@@ -6,7 +6,11 @@ requires-python = ">=3.10"
 dependencies = [
     "strands-agents>=0.1.0",
     "bedrock-agentcore>=0.1.0",
-    "boto3>=1.35.0",
+    # 下限对齐仓库根 requirements.txt：devops-agent 的 Asset API（读 custom agent 产出的
+    # artifact 要用 GetAsset / GetAssetContent）在 1.43.19 里不存在，1.43.30 起才有。
+    # 已有的 create_backlog_task / list_recommendations 老版本就有，但混用两个下限会让
+    # 「本地能读 artifact、runtime 读不到」这类问题只在部署后才暴露。
+    "boto3>=1.43.30",
     # core/aws_docs_mcp 通过 HTTP 调 AWS Knowledge MCP，仅用标准库 + boto3，无额外依赖
 ]
 

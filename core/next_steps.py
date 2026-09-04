@@ -14,22 +14,18 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 
-import boto3
-from core.lazy_boto import LazyClient
-
-from shared.model_config import get_bot_model_id
+from core import bot_llm
 
 logger = logging.getLogger(__name__)
 
-BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
-
-# 惰性构造（core/lazy_boto.py）：botocore 在**构造时**快照凭证，import 期建好的
-# client 会让后续 setenv AWS_BEARER_TOKEN_BEDROCK 完全失效（Bedrock API Key 模式
-# 因此无法生效）。代理转发属性访问，所有调用点写法不变。
-_bedrock = LazyClient("bedrock-runtime", region=BEDROCK_REGION)
+# 2026-09-01：本模块那几处「一个 system prompt + 一段文本 → 一段（通常是 JSON 的）
+# 文本」的调用，从手搓 Anthropic body 的 invoke_model 换成 core/bot_llm 的 Converse
+# 统一入口。理由与取舍全在 core/bot_llm.py 的模块 docstring 里。
+# 顺带删掉 `_bedrock` / `BEDROCK_REGION`：`invoke_llm` 每次调用自己建 client（比
+# LazyClient 更不会拿到过期凭证），而 BEDROCK_REGION 在三条部署路径里恒等于
+# `cdk.Aws.REGION` = Lambda 自己的区域 = boto3 默认区域，去掉是**零行为变化**。
 
 MAX_STEPS = 3
 LABEL_MAX = 30
@@ -165,31 +161,14 @@ def generate(summary_md: str, status: str = "COMPLETED",
         body_input = body_input[:max_chars] + "\n\n[truncated]"
 
     try:
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
+        text = bot_llm.invoke_bot_text(
+            SYSTEM_PROMPT + _locale_directive(locale),
+            body_input,
             # 1500 was 800 — bumped 2026-05-30 alongside the chat
             # path's 3000, since long investigations can produce
             # next-step lists that bumped against the old cap.
-            "max_tokens": 1500,
-            "system": SYSTEM_PROMPT + _locale_directive(locale),
-            "messages": [{"role": "user", "content": body_input}],
-        }
-        resp = _bedrock.invoke_model(
-            modelId=get_bot_model_id(),
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(body),
+            max_tokens=1500,
         )
-        data = json.loads(resp["body"].read())
-        text = ""
-        for block in data.get("content", []):
-            if block.get("type") == "text":
-                text = block["text"].strip()
-                break
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lstrip().lower().startswith("json"):
-                text = (text.split("\n", 1)[1] if "\n" in text else text[4:])
         parsed = _loose_load_json(text)
         if not parsed:
             logger.warning("next_steps: could not parse Bedrock output")

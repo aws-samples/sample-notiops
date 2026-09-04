@@ -12,8 +12,9 @@
     ④ runtime 的生命周期设置（保温多久 / 最长活多久）
     ⑤ 「通知」生产端（AWS 事件 → Web 收件箱）建没建、订了哪些事件源
     ⑥ 建 Agent Space 时有没有把 Operator App（web app）一并开好
-    ⑦ AgentCore Memory（长期记忆）建没建、四个 namespace 对不对
+    ⑦ AgentCore Memory（会话记忆）建没建、跨会话那几个开关是不是同时关着
     ⑧ 首次登录交付：部署者拿到临时密码时，是不是同时拿到了 Web Chat 地址
+    ⑨ IM（飞书 / Slack）加装项：三件套是不是同一份定义，方式 A 的部署期开关全不全
 
 ①②④ 是运行期行为，③ 是部署期数据 —— 三者在两条路径上各写了一份，没有任何一处能
 import 另一处；⑤ 反过来：它现在**只有一份**，两个栈 import 同一个模块，本文件断言的
@@ -21,8 +22,13 @@ import 另一处；⑤ 反过来：它现在**只有一份**，两个栈 import 
 StackSet payload（`infra/member-devops-agent.yaml`）也自己建 space，三处都得开。
 ⑦ 有第三方参与：写入端（strategy 的 namespace）和读取端（`memory/session.py` 的
 retrieval_config）必须逐字对上，对不上时**不报错**，只是永远检索不到东西。
+2026-09-01 起两边都是**空**的（产品决策：只保留会话内记忆），所以这一节除了「两条路径
+形状一致」还多钉一条「跨会话确实关着」—— 否则"一致地打开"也能过。
 ⑧ 是唯一**机制天生不同**的一条（方式 B 有终端可打印，方式 A 只有一封邮件），所以断言的
 是不变量「密码与地址同时到手」，不是"两边写法一样"。
+⑨ 与 ⑤ 同构（只有一份定义，断言"没人抄回栈里"），但多一层：方式 A 的 IM 是**部署期
+可选**的（参数页那个 InstallOption 下拉框），所以还要钉住「默认只装 web」「三个选项都
+含 web」「共用资源挂 Or 条件」「代码来自 staging 桶的函数都等 StagerArtifacts」。
 
     ① 方式 B：agent-build/NotiOpsWebChat/agentcore/cdk/lib/cdk-stack.ts 的 NotiOps 段
        方式 A：infra/lib/notiops-webchat-standalone-stack.ts 的 AgentCore Runtime 段
@@ -42,9 +48,15 @@ retrieval_config）必须逐字对上，对不上时**不报错**，只是永远
        成员账号：infra/member-devops-agent.yaml 的 AgentSpace 资源
     ⑦ 方式 B：agentcore.json 的 memories[]（AgentCore CLI 建资源 + 注入 memory id）
        方式 A：notiops-webchat-standalone-stack.ts 的 AgentCore Memory 段
-       读取端（两条路径共用）：agent-build/…/memory/session.py 的 retrieval_config
+       读取端（两条路径共用）：agent-build/…/memory/session.py（现在**不配**
+       retrieval_config —— 只按 sessionId 存取事件）
     ⑧ 方式 B：setup.sh 建 admin（`--message-action SUPPRESS`）+ 部署总结那块打印
        方式 A：notiops-webchat-standalone-stack.ts 的 Cognito 邀请邮件模板
+    ⑨ 两条路径都调 infra/lib/constructs/im-core.ts 的 createImCore()
+       方式 B：infra/lib/im-stack.ts（`-c enabledPlatforms`，合成期决定装哪些平台）
+       方式 A：notiops-webchat-standalone-stack.ts 的 IM 段（InstallOption 参数 +
+       CfnCondition，部署期决定；代码/依赖层走 im-code.zip / im-layer.zip 产物）
+       排除清单（两条路径共用）：infra/im-code-exclude.txt
 
 漂移的后果**不是**「功能没做」，而是「界面上有开关、点了静默失败」——
 UI 上那些开关（联网搜索 / FinOps / 深度调查）绝大多数是**无条件**渲染的
@@ -53,7 +65,7 @@ UI 上那些开关（联网搜索 / FinOps / 深度调查）绝大多数是**无
 
 一条修好的漂移，留着当教训（判据已经是第 ⑦ 节的真断言）
 ------------------------------------------------------------------------
-  · **AgentCore Memory 曾在方式 A 上整个不存在**（长期记忆静默失效），而本文件曾把它
+  · **AgentCore Memory 曾在方式 A 上整个不存在**（记忆静默失效），而本文件曾把它
     列成"有意的差异"，理由写的是「grep 过 core/ 与 agent/，没有任何代码读 MEMORY_*
     环境变量 —— 两条路径上都是死权限」。那次 grep **没覆盖 agent-build/**，而读它的代码
     (`memory/session.py`) 正好只在那里 —— 于是这个漂移躲过了本判据整整多个版本。
@@ -79,6 +91,7 @@ Run from repo root::
 """
 from __future__ import annotations
 
+import ast
 import fnmatch
 import json
 import os
@@ -90,6 +103,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PASS = "✅"
 FAIL = "❌"
 _failed = 0
+# 失败明细（不只是计数）—— pytest 下要把它塞进 assert 消息里，否则只看到 "assert 0 == 1"。
+_failures: list[str] = []
 
 ONECLICK = "infra/lib/notiops-webchat-standalone-stack.ts"
 SETUP_CDK = "agent-build/NotiOpsWebChat/agentcore/cdk/lib/cdk-stack.ts"
@@ -110,11 +125,11 @@ SID_ALIASES = {
 # （不在仓库里，所以源码比对看不见它们），且生成的语句**没有 Sid**。
 # 值 = 为什么它在这张表里。判据落在别处（见值里写的那一条），不是"就这么算了"。
 CLI_GENERATED_SIDS = {
-    "NotiOpsMemoryRetrieve":
+    "NotiOpsMemoryEvents":
         "方式 B 由 AgentCore CLI 按 agentcore.json 的 memories[] 生成同等授权（无 Sid）。"
-        "两条路径的 Memory 形状本身由 test_agentcore_memory_parity 断言。",
-    "NotiOpsMemoryRetrieveByPath": "同上（namespacePath 条件键那半边）。",
-    "NotiOpsMemoryEvents": "同上（事件读写那组，无 namespace 条件键可用）。",
+        "两条路径的 Memory 形状本身由 test_agentcore_memory_parity 断言。"
+        "（原先还有 NotiOpsMemoryRetrieve / …ByPath 两条，2026-09-01 去掉跨会话记忆时"
+        "连同调用面一起删了 —— 恢复跨会话记忆要把这两条一起加回来。）",
 }
 
 # runtime 执行角色的授权段。两个 marker 都是文件里的章节注释 —— 挑它们而不是行号，
@@ -129,7 +144,33 @@ def _check(label: str, cond: bool, detail: str = "") -> None:
         print(f"  {PASS} {label}")
     else:
         _failed += 1
+        _failures.append(f"{label}{(' :: ' + detail) if detail else ''}")
         print(f"  {FAIL} {label}{(' :: ' + detail) if detail else ''}")
+
+
+# ─── pytest 下也必须真的失败 ──────────────────────────────────────────────────
+# `_check` 故意不抛异常（要一次跑完列出**所有**漂移，而不是第一条就中断），失败只记在
+# `_failed` 里、由 `main()` 读。后果是：在 CI 的 pytest 里，本文件的漂移**全部静默通过**。
+# 2026-09-03 实测同一份代码：
+#     pytest scripts/test_oneclick_parity.py -q   → 9 passed
+#     python3 scripts/test_oneclick_parity.py     → 1 项失败（方式 A 缺 COST_AGENT_MCP_URL）
+# 静默通过的断言比没有断言更糟 —— 它让人以为这件事有人守着。所以补一个 autouse fixture：
+# 每个 test 前后比对失败明细，涨了就让那个 test 真的挂，并把明细带进 assert 消息
+# （pytest 默认吞掉 stdout，只有 -s 才能看见上面那些 ❌ 行）。
+# 注意报告形态：断言发生在 fixture 的 teardown 阶段，所以 pytest 记的是那个 test id 的
+# **ERROR**（不是 FAILED），汇总行会写成 "N passed, 1 error"。退出码仍是非 0 —— CI 会红，
+# 别看到 "passed" 就以为过了；error 行后面跟的就是漂移明细。
+try:
+    import pytest as _pytest
+except ImportError:  # 直接 `python3 scripts/test_oneclick_parity.py` 跑时不依赖 pytest
+    pass
+else:
+    @_pytest.fixture(autouse=True)
+    def _fail_on_parity_drift():
+        before = len(_failures)
+        yield
+        new = _failures[before:]
+        assert not new, "方式 A / 方式 B 漂移：\n  - " + "\n  - ".join(new)
 
 
 def _read(rel: str) -> str:
@@ -235,16 +276,80 @@ def _memory_env_key(memory_name: str) -> str:
     return "MEMORY_" + re.sub(r"[^A-Za-z0-9]", "", memory_name).upper() + "_ID"
 
 
+# 方式 B 上真正**给这些键赋值**的脚本。判「某个键是不是被自动接线的」就看它在
+# 这几份里出不出现（见 _env_keys_setup 的说明）。
+SETUP_WIRING_SCRIPTS = (
+    "scripts/deploy_agent.sh",       # 出厂占位符 → 真值的替换表 + 部署后 backfill
+    "setup.sh",                      # 部署后回填（AgentSpaceId / ReportsCdnDomain）
+    "scripts/backfill_runtime_env.sh",
+)
+
+# 明确声明为**人工接线**的键：在 `agentcore.json` 的 envVars 里，但没有任何脚本
+# 给它赋值，按 DEPLOYMENT.md 是人工步骤。这些不参与两条路径的对等判据。
+#
+# 🔴 这是一张**双向**对账表，不是豁免清单：下面断言「实测出来的人工集合 ==
+#    这张表」，两个方向都要相等。
+#
+#      多出来  某个原本自动接线的键脱离了脚本（改名 / 删了替换逻辑 / 判据路径
+#              漂移）→ 报红。这是这张表存在的主要理由 —— 换成阈值式自检
+#              （「命中率别塌太多」）挡不住，反向注入实测过：清空
+#              deploy_agent.sh 之后命中数刚好卡在阈值边界上，自检全绿。
+#      少一个  有人真的把它接线了 → 报红，提示把它从这张表里删掉，
+#              于是它立刻回到对等判据里，方式 A 少了就会被抓。
+#
+# ⚠️ 往这张表里加东西**不等于**这个功能可以只做一半。它的含义严格是
+#    「两条路径都要人工接」。只在方式 B 上自动接、方式 A 靠人工，
+#    那是真漂移，不该写进这里。
+# 目前**空表**：唯一曾经在表里的 COST_AGENT_MCP_URL 已经毕业 —— 两条路径都自动接线了
+# （方式 B：scripts/deploy_agent.sh 注入 + setup.sh 前置校验；方式 A：CfnParameter
+#  CostAgentMcpUrl / CostAgentFunctionArn + CfnRule CostAgentArnRequiredWithUrl）。
+# 按上面「少一个 → 报红 → 从表里删掉」的规则删除，于是它回到了对等判据里。
+# 空表不是判据失效：下面的双向对账仍然生效 —— 任何一个键脱离脚本接线都会让
+# `manual` 非空而报红。
+MANUAL_ENV_KEYS: set[str] = set()
+
+
 def _env_keys_setup() -> set[str]:
+    """方式 B **真正会被赋值**的 runtime 环境变量键。
+
+    🔴 判据不是「在 `agentcore.json` 的 envVars 里出现」，而是「出现 **且**
+       有脚本给它赋值」。两者不等价，差别不是理论上的：envVars 里的出厂值是
+       `__FOO__` 形态的占位符，**占位符是 truthy** —— 漏注入时 consumer 不会
+       把它当「未配置」，而是拿着字面量去访问，于是功能挂在那里但每次都失败
+       （见 core/cost_agent_mcp.py::_env、bff/web-chat/cur_dashboard.mjs 里
+       统一把 `__FOO__` 归一成未配置的那段）。所以「声明了」≠「接上了」。
+
+    ⚠️ 这**不是**放宽判据。真正人工接线的键（如果有）在方式 A 上要求它出现是
+       没有意义的：方式 A 是发给客户的模板，模板里塞一个必须人工替换的占位符
+       只会让 AgentCore Runtime 拿着字面量上线 —— 正是上面那个形态。
+       反过来，一个键一旦被脚本自动注入，就必须两条路径**同时**做，
+       它会自动落进这个集合，方式 A 缺了就会被下面的对等断言抓住。
+       COST_AGENT_MCP_URL 走完的正是这条路（详见 MANUAL_ENV_KEYS 上方）。
+    """
     data = json.loads(_read(SETUP_AGENTCORE_JSON))
-    keys = {
+    declared = {
         ev["name"]
         for rt in data.get("runtimes", [])
         for ev in rt.get("envVars", [])
         if ev.get("name")
     }
-    if not keys:
+    if not declared:
         raise AssertionError(f"{SETUP_AGENTCORE_JSON}: no runtimes[].envVars[].name found")
+
+    wiring = "\n".join(_read(p) for p in SETUP_WIRING_SCRIPTS)
+    keys = {k for k in declared if k in wiring}
+    manual = declared - keys
+
+    # 双向对账（见 MANUAL_ENV_KEYS 上方说明）。不用阈值 —— 阈值挡不住部分漂移。
+    _check("人工接线的 envVars 键与 MANUAL_ENV_KEYS 完全一致",
+           manual == MANUAL_ENV_KEYS,
+           f"实测人工接线 = {sorted(manual)}，表里写的 = {sorted(MANUAL_ENV_KEYS)}。"
+           f"\n     多出来的 {sorted(manual - MANUAL_ENV_KEYS)} —— 这些键原本有脚本"
+           f" 赋值，现在没有了（改名/删逻辑/{SETUP_WIRING_SCRIPTS} 路径漂移），"
+           f"那是真缺陷，别往表里加。"
+           f"\n     少了的 {sorted(MANUAL_ENV_KEYS - manual)} —— 已经接线了，"
+           f"把它从 MANUAL_ENV_KEYS 删掉，让它回到对等判据里。")
+
     # CLI 隐式注入的那批（见 _memory_env_key）。
     keys |= {_memory_env_key(m["name"]) for m in data.get("memories", []) if m.get("name")}
     return keys
@@ -371,6 +476,14 @@ def _oneclick_seeds_llm_catalog() -> list[str]:
         ("both paths top up models added after the first deploy",
          "generation = :zero" in stager and "generation = :zero" in seeder
          and "merge_missing_models" in stager and "merge_missing_models" in seeder),
+        # 同一支里还必须跟 **default_model**。2026-09-02 现网:目录默认从 claude-sonnet-5
+        # 换成 xai-grok-4-6,grok 被补进了模型列表、默认却还停在 Sonnet 5 —— 因为那次
+        # 只写了 `models`。难查的原因是其它槽位(SSM /notiops/agent/model_id、
+        # health-checker 的 BEDROCK_MODEL_ID)都跟着改了,从 CLI 看整个环境是一致的,
+        # 只有 web 聊天开在旧模型上。同样只在 generation==0 时跟。
+        ("both paths follow default_model drift too",
+         "default_model_drift" in stager and "default_model_drift" in seeder
+         and '"default_model"' in stager and '"default_model"' in seeder),
         # 补的那一步要读+改，一键路径的 stager role 得有对应权限；只给 PutItem 的话
         # 这条分支会以 AccessDenied 让整栈升级失败（比静默少一个模型更响，但同样是缺陷）。
         ("the stager role may read and update the config item too",
@@ -557,7 +670,10 @@ def test_web_notif_producer_parity() -> None:
     # 判据形状：一条源的定义 = 一个 `{…}` 里既有 `source: "aws.…"` 又有 `on: true|false`
     # （出厂开关）。**不能**只看 `source: "aws.`：同一个后端栈里还有 IM push 的
     # `pushRuleSources`（5 条，同样是 `source: "aws.…"` 但没有 `on:`）—— 那是另一个功能
-    # （推到飞书），一键部署整块不含 IM，它本来就不该有方式 A 的对应物，不算漂移。
+    # （每日报告 / 告警**主动推**到飞书群），它依赖方式 B 才有的报告流水线（报告生成
+    # Lambda + 推送规则），方式 A 的单栈里没有那条流水线，所以它没有方式 A 的对应物，
+    # 不算漂移。⚠️ 别把这句读成"方式 A 不含 IM" —— 方式 A 有 IM（InstallOption 那个
+    # 下拉框，判据在 test_im_webhook_parity），只是没有**主动推送**这一路。
     def _source_entries(text: str) -> list[str]:
         return [b for b in re.findall(r"\{[^{}]*\}", text, re.S)
                 if re.search(r'source:\s*"aws\.', b) and re.search(r"\bon:\s*(?:true|false)\b", b)]
@@ -600,6 +716,188 @@ def test_web_notif_producer_parity() -> None:
     # context 键必须还在（它是方式 B 客户唯一的关法）。
     _check("方式 B 仍支持 `-c webNotif<Id>=on|off`",
            "webNotif${src.id}" in _read(SETUP_BACKEND) or "`webNotif${src.id}`" in _read(SETUP_BACKEND))
+
+
+# ⑨ IM（飞书 / Slack）webhook 三件套。
+#
+# 两条路径都从 `infra/lib/constructs/im-core.ts` 生成，差异**只允许**通过 props 表达
+# （那份文件的头部有完整的差异表）。所以这一节断言的不是"两边写法一样"，而是
+# 「谁也没有绕过共享 construct 自己写一份」+「方式 A 那套部署期开关是完整的」。
+#
+# 为什么需要断言：IM 有 ~25 个"错一个只在生产暴露"的属性（worker 900s、ingress 的
+# reservedConcurrentExecutions=10、Slack 那两个不能改名的环境变量、progress 的 1 分钟
+# 节拍……）。一旦有人为了赶一键部署把它们抄一份进 standalone 栈，两条路径就会各自演化，
+# 而症状是「飞书里某个能力在一种部署方式下不灵」——最难查的一类。
+IM_CORE_TS = "infra/lib/constructs/im-core.ts"
+IM_SETUP_STACK = "infra/lib/im-stack.ts"
+IM_EXCLUDE_FILE = "infra/im-code-exclude.txt"
+IM_BUILD_SCRIPT = "scripts/build_im_zips.py"
+IM_PACKAGE_SCRIPT = "scripts/package_artifacts.sh"
+IM_STAGER = "infra/lambda/stager/index.py"
+
+#: 方式 A 的安装选项。`web` 必须是**默认值**（客户不动下拉框就只装 web），
+#: 且三项里每一项都含 web —— 用户的要求原话：「无论选择哪个，都必须安装 web」。
+IM_INSTALL_OPTIONS = ("web", "web+feishu", "web+slack")
+
+#: 只允许出现在**一条**路径上的 props（其余必须两边都给，值可以不同）：
+#:   · conditions        —— 部署期开关，只有方式 A 有（方式 B 是合成期 -c enabledPlatforms）
+#:   · progressRuleName  —— 写死的 EventBridge 规则名，只有方式 B 有（方式 A 会撞名）
+#:   · keepAliveRuleName —— 同上：ingress 保活规则的物理名。**只是名字缺席，不是功能缺席** ——
+#:     im-core.ts 里 createIngressKeepAlive 是无条件调的，方式 A 不传名字就让 CFN 自动生成，
+#:     免得与 setup.sh 写死的 notiops-im-keepalive-* 在同一账号里撞名。功能本身由下面
+#:     「保活两条路径都有」那条断言守着 —— 这里放行名字，那里不许放行功能。
+IM_ONECLICK_ONLY_PROPS = {"conditions"}
+IM_SETUP_ONLY_PROPS = {"progressRuleName", "keepAliveRuleName"}
+
+
+def _im_core_props(rel: str) -> set[str]:
+    """某条路径调 `createImCore` 时传了哪些 props（顶层键名）。"""
+    src = _read(rel)
+    if "createImCore" not in src:
+        raise AssertionError(
+            f"{rel}: 没有调用 createImCore —— IM 三件套的定义必须来自 {IM_CORE_TS}，"
+            "不能在栈里自己写一份。")
+    open_idx = src.index("{", src.index("createImCore("))
+    body = _strip_comments(src[open_idx: _balanced_end(src, open_idx) + 1])
+    # 只取**顶层**键：把嵌套的 `{…}`（platforms / conditions 的值）先掏空，
+    # 否则 `feishu:` / `slack:` 会被当成顶层 prop。
+    while True:
+        m = re.search(r"\{[^{}]*\}", body[1:-1])
+        if not m:
+            break
+        body = body[0] + body[1:-1][: m.start()] + "OBJ" + body[1:-1][m.end():] + body[-1]
+    # 两种写法都要认：`key: value` 和 ES6 的简写 `key,`（im-stack.ts 里
+    # lockedAccountId / allowedChatIds 就是简写 —— 只认冒号会把它们判成"方式 B 没传"）。
+    return set(re.findall(r"^\s*([A-Za-z][A-Za-z0-9]*)\s*[:,]", body, re.M))
+
+
+def test_im_webhook_parity() -> None:
+    """IM 三件套：两条路径同一份定义，方式 A 的部署期开关完整。"""
+    print("\ntest_im_webhook_parity")
+
+    # 1) 谁也不许自己写一份。判据取 handler 字符串：三个 handler 的模块路径只能出现在
+    #    共享 construct 里（栈里出现 = 有人抄了一份函数定义回去）。
+    core = _read(IM_CORE_TS)
+    handlers = re.findall(r'handler:\s*"(platforms\.[^"]+)"', core)
+    _check("三个 IM handler 都在共享 construct 里", len(handlers) == 5,
+           f"在 {IM_CORE_TS} 里数到 {len(handlers)} 个 handler（应为 5："
+           "飞书 ingress/worker、Slack ingress/worker、平台无关的 progress）")
+    for rel in (ONECLICK, IM_SETUP_STACK):
+        text = _strip_comments(_read(rel))
+        _check(f"{os.path.basename(rel)} 没有自己的 IM handler 定义",
+               not re.search(r'handler:\s*"platforms\.', text),
+               "栈里出现了 `handler: \"platforms.…\"` —— IM 函数被抄回栈里了。"
+               "超时/内存/环境变量/IAM 一律去 im-core.ts 改。")
+
+    # 2) props 必须两边都给（差异只允许是那两个"天生只属于一条路径"的）。
+    oneclick_props = _im_core_props(ONECLICK)
+    setup_props = _im_core_props(IM_SETUP_STACK)
+    _check("方式 A 独有的 props 就是那一个", oneclick_props - setup_props == IM_ONECLICK_ONLY_PROPS,
+           f"实际多出来的是 {sorted(oneclick_props - setup_props)}")
+    _check("方式 B 独有的 props 就是那一个", setup_props - oneclick_props == IM_SETUP_ONLY_PROPS,
+           f"实际多出来的是 {sorted(setup_props - oneclick_props)}")
+
+    # 2b) ingress 保活：**功能**必须两条路径都有。
+    #
+    # 上面放行了 keepAliveRuleName 只在方式 B 出现（物理名会撞名），这条就是那个放行的
+    # 对价：功能本身不许只在一条路径上。判据落在共享 construct —— 保活规则必须由
+    # createIngressKeepAlive 无条件建出来（不许写成 `if (props.keepAliveRuleName)`，
+    # 那样方式 A 不传名字就等于没有保活，而症状是「一键部署的客户第一次在飞书点按钮
+    # 就 3 秒超时」，与部署方式的关联极难想到）。
+    _check("保活规则在共享 construct 里定义（不是某条路径自己写的）",
+           "function createIngressKeepAlive(" in core,
+           f"{IM_CORE_TS} 里找不到 createIngressKeepAlive")
+    ka_calls = re.findall(r"createIngressKeepAlive\(", core)
+    _check("两个平台的 ingress 各有一条保活规则", len(ka_calls) == 3,
+           f"数到 {len(ka_calls)} 处（应为 3：1 个定义 + 飞书/Slack 各 1 次调用）")
+    _check("保活不以 keepAliveRuleName 是否传入为前提",
+           not re.search(r"if\s*\(\s*props\.keepAliveRuleName", core),
+           "写成条件建规则 = 方式 A（不传名字）静默没有保活")
+    for rel in (ONECLICK, IM_SETUP_STACK):
+        _check(f"{os.path.basename(rel)} 没有自己的保活规则",
+               "notiops_warmup" not in _strip_comments(_read(rel)),
+               "保活的哨兵 input 只能出现在 im-core.ts —— 栈里出现说明有人抄了一份")
+    _check("保活节拍是 4 分钟（比 Lambda 回收空闲环境更勤）",
+           re.search(r"Schedule\.rate\(cdk\.Duration\.minutes\(4\)\)", core) is not None,
+           "放宽节拍就把「第一次点按钮失败」的概率放回来了")
+
+    # 3) 方式 A 的安装选项：默认只装 web，三项都含 web。
+    oneclick = _strip_comments(_read(ONECLICK))
+    param_idx = oneclick.find('new cdk.CfnParameter(this, "InstallOption"')
+    _check("方式 A 有 InstallOption 参数", param_idx >= 0)
+    if param_idx >= 0:
+        param = oneclick[param_idx: _balanced_end(oneclick, oneclick.index("{", param_idx)) + 1]
+        allowed = re.search(r"allowedValues:\s*\[([^\]]*)\]", param)
+        values = tuple(v.strip().strip("\"'") for v in allowed.group(1).split(",") if v.strip()) if allowed else ()
+        _check("安装选项就是 web / web+feishu / web+slack", values == IM_INSTALL_OPTIONS,
+               f"实际是 {values}")
+        _check("默认只装 web", re.search(r'default:\s*"web"', param) is not None)
+        _check("每一项都包含 web", all(v == "web" or v.startswith("web+") for v in values),
+               "「无论选择哪个都必须安装 web」是产品约束，不是巧合")
+
+    # 4) 三个部署期条件都在，且共用资源挂的是 InstallIm（Or）而不是某一个平台。
+    for cond in ("InstallFeishu", "InstallSlack", "InstallIm"):
+        _check(f"方式 A 有 {cond} 条件", f'new cdk.CfnCondition(this, "{cond}"' in oneclick)
+    _check("InstallIm 是两个平台的 Or",
+           re.search(r'"InstallIm"[^}]*conditionOr\(installFeishu,\s*installSlack\)', oneclick, re.S) is not None,
+           "共用资源（IAM 角色 / progress 函数 / 节拍规则）必须"
+           "「选了任一平台就建」，挂在单个平台上会让另一个平台的调查进度永远不刷新。")
+
+    # 5) 代码来自 staging 桶 → 每个 IM 函数都必须等 StagerArtifacts。少一条依赖的症状是
+    #    **偶发**的 NoSuchKey（CFN 并行创建，函数可能比产物先到）。
+    _check("方式 A 给每个 IM 函数挂了 StagerArtifacts 依赖",
+           "for (const fn of im.functions)" in oneclick and "addDependency(stagerArtifacts)" in oneclick)
+    _check("方式 A 的 IM 依赖层也等 StagerArtifacts",
+           re.search(r"imLayerCfn\.addDependency\(stagerArtifacts\)", oneclick) is not None)
+
+    # 6) 排除清单只有一份，两边都读它。抄两份的代价：一键部署的 IM 缺文件
+    #    （客户账号里 ImportModuleError）或者超 250MB 解压上限。
+    for rel in (IM_SETUP_STACK, IM_BUILD_SCRIPT):
+        _check(f"{os.path.basename(rel)} 读共享排除清单",
+               os.path.basename(IM_EXCLUDE_FILE) in _read(rel),
+               f"必须读 {IM_EXCLUDE_FILE}，不能自己写一份文件清单")
+    patterns = [l.strip() for l in _read(IM_EXCLUDE_FILE).splitlines()
+                if l.strip() and not l.strip().startswith("#")]
+    for sentinel in ("dist/**", ".cdk-out", "**/node_modules/**"):
+        _check(f"排除清单里有哨兵 {sentinel}", sentinel in patterns)
+    _check("排除清单**没有** platforms/**", "platforms/**" not in patterns,
+           "IM 的三个 handler 全在 platforms/ 下，排掉它 = handler not found")
+
+    # 7) 产物名的三方契约：postprocess 注入清单、package_artifacts 算 sha256、
+    #    stager 按 `im-` 前缀在"只装 web"时跳过下载。名字对不上就是客户侧 404 / 白下载。
+    postprocess = _read("scripts/postprocess_template.py")
+    package = _read(IM_PACKAGE_SCRIPT)
+    stager = _read(IM_STAGER)
+    for artifact in ("im-code.zip", "im-layer.zip"):
+        _check(f"{artifact} 在模板清单里（postprocess）", f'"{artifact}"' in postprocess)
+        _check(f"{artifact} 进 SHA256SUMS（package_artifacts）", artifact in package)
+        _check(f"{artifact} 带 stager 的跳过前缀 im-", artifact.startswith("im-"))
+    _check("stager 按 im- 前缀跳过（只装 web 时）",
+           'startswith("im-")' in stager and "InstallOption" in stager,
+           "少了这段，只装 web 的客户也要白下载 28MiB 的 IM 产物")
+
+    # 8) 群/频道允许清单（IM 四道防线的第三道）必须**两条路径都能开**。
+    #
+    # 🔴 上面第 2 条只查「props 传没传」，传一个写死的 `""` 照样过 —— 这正是这条防线
+    #    曾经在方式 A 上永久缺席的原因（`allowedChatIds: ""`，全栈没有对应参数）。
+    #    所以这里查的是**值的来源**：方式 A 必须来自 CfnParameter，方式 B 必须来自
+    #    context 键。写死空串的症状不是报错，而是「文档说有这道防线，一键部署的客户
+    #    打不开，手改 Lambda 环境变量下次栈更新又被覆盖回空」。
+    _check("方式 A 有 ImAllowedChatIds 参数",
+           'new cdk.CfnParameter(this, "ImAllowedChatIds"' in oneclick,
+           "一键部署必须能填群允许清单 —— 见「方式 A / 方式 B 功能必须对等」铁律")
+    _check("方式 A 的 allowedChatIds 取自那个参数（不是写死）",
+           re.search(r"allowedChatIds:\s*imAllowedChatIds\.valueAsString", oneclick) is not None,
+           "写死字面量 = 这道防线在一键部署上打不开")
+    _check("方式 B 的 allowedChatIds 取自 -c imAllowedChatIds",
+           'tryGetContext("imAllowedChatIds")' in _strip_comments(_read(IM_SETUP_STACK)),
+           "方式 B 少了这个 context 键，两条路径就又不对等了")
+    # 两个平台的环境变量名故意不同（飞书 ALLOWED_CHAT_IDS / Slack ALLOWED_CHANNEL_IDS，
+    # 沿用各自平台既有口径），但都必须由同一个 prop 喂 —— 少喂一个就是那个平台没防线。
+    for env_name in ("ALLOWED_CHAT_IDS", "ALLOWED_CHANNEL_IDS"):
+        _check(f"{env_name} 由 props.allowedChatIds 喂（共享 construct 里）",
+               re.search(rf"{env_name}:\s*props\.allowedChatIds", core) is not None,
+               f"{IM_CORE_TS} 里 {env_name} 没接上 props.allowedChatIds")
 
 
 # ⑥ Operator App（控制台上那一步叫「Agent Space → Access → Operator access →
@@ -664,24 +962,59 @@ def test_operator_app_enabled_everywhere() -> None:
         _check(f"member-devops-agent.yaml 的 Operator App 角色带 {must}", must in member)
     # 成员账号里可能同时存在一套**独立 NotiOps 部署**（无 -m 后缀的同名角色）。
     # 后缀是共存的前提，不是风格问题。
+    #
+    # 🔴 判据是「**每个**带 ${AWS::AccountId} 的 RoleName 都以 -m${SystemAccountId}
+    #    收尾」，而不是写死某一个角色名。原来这里写死的是
+    #    `notiops-agent-webapp-${AWS::AccountId}-m${SystemAccountId}` —— 两个毛病：
+    #
+    #      1. 只覆盖三个 notiops-agent-* 角色里的**一个**。另外两个
+    #         （primary / trigger）丢了后缀照样撞名、照样 CREATE_FAILED，
+    #         而这条断言全绿。
+    #      2. 把「基名叫什么」和「有没有后缀」绑在一条正则里。基名是 `operator`
+    #         （线上实查 2026-09-03：677 = notiops-agent-operator-111122223333-m444455556666、
+    #          088 = notiops-agent-operator-012345678901-m444455556666、
+    #          698 部署账号 = notiops-agent-operator-444455556666 无后缀，与 CDK 侧一致），
+    #         于是这条断言在**代码正确**的情况下报红，指向一个不存在的问题。
+    #
+    # ⚠️ `notiops-idle-detection-role-${SystemAccountId}` 不带 ${AWS::AccountId}，
+    #    因此不在这个判据的范围内 —— 它靠把系统账号 id 嵌进名字本身来避撞
+    #    （成员账号自建的那套会嵌它自己的 id），满足同一个意图、形态不同。
+    role_names = re.findall(r"RoleName:\s*!Sub\s*\"([^\"]+)\"", member)
+    # 自检：判据是「**每一条** RoleName 都被正则解析到」，不是「至少抓到几条」。
+    #
+    # 🔴 阈值式自检（`len(role_names) >= 3`）挡不住部分漂移：把三个
+    #    notiops-agent-* 改成 !Join、留下另外三条 !Sub，计数仍然是 3 —— 自检
+    #    全绿而那三个角色已经脱离后缀断言的视野。反向注入实测过这个盲区。
+    total_role_lines = len(re.findall(r"^\s*RoleName:", member, re.M))
+    _check("成员模板每条 RoleName 都被解析到（自检，防断言空过）",
+           len(role_names) == total_role_lines and total_role_lines > 0,
+           f"模板里有 {total_role_lines} 条 RoleName，正则只解析出 "
+           f"{len(role_names)} 条 —— 没解析到的那些脱离了下面的后缀断言。"
+           "改了 RoleName 的写法（比如换成 !Join）就要同步改这里的正则。")
+    scoped = [n for n in role_names if "${AWS::AccountId}" in n]
+    missing = [n for n in scoped if not n.endswith("-m${SystemAccountId}")]
     _check("成员账号的角色名带 -m<SystemAccountId> 后缀",
-           re.search(r"RoleName:\s*!Sub\s*\"notiops-agent-webapp-\$\{AWS::AccountId\}-m\$\{SystemAccountId\}\"",
-                     member) is not None,
-           "少了后缀会和成员账号内自建的 NotiOps 部署撞名，StackSet 实例直接 CREATE_FAILED。")
+           not missing,
+           "少了后缀会和成员账号内自建的 NotiOps 部署撞名，StackSet 实例直接 "
+           f"CREATE_FAILED。缺后缀的：{missing}")
 
 
-# ───────────────── 第七个维度：AgentCore Memory（长期记忆） ─────────────────
+# ───────────────── 第七个维度：AgentCore Memory（会话记忆） ─────────────────
 #
-# 为什么单独一节：长期记忆坏掉的样子**完全静默**。BFF 每轮只发 `prompt`
+# 为什么单独一节：记忆坏掉的样子**完全静默**。BFF 每轮只发 `prompt`
 # （bff/web-chat/agentcore.mjs 的 buildRuntimePayload 里没有历史），所以模型接得上上文靠
 # 两件事之一 —— 容器里那个 Agent 对象还在 LRU 缓存里，或者 Memory 把历史读回来。
 # 没有后者时，缓存那一格一被顶掉（换模型 / 换主题 / 换账号 / 存一次 Admin 配置 / 闲置 1 小时
 # / 重新部署 …）模型就当场失忆，而界面上历史还在（历史存 DynamoDB）。
 # 客户看到的是「它刚刚还知道，现在突然不认了」，日志里什么都没有。
 #
-# 这一节比前六节多一个参与方：**读取端**。写入端（strategy 的 namespace）和读取端
-# （`memory/session.py` 的 retrieval_config）对不上时也不报错，只是永远检索不到东西。
-# 所以这里断言三方一致，而不是两方。
+# 2026-09-01 产品决策：**只保留会话内**（按 sessionId 存原始事件，create_event /
+# list_events），**去掉跨会话记忆**（strategy 抽取 + 每轮检索）。于是这一节守两件事：
+#   ① 两条路径的 Memory 形状仍然一致（保留期、strategy 集合、推导出的 env 键）；
+#   ② 「跨会话」这件事的三个开关**同时**关着 —— 两条部署路径上的 strategy，
+#      以及读取端 `memory/session.py` 的 retrieval_config。
+# 三者任意一个单独打开都是坏状态：只加 strategy = 白花抽取成本没人读；
+# 只加 retrieval_config = 每轮白发检索请求、永远检索不到（而且**不报错**）。
 MEMORY_SESSION_PY = "agent-build/NotiOpsWebChat/app/NotiOpsWebChat/memory/session.py"
 
 #: CFN 的 strategy wrapper 键 → agentcore.json 的 `type`。
@@ -746,7 +1079,7 @@ def _memory_oneclick() -> dict:
     if i < 0:
         raise AssertionError(
             f"{ONECLICK}: 找不到 AWS::BedrockAgentCore::Memory 资源 —— "
-            "长期记忆在方式 A 上又没了（这正是本节要守的那个漂移）")
+            "会话记忆在方式 A 上又没了（这正是本节要守的那个漂移）")
     j = src.index("properties: {", i)
     depth, end = 0, None
     for k in range(j, len(src)):
@@ -798,16 +1131,44 @@ def _memory_oneclick() -> dict:
     }
 
 
+def _memory_retrieval_configured() -> bool:
+    """读取端到底有没有配 `retrieval_config` —— 用 **AST** 判断，不用 grep。
+
+    必须用 AST：`memory/session.py` 的文档字符串和注释里会大段解释 retrieval_config
+    （本文件自己也一样），grep 会把"解释得清楚"当成"又打开了"。
+    两种形态都算打开：赋值给局部变量，或者直接当关键字参数传给 AgentCoreMemoryConfig。
+    """
+    tree = ast.parse(_read(MEMORY_SESSION_PY))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == "retrieval_config":
+            return True
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == "retrieval_config" for t in node.targets):
+                return True
+        if isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "retrieval_config":
+                return True
+    return False
+
+
 def _memory_namespaces_read() -> set[str]:
     """读取端：`memory/session.py` 的 retrieval_config 里那几个 namespace。
+
+    没配 retrieval_config 时返回**空集**（这是 2026-09-01 之后的正常状态：不检索跨会话
+    记忆），而不是抛异常 —— "跨会话是关着的"这件事由调用方断言，这里只负责提取。
 
     把 Python 的占位符名归一到 AgentCore 的写法（`{actor_id}` → `{actorId}`）——
     两边指的是同一个东西，只是一个是本地变量名、一个是服务端模板变量。
     """
+    if not _memory_retrieval_configured():
+        return set()
     src = _read(MEMORY_SESSION_PY)
     i = src.find("retrieval_config = {")
     if i < 0:
-        raise AssertionError(f"{MEMORY_SESSION_PY}: 找不到 retrieval_config")
+        raise AssertionError(
+            f"{MEMORY_SESSION_PY}: 配了 retrieval_config，但不是本提取器认识的 "
+            "`retrieval_config = {` 形态 —— 于是看不见它检索哪些 namespace，"
+            "也就无法核对写入端有没有人往那里写（宁可在这里失败，也不要静默放过）")
     end = src.index("\n    }", i)
     found = re.findall(r'f"(/[^"]+)"', src[i:end])
     if not found:
@@ -817,7 +1178,7 @@ def _memory_namespaces_read() -> set[str]:
 
 
 def test_agentcore_memory_parity() -> None:
-    """长期记忆：两条路径的 Memory 形状一致，且写入端与读取端的 namespace 对得上。"""
+    """会话记忆：两条路径的 Memory 形状一致；跨会话那三个开关同时关着。"""
     print("\ntest_agentcore_memory_parity")
     setup, oneclick = _memory_setup(), _memory_oneclick()
 
@@ -841,7 +1202,7 @@ def test_agentcore_memory_parity() -> None:
     _check("两条路径推导出同一个 runtime 环境变量键",
            key_setup == key_oneclick,
            f"方式 B → {key_setup}; 方式 A → {key_oneclick} —— "
-           "键不一致时 get_memory_session_manager() 返回 None，长期记忆**静默**失效")
+           "键不一致时 get_memory_session_manager() 返回 None，会话历史**静默**不落库")
     _check(f"消费方写死读的就是这个键（{key_setup}）",
            key_setup in _read(MEMORY_SESSION_PY),
            f"{MEMORY_SESSION_PY} 读的键和两条路径注入的键不是一个")
@@ -850,6 +1211,8 @@ def test_agentcore_memory_parity() -> None:
            "Memory 资源建了但没注入 id —— 这是最容易漏的一半，且症状与完全没做一模一样")
 
     # 写入端 ∩ 读取端：strategy 往哪写、session.py 就得从哪读。
+    # 现在两边都该是**空**的；这两条断言对"都空"和"都非空且对齐"同样成立，
+    # 所以日后真要恢复跨会话记忆时不用改它们。
     written = {ns for nss in oneclick["strategies"].values() for ns in nss}
     read = _memory_namespaces_read()
     _check("读取端的每个 namespace 都有 strategy 在往里写",
@@ -858,6 +1221,19 @@ def test_agentcore_memory_parity() -> None:
     _check("每个 strategy 写的 namespace 都有人读",
            not (written - read),
            f"这些 strategy 在抽取、但 session.py 从不检索它们（白花抽取成本）：{sorted(written - read)}")
+
+    # 2026-09-01 的产品决策本身：**跨会话记忆是关着的**。
+    # 上面两条只保证"写入端与读取端一致"，一致地打开也能过 —— 所以决策要单独钉一条。
+    # 如果哪天决定恢复跨会话记忆，这条断言就该在同一个 MR 里被显式改掉（连带
+    # RELEASE_TEST_CHECKLIST 的 §4.13 / §4.14 / §11.10 从「已废弃」改回去），
+    # 而不是让它悄悄变成"两边都开着也算过"。
+    _check("跨会话记忆两条路径都没有 strategy（产品决策：只保留会话内）",
+           not setup["strategies"] and not oneclick["strategies"],
+           f"方式 B: {sorted(setup['strategies'])}; 方式 A: {sorted(oneclick['strategies'])}")
+    _check("读取端也没配 retrieval_config（不做跨会话检索）",
+           not _memory_retrieval_configured(),
+           f"{MEMORY_SESSION_PY} 又配上了 retrieval_config —— "
+           "没有 strategy 的情况下这是每轮白发的检索请求，且**不会报错**")
 
 
 def _invite_template_oneclick() -> str:
@@ -916,6 +1292,56 @@ def test_first_login_handoff_parity() -> None:
            "少了任何一半，方式 B 的部署者就得自己去找另一半")
 
 
+def test_cur_dashboard_parity() -> None:
+    """客户自有 CUR 数据源（cost-agent MCP）：可选加装项，但**两条路径必须一样可选**。
+
+    这一条与 ⑤⑨ 同构（接线只有一份，在 `web-chat-core.ts` 里，两个栈都 import 它），
+    所以断言的是「没人把它抄回栈里」+「两条路径都提供了填参数的入口」+「两个桶的缓存
+    生命周期一致」。桶那条尤其容易漂：方式 B 的桶在 `notiops-backend-stack.ts`，方式 A
+    的在 `minimal-base-core.ts` —— 两份定义，没有任何一处 import 另一处。
+    漏了它的后果不是"功能没做"，而是缓存对象常年堆积（缓存 key 带日期，次日就再也不会
+    被读到，但对象不会自己消失）。
+
+    另钉一条**成对性**：URL 与函数 ARN 必须同时给。Function URL 里不含函数 ARN，而
+    `lambda:InvokeFunctionUrl` 只能按资源授权 —— 只填一半会部署出一个"看起来装好了、
+    每次调用 403"的数据源，而 403 只在 CloudTrail 里看得到。两条路径各自的拦法不同
+    （方式 A 是 CfnRule，在开栈前拦；方式 B 是 setup.sh 的前置校验），断言的是都拦。
+    """
+    print("\ntest_cur_dashboard_parity")
+    core = _read("infra/lib/constructs/web-chat-core.ts")
+    oneclick = _read(ONECLICK)
+    setup_sh = _read(SETUP_SH)
+
+    _check("接线只有一份（共享构件里建预热规则与授权）",
+           "CurDashWarmup" in core and "InvokeCostAgentMcp" in core,
+           "web-chat-core.ts 里找不到预热规则/授权 —— 它们被挪回某个栈了，"
+           "那就意味着另一条路径悄悄少了这项能力")
+    _check("没人把预热规则抄回一键模板",
+           "CurDashWarmup" not in oneclick,
+           "两处都建 = 每天预热两次（且方式 A 的物理名冲突会让栈回滚）")
+
+    for rel in ("infra/lib/notiops-backend-stack.ts", "infra/lib/constructs/minimal-base-core.ts"):
+        src = _read(rel)
+        _check(f"{os.path.basename(rel)} 有 cur-dash-cache 的过期规则",
+               "expire-cur-dash-cache-3d" in src and "cur-dash-cache/" in src,
+               "缓存 key 带日期、次日即失效，但对象不会自己消失 —— 不清理就是纯垃圾常年堆着")
+
+    _check("方式 A 提供了填 URL 与函数 ARN 的参数",
+           "CostAgentMcpUrl" in oneclick and "CostAgentFunctionArn" in oneclick,
+           "一键部署的客户只有参数页这一个入口；缺参数 = 这条路径上永远开不了这项能力")
+    _check("方式 A 在开栈前就拦住「只填一半」",
+           "CostAgentArnRequiredWithUrl" in oneclick,
+           "没有 CfnRule = 栈能建起来，但每次调用 403，客户只看到表格空着")
+    _check("方式 B 也拦住「只填一半」",
+           "COST_AGENT_FN_ARN" in setup_sh and "costAgentFunctionArn=" in setup_sh,
+           "setup.sh 没有前置校验/没把 ARN 传给 CDK —— 同一个 403，只是换条路踩")
+    _check("方式 B 把函数 ARN 也带给 agent 的执行角色",
+           "COST_AGENT_FN_ARN" in _read("scripts/deploy_agent.sh")
+           and "InvokeCostAgentMcp" in _read(SETUP_CDK),
+           "runtime 角色少了 lambda:InvokeFunctionUrl —— 仪表盘能看（BFF 有权限），"
+           "但聊天里问客户费用恒失败降级到 CE，症状是「数字口径莫名变了」")
+
+
 def main() -> int:
     print("=" * 72)
     print("方式 A（一键部署）与方式 B（setup.sh）的 web 功能一致性")
@@ -926,9 +1352,11 @@ def main() -> int:
         test_deploy_time_seeds_match()
         test_runtime_lifecycle_matches()
         test_web_notif_producer_parity()
+        test_im_webhook_parity()
         test_operator_app_enabled_everywhere()
         test_agentcore_memory_parity()
         test_first_login_handoff_parity()
+        test_cur_dashboard_parity()
     except AssertionError as e:
         # 提取器找不到目标 = 有人改了源码的形态。必须失败而不是静默通过 ——
         # 静默通过的断言比没有断言更糟：它让人以为这件事有人守着。

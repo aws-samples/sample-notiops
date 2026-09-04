@@ -426,7 +426,17 @@ def _invoke_bedrock(
     output = response.get("output", {})
     message = output.get("message", {})
     content_blocks = message.get("content", [])
-    content = content_blocks[0].get("text", "") if content_blocks else ""
+    # ⚠️ 取**第一个带 `text` 的块**，不是 `content[0]`。推理型模型（Grok 4.6、
+    # DeepSeek、GLM）在 Converse 下会把 `reasoningContent` 放在 content[0]，那个块
+    # **没有** `text` 键 —— 硬取 [0] 会拿到空串，表现为"模型什么都没回"（不报错、
+    # 不抛异常，下游只看到空内容然后走各自的 fallback，归因极难）。
+    # 2026-09-01 默认模型换成 Grok 4.6 时补上；对 Claude 行为完全不变（它的
+    # content[0] 就是 text 块）。
+    content = ""
+    for _blk in content_blocks:
+        if isinstance(_blk, dict) and "text" in _blk:
+            content = _blk.get("text") or ""
+            break
     stop_reason = response.get("stopReason", "")
     usage = response.get("usage", {})
 

@@ -19,7 +19,7 @@ import boto3
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 常量（与 agent/core.py 保持同步 — ADR 见 design.md）
+# 常量（与 agent/core.py 保持同步）
 # ---------------------------------------------------------------------------
 
 _MODEL_ID_SSM_PARAMETER = "/notiops/agent/model_id"

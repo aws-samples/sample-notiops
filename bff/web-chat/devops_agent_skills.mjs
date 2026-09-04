@@ -26,7 +26,49 @@ const SELF_AGENT_SPACE = (() => {
   const v = (process.env.DEVOPS_AGENT_SPACE_ID || "").trim();
   return v.startsWith("__") && v.endsWith("__") ? "" : v;
 })();
-const SELF_ACCOUNT = process.env.LOCKED_ACCOUNT_ID || process.env.AWS_ACCOUNT_ID || "";
+/**
+ * 部署账号 ID —— 回答「我自己是谁」。**异步解析 + 缓存。**
+ *
+ * 🔴 原来是 `const SELF_ACCOUNT = LOCKED_ACCOUNT_ID || AWS_ACCOUNT_ID || ""`，
+ *    两个都可能是空：
+ *
+ * ```
+ * LOCKED_ACCOUNT_ID   orgMode ? "" : <账号>   ← **多账号模式下就是空的**
+ *                     （它的语义是闸门「只允许这个账号」，解锁 = 留空）
+ * AWS_ACCOUNT_ID      不是 Lambda 的标准注入变量，CDK 里也没注入
+ * ```
+ *
+ * 空串的后果在 `resolveTarget()` 里：`id === SELF_ACCOUNT` 恒不成立，
+ * 于是**传部署账号自己的 ID 会走跨账号分支** —— 去 `da#<部署账号>` 拿
+ * `trigger_role_arn` 然后 assume 自己，还带上 `ExternalId`。
+ * 那个角色的信任策略里未必有 ExternalId 条件，所以可能直接失败：
+ * 「从 UI 选『本账号』发布 skill」在 org 模式下会报错。
+ *
+ * 现在的顺序：`DEPLOY_ACCOUNT_ID`（CDK 注入，恒有值）→ `LOCKED_ACCOUNT_ID`
+ * （存量部署）→ `AWS_ACCOUNT_ID` → **STS 兜底**。
+ *
+ * ⚠️ 与 `SELF_AGENT_SPACE` / `localAgentSpaceProbe()` **是两件事**：
+ *    这个回答「我是哪个账号」，那个回答「本账号有没有 Agent Space」。
+ *    2026-09-03 合并 main 时两边各修了其中一件 —— 都要留。
+ */
+let _selfAccountCache = null;
+async function selfAccount() {
+  if (_selfAccountCache !== null) return _selfAccountCache;
+  const fromEnv = (process.env.DEPLOY_ACCOUNT_ID
+    || process.env.LOCKED_ACCOUNT_ID
+    || process.env.AWS_ACCOUNT_ID || "").trim();
+  if (fromEnv) { _selfAccountCache = fromEnv; return fromEnv; }
+  try {
+    const { STSClient, GetCallerIdentityCommand } =
+      await import("@aws-sdk/client-sts");
+    const r = await new STSClient({}).send(new GetCallerIdentityCommand({}));
+    _selfAccountCache = String(r.Account || "");
+  } catch {
+    // 拿不到就留空串 —— 退化成「所有 id 都当跨账号」，与修复前一致（不更坏）
+    _selfAccountCache = "";
+  }
+  return _selfAccountCache;
+}
 const CONFIG_TABLE = process.env.CONFIG_TABLE || "notiops-config";
 // Asset API 里 skill 类别的 assetType。开放标准里就叫 "skill"；用 env 兜底以防服务改名。
 const SKILL_ASSET_TYPE = process.env.DA_SKILL_ASSET_TYPE || "skill";
@@ -180,7 +222,13 @@ export async function localAgentSpaceProbe() {
     const client = new DevOpsAgentClient({ region: REGION });
     const resp = await client.send(new ListAgentSpacesCommand({}));
     const spaces = resp.agentSpaces || [];
-    const preferred = SELF_ACCOUNT ? `notiops-devops-${SELF_ACCOUNT}` : "";
+    /* ⚠️ 走 `selfAccount()` 而不是原来的 `SELF_ACCOUNT` 常量（2026-09-03 合并
+       main 时改）—— 那个常量在**多账号模式下恒为空**（`LOCKED_ACCOUNT_ID`
+       的语义是「只允许这个账号」，解锁 = 留空），于是 `preferred` 恒为空、
+       首选名匹配这一步等于没做，只能拿 `spaces[0]`。
+       本函数已经是 async，加一次 await 没有额外成本（结果有缓存）。 */
+    const acct = await selfAccount();
+    const preferred = acct ? `notiops-devops-${acct}` : "";
     const chosen = (preferred && spaces.find((s) => s.name === preferred)) || spaces[0];
     _localSpace = chosen?.agentSpaceId || "";   // 列表拿到了就是确定结论（空列表=真没有）
     return { spaceId: _localSpace, inconclusive: false };
@@ -204,7 +252,8 @@ export async function localAgentSpaceId() {
 // 为了把按钮变灰去 assume 一个 15 分钟的跨账号会话完全没必要。
 export async function resolveTarget(accountId, opts = {}) {
   const id = String(accountId || "").trim();
-  if (!id || id === SELF_ACCOUNT) {
+  const self = await selfAccount();
+  if (!id || (self && id === self)) {
     const { spaceId, inconclusive } = await localAgentSpaceProbe();
     if (!spaceId) {
       // 分开两种失败：确定没有 → bad_request(400)；这次问不出来 → 当服务端错误(500)，
@@ -213,7 +262,7 @@ export async function resolveTarget(accountId, opts = {}) {
         ? new Error("agent_space_probe_failed")
         : Object.assign(new Error("no_local_agent_space"), { code: "bad_request" });
     }
-    return { agentSpaceId: spaceId, credentials: undefined, accountId: SELF_ACCOUNT, scope: "self" };
+    return { agentSpaceId: spaceId, credentials: undefined, accountId: self, scope: "self" };
   }
   const { DynamoDBClient } = await import("@aws-sdk/client-dynamodb");
   const { DynamoDBDocumentClient, GetCommand } = await import("@aws-sdk/lib-dynamodb");
@@ -339,7 +388,7 @@ export async function uploadSkillToDevopsAgent(skillId, { accountId = "", agentT
   }
   uploads[key] = {
     asset_id: assetId, agent_space_id: target.agentSpaceId,
-    scope: target.scope, account_id: target.accountId || SELF_ACCOUNT,
+    scope: target.scope, account_id: target.accountId || await selfAccount(),
     uploaded_version: skill.latest_version || "", uploaded_at: new Date().toISOString(),
     agent_types: finalAgentTypes,
   };
@@ -380,7 +429,7 @@ export async function listDevopsAgentTargets() {
   // env 缺失时也别把本账号漏掉 —— 账号里有 Agent Space 就该能选（见 localAgentSpaceId）。
   const selfSpace = await localAgentSpaceId();
   if (selfSpace) {
-    targets.push({ account_id: SELF_ACCOUNT || "self", agent_space_id: selfSpace, scope: "self", label: "本账号 (This account)" });
+    targets.push({ account_id: (await selfAccount()) || "self", agent_space_id: selfSpace, scope: "self", label: "本账号 (This account)" });
   }
   try {
     const { DynamoDBClient } = await import("@aws-sdk/client-dynamodb");
@@ -393,10 +442,14 @@ export async function listDevopsAgentTargets() {
     }));
     for (const it of r.Items || []) {
       if (it.onboarding_status !== "active" || !it.agent_space_id) continue;
-      // 已作为 self 列出的不重复。按 account_id 或 agent_space_id 任一命中即跳过——
-      // LOCKED_ACCOUNT_ID 未配置时 SELF_ACCOUNT 为空，只能靠 agent_space_id 去重，
-      // 否则本部署账号会既以 self 又以 cross-payer 出现（同一个 Agent Space）。
-      if (it.account_id === SELF_ACCOUNT) continue;
+      // 已作为 self 列出的不重复。按 account_id 或 agent_space_id **任一**命中即跳过。
+      //
+      // ⚠️ 两条都要留。`selfAccount()` 有 STS 兜底（2026-08-25 修）所以一般
+      //    拿得到账号 id，但它仍可能为空（STS 也失败）—— 那时只有
+      //    agent_space_id 这条能防住「本部署账号既以 self 又以 cross-payer
+      //    出现」（同一个 Agent Space 出现两次，客户不知道该选哪个）。
+      const _self = await selfAccount();
+      if (_self && it.account_id === _self) continue;
       if (selfSpace && it.agent_space_id === selfSpace) continue;
       targets.push({
         account_id: it.account_id, agent_space_id: it.agent_space_id,

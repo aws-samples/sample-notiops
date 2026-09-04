@@ -31,13 +31,18 @@ from core import ddb_state
 from core import i18n
 from core import support_logic
 from core.support_logic import (
-    DEFAULT_LANGUAGE, DEFAULT_SEVERITY,
+    DEFAULT_ISSUE_TYPE, DEFAULT_LANGUAGE, DEFAULT_SEVERITY,
+    ISSUE_TYPE_CODES,
     LANGUAGE_CODES, LANGUAGE_LABELS,
     SEVERITY_CODES,
     severity_label, severity_labels,
 )
 
 from platforms.slack.app import blocks
+# 「服务名称 / 案例类型」这一组控件由 case_flow 提供 —— 两个开案例面板共用一份，
+# 避免同一个操作从两个入口进去开出不同的案例。case_flow 不 import support_flow，
+# 无循环依赖。
+from platforms.slack.app import case_flow
 
 logger = logging.getLogger(__name__)
 PLATFORM = "slack"
@@ -160,6 +165,16 @@ def handle_view_submission(ack, body: dict, view: dict, client) -> None:
     contact = field("contact_block", "contact").strip()
     severity = select("severity_block", "severity_select") or DEFAULT_SEVERITY
     language = select("language_block", "language_select") or DEFAULT_LANGUAGE
+    # 服务名称 / 类别 / 案例类型 —— 与 `/case` 面板同一套取值规则（服务下拉优先、自由
+    # 文本兜底、留空就交给分类器；类别在最终那个服务名下反查）。三项都**不拦提交**。
+    service_text = case_flow.picked_service_code(
+        select("service_select_block", "service_select"),
+        field("service_block", "service_text"))
+    category_text = field("category_block", "category_text").strip()
+    issue_type = select("issue_type_block", "issue_type_select") \
+        or DEFAULT_ISSUE_TYPE
+    if issue_type not in ISSUE_TYPE_CODES:
+        issue_type = DEFAULT_ISSUE_TYPE
 
     pm_raw = view.get("private_metadata") or "{}"
     try:
@@ -225,18 +240,24 @@ def handle_view_submission(ack, body: dict, view: dict, client) -> None:
         target=_create_case_worker,
         args=(client, channel_id, thread_ts, ctx, incident_id,
               severity, language, extra, locale),
+        kwargs={"service_text": service_text, "issue_type": issue_type,
+                "category_text": category_text},
         daemon=True,
     ).start()
 
 
 def _create_case_worker(client, channel_id: str, thread_ts: str, ctx: dict,
                         incident_id: str, severity: str, language: str,
-                        extra: str, locale: str = "en") -> None:
+                        extra: str, locale: str = "en",
+                        service_text: str = "", issue_type: str = "",
+                        category_text: str = "") -> None:
     locale = _normalize_locale(locale)
     try:
         result = support_logic.create_case(
             ctx, platform=PLATFORM, severity=severity, language=language,
             extra=extra, operator_name="",
+            service_text=service_text, issue_type=issue_type,
+            category_text=category_text,
         )
         subject_for_display = support_logic.build_subject(ctx, PLATFORM)
         result_blocks = _result_blocks(result, severity, language,
@@ -299,6 +320,10 @@ def _build_form_view(*, incident_id: str, channel_id: str,
                 initial_value=initial_subject,
                 max_length=250,
             ),
+            # 服务名称 + 案例类型 —— 与 `/case` 面板**共用**同一份控件
+            # (`case_flow.service_and_type_blocks`)。这个面板当初漏了这两项，客户从
+            # 报告卡升级时只能靠分类器猜；共用一份也保证以后两个入口不会长歪。
+            *case_flow.service_and_type_blocks(locale),
             blocks.static_select(
                 i18n.t("support.form.severity_label_short", locale),
                 "severity_select",
@@ -356,9 +381,21 @@ def _result_blocks(result: support_logic.CaseResult, severity: str,
         classification_block = i18n.t(
             "case.create.classification_lines", locale,
             service=cls.get("serviceCode", ""),
-            category=cls.get("categoryCode", ""),
+            category=support_logic.category_display(cls, locale),
             issue_type=cls.get("issueType", ""),
         )
+    # 不静默降级：用户在面板里填的服务名没匹配上目录时，明说"改用了自动判断的服务"，
+    # 而不是让他以为开在了自己填的那个服务下（与 `/case` 面板的结果卡同一条口径）。
+    if cls.get("serviceUnmatched"):
+        classification_block += i18n.t(
+            "case.create.service_unmatched_line", locale,
+            text=blocks.escape_mrkdwn(str(cls["serviceUnmatched"])))
+    if cls.get("categoryUnmatched"):
+        classification_block += i18n.t(
+            "case.create.category_unmatched_line", locale,
+            text=blocks.escape_mrkdwn(str(cls["categoryUnmatched"])),
+            service=cls.get("serviceCode", ""),
+            category=cls.get("categoryCode", ""))
     subject_line = (i18n.t("support.success.subject_block_slack", locale,
                            subject=blocks.escape_mrkdwn(subject.strip()))
                     if subject and subject.strip() else "")

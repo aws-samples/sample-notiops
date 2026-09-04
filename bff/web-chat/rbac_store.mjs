@@ -66,7 +66,7 @@ export async function deleteRole(name) {
   await ddb.send(new DeleteCommand({ TableName: TABLE, Key: { PK: `role#${name}`, SK: "meta" } }));
 }
 
-/** seed 预置角色：仅当不存在时写入（幂等，需求 7.3）。返回被写入的角色名。 */
+/** seed 预置角色：仅当不存在时写入（幂等）。返回被写入的角色名。 */
 export async function seedRoleIfAbsent(name, permissions) {
   const existing = await getRole(name);
   if (existing) return null;

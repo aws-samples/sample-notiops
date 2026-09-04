@@ -53,7 +53,16 @@
 - ❌ **绕过 IAM**:你能调查的资源 = AWS DevOps Agent 角色能读的资源,bot 不会替你越权
 - ❌ **存储敏感信息超过 7 天**:聊天历史 DDB TTL 7 天自动清理,locale 偏好 90 天
 
-> 想了解为什么 bot 这么"保守"? 见 [TECHNICAL_DESIGN.md §4.2 三层防御](TECHNICAL_DESIGN.md#42-通用对话--三层防御-bedrock_chat)。
+> **这个"只读"是谁保证的(2026-09-03 起口径变了,请照新的看)**:IM 侧的问答是**直连
+> AWS DevOps Agent**、NotiOps 自己不过 LLM(所以 0 token),因此
+> **拒绝变更是由 DevOps Agent 侧 + 它使用的只读 IAM 角色保证的** —— 不再是"NotiOps 先用
+> 一次 LLM 判断你是不是想改东西"。NotiOps 侧只保留一条**正则二道门**
+> (`platforms/common/router.py`),用来拦明显的变更措辞与 prompt injection。
+> 两层叠起来的实际效果没变:**变更类请求依然到不了执行**。
+> 细节见 [TECHNICAL_DESIGN.md §5 安全设计](TECHNICAL_DESIGN.md#5-安全设计);
+> §4.2 那套"三层防御"描述的是 `core/bedrock_chat.py` —— 它只在已随 `BotStack` 退役的
+> ECS 长连接 app(回滚路径)上跑,**网页控制台与 IM 现网入口都不跑它**;两条入口各自
+> 的实际防线见同一份文档的 §5.3。
 
 ---
 
@@ -429,7 +438,7 @@ bot 支持的别名 = 管理员在模型目录里勾选的 IM 启用集(下表�
 |---|---|---|
 | `claude` | **Claude Sonnet 5** | **默认值**(模型目录 `default_model`)。内部测试中工具调用较稳、中英文都好;支持提示缓存 |
 | `grok` | **Grok 4.6** | Bedrock Converse;⚠️ 不支持显式提示缓存,长会话的 input 成本比 Claude 高 |
-| `nova` | **Amazon Nova Pro** | Bedrock Converse,单价约为 Claude Sonnet 的 1/4(据 Bedrock 公开定价,截至 2026-07),中文够用,合规白名单常见 |
+| `nova` | **Amazon Nova Pro** | Bedrock Converse,单价约为 Claude Sonnet 的 1/4(据 Bedrock 公开定价,截至 2026-07),中文够用,合规允许清单常见 |
 | `gpt` / `gpt_sol` / `gpt_luna` | **GPT-5.6** Terra / Sol / Luna(实验性)| 走 Bedrock Mantle Responses API,工具调用稳定性弱于上面两个,建议仅作尝鲜 |
 
 > ⚠️ **GPT-5.6 当前为实验性档位**。GPT 在 tool-use 场景下偶发把 OpenAI 内部协议片段或低质 token 输出到回复中。bot 已经叠了三层硬防护(token 预算、JSON 错误回喂、输出审计),即便如此仍建议默认使用 `claude` 或 `nova`,把 GPT 当作"我想试试 Open AI 模型"的尝鲜选项。
@@ -525,7 +534,9 @@ bot 决定每条消息回什么语言时,**按这个顺序找答案**:
 
 ### Q1: 我能让 bot 帮我重启某个 EC2 吗?
 
-**不能**。bot 是 read-only,产品级硬规则,不可绕过。详见 [TECHNICAL_DESIGN.md §5 安全设计](TECHNICAL_DESIGN.md#5-安全设计)。
+**不能**。bot 是 read-only,产品级硬规则,不可绕过 —— 由 AWS DevOps Agent 侧 + 它使用的
+只读 IAM 角色保证,NotiOps 侧再加一条正则二道门。详见
+[TECHNICAL_DESIGN.md §5 安全设计](TECHNICAL_DESIGN.md#5-安全设计)。
 
 变通:**问 bot 怎么重启**(教程式),它会教你 CLI 命令,你 review 后自己执行。
 
@@ -556,7 +567,7 @@ DDB TTL 自动清理,不需要人工干预。
 
 ### Q5: 我能不能把 bot 加到非生产群?
 
-可以,**强烈推荐先在测试群试用 1-2 周**。bot 默认全部 chat 都收,管理员可以用 `AllowedChatIds` 限白名单。
+可以,**强烈推荐先在测试群试用 1-2 周**。bot 默认全部 chat 都收,管理员可以用 `AllowedChatIds` 限允许清单。
 
 ### Q6: bot 回的内容是模型生成的吗?会不会胡编?
 
@@ -592,7 +603,7 @@ bot 在飞书 / Slack 上完整可用的功能,在钉钉上**当前处于分阶�
 | 模型切换(`@bot model claude/nova/gpt`) | ✅ |
 | 语言切换(`language zh/en` / 自然语) | ✅ |
 | 调查报告 markdown 回贴 | ✅(需要操作员在群里加自定义机器人,见 [DEPLOYMENT.md §3.3](DEPLOYMENT.md) 第 6 步)|
-| 零变更承诺(任何变更类请求都拒绝) | ✅ |
+| 零变更承诺(任何变更类请求都拒绝;由 DevOps Agent 侧 + 只读角色保证,NotiOps 侧正则二道门) | ✅ |
 
 ### 9.5.2 暂不可用(Phase 2 计划中)
 
@@ -687,7 +698,7 @@ bot 在飞书 / Slack 上完整可用的功能,在钉钉上**当前处于分阶�
 
 除了飞书 / Slack 里的 bot,NotiOps 还提供一个**网页版的 agentic AI 助手 —— Web Chat**。它在浏览器里打开,登录后即可用自然语言完成告警通知查看、故障调查、成本咨询、Support 案例创建与自建 Skills 调用。本节讲清楚**怎么操作、会看到什么**。
 
-> Web Chat 与 IM 端是两套并行的入口,共用后端的只读安全约束(严格只读、三层防御沿用后端)。它不是替代 IM bot,而是一个更适合"坐下来专注调查/建案"的网页工作台。
+> Web Chat 与 IM 端是两套并行的入口,**都严格只读**,但只读是**各自**保证的:Web Chat 靠只读 IAM 角色(硬边界)+ 工具层只读 + 命令级 denylist + 只读 system prompt;IM 端靠 DevOps Agent 侧的只读 agent + 只读角色,NotiOps 侧再加一条变更措辞正则(见上文「这个'只读'是谁保证的」)。它不是替代 IM bot,而是一个更适合"坐下来专注调查/建案"的网页工作台。
 
 ### 12.1 登录与整体布局
 
@@ -801,7 +812,7 @@ Web Chat 提供**两条建案路径,客户二选一**。两种方式都走**确�
 - **What's New**:查看 AWS 新发布内容。
 - **"/" 命令**:在输入框输入 `/` 会弹出命令菜单,列出**你全部的 Skill**(表头写着总条数,列表可滚动,不抽样也不截断),继续打字即按 id / 名称筛选;**↑ / ↓** 移动高亮、**Enter** 选中、**Esc** 关闭。菜单底部固定「管理 Skills」「新建 Skill」两个出口。选中后输入框会预填一句"使用 Skill「××」",可直接回车发送。
 - **Sources 面板**:透传工具调用与出处,便于你核验助手的依据。
-- **只读安全**:Web Chat 沿用后端的严格只读约束(三层防御),不会替你变更 AWS 环境。
+- **只读安全**:Web Chat 严格只读 —— 只读 IAM 角色(硬边界)+ 工具层只读 + 命令级 denylist(连 `get-secret-value` 这类「是只读但不该读」的都拦)+ 只读 system prompt;工单的建 / 回 / 关只产出预览,你确认后才执行。不会替你变更 AWS 环境。
 
 ### 12.9 使用须知(务必知晓)
 

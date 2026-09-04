@@ -11,9 +11,11 @@ Exits non-zero if any case fails.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
+import traceback
 import unittest.mock as mock
 
 # Make `core` importable when run from repo root.
@@ -48,6 +50,27 @@ class _CaseRunner:
             print(f"  {FAIL} {label}")
             if detail:
                 print(f"      {detail}")
+
+    def run_section(self, fn, *args) -> None:
+        """跑一个 section,并把「section 自己炸了」记成一条失败。
+
+        为什么必须这样:此前 main() 是直接 `test_x(t)` 顺序调用,任何一个
+        section 里的异常都会终止整个进程 —— 2026-09-01 的表现就是第 9 节
+        `bodies[0]` 吃到 IndexError(桩一次都没被调用),于是第 10..13 节
+        **一条都没跑**,汇总也没打出来。CI 只看到一个 traceback,看不到
+        「还有多少判据其实是绿的、又有多少同样红」,定位成本翻倍。
+
+        ⚠️ 这不是把断言变宽:异常照旧计为 failed → 退出码仍是 1。区别只在
+        「一条红」与「一条红 + 后面全部未知」。也**不**在 expect() 里吞异常,
+        那才会让「条件求值失败」变成静默的通过。
+        """
+        label = fn.__name__ + (f"{args}" if args else "")
+        try:
+            fn(self, *args)
+        except Exception:
+            self.failed += 1
+            print(f"  {FAIL} section {label} raised — 该 section 余下判据未执行")
+            traceback.print_exc()
 
     def summary(self) -> int:
         total = self.passed + self.failed
@@ -359,6 +382,23 @@ def test_injection_resistance(t: _CaseRunner) -> None:
 # ---------------------------------------------------------------------------
 # Helpers for fake Bedrock tool-use responses
 # ---------------------------------------------------------------------------
+# ⚠️ 这个 fake 必须**同时会说两种 wire protocol**,不能只桩 `invoke_model`。
+#
+# core/bedrock_chat.py 按 `model_kind` 分派:`bedrock_anthropic` 走
+# `invoke_model` + 手搓 Anthropic Messages body;`bedrock_converse` 走
+# `converse` + toolConfig/toolUse/toolResult。2026-09-01 目录默认模型从
+# Claude Sonnet 5 换成 Grok 4.6(kind=bedrock_converse)之后,只桩
+# `invoke_model` 的 fake **在默认路径上一次都不会被调用**。
+#
+# 静默失败的形态极具误导性:`_bedrock` 被换成 MagicMock,`converse()` 返回的
+# 还是 MagicMock,而 `resp.get("stopReason")` / `.get("output",{})` 在
+# MagicMock 上一路不抛异常,`for b in content` 又当空迭代 —— 于是产品代码
+# 一声不响地走完「模型没给文本」分支。测试看到的现象是「Bedrock 被调用 0 次」
+# 加 `bodies[0]` IndexError,读起来像产品不发请求了,实际产品发的是 converse。
+#
+# 所以 fake 按**被调用的方法**决定回什么形状,payload 用与协议无关的中间表示,
+# 抓到的请求也归一化成同一套 key。这样默认模型再换一次厂商,这里不用再改一遍;
+# 而这次的 bug 正是「换厂商 → 桩失配」。
 class _FakeBedrockBody:
     def __init__(self, payload: dict):
         self._raw = json.dumps(payload).encode("utf-8")
@@ -367,44 +407,193 @@ class _FakeBedrockBody:
         return self._raw
 
 
-def _fake_invoke(payloads: list[dict]):
-    """Return a fake bedrock-runtime client whose invoke_model() yields
-    `payloads` in order, one per call."""
-    iterator = iter(payloads)
-    captured_bodies: list[dict] = []
-
-    def invoke_model(*, modelId, contentType, accept, body):
-        captured_bodies.append(json.loads(body))
-        try:
-            payload = next(iterator)
-        except StopIteration:
-            raise AssertionError("fake bedrock invoked more times than expected")
-        return {"body": _FakeBedrockBody(payload)}
-
-    fake = mock.MagicMock()
-    fake.invoke_model.side_effect = invoke_model
-    return fake, captured_bodies
-
-
 def _tool_use_payload(tool_use_blocks: list[dict]) -> dict:
-    return {
-        "stop_reason": "tool_use",
-        "content": tool_use_blocks,
-    }
+    """「模型要求调工具」的协议无关 payload。
+
+    每个 block 取 `id` / `name` / `input` 三个键(历史写法里还带一个
+    `"type": "tool_use"`,保留兼容、忽略不用)。
+    """
+    return {"_stop": "tool_use", "_tool_uses": list(tool_use_blocks)}
 
 
 def _final_text_payload(text: str) -> dict:
+    """「模型给出最终文本」的协议无关 payload。"""
+    return {"_stop": "end_turn", "_text": text}
+
+
+def _error_payload(exc: Exception) -> dict:
+    """「这一次调用直接抛」的协议无关 payload。
+
+    循环**中途**单次调用失败(节流 / 超时)是比撞迭代上限常见得多的触发路径,
+    而它同样让工具循环带着 tool_calls 回一个空文本。没有这个 payload 就没法在
+    两条协议上各测一遍那条路径 —— 只能测到「跑满预算」这一种,而那是最罕见的。
+    """
+    return {"_raise": exc}
+
+
+def _render_anthropic(spec: dict) -> dict:
+    """协议无关 payload → Anthropic Messages 响应体。"""
+    if spec.get("_stop") == "tool_use":
+        return {
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use",
+                         "id": b.get("id", ""),
+                         "name": b.get("name", ""),
+                         "input": b.get("input", {})}
+                        for b in spec.get("_tool_uses", [])],
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
     return {
-        "stop_reason": "end_turn",
-        "content": [{"type": "text", "text": text}],
+        "stop_reason": spec.get("_stop", "end_turn"),
+        "content": [{"type": "text", "text": spec.get("_text", "")}],
+        "usage": {"input_tokens": 0, "output_tokens": 0},
     }
+
+
+def _render_converse(spec: dict) -> dict:
+    """协议无关 payload → Bedrock Converse 响应体。"""
+    if spec.get("_stop") == "tool_use":
+        content = [{"toolUse": {"toolUseId": b.get("id", ""),
+                                "name": b.get("name", ""),
+                                "input": b.get("input", {})}}
+                   for b in spec.get("_tool_uses", [])]
+    else:
+        content = [{"text": spec.get("_text", "")}]
+    return {
+        "stopReason": spec.get("_stop", "end_turn"),
+        "output": {"message": {"role": "assistant", "content": content}},
+        "usage": {"inputTokens": 0, "outputTokens": 0},
+    }
+
+
+def _neutral_blocks(content) -> list[dict]:
+    """请求里的 content → 协议无关 block 列表。
+
+    统一成 Anthropic 那套 key(`type` / `tool_use_id` / `is_error`),因为断言
+    早就是按那套写的;Converse 的 `toolUse` / `toolResult` / `{"text": …}`
+    在这里翻译过去。纯字符串 content(Anthropic 首轮 user)也包成单块列表,
+    这样「取最后一条消息的 content 块」在两条协议下写法一致。
+    """
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    blocks: list[dict] = []
+    for b in content or []:
+        if not isinstance(b, dict):
+            continue
+        if "toolUse" in b:
+            tu = b.get("toolUse") or {}
+            blocks.append({"type": "tool_use",
+                           "id": tu.get("toolUseId", ""),
+                           "name": tu.get("name", ""),
+                           "input": tu.get("input", {})})
+        elif "toolResult" in b:
+            tr = b.get("toolResult") or {}
+            blocks.append({"type": "tool_result",
+                           "tool_use_id": tr.get("toolUseId", ""),
+                           "content": tr.get("content", []),
+                           # Converse 用 status="error" 表达 Anthropic 的
+                           # is_error=True,归一化到后者。
+                           "is_error": tr.get("status") == "error"})
+        elif "type" not in b and "text" in b:
+            blocks.append({"type": "text", "text": b.get("text", "")})
+        else:
+            blocks.append(b)
+    return blocks
+
+
+def _normalized_request(protocol: str, messages, tools) -> dict:
+    """两条协议的请求 → 同一套断言用的记录。
+
+    `tools` 键**只在真的挂了工具时才存在**:Anthropic body 恒带
+    `"tools": tools`(可能是空列表),Converse 则是
+    `toolConfig=None`。判据关心的是「这一次调用有没有把工具交给模型」,
+    所以空列表按「没挂」归一化 —— 否则 [13] 的 `"tools" not in bodies[0]`
+    在 Anthropic 路径上永远假红。
+    """
+    rec = {
+        "protocol": protocol,
+        "messages": [{"role": m.get("role", ""),
+                      "content": _neutral_blocks(m.get("content"))}
+                     for m in (messages or [])],
+    }
+    if tools:
+        rec["tools"] = list(tools)
+    return rec
+
+
+def _fake_invoke(payloads: list[dict]):
+    """Fake bedrock-runtime client,两种协议都接。
+
+    `payloads` 由 `_tool_use_payload` / `_final_text_payload` 生成,按顺序
+    一次调用消费一个,按**实际被调用的方法**渲染成对应线格式。
+
+    返回 `(client, bodies)`;`bodies` 是归一化后的请求记录(见
+    `_normalized_request`),因此判据在 Anthropic / Converse 两条路径上是同一份。
+    """
+    iterator = iter(payloads)
+    captured_bodies: list[dict] = []
+
+    def _next_spec() -> dict:
+        try:
+            spec = next(iterator)
+        except StopIteration:
+            raise AssertionError("fake bedrock invoked more times than expected")
+        # `_error_payload` 生成的那种:这一次调用直接抛(节流 / 超时)。
+        if spec.get("_raise") is not None:
+            raise spec["_raise"]
+        return spec
+
+    def invoke_model(*, modelId, contentType, accept, body):
+        raw = json.loads(body)
+        captured_bodies.append(
+            _normalized_request("anthropic", raw.get("messages"),
+                                raw.get("tools")))
+        return {"body": _FakeBedrockBody(_render_anthropic(_next_spec()))}
+
+    def converse(*, modelId, system, messages, inferenceConfig,
+                 toolConfig=None):
+        # Converse 的 toolSpec 反向摊平成 {"name", "description",
+        # "input_schema"},让 `[tool["name"] for tool in bodies[0]["tools"]]`
+        # 这类判据两条协议共用。
+        tools = [
+            {"name": (spec.get("toolSpec") or {}).get("name", ""),
+             "description": (spec.get("toolSpec") or {}).get("description", ""),
+             "input_schema": ((spec.get("toolSpec") or {})
+                              .get("inputSchema") or {}).get("json", {})}
+            for spec in ((toolConfig or {}).get("tools") or [])
+        ]
+        captured_bodies.append(
+            _normalized_request("converse", messages, tools))
+        return _render_converse(_next_spec())
+
+    fake = mock.MagicMock()
+    fake.invoke_model.side_effect = invoke_model
+    fake.converse.side_effect = converse
+    return fake, captured_bodies
+
+
+@contextlib.contextmanager
+def _pinned_model(kind: str):
+    """把本次 respond() 用的模型钉在指定 `kind` 上。
+
+    默认模型只有一个 kind(今天是 Converse),但另一条分派分支
+    (`bedrock_anthropic`,Claude / Opus 仍可被 `@bot model claude` 选中)
+    在生产上一样活着。不显式钉一遍,它就会随「谁是默认模型」这件事悄悄脱测 ——
+    这次的红就是反例:Claude 让位给 Grok 之后,Anthropic 那条 body 的判据
+    看着还在,实际再没人跑过。
+    """
+    entry = next(e for e in bedrock_chat._model_catalog.all_entries()
+                 if e.kind == kind)
+    with mock.patch.object(bedrock_chat._model_catalog, "get",
+                           return_value=entry):
+        yield entry
 
 
 # ---------------------------------------------------------------------------
 # 9. Tool-use loop: single tool call → final answer
 # ---------------------------------------------------------------------------
-def test_tool_use_single(t: _CaseRunner) -> None:
-    print("\n[9] Tool-use loop: single search → final answer")
+def test_tool_use_single(t: _CaseRunner, kind: str) -> None:
+    print(f"\n[9] Tool-use loop: single search → final answer ({kind})")
 
     fake_search_hits = {
         "hits": [{
@@ -425,13 +614,19 @@ def test_tool_use_single(t: _CaseRunner) -> None:
         _final_text_payload("Lambda 默认账户级并发是 1000。"),
     ]
     fake_bedrock, bodies = _fake_invoke(payloads)
-    with mock.patch.object(bedrock_chat, "_bedrock", fake_bedrock), \
+    with _pinned_model(kind), \
+         mock.patch.object(bedrock_chat, "_bedrock", fake_bedrock), \
          mock.patch.object(bedrock_chat._aws_docs_mcp, "search_documentation",
                            return_value=fake_search_hits):
         reply = bedrock_chat.respond("Lambda 最大并发是多少",
                                      command="general_qa", locale="zh")
 
-    t.expect("calls Bedrock 2 times (tool_use + final)", len(bodies) == 2)
+    t.expect("calls Bedrock 2 times (tool_use + final)", len(bodies) == 2,
+             f"bodies={len(bodies)}")
+    if len(bodies) != 2:
+        # 0 次调用曾经在这里以 IndexError 收场,把后面 4 个 section 一起带走。
+        # 判据照旧算红(上一条已经计入),只是不再拿 traceback 掩盖其余判据。
+        return
     t.expect("first call includes tools list", "tools" in bodies[0])
     t.expect("second call includes assistant tool_use + tool_result",
              len(bodies[1]["messages"]) == 3)
@@ -487,10 +682,27 @@ def test_tool_use_multi(t: _CaseRunner) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 11. Tool-use loop: max iterations exhausted → falls back to P1 RAG
+# 11. 迭代预算用尽 **且收尾轮也失败** → 裸 invoke,且**不许**盖来源 / 工具章
 # ---------------------------------------------------------------------------
+# ⚠️ 这一节此前叫「max-iter exhausted → P1 RAG fallback」,两处都不对,而且第二处
+#    把缺陷当成了正确行为锁住:
+#
+#      · P1 **压根没跑**。`respond()` 的 P1 分支条件是 `not reply and not tool_calls`,
+#        这里 tool_calls 非空(工具真调过),所以直接短路 —— 桩住的是 `_invoke`,
+#        跑到的也是 `_invoke`,一次「不带任何工具结果」的裸调用。
+#      · 唯一的内容判据是「`P1 fallback answer` 在 reply 里」,而当时那段 reply 长这样:
+#
+#            P1 fallback answer
+#            📚 来源:• x — https://docs.aws.amazon.com/x.html
+#            🔧 调用的 MCP 工具(AWS Knowledge MCP):• aws_docs_search · query="x"
+#
+#        一段什么都没读的回答,盖着 AWS 官方文档的章 —— 正是 [11b] 声明要防的那件事。
+#        两节判据互相矛盾:真把 `respond()` 修对,[11] 反而会红。
+#
+#    所以本节改成守**同一个不变量的另一半**:收尾轮也失败时,答案照出(有答案比没有
+#    好),但 `📚 来源` / `🔧 调用的 MCP 工具` 必须一起消失,并如实补一句没核对过文档。
 def test_tool_use_max_iter(t: _CaseRunner) -> None:
-    print("\n[11] Tool-use loop: max-iter exhausted → P1 RAG fallback")
+    print("\n[11] 预算用尽 + 收尾轮失败 → 裸 invoke 不许盖来源")
 
     # Always returns tool_use → never terminates → loop exhausts.
     looping_payloads = [
@@ -508,13 +720,140 @@ def test_tool_use_max_iter(t: _CaseRunner) -> None:
                                "https://docs.aws.amazon.com/x.html",
                                "snippet": "y", "source": "docs"}]}), \
          mock.patch.object(bedrock_chat, "_invoke",
-                           return_value="P1 fallback answer"):
-        reply = bedrock_chat.respond("ALB 区别", command="general_qa")
+                           return_value="UNGROUNDED-PLAIN-INVOKE"):
+        reply = bedrock_chat.respond("ALB 区别", command="general_qa",
+                                     locale="zh")
 
+    # MAX + 1:预算内的 MAX 轮,再加一次「强制收尾轮」。这里只喂了 MAX 个
+    # payload,所以收尾轮那次调用被 fake 拒绝(请求已记账)→ 产品按「收尾轮失败」
+    # 处理 → 落到被桩住的 `_invoke`。测的是收尾轮**发生了**且失败不炸。
     t.expect("Bedrock invoked exactly _MAX_TOOL_ITERATIONS times in tool loop",
-             len(bodies) == bedrock_chat._MAX_TOOL_ITERATIONS + 1)
-    t.expect("P1 fallback answer reached user",
-             "P1 fallback answer" in reply)
+             len(bodies) == bedrock_chat._MAX_TOOL_ITERATIONS + 1,
+             f"bodies={len(bodies)}")
+    # 有答案比没答案好 —— 裸 invoke 的产物照样交付。
+    t.expect("plain-invoke answer still reaches the user",
+             "UNGROUNDED-PLAIN-INVOKE" in reply)
+    # 🔴 但它没读过任何东西,所以两块出处必须一起消失。这三条是 2026-09-04 那次
+    #    修复的回归闸门:少任何一条,「凭记忆答 + 官方文档来源」就能原样回来。
+    t.expect("no 📚 来源 on an answer that read nothing",
+             "📚" not in reply, reply[:400])
+    t.expect("no 🔧 工具清单 on an answer that read nothing",
+             "🔧" not in reply, reply[:400])
+    # ⚠️ 静默清掉不算修好:「没有来源」与「有来源但没显示」对读者是两件事。
+    t.expect("the reply says out loud that it was not checked against the docs",
+             "未经文档核对" in reply, reply[:400])
+
+
+# ---------------------------------------------------------------------------
+# 11b. 迭代预算用尽 → 强制收尾轮成功 → 回答必须来自工具结果
+# ---------------------------------------------------------------------------
+# 为什么单独一节:[11] 只证明「收尾轮被发起过」,没有证明它的**产物**会到用户
+# 手里。这条判据锁的是 2026-09-01 修掉的那个归因缺陷 —— Converse 循环撞到
+# 迭代上限时曾直接 return "",于是 `respond()` 掉到不带任何工具结果的 plain
+# `_invoke`,一段没看过文档的回答却盖着 `📚 来源` 的章。
+def test_tool_use_max_iter_summary(t: _CaseRunner, kind: str) -> None:
+    print(f"\n[11b] Tool-use loop: cap exhausted → forced summary ({kind})")
+
+    payloads = [
+        _tool_use_payload([{"type": "tool_use", "id": f"t{i}",
+                            "name": "aws_docs_search",
+                            "input": {"query": "x"}}])
+        for i in range(bedrock_chat._MAX_TOOL_ITERATIONS)
+    ]
+    # 第 MAX+1 次调用 = 强制收尾轮,这次给它一段最终文本。
+    payloads.append(_final_text_payload("按工具结果收尾:ALB 七层 / NLB 四层。"))
+
+    fake_bedrock, bodies = _fake_invoke(payloads)
+    with _pinned_model(kind), \
+         mock.patch.object(bedrock_chat, "_bedrock", fake_bedrock), \
+         mock.patch.object(bedrock_chat._aws_docs_mcp, "search_documentation",
+                           return_value={"hits": [{"title": "x", "url":
+                               "https://docs.aws.amazon.com/x.html",
+                               "snippet": "y", "source": "docs"}]}), \
+         mock.patch.object(bedrock_chat, "_invoke",
+                           return_value="UNGROUNDED-PLAIN-INVOKE"):
+        reply = bedrock_chat.respond("ALB 区别", command="general_qa",
+                                     locale="zh")
+
+    t.expect("cap + forced summary = _MAX_TOOL_ITERATIONS + 1 calls",
+             len(bodies) == bedrock_chat._MAX_TOOL_ITERATIONS + 1,
+             f"bodies={len(bodies)}")
+    # 收尾轮的请求形状按协议分开判 —— 两条协议对「合法请求」的定义本身不同,
+    # 用一条共用判据就必然有一边是错的(见 `_invoke_with_tools_converse` 末尾)。
+    last = bodies[-1] if bodies else {}
+    last_msgs = last.get("messages") or []
+    if kind == "bedrock_anthropic":
+        # Anthropic:抽掉 tools 才能逼出最终答案,协议也允许 history 里留着
+        # tool_use / tool_result 而不带 tools。
+        t.expect("anthropic summary turn attaches NO tools",
+                 "tools" not in last)
+    else:
+        # Converse:history 里还有 toolUse / toolResult,抽掉 toolConfig 会被判
+        # ValidationException,收尾轮因此**必须**继续挂工具;「别再要工具」由
+        # nudge 文案负责。这条判据锁的是形状合法性,不是「工具越少越好」。
+        t.expect("converse summary turn keeps toolConfig (否则请求被 API 拒)",
+                 "tools" in last)
+        # 相邻两条 user 会被 Converse 拒掉,而 fake 客户端不校验形状 —— 不显式
+        # 判一遍,「本地绿、现网 400、except 吞成空串」这条路会原样回来。
+        t.expect("converse roles strictly alternate (无相邻同角色)",
+                 all(a.get("role") != b.get("role")
+                     for a, b in zip(last_msgs, last_msgs[1:])),
+                 " ".join(m.get("role", "?") for m in last_msgs))
+    # 共通:nudge 必须真的出现在最后那条 user 里(并进去也算,新开一轮也算),
+    # 否则模型压根没被要求收尾,「收尾轮」只是多打了一次空转的调用。
+    t.expect("forced-summary nudge reached the model",
+             any(b.get("type") == "text"
+                 and bedrock_chat._FORCED_SUMMARY_NUDGE in (b.get("text") or "")
+                 for b in (last_msgs[-1].get("content") if last_msgs else [])
+                 or []))
+    t.expect("summary answer reached user", "按工具结果收尾" in reply)
+    t.expect("ungrounded plain invoke NOT used",
+             "UNGROUNDED-PLAIN-INVOKE" not in reply)
+    t.expect("citations accompany a tool-grounded answer", "📚 来源" in reply)
+
+
+# ---------------------------------------------------------------------------
+# 11c. 循环**中途**单次调用失败 → 同样不许盖来源
+# ---------------------------------------------------------------------------
+# ⚠️ 为什么不能只有 [11]:[11] 测的是「跑满 MAX 轮预算」,那是最罕见的触发路径。
+#    真正常见的是**中途一次节流 / 超时**:第一次工具调用成功、`tool_calls` 已经
+#    攒了一条,第二次调用抛 → 工具循环带着非空 tool_calls 返回空文本 → `respond()`
+#    落到裸 `_invoke`。这条路径与 [11] 走的是产品里**不同的 return 点**,所以只修
+#    /只测其中一处,另一处会原样把「凭记忆答 + 官方文档来源」发出去。
+#    两条协议各跑一遍:两个工具循环是两份独立实现,各有自己的 except 与 return。
+def test_tool_use_midloop_failure(t: _CaseRunner, kind: str) -> None:
+    print(f"\n[11c] 循环中途调用失败 → 裸 invoke 不许盖来源 ({kind})")
+
+    payloads = [
+        # 第一轮:真调一次工具(于是 citations / tool_calls 都非空)。
+        _tool_use_payload([{"type": "tool_use", "id": "t0",
+                            "name": "aws_docs_search",
+                            "input": {"query": "x"}}]),
+        # 第二轮:节流。产品应当记一次模型失败并带着已有 tool_calls 返回空文本。
+        _error_payload(RuntimeError("ThrottlingException: slow down")),
+    ]
+    fake_bedrock, bodies = _fake_invoke(payloads)
+    with _pinned_model(kind), \
+         mock.patch.object(bedrock_chat, "_bedrock", fake_bedrock), \
+         mock.patch.object(bedrock_chat._aws_docs_mcp, "search_documentation",
+                           return_value={"hits": [{"title": "x", "url":
+                               "https://docs.aws.amazon.com/x.html",
+                               "snippet": "y", "source": "docs"}]}), \
+         mock.patch.object(bedrock_chat, "_invoke",
+                           return_value="UNGROUNDED-PLAIN-INVOKE"):
+        reply = bedrock_chat.respond("ALB 区别", command="general_qa",
+                                     locale="zh")
+
+    t.expect("the loop stopped at the failing call (2 requests)",
+             len(bodies) == 2, f"bodies={len(bodies)}")
+    t.expect("plain-invoke answer still reaches the user",
+             "UNGROUNDED-PLAIN-INVOKE" in reply)
+    t.expect("no 📚 来源 after a mid-loop failure",
+             "📚" not in reply, reply[:400])
+    t.expect("no 🔧 工具清单 after a mid-loop failure",
+             "🔧" not in reply, reply[:400])
+    t.expect("the reply says out loud that it was not checked against the docs",
+             "未经文档核对" in reply, reply[:400])
 
 
 # ---------------------------------------------------------------------------
@@ -823,19 +1162,29 @@ def test_tier2_multi_tool_accumulate(t: _CaseRunner) -> None:
 # ---------------------------------------------------------------------------
 def main() -> int:
     t = _CaseRunner()
-    test_url_allowlist(t)
-    test_search_parsing(t)
-    test_failure_paths(t)
-    test_skip_heuristic(t)
-    test_citation_render(t)
-    test_respond_e2e(t)
-    test_mode_gates(t)
-    test_injection_resistance(t)
-    test_tool_use_single(t)
-    test_tool_use_multi(t)
-    test_tool_use_max_iter(t)
-    test_tool_use_tool_error(t)
-    test_mode_gates_p2(t)
+    # 每个 section 都经 run_section:一个 section 炸掉只算它自己红,
+    # 后面的照跑(见 `_CaseRunner.run_section` 的注释)。
+    t.run_section(test_url_allowlist)
+    t.run_section(test_search_parsing)
+    t.run_section(test_failure_paths)
+    t.run_section(test_skip_heuristic)
+    t.run_section(test_citation_render)
+    t.run_section(test_respond_e2e)
+    t.run_section(test_mode_gates)
+    t.run_section(test_injection_resistance)
+    # 工具循环两条 wire protocol 各跑一遍。目录默认模型(今天 Grok 4.6)
+    # 是 Converse,Claude / Opus 仍走 Anthropic Messages —— 只测默认那条,
+    # 另一条就会在下一次换默认模型时无声脱测。
+    t.run_section(test_tool_use_single, "bedrock_converse")
+    t.run_section(test_tool_use_single, "bedrock_anthropic")
+    t.run_section(test_tool_use_multi)
+    t.run_section(test_tool_use_max_iter)
+    t.run_section(test_tool_use_max_iter_summary, "bedrock_converse")
+    t.run_section(test_tool_use_max_iter_summary, "bedrock_anthropic")
+    t.run_section(test_tool_use_midloop_failure, "bedrock_converse")
+    t.run_section(test_tool_use_midloop_failure, "bedrock_anthropic")
+    t.run_section(test_tool_use_tool_error)
+    t.run_section(test_mode_gates_p2)
     return t.summary()
 
 

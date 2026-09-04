@@ -18,6 +18,7 @@ from shared.queries.waste_report import (
 from shared.queries.metrics import get_monitoring_history, get_latest_monitoring_date
 from shared.queries.whitelist import load_whitelist_set
 from api.routes._export_util import csv_safe_row
+from api.errors import NotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -106,11 +107,11 @@ def _get_detail(account_id: str, instance_id: str, query_params: dict) -> dict:
     """闲置实例详情（含关联监控数据）。按全键点查。"""
     report_date = query_params.get("report_date") or get_latest_waste_date()
     if not report_date:
-        raise KeyError(f"Waste report for {account_id}/{instance_id} not found")
+        raise NotFoundError(f"Waste report for {account_id}/{instance_id} not found")
 
     report = get_waste_report(account_id, report_date, instance_id)
     if not report:
-        raise KeyError(f"Waste report for {account_id}/{instance_id} not found")
+        raise NotFoundError(f"Waste report for {account_id}/{instance_id} not found")
 
     # 查询关联的监控数据（最近 7 天）
     rt = report.get("resource_type", "rds")

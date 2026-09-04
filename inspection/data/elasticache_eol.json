@@ -1,0 +1,34 @@
+{
+  "_note": "ElastiCache 引擎大版本的支持窗口。ElastiCache 没有等价于 rds:DescribeDBMajorEngineVersions 的 API —— CacheEngineVersion shape 只有 5 个字段且无任何生命周期信息（已核对 botocore 1.43.19 的 elasticache/2015-02-02 模型）。因此这是本 feature 里唯一需要人工维护的参考表。",
+  "_ops": "⚠️ 每季度人工核对（R2.4b.4）。核对方法：打开下面 sources 里的两个页面，比对表格是否新增大版本或改期。改完更新 asOf。过期不会导致误报，只会导致漏报（rules.check_engine_eol 查不到就跳过）。",
+  "asOf": "2026-08-17",
+  "sources": {
+    "extended_support": "https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/extended-support-versions.html",
+    "engine_versions": "https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/engine-versions.html"
+  },
+  "engines": {
+    "redis": {
+      "3": {
+        "standard_support_end": "2023-07-31",
+        "extended_support_end": null,
+        "_note": "已 EOL，无 Extended Support。推荐升级目标 6.2+"
+      },
+      "4": {
+        "standard_support_end": "2026-01-31",
+        "extended_support_end": "2029-01-31"
+      },
+      "5": {
+        "standard_support_end": "2026-01-31",
+        "extended_support_end": "2029-01-31",
+        "_note": "5.0.0~5.0.5 已废弃，须用 5.0.6+"
+      },
+      "6": {
+        "standard_support_end": "2027-01-31",
+        "extended_support_end": "2030-01-31"
+      }
+    },
+    "valkey": {},
+    "memcached": {}
+  },
+  "_unannounced": "redis 7.x、valkey 全系、memcached 全系截至 asOf 未公布 EOL 日期。空对象 = 未公布，不是漏填 —— 规则查不到即跳过，不得猜日期。"
+}

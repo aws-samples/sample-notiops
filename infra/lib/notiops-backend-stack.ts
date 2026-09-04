@@ -27,7 +27,10 @@ import * as subscriptions from "aws-cdk-lib/aws-sns-subscriptions";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
+import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
 import * as sqs from "aws-cdk-lib/aws-sqs";
+import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
+import * as cwActions from "aws-cdk-lib/aws-cloudwatch-actions";
 import * as cr from "aws-cdk-lib/custom-resources";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as ssm from "aws-cdk-lib/aws-ssm";
@@ -55,6 +58,14 @@ export class NotiOpsBackendStack extends cdk.Stack {
   // 暴露给 WebChatStack：FinOps 仪表盘跨账号成本查询用它调
   // devops-agent:ListAssociations 动态发现关联账号（见 bff/web-chat/devops_agent_accounts.mjs）。
   public readonly agentSpaceId: string;
+  // 资源巡检专用 Agent Space（与上面那个隔离，见 spec R12.5c）。
+  // 隔离的三个理由：并发配额是 per space（批量派发会占满 3 个位、拖慢客户的交互式深度调查）；
+  // skill 是 per space（巡检 skill 不该被排障调查误加载）；
+  // 事件里的 agent_space_id 直接成为「这是巡检」的分流判据。
+  // ⚠️ 与 `agentSpaceId` 是**两个独立标量**，SHALL NOT 合成 list —— 后者有 20+ 个
+  // 标量读取点（shared/devops_agent.py · core/ · devops_agent_callback/ ·
+  // shared/report_delivery/ · 前端），改多值等于重写整条排障链路。
+  public readonly inspectionAgentSpaceId: string;
   // 暴露给 WebChatStack：idle 控制台前端 CloudFront 地址，供 web chat 侧栏「巡检&报告」外链跳转。
   public readonly consoleUrl: string;
 
@@ -70,6 +81,25 @@ export class NotiOpsBackendStack extends cdk.Stack {
     // 未设置时保持 v1 单账号锁定行为，完全向后兼容。
     const organizationId = (this.node.tryGetContext("organizationId") as string | undefined)?.trim() || "";
     const orgMode = organizationId.length > 0;
+
+    /**
+     * 巡检判读的语言。**巡检 space 的 `locale` 与 executor 的
+     * `INSPECTION_REPORT_LOCALE` 共用这一个值** —— 两处各写一遍
+     * `tryGetContext` 会漂移，那时 space 说英文、payload 说中文，
+     * 而判读听哪个不确定。
+     *
+     * ⚠️ 取值格式实测确认 `"zh"` 可用（`UpdateAgentSpace` 接受）。
+     * 换英文用 `-c inspectionReportLocale=en`（`setup.sh` 读
+     * `$INSPECTION_REPORT_LOCALE` 转成这个 context）。
+     *
+     * ⚠️ 这是**全局**的，刻意不做 per-account / per-查看者：
+     * 判读一条只生成一次、多处复用（推给多个 IM 群 + Web 看板），
+     * 按查看者变就得为同一条 finding 生成 N 份判读 —— N 倍 LLM 额度。
+     * 推送**外壳**的语言是另一层，由 `ChatTarget.locale` 决定。
+     */
+    const inspectionReportLocale =
+      (this.node.tryGetContext("inspectionReportLocale") as string | undefined)
+      ?? "zh";
 
     // ─── DynamoDB Tables ───
 
@@ -90,6 +120,65 @@ export class NotiOpsBackendStack extends cdk.Stack {
       timeToLiveAttribute: "ttl",
     });
     metricsTable.addGlobalSecondaryIndex({
+      indexName: "GSI1",
+      partitionKey: { name: "GSI1PK", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "GSI1SK", type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    // ─── 资源巡检表 ───────────────────────────────
+    // 单独建表而非复用 notiops-metrics：后者已列入删除计划，且序列库有自己的
+    // TTL 策略（data_date + 35 天，**不等于**窗口长度 7 天）。混在一张表里
+    // 会让删除动作互相牵制。
+    //
+    // 七个 PK 前缀共用这一张表，靠「互不为前缀」区分：
+    //   inspseries# · insprun# · inspfind# · inspscope# · insptarget# ·
+    //   inspchat# · cfgver#     （唯一来源是 inspection/adapters/keys.py 的 Prefix 枚举）
+    // ⚠️ 它们安全的原因是**公共词根 insp 后不接分隔符**（inspseries# 而非
+    //    insp#series#）。要分子空间时另起平级前缀（inspdispatch#），
+    //    SHALL NOT 嵌套成 inspfind#dispatch# —— 那会让
+    //    begins_with("inspfind#") 把它一起扫出来。
+    //    keys.assert_prefixes_disjoint() 把这条固化成测试（R14.1b）。
+    const inspectionTable = new dynamodb.Table(this, "InspectionTable", {
+      tableName: "notiops-inspection",
+      partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "SK", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      // ⚠️ RETAIN 而非 DESTROY：finding 的状态机跨天累积
+      // （first_seen_date / consecutive_misses / was_confirmed）。
+      // 删表重建会让全部历史 finding 以 new 重新冒出一遍，客户看到
+      // 「今天新增 200 项风险」，而 R6.5 的「已持续 N 天」全部归 1。
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      timeToLiveAttribute: "ttl",
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+    });
+    // ─── GSI1：跨账号统一视图 ───
+    //
+    // 🔴 看板的语义是「今天我要处置什么」—— 跨账号一起按严重度排。而主键是
+    //    `inspfind#<账号>`，每个账号一个分区，读侧必须先选账号。于是页面顶部那个
+    //    账号选择器从「筛选」退化成了「决定加载哪个分区」，客户看到的是
+    //    「一次只能看一个账号」，而那与统一视图的目的相反。
+    //
+    //    GSI1 让一次 Query 拿到全部账号：
+    //      GSI1PK = "inspfind"（常量，所有 finding 一个分区）
+    //      GSI1SK = "<严重度序>#<账号>#<finding_id>"
+    //
+    // ⚠️ 严重度**在 SK 最前**，为的是截断时先保住最严重的（读侧有 5000 条上限）。
+    //    账号放前面会让截断变成「按账号字典序切一刀」—— 账号 ID 小的把配额吃光，
+    //    而那与严重程度无关。完整说明见 `inspection/adapters/keys.py`。
+    //
+    // ⚠️ **稀疏索引**：只有 finding 行带 GSI1PK。表里有 12 种前缀
+    //    （insprun# / inspseries# / cfgver# / …），它们不带这两个属性，
+    //    所以索引里只有 finding，不会被别的记录类型污染，也不额外花钱。
+    //
+    // ⚠️ 投影用 ALL：读侧要的是完整 finding（严重度/证据/判读/持续天数都在卡片上）。
+    //    KEYS_ONLY 或 INCLUDE 会让每条都要回主表再取一次 —— 那正是这个 GSI
+    //    要省掉的往返。代价是索引存一份副本（finding 行约 1KB，量级可忽略）。
+    //
+    // ⚠️ **存量行没有 GSI1PK，不会出现在索引里。** 升级后要跑
+    //    `scripts/backfill_finding_gsi.py`，否则统一视图看不到旧 finding，
+    //    而那个缺失是静默的（查询成功、只是少了行）。
+    inspectionTable.addGlobalSecondaryIndex({
       indexName: "GSI1",
       partitionKey: { name: "GSI1PK", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "GSI1SK", type: dynamodb.AttributeType.STRING },
@@ -241,10 +330,67 @@ export class NotiOpsBackendStack extends cdk.Stack {
     lambdaRole.addToPolicy(new iam.PolicyStatement({
       actions: [
         "rds:DescribeDBInstances",
+        // 🔴 Aurora 用的是**集群**而不是实例。缺这条的后果（东京实测）：
+        //    `load_rds_attrs` 的 describe_db_clusters 拿到 AccessDenied →
+        //    `loaded 0 RDS attrs` → `范围: 0 台资源` → 看板「本轮未发现风险」。
+        //    整轮巡检**成功结束**、零错误码，只在日志里留两行 WARNING。
+        //    另外 rollup 的分母也退化：集群成员展开失败 → 覆盖率按已评估数算，
+        //    于是「漏了一半实例」会显示成 100% 完整。
+        "rds:DescribeDBClusters",
+        // 变更事件抑制（R2.5）：刚扩容/刚重启的实例本轮不报。
+        // 缺它不会让巡检失败，但会让「昨天刚改过配置」这个抑制条件恒不成立
+        // → 客户在维护窗口后第一天收到一批本该被压掉的告警。
+        "rds:DescribeEvents",
+        // 引擎 EOL 判定（结构性风险页的「版本即将停止支持」）。
+        // 缺它的表现是 `loaded 0 engine major-version lifecycles` ——
+        // 那一整类 finding **永远为空**，而页面上与「没有 EOL 风险」无法区分。
+        // 东京实测：四个引擎各报一次 AccessDenied，然后静静地算完。
+        "rds:DescribeDBMajorEngineVersions",
+        "rds:DescribeDBEngineVersions",
+        // CA 证书到期规则（ca_cert_expiring）。缺它 `load_ca_certs` 只记一行
+        // WARNING 并返回**空表** → 那条规则永远不命中，而页面上与「没有证书
+        // 风险」无法区分。RDS CA 到期是硬期限（到点连不上），漏报代价很高。
+        // 东京实测（2026-08-22，e2e 链路测试）：闲置轮报 AccessDenied。
+        "rds:DescribeCertificates",
         "rds:ListTagsForResource",
         "elasticache:DescribeCacheClusters",
         "elasticache:DescribeReplicationGroups",
+        // 与 RDS 侧同理：EC 的变更事件也参与抑制判定。
+        "elasticache:DescribeEvents",
         "elasticache:ListTagsForResource",
+        // 🔴 **内存类判定的分母。** `freeable_memory_pct` /
+        //    `database_memory_usage_pct` 都是「占实例规格的百分比」
+        //    （R2.1.2），分母来自 `ec2:DescribeInstanceTypes` 的
+        //    `MemoryInfo.SizeInMiB`（RDS/EC 的规格名去掉 `db.` / `cache.`
+        //    前缀就是 EC2 机型）。
+        //
+        //    缺它的表现（2026-08-25 东京实测，14 台真实资源）：
+        //    `resolved memory for 0/5 instance types` → 全部 attrs 的
+        //    `memory_bytes` 留 None → **内存类规则一条都不命中**，
+        //    而看板上与「内存都很健康」完全无法区分。
+        //    整轮巡检 `status=success` / `completeness=100%`，零错误码。
+        //
+        //    ⚠️ 与 `web-chat-stack.ts` 里那句「**没有** ec2:DescribeInstances」
+        //    不矛盾：那条说的是**不列举 EC2 实例**（巡检不覆盖 EC2 这个服务）。
+        //    这里要的是**机型规格表**，一个静态的公共目录，与账号里有什么
+        //    实例无关。
+        //
+        //    ⚠️ 不支持资源级限定（API 要求 `*`）。只读。
+        "ec2:DescribeInstanceTypes",
+        // 🔴 **巡检的 region 枚举**（2026-08-27，`scan_regions()`）。
+        //
+        //    在这之前巡检的 region 是执行 Lambda 的 `AWS_REGION`
+        //    （AWS 注入、不可配），也就是部署 region 一个。验证账号
+        //    的 4 台 RDS 全在 us-east-1、部署在 ap-northeast-1 →
+        //    `expected.instances = 0` → `completeness = 0 ÷ 0 = 1` →
+        //    看板显示「跑过了、没风险」。零错误、零告警、零日志。
+        //
+        //    ⚠️ 缺这条权限时 `scan_regions()` **抛异常**而不是回落成
+        //    「只扫部署 region」—— 回落会让上面那个缺陷静默复活，而
+        //    `dispatched` 计数看起来完全正常。
+        //
+        //    ⚠️ 不支持资源级限定。只读、只回本账号已启用的 region。
+        "ec2:DescribeRegions",
       ],
       resources: ["*"],
     }));
@@ -287,6 +433,10 @@ export class NotiOpsBackendStack extends cdk.Stack {
     metricsTable.grantReadWriteData(lambdaRole);
     configTable.grantReadWriteData(lambdaRole);
     conversationsTable.grantReadWriteData(lambdaRole);
+    // ⚠️ 巡检表也要授权 —— 漏了的表现是运行时 AccessDeniedException，
+    // 而巡检 Lambda 的失败是**静默的**：run 记录写不进去 → 对账扫不到这一轮
+    // → 既不报「失败」也不报「成功」，看板上那天直接空白。
+    inspectionTable.grantReadWriteData(lambdaRole);
 
     // Bedrock 权限（Lambda3 Converse + API Lambda ListInferenceProfiles/ListFoundationModels）
     // bedrock:InvokeModel 同时覆盖 Converse API，无需单独声明 bedrock:Converse
@@ -320,10 +470,51 @@ export class NotiOpsBackendStack extends cdk.Stack {
     idleDetectionRole.addToPolicy(new iam.PolicyStatement({
       actions: [
         "rds:DescribeDBInstances",
+        // 与 lambdaRole 保持一致 —— 这个角色是**成员账号**那侧的对应物。
+        // 只补部署账号会让「本账号有 Aurora 就巡检得到、成员账号有就巡检不到」，
+        // 而两边的表现都是「本轮未发现风险」，差别只在日志里。
+        "rds:DescribeDBClusters",
+        "rds:DescribeEvents",
+        "rds:DescribeDBMajorEngineVersions",
+        "rds:DescribeDBEngineVersions",
+        // CA 证书到期规则（ca_cert_expiring）。缺它 `load_ca_certs` 只记一行
+        // WARNING 并返回**空表** → 那条规则永远不命中，而页面上与「没有证书
+        // 风险」无法区分。RDS CA 到期是硬期限（到点连不上），漏报代价很高。
+        // 东京实测（2026-08-22，e2e 链路测试）：闲置轮报 AccessDenied。
+        "rds:DescribeCertificates",
         "rds:ListTagsForResource",
         "elasticache:DescribeCacheClusters",
         "elasticache:DescribeReplicationGroups",
+        "elasticache:DescribeEvents",
         "elasticache:ListTagsForResource",
+        // 🔴 **内存类判定的分母。** `freeable_memory_pct` /
+        //    `database_memory_usage_pct` 都是「占实例规格的百分比」
+        //    （R2.1.2），分母来自 `ec2:DescribeInstanceTypes` 的
+        //    `MemoryInfo.SizeInMiB`（RDS/EC 的规格名去掉 `db.` / `cache.`
+        //    前缀就是 EC2 机型）。
+        //
+        //    缺它的表现（2026-08-25 东京实测，14 台真实资源）：
+        //    `resolved memory for 0/5 instance types` → 全部 attrs 的
+        //    `memory_bytes` 留 None → **内存类规则一条都不命中**，
+        //    而看板上与「内存都很健康」完全无法区分。
+        //    整轮巡检 `status=success` / `completeness=100%`，零错误码。
+        //
+        //    ⚠️ 与 `web-chat-stack.ts` 里那句「**没有** ec2:DescribeInstances」
+        //    不矛盾：那条说的是**不列举 EC2 实例**（巡检不覆盖 EC2 这个服务）。
+        //    这里要的是**机型规格表**，一个静态的公共目录，与账号里有什么
+        //    实例无关。
+        //
+        //    ⚠️ 不支持资源级限定（API 要求 `*`）。只读。
+        "ec2:DescribeInstanceTypes",
+        // 🔴 与 `lambdaRole` 保持一致（本文件上面那份）。巡检的 region 枚举
+        //    走 `ec2:DescribeRegions`（`inspection/adapters/regions.py`）。
+        //
+        // ⚠️ 当前链路走不到这个角色 —— `_session_for` 对**部署账号**直接
+        //    `return boto3.Session()`（`target == deploy` 时不 assume）。
+        //    补它是因为这两份清单该一致，而「两份该一致的清单漂移了」是这个
+        //    仓库反复踩的形态：下一个照它建角色的人会缺权限，
+        //    表现是整轮 `RegionDiscoveryError`（好在这个是抛的，不静默）。
+        "ec2:DescribeRegions",
         "cloudwatch:GetMetricData",
         "cloudwatch:GetMetricStatistics",
         "support:DescribeTrustedAdvisorCheckResult",
@@ -369,6 +560,23 @@ export class NotiOpsBackendStack extends cdk.Stack {
       // 留空即可恢复多账号(零侵入、可逆)。见 shared/account_scope.py。
       // orgMode(-c organizationId=...)时留空 = 解锁多账号。
       LOCKED_ACCOUNT_ID: orgMode ? "" : cdk.Aws.ACCOUNT_ID,
+      // 🔴 部署账号 ID，**恒有值**，与 orgMode 无关。
+      //
+      // 与 LOCKED_ACCOUNT_ID 的区别是语义：
+      //
+      // ```
+      // LOCKED_ACCOUNT_ID   闸门：「只允许这个账号」。orgMode 下留空 = 解锁
+      // DEPLOY_ACCOUNT_ID   身份：「我自己是谁」。任何模式下都要知道
+      // ```
+      //
+      // 巡检 executor 靠它判断「这个 task 的目标账号是不是我自己」——
+      // 是则用 Lambda 自身角色，否则 AssumeRole 进成员账号
+      // （见 `lambda_inspection_executor/handler._session_for`）。
+      //
+      // ⚠️ 第一版复用了 LOCKED_ACCOUNT_ID 做这件事，于是**恰好在 orgMode
+      //    下失效**：那时它是空串，executor 判不出自己是谁，只能保守退化成
+      //    单账号 —— 也就是「开了多账号模式反而不跨账号」。
+      DEPLOY_ACCOUNT_ID: cdk.Aws.ACCOUNT_ID,
     };
 
     // ─── Python 依赖 Layer ───
@@ -418,10 +626,41 @@ export class NotiOpsBackendStack extends cdk.Stack {
         "frontend/**", "infra/**", ".venv*/**", "**/node_modules/**",
         "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
         ".git/**", "tests/**", "docs/**", ".kiro/**",
-        "lambda_layer/**", "cdk.out/**", "**/__pycache__/**",
+        "lambda_layer/**", "lambda_layer_im/**", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
+        // ⚠️ dist/** 是一键部署（方式A）的产物目录（dist/oneclick + dist/verify，
+        // 各 ~290MB 的 zip）。不排掉它，「代码资产 + 依赖层」解压后会超 Lambda 的
+        // 250MB 上限，部署到一半才报 `Unzipped size must be smaller than 262144000
+        // bytes`（2026-09-01 实测：ImStack 整栈回滚）。本地跑过一键构建的人才会中，
+        // 极易误判成"依赖层太大"。四处 fromAsset("../") 都要有这一条。
+        "dist/**",
         "platforms/**", "*.md", "mcp_server/**",
         ".hypothesis/**", ".pytest_cache/**",
         "phd_event_forwarder/**", "devops_agent_callback/**",
+        // 🔴 **必须把判读 skill 放回来。** `"*.md"` 在 GLOB 模式下排除的是
+        //    **所有深度**的 `.md`，不只是仓库根那几个 —— 2026-08-31 从线上
+        //    Lambda 包里 unzip 出来实测：包内 `.md` 文件数 = **0**。
+        //
+        //    后果是 `inspection/adapters/skill_upload.py::ensure_skills()`
+        //    在 Lambda 里**找不到任何 skill**，而它的约定是「从不抛」——
+        //    返回一个 `skipped:` / `failed:` 字符串就过去了。于是：
+        //
+        //    ```
+        //    CreateBacklogTask 照样成功
+        //      → DA 那侧没有 inspection-cost-idle / inspection-high-load
+        //      → 用**通用提示词**自由发挥
+        //      → 报告照样出得来，格式大致像那么回事
+        //      → 而 finding_id 分节、severity 不得改写、四档 unavailable 语义
+        //        这些契约一条都没生效
+        //    ```
+        //
+        //    从外面完全看不出来（`task_builder.py` 的注释早就写过这个形态：
+        //    「两份都不加载…报告照样出，只是退化成 DA 的通用发挥」）。
+        //
+        // ⚠️ 放在 `"*.md"` **之后** —— GLOB 模式按顺序求值，后面的否定式胜出。
+        //    放前面无效。
+        // ⚠️ 只放回 `inspection/skills/`，不是所有 `.md`：仓库里那些
+        //    README / 设计文档进包只是白占空间（包越大冷启越慢）。
+        "!inspection/skills/**",
       ],
     });
 
@@ -471,10 +710,11 @@ export class NotiOpsBackendStack extends cdk.Stack {
       description: "RDS/ElastiCache AI 智能巡检 — Bedrock 分析与报告生成（路径 C）",
     } as lambda.FunctionProps);
 
-    // 与 config/llm-model-catalog.json 的 default_model 一致（Claude Sonnet 5）。
+    // 与 config/llm-model-catalog.json 的 default_model 一致（2026-09-01 起为 Grok 4.6）。
     // lambda3 走 `client.converse()`（见 lambda3_health_checker/bedrock_invoker.py），
-    // Converse 对 Anthropic 模型同样适用，协议对得上。
-    lambda3.addEnvironment("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5");
+    // 而 Grok 的目录 kind 就是 `bedrock_converse` —— 协议原生对得上（换成任何
+    // Converse 可调的模型都行；**不要**换成只走 Mantle Responses 的 GPT-5.6 系列）。
+    lambda3.addEnvironment("BEDROCK_MODEL_ID", "global.xai.grok-4.6");
     apiLambda.addEnvironment("HEALTH_CHECKER_FUNCTION_NAME", lambda3.functionName);
     apiLambda.addEnvironment("COLLECTOR_FUNCTION_NAME", "notiops-collector");
 
@@ -879,6 +1119,15 @@ export class NotiOpsBackendStack extends cdk.Stack {
       description: "Slack app-level token (xapp-) for Socket Mode",
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
+    // Signing Secret —— **webhook 路径专用**（IM 重构 M3）。Socket Mode 用不到它
+    // （长连接由 App Token 鉴权），改成 HTTP webhook 后它是**唯一**的请求真伪凭据：
+    // ingress 用它算 HMAC-SHA256 校验 `X-Slack-Signature`。
+    // 与 App Token 并存而不是替换：M3 阶段 Fargate（Socket Mode）还留着做回滚目标。
+    const slackSigningSecret = new secretsmanager.Secret(this, "SlackSigningSecret", {
+      secretName: "notiops/slack-signing-secret",
+      description: "Slack Signing Secret — HTTP webhook 请求验签（Basic Information 页）",
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
 
     const bedrockApiKeySecret = new secretsmanager.Secret(this, "BedrockApiKeySecret", {
       secretName: "notiops/bedrock-api-key",
@@ -915,19 +1164,28 @@ export class NotiOpsBackendStack extends cdk.Stack {
     });
     llmProviderParam.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
-    // ⚠️ 这一条**故意不跟随** config/llm-model-catalog.json 的 default_model
-    // （现为 Claude Sonnet 5 —— 恰好同值，但那是目录的自由，改目录默认时别顺手改这里）。
-    // 它不是"对话默认模型"，而是 IM 侧一批**内部工具调用**的模型：意图分类 / 下一步建议 /
-    // 进度卡叙述 / 案例分类 / 技能派发 / 技能编写（shared/model_config.py::get_bot_model_id
-    // 的 8 个调用点）。那 8 处都是手搓 Anthropic 原生 `invoke_model` body
-    // （"anthropic_version": "bedrock-2023-05-31"），换成非 Claude 模型会直接
-    // ValidationException —— 也就是"机器人一说话就报错"。
-    // 要真正统一，得先把那 8 处迁到 shared/llm_provider.py::invoke_llm（Converse），
-    // 且注意它们现在各自设了 temperature，迁移时不能丢（分类器靠低温保证确定性）。
+    // 这一条不是"对话默认模型"，而是 IM 侧一批**内部工具调用**的模型：意图分类 /
+    // 下一步建议 / 进度卡叙述 / 案例分类 / 技能派发 / 技能编写
+    // （shared/model_config.py::get_bot_model_id 的 8 个调用点）。
+    //
+    // 历史（留着，因为它解释了为什么这里长期落后于目录默认）：那 8 处原先都是手搓
+    // Anthropic 原生 body（"anthropic_version": "bedrock-2023-05-31"）的 `invoke_model`，
+    // 所以这里**必须**是 Claude —— 换任何非 Claude 模型都会 ValidationException，表现
+    // 成"机器人一说话就报错"。这条约束在 2026-09-01 解除了：8 处已统一到
+    // core/bot_llm.py → shared/llm_provider.py::invoke_llm（Bedrock Converse），
+    // 目录里任何 Converse 可调的 Bedrock 模型都能绑，于是这里跟随目录默认改成 Grok 4.6。
+    //
+    // 更正一处旧注释的事实错误：这里曾写"那 8 处现在各自设了 temperature（分类器靠低温
+    // 保证确定性）"—— 不实，8 处 body 里从来没有 temperature（2026-09-01 grep 实证），
+    // `invoke_llm` 也没有这个参数。所以那次迁移在采样参数上是零行为变化。
+    //
+    // ⚠️ 仍有一条约束：只在 bedrock-mantle 上架的模型（GPT-5.6 系列）**不能**绑到这里 ——
+    // `core/bot_llm.py` 恒走 Converse，不按 model_id 猜协议（猜错报
+    // "model identifier is invalid"，读起来像模型不存在，归因极贵）。
     // 见 core/llm_pref_resolver.py 顶部对同一约束的说明（spec R8）。
     const agentModelIdParam = new ssm.StringParameter(this, "AgentModelIdParam", {
       parameterName: "/notiops/agent/model_id",
-      stringValue: "global.anthropic.claude-sonnet-5",
+      stringValue: "global.xai.grok-4.6",
       description: "Current Bedrock model ID used by the Strands Agent (writable via dashboard)",
       tier: ssm.ParameterTier.STANDARD,
     });
@@ -949,7 +1207,7 @@ export class NotiOpsBackendStack extends cdk.Stack {
     // BFF 角色持 PutSecretValue）。历史上后端也持 PutSecretValue，成了第二条写路径：
     // rds/elasticache 巡检配置页与 webchat 抢写同一个 Secret、后写覆盖先写。写入侧的
     // 路由已改为拒绝（api/routes/*_health_check.py），这里同步撤掉 IAM 写权限，双保险
-    // （spec task 7.1 / R6.6）。
+    // （R6.6）。
     lambdaRole.addToPolicy(new iam.PolicyStatement({
       sid: "BedrockApiKeySecretAccess",
       actions: ["secretsmanager:GetSecretValue"],
@@ -1009,6 +1267,30 @@ export class NotiOpsBackendStack extends cdk.Stack {
     // 部署账号的 Agent Space 由 CDK 自动创建,无需手动 onboard。
     // 其他业务账号仍需 Dashboard 手动上车(跨账号 onboarding 流程)。
     const devopsAgentModule = require("aws-cdk-lib/aws-devopsagent");
+    // ─── Operator App（Web App）的角色 ───
+    //
+    // 🔴 **角色名跟随 main（`notiops-agent-webapp-…`）。**
+    //    本分支曾把它改成 `notiops-agent-operator-…` —— 那是一次没有理由的分叉：
+    //    这个角色本身是 main 的 `fb560db` 引入的，改名不带来任何功能。
+    //    2026-09-03 第二轮合并时收敛回 main：
+    //      · 留着它，每轮合并都要在这里冲突一次；
+    //      · 更要紧的是这条分支并回 main 时会把**所有** main 系部署一起改名，
+    //        而改名 = 改 space 的 operatorAppRoleArn = 下面那次整栈回滚的形态。
+    //    收敛的代价只落在本分支的验证账号上（一次性迁移，见下面 A/B 两条出路）。
+    //
+    // 🔴 不配 `operatorApp` 的后果（2026-08-27 实测）：
+    //    `https://<spaceId>.aidevops.global.app.aws/investigation/<taskId>`
+    //    返回 **Invalid or unregistered domain** —— 那个子域名只有在 space 配了
+    //    OperatorApp 之后才被注册。而我们在**四个地方**往客户面前放这条链接：
+    //      core/devops_agent.py                             聊天回复里的「查看进度」
+    //      shared/report_delivery/{feishu,slack}_sender.py   IM 推送正文
+    //      core/support_logic.py                            support case 的 operator_url
+    //    也就是说不开 Web App 等于在每一条推送里放一个死链。
+    //
+    // ⚠️ 与 `primaryRole` 是**两件事**（官方文档的分工）：
+    //      primaryRole       DA 服务 AssumeRole 进来**读资源**
+    //      operatorAppRole   **人**在 web app 里能做什么（发起调查/看结果/开 case）
+    //
 
     // Operator App(web app)角色：免掉控制台上「Agent Space → Access →
     // Operator access → Configure web app」那一次手点。没点过的话
@@ -1019,22 +1301,55 @@ export class NotiOpsBackendStack extends cdk.Stack {
     //     `agentspace/${aws:PrincipalTag/AgentSpaceId}`，靠 session tag 授权。
     //   · `ArnLike .../agentspace/*` 而不是精确 ARN —— 后者会让角色与 space 互相
     //     引用，CFN 判循环依赖。收口靠 aws:SourceAccount，与下面 primaryRole 同一套。
-    const operatorAppRole = new iam.Role(this, "DevOpsAgentOperatorAppRole", {
+    // ⚠️ 老部署逃生口。space 已存在、且 web app 当初是**在控制台手点**开的时候，
+    // 模板里 `operatorApp` 从「没有」变成「有」→ CFN 走 update handler 去 Enable 一次
+    // → 服务侧直接拒：`Operator App with IAM configuration to AgentSpace with
+    // agentSpaceId <id> is already enabled. Disable it first or use a different auth
+    // flow.`（2026-09-01 在一个已有部署的账号上实测，整栈 UPDATE_ROLLBACK —— 那一批 42 个
+    // 资源的改动**一个都没落地**，所以这不是"顺带失败一个资源"，是整次部署白跑。）
+    //
+    // 两条出路，按「能不能停几分钟 web app」选：
+    //   A. `-c operatorAppAlreadyEnabled=true` —— 本次部署**不接管** web app，
+    //      控制台建的那份配置（角色 `DevOpsAgentRole-WebappAdmin-*`）继续用，
+    //      域名和功能都不动。代价：web app 配置不在 CFN 里，删栈不回收；
+    //      想让 CFN 接管得走 B。
+    //   B. 先 `aws devops-agent disable-operator-app --agent-space-id <id> --auth-flow iam`，
+    //      再部署。域名由 spaceId 派生，关掉重开**不换 URL**；但中间几分钟 web app
+    //      不可用，期间 BFF 的 DevOps 直连 / 深度调查会报
+    //      `Invalid or unregistered domain`。
+    //      2026-09-02 在同一个账号走通了这条：停机 ~2.5 分钟（disable → 部署完
+    //      95s → 服务侧 Enable 落地），space id / URL 都没变，之后 web app 配置就归
+    //      CFN 管了（角色换成 `notiops-agent-webapp-<acct>`）。`--auth-flow` 是必填的，
+    //      漏了报 `Auth flow must be one of iam, idc, idp`。
+    //      ⚠️ 顺序很要紧：**先确认模板已就绪再 disable** —— disable 那一刻 web app 就
+    //      废了，把 synth 的几分钟放在停机窗口里纯属白停。
+    //      ⚠️ 控制台建的那个老角色（`DevOpsAgentRole-WebappAdmin-*`）走完 B 就没人用了，
+    //      但**别顺手删** —— 它不是这个栈的资源，删它属于动生产，要单独确认。
+    //
+    // ⚠️⚠️ 逃生口 A 只在**重新 synth** 时有效。`cdk deploy --app <某个 cdk.out 目录>`
+    // 走的是**已经 synth 好的** cloud assembly，CDK 直接读目录里的模板，
+    // `-c operatorAppAlreadyEnabled=true` **会被静默忽略** —— 你以为躲开了，实际部下去
+    // 的还是带 `operatorApp` 的那份模板，照样整栈回滚。要用 A 就得带着这个 -c
+    // （以及**全部**其它 -c，见 DEPLOYMENT.md）重新 synth 一次。
+    //
+    // 新部署（space 由本栈创建）两者都不用管：create handler 一把开好，默认即 false。
+    const operatorAppAlreadyEnabled =
+      String(this.node.tryGetContext("operatorAppAlreadyEnabled") ?? "").toLowerCase() === "true";
+
+    const operatorAppRole = operatorAppAlreadyEnabled ? undefined : new iam.Role(this, "DevOpsAgentOperatorAppRole", {
       roleName: `notiops-agent-webapp-${cdk.Aws.ACCOUNT_ID}`,
       assumedBy: new iam.ServicePrincipal("aidevops.amazonaws.com", {
         conditions: {
-          StringEquals: {
-            "aws:SourceAccount": cdk.Aws.ACCOUNT_ID,
-          },
+          StringEquals: { "aws:SourceAccount": cdk.Aws.ACCOUNT_ID },
           ArnLike: {
             "aws:SourceArn": `arn:aws:aidevops:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:agentspace/*`,
           },
         },
-      }).withSessionTags(),  // ← 这就是那条 sts:TagSession
+      }).withSessionTags(),   // ← 这就是那条 sts:TagSession（等价于手写 addStatements）
       managedPolicies: [
         iam.ManagedPolicy.fromAwsManagedPolicyName("AIDevOpsOperatorAppAccessPolicy"),
       ],
-      description: "Assumed by AWS DevOps Agent for its per-Agent-Space operator web app",
+      description: "Assumed by humans in the DevOps Agent web app",
     });
 
     const agentSpace = new devopsAgentModule.CfnAgentSpace(this, "DevOpsAgentSpace", {
@@ -1044,13 +1359,11 @@ export class NotiOpsBackendStack extends cdk.Stack {
       // aidevops:EnableOperatorApp，delete handler 调 DisableOperatorApp。
       // 只走 `iam` 认证流（BFF 是 SigV4 直连）；IdC / IdP 留给客户自己选。
       //
-      // ⚠️ **老部署升级到本版本**（space 已存在、且当初是**在控制台手点**开的 web app）：
-      // 模板里这条属性从「没有」变成「有」，CFN 会走 update handler 去 Enable 一次。
-      // 此时服务侧其实已经 enabled（角色是控制台建的 `DevOpsAgentRole-WebappAdmin-*`），
-      // 未实测该 update 是幂等还是报冲突。真撞上冲突就先 `aws devops-agent
-      // disable-operator-app --agent-space-id <id>` 再 deploy —— 域名由 spaceId 派生，
-      // 关掉重开不换 URL。新部署无此问题（create handler 一把开好）。
-      operatorApp: { iam: { operatorAppRoleArn: operatorAppRole.roleArn } },
+      // ⚠️ **老部署升级到本版本**（space 已存在、且当初是在控制台手点开的 web app）：
+      // 这条属性从「没有」变成「有」会让 CFN 去 Enable 一次，服务侧报 already enabled
+      // 并回滚整栈 —— 已实测。逃生口 `-c operatorAppAlreadyEnabled=true` 见上面
+      // operatorAppRole 处的长注释（含 A/B 两条出路的取舍）。
+      ...(operatorAppRole ? { operatorApp: { iam: { operatorAppRoleArn: operatorAppRole.roleArn } } } : {}),
     });
     this.agentSpaceId = agentSpace.attrAgentSpaceId;
 
@@ -1116,6 +1429,85 @@ export class NotiOpsBackendStack extends cdk.Stack {
     association.node.addDependency(agentSpace);
     association.node.addDependency(primaryRole);
 
+    // ─── 巡检专用 Agent Space（第二个）───────────────────────────────────────
+    // 为什么要第二个而不是共用上面那个（见 spec R12.5c）：
+    //   ① 并发配额是 **per agent space**（Concurrent investigations = 3）。实测一次并发
+    //      发 6 条 → 恰好 3 IN_PROGRESS + 3 PENDING_START，配额是执行调度上的限制。
+    //      巡检批量派发会占满 3 个位 → 客户此刻点「深度调查」要排在巡检后面，
+    //      界面上就是卡着不动。后台批处理不该抢占前台交互。
+    //   ② skill 是 **per agent space** 的（全部 Asset API 都必填 agentSpaceId）。
+    //      巡检的两份判读 skill 待在这里，碰不到排障 space —— 否则客户的排障调查
+    //      可能误加载它们（实测 skill 激活是 description 语义匹配，命中并不精确），
+    //      或被它们的 skip criteria 跳过（Investigation Skipped）。
+    //   ③ 事件里的 detail.metadata.agent_space_id 直接成为「这是巡检」的判据，
+    //      不必依赖我们自己预注册 DDB 行成功（那条路一旦写失败是完全静默的）。
+    // 成本：credits 是**账号级**的（GetAccountUsage → monthlyAccountInvestigationHours），
+    // 拆两个 space 不多花钱也不多给额度，只是把并发拆开。
+    //
+    // ⚠️ 命名 SHALL NOT 用 `notiops-devops-${account}` —— core/devops_agent.py 的
+    // _discover_space() 把那个名字当 preferred 匹配用，撞名会让排障调查的 space
+    // 选择变歧义（且选错没有任何信号）。
+    // 🔴 `locale` **必须显式设**，而且要与 executor 的
+    //    `INSPECTION_REPORT_LOCALE` 同源。
+    //
+    //    2026-08-25 实测：两个 space 的 locale 都是 `None`（从没设过），
+    //    判读之所以出中文，靠的是 skill 里那句
+    //    `Answer in locale; default to Chinese` —— 也就是**在对抗服务默认值**。
+    //    哪天 skill 被改坏、或者 DA 更严格地遵守 space 级设置，输出就变英文，
+    //    而这**不会报错**：客户只会看到判读突然变成英文。
+    //
+    //    取值格式实测确认是 `"zh"`（`UpdateAgentSpace` 接受它，
+    //    `zh_CN` / `zh-CN` 都没试到就成功了，所以只知道 `zh` 可用）。
+    //
+    // ⚠️ **排障 space 刻意不设 locale**（下面那个 `agentSpace` 与
+    //    `member-devops-agent.yaml` 的都不设）。排障是**交互式**的：
+    //    web chat 按 `body.locale`（当前用户的 UI 语言）组装，英文用户提问
+    //    就该拿英文回答。给 space 钉死一个语言可能覆盖那个 per-request 行为。
+    //    巡检相反 —— 它是批处理，一条判读推给多个人，语言必须是全局的。
+    const inspectionAgentSpace = new devopsAgentModule.CfnAgentSpace(
+      this, "InspectionAgentSpace", {
+        name: `notiops-inspection-${cdk.Aws.ACCOUNT_ID}`,
+        description: "NotiOps resource inspection - isolated from incident RCA space",
+        locale: inspectionReportLocale,
+        // 与排障 space 共用同一个操作员角色（信任策略里 agentspace/* 通配）。
+        // ⚠️ 巡检 space 也要开：判读结论里的深链指向的是**这个** space，
+        //    不开的话那些链接和排障那边一样是死的。
+        //
+        // 🔴 与排障 space 一样走 `operatorAppRole ? … : {}` —— `operatorAppRole`
+        //    在 `-c operatorAppAlreadyEnabled=true` 时是 **undefined**
+        //    （见上面那个逃生口）。原来这里是无条件 `operatorAppRole.roleArn`，
+        //    那是本分支加巡检 space 时抄的排障 space 的**旧形态**，而 main 后来
+        //    给排障那边加了守卫、巡检这边没跟上（2026-09-03 第二轮合并时补的）。
+        //    不补的话开着逃生口部署就是 TypeError，整个 synth 失败。
+        ...(operatorAppRole
+          ? { operatorApp: { iam: { operatorAppRoleArn: operatorAppRole.roleArn } } }
+          : {}),
+      });
+    this.inspectionAgentSpaceId = inspectionAgentSpace.attrAgentSpaceId;
+
+    // 复用同一个 primaryRole：巡检与排障读的是同一个账号的同一批资源，
+    // 权限需求完全相同（AIDevOpsAgentAccessPolicy 只读）。再建一个角色只会多一份要维护的东西。
+    const inspectionAssociation = new devopsAgentModule.CfnAssociation(
+      this, "InspectionAgentSpaceAssociation", {
+        agentSpaceId: inspectionAgentSpace.attrAgentSpaceId,
+        serviceId: "aws",
+        configuration: {
+          aws: {
+            accountId: cdk.Aws.ACCOUNT_ID,
+            accountType: "monitor",
+            assumableRoleArn: primaryRole.roleArn,
+          },
+        },
+      });
+    inspectionAssociation.node.addDependency(inspectionAgentSpace);
+    inspectionAssociation.node.addDependency(primaryRole);
+
+    // 两个 agent space 的 ARN —— trigger role 的授权范围。
+    const agentSpaceArns = [
+      agentSpace.attrArn,
+      inspectionAgentSpace.attrArn,
+    ].filter((a): a is string => Boolean(a));
+
     // Trigger Role: Lambda/ECS AssumeRole 到本账号调 DevOps Agent API
     const triggerRole = new iam.Role(this, "DevOpsAgentTriggerRole", {
       roleName: `notiops-agent-trigger-${cdk.Aws.ACCOUNT_ID}`,
@@ -1128,8 +1520,102 @@ export class NotiOpsBackendStack extends cdk.Stack {
         "aidevops:GetAgentSpace",
         "aidevops:ListJournalRecords",
         "aidevops:GetJournalRecord",
+        // ── 巡检需要的四个（R12.5c / R13.13a，方案丙）──
+        // 上传两份判读 skill（Asset API，assetType=skill）。
+        // ⚠️ 没有 ListAssets 就无法查重 → 每次上传都 Create → 同一个 skill
+        //    在 space 里堆出多份，DA 可能加载到旧的那份。
+        "aidevops:CreateAsset",
+        "aidevops:UpdateAsset",
+        "aidevops:ListAssets",
+        // 读任务终态做对账兜底（事件丢失时按 status 核实，R13.13a）；
+        // 也是涓流派发数「在飞条数」的依据（R12.5b：IN_PROGRESS + PENDING_START）。
+        "aidevops:GetBacklogTask",
+        "aidevops:ListBacklogTasks",
       ],
-      resources: [agentSpace.attrArn || `arn:aws:aidevops:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:agentspace/*`],
+      // ⚠️ 两个 agent space 的 ARN 都要授权。
+      // 原来只有 `[agentSpace.attrArn || <通配兜底>]` —— 而 `attrArn` 是 CDK token，
+      // **恒为真值**，所以那个 `||` 兜底永远不生效。漏掉巡检 space 的 ARN
+      // 会让对它的每次调用直接 AccessDenied，且错误发生在派发时而不是部署时。
+      // 兜底放在数组为空时（而不是逐项 ||）—— 逐项写的话 filter 掉全部后会得到
+      // 空 resources，那是非法的 IAM 语句。
+      resources: agentSpaceArns.length > 0
+        ? agentSpaceArns
+        : [`arn:aws:aidevops:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:agentspace/*`],
+    }));
+
+    // 🔴 巡检的两个 Lambda 直连 DevOps Agent，用的是**共享 lambdaRole**，
+    // 不是上面那个 triggerRole。
+    //
+    // 部署账号本身走「直连 + 自己的角色」是既有惯例（见
+    // `core/devops_agent.py` 的 `is_deploy` 分支：`boto3.client("devops-agent")`
+    // 不 AssumeRole）。而 `lambdaRole` 此前**只有** ListJournalRecords /
+    // GetJournalRecord —— 于是：
+    //
+    //   执行器 `da.create_backlog_task(...)`   → AccessDenied
+    //   而调用点是 `except Exception: logger.exception(...); continue`
+    //   → `dispatched_tasks = 0`，run 状态仍然是 **success**
+    //   → 看板上只显示「另有 N 项未做根因分析」
+    //
+    // 也就是说部署下去之后**判读一条都派不出去，且没有任何报错信号**。
+    // 这两条权限是巡检能工作的前提，不是优化。
+    //
+    // ⚠️ 这里原来只有 `CreateBacklogTask` / `GetBacklogTask` 两个动作，注释写着
+    //    「`CreateAsset` / `UpdateAsset` 是 setup.sh 用操作者凭证跑
+    //     `scripts/upload_inspection_skills.py` 时用的，不该进 Lambda 角色」。
+    //
+    // 🔴 那句话在 2026-08-30 就**过期**了：`2a574b8` 把 skill 下发搬进了
+    //    Lambda（`skill_upload.ensure_skills()`，在每次派发前跑），
+    //    理由是那个函数此前**生产零调用点** —— skill 从来没被下发过。
+    //    但那次**只搬了实现，没搬权限**。
+    //
+    //    2026-08-31 实机踩到（客户点了「深入分析」等不到结果）：
+    //
+    //    ```
+    //    ensure_skills → aidevops:ListAssets   AccessDenied
+    //                  → aidevops:CreateAsset  AccessDenied
+    //                  → 2/2 份 skill 上传失败
+    //                  → 「继续派发」（设计如此，skill 失败不该让判读整个没有）
+    //                  → DA 那侧没有 inspection-cost-idle
+    //                  → 用**通用调查格式**回答（598 字符的 JSON，
+    //                    还去读了它自己的 memory 而不是我们给的载荷）
+    //                  → 切不出 `## <finding_id>` → da_parse_status=parse_failed
+    //                  → 界面上：一直等，而额度已经花了
+    //    ```
+    //
+    //    整条链每一步都按设计工作（`ensure_skills` 从不抛、失败不阻断、
+    //    callback 保留原文并标 parse_failed），所以**完全静默**。
+    //
+    // ⚠️ `DeleteAsset` 不给：`ensure_skills` 只做 create/update
+    //    （`find_existing_asset_id` → 有就 update、没有就 create）。
+    //    给了它就等于让一个自动化路径能删掉客户 space 里别的 asset。
+    // ⚠️ `ListBacklogTasks` 等 R12.5b 的涓流派发实现了再加。
+    lambdaRole.addToPolicy(new iam.PolicyStatement({
+      sid: "InspectionDevOpsAgentDispatch",
+      actions: [
+        // 执行器派发判读任务。
+        "aidevops:CreateBacklogTask",
+        // 对账 Lambda 核实终态（R13.13a）。
+        "aidevops:GetBacklogTask",
+        // 判读 skill 的自动下发（`skill_upload.ensure_skills()`）。
+        // ⚠️ 三个都要：`ListAssets` 用来判「这份 skill 已经在里面了吗」，
+        //    缺了它会退化成「每次直接 Create」→ 同一份 skill 在 space 里
+        //    堆出多份，而 DA 匹配到哪一份不确定。
+        "aidevops:ListAssets",
+        "aidevops:CreateAsset",
+        "aidevops:UpdateAsset",
+        // 🔴 上传后的**回验**（`skill_upload.py:464` 的 `_asset_exists`）。
+        //    那段注释逐字写着「拿到 asset_id 不等于 space 里真有这份 skill」——
+        //    create 返回 200 而 asset 之后不存在的情况实测过（幂等 token 撞车）。
+        //
+        //    缺这个权限的表现（2026-08-31 实机日志）：
+        //    「skill 回验跳过（GetAsset 失败，可能缺 devops-agent:GetAsset 权限）」
+        //    ⇒ 上传照样报成功，而**回验这道防线是空的** —— 传上去一份被截断
+        //      或压根不存在的 skill 也看不出来，然后判读静默退化成通用发挥。
+        "aidevops:GetAsset",
+      ],
+      resources: agentSpaceArns.length > 0
+        ? agentSpaceArns
+        : [`arn:aws:aidevops:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:agentspace/*`],
     }));
 
     // Auto-onboard: 用 Custom Resource 在部署时写 DDB config 表
@@ -1169,6 +1655,9 @@ def handler(event, context):
                 'account_alias': 'deploy-account (auto)',
                 'agent_space_id': os.environ['AGENT_SPACE_ID'],
                 'agent_space_arn': os.environ['AGENT_SPACE_ARN'],
+                # 资源巡检专用 space（与上面那个隔离，见 spec R12.5c）。
+                # 新字段而非把 agent_space_id 改成 list —— 后者有 20+ 个标量读取点。
+                'inspect_agent_space_id': os.environ['INSPECT_AGENT_SPACE_ID'],
                 'trigger_role_arn': os.environ['TRIGGER_ROLE_ARN'],
                 'region': os.environ['DEPLOY_REGION'],
                 'onboarding_status': 'active',
@@ -1185,6 +1674,7 @@ def handler(event, context):
         ACCOUNT_ID: cdk.Aws.ACCOUNT_ID,
         AGENT_SPACE_ID: agentSpace.attrAgentSpaceId,
         AGENT_SPACE_ARN: agentSpace.attrArn || "",
+        INSPECT_AGENT_SPACE_ID: inspectionAgentSpace.attrAgentSpaceId,
         TRIGGER_ROLE_ARN: triggerRole.roleArn,
         DEPLOY_REGION: cdk.Aws.REGION,
       },
@@ -1192,6 +1682,7 @@ def handler(event, context):
     });
     configTable.grantWriteData(onboardFn);
     onboardFn.node.addDependency(agentSpace);
+    onboardFn.node.addDependency(inspectionAgentSpace);
     onboardFn.node.addDependency(triggerRole);
 
     new cdk.CustomResource(this, "AutoOnboardResource", {
@@ -1199,6 +1690,7 @@ def handler(event, context):
       properties: {
         triggerRoleArn: triggerRole.roleArn,
         agentSpaceId: agentSpace.attrAgentSpaceId,
+        inspectionAgentSpaceId: inspectionAgentSpace.attrAgentSpaceId,
         // 每次部署都变 → CustomResource 每次都重跑,自愈补写 da# 记录。
         // 修复:配置表若被删/重建(如 SpringClean),静态 property 会让 CFN 判定"无变化"
         // 而不重跑,导致 da# 上车记录永久丢失 → IM 端派发报"未上车"。put_item 整条覆盖、
@@ -1207,9 +1699,18 @@ def handler(event, context):
       },
     });
 
+    // ⚠️ **这个 OutputKey 的含义 SHALL NOT 改** —— setup.sh:1062 读它
+    // (`jq .NotiOpsBackendStack.AgentSpaceId`) 回填成 agent runtime 的
+    // `DEVOPS_AGENT_SPACE_ID`，那是**排障**调查用的 space。指向改了会让 IM 侧的
+    // 深度调查被静默路由到巡检 space。巡检的 id 走下面那个**新** output。
     new cdk.CfnOutput(this, "AgentSpaceId", {
       value: agentSpace.attrAgentSpaceId,
-      description: "DevOps Agent Space ID (部署账号, 自动创建)",
+      description: "DevOps Agent Space ID (部署账号, 自动创建) — 排障根因调查用",
+    });
+
+    new cdk.CfnOutput(this, "InspectionAgentSpaceId", {
+      value: inspectionAgentSpace.attrAgentSpaceId,
+      description: "DevOps Agent Space ID — 资源巡检专用（与排障隔离，见 spec R12.5c）",
     });
 
     // ─── Seed Data: 初始阈值 + v3 prompt + 默认模型 ───
@@ -1248,65 +1749,647 @@ def handler(event, context):
       resources: [devopsEventBus.eventBusArn],
     }));
 
-    // Resource policy 双重条件（R5.6, R5.9, R13.3）：
-    //  1. aws:PrincipalAccount ∈ CDK context devopsAgentBusinessAccounts 白名单
-    //  2. events:source 等于 "aws.aidevops"
-    const devopsAgentBusinessAccountsRaw = this.node.tryGetContext(
-      "devopsAgentBusinessAccounts",
-    ) as string | undefined;
-    const devopsAgentBusinessAccounts = (devopsAgentBusinessAccountsRaw ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter((s) => /^[0-9]{12}$/.test(s));
+    // ─── Custom Event Bus 的资源策略（改动②，2026-08-29 重写）───
+    //
+    // 判据从「你是哪个账号」换成「你是不是我们模板建出来的转发角色 + 事件是不是
+    // DA 服务署名的」。
+    //
+    // 🔴 **为什么要换掉原来那个白名单。** 原来是
+    //    `StringEquals aws:PrincipalAccount ∈ <CDK context 的常量列表>`，
+    //    而那个列表由 setup.sh 用 `-c` 传进来、**烧进 CFN 模板**。于是接入一个
+    //    子账号的代价是「改 setup.sh 的变量 → 重跑 ./setup.sh → CDK 更新整个
+    //    NotiOpsBackendStack（Lambda/DDB/API GW/CloudFront）」。在几十个账号的
+    //    量级上不可接受。现在加账号**零部署**：客户的栈建出那个角色就能投递。
+    //
+    // 🔴 **原来还有个 `length > 0` 门控** —— 白名单为空就整条策略不创建。
+    //    实测 2026-08-29：生产总线的 `Policy` 就是 `None`（从来没配过白名单），
+    //    也就是说跨账号事件回传**一直是死的**，而 UI 上照样能 onboard。
+    //    现在策略恒创建。
+    //
+    // ⚠️ 三个 Condition 各自不可省：
+    //
+    //  ① ArnLike aws:PrincipalArn —— **必须是 iam 形态**，不是 sts。
+    //     IAM 官方：「For IAM roles, the request context returns the ARN of the
+    //     role」「Do not specify the assumed role session ARN as a value for this
+    //     condition key」。写 sts:assumed-role 形态**永不匹配**，而不匹配的表现
+    //     是事件静默不到（零错误码）。
+    //     实测确认（scripts/probe_arnlike_bus_policy.py）：iam 到、sts 不到。
+    //     partition 用 ${AWS::Partition} 而不是 `arn:*:` —— 跨 partition 根本投
+    //     不到，通配零收益；而硬写 `arn:aws:` 会让中国区部署直接失效。
+    //
+    //  ② events:source == "aws.aidevops" —— 这一条**是真边界**。
+    //     `aws.` 是保留前缀：实测 PutEvents(Source="aws.aidevops") 直接返回
+    //     NotAuthorizedForSourceException「Not authorized for the source.」
+    //     （该错误码不在 PutEvents 的官方错误表里，只能实测出来）。
+    //     ⇒ 攻击者伪造不出这个 source；而服务产生的保留前缀 source **能**被
+    //       跨账号转发（同一份实测的 C 段用 aws.events 验过）。
+    //     残留面只剩「转发他自己账号里真实产生的 aws.aidevops 事件」，那种事件
+    //     的顶层 account 是他自己的（服务盖章），callback 的账号校验会拒。
+    //
+    //  ③ Null events:source = "false" —— 防空集为真。
+    //     EventBridge UG 明写 `ForAllValues` 不配 `Null` 检查时，缺键会在空集上
+    //     求值并返回 true，「A principal can therefore bypass the intended source
+    //     restriction」。
+    //
+    // ⚠️ Principal 只能是 `{ AWS: "*" }` —— Principal 元素不支持部分通配
+    //    （官方：「You cannot use a wildcard to match part of a principal name
+    //    or ARN」），收紧只能靠 Condition。
+    //
+    // ⚠️ 角色名必须与两份成员模板里的一致：
+    //    member-account-onboarding.yaml 的 notiops-devops-forwarder-role-<账号>，
+    //    以及改动① 要往 member-devops-agent.yaml 加的那个（带 -m<系统账号> 后缀）。
+    //    通配 `-*` 同时覆盖两种形态。
+    new events.CfnEventBusPolicy(this, "DevOpsAgentEventBusPolicy", {
+      eventBusName: devopsEventBus.eventBusName,
+      statementId: "AllowNotiOpsForwarderRolesPutAidevopsEvents",
+      statement: {
+        Effect: "Allow",
+        Principal: { AWS: "*" },
+        Action: "events:PutEvents",
+        Resource: devopsEventBus.eventBusArn,
+        Condition: {
+          ArnLike: {
+            "aws:PrincipalArn":
+              `arn:${cdk.Aws.PARTITION}:iam::*:role/notiops-devops-forwarder-role-*`,
+          },
+          "ForAllValues:StringEquals": { "events:source": "aws.aidevops" },
+          Null: { "events:source": "false" },
+          // 🔴 **不加 `aws:PrincipalOrgID`。这一条我加过又撤回了，理由记在这里。**
+          //
+          //    2026-08-30 上午按 review 建议加了它（「orgMode 下追加保留是可以
+          //    不降的降级」）。当天下午另一轮 review 抓出：**它把整个功能的核心
+          //    场景堵死了。**
+          //
+          //    这四个 Condition 在**同一条语句**里 ⇒ AND。而：
+          //
+          //    ```
+          //    部署账号是组织管理账号 → setup.sh 自动置 ORG_MODE=true（无交互）
+          //    「手动接入」存在的**全部理由**就是**组织外**账号
+          //      （partner-resold 多 payer：客户没有 payer 权限，
+          //        organizations:ListAccounts AccessDenied，StackSets 不可用）
+          //    ⇒ 那些账号的 PrincipalOrgID 必然对不上 ⇒ 事件 100% 到不了
+          //    ⇒ 转发角色建了、规则建了、总线 ARN 预填对了，零错误码
+          //    ```
+          //
+          //    实测确认：拟部署账号在 o-ddddeeeeff，要手动接入的那个成员
+          //    账号在 o-aaaabbbbcc —— 两个不同的 org，正是这个形态。
+          //
+          // ⚠️ 拆成两条语句（一条给 org 内、一条给组织外）也没有意义：
+          //    组织外那条必然是 `ArnLike + source`，而它是 org 内那条的超集
+          //    ⇒ 等价于不加。
+          //
+          // ⚠️ 所以残留面是**设计接受**的，不是遗漏：外部人猜到总线 ARN
+          //    （`arn:aws:events:<区>:<部署账号>:event-bus/notiops-devops-events`，
+          //    名字是硬编码常量）+ 在自己账号建一个 `notiops-devops-forwarder-role-*`
+          //    的角色，就能把他账号里**真实产生**的 aws.aidevops 事件转过来。
+          //    伪造不了（`PutEvents` 拒 `aws.` 保留前缀，实测；⚠️ 该行为
+          //    **AWS 未文档化**，且依赖大小写敏感 —— `AWS.aidevops` 能过
+          //    PutEvents，只是过不了下面这条 `StringEquals` 与规则的 pattern）。
+          //    callback 的 step 2 会拒未登记账号，代价上限是一次 Lambda invoke。
+          //    ⚠️ 那条通道**仍然没有告警** —— 见 §五 的「已知未处理」。
+        },
+      },
+    });
 
-    if (orgMode) {
-      // 多账号(Organizations)模式：整组放行，双重条件
-      //  1. aws:PrincipalOrgID == 本组织 — 只有组织内账号能投递
-      //  2. events:source == "aws.aidevops" — 只接受 DevOps Agent 调查事件
-      // 免去逐账号白名单维护；实际采集/调查范围仍由 config 表 enabled 账号控制。
-      new events.CfnEventBusPolicy(this, "DevOpsAgentEventBusPolicy", {
-        eventBusName: devopsEventBus.eventBusName,
-        statementId: "AllowOrgAccountsForwardAidevopsEvents",
-        statement: {
-          Effect: "Allow",
-          Principal: { AWS: "*" },
-          Action: "events:PutEvents",
-          Resource: devopsEventBus.eventBusArn,
-          Condition: {
-            StringEquals: {
-              "aws:PrincipalOrgID": organizationId,
-              "events:source": "aws.aidevops",
-            },
-          },
+    new cdk.CfnOutput(this, "DevOpsAgentBusPolicyJudgement", {
+      // 值保持纯 ASCII：它会被 setup.sh 用 jq 取出后直接 echo，含中文/em-dash
+      // 会在部分终端显示为乱码。中文说明放 description。
+      value:
+        "ArnLike aws:PrincipalArn arn:<partition>:iam::*:role/"
+        + "notiops-devops-forwarder-role-* AND events:source=aws.aidevops",
+      description:
+        "Custom Event Bus 的跨账号 PutEvents 判据。加账号无需重新部署 —— "
+        + "客户栈建出该名字的转发角色即可投递（原来的账号白名单已废弃）",
+    });
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 资源巡检（spec resource-inspection，Phase 5）
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    //   EventBridge (rate 15 min) ──► 调度器 Lambda
+    //                                    │  读定时配置（DDB，不是每客户一条 Rule）
+    //                                    │  抢 run 锁 → 快照配置 → 查额度
+    //                                    ▼
+    //                                 SQS ──► 执行 Lambda ──► DLQ
+    //
+    // ⚠️ 为什么不给每个客户建 Rule：老系统把 cron 写死在 CDK 里（下面那 5 条
+    //    DailyXxxRule），客户改巡检时间必须改代码重新部署。代价是调度粒度
+    //    = 15 分钟，所以 UI 必须把可选时刻限制成 15 分钟整数倍。
+
+    // ─── 巡检任务队列 + DLQ ───
+    // ⚠️ 两个队列都没显式写 `encryption` —— CDK 默认就是 SSE-SQS
+    //    （见 aws-cdk-lib.aws_sqs 文档「By default queues are encrypted using
+    //    SSE-SQS」）。所以 synth 产物里看不到 SqsManagedSseEnabled 不是漏配，
+    //    而是服务端默认值。`enforceSSL` 管的是**传输中**（Deny 非 TLS 请求），
+    //    与静态加密是两件事，两个都要。
+    const inspectionDlq = new sqs.Queue(this, "InspectionDlq", {
+      queueName: "notiops-inspection-dlq",
+      // 14 天 = SQS 上限。DLQ 里的消息是要人来看的，短了会在假期后消失。
+      retentionPeriod: cdk.Duration.days(14),
+      enforceSSL: true,
+    });
+
+    const inspectionQueue = new sqs.Queue(this, "InspectionQueue", {
+      queueName: "notiops-inspection-tasks",
+      // ⚠️ visibilityTimeout 必须 ≥ 执行 Lambda 的 timeout（这里 15 分钟）。
+      //    小于它会让还在跑的消息重新可见 → 同一账号被并发巡检两次。
+      //    真正的互斥靠 DDB 条件写的 run 锁，但那时第二次会白跑一遍
+      //    GetMetricData（有费用）才被拒。
+      visibilityTimeout: cdk.Duration.minutes(16),
+      retentionPeriod: cdk.Duration.days(4),
+      enforceSSL: true,
+      deadLetterQueue: {
+        queue: inspectionDlq,
+        // 3 次：一次瞬时限流能自愈，真正的坏消息 3 次后进 DLQ 不无限重放。
+        maxReceiveCount: 3,
+      },
+    });
+    inspectionQueue.grantSendMessages(lambdaRole);
+    inspectionQueue.grantConsumeMessages(lambdaRole);
+
+    // ─── 调度器 Lambda ───
+    const logGroupInspectionScheduler = createLogGroup(
+      "LogGroupInspectionScheduler",
+      "notiops-inspection-scheduler",
+    );
+    const inspectionSchedulerLambda = new lambda.Function(
+      this,
+      "InspectionSchedulerLambda",
+      {
+        functionName: "notiops-inspection-scheduler",
+        runtime: lambda.Runtime.PYTHON_3_14,
+        handler: "lambda_inspection_scheduler.handler.handler",
+        code: lambdaCode,
+        logGroup: logGroupInspectionScheduler,
+        role: lambdaRole,
+        // 只做「读配置 → 抢锁 → 发消息」，不拉指标。60 秒足够 100 个账号。
+        timeout: cdk.Duration.seconds(120),
+        memorySize: 256,
+        layers: [depsLayer],
+        environment: {
+          ...lambdaEnv,
+          INSPECTION_TABLE: inspectionTable.tableName,
+          INSPECTION_QUEUE_URL: inspectionQueue.queueUrl,
+          // 排障 space + 巡检 space 都要，pace 必须跨两个求和（R12.5c）：
+          // CloudWatch 的维度是 AgentSpaceUUID，一个 space 一条曲线，
+          // 而 credits 是账号级的。只读一个会系统性低估 pace。
+          DEVOPS_AGENT_SPACE_ID: agentSpace.attrAgentSpaceId,
+          INSPECT_AGENT_SPACE_ID: inspectionAgentSpace.attrAgentSpaceId,
+          // 月度 DA 判读额度上限（秒）。R12.2 的**分母**。
+          //
+          // 🔴 缺省 `-1` = 「上限未知」。那时 `BudgetState.used_ratio` 恒为 0、
+          // tier 恒为 NORMAL（即**不启用预算护栏**），且打点侧不发
+          // `DaQuotaUsedRatio` —— P3 那条 Alarm 会停在 INSUFFICIENT_DATA，
+          // 明示「额度没有被监控」而不是假装健康。
+          //
+          // ⚠️ 之前这个 env **压根没设**，于是 `_env("MONTHLY_LIMIT_SECONDS","-1")`
+          // 恒取兜底值 —— 预算护栏在所有部署里都是关着的，而没有任何信号说明
+          // 这一点。Phase 0 的 0.4b（额度的权威读法）有结论后应改为自动填。
+          MONTHLY_LIMIT_SECONDS: String(
+            this.node.tryGetContext("monthlyLimitSeconds") ?? "-1"),
         },
-      });
-    } else if (devopsAgentBusinessAccounts.length > 0) {
-      new events.CfnEventBusPolicy(this, "DevOpsAgentEventBusPolicy", {
-        eventBusName: devopsEventBus.eventBusName,
-        statementId: "AllowWhitelistedBusinessAccountsForwardAidevopsEvents",
-        statement: {
-          Effect: "Allow",
-          Principal: { AWS: "*" },
-          Action: "events:PutEvents",
-          Resource: devopsEventBus.eventBusArn,
-          Condition: {
-            StringEquals: {
-              "aws:PrincipalAccount": devopsAgentBusinessAccounts,
-              "events:source": "aws.aidevops",
-            },
-          },
+        description:
+          "资源巡检调度器 — 每 15 分钟判定该跑哪些 (类型 × 账号)，抢锁后 fan-out 到 SQS",
+      },
+    );
+
+    // ─── 一条 Rule 管全部客户（R11.1a）───
+    new events.Rule(this, "InspectionSchedulerRule", {
+      ruleName: "notiops-inspection-scheduler",
+      description:
+        "资源巡检调度器 — 每 15 分钟一次；具体时刻存 DDB，改时间不需要重新部署",
+      schedule: events.Schedule.rate(cdk.Duration.minutes(15)),
+      targets: [new targets.LambdaFunction(inspectionSchedulerLambda)],
+    });
+
+    // ─── 执行 Lambda（SQS 消费者）───
+    const logGroupInspectionExecutor = createLogGroup(
+      "LogGroupInspectionExecutor",
+      "notiops-inspection-executor",
+    );
+    const inspectionExecutorLambda = new lambda.Function(
+      this,
+      "InspectionExecutorLambda",
+      {
+        functionName: "notiops-inspection-executor",
+        runtime: lambda.Runtime.PYTHON_3_14,
+        handler: "lambda_inspection_executor.handler.handler",
+        code: lambdaCode,
+        logGroup: logGroupInspectionExecutor,
+        role: lambdaRole,
+        // 15 分钟：一轮要拉 GetMetricData（400/批、并发 8）+ DescribeEvents +
+        // 判定 + 落库。⚠️ 必须 < 队列的 visibilityTimeout(16 分钟)，
+        // 否则还在跑的消息会重新可见 → 同账号被并发巡检。
+        timeout: cdk.Duration.minutes(15),
+        // 1024 MB：Lambda 的 CPU 配额随内存线性增长，而这个函数是
+        // 并发 8 路 HTTP + JSON 解析，CPU 是瓶颈而非内存。
+        memorySize: 1024,
+        layers: [depsLayer],
+        environment: {
+          ...lambdaEnv,
+          INSPECTION_TABLE: inspectionTable.tableName,
+          DEVOPS_AGENT_SPACE_ID: agentSpace.attrAgentSpaceId,
+          INSPECT_AGENT_SPACE_ID: inspectionAgentSpace.attrAgentSpaceId,
+          // 🔴 DA 判读**正文**的语言（R11b.10）。随载荷下发，
+          // skill 照它输出。此前没设，一直吃 `judge_findings(locale="zh")`
+          // 的默认值 —— 对当前客户恰好是对的，但那是巧合。
+          // ⚠️ 不复用 `DEFAULT_LOCALE`：那个在 report_delivery/push_handler
+          // 里的兜底是 "en"，共用会把巡检报告拖成英文。
+          // ⚠️ 推送外壳的语言是**另一层**，由每个投递目标的 `locale` 决定
+          // （判读一条一份、多个 chat 共享，按目标定必然出现
+          //  「外壳中文、正文英文」的混合卡片）。
+          // ⚠️ 与巡检 space 的 `locale` **同一个值**（见那里的说明）。
+          //    两处各写一遍 tryGetContext 会漂移 —— 那时 space 说英文、
+          //    payload 说中文，而判读听哪个不确定。
+          INSPECTION_REPORT_LOCALE: inspectionReportLocale,
         },
-      });
+        description: "资源巡检执行器 — 采集指标、跑判定、落 finding",
+      },
+    );
+
+    inspectionExecutorLambda.addEventSource(
+      new lambdaEventSources.SqsEventSource(inspectionQueue, {
+        // ⚠️ batchSize=1。一条消息 = 一个账号一整轮巡检（最长 15 分钟），
+        //    批量取多条只会让第一条之后的全部超时。
+        batchSize: 1,
+        // ★ 必须开。不开的话「函数抛异常」会让**整批**重新可见 ——
+        //   包括已经跑完的消息，那意味着重复付 GetMetricData、重复派 DA 调查。
+        //   handler 侧对应地返回 {batchItemFailures: [{itemIdentifier: id}]}。
+        //   ⚠️ 官方文档明列：键名写错 / 值为空串 / 值指向不存在的 messageId
+        //   都会让整批被判失败，所以 handler 那侧有专门的测试钉住形状。
+        reportBatchItemFailures: true,
+        // 同一时刻最多 3 个账号在跑。取 3 而不是更多：DA 的 custom agent
+        // 并发是 1，派再多也只是排队，而排队会让客户的交互式深度调查等在后面。
+        maxConcurrency: 3,
+      }),
+    );
+
+    new cdk.CfnOutput(this, "InspectionQueueUrl", {
+      value: inspectionQueue.queueUrl,
+      description: "巡检任务队列 URL",
+    });
+
+    // ─── 对账 Lambda（每小时；R13.13）───
+    //
+    // ⚠️ 设计写的是「扩展既有对账 Lambda（不新建）」，**那个前提是错的**：
+    // 本仓没有对账 Lambda。全部 EventBridge Rule 都是每日 cron 或事件驱动，
+    // 没有任何 `rate(1 hour)`；`devops_agent_callback` 是纯事件驱动、无定时。
+    // 早期设计里画的「对账 Lambda（每小时，扩展既有实现）」指向一个不存在
+    // 的组件。⇒ 这里新建。
+    //
+    // 它做两件事：
+    //   ① 已派发但判读没回来的 task → GetBacklogTask 核实（补事件丢失）
+    //   ② 今天该跑的账号有没有 run 行 / 跑了的完整度够不够
+    // 两者都**只判定不重投** —— 按墙钟时长判死会开正反馈，见
+    // `inspection/domain/dispatch_recon.py` 的模块 docstring。
+    const logGroupInspectionReconciler = createLogGroup(
+      "LogGroupInspectionReconciler",
+      "notiops-inspection-reconciler",
+    );
+    const inspectionReconcilerLambda = new lambda.Function(
+      this,
+      "InspectionReconcilerLambda",
+      {
+        functionName: "notiops-inspection-reconciler",
+        runtime: lambda.Runtime.PYTHON_3_14,
+        handler: "lambda_inspection_reconciler.handler.handler",
+        code: lambdaCode,
+        logGroup: logGroupInspectionReconciler,
+        role: lambdaRole,
+        // 只做「Query → GetBacklogTask → UpdateItem」，不拉指标、不跑判定。
+        // 上界由 handler 里的 MAX_PROBES_PER_RUN 控制（200 次 probe）。
+        timeout: cdk.Duration.minutes(5),
+        memorySize: 256,
+        layers: [depsLayer],
+        environment: {
+          ...lambdaEnv,
+          INSPECTION_TABLE: inspectionTable.tableName,
+          // 派发映射行里通常带 agent_space_id；这个 env 是兜底
+          // （老行没有那个字段时用它）。
+          INSPECT_AGENT_SPACE_ID: inspectionAgentSpace.attrAgentSpaceId,
+          // 🔴 补齐重投要往队列发消息（R13.15）。没有它对账
+          // 只检测不补齐 —— handler 会记一条 warning 说明这一点，
+          // 而不是静默（否则「为什么缺口一直在」查不到「补齐压根没配」）。
+          INSPECTION_QUEUE_URL: inspectionQueue.queueUrl,
+        },
+        description:
+          "资源巡检对账 — 每小时核实已派发判读的终态，并检查采集覆盖缺口",
+      },
+    );
+
+    new events.Rule(this, "InspectionReconcilerRule", {
+      ruleName: "notiops-inspection-reconciler",
+      description:
+        "资源巡检对账 — 每小时一次；补 EventBridge 事件丢失 + 查采集缺口",
+      // ⚠️ 每小时，不是每天。改成每天会让「判读回不来」最长晚一天才被发现，
+      // 而巡检报告是当天要交付的。
+      schedule: events.Schedule.rate(cdk.Duration.hours(1)),
+      targets: [new targets.LambdaFunction(inspectionReconcilerLambda)],
+    });
+
+    // ─── 推送 Lambda（每 15 分钟；R11b.1~R11b.10）───
+    //
+    // 🔴 **独立于巡检的 cron，不是巡检跑完顺手发**（R11b.6）。挂在巡检末尾
+    // 的话推送时刻 = 巡检完成时刻，而那是配置好的凌晨批处理时间；更麻烦的是
+    // 巡检是逐账号 fan-out（一账号一条 SQS 消息），顺手发意味着 50 个账号
+    // 发 50 次，而 R11b.3 的模型是「一个 chat 一份摘要」。
+    //
+    // ⚠️ Rule 是 15 分钟一次，**真正的时段窗口在代码里判**
+    // （`inspection/domain/push_policy.in_push_window`，默认工作日 03:00 UTC
+    // = 北京 11:00，即巡检默认时刻 02:00 UTC 之后一小时）。与调度器同思路：
+    // cron 粗、判定细 —— 让客户改推送时间不需要重新部署。
+    //
+    // ⚠️ `WEB_BASE_URL` 空着**不是错误**：没配就不放深链（R11b.7 的链接会
+    // 被省掉），照 `bff/web-chat/devops_investigate.mjs` 对
+    // REPORTS_CDN_DOMAIN 的处理。它取 WebChat 前端的 CloudFront 域名，
+    // 而那个 distribution 在**另一个 stack**（WebChatStack）里 ——
+    // 走 context 而不是跨栈引用，避免给共享后端栈加一条部署顺序依赖。
+    const logGroupInspectionPush = createLogGroup(
+      "LogGroupInspectionPush",
+      "notiops-inspection-push",
+    );
+    const inspectionWebBaseUrl =
+      (this.node.tryGetContext("webBaseUrl") as string | undefined) ?? "";
+    if (!inspectionWebBaseUrl) {
+      cdk.Annotations.of(this).addInfo(
+        "巡检推送未配置 webBaseUrl —— 推送正文里不会有「查看详情 / 查看全部」深链。" +
+        "部署完 WebChatStack 后用 -c webBaseUrl=<ChatUrl 输出值> 重新部署即可补上。",
+      );
+    }
+    const inspectionPushLambda = new lambda.Function(
+      this,
+      "InspectionPushLambda",
+      {
+        functionName: "notiops-inspection-push",
+        runtime: lambda.Runtime.PYTHON_3_14,
+        handler: "lambda_inspection_push.handler.handler",
+        code: lambdaCode,
+        logGroup: logGroupInspectionPush,
+        role: lambdaRole,
+        // 只做「Query → 拼 markdown → 调 IM API」，不拉指标、不跑判定。
+        // 逐账号一次 Query finding + 一次 Query 推送状态。
+        timeout: cdk.Duration.minutes(5),
+        memorySize: 512,
+        layers: [depsLayer],
+        environment: {
+          ...lambdaEnv,
+          INSPECTION_TABLE: inspectionTable.tableName,
+          WEB_BASE_URL: inspectionWebBaseUrl,
+          // 三个 platform sender 各自从 Secrets Manager 读凭证；
+          // 名字与 DevOpsCallbackLambda 那一份保持一致，否则
+          // `is_configured()` 返回 false → 整平台静默不投。
+          // ⚠️ 飞书传 **ARN**、Slack 传 **name** —— 这不是笔误，
+          //    `slack_sender.py` 把这个 env 的值直接当 SecretId 用，而
+          //    BotStack 传给 bot 容器的也是 name，契约统一在 name 上。
+          //    照抄成 secretArn 不会报错（GetSecretValue 两者都吃），
+          //    但会与 BotStack 分叉。
+          FEISHU_SECRET_ARN: feishuSecret.secretArn,
+          SLACK_BOT_TOKEN_ARN: slackBotTokenSecret.secretName,
+        },
+        description:
+          "资源巡检推送 — 工作日按时段窗口把当日变化投递给各 IM 群（分级节奏 + 退避重推）",
+      },
+    );
+
+    new events.Rule(this, "InspectionPushRule", {
+      ruleName: "notiops-inspection-push",
+      description:
+        "资源巡检推送 — 每 15 分钟检查是否进入推送时段窗口（默认工作日 03:00 UTC）",
+      schedule: events.Schedule.rate(cdk.Duration.minutes(15)),
+      targets: [new targets.LambdaFunction(inspectionPushLambda)],
+    });
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 巡检告警（R11c.2 / R11c.3）
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // 数据源是 EMF：`inspection/adapters/metrics.py` 往 stdout 写一行合规 JSON，
+    // CloudWatch 自动抽取。所以这些 Alarm **不需要** PutMetricData 权限。
+    //
+    // ⚠️ 下面每个 `new cloudwatch.Metric` 都**不带 dimensionsMap** ——
+    // 它匹配的是打点侧那个**空 DimensionSet** 生成的指标（跨 run_type 聚合）。
+    // 打点侧一旦把空集删掉，这些 Alarm 全部查不到数据点 → 假绿灯。
+    // 那一条由 `tests/test_inspection_observability.py` 的断言守住。
+    //
+    // 🔴 命名前缀 `notiops-inspection-` 不是装饰：客户推送规则靠它排除我们的
+    // 运维告警（见下面 OPS_ALARM_NAME_PREFIX 的使用处）。改前缀等于把运维
+    // 告警推给客户。
+
+    const OPS_ALARM_NAME_PREFIX = "notiops-inspection-";
+    const INSPECTION_METRIC_NAMESPACE = "NotiOps/Inspection";
+
+    // ── ops 告警通道：**必须**独立于客户推送通道（R11c.2）──
+    //
+    // 🔴 为什么不复用 `notiops-alerts`（上面那个 snsTopic）：
+    //   ① 它的 displayName 是「闲置资源告警」，语义上是客户面的；
+    //   ② 它的 publish 权限已经给了共享的 `lambdaRole`，任何采集 Lambda 都能发；
+    //   ③ 它的 ARN 在 `lambdaEnv` 里对**所有** Lambda 可见。
+    // 运维告警混进去，客户就会收到我们的内部故障 —— R11c.2 明确禁止。
+    //
+    // ⚠️ 这个 topic 的 ARN **刻意不放进 `lambdaEnv`**。那个 env 块被每个采集
+    // Lambda 共享，放进去等于把「谁能往运维通道发东西」重新变成所有人。
+    const opsAlertTopic = new sns.Topic(this, "InspectionOpsAlertTopic", {
+      topicName: "notiops-inspection-ops-alerts",
+      displayName: "巡检运维告警（内部，勿转客户）",
+    });
+
+    // 收件人由部署方决定：`-c opsAlertEmail=sre@example.com`。
+    // ⚠️ 不填也要建 topic —— Alarm 必须有 action，否则它只在控制台变红，
+    // 而「没人看控制台」正是 R11c.3 存在的原因。不填时至少 topic 在，
+    // 事后订阅一下即可，不用重新部署。
+    const opsAlertEmail = this.node.tryGetContext("opsAlertEmail") as string | undefined;
+    if (opsAlertEmail) {
+      opsAlertTopic.addSubscription(new subscriptions.EmailSubscription(opsAlertEmail));
+    } else {
+      cdk.Annotations.of(this).addInfo(
+        "巡检运维告警 topic 已创建但无订阅者 —— 告警只会在控制台变红。" +
+        "传 -c opsAlertEmail=<邮箱> 或事后手动订阅 notiops-inspection-ops-alerts。",
+      );
     }
 
-    new cdk.CfnOutput(this, "DevOpsAgentBusinessAccountsWhitelist", {
-      // 值保持纯 ASCII：它会被 setup.sh 用 jq 取出后直接 echo，含中文/em-dash 会在部分终端显示为乱码。
-      // 中文说明放在双语标签(setup.sh 的 t())与本 output 的 description 里，不进入 value 本身。
-      value:
-        devopsAgentBusinessAccounts.length > 0
-          ? devopsAgentBusinessAccounts.join(",")
-          : "(none configured; Custom Bus accepts only same-account IAM principals)",
-      description: "Custom Event Bus 允许跨账户 PutEvents 的业务账户白名单（来自 CDK context devopsAgentBusinessAccounts）",
+    const opsAction = new cwActions.SnsAction(opsAlertTopic);
+
+    /** 建一条巡检指标。**不带维度** —— 见上面的说明。 */
+    const inspMetric = (metricName: string, statistic: string,
+                        period: cdk.Duration) =>
+      new cloudwatch.Metric({
+        namespace: INSPECTION_METRIC_NAMESPACE,
+        metricName,
+        statistic,
+        period,
+      });
+
+    const mkAlarm = (
+      id: string, name: string,
+      props: Omit<cloudwatch.AlarmProps, "alarmName">,
+    ) => {
+      const a = new cloudwatch.Alarm(this, id, {
+        alarmName: `${OPS_ALARM_NAME_PREFIX}${name}`,
+        ...props,
+      });
+      a.addAlarmAction(opsAction);
+      // OK 也通知：只在 ALARM 时通知会让「恢复了没有」只能靠人去看控制台，
+      // 而值班的人需要知道事情结束了。
+      a.addOkAction(opsAction);
+      return a;
+    };
+
+    // ── P1：连续 2 天全账号失败（含「压根没跑」）──
+    //
+    // 判据是「成功数 < 1」而不是「失败数 > 0」：后者在部分账号成功时也会响，
+    // 而那是 P2 的职责（completeness）。
+    //
+    // 🔴 `treatMissingData: BREACHING` 是刻意的。巡检整体停摆（调度器挂了 /
+    // kill switch 被拉了 / EventBridge 规则被删）时**一个数据点都不会有**，
+    // 而那正是这条告警最该抓的形态。用 NOT_BREACHING 会让「彻底没跑」显示成绿的。
+    //
+    // ⚠️ 代价要知道：**全新部署在还没登记任何账号时这条会红**（没有 run →
+    // 无数据 → BREACHING）。这是有意的取舍 —— 第一天一次误报，
+    // 换「永远不会静默」。topic 默认无订阅者，所以不会真的吵到人。
+    mkAlarm("InspectionAllAccountsFailedAlarm", "all-accounts-failed", {
+      alarmDescription:
+        "P1 连续 2 天没有任何一轮巡检成功（全账号失败，或调度整体停摆）。" +
+        "排查顺序：kill switch(appconfig#inspection/enabled) → 调度器日志 → SQS DLQ。",
+      metric: inspMetric("RunSucceeded", "Sum", cdk.Duration.days(1)),
+      threshold: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+      evaluationPeriods: 2,
+      treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+    });
+
+    // ── P1：run success 但零产出 ──
+    //
+    // 判据在打点侧（`observability.signals_from_stats`）：success + 评估过实例
+    // + `series_written == 0`。**不是**「零 finding」—— 后者可能是真健康。
+    mkAlarm("InspectionZeroOutputAlarm", "zero-output", {
+      alarmDescription:
+        "P1 有 run 报告 success 但一条指标序列都没写入 —— 典型成因是指标名/维度写错" +
+        "（GetMetricData 返回 200 空数据点，批次不算失败，于是 status 是绿的）。",
+      metric: inspMetric("RunZeroOutput", "Sum", cdk.Duration.days(1)),
+      threshold: 0,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      evaluationPeriods: 1,
+      // 没跑不是这条的职责（上面那条管），所以缺数据按不违规处理。
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    // ── P2：单账号 completeness < 95% ──
+    //
+    // ⚠️ 用 `Minimum` 而不是 `Average`：平均值会把一个 60% 的账号
+    // 稀释进十个 100% 里，于是「有账号采集不全」永远不响。
+    // 这也是为什么 account_id **不需要**进维度（那会造出 N 条曲线）。
+    mkAlarm("InspectionLowCompletenessAlarm", "low-completeness", {
+      alarmDescription:
+        "P2 至少有一个账号本轮采集完整度低于 95%。看板「巡检总览」的 run 表" +
+        "可以定位到具体账号；EMF 行里的 account_id 字段亦可用 Logs Insights 查。",
+      metric: inspMetric("Completeness", "Minimum", cdk.Duration.days(1)),
+      threshold: 95,
+      comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+      evaluationPeriods: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    // ── P2：派发失败率 > 10% ──
+    //
+    // ⚠️ 打点侧对 `dry_run` 轮**不发**这个指标：预演刻意「照常算、不真发」，
+    // built>0 而 dispatched==0 → 失败率 100%。灰度第 ① 段每天都在做预演，
+    // 不豁免就是每天误报一次。
+    mkAlarm("InspectionDispatchFailureAlarm", "dispatch-failure-ratio", {
+      alarmDescription:
+        "P2 CreateBacklogTask 派发失败率超过 10%。看 executor 日志里的" +
+        "「派发 task 失败」；额度耗尽走的是另一条路径（不算失败，走 skipped_by_gate）。",
+      metric: inspMetric("DispatchFailureRatio", "Maximum", cdk.Duration.days(1)),
+      threshold: 10,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      evaluationPeriods: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    // ── P2：派发出去但没落映射（R11c.3 之外**额外加的一条**）──
+    //
+    // 为什么值得单独一条：这不是「没发出去」，而是**发出去了、额度花了、
+    // 判读永久回不来**。它与派发失败的处置完全不同 ——
+    // 前者要查响应解析，后者要查 API/额度。合进上面那条会让两种成因
+    // 在告警上无法区分，而看板已经把它单独标红了（dispatch_gap）。
+    mkAlarm("InspectionDispatchUnmappedAlarm", "dispatch-unmapped", {
+      alarmDescription:
+        "P2 有判读任务已派发但未能记录 taskId → 那些分析结果永久无法回填，" +
+        "而额度已经消耗。查 executor 日志「派发成功但响应里没有 taskId」。",
+      metric: inspMetric("DispatchUnmapped", "Sum", cdk.Duration.days(1)),
+      threshold: 0,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      evaluationPeriods: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    // ── P3：DA 额度 > 80% ──
+    //
+    // 🔴 `treatMissingData: MISSING` 是这条的关键，不是随手选的。
+    //
+    // 打点侧在 `MONTHLY_LIMIT_SECONDS <= 0`（= 当前所有部署的状态，
+    // 因为 Phase 0 的 0.4b「额度的权威读法」还没结论）时**不发**这个指标。
+    // 那时：
+    //   · NOT_BREACHING → 显示 OK  ← **假绿灯**，我们压根没在监控额度
+    //   · BREACHING     → 显示 ALARM ← 天天红，两周后没人看
+    //   · MISSING       → INSUFFICIENT_DATA ← 「我们不知道」，视觉上与另两者都不同
+    // 见 https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/alarms-and-missing-data.html
+    //
+    // 想让它真正工作：`-c monthlyLimitSeconds=<秒>`（见调度器 env）。
+    mkAlarm("InspectionDaQuotaAlarm", "da-quota-high", {
+      alarmDescription:
+        "P3 本月 DA 判读额度已用超 80%。停在 INSUFFICIENT_DATA 表示额度上限未配置" +
+        "（-c monthlyLimitSeconds=…），那时额度完全没有被监控。",
+      metric: inspMetric("DaQuotaUsedRatio", "Maximum", cdk.Duration.hours(1)),
+      threshold: 80,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      evaluationPeriods: 1,
+      treatMissingData: cloudwatch.TreatMissingData.MISSING,
+    });
+
+    // ─── 对账兜底的两条告警（2026-08-30 补）───
+    //
+    // 🔴 在此之前那 6 条告警**一条都不看** probe_failed / no_mapping /
+    //    da_target_unresolved。而对账是「判读结果回不来」时的唯一兜底 ——
+    //    它自己坏掉了没有任何人会发现，因为它的既有约定就是
+    //    「拿不到状态什么都不做」（那是刻意的：按墙钟判死重投会形成正反馈）。
+    mkAlarm("InspectionReconDaTargetAlarm", "recon-da-target-unresolved", {
+      alarmDescription:
+        "P2 有账号的判读目标解析不出来（缺 inspect_agent_space_id / "
+        + "AssumeRole 失败），那些账号的对账兜底整条不工作。"
+        + "去管理页看那一行有没有「待更新栈」徽章，或点「测试连接」看 AWS 原话。",
+      // ⚠️ 指标名写**字面量**（与本文件其余 8 条一致）。一致性由
+      //    `scripts/test_inspection_infra_wired.py` 的那条元断言守着：
+      //    「每个 CDK 指标名都必须在发射器的 ALL_METRICS 里」。
+      metric: inspMetric("ReconcileDaTargetUnresolved", "Maximum",
+                         cdk.Duration.hours(1)),
+      threshold: 0,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      evaluationPeriods: 1,
+      // ⚠️ 缺数据当正常：对账每小时一轮，没有账号解析失败时这个指标是 0 而不是
+      //    不发射（emit_reconcile 把映射里的键全打出去）—— 但对账整轮没跑时
+      //    确实缺数据，那种情况由 zero-output 那条盖。
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    mkAlarm("InspectionReconProbeFailedAlarm", "recon-probe-failed", {
+      alarmDescription:
+        "P2 对账 probe 失败（GetBacklogTask 拿不到状态）。"
+        + "⚠️ 本模块刻意「拿不到状态什么都不做」（按墙钟判死重投会形成正反馈："
+        + "队列更长→更多被判死→额度烧光且永不收敛），所以这条告警是唯一信号。"
+        + "常见原因：space id 错、跨账号 region 错、DA API 限流。",
+      metric: inspMetric("ReconcileProbeFailed", "Sum",
+                         cdk.Duration.hours(1)),
+      // ⚠️ 阈值不是 0：偶发一次限流不值得叫人。连续一小时 >3 条才是真问题。
+      threshold: 3,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      evaluationPeriods: 2,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    new cdk.CfnOutput(this, "InspectionOpsAlertTopicArn", {
+      value: opsAlertTopic.topicArn,
+      description:
+        "巡检运维告警 SNS Topic ARN（内部通道，勿订阅到客户群）",
     });
 
     // ─── SQS DLQ：Custom Bus Rule → Callback Lambda 投递失败落到此队列 ───
@@ -1323,7 +2406,8 @@ def handler(event, context):
         "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
         "**/node_modules/**", ".git/**", ".hypothesis/**",
         "*.md", ".pytest_cache/**", ".kiro/**",
-        "lambda_layer/**", "cdk.out/**", "**/__pycache__/**",
+        "lambda_layer/**", "lambda_layer_im/**", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
+        "dist/**",   // 见上面 lambdaCode 处的长注释：漏了会撞 Lambda 250MB 解压上限
         "platforms/**", "agent/**",
         "api/**", "lambda1_collector/**", "lambda2_analyzer/**",
         "lambda3_health_checker/**", "lambda4_notifier/**",
@@ -1345,6 +2429,24 @@ def handler(event, context):
       role: lambdaRole,
       timeout: cdk.Duration.seconds(120),
       memorySize: 256,
+      // 🔴 **函数级 DLQ**（2026-08-29 实测补上）。
+      //
+      //    实测：`AsyncEventsReceived (76) == Invocations (76)` ——
+      //    EventBridge 对这个函数的每一次调用都是**异步**的。于是：
+      //
+      //      EventBridge 的 retryAttempts:2 + 那个 callbackDlq
+      //        → 只兜「**投不进去**」（Invoke 拿不到 202）
+      //      函数内抛异常
+      //        → Lambda 自己异步重试 2 次 → **丢弃**，落点为 None
+      //
+      //    也就是说 `handler` docstring 里那句「顶层不吞异常 …让 EventBridge
+      //    重试 → DLQ」**在函数抛异常这条路上不成立**：事件被静默丢掉。
+      //    而 `_inspect_space_ids()` 选择「读 DDB 失败就抛」的理由正是
+      //    「抛 → DLQ → 可重投（可逆）」—— 那个理由靠这一行才成立。
+      //
+      // ⚠️ 复用同一个 `callbackDlq`：两类失败（投不进去 / 函数抛）落同一个队列，
+      //    排查时只有一个地方要看。CDK 会自动给函数角色补 sqs:SendMessage。
+      deadLetterQueue: callbackDlq,
       layers: [depsLayer],
       environment: {
         ...lambdaEnv,
@@ -1356,6 +2458,22 @@ def handler(event, context):
         // containers, keeping the contract uniform.
         SLACK_BOT_TOKEN_ARN: slackBotTokenSecret.secretName,
         BEDROCK_API_KEY_SECRET_ARN: bedrockApiKeySecret.secretArn,
+        // 巡检表 —— callback 要把判读文本按 finding_id 回拼到 finding 行
+        // （R9.6）。权限走 lambdaRole，第 318 行已 grant。
+        //
+        // ⚠️ 不注入的后果是**静默的**：全部巡检判读永久回不来，
+        // 现象是「finding 旁边总是空的」，而那与「DA 说这条没问题」
+        // 在看板上长得一样。handler 侧对空值记 ERROR 兜住。
+        INSPECTION_TABLE: inspectionTable.tableName,
+        // 巡检 space id —— callback 靠它区分「这次调查是巡检的还是排障的」
+        // （R12.5d）。两类事件走**同一个** callback：
+        // EventBridge 规则只按 source + detail-type 匹配，没有 space 维度。
+        //
+        // ⚠️ 不注入的后果是**静默的**：`callback_route.route_of()` 判据恒为空 →
+        // 全部按排障处理 → 巡检判读事件白跑一次 Bedrock 摘要 + 写一条没有
+        // 消费者的 progress 行，而且「CDK 没重新部署」会表现成
+        // 「巡检 callback 从来没触发过」。domain 侧对空值记 ERROR 兜住这点。
+        INSPECT_AGENT_SPACE_ID: inspectionAgentSpace.attrAgentSpaceId,
       },
       description:
         "DevOps Agent 调查结果回调 — Custom Event Bus 触发，AssumeRole 拉摘要 → Bedrock 精简 → 入 DDB",
@@ -1366,6 +2484,51 @@ def handler(event, context):
       "LITELLM_CONFIG_SECRET_ARN",
       liteLlmConfigSecret.secretName,
     );
+
+    // ─── callback 的两条告警（2026-08-29 补）───
+    //
+    // 🔴 在此之前 callback 这条链路**一条告警都没有**：那 6 条巡检告警全挂在
+    //    `NotiOps/Inspection` 自定义指标上，没有 log metric filter、没有函数
+    //    Errors 告警、也没有 DLQ 深度告警。于是所有「记 ERROR 然后继续」和
+    //    「抛出去」的处置都只存在于日志流里，没有人会发现。
+    //
+    // ⚠️ `AsyncEventsDropped` 是这类丢弃**唯一**会留下的痕迹（实测确认
+    //    EventBridge 对这个函数是异步调用：AsyncEventsReceived == Invocations）。
+    //    加了函数级 DLQ 之后正常情况下它应该恒为 0 —— 非 0 意味着连 DLQ 都没写进去。
+    mkAlarm("DevOpsCallbackAsyncDroppedAlarm", "callback-async-dropped", {
+      alarmDescription:
+        "P1 DevOps Agent callback 有异步事件被丢弃（连 DLQ 都没落）。"
+        + "每一条都是一次判读结果永久丢失：巡检那边表现为 finding 旁边一直是空的，"
+        + "排障那边表现为调查跑完了但卡片不来。",
+      metric: new cloudwatch.Metric({
+        namespace: "AWS/Lambda",
+        metricName: "AsyncEventsDropped",
+        dimensionsMap: { FunctionName: "notiops-devops-callback" },
+        statistic: "Sum",
+        period: cdk.Duration.minutes(5),
+      }),
+      threshold: 0,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      evaluationPeriods: 1,
+      // ⚠️ 没有丢弃时这个指标**不发射**，所以缺数据必须当「正常」——
+      //    当 BREACHING 会让告警长期红着，值班的人很快就学会忽略它。
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    mkAlarm("DevOpsCallbackDlqAlarm", "callback-dlq-nonempty", {
+      alarmDescription:
+        "P1 DevOps Agent callback 的 DLQ 里有消息。函数抛异常（Lambda 异步重试 "
+        + "2 次后落 DLQ）或 EventBridge 投递失败都会到这里。"
+        + "⚠️ 保留期 14 天 —— 过了就没了，要在那之前重投。",
+      metric: callbackDlq.metricApproximateNumberOfMessagesVisible({
+        period: cdk.Duration.minutes(5),
+        statistic: "Maximum",
+      }),
+      threshold: 0,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      evaluationPeriods: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
 
     // ─── EventBridge Rule on Custom Bus → Callback Lambda（带 DLQ + 2 次重试）───
     new events.Rule(this, "DevOpsAgentCallbackCustomRule", {
@@ -1382,6 +2545,17 @@ def handler(event, context):
           "Investigation Timed Out",
           "Investigation Cancelled",
           "Investigation Linked",
+          // R13.13b：官方语义是「matched skip criteria defined in
+          // a skill」，而巡检自己上传两份判读 skill → 这条路径**真实可达**。
+          // 少了它，SKIPPED 只能等对账 Lambda 每小时一次去 GetBacklogTask 才
+          // 发现 —— 在那之前 finding 上一直显示「判读缺失（原因未知）」。
+          //
+          // ⚠️ 判据取自官方文档的 10 个 detail-type，**不是** EventBridge
+          // schema registry。实测 registry 里**没有** InvestigationSkipped
+          // （2026-07 查 ap-northeast-1 与 us-east-1 都只有 9 个 Investigation
+          // schema）—— registry 滞后于文档。本文件上方那句「判据:schema
+          // registry 里存在该 schema」对新事件类型不可靠。
+          "Investigation Skipped",
         ],
       },
       targets: [
@@ -1409,6 +2583,17 @@ def handler(event, context):
           "Investigation Timed Out",
           "Investigation Cancelled",
           "Investigation Linked",
+          // R13.13b：官方语义是「matched skip criteria defined in
+          // a skill」，而巡检自己上传两份判读 skill → 这条路径**真实可达**。
+          // 少了它，SKIPPED 只能等对账 Lambda 每小时一次去 GetBacklogTask 才
+          // 发现 —— 在那之前 finding 上一直显示「判读缺失（原因未知）」。
+          //
+          // ⚠️ 判据取自官方文档的 10 个 detail-type，**不是** EventBridge
+          // schema registry。实测 registry 里**没有** InvestigationSkipped
+          // （2026-07 查 ap-northeast-1 与 us-east-1 都只有 9 个 Investigation
+          // schema）—— registry 滞后于文档。本文件上方那句「判据:schema
+          // registry 里存在该 schema」对新事件类型不可靠。
+          "Investigation Skipped",
         ],
       },
       targets: [
@@ -1436,6 +2621,13 @@ def handler(event, context):
         id: "expire-reports-7d",
         prefix: "reports/",
         expiration: cdk.Duration.days(7),
+      }, {
+        // 客户 CUR 仪表盘的当天缓存（cube/es/sp 超 DDB 400KB 单条上限，只能落 S3）。
+        // key 带日期、次日自然失效，但对象不会自己消失 —— 每天 4 个 panel × ~数 MB，
+        // 不清理就是一年几 GB 的纯垃圾。3 天而不是 1 天：给"翻看前两天缓存"留余量。
+        id: "expire-cur-dash-cache-3d",
+        prefix: "cur-dash-cache/",
+        expiration: cdk.Duration.days(3),
       }],
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
@@ -1507,7 +2699,8 @@ def handler(event, context):
         "frontend/**", "infra/**", ".venv*/**", "**/node_modules/**",
         "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
         ".git/**", "tests/**", "docs/**", ".kiro/**",
-        "lambda_layer/**", "cdk.out/**", "**/__pycache__/**",
+        "lambda_layer/**", "lambda_layer_im/**", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
+        "dist/**",   // 见上面 lambdaCode 处的长注释：漏了会撞 Lambda 250MB 解压上限
         "platforms/**", "*.md", "mcp_server/**",
         ".hypothesis/**", ".pytest_cache/**",
       ],
@@ -1550,10 +2743,32 @@ def handler(event, context):
       { id: "TrustedAdvisor", source: "aws.trustedadvisor", detailType: "Trusted Advisor Check Item Refresh Notification" },
     ];
 
+    // 🔴 R11c.2：客户通道**必须**排除我们自己的运维告警。
+    //
+    // 我们在同一个账号同一个区建了 6 条 `notiops-inspection-*` Alarm。它们的
+    // 状态变更发出的正是 `aws.cloudwatch` / `CloudWatch Alarm State Change`
+    // 事件 —— 与下面这条规则的 pattern **逐字匹配**，于是默认就会被捞走推给
+    // 客户。R11c.2 明确禁止：「客户不应收到我们的运维告警」。
+    //
+    // ⚠️ 光换 SNS topic 不够。Alarm 的 EventBridge 事件与 alarmActions 是两条
+    // 独立的投递路径，换 topic 只管住后者。
+    //
+    // 判据用 `anything-but` + `prefix`（EventBridge 支持，见
+    // https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-create-pattern-operators.html ）
+    // 而不是把客户的告警名逐个列白名单 —— 后者要求我们预先知道客户建了什么告警。
+    const excludeOwnOpsAlarms = {
+      alarmName: [{ "anything-but": { prefix: OPS_ALARM_NAME_PREFIX } }],
+    };
+
     for (const src of pushRuleSources) {
+      const isAlarmSource = src.source === "aws.cloudwatch";
       new events.Rule(this, `PushRule${src.id}`, {
         ruleName: `notiops-push-${src.id.toLowerCase()}`,
-        eventPattern: { source: [src.source], detailType: [src.detailType] },
+        eventPattern: {
+          source: [src.source],
+          detailType: [src.detailType],
+          ...(isAlarmSource ? { detail: excludeOwnOpsAlarms } : {}),
+        },
         targets: [new targets.LambdaFunction(pushLambda)],
         enabled: false, // 默认 DISABLED,需在控制台或 CDK context 启用
       });
@@ -1606,10 +2821,27 @@ def handler(event, context):
     for (const src of WEB_NOTIF_SOURCES) {
       const override = this.node.tryGetContext(`webNotif${src.id}`) as string | undefined;
       const enabled = override ? override === "on" : src.on;
+      // 🔴 R11c.2：排除我们自己的 `notiops-inspection-*` 运维告警。
+      //
+      // 这条比 IM push 那条更要紧 —— CloudWatchAlarm 在本清单里是
+      // **默认开启**（`on: true`），而 sink 是客户的 web 通知收件箱。
+      // 不排除的表现是：巡检一出运维故障，客户的收件箱里就多一条
+      // 「notiops-inspection-zero-output 进入 ALARM」——
+      // 那是我们的内部缺陷，客户既看不懂也无法处置。
+      const isAlarmSource = src.source === "aws.cloudwatch";
       const rule = new events.Rule(this, `WebNotifRule${src.id}`, {
+        // 规则名与描述走 `web-notif-sources.ts` 的两个函数（main 抽出去的）——
+        // 一键部署那条路（standalone 单栈）要复用同一套命名，各写一遍会漂。
         ruleName: webNotifRuleName(src.id),
         description: webNotifRuleDescription(src),
-        eventPattern: { source: [src.source], detailType: [src.detailType] },
+        eventPattern: {
+          source: [src.source],
+          detailType: [src.detailType],
+          // 🔴 R11c.2：排除**我们自己**的 `notiops-inspection-*` 运维告警。
+          //    不排的话巡检自己的告警会当成客户的事件推给客户 ——
+          //    而「没人看控制台」正是 R11c.3 存在的原因。
+          ...(isAlarmSource ? { detail: excludeOwnOpsAlarms } : {}),
+        },
         targets: [new targets.LambdaFunction(webNotifLambda)],
         enabled,
       });
@@ -1697,7 +2929,8 @@ def handler(event, context):
           "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
           "**/node_modules/**", ".git/**", ".hypothesis/**",
           "*.md", ".pytest_cache/**", ".kiro/**",
-          "lambda_layer/**", "cdk.out/**", "**/__pycache__/**",
+          "lambda_layer/**", "lambda_layer_im/**", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
+        "dist/**",   // 见上面 lambdaCode 处的长注释：漏了会撞 Lambda 250MB 解压上限
           "platforms/**", "agent/**",
           "api/**", "lambda1_collector/**", "lambda2_analyzer/**",
           "lambda3_health_checker/**", "lambda4_notifier/**",
@@ -1723,7 +2956,7 @@ def handler(event, context):
           // MODEL_ID 现在只是**兜底**：真值走 DDB appconfig#phd（Admin「后端任务模型」写入，
           // 由 BFF 从模型目录解析 alias 后投影过去）。保留 env 是为了 DDB 不可用 / 未 seed
           // 时仍能推送，见 shared/phd_config.py 的三级降级。
-          MODEL_ID: "global.anthropic.claude-sonnet-5",
+          MODEL_ID: "global.xai.grok-4.6",
           CONFIG_TABLE: configTable.tableName,
         },
         description: "PHD 事件转发 — SNS 触发,LLM 翻译摘要(Bedrock/LiteLLM 可切换),推送飞书",
@@ -1815,6 +3048,10 @@ def handler(event, context):
     new cdk.CfnOutput(this, "SlackAppTokenSecretArn", {
       value: slackAppTokenSecret.secretArn,
       description: "Slack app-level token (xapp-) Secret ARN — Socket Mode",
+    });
+    new cdk.CfnOutput(this, "SlackSigningSecretArn", {
+      value: slackSigningSecret.secretArn,
+      description: "Slack Signing Secret ARN — HTTP webhook 验签（IM 重构 M3）",
     });
     new cdk.CfnOutput(this, "BedrockApiKeySecretArn", {
       value: bedrockApiKeySecret.secretArn,

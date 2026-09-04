@@ -12,6 +12,7 @@ import logging
 from shared.queries.metrics import query_monitoring_by_date, get_latest_monitoring_date, get_monitoring_history
 from shared.queries.whitelist import load_whitelist_set
 from api.routes._export_util import csv_safe_row
+from api.errors import NotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,7 @@ def _get_detail(account_id: str, instance_id: str, query_params: dict) -> dict:
     """单条 EC2 低利用率记录详情。"""
     monitoring = get_monitoring_history("ec2", instance_id, account_id, days=1)
     if not monitoring:
-        raise KeyError(f"EC2 underutilized record {account_id}/{instance_id} not found")
+        raise NotFoundError(f"EC2 underutilized record {account_id}/{instance_id} not found")
 
     record = monitoring[0]
     record.setdefault("instance_id", record.get("instance", ""))

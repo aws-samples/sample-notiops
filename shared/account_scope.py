@@ -86,3 +86,88 @@ def filter_allowed(items: list, get_account_id) -> list:
             ", ".join(dropped),
         )
     return allowed
+
+
+# ─── role ARN 的账号段校验（2026-08-30 补）────────────────────────────────
+#
+# 🔴 这道防御此前**只装在 DevOps Agent 那条路上**（`shared/devops_agent.py`
+#    的 `_get_cross_account_client`），而**采集那条路上没有**：
+#
+#    ```
+#    shared/devops_agent.py:161-168      ✅ 有（注释逐字写着这个攻击）
+#    lambda_inspection_executor:208      ❌ 裸 assume_role
+#    lambda1_collector/accounts.py:89    ❌ 裸 assume_role（连账号号都没传进来）
+#    lambda5_cost_analyzer/handler.py:72 ❌ 裸 assume_role（账号号在手里却没用）
+#    api/routes/devops_agent.py:606      ❌ 裸 assume_role（_test_connection）
+#    core/devops_agent.py:178-180        ✅ 有（自己写了一份）
+#    ```
+#
+#    而写侧 `api/routes/accounts.py` 的 `role_arn` 是从请求体直取、**零校验**
+#    （`put_account(**fields)` 也不校验）。两头一凑：能写 config 表的人
+#    就能让我们的 Lambda 执行角色 assume 到**他自己账号**的角色，
+#    然后用他控制的凭证去「采集」某个合法账号 —— 落库时账号号写的是那个
+#    合法账号。巡检 finding 的完整性整个失守，而且这是 confused deputy。
+#
+#    ⚠️ 巡检那条路**刻意不接** `LOCKED_ACCOUNT_ID` 闸门（那是设计，见
+#       `lambda_inspection_executor.handler` 的 docstring），所以闸门也拦不住。
+#
+# ⇒ 抽成一个函数，四个 assume 点都过它。各写一遍必然漏，而漏了的表现是静默。
+
+
+class CrossAccountRoleMismatch(RuntimeError):
+    """role ARN 的账号段与目标账号不一致 —— 拒绝 AssumeRole。"""
+
+
+def assert_role_belongs_to(
+    role_arn: str, target_account_id: str, *, what: str = "role_arn",
+) -> None:
+    """`role_arn` 的账号段必须 == `target_account_id`，否则抛。
+
+    Args:
+        role_arn: 要 assume 的角色 ARN。
+        target_account_id: 我们**认为**这次操作针对的账号（来自我们自己的
+            config 表的 key，或来自 EventBridge 服务盖章的 `event.account`）。
+        what: 出错信息里的字段名，方便定位是哪条记录写坏了。
+
+    Raises:
+        CrossAccountRoleMismatch: 不一致、ARN 形状不对、或账号段为空。
+
+    ⚠️ **一律抛，不返回 bool。** 返回 bool 会让调用方漏掉 `if` —— 而漏掉的
+       表现是静默通过。抛异常时最坏情况是那个账号这一轮失败，可见。
+
+    ⚠️ 只查账号段，**不查角色名**。角色名有三种合法形态
+       （`notiops-idle-detection-role-<系统账号>`、
+        `notiops-agent-trigger-<账号>-m<系统账号>`、历史手工建的），
+       写死会把合法接入挡掉。账号段是唯一在所有形态里都成立的判据。
+    """
+    arn = str(role_arn or "").strip()
+    target = str(target_account_id or "").strip()
+    if not target:
+        raise CrossAccountRoleMismatch(
+            f"目标账号为空，拒绝 AssumeRole({what}={arn or '空'})。"
+            "调用方必须把「我们认为这是哪个账号」传进来 —— "
+            "拿不到就说明这条链路上账号归属是不明确的，那正是要防的情况")
+    # `arn:aws:iam::<账号>:role/<名字>` —— 账号段是第 5 段（下标 4）
+    parts = arn.split(":")
+    if len(parts) < 6 or parts[0] != "arn" or parts[2] != "iam":
+        raise CrossAccountRoleMismatch(
+            f"{what} 不是 IAM role ARN，拒绝 AssumeRole: {arn or '空'}")
+    if parts[4] != target:
+        raise CrossAccountRoleMismatch(
+            f"{what} 的账号段({parts[4] or '空'})与目标账号({target})不一致，"
+            f"拒绝 AssumeRole（防跨账号绕过）: {arn}。"
+            "如果这是合法接入，去管理页重新登记那个账号的角色 —— "
+            "而不是放宽这道校验")
+
+
+def role_belongs_to(role_arn: str, target_account_id: str) -> bool:
+    """`assert_role_belongs_to` 的**只读**版本，给写侧的入参校验用。
+
+    ⚠️ 执行路径上（真要 assume 之前）请用 `assert_role_belongs_to` ——
+       返回 bool 的版本容易被漏掉 `if`。
+    """
+    try:
+        assert_role_belongs_to(role_arn, target_account_id)
+    except CrossAccountRoleMismatch:
+        return False
+    return True

@@ -36,9 +36,11 @@ logger = logging.getLogger("shared.phd_config")
 # Must stay Converse-capable. ``phd_model_route`` returns ("", "") on the env /
 # hardcoded paths -- i.e. "speak Converse" -- so a Mantle-only id here would
 # fail as ``ValidationException: model identifier is invalid`` on every push
-# that lands before an admin has ever saved the catalogue. Claude Sonnet 5's
-# catalogue entry is ``kind: bedrock_anthropic``, which the Converse path handles.
-_DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-5"
+# that lands before an admin has ever saved the catalogue. Grok 4.6's catalogue
+# entry is ``kind: bedrock_converse``, i.e. natively the Converse path.
+#
+# 2026-09-01: follows the catalogue default from Claude Sonnet 5 to Grok 4.6.
+_DEFAULT_MODEL_ID = "global.xai.grok-4.6"
 
 _ENV_MODEL_ID = "MODEL_ID"
 

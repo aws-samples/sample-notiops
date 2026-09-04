@@ -17,6 +17,7 @@ from shared.queries.whitelist import (
     load_whitelist_set,
 )
 from shared.queries.metrics import get_latest_monitoring_date, query_monitoring_by_date
+from api.errors import NotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ def _delete(body: dict | None) -> dict:
 
     existed = remove_whitelist("health", account_id, instance_id, rt=resource_type)
     if not existed:
-        raise KeyError(f"Health check whitelist entry not found")
+        raise NotFoundError(f"Health check whitelist entry not found")
     return {"success": True}
 
 
@@ -171,7 +172,7 @@ def _update_expiry(body: dict | None) -> dict:
     found = set_whitelist_expiry("health", account_id, instance_id,
                                  rt=resource_type, expires_at=expires_at)
     if not found:
-        raise KeyError(f"Health check whitelist entry not found")
+        raise NotFoundError(f"Health check whitelist entry not found")
     return {"success": True, "message": "Expiry updated"}
 
 

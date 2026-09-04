@@ -41,6 +41,7 @@ from shared.queries.reports import (
     upsert_investigation,
 )
 from shared.queries._client import config_table, _now_iso
+from api.errors import NotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +157,7 @@ def handle_devops_agent(
             return _update_summarizer_config(body)
         raise ValueError(f"Method {method} not allowed on {path}")
 
-    raise KeyError(f"Unknown DevOps Agent resource: {resource}")
+    raise NotFoundError(f"Unknown DevOps Agent resource: {resource}")
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +199,7 @@ def _get_account(account_id: str) -> dict:
     resp = _table.get_item(Key={"PK": _da_pk(account_id), "SK": _DA_SK})
     row = resp.get("Item")
     if not row:
-        raise KeyError(f"Account {account_id} not found")
+        raise NotFoundError(f"Account {account_id} not found")
     return row
 
 
@@ -255,7 +256,7 @@ def _delete_account(account_id: str | None) -> dict:
     resp = _table.get_item(Key={"PK": _da_pk(account_id), "SK": _DA_SK})
     row = resp.get("Item")
     if not row:
-        raise KeyError(f"Account {account_id} not found")
+        raise NotFoundError(f"Account {account_id} not found")
 
     status = row.get("onboarding_status")
     if status == "active":
@@ -287,7 +288,7 @@ def _set_enabled(account_id: str | None, enable: bool) -> dict:
     resp = _table.get_item(Key={"PK": _da_pk(account_id), "SK": _DA_SK})
     row = resp.get("Item")
     if not row:
-        raise KeyError(f"Account {account_id} not found")
+        raise NotFoundError(f"Account {account_id} not found")
 
     current = row.get("onboarding_status")
     now = _now_iso()
@@ -503,6 +504,24 @@ def _save_onboarding_payload(account_id: str | None, body: dict | None) -> dict:
 
     if not trigger_role_arn.startswith("arn:aws:iam::"):
         raise ValueError("triggerRoleArn 格式非法")
+    # 🔴 **ARN 的账号段必须等于目标账号**（2026-08-30 补）。
+    #
+    #    只校前缀的后果：可以给账号 A 登记一个指向账号 B 的角色 ARN。
+    #    而下游 `shared/devops_agent.py` 那道防御（「arn 账号段必须 ==
+    #    target_account_id」）会在 AssumeRole 前拒掉它 —— 也就是说这一行不修
+    #    不会造成跨账号逃逸，但会造成**一个永远失败的登记**：
+    #    管理页显示「已登记 ✓」，而每一轮判读派发都 AccessDenied，
+    #    错误只在 executor 日志里。写侧拒掉比让它烂在库里好。
+    #
+    # ⚠️ 这条**挡不住**「用自己的账号 A 配 A 里的恶意角色」——
+    #    那要靠消费侧的授权判据（见下一条注释），不是这里。
+    _arn_parts = trigger_role_arn.split(":")
+    _arn_acct = _arn_parts[4] if len(_arn_parts) >= 5 else ""
+    if _arn_acct != str(account_id):
+        raise ValueError(
+            f"triggerRoleArn 的账号段({_arn_acct or '空'})与目标账号"
+            f"({account_id})不一致 —— 那样登记出来的账号每一轮都会 AccessDenied，"
+            "而管理页会显示「已登记 ✓」")
     if not agent_space_arn.startswith("arn:aws:aidevops:"):
         raise ValueError("agentSpaceArn 格式非法")
 
@@ -518,6 +537,18 @@ def _save_onboarding_payload(account_id: str | None, body: dict | None) -> dict:
             ":asi": agent_space_id,
             ":asa": agent_space_arn,
             ":tra": trigger_role_arn,
+            # 🔴 **`deployed` 不是 `active`，这个区别是一道安全边界**（2026-08-30）。
+            #
+            #    `devops_agent_callback` 在跨账号取判读正文时要跳过
+            #    `LOCKED_ACCOUNT_ID` 闸门，而它的授权判据是
+            #    「`onboarding_status == "active"` **且** `enabled is True`」——
+            #    本路由写的 `deployed`（且不写 `enabled`）**过不了**那个判据。
+            #
+            # ⚠️ 这很重要，因为本路由的授权很弱：`api/handler.py` 没有任何
+            #    组/角色校验，API GW 只挂了 Cognito authorizer（**认证**，不是
+            #    授权）。也就是说池里任何已登录用户都能调它。
+            #    ⇒ 不要把这里改成写 `active`，也不要在这里写 `enabled`。
+            #      真正的接入终态由 BFF 那两条路写（它们要 nav:admin 能力）。
             ":s": "deployed",
             ":u": now,
         },
@@ -569,6 +600,28 @@ def _test_connection(account_id: str | None) -> dict:
     overall_passed = True
 
     # Step 1: AssumeRole
+    #
+    # 🔴 账号段校验：本函数**自己** assume，绕过了
+    #    `shared.devops_agent._get_cross_account_client` 里那道防御。
+    #    而 `_test_connection` 成功会把 `onboarding_status` 推进到 `tested`，
+    #    紧接着 `/enable` 就能写成 `active` + `enabled=true` —— 那正是
+    #    callback 放行跨账号取判读全文的判据。
+    #    ⇒ 这一步放过一个指向别人账号的角色，等于把那个判据也放过了。
+    from shared.account_scope import (
+        CrossAccountRoleMismatch, assert_role_belongs_to,
+    )
+
+    try:
+        assert_role_belongs_to(trigger_role_arn, account_id,
+                               what=f"da#{account_id}.trigger_role_arn")
+    except CrossAccountRoleMismatch as e:
+        # 走既有的 step 失败形状（前端逐步显示原话），不抛 500
+        return {
+            "account_id": account_id, "passed": False,
+            "steps": [{"step": 1, "name": "AssumeRole", "passed": False,
+                       "error": str(e)}],
+        }
+
     session_name = f"dashboard-{account_id}-test-connection"[:_SESSION_NAME_MAX]
     try:
         sts = boto3.client("sts")
@@ -754,7 +807,7 @@ def _read_s3_text(key: str) -> str | None:
 def _get_investigation(task_id: str) -> dict:
     row = get_investigation(task_id)
     if not row:
-        raise KeyError(f"Investigation {task_id} not found")
+        raise NotFoundError(f"Investigation {task_id} not found")
 
     # report_content 解析：① 新行带 S3 指针 → 读 S3 report.md；
     # ② 旧行内联 summary_raw → 读兼容；③ 都没有 → 空（详情优雅降级）。
@@ -786,35 +839,18 @@ def _preregister_investigation(body: dict | None) -> dict:
     title = (body.get("title") or "").strip()
     source = (body.get("source") or "").strip()
 
-    if not task_id:
-        raise ValueError("task_id is required")
-    if not account_id or not _ACCOUNT_ID_RE.match(account_id):
-        raise ValueError("account_id 必须是 12 位数字")
-    if not title:
-        raise ValueError("title is required")
-    if not source:
-        raise ValueError("source is required")
+    # ⚠️ 校验 + 写入都委托给 `shared/investigations.py`（R5.5c）。
+    #    此前本函数与 `lambda4_notifier/handler.py::_preregister_investigation`
+    #    是两份独立实现，字段清单分叉且不报错。
+    #    `raise_on_error=True` 保持本端点的既有契约：调用方（AgentCore 工具）
+    #    需要知道写没写成功，静默成功会让它以为登记好了。
+    from shared.investigations import lookup_account_alias, preregister_investigation
 
-    # 冗余读 account_alias
-    account_alias = None
-    try:
-        _table = config_table()
-        resp = _table.get_item(Key={"PK": _da_pk(account_id), "SK": _DA_SK})
-        alias_row = resp.get("Item")
-        if alias_row:
-            account_alias = alias_row.get("account_alias")
-    except Exception as e:
-        logger.warning("查 account_alias 失败，继续预注册: account=%s error=%s",
-                       account_id, e)
-
-    upsert_investigation(
-        task_id,
-        account_id=account_id,
-        status="pending",
-        title=title,
-        source=source,
-        execution_id=execution_id,
-        account_alias=account_alias,
+    account_alias = lookup_account_alias(account_id) if account_id else None
+    preregister_investigation(
+        task_id=task_id, account_id=account_id, title=title, source=source,
+        execution_id=execution_id or "", account_alias=account_alias,
+        raise_on_error=True,
     )
 
     return {
@@ -860,11 +896,26 @@ def _update_summarizer_config(body: dict | None) -> dict:
 
     allowed_keys = {"bedrock_model_id", "agent_prompt"}
 
-    # **先全量校验，再碰 DynamoDB**。原来是边遍历边 put_item，于是
-    #   - 一个字段合法、后一个字段类型不对的请求会留下半截写入；
-    #   - 一个字段都没带的请求（只有未知字段）在 `config_table()` 上先炸掉，
-    #     调用方看到的是 CONFIG_TABLE 解析失败而不是本该返回的「至少需要…」。
-    # 校验通过后才取表、才写，请求要么全写要么不写。
+    # 🔴 **先全部校验，再写一个字节。** 原来是「建表客户端 → 边校验边写」，
+    #    两个后果：
+    #
+    #    ① `{"agent_prompt": 123}` 这种请求会**部分写入** —— 循环里第一个
+    #       合法字段已经 put_item 落库，第二个类型不对才抛。调用方拿到 400，
+    #       以为什么都没改，实际有一半生效了。
+    #    ② 「一个合法字段都没给」那条校验**永远走不到**：`config_table()`
+    #       在最前面，环境里没有 CONFIG_TABLE 时先炸 `KeyError` —— 调用方
+    #       看到的是 CONFIG_TABLE 解析失败，而不是本该返回的「至少需要…」。
+    #       `test_update_rejects_unknown_field` 一直是红的就是因为这个。
+    #
+    #    ⇒ 校验通过后才取表、才写：请求要么全写要么不写。
+    #
+    # ⚠️ `sorted()` 不是排版 —— `allowed_keys` 是 set，原来那个循环序不定，
+    #    于是返回的 `updated` 顺序在两次相同请求之间可能不一样。
+    #
+    # ⚠️ 2026-09-03 合并 main：那边**独立做了同一个修复**，但引入的
+    #    `updated: list[str]` 从不 append，返回的恒是空数组
+    #    （调用方拿不到「改了哪几个字段」）。这里保留 HEAD 的
+    #    `[k for k, _ in pending]`。
     pending: list[tuple[str, str]] = []
     for key in sorted(allowed_keys):
         if key not in body:
@@ -881,7 +932,6 @@ def _update_summarizer_config(body: dict | None) -> dict:
 
     _table = config_table()
     now = _now_iso()
-    updated: list[str] = []
     for key, value in pending:
         _table.put_item(Item={
             "PK": _DA_CONFIG_PK,
@@ -889,6 +939,5 @@ def _update_summarizer_config(body: dict | None) -> dict:
             "config_value": value,
             "updated_at": now,
         })
-        updated.append(key)
 
-    return {"updated": updated}
+    return {"updated": [k for k, _ in pending]}

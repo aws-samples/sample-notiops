@@ -1,5 +1,5 @@
 /**
- * `LLMCFG_ENABLED=0` 在 BFF 侧的语义（spec R9.1 / task 6.5）。
+ * `LLMCFG_ENABLED=0` 在 BFF 侧的语义（spec R9.1）。
  * 运行：node bff/web-chat/tests/llmcfg_disabled.test.mjs
  *
  * BFF 侧的语义与两个 Python 读取器**不同**：只旁路**消费路径**，Admin 读写必须照常

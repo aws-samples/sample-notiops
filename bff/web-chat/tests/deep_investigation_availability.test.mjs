@@ -14,8 +14,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 let fails = 0;
+let ok = 0;
 async function t(name, fn) {
-  try { await fn(); console.log(`  ok   ${name}`); }
+  try { await fn(); ok++; console.log(`  ok   ${name}`); }
   catch (e) { fails++; console.log(`  FAIL ${name}\n       ${e?.message}`); }
 }
 
@@ -80,5 +81,5 @@ await t("/features/deep-investigation 在 LOGIN_ONLY 里且带 $ 锚点", async 
             "必须是锚定的 /\\/features\\/deep-investigation$/ 正则");
 });
 
-console.log(fails ? `\nFAILED: ${fails}` : "\nPASSED: all ok");
+console.log(fails ? `\nFAILED: ${fails}` : `\nPASSED: ${ok} ok, 0 failed`);
 process.exit(fails ? 1 : 0);

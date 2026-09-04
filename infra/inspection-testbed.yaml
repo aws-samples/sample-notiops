@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# 🔴 **一次性测试资源。不要部署到生产账号。**
+#
+# 用途：验证「巡检拉取全部 region 的资源」这条修复（2026-08-27）。在那之前
+# 巡检的 region 是执行 Lambda 的 `AWS_REGION`（AWS 注入、不可配），也就是
+# 部署 region 一个 —— 验证账号的 4 台 RDS 全在 us-east-1，而
+# `expected.instances = 0` / `completeness = 0÷0 = 1`，看板显示
+# 「跑过了、没风险」。
+#
+# 每个 (账号 × region) 一个栈，删的时候一条 delete-stack 清干净 —— 不会漏下
+# DB subnet group / cache subnet group / 安全组这些附属资源。
+#
+# ## 刻意关掉的保护机制（**仅因为这是一次性测试资源**）
+#
+# ```
+# DeletionPolicy: Delete        RDS 的 CFN 默认是 Snapshot ——
+#                               不显式改会在删栈后留下快照，一直计费
+# SkipFinalSnapshot: true       同上
+# DeletionProtection: false     默认就是 false，显式写出来是为了让 review 能看到
+# BackupRetentionPeriod: 0      关掉自动备份（省钱；测试资源没有恢复需求）
+# ```
+#
+# ⚠️ **不要把这几行抄到真实环境的模板里。**
+#
+# ## 密码
+#
+# `ManageMasterUserPassword: true` —— 让 RDS 自己在 Secrets Manager 里建并
+# 轮换主密码。模板里**不出现任何明文口令**，也不需要 NoEcho 参数。
+#
+# ## 巡检当天能验什么
+#
+# ```
+# ✅ 多 region 采集：expected.instances 从 0 变成真实数
+# ✅ 「移出巡检范围」弹层能列出三个 region 的资源
+# ❌ finding 判定：WARMUP_DAYS = 5（新建实例 5 天内被抑制，
+#    见 inspection/domain/series.py:321）+ 慢性判定要 7 天日粒度指标
+# ```
+Description: >
+  NotiOps inspection testbed - THROWAWAY resources for verifying multi-region
+  resource discovery. Creates one small RDS MySQL instance, one single-node
+  ElastiCache Redis replication group and one single-node Memcached cluster in
+  the default VPC. Backups and final snapshots are disabled on purpose because
+  these are disposable test resources - do NOT copy that setting into a real
+  template. Delete the whole stack when the verification is done.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Default VPC of this account and region.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    # 中文：至少两个不同 AZ 的子网 —— DB subnet group 硬要求。
+    Description: >
+      At least two subnets in different Availability Zones. Required by the DB
+      subnet group even for a single-AZ instance.
+
+  NamePrefix:
+    Type: String
+    Default: notiops-tb
+    # 中文：资源名前缀。加 region 后缀是为了在跨 region 的清单里一眼看出来源。
+    Description: Prefix for every resource name created by this stack.
+    AllowedPattern: "[a-z][a-z0-9-]{2,20}"
+
+Resources:
+  # 巡检只做 describe + GetMetricData，没有任何东西需要连进去 ——
+  # 所以这个安全组**不开任何 ingress**。
+  Sg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "NotiOps inspection testbed - no ingress on purpose"
+      VpcId: !Ref VpcId
+      # ⚠️ 不写 SecurityGroupIngress：巡检不连接实例，开端口纯属扩大暴露面。
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+          Description: "No egress needed; placeholder to avoid the default allow-all"
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-sg-${AWS::Region}"
+        - Key: notiops:purpose
+          Value: inspection-testbed-throwaway
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "NotiOps inspection testbed"
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: notiops:purpose
+          Value: inspection-testbed-throwaway
+
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: "NotiOps inspection testbed"
+      SubnetIds: !Ref SubnetIds
+
+  # ─── RDS MySQL（单实例，最小规格）───
+  # 巡检侧走 attrs_repo.load_rds_attrs_with_groups → DescribeDBInstances。
+  Rds:
+    Type: AWS::RDS::DBInstance
+    # 🔴 **必须显式写。** RDS 的 CFN 默认 DeletionPolicy 是 `Snapshot` ——
+    #    删栈之后会留下一个手动快照，一直按 GB 计费，而栈已经不见了，
+    #    没人会想起去删它。
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${NamePrefix}-mysql-${AWS::Region}"
+      Engine: mysql
+      # ⚠️ 不锁 EngineVersion —— 各 region 的默认版本不同，锁死会在某个
+      #    region 上报 InvalidParameterCombination。默认版本恒可用。
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: "20"
+      StorageType: gp3
+      # 让 RDS 自己在 Secrets Manager 里建并轮换主密码。模板里不出现明文。
+      ManageMasterUserPassword: true
+      MasterUsername: notiops_tb
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt Sg.GroupId
+      PubliclyAccessible: false
+      MultiAZ: false
+      # 一次性资源：关自动备份 + 不留最终快照（见文件头的说明）。
+      BackupRetentionPeriod: 0
+      DeletionProtection: false
+      Tags:
+        - Key: notiops:purpose
+          Value: inspection-testbed-throwaway
+
+  # ─── ElastiCache Redis 副本组（单节点）───
+  # 巡检侧走 DescribeReplicationGroups。
+  Redis:
+    Type: AWS::ElastiCache::ReplicationGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      ReplicationGroupId: !Sub "${NamePrefix}-redis-${AWS::Region}"
+      ReplicationGroupDescription: "NotiOps inspection testbed"
+      Engine: redis
+      CacheNodeType: cache.t4g.micro
+      NumCacheClusters: 1
+      # 单节点不能开自动故障转移。
+      AutomaticFailoverEnabled: false
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds:
+        - !GetAtt Sg.GroupId
+      Tags:
+        - Key: notiops:purpose
+          Value: inspection-testbed-throwaway
+
+  # ─── ElastiCache Memcached（单节点）───
+  #
+  # 🔴 单独建它是**刻意的**：Memcached **没有 ReplicationGroupId**，所以它
+  #    进不了 `DescribeReplicationGroups` 那份列表。2026-08-26 修过一条缺陷
+  #    就是这个 —— 「移出巡检范围」面板只调 DescribeReplicationGroups，
+  #    客户在里面永远找不到自己的 Memcached，而 `total` 与空的 `degraded`
+  #    联合表示「账号里就这些」。这台机器是那条修复的回归验证对象。
+  Memcached:
+    Type: AWS::ElastiCache::CacheCluster
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      ClusterName: !Sub "${NamePrefix}-mc-${AWS::Region}"
+      Engine: memcached
+      CacheNodeType: cache.t4g.micro
+      NumCacheNodes: 1
+      AZMode: single-az
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      VpcSecurityGroupIds:
+        - !GetAtt Sg.GroupId
+      Tags:
+        - Key: notiops:purpose
+          Value: inspection-testbed-throwaway
+
+Outputs:
+  RdsId:
+    Description: RDS instance identifier that resource inspection should discover.
+    Value: !Ref Rds
+  RedisId:
+    Description: ElastiCache replication group id.
+    Value: !Ref Redis
+  MemcachedId:
+    Description: >
+      Memcached cluster id. It has no replication group, so it only shows up via
+      DescribeCacheClusters - that is the regression this resource guards.
+    Value: !Ref Memcached
+  Region:
+    Value: !Ref "AWS::Region"

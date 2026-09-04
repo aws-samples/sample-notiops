@@ -1,8 +1,9 @@
 /**
  * Capability Registry 加载器（BFF 侧）。
  *
- * 读取 config/capabilities.json（Lambda 构建时由 setup.sh 复制进本目录，
- * 见 design.md §4 打包策略），构建三类索引供 authz / 渲染 / 过滤消费：
+ * 读取 config/capabilities.json（Lambda 构建时由 setup.sh 复制进本目录 ——
+ * 打包策略见 setup.sh 里那一步的注释），构建三类索引供 authz / 渲染 /
+ * 过滤消费：
  *   - matchRoute(method, path, query, body) → 命中的 Capability_Node（含所需 permissionKey）
  *   - subtabsOf(tabKey)                     → 该 tab 下带 responseKey 的 subtab（response-side 过滤用）
  *   - rootTabOf(key)                        → 某 key 的顶层 tab key（模块开关判定用）

@@ -73,7 +73,10 @@ _BUILTIN_CATALOG: dict = {
     "generation": 0,
     "provider": "bedrock",
     "credential_mode": "iam",
-    "default_model": "claude-sonnet-5",
+    # 2026-09-01：默认从 Claude Sonnet 5 换成 Grok 4.6（用户决策）。理由与取舍、
+    # 以及"改这一条要同步哪几处 / 哪几处不许顺手改"，全在种子文件
+    # config/llm-model-catalog.json 的 `_default_model_note` 里，别在这里再写一份。
+    "default_model": "xai-grok-4-6",
     "models": [
         {"alias": "claude-sonnet-5", "short": "claude", "aliases_legacy": ["claude"],
          "model_id": "global.anthropic.claude-sonnet-5", "label": "Claude Sonnet 5",
@@ -90,11 +93,15 @@ _BUILTIN_CATALOG: dict = {
          "kind": "bedrock_anthropic", "region": None, "hard_output_limit": 65536,
          "output_override": {"im": 6000}, "supports_prompt_cache": True,
          "surfaces": ["webchat"], "enabled": False},
+        # enabled=False（2026-09-03 从 Web 对话的模型列表里下架；条目**保留不删**，
+        # 否则历史消息的落款会退化成裸 alias）。这里的取值必须与种子
+        # `config/llm-model-catalog.json` 逐字一致 —— 兜底目录是 DDB 读不到时客户
+        # 真正看到的那份列表，写 True 就等于「下架在兜底路径上失效」。
         {"alias": "claude-haiku-4-5", "short": "haiku", "aliases_legacy": [],
          "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
          "label": "Claude Haiku 4.5", "kind": "bedrock_anthropic", "region": None,
          "hard_output_limit": 65536, "output_override": {"im": 6000},
-         "supports_prompt_cache": True, "surfaces": ["webchat"], "enabled": True},
+         "supports_prompt_cache": True, "surfaces": ["webchat"], "enabled": False},
         {"alias": "amazon-nova-pro", "short": "nova", "aliases_legacy": ["nova"],
          # 裸 `amazon.nova-pro-v1:0` **不能按需直调**（东京实测：
          # `ValidationException: Invocation of model ID amazon.nova-pro-v1:0 with
@@ -116,7 +123,7 @@ _BUILTIN_CATALOG: dict = {
         {"alias": "zai-glm-5", "short": "glm", "aliases_legacy": [],
          "model_id": "zai.glm-5", "label": "GLM 5", "kind": "bedrock_converse",
          "region": None, "hard_output_limit": 202752, "output_override": None,
-         "supports_prompt_cache": False, "surfaces": ["webchat"], "enabled": True},
+         "supports_prompt_cache": False, "surfaces": ["webchat", "im"], "enabled": True},
         {"alias": "gpt-5-6", "short": "gpt", "aliases_legacy": ["gpt"],
          "model_id": "openai.gpt-5.6-terra", "label": "GPT-5.6 Terra",
          "kind": "bedrock_mantle_responses", "region": "us-east-2", "hard_output_limit": 32768,
@@ -127,11 +134,14 @@ _BUILTIN_CATALOG: dict = {
          "kind": "bedrock_mantle_responses", "region": "us-east-2", "hard_output_limit": 32768,
          "output_override": {"im": 8000}, "supports_prompt_cache": False,
          "surfaces": ["webchat", "im"], "enabled": True},
+        # surfaces 只剩 im（2026-09-03 Web 侧同一代 GPT 三个变体挤在列表里，只留
+        # Terra / Sol）。走 surfaces 收窄而不是 enabled=False —— 后者会把 IM 的
+        # `@bot model gpt_luna` 一起关掉。同上：必须与种子逐字一致。
         {"alias": "gpt-5-6-luna", "short": "gpt_luna", "aliases_legacy": ["gpt_luna"],
          "model_id": "openai.gpt-5.6-luna", "label": "GPT-5.6 Luna",
          "kind": "bedrock_mantle_responses", "region": "us-east-2", "hard_output_limit": 32768,
          "output_override": {"im": 8000}, "supports_prompt_cache": False,
-         "surfaces": ["webchat", "im"], "enabled": True},
+         "surfaces": ["im"], "enabled": True},
         # `hard_output_limit` / `supports_prompt_cache` 的取值依据见种子文件里同名的
         # `_*_note`（都是 us-east-1 实测，不是抄文档）：524288 是 Converse 的拒绝阈值，
         # prompt cache 虽被模型卡列为支持、但显式 cachePoint 实测被拒，故为 False。
@@ -470,7 +480,7 @@ def config_source() -> str:
 
 
 # ---------------------------------------------------------------------------
-# 只读诊断（spec R9.4 / task 9.2）
+# 只读诊断（spec R9.4）
 # ---------------------------------------------------------------------------
 # 排障时最先要回答的问题是「**这个正在跑的实例**当前用的是哪一代配置、来自 DDB 还是内置
 # 兜底」。此前没有任何办法问出来：`config_source()` 有定义但零调用方，metric 只给计数不给
@@ -525,7 +535,7 @@ def _default_entry(cfg: dict) -> dict | None:
     `default_model` 是**全局**设置，但某个模型可能不在本端的 `surfaces` 里
     （例：Claude Haiku 只在 webchat 开放）。此时必须回落到本端第一个启用项——
     否则调用方拿到一个本端无法解析的 alias，会静默落到硬编码默认，
-    admin 的选择被吞掉（2026-08 由 task 0.2 的测试抓到）。
+    admin 的选择被吞掉（2026-08 由 的测试抓到）。
     """
     entries = _entries(cfg)
     want = str(cfg.get("default_model") or "")

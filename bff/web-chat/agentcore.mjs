@@ -34,7 +34,7 @@ export function toSessionId(conversationId) {
  * 而不是传 0：runtime 侧 0 是合法值（未 seed 的目录就是 0），传 0 会让"与本地不同"恒真、
  * 每条消息都触发一次强制 ConsistentRead。省掉 → runtime 收到 None → 纯走 TTL 兜底。
  */
-export function buildRuntimePayload({ prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, now, topic, accountId, allowedAccounts, skillId, skillVersion }) {
+export function buildRuntimePayload({ prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, now, topic, accountId, allowedAccounts, skillId, skillVersion, warmup }) {
   const gen = Number(generation);
   return {
     prompt, model, locale,
@@ -48,14 +48,61 @@ export function buildRuntimePayload({ prompt, model, generation, locale, webSear
     allowed_accounts: allowedAccounts || "*",
     skill_id: skillId || "",
     skill_version: skillVersion || "",
+    // 预热帧标记。只在真的预热时出现（JSON.stringify 丢弃 undefined）——
+    // runtime 侧判据是 `payload.get("warmup") is True`，传 false 也不会误触发，
+    // 但省掉能让"真实那一轮的 payload 一个字节都没变"这件事一眼可验。
+    warmup: warmup ? true : undefined,
   };
+}
+
+/**
+ * 会话预热（**0 token**）：让 runtime 提前做完平台冷启动 + import + 挂工具快照 +
+ * 起 MCP 子进程，把这 ~10s 挪到"用户还在打字"的时候。
+ *
+ * ⚠️ `conversationId` 必须与随后真实那一轮**完全相同** —— runtimeSessionId 由它派生
+ * （toSessionId），AgentCore 按 runtimeSessionId 路由到具体 microVM。传不同的 id 就是
+ * 预热了另一个容器，10s 白花且真实那一轮照旧冷启动。
+ * ⚠️ model/topic/accountId/devopsAgent 也要与真实那一轮一致：runtime 的 agent 缓存键
+ * 含这四项，不一致会在真实那一轮再建一个 agent、白热一遍。
+ *
+ * 语义是"尽力而为"：任何失败都只 return false，绝不抛给调用方 —— 预热失败的唯一后果
+ * 是首字回到原来的延迟。**必须 await 完**（不能发了就返回）：BFF 跑在 Lambda 上，
+ * 响应一返回容器就冻结，未完成的请求会被掐断，等于没预热。
+ */
+export async function warmupAgent({ conversationId, model, generation, topic, accountId, devopsAgent }) {
+  if (!RUNTIME_ARN) return false;
+  try {
+    const cmd = new InvokeAgentRuntimeCommand({
+      agentRuntimeArn: RUNTIME_ARN,
+      runtimeSessionId: toSessionId(conversationId),
+      contentType: "application/json",
+      accept: "text/event-stream",
+      payload: new TextEncoder().encode(JSON.stringify(buildRuntimePayload({
+        prompt: "", model, generation, locale: "", topic, accountId, devopsAgent,
+        now: new Date().toISOString().slice(0, 10), warmup: true,
+      }))),
+    });
+    const resp = await client.send(cmd);
+    // 必须把流读干：不读完连接就挂在那儿，容器侧的 generator 未必跑到 return。
+    const body = resp.response;
+    if (body && typeof body[Symbol.asyncIterator] === "function") {
+      for await (const _ev of body) { /* 预热帧无正文，丢弃 */ }
+    } else if (body && typeof body.transformToString === "function") {
+      await body.transformToString();
+    }
+    return true;
+  } catch (e) {
+    // 只记类型/摘要（docs/LOGGING_STANDARD.md），不记 payload。
+    console.error(`[BFF] warmup failed (harmless) — ${e?.name || ""}: ${e?.message || e}`);
+    return false;
+  }
 }
 
 /**
  * 调用 runtime，回调 onToken(text) / onSources(arr)。返回拼好的全文。
  * 解析失败不抛，尽量把能拿到的文本推出去。
  */
-export async function invokeAgent({ conversationId, prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, topic, accountId, allowedAccounts, skillId, skillVersion }, { onToken, onSources, onActions, onUsage, onFollowups, onInvestigationStep, onProgress, onReasoning, onRuntimeError }) {
+export async function invokeAgent({ conversationId, prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, topic, accountId, allowedAccounts, skillId, skillVersion }, { onToken, onSources, onActions, onUsage, onFollowups, onInvestigationStep, onThinkingStep, onProgress, onReasoning, onRuntimeError, onVia, onOpen, onReady }) {
   // 把"今天"传给 agent：用于联网搜索时给 query 补当前年份（让结果偏向最新），
   // 也让模型知道当前日期、不把训练截止当“现在”。
   const now = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
@@ -71,6 +118,10 @@ export async function invokeAgent({ conversationId, prompt, model, generation, l
   });
 
   const resp = await client.send(cmd);
+  // 响应头已到达 → **平台侧的等待结束了**（冷容器要先拉起来才会回响应头，热容器这一步
+  // 亚秒级）。等待期提示据此从"正在启动服务"切到"正在分析"，不再把每个慢轮次都说成
+  // 冷启动（见 wait_hint.mjs 的模块注释）。回调自身出错不许影响正文。
+  try { onOpen?.(); } catch { /* 提示用，忽略 */ }
   let full = "";
 
   // resp.response 是一个异步可迭代的字节流（SDK v3 streaming）
@@ -95,13 +146,22 @@ export async function invokeAgent({ conversationId, prompt, model, generation, l
         if (!m) continue;
         let evt;
         try { evt = JSON.parse(m[1]); } catch { evt = m[1]; }
-        const { text, sources, actions, usage, followups, investigationStep, progress, reasoning, error } = extract(evt);
+        const { text, sources, actions, usage, followups, investigationStep, thinkingStep, progress, reasoning, error, via, ready } = extract(evt);
         if (error) runtimeError = error;
+        // 容器里的 entrypoint 真的跑起来了（agent 的第一帧）。纯信号、不发给浏览器：
+        // 只用来把等待期提示切到"模型在干活"那一组。比 onOpen 更硬（那只说明响应头回来了）。
+        if (ready) { try { onReady?.(); } catch { /* 提示用，忽略 */ } }
+        // via 必须在正文之前处理：agent 是先发 via 再发正文的，前端拿到 via 才能把这条
+        // 消息的署名切成 NotiOps；顺序颠倒会先按模型署名渲染、再跳一下。
+        if (via) onVia?.(via);
         if (text) { full += text; onToken?.(text); }
         if (sources?.length) onSources?.(sources);
         if (actions?.length) onActions?.(actions);
         if (followups?.length) onFollowups?.(followups);
         if (investigationStep) onInvestigationStep?.(investigationStep);
+        // 思考/处理过程的**持久**一步（工具调用及其入参摘要、工具返回摘要）→ 右侧「思考过程」面板。
+        // 与 progress 的区别：progress 是一行会被覆盖掉的瞬态状态，thinking_step 是一条时间线记录。
+        if (thinkingStep) onThinkingStep?.(thinkingStep);
         // 处理中信号（长耗时时聊天窗口不再干等）：progress=一句"正在做什么"；reasoning=思考过程增量。
         if (progress) onProgress?.(progress);
         if (reasoning) onReasoning?.(reasoning);
@@ -205,11 +265,25 @@ export function extract(evt) {
   // 处理中进度（agent yield {"progress":{text,kind}}）——主聊天里的临时状态行（工具调用等）。
   const progress = (evt.progress && typeof evt.progress === "object") ? evt.progress : null;
 
+  // 思考/处理过程的一步（agent yield {"thinking_step":{text,kind?,detail?}}）——收进右侧
+  // 「思考过程」面板。**持久**（不像 progress 被下一行覆盖），所以长任务结束后仍可回看。
+  const thinkingStep = (evt.thinking_step && typeof evt.thinking_step === "object")
+    ? evt.thinking_step : null;
+
+  // agent entrypoint 的第一帧（agent yield {"ready":true}）：容器已就绪、代码已开始跑。
+  // 不是内容、不发给浏览器 —— 只用于等待期提示的阶段切换（见 wait_hint.mjs）。
+  const ready = evt.ready === true;
+
   // 思考过程增量（agent yield {"reasoning":{text}}）——前端可折叠灰字，收到正文即隐藏。
   const reasoning = (evt.reasoning && typeof evt.reasoning === "object") ? evt.reasoning : null;
 
   // 本轮 token 用量（agent 收尾 yield {"usage":{inputTokens,outputTokens,totalTokens}}）。
   const usage = evt.usage && typeof evt.usage === "object" ? evt.usage : undefined;
+
+  // 答案来源标记（agent yield {"via":"builtin"}）：这一轮的回答**不是模型生成的**
+  // （内置确定性答案，0 token）。前端署名行必须据此写 "NotiOps" 而不是
+  // 「AWS Bedrock (某模型)」—— 沿用模型署名会把答案来源说错。
+  const via = typeof evt.via === "string" && evt.via ? evt.via : undefined;
 
   // runtime 流内异常帧。形状由 AgentCore SDK 固定（bedrock_agentcore/runtime/app.py 的
   // `_sync_stream_with_error_handling`）：{error, error_type, message}。判据用
@@ -220,5 +294,5 @@ export function extract(evt) {
     error = { type: evt.error_type, message: typeof evt.error === "string" ? evt.error : "" };
   }
 
-  return { text: typeof text === "string" ? text : "", sources, actions, usage, followups, investigationStep, progress, reasoning, error };
+  return { text: typeof text === "string" ? text : "", sources, actions, usage, followups, investigationStep, thinkingStep, progress, reasoning, error, via, ready };
 }

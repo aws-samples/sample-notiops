@@ -16,10 +16,14 @@ default model in the console saw no effect on IM. Both legacy levels are gone:
   * SSM `/notiops/agent/model_id` — still read by `shared/model_config.py::
     get_bot_model_id()`, but that value drives **internal utility calls**
     (intent classification / next-steps / progress-card narration / case
-    classification / skill dispatch), all of which hand-roll an Anthropic
-    `invoke_model` body and therefore hard-assume a Claude model. It is a
-    different concern from the user's conversational model choice and is tracked
-    separately (spec R8).
+    classification / skill dispatch). It is a different concern from the user's
+    conversational model choice and is tracked separately (spec R8).
+    Those call sites used to hand-roll an Anthropic `invoke_model` body and so
+    hard-assumed a Claude model; since 2026-09-01 they go through
+    `core/bot_llm.py` → `shared/llm_provider.py::invoke_llm` (Bedrock Converse)
+    and any Converse-callable model in the catalogue works. The one remaining
+    restriction is that Mantle-only models (the GPT-5.6 family) still cannot be
+    bound there, because `bot_llm` never guesses the wire protocol from the id.
 
 The DDB read is fail-safe: `llm_config` falls back to its builtin catalogue
 snapshot when DynamoDB is unreachable, so this chain never hard-fails.
@@ -70,7 +74,7 @@ def _admin_default() -> str:
         rather than returning an alias IM cannot resolve.
 
     Returns a canonical alias (`claude-sonnet-5`). The short-alias bridge that
-    used to live here is gone: `model_catalog` is DDB-backed now (spec task 4.1)
+    used to live here is gone: `model_catalog` is DDB-backed now
     and accepts canonical, short and legacy forms alike, so there is nothing
     left to translate.
     """

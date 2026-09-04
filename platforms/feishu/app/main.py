@@ -28,10 +28,12 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 
 from platforms.feishu.app import skill_commands
 from core import bedrock_intent
+from core import nl_router
 from core import chat_history
 from core import ddb_state
 from core import dispatch_compose
 from core import i18n
+from core.feishu_card import card_config
 from core import locale_resolver
 # webhook_dispatch is retained ONLY for skill_commands' `/skills run` path,
 # which still POSTs to the single fixed Agent Space. The @-mention
@@ -110,8 +112,12 @@ APP_SECRET = _feishu_secret["app_secret"]
 # ===========================================================================
 # Event: im.message.receive_v1 (user @ the bot, or DMs the bot)
 # ===========================================================================
+# zh + en command words. This regex only carries the ASCII alternates so
+# `scripts/lint_i18n.py` stays clean on this file; the Chinese aliases live
+# in `core/nl_router.py` (which IS allowlisted for CJK literals) and are
+# folded in via `_maybe_handle_language_command` → `nl_router.parse_command`.
 _LANGUAGE_CMD_RE = re.compile(
-    r"^\s*/?\s*language(?:\s+(\S+))?\s*$",
+    r"^\s*/?\s*(?:language|lang)(?:\s+(\S+))?\s*$",
     re.IGNORECASE,
 )
 
@@ -125,8 +131,16 @@ def _maybe_handle_language_command(msg, raw_text: str, user_id: str,
     otherwise.
     """
     m = _LANGUAGE_CMD_RE.match(raw_text or "")
-    nl_target = "" if m else i18n.parse_language_switch_intent(raw_text or "")
-    if not m and not nl_target:
+    # zh command alias (`/语言`) is caught here — the ASCII-only regex above
+    # is deliberate (see the CJK-lint note where it's defined). NL path stays
+    # as before.
+    zh_cmd_arg: str = ""
+    if not m:
+        _route = nl_router.parse_command(raw_text or "")
+        if _route.kind == "language":
+            zh_cmd_arg = _route.arg
+    nl_target = "" if (m or zh_cmd_arg) else i18n.parse_language_switch_intent(raw_text or "")
+    if not m and not zh_cmd_arg and not nl_target:
         return False
     if not user_id:
         feishu_utils.reply_text(msg.message_id,
@@ -137,8 +151,10 @@ def _maybe_handle_language_command(msg, raw_text: str, user_id: str,
     # explicit `/language` form may have no arg (= show current).
     if nl_target:
         arg = nl_target
-    else:
+    elif m:
         arg = i18n.normalize_locale(m.group(1)) if m.group(1) else ""
+    else:
+        arg = i18n.normalize_locale(zh_cmd_arg) if zh_cmd_arg else ""
     if not arg:
         # Show current.
         cur, source = locale_resolver.resolve(user_id=user_id,
@@ -171,6 +187,8 @@ def _maybe_handle_language_command(msg, raw_text: str, user_id: str,
 
 # `@bot model [alias|list|default]` — anyone in chat can switch model
 # for that chat. Same short-circuit pattern as the language command.
+# ASCII-only regex; the `/模型` Chinese alias is folded in via
+# `nl_router.parse_command` below (see the language cmd note for why).
 _MODEL_CMD_RE = re.compile(
     r"^\s*/?\s*model(?:\s+(\S+))?\s*$",
     re.IGNORECASE,
@@ -186,11 +204,30 @@ def _maybe_handle_model_command(msg, raw_text: str, chat_id: str,
     one and should fall through to normal intent classification.
     """
     m = _MODEL_CMD_RE.match(raw_text or "")
-    if not m:
-        return False
-
     is_dm = msg.chat_type == "p2p"
-    arg = (m.group(1) or "").strip().lower()
+    # zh command alias (`/模型 …`) via the shared router (kept out of the
+    # ASCII regex above to keep this file CJK-clean for the i18n lint).
+    zh_cmd_arg: str = ""
+    if not m:
+        _route = nl_router.parse_command(raw_text or "")
+        if _route.kind == "model":
+            zh_cmd_arg = _route.model_arg
+    if not m and not zh_cmd_arg:
+        # Natural-language "换个模型" / "switch model" — can't name a specific
+        # alias (aliases are dynamic), so surface the list and let the user
+        # pick. 0 token: pure regex, runs before Bedrock.
+        if not nl_router.parse_model_switch_intent(raw_text or ""):
+            return False
+        rows = "\n".join(
+            i18n.t("model.list_row", locale, alias=e.alias, label=e.label)
+            for e in model_catalog.all_entries()
+        )
+        text = (i18n.t("model.switch_nl_hint", locale) + "\n" + rows
+                + "\n\n" + i18n.t("model.usage", locale))
+        _reply(msg, text)
+        return True
+
+    arg = ((m.group(1) if m else zh_cmd_arg) or "").strip().lower()
 
     if not arg:
         # show current
@@ -241,6 +278,35 @@ def _maybe_handle_model_command(msg, raw_text: str, chat_id: str,
     entry = model_catalog.get(arg)
     msg_key = "model.set_dm" if is_dm else "model.set_chat"
     _reply(msg, i18n.t(msg_key, locale, label=entry.label))
+    return True
+
+
+def _help_text(locale: str) -> str:
+    """Bilingual command menu, rendered from the i18n `help.*` keys.
+
+    Lists BOTH language forms of every command — a Chinese user won't guess
+    `/调查` exists unless we tell them.
+    """
+    rows = "\n".join(
+        i18n.t(f"help.row.{feature}", locale)
+        for feature, _en, _zh in nl_router.HELP_COMMANDS
+    )
+    return (f"**{i18n.t('help.title', locale)}**\n\n"
+            f"{i18n.t('help.intro', locale)}\n\n"
+            f"{rows}\n\n"
+            f"{i18n.t('help.footer', locale)}")
+
+
+def _maybe_handle_help_command(msg, raw_text: str, locale: str) -> bool:
+    """Handle `/help` / `/帮助` / bare `怎么用` — the command menu.
+
+    Deterministic, 0 token. Returns True if handled (reply already sent).
+    Discoverability is a hard requirement once routing is deterministic:
+    without it the new command forms effectively don't exist.
+    """
+    if nl_router.parse_command(raw_text or "").kind != "help":
+        return False
+    _reply(msg, _help_text(locale))
     return True
 
 
@@ -343,6 +409,12 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
     if _maybe_handle_model_command(msg, raw_text, chat_id, user_id, _pre_locale):
         return
 
+    # `/help` / `/帮助` / `怎么用` — the command menu. Deterministic, 0 token.
+    # Runs here (before Bedrock) so commands stay discoverable now that
+    # routing is deterministic. See §8.1.3.
+    if _maybe_handle_help_command(msg, raw_text, _pre_locale):
+        return
+
     # Resolve conversation locale BEFORE the event row is written so
     # everything downstream (ack / refusal / chat / dispatch / Lambda
     # senders) reads the same locale. Priority: user-pref → thread/
@@ -395,6 +467,58 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
         _reply(msg, i18n.t(_key, locale))
         return
 
+    # ── Deterministic 0-token routing (core.nl_router) ───────────────────
+    # Explicit case commands (`/案例` `/case` …) and clearly-worded NL case
+    # requests ("我要开案例" / "open a case") route STRAIGHT to the case flow
+    # with NO Bedrock classify — that's the token the IM refactor cuts. An
+    # explicit investigate command (`/调查 …` `/investigate …`) forces the
+    # investigate route so an unambiguous signal can never be misclassified.
+    #
+    # Guard: if the text also trips the strong-change regex, DON'T shortcut —
+    # fall through to the normal hybrid change-request check so the read-only
+    # guarantee (§8.3) still refuses mutations deterministically.
+    _route = nl_router.classify(raw_text)
+    _force_investigate = False
+    if _route.kind in ("case", "investigate") and not _looks_strongly_change(raw_text):
+        if _route.kind == "case":
+            from platforms.feishu.app import case_flow
+            cc, cid = _route.case_command, _route.case_id
+            logger.info("nl_router: case route command=%s id=%s form=%s (0 token)",
+                        cc, cid, _route.form)
+            if cc == "case_view":
+                case_flow.start_view(chat_id, cid, locale=locale)
+            elif cc == "case_reply":
+                case_flow.start_reply(chat_id, cid, raw_text, locale=locale)
+            elif cc == "case_resolve":
+                case_flow.start_resolve(chat_id, cid, locale=locale)
+            elif cc == "case_analyze":
+                case_flow.start_analyze(chat_id, cid, locale=locale)
+            elif cc == "case_create":
+                case_flow.start_create(chat_id, raw_text, locale=locale)
+            else:  # case_list + any unmapped canonical
+                case_flow.start_list(chat_id, status_filter="recent", locale=locale)
+            return
+        # investigate — only the explicit COMMAND form forces the route (an
+        # unambiguous user signal). NL deep-dive phrasings still flow through
+        # analyze_intent, which already routes them AND fills `suggestions`.
+        if _route.form == "command":
+            _investigate_text = _route.arg.strip()
+            if _investigate_text:
+                # Strip the `/调查` prefix so the investigation is about the
+                # request, not the command word. Persist so confirm_dispatch
+                # (which reads the row) dispatches the clean text.
+                raw_text = _investigate_text
+                try:
+                    ddb_state._table.update_item(
+                        Key={"lookup_key": f"event#{event_id}"},
+                        UpdateExpression="SET raw_text = :t",
+                        ExpressionAttributeValues={":t": raw_text},
+                    )
+                except Exception as e:
+                    logger.warning("nl_router: persist investigate text failed: %s", e)
+            _force_investigate = True
+            logger.info("nl_router: investigate command route (forced)")
+
     _reply(msg, i18n.t("ack.understanding", locale))
 
     # ZERO-CHANGE PROMISE — Hybrid LLM + regex architecture.
@@ -417,6 +541,10 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
     intent = analysis["intent"]
     suggestions = analysis.get("suggestions", [])
     command = analysis.get("command", "investigate")
+    # An explicit `/调查 …` command overrides the classifier — the user named
+    # the route, so it must win even if Bedrock would have guessed otherwise.
+    if _force_investigate:
+        command = "investigate"
     case_display_id = analysis.get("case_display_id", "")
     # Multi-turn rewrite (#1) was retired — these locals always stay
     # at the no-rewrite values. Kept (rather than ripped out) so the
@@ -1007,7 +1135,7 @@ def _confirmation_card(event_id: str, intent: str, raw_text: str,
     })
 
     return {
-        "config": {"wide_screen_mode": True},
+        "config": card_config(wide_screen_mode=True),
         "header": {
             "title": {"tag": "plain_text", "content": "🤖 NotiOps"},
             "template": "blue",
@@ -1230,8 +1358,9 @@ def _edit_dispatch_card(*, event_id: str, intent: str,
                           "elements": form_inner})
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False,
-                   "summary": {"content": i18n.t("edit.modal.title", locale)}},
+        "config": card_config(
+            streaming_mode=False,
+            summary={"content": i18n.t("edit.modal.title", locale)}),
         "header": {
             "title": {"tag": "plain_text",
                       "content": i18n.t("edit.modal.title", locale)},
@@ -1259,8 +1388,9 @@ def _final_card_v2(title: str, body_md: str = "",
         body_md = rest or first_line
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False,
-                   "summary": {"content": title[:100]}},
+        "config": card_config(
+            streaming_mode=False,
+            summary={"content": title[:100]}),
         "header": {
             "title": {"tag": "plain_text", "content": title},
             "template": color,
@@ -1674,7 +1804,7 @@ def _build_response(toast: str, new_card: dict) -> P2CardActionTriggerResponse:
 # Entrypoint
 # ===========================================================================
 def main():
-    # Bedrock API Key 注入（spec task 4.5）：注册 bedrock 客户端的构造前钩子并做一次
+    # Bedrock API Key 注入：注册 bedrock 客户端的构造前钩子并做一次
     # 初次收敛。必须在任何 Bedrock 调用之前 —— botocore 在**构造时**快照 token provider，
     # 设晚了会 NoAuthTokenError 硬失败而非回退 IAM。之后每条消息 / 每轮轮询各自 refresh()。
     try:

@@ -29,19 +29,17 @@ import logging
 import os
 import re
 
-import boto3
-from core.lazy_boto import LazyClient
-
-from shared.model_config import get_bot_model_id
+from core import bot_llm
 
 logger = logging.getLogger(__name__)
 
-BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
-
-# 惰性构造（core/lazy_boto.py）：botocore 在**构造时**快照凭证，import 期建好的
-# client 会让后续 setenv AWS_BEARER_TOKEN_BEDROCK 完全失效（Bedrock API Key 模式
-# 因此无法生效）。代理转发属性访问，所有调用点写法不变。
-_bedrock = LazyClient("bedrock-runtime", region=BEDROCK_REGION)
+# 2026-09-01：这 8 处「一个 system prompt + 一段文本 → 一段（通常是 JSON 的）
+# 文本」的调用，从手搓 Anthropic body 的 invoke_model 换成 core/bot_llm 的
+# Converse 统一入口。理由与取舍全在 core/bot_llm.py 的模块 docstring 里。
+# 顺带删掉本模块的 `_bedrock` / `BEDROCK_REGION`：`invoke_llm` 每次调用自己
+# 建 client（比 LazyClient 更不会拿到过期凭证），而 BEDROCK_REGION 在三条部署
+# 路径里恒等于 `cdk.Aws.REGION`，也就是 Lambda 自己的区域 = boto3 默认区域，
+# 所以去掉它是**零行为变化**，不是丢了一个可配置项。
 
 VALID_COMMANDS = {
     "investigate",
@@ -763,34 +761,10 @@ def analyze_intent(user_text: str, history: list[dict] | None = None,
                 "is_change_request": False}
     response_text = ""
     try:
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 500,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": text}],
-        }
-        resp = _bedrock.invoke_model(
-            modelId=get_bot_model_id(),
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(body),
-        )
-        data = json.loads(resp["body"].read())
-        for block in data.get("content", []):
-            if block.get("type") == "text":
-                response_text = block["text"].strip()
-                break
+        # 围栏剥离与"空内容"告警都在 bot_llm 里，所以这里只剩 fallback 判定。
+        response_text = bot_llm.invoke_bot_text(system_prompt, text, max_tokens=500)
         if not response_text:
-            logger.warning("Bedrock returned no text block (stop_reason=%s, %d content blocks)",
-                           data.get("stop_reason"), len(data.get("content", [])))
             return fallback
-
-        if response_text.startswith("```"):
-            response_text = response_text.strip("`")
-            if response_text.lstrip().lower().startswith("json"):
-                response_text = (response_text.split("\n", 1)[1]
-                                 if "\n" in response_text else response_text[4:])
-
         parsed = _loose_load_json(response_text)
         if parsed is None:
             raise json.JSONDecodeError("loose load failed", response_text, 0)

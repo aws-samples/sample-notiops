@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Metric emission for the model catalogue (spec R9.5 / task 6.4).
+"""Metric emission for the model catalogue (spec R9.5).
 
 Every degradation in `llm_config` is silent by design — DynamoDB unreachable
 falls back to the builtin catalogue, a retired model is swapped for the default,

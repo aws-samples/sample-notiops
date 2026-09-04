@@ -93,28 +93,57 @@ def _client_and_space(account_id: str) -> tuple:
     """返回 (devops-agent client, agent_space_id)。
     - 目标==部署账号：本地凭证直连 + 自动发现/指定 Agent Space。
     - 否则且 config 有跨账号配置：AssumeRole trigger role + config 的 agent_space_id。
-    取不到 Agent Space → 返回 (None, None)（调用方走 not_onboarded）。"""
+    取不到 Agent Space → 返回 (None, None)（调用方走 not_onboarded）。
+
+    `account_id` 传空 = 部署账号（与 `platforms/common/im_types.py::ImMessage.account_id`
+    同一个契约）。这一步**必须在这里补**，不能指望每个调用方先过 `_target_account()`：
+    空串跟部署账号号永远不相等 → 一路走到跨账号分支 → 找不到 `da#` 配置行 →
+    (None, None) → 客户看到「无法定位该账号的 Agent Space」。2026-09-02 现网实测：
+    飞书「DevOps 对话」100% 命中（core/devops_chat.py 传的就是 `account_id or ""`）。
+    顺带修掉同源的第二处静默错：空账号会让 `_discover_space` 去找名叫
+    `notiops-devops-`（后缀空）的 space，找不到就取列表第一个 —— 账号里有多个
+    Agent Space 时会安静地连错一个。"""
     deploy = _deploy_account_id()
-    is_deploy = (deploy is not None and str(account_id) == str(deploy))
+    target = str(account_id or "").strip() or str(deploy or "")
+    if not target:
+        return (None, None)
+    is_deploy = bool(deploy) and target == str(deploy)
 
     if is_deploy:
         client = boto3.client("devops-agent", region_name=_REGION)
-        space = _discover_space(client, account_id)
+        space = _discover_space(client, target)
         return (client, space) if space else (None, None)
 
     # 跨账号：需要 config 行（trigger_role_arn + agent_space_id）
-    cfg = _get_da_config(account_id)
+    cfg = _get_da_config(target)
     if not cfg or not cfg.get("trigger_role_arn") or not cfg.get("agent_space_id"):
         return (None, None)
     if cfg.get("enabled") is not True and cfg.get("onboarding_status") not in (None, "active"):
         return (None, None)
-    client = _assume_client(account_id, cfg)
+    client = _assume_client(target, cfg)
     return (client, cfg["agent_space_id"])
 
 
 def _discover_space(client, account_id: str) -> str | None:
-    """自动发现部署账号里的 Agent Space。env 指定优先；否则优先名为
-    notiops-devops-<account> 的；再否则取第一个。结果缓存。"""
+    """自动发现部署账号里**排障用**的 Agent Space。env 指定优先；否则按名字
+    `notiops-devops-<account>` 匹配。结果缓存。
+
+    ⚠️ **不再兜底取 `spaces[0]`。** 本账号现在有两个 agent space
+    （`notiops-devops-<account>` 排障 · `notiops-inspection-<account>` 巡检，
+    见 spec R12.5c），而 `ListAgentSpaces` 的返回顺序没有任何保证：
+
+    ```
+    原实现  chosen = next(名字匹配) or spaces[0]
+            名字匹配不中时取第一个 —— 只有一个 space 时它恒等于那个正确的
+            有两个之后，spaces[0] 可能是巡检 space
+            → 客户的深度调查跑在巡检 space 里
+            → 报告照样出，只是并发算在巡检头上、且加载到巡检的判读 skill
+            → **没有任何错误信号**
+    ```
+
+    所以匹配不中时**返回 None**（调用方走 `_not_onboarded`，客户会看到一条明确提示），
+    而不是猜一个。猜错的代价远大于报错。
+    """
     if _SPACE_ENV:
         return _SPACE_ENV
     if account_id in _space_cache:
@@ -125,7 +154,26 @@ def _discover_space(client, account_id: str) -> str | None:
         if not spaces:
             return None
         preferred = f"notiops-devops-{account_id}"
-        chosen = next((s for s in spaces if s.get("name") == preferred), None) or spaces[0]
+        chosen = next((s for s in spaces if s.get("name") == preferred), None)
+        if chosen is None:
+            # ⚠️ 只有一个 space 且名字不匹配时（如客户手工建的、或早期版本命名不同），
+            # 沿用它 —— 否则会把本来能用的环境判成未上车。两个及以上就必须明确，
+            # 因为那时「取第一个」是在两个语义完全不同的 space 之间瞎猜。
+            if len(spaces) == 1:
+                chosen = spaces[0]
+                logger.info(
+                    "devops_agent: 唯一的 agent space 名字不是 %s，沿用它: name=%s",
+                    preferred, chosen.get("name"),
+                )
+            else:
+                logger.error(
+                    "devops_agent: 账号 %s 有 %d 个 agent space 但没有名为 %s 的，"
+                    "拒绝猜测（猜错会把调查跑到巡检 space 且无任何信号）。"
+                    "请设置 DEVOPS_AGENT_SPACE_ID。现有: %s",
+                    account_id, len(spaces), preferred,
+                    [s.get("name") for s in spaces],
+                )
+                return None
         sid = chosen.get("agentSpaceId")
         if sid:
             _space_cache[account_id] = sid
@@ -187,10 +235,14 @@ def operator_urls(agent_space_id: str, task_id: str = "") -> dict:
 
 
 def start_investigation(title: str, description: str, account_id: str | None = None,
-                        priority: str = "MEDIUM") -> dict:
+                        priority: str = "MEDIUM", source: str = "notiops-web-chat") -> dict:
     """发起一次 DevOps Agent 深度调查（异步，立即返回 task/execution id）。
     成功：{ok, task_id, execution_id, agent_space_id, account_id, console_url, console_home, note}；
-    未上车/失败：{error, message}。console_url = 本次调查的后台进度深链（客户可点开看进度）。"""
+    未上车/失败：{error, message}。console_url = 本次调查的后台进度深链（客户可点开看进度）。
+
+    `source` 会作为 `[<source>]` 前缀写进 description —— 客户在 Operator App 的 backlog 里
+    要能一眼看出这条调查是从哪儿发起的（web / 飞书 / Slack / 钉钉）。默认值保持
+    "notiops-web-chat" 以兼容既有调用方。"""
     if _DISABLED:
         return _not_onboarded(account_id)
     acct = _target_account(account_id)
@@ -207,7 +259,7 @@ def start_investigation(title: str, description: str, account_id: str | None = N
         resp = client.create_backlog_task(
             agentSpaceId=space, taskType="INVESTIGATION",
             title=title, priority=priority,
-            description=f"[notiops-web-chat] {description}")
+            description=f"[{source}] {description}")
         task = resp["task"]
         _urls = operator_urls(space, task["taskId"])
         return {"ok": True, "task_id": task["taskId"], "execution_id": task["executionId"],
@@ -257,9 +309,15 @@ def get_investigation_result(execution_id: str, account_id: str | None = None) -
 _TERMINAL = {"COMPLETED", "FAILED", "TIMED_OUT", "CANCELED", "SKIPPED"}
 
 
-def _record_progress_line(rec: dict) -> str | None:
+def _record_progress_line(rec: dict, locale: str = "zh") -> str | None:
     """把一条 journal record 渲染成一行人类可读的实时进度（用于流式显示到 chat）。
-    返回 None 表示这条不值得展示（如纯系统记录）。"""
+    返回 None 表示这条不值得展示（如纯系统记录）。
+
+    `locale`（"zh" / "en"）只影响这几个固定前缀（"调用工具" / "Observation" …）；
+    正文一律**原样透传** agent 的输出，不翻译（翻译要过模型 = 烧 token，而这条路径
+    的全部意义就是 0 token）。
+    默认 zh 是为了兼容既有调用方（Fargate progress_poller）。"""
+    en = locale == "en"
     rt = rec.get("recordType", "") or ""
     content = rec.get("content")
     # content 可能是 str / dict / JSON 字符串；先解析成对象。
@@ -280,14 +338,15 @@ def _record_progress_line(rec: dict) -> str | None:
         return f"\n🤔 {_clip(body, 400)}\n" if body else None
     if rt == "tool_use":
         name = _tool_name_from(content)
-        return f"\n🔧 调用工具：`{name}`\n" if name else None
+        label = "Tool call" if en else "调用工具"
+        return f"\n🔧 {label}：`{name}`\n" if name else None
     if rt == "observation":
         # {title, analysis, signals}
         if isinstance(obj, dict):
             title = (obj.get("title") or "").strip()
             analysis = _plain(obj.get("analysis") or "")
             if title:
-                out = f"\n**🔭 Observation：{title}**\n"
+                out = f"\n**🔭 Observation{'' if en else '：'}{': ' + title if en else title}**\n"
                 if analysis:
                     out += f"\n{_clip(analysis, 700)}\n"
                 return out
@@ -298,7 +357,7 @@ def _record_progress_line(rec: dict) -> str | None:
             title = (obj.get("title") or "").strip()
             desc = _plain(obj.get("description") or "")
             if title:
-                out = f"\n**🔎 Finding：{title}**\n"
+                out = f"\n**🔎 Finding{'' if en else '：'}{': ' + title if en else title}**\n"
                 if desc:
                     out += f"\n{_clip(desc, 900)}\n"
                 return out
@@ -310,9 +369,9 @@ def _record_progress_line(rec: dict) -> str | None:
         return f"\n💬 {_clip(body, 600)}\n" if body else None
     if rt == "investigation_result":
         # 最终摘要在这条；流式阶段不重复吐（完成后单独展示全文），这里只给一句提示。
-        return "\n📄 调查摘要已生成。\n"
+        return "\n📄 Investigation summary generated.\n" if en else "\n📄 调查摘要已生成。\n"
     if rt == "investigation_summary_md":
-        return "\n📄 正在生成调查摘要…\n"
+        return "\n📄 Generating the investigation summary…\n" if en else "\n📄 正在生成调查摘要…\n"
     return None
 
 
@@ -355,10 +414,14 @@ def _assistant_text(content) -> str:
 
 
 def poll_investigation(execution_id: str, task_id: str, agent_space_id: str,
-                       account_id: str | None = None, seen_ids: set | None = None) -> dict:
+                       account_id: str | None = None, seen_ids: set | None = None,
+                       locale: str = "zh") -> dict:
     """**轮询一次**：拉自上次以来的新 journal 记录 + 当前任务状态。供上层循环驱动"实时显示"。
     返回 {ok, status, terminal(bool), new_lines:[str], seen_ids(set)}；失败 {error,message}。
-    无状态化：调用方持有 seen_ids（已展示过的 recordId），传进来做增量。"""
+    无状态化：调用方持有 seen_ids（已展示过的 recordId），传进来做增量。
+
+    `locale`（"zh" / "en"）只影响进度行的固定前缀；agent 正文一律原样透传、不翻译
+    （翻译=过模型=烧 token，与本路径 0 token 的口径冲突）。默认 zh 兼容既有调用方。"""
     if _DISABLED:
         return _not_onboarded(account_id)
     acct = _target_account(account_id)
@@ -384,7 +447,7 @@ def poll_investigation(execution_id: str, task_id: str, agent_space_id: str,
         if not rid or rid in seen:
             continue
         seen.add(rid)
-        line = _record_progress_line(rec)
+        line = _record_progress_line(rec, locale)
         if line:
             new_lines.append(line)
     # 2) 查任务状态（判断是否终态）
@@ -396,6 +459,100 @@ def poll_investigation(execution_id: str, task_id: str, agent_space_id: str,
         logger.warning("poll_investigation get_backlog_task failed: %s", _safe_err(e))
     return {"ok": True, "status": status, "terminal": status in _TERMINAL,
             "new_lines": new_lines, "seen_ids": seen}
+
+
+def describe_investigation(ref_id: str, account_id: str | None = None,
+                           locale: str = "zh", max_lines: int = 8) -> dict:
+    """凭**用户给的一个引用**（task_id 或 execution_id）回读一条已有调查的状态。
+
+    这是 IM 侧「[[investigation:…]] 现在是什么状态 / 帮我监控它的实时进展」那条路径的
+    数据源 —— **0 token**（不过模型，全是 DevOps Agent 的只读 API）。
+
+    为什么要"两种 id 都收"：卡片正文里我们贴给用户的是 **task_id**（Operator App 深链
+    的 key），而 journal 记录只能按 **executionId** 读。用户复制哪个都得认，所以：
+
+      · `exe-…` 开头 → 直接当 executionId 用（`GetBacklogTask` 不认它，别去问）；
+      · 其余 → 当 taskId，先 `GetBacklogTask` 换出 executionId + status + title。
+
+    口径与 web 端 `devops_investigate.mjs::resolveInvestigationRef` 一致。
+
+    返回：
+      · 成功 ``{ok, task_id, execution_id, status, terminal, title, lines[],
+        rendered, seen_ids[], console_url, console_home, agent_space_id,
+        account_id}`` —— ``rendered`` / ``seen_ids`` 是给"把这张状态卡接到每分钟的
+        进度 Lambda 上继续刷"用的（`imtask#` 行的两个游标字段，口径与
+        `platforms/common/lambda_progress.py` 完全一致：行自带换行，用 `"".join`
+        拼；`seen_ids` 是**全部**已渲染过的 recordId，接上之后不会重复贴旧进度）。
+      · 解析不出来 ``{error: "not_found", message}`` —— 调用方应当**照实说**，
+        绝不能退化成"那就再开一条调查"（那是这次要修的 bug 本身）。
+      · 其余失败沿用本模块统一的 ``{error, message}`` 形状。
+
+    ``max_lines`` 只截**最近**几行进度（卡片装不下全量 journal；<=0 = 不截）。
+    """
+    if _DISABLED:
+        return _not_onboarded(account_id)
+    ref = (ref_id or "").strip().strip("`")
+    if not ref:
+        return {"error": "bad_request", "message": "缺少调查引用（task_id / execution_id）"}
+    acct = _target_account(account_id)
+    if not acct:
+        return {"error": "cross_account_denied", "message": "跨账号未开启，仅支持部署账号。"}
+    try:
+        client, space = _client_and_space(acct)
+    except Exception as e:  # noqa: BLE001
+        return {"error": "connect_failed", "message": f"连接 DevOps Agent 失败：{_safe_err(e)}"}
+    if not client or not space:
+        return _not_onboarded(acct)
+
+    task_id, execution_id, status, title = "", "", "", ""
+    if ref.lower().startswith("exe-"):
+        execution_id = ref
+    else:
+        task_id = ref
+        try:
+            t = client.get_backlog_task(agentSpaceId=space, taskId=ref).get("task", {})
+        except Exception as e:  # noqa: BLE001
+            # 引用查不到是**正常**的用户输入错误（打错一位、引用了别的账号的调查），
+            # 不是系统故障 —— 所以只留错误类型，不刷 exception 栈。
+            logger.info("describe_investigation get_backlog_task miss: %s", _safe_err(e))
+            return {"error": "not_found",
+                    "message": f"没有找到调查 {ref}（可能 id 有误，或它属于另一个账号）。"}
+        execution_id = t.get("executionId") or ""
+        status = t.get("status") or ""
+        title = t.get("title") or ""
+        if not execution_id:
+            return {"error": "not_found",
+                    "message": f"调查 {ref} 还没有执行记录，请稍后再看。"}
+
+    lines: list[str] = []
+    seen_ids: list[str] = []
+    try:
+        records = _list_all_records(client, space, execution_id)
+    except Exception as e:  # noqa: BLE001
+        records = []
+        logger.warning("describe_investigation list records failed: %s", _safe_err(e))
+    for rec in records:
+        line = _record_progress_line(rec, locale)
+        if not line:
+            continue
+        lines.append(line)
+        rid = rec.get("recordId")
+        if rid:
+            seen_ids.append(str(rid))
+    rendered = "".join(lines)
+    if max_lines > 0 and len(lines) > max_lines:
+        lines = lines[-max_lines:]
+
+    if not status:
+        # 只给了 execution_id 时拿不到 backlog task —— 用 journal 是否收敛做兜底判断。
+        status = "COMPLETED" if _structured_summary_from_records(records) else "IN_PROGRESS"
+    urls = operator_urls(space, task_id)
+    return {"ok": True, "task_id": task_id, "execution_id": execution_id,
+            "status": status, "terminal": status in _TERMINAL, "title": title,
+            "lines": lines, "rendered": rendered, "seen_ids": seen_ids,
+            "console_url": urls["deep_link"],
+            "console_home": urls["home"], "agent_space_id": space,
+            "account_id": acct}
 
 
 def _list_all_records(client, space, execution_id) -> list:

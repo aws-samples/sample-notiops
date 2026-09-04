@@ -7,7 +7,7 @@
 # (see infra/lib/bot-stack.ts → ContainerImage.fromAsset). The setup.sh
 # wrapper handles the full flow.
 
-FROM public.ecr.aws/docker/library/python:3.12-slim
+FROM public.ecr.aws/docker/library/python:3.14-slim
 
 WORKDIR /app
 

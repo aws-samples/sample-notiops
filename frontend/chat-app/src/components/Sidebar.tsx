@@ -6,7 +6,7 @@ import type { Conversation, TopicKey } from "../types";
 import { TOPICS } from "../types";
 import {
   IconNewChat, IconInvestigate, IconFinOps, IconCases, IconSecurity,
-  IconReports, IconMore, IconExternal, IconSkill, IconCustomize, IconWhatsNew, IconChevronRight, IconBell,
+  IconReports, IconInspection, IconMore, IconExternal, IconSkill, IconCustomize, IconWhatsNew, IconChevronRight, IconBell,
   IconCollapseAll, IconExpandAll,
 } from "./icons";
 import ConvItem from "./ConvItem";
@@ -45,6 +45,8 @@ interface Props {
   securityActive?: boolean;     // 安全页当前是否激活（高亮）
   onInvestigate?: () => void;   // 打开「调查」告警仪表盘独立页
   investigateActive?: boolean;  // 调查页当前是否激活（高亮）
+  onInspection?: () => void;    // 打开「资源巡检」看板独立页（站内，非外链）
+  inspectionActive?: boolean;   // 巡检页当前是否激活（高亮）
   showFinops?: boolean;         // 能力门禁：是否显示 FinOps 入口（默认 true）
   showCases?: boolean;          // 能力门禁：是否显示 Cases 入口（默认 true）
   showAdmin?: boolean;          // 能力门禁：是否显示 管理 入口（默认 false，仅 admin 可见）
@@ -53,6 +55,14 @@ interface Props {
   showSkills?: boolean;         // 能力门禁：Skills（默认 true）
   showCustomize?: boolean;      // 能力门禁：Customize（默认 true）
   showSecurity?: boolean;       // 能力门禁：Security（默认 false，需 nav:security）
+  /**
+   * 能力门禁：资源巡检看板（默认 **false**，需 `nav:inspection`）。
+   *
+   * ⚠️ 默认 false 而不是 true —— 与 Security / Admin 同档。巡检看板会显示
+   * 客户的排除清单与阈值配置，那是运维决策而不是公开信息。
+   * 默认 true 会让能力还没加载完的那一瞬间对所有人闪出这个入口。
+   */
+  showInspection?: boolean;
 }
 
 const PanelIcon = () => (
@@ -73,7 +83,7 @@ const PanelIcon = () => (
  */
 const SHOW_INSPECTIONS = false;
 
-export default function Sidebar({ conversations, activeId, busyIds, unreadIds, onSelect, onNew, onRename, onTogglePin, onDelete, collapsed, onToggle, username, onSignOut, width = 264, onSkills, skillsActive, onCustomize, customizeActive, onWhatsNew, onNotifications, notificationsActive, notifUnread = 0, onFinops, finopsActive, onCases, casesActive, onAdmin, adminActive, showFinops = true, showCases = true, showAdmin = false, showNotifications = true, showInvestigation = true, showSkills = true, showCustomize = true, onSecurity, securityActive, showSecurity = false, onInvestigate, investigateActive }: Props) {
+export default function Sidebar({ conversations, activeId, busyIds, unreadIds, onSelect, onNew, onRename, onTogglePin, onDelete, collapsed, onToggle, username, onSignOut, width = 264, onSkills, skillsActive, onCustomize, customizeActive, onWhatsNew, onNotifications, notificationsActive, notifUnread = 0, onFinops, finopsActive, onCases, casesActive, onAdmin, adminActive, showFinops = true, showCases = true, showAdmin = false, showNotifications = true, showInvestigation = true, showSkills = true, showCustomize = true, onSecurity, securityActive, showSecurity = false, onInvestigate, investigateActive, onInspection, inspectionActive, showInspection = false }: Props) {
   const t = useT();
   const { locale } = useLocale();
   // "更多"子菜单展开态（收纳 安全 / 巡检&报告 等非高频入口）
@@ -171,6 +181,10 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
         {/* 主题入口（②）：点击将在右侧打开该主题的定制 chat 页。 */}
         {showInvestigation && <button className={"navitem" + (investigateActive ? " active" : "")} onClick={() => onInvestigate?.()}><span className="ni-ic"><IconInvestigate /></span>{t("topic.investigate")}</button>}
         {showFinops && <button className={"navitem" + (finopsActive ? " active" : "")} onClick={onFinops}><span className="ni-ic"><IconFinOps /></span>{t("topic.cost")}</button>}
+        {/* 资源巡检：站内看板（**不是**「更多」里那个外链到 idle 控制台的旧入口）。
+            放在成本之后 —— 它的两个主力页面是高负载（可靠性）与闲置（成本），
+            与上下两个邻居各有一半重合，位置上贴着它们最好找。 */}
+        {showInspection && <button className={"navitem" + (inspectionActive ? " active" : "")} onClick={() => onInspection?.()}><span className="ni-ic"><IconInspection /></span>{t("insp.title")}</button>}
         {showSecurity && <button className={"navitem" + (securityActive ? " active" : "")} onClick={() => onSecurity?.()}><span className="ni-ic"><IconSecurity /></span>{t("topic.security")}</button>}
         {showCases && <button className={"navitem" + (casesActive ? " active" : "")} onClick={onCases}><span className="ni-ic"><IconCases /></span>{t("topic.cases")}</button>}
         {/* Skills：独立一级入口。点开进独立 Skills 管理页（非「定制」外壳）。 */}

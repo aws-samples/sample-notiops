@@ -53,6 +53,10 @@ SUMS = {
     "bff.zip": "a" * 64,
     "chat-dist.zip": "b" * 64,
     "web-notif.zip": "e" * 64,
+    # IM 加装项。**无条件出现在清单里** —— `InstallOption` 是部署期参数，发布时不知道
+    # 客户会选什么；只装 web 的客户由 stager 按 `im-` 前缀跳过下载。
+    "im-code.zip": "f" * 64,
+    "im-layer.zip": "0" * 64,
     "agent-code.zip": "c" * 64,
 }
 TAG = "v9.9.9"
@@ -111,6 +115,12 @@ def synth_template() -> dict:
         },
         "Parameters": {
             "AdminEmail": {"Type": "String", "Description": "Where to email the first login"},
+            "InstallOption": {
+                "Type": "String",
+                "Default": "web",
+                "AllowedValues": ["web", "web+feishu", "web+slack"],
+                "Description": "What to install. Web Chat is always installed.",
+            },
             "BootstrapVersion": {
                 "Type": "AWS::SSM::Parameter::Value<String>",
                 "Default": "/cdk-bootstrap/hnb659fds/version",
@@ -126,6 +136,11 @@ def synth_template() -> dict:
             "NotiOpsRelease": {
                 pp.RELEASE_MAP_KEY: {"Tag": pp.RELEASE_TAG_PLACEHOLDER, "BaseUrl": "UNSET"}
             }
+        },
+        "Conditions": {
+            "InstallFeishu": {"Fn::Equals": [{"Ref": "InstallOption"}, "web+feishu"]},
+            "InstallSlack": {"Fn::Equals": [{"Ref": "InstallOption"}, "web+slack"]},
+            "InstallIm": {"Fn::Or": [{"Condition": "InstallFeishu"}, {"Condition": "InstallSlack"}]},
         },
         "Resources": {
             "StagingBucket9644C37C": {
@@ -196,6 +211,36 @@ def synth_template() -> dict:
                     "LoggingConfig": {"LogGroup": {"Ref": "WebNotifLogs389A7992"}},
                 },
             },
+            # IM 加装项（`InstallOption=web+feishu` / `web+slack` 才落地，但**模板里
+            # 恒在** —— 合成期不知道客户会选什么，装不装由部署期条件决定）。
+            # 三个 IM 函数共用 im-code.zip，脚本取 FeishuWorker 那一份；层的代码字段
+            # 叫 `Content` 而不是 `Code`，DependsOn 判据要同时认这两个名字。
+            "FeishuWorkerA1B2C3D4": {
+                "Type": "AWS::Lambda::Function",
+                "Condition": "InstallFeishu",
+                "DependsOn": ["StagerArtifacts"],
+                "Metadata": {"aws:cdk:path": "NotiOps/FeishuWorker/Resource"},
+                "Properties": {"Code": {
+                    "S3Bucket": {"Ref": "StagingBucket9644C37C"},
+                    "S3Key": {"Fn::Join": ["", [
+                        "im/",
+                        {"Fn::FindInMap": ["NotiOpsRelease", pp.RELEASE_MAP_KEY, "Tag"]},
+                        "/im-code.zip"]]},
+                }},
+            },
+            "ImDepsLayerE5F6A7B8": {
+                "Type": "AWS::Lambda::LayerVersion",
+                "Condition": "InstallIm",
+                "DependsOn": ["StagerArtifacts"],
+                "Metadata": {"aws:cdk:path": "NotiOps/ImDepsLayer/Resource"},
+                "Properties": {"Content": {
+                    "S3Bucket": {"Ref": "StagingBucket9644C37C"},
+                    "S3Key": {"Fn::Join": ["", [
+                        "im/",
+                        {"Fn::FindInMap": ["NotiOpsRelease", pp.RELEASE_MAP_KEY, "Tag"]},
+                        "/im-layer.zip"]]},
+                }},
+            },
             "AgentRuntime": {
                 "Type": "AWS::BedrockAgentCore::Runtime",
                 "DependsOn": ["StagerArtifacts"],
@@ -246,12 +291,20 @@ _check("清单是 JSON **字符串**而不是嵌套对象（自定义资源属�
        isinstance(out["Resources"]["StagerArtifacts"]["Properties"]["Artifacts"], str))
 _check("清单顺序 = 搬运顺序：144MiB 的 agent zip 放最后（前面失败能秒级暴露）",
        [e["name"] for e in manifest]
-       == ["bff.zip", "chat-dist.zip", "web-notif.zip", "agent-code.zip"])
-_check("四个 key 都是从模板里读出来的（intrinsic 求值），不是脚本里重拼的",
+       == ["bff.zip", "chat-dist.zip", "web-notif.zip",
+           "im-code.zip", "im-layer.zip", "agent-code.zip"])
+_check("六个 key 都是从模板里读出来的（intrinsic 求值），不是脚本里重拼的",
        [e["key"] for e in manifest]
        == [BFF_KEY, f"frontend/{TAG}/chat-dist.zip", f"notif/{TAG}/web-notif.zip",
+           f"im/{TAG}/im-code.zip", f"im/{TAG}/im-layer.zip",
            f"agent/{TAG}/agent-code.zip"],
        str([e["key"] for e in manifest]))
+# 两个 im-*.zip 的名字前缀是**跨三处的契约**：这里 / SHA256SUMS / stager 里
+# `name.startswith("im-")` 的跳过逻辑。改名字要三处一起改，否则症状是"只有选了 IM 的
+# 客户开栈失败"（web-only 客户一切正常，发布验证极易漏掉）。
+_check("IM 两个产物名都以 `im-` 开头（stager 靠这个前缀在 InstallOption=web 时跳过下载）",
+       all(e["name"].startswith("im-") for e in manifest if "im-" in e["name"])
+       and {pp.IM_CODE_ARTIFACT, pp.IM_LAYER_ARTIFACT} <= {e["name"] for e in manifest})
 _check("sha256 逐个对上", {e["name"]: e["sha256"] for e in manifest} == SUMS)
 _check("模板里不再有 tag 占位符", pp.RELEASE_TAG_PLACEHOLDER not in blob)
 
@@ -372,6 +425,10 @@ def _tagless_keys() -> None:
     t["Resources"]["WebNotifFn"]["Properties"]["Code"]["S3Key"] = "notif/web-notif.zip"
     t["Resources"]["AgentRuntime"]["Properties"]["AgentRuntimeArtifact"]["CodeConfiguration"][
         "Code"]["S3"]["Prefix"] = "agent/agent-code.zip"
+    # IM 那两个也要一起去掉 tag：判据是「清单里**一个** key 都不带 tag」，漏掉任何
+    # 一个产物这条反例就撞不上（而它本身就是"少改一处"的那类 bug）。
+    t["Resources"]["FeishuWorkerA1B2C3D4"]["Properties"]["Code"]["S3Key"] = "im/im-code.zip"
+    t["Resources"]["ImDepsLayerE5F6A7B8"]["Properties"]["Content"]["S3Key"] = "im/im-layer.zip"
     pp.postprocess(t, TAG, dict(SUMS), "https://example.invalid/x")
 
 
@@ -440,6 +497,8 @@ with tempfile.TemporaryDirectory() as d:
         fh.write(f"{'a' * 64}  bff.zip\n")
         fh.write(f"{'b' * 64} *chat-dist.zip\n")
         fh.write(f"{'e' * 64}  web-notif.zip\n")
+        fh.write(f"{'f' * 64}  im-code.zip\n")
+        fh.write(f"{'0' * 64} *im-layer.zip\n")
         fh.write(f"# 注释行\n\n{'c' * 64}  dist/oneclick/agent-code.zip\n")
     _check("接受 `*` 前缀 / 目录前缀 / 注释与空行，key 取 basename",
            pp._read_sha256sums(pp.Path(good)) == SUMS)
@@ -456,9 +515,10 @@ ts = open(STANDALONE_TS, encoding="utf-8").read()
 _check(f"TS 里写着同一个 tag 占位值 {pp.RELEASE_TAG_PLACEHOLDER!r}", pp.RELEASE_TAG_PLACEHOLDER in ts)
 _check(f"TS 里的 Mappings 顶层键是 {pp.RELEASE_MAP_KEY!r}（不是 CFN 保留的 Default）",
        pp.RELEASE_MAP_KEY in ts and '"Default":' not in ts)
-_check("四个产物名与 TS/StagerFn 侧一致",
+_check("六个产物名与 TS/StagerFn 侧一致",
        all(n in ts or n in json.dumps(out) for n in
-           (pp.BFF_ARTIFACT, pp.CHAT_DIST_ARTIFACT, pp.NOTIF_ARTIFACT, pp.AGENT_ARTIFACT)))
+           (pp.BFF_ARTIFACT, pp.CHAT_DIST_ARTIFACT, pp.NOTIF_ARTIFACT,
+            pp.IM_CODE_ARTIFACT, pp.IM_LAYER_ARTIFACT, pp.AGENT_ARTIFACT)))
 # 「通知」产物名在 TS 侧是常量（web-notif-sources.ts 的 WEB_NOTIF_ARTIFACT），
 # 单栈里只出现 `${WEB_NOTIF_ARTIFACT}`，所以这里对着那份源文件核。
 _check(f"web-notif-sources.ts 里的产物名与 {pp.NOTIF_ARTIFACT!r} 一致",

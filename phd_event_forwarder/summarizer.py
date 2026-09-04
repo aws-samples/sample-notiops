@@ -6,8 +6,6 @@
 认证优先级：
   1. API Key Bearer Token（BEDROCK_API_KEY_SECRET_ARN 非空且 API Key 非空）
   2. IAM 凭证（默认回退）
-
-Requirements: 5.1, 5.2, 5.3, 5.4, 5.5
 """
 
 import json

@@ -374,6 +374,13 @@ def _extract_record_content(content) -> str | None:
 
     content 是 boto3 document 类型，可能是 str / dict / list 等。
 
+    ⚠️ 只适用于 **content 本身就是正文**的 recordType。实测只有
+    `investigation_summary_md` 是这样（裸 markdown，不是 JSON）。
+    `investigation_result` / `investigation_summary` / `finding` 的 content 是
+    **JSON 字符串**，走这里会把 `{"type": ..., "text": ...}` 整段当正文返回，
+    报告里就会漏出 JSON 包装。那几类用类型感知的提取器
+    （见 `_extract_investigation_result_text`）。
+
     Returns:
         提取到的文本，失败返回 None
     """
@@ -386,6 +393,113 @@ def _extract_record_content(content) -> str | None:
     return str(content)
 
 
+def _extract_investigation_result_text(
+    client,
+    agent_space_id: str,
+    execution_id: str,
+) -> str | None:
+    """读**成品报告**记录里的 markdown。按 `_REPORT_RECORD_TYPES` 逐个类型试。
+
+    ## 为什么不写死单一类型
+
+    三次实测，`recordType` 的构成每次都不同：
+
+    ```
+    2026-07 的 5 次    message · utilization · investigation_result
+                       + 部分带 symptom/finding/observation/investigation_gap
+                       其中 1 次（07-14）带 investigation_summary_md + investigation_summary
+    2026-08-11 的 4 次 message · utilization · investigation_result   （细粒度记录全消失）
+    2026-08-19 的 1 次 message · utilization · investigation_summary_md(2) ·
+                       investigation_summary(2) · finding(2) · observation(2) · symptom(1)
+                       + ui_investigation_summary(11)   ← 全新类型
+                       ⚠️ **没有 investigation_result**
+    ```
+
+    所以「哪个类型是成品报告」这件事**不是稳定契约**。上一版把
+    `investigation_result` 当唯一第一优先级，而 2026-08-19 那次它压根没出现 ——
+    那次会直接落到最末的 message 兜底（对话式回复而非成品报告）。
+
+    ⚠️ `ui_investigation_summary` 故意**不在**候选里：它是给控制台渲染的 UI 组件树
+    （`{"type":..., "content":{"id":"root","type":"container","children":[...]}}`，
+    单条 6.8KB），不是可读报告。把它当报告会把一坨组件 JSON 推给客户。
+
+    ## content 的编码按类型不同
+
+    ```
+    investigation_result       JSON 字符串 {"type","text"}   正文在 text
+    investigation_summary_md   **裸 markdown**（不是 JSON）
+    ```
+    两种都要能处理 —— 只处理一种，另一种会漏出 JSON 包装或直接被丢弃。
+
+    ⚠️ recordType 在 API 模型里**没有枚举、文档也没列**（`order` 却是 ASC|DESC 枚举）。
+    因此只用 journal 取**叙述**；需要可复现的结构化数字 SHALL NOT 依赖它。
+    """
+    for record_type in _REPORT_RECORD_TYPES:
+        text = _read_report_record(client, agent_space_id, execution_id, record_type)
+        if text:
+            return text
+    return None
+
+
+# 成品报告的候选 recordType，按优先级。⚠️ 顺序之外更重要的是**逐个都试** ——
+# 实测三批调查里没有任何一个类型是每次都出现的。
+# SHALL NOT 加入 `ui_investigation_summary`（UI 组件树，见上）或 `message`
+# （对话式回复，由 `_extract_summary_from_messages` 单独兜底）。
+_REPORT_RECORD_TYPES: tuple[str, ...] = (
+    "investigation_result",
+    "investigation_summary_md",
+)
+
+
+def _read_report_record(
+    client,
+    agent_space_id: str,
+    execution_id: str,
+    record_type: str,
+) -> str | None:
+    """取单一 recordType 的最新一条并解出正文。兼容 JSON 包装与裸 markdown。"""
+    try:
+        response = client.list_journal_records(
+            agentSpaceId=agent_space_id,
+            executionId=execution_id,
+            recordType=record_type,
+            order="DESC",
+            limit=1,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "查询 %s 失败: execution_id=%s error=%s", record_type, execution_id, e,
+        )
+        return None
+
+    for record in response.get("records", []):
+        raw = record.get("content")
+        if raw is None:
+            continue
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            # 裸 markdown 是 `investigation_summary_md` 的**正常**形态（实测 2026-08-19
+            # 那条以 "# Investigation Summary" 开头、不是 JSON），不是降级路径。
+            if isinstance(raw, str) and raw.strip():
+                logger.info(
+                    "%s 是裸文本（%d 字符）: execution_id=%s",
+                    record_type, len(raw), execution_id,
+                )
+                return raw
+            continue
+        if not isinstance(payload, dict):
+            continue
+        text = payload.get("text")
+        if isinstance(text, str) and text.strip():
+            logger.info(
+                "从 %s 获取到摘要（%d 字符）: execution_id=%s",
+                record_type, len(text), execution_id,
+            )
+            return text
+    return None
+
+
 def _extract_summary_from_messages(
     client,
     agent_space_id: str,
@@ -393,8 +507,11 @@ def _extract_summary_from_messages(
 ) -> str | None:
     """从 message 类型的 journal records 中提取最后一条 assistant 报告。
 
-    全面巡检型调查不会生成 investigation_summary_md 记录，
-    报告内容存储在最后一条 role=assistant 的 message 记录中。
+    这是降级链的**最后一档**，不是常规路径 —— 它拿到的是对话式回复，不是成品报告。
+    原注释说「全面巡检型调查不会生成 investigation_summary_md 记录，所以报告在最后
+    一条 assistant message 里」：前半句对（实测 8/9 不生成），后半句错 —— 成品报告
+    在 `investigation_result` 记录里，见 `_extract_investigation_result_text`。
+    走到这里说明那两种记录都没拿到。
 
     Returns:
         提取到的 Markdown 文本，失败返回 None
@@ -476,10 +593,15 @@ def get_investigation_summary(
 ) -> str | None:
     """跨账户获取调查摘要 Markdown。
 
-    降级链：
-      1. 查询 investigation_summary_md 记录（问题诊断型调查）
-      2. 若为空，从最后一条 assistant message 中提取（全面巡检型调查）
-      3. 支持重试，应对 EventBridge 事件与摘要生成的时序竞争
+    降级链（每一轮①②都试，命中即返回；重试只覆盖 EventBridge 事件与摘要落库的
+    时序竞争，不是为了等某一种 recordType 出现）：
+      ① investigation_result      当前主路径。实测 8/9 命中，单条成品 markdown，
+                                  content 是 JSON 字符串，正文在 `text`
+      ② investigation_summary_md  老调查仍可能命中，content 是裸 markdown
+      ③ 最后一条 assistant message  兜底，是对话式回复而非成品报告
+
+    ⚠️ 顺序曾经是反的（①②互换且先把②重试满 3×5 秒才降级）。因为 8/9 的调查不产出
+    `investigation_summary_md`，那等于每次回调白等 15 秒再退到③。
 
     使用 _query_account_mapping_raw 查配置（即便账户 disabled 也允许拉摘要入库）。
 
@@ -551,63 +673,39 @@ def get_investigation_summary(
         logger.error("创建 devops-agent client 失败: %s", e)
         return None
 
-    # 第一优先级：查询 investigation_summary_md 记录
+    # ①：每一轮把 `_REPORT_RECORD_TYPES` 里的类型**逐个都试**，命中即返回。
+    # 重试只为覆盖 EventBridge 事件与摘要落库之间的时序竞争，不是为了等某一种类型出现。
+    #
+    # ⚠️ 为什么不能只试一种：`recordType` 的构成三次实测三个样子，没有任何类型每次都出现
+    #    （详见 `_extract_investigation_result_text` 的 docstring）。上一版只试
+    #    `investigation_result`，而 2026-08-19 那次调查压根没产生它 → 直接落到 message 兜底。
+    #    再上一版反过来只试 `investigation_summary_md` 并先重试满 3×5 秒 → 每次白等 15 秒。
     for attempt in range(1, max_retries + 1):
-        try:
-            response = client.list_journal_records(
-                agentSpaceId=agent_space_id,
-                executionId=execution_id,
-                recordType="investigation_summary_md",
+        content = _extract_investigation_result_text(
+            client, agent_space_id, execution_id
+        )
+        if content:
+            return content
+
+        if attempt < max_retries:
+            logger.info(
+                "成品报告记录 %s 均未命中（第 %d/%d 次），%s 秒后重试: execution_id=%s",
+                list(_REPORT_RECORD_TYPES),
+                attempt,
+                max_retries,
+                retry_delay,
+                execution_id,
+            )
+            time.sleep(retry_delay)  # nosemgrep: arbitrary-sleep — retry backoff for journal eventual consistency
+        else:
+            logger.info(
+                "重试 %d 次后 %s 均无，降级到 message 提取: execution_id=%s",
+                max_retries,
+                list(_REPORT_RECORD_TYPES),
+                execution_id,
             )
 
-            records = response.get("records", [])
-            if records:
-                content = _extract_record_content(records[0].get("content"))
-                if content:
-                    logger.info(
-                        "从 investigation_summary_md 获取到摘要: execution_id=%s",
-                        execution_id,
-                    )
-                    return content
-
-            if attempt < max_retries:
-                logger.info(
-                    "未找到 investigation_summary_md（第 %d/%d 次），"
-                    "%s 秒后重试: execution_id=%s",
-                    attempt,
-                    max_retries,
-                    retry_delay,
-                    execution_id,
-                )
-                time.sleep(retry_delay)  # nosemgrep: arbitrary-sleep — retry backoff for journal eventual consistency
-            else:
-                logger.info(
-                    "重试 %d 次后仍无 investigation_summary_md，"
-                    "尝试从 message 记录降级提取: execution_id=%s",
-                    max_retries,
-                    execution_id,
-                )
-
-        except Exception as e:
-            if attempt < max_retries:
-                logger.warning(
-                    "查询 investigation_summary_md 异常（第 %d/%d 次），"
-                    "%s 秒后重试: %s",
-                    attempt,
-                    max_retries,
-                    retry_delay,
-                    e,
-                )
-                time.sleep(retry_delay)  # nosemgrep: arbitrary-sleep — retry backoff after API error
-            else:
-                logger.warning(
-                    "查询 investigation_summary_md 失败，"
-                    "尝试从 message 记录降级提取: execution_id=%s error=%s",
-                    execution_id,
-                    e,
-                )
-
-    # 第二优先级：从 message 记录中提取最后一条 assistant 报告
+    # ② 兜底：从 message 记录中提取最后一条 assistant 报告
     return _extract_summary_from_messages(client, agent_space_id, execution_id)
 
 
@@ -620,6 +718,7 @@ def build_cross_account_devops_client(
     target_account_id: str,
     *,
     source: str = "fetch-report",
+    account_already_authorized: bool = False,
 ) -> tuple[object | None, str | None]:
     """返回 (跨账户 devops-agent client, agent_space_id)。
 
@@ -629,9 +728,48 @@ def build_cross_account_devops_client(
     任何失败（账户未配置 / 跨账号闸门拦截 / 缺 agent_space_id / AssumeRole 失败）
     返回 (None, None)，调用方据此降级（report_available=false）。
 
-    Requirements: R3.1, R4.1, R4.3
+    Args:
+        account_already_authorized: 调用方**已经**确认过 `target_account_id`
+            是我们登记的账号。为真时跳过 `LOCKED_ACCOUNT_ID` 闸门。
+
+    🔴 **那个参数说的是前提，不是动作**（2026-08-30 加）。名字刻意不叫
+    `skip_gate` —— 那会让下一个人以为「想省事就传 True」。传它的调用方必须
+    真的验过，而目前只有一个：`devops_agent_callback.handler`，它的 step 2
+    用 `_query_account_mapping_raw(event.account)` 拦掉未登记账号，
+    **而 `event.account` 是 EventBridge 服务盖章的**（`PutEventsRequestEntry`
+    没有 `Account` 字段，调用方填不了）—— 那才是真正的边界。
+
+    ⚠️ 为什么需要它：这道闸的本意是「把跨账号**采集/调查的发起**锁在部署账号」
+    （见 `shared/account_scope.py` 的 docstring）。而本函数在 callback 里做的是
+    **读回我们自己派出去的调查的结果** —— 事件已经到了、调查已经跑完了、账号
+    已经验过了。闸在这里只做了一件事：让成员账号的判读永远取不回来，而
+    `run` 状态、报告链接、S3 对象全部正常，只是 `parse_status="empty"`。
+    零错误码。
+
+    ⚠️ 默认 `False`，所以**其余调用方行为一字不变**（包括那个未部署的
+    `report_handler.lambda_handler`，它没有账号校验，不该传 True）。
     """
-    if not target_account_id or not is_account_allowed(target_account_id):
+    if not target_account_id:
+        return None, None
+    # 🔴 **判据是「必须授权」，不是「授权了就绕过闸门」**（2026-08-30 第二次改）。
+    #
+    #    上一版写的是 `if not authorized and not is_account_allowed(...)`，
+    #    也就是「没授权时回落到 LOCKED_ACCOUNT_ID 闸门」。而 orgMode 下
+    #    `LOCKED_ACCOUNT_ID` 是**空串**（notiops-backend-stack.ts:551
+    #    `orgMode ? "" : ACCOUNT_ID`）→ `is_account_allowed` 恒 True
+    #    → `not True` = False → 整个条件为假 → **不 return，继续往下 assume**。
+    #
+    #    后果比没有判据更糟：调用方那侧记着 "不跨账号取判读正文" 的 WARNING，
+    #    而代码真的取了。排查的人会相信那行日志。
+    #    （两份独立 review 都抓到这条；我自己用真值表复现过。）
+    #
+    # ⇒ 现在：没授权就是不放行，两种部署形态行为一致，日志不再说谎。
+    # ⚠️ 默认 `False` ⇒ **fail-closed**：将来谁忘了传这个参数，拿到的是
+    #    `(None, None)`（报告降级、可见），而不是静默的跨账号 assume。
+    # ⚠️ `is_account_allowed` 在这条路上**不再被读** —— 那道闸锁的是
+    #    「跨账号采集/调查的**发起**」，而这里是读回我们自己派出去的结果。
+    #    把「谁有资格被读」交给调用方的显式判据（active + enabled）更准确。
+    if not account_already_authorized:
         return None, None
     mapping = _query_account_mapping_raw(target_account_id)
     if mapping is None or not mapping.get("agent_space_id"):
@@ -659,6 +797,8 @@ def list_journal_records_cross_account(
     execution_id: str,
     target_account_id: str,
     record_type: str | None = None,
+    account_already_authorized: bool = False,
+    agent_space_id: str = "",
 ) -> list[dict]:
     """跨账户分页拉取一次 execution 的全部 journal records（供 trace.html 生成）。
 
@@ -677,6 +817,10 @@ def list_journal_records_cross_account(
         execution_id: 执行 ID
         target_account_id: 目标业务账户 ID
         record_type: 可选的 recordType 过滤（None 表示全部类型）
+        account_already_authorized: 调用方已确认该账号是我们登记的账号，
+            为真时跳过 `LOCKED_ACCOUNT_ID` 闸门。语义与理由见
+            `build_cross_account_devops_client`（两处必须一起传，否则会出现
+            「报告正文取到了、trace 是空的」这种半通状态）。
 
     Returns:
         records 列表；失败返回 []
@@ -690,11 +834,16 @@ def list_journal_records_cross_account(
         )
         return []
 
-    # 跨账号闸门（defense-in-depth）：与 get_investigation_summary 一致收敛到部署账号。
-    if not is_account_allowed(target_account_id):
+    # 🔴 与 `build_cross_account_devops_client` **同一个判据形状**：必须授权。
+    #    上一版是「没授权时回落到闸门」，而 orgMode 下闸门恒放行 ⇒ 判据 no-op。
+    #    详见那个函数里的说明。
+    if not account_already_authorized:
         logger.info(
-            "跨账号已 disabled：跳过非部署账号 %s 的 trace 列举（仅允许 %s）",
-            target_account_id, locked_account_id(),
+            "账号 %s 未被调用方授权（active+enabled），跳过 trace 列举。"
+            "⚠️ 与报告正文那条**必须一致** —— 只放一个会出现"
+            "「正文取到了、trace 是空的」这种半通状态，而 trace 的失败是"
+            "best-effort 吞掉的，那种半通完全静默",
+            target_account_id,
         )
         return []
 
@@ -706,7 +855,26 @@ def list_journal_records_cross_account(
         )
         return []
 
-    agent_space_id = mapping.get("agent_space_id")
+    # 🔴 **调用方传进来的 space 优先。** `mapping` 里那个是**排障** space
+    #    （`da#<acct>.agent_space_id`），而巡检的 execution 活在**巡检** space
+    #    （`inspect_agent_space_id`）里 —— 两者是不同的 agent space。
+    #
+    #    只读 mapping 的后果（2026-08-31 实机确认）：拿排障 space 去查一个
+    #    巡检 execution 的 journal，`ListJournalRecords` 返回空 ⇒
+    #
+    #    ```
+    #    trace.html          巡检的一直是**空的**（6.4KB 骨架、零条记录）
+    #    skill 加载门禁       恒判 no_journal / trustworthy=False
+    #                        —— 一个恒亮的红灯，而门禁的价值全在于它平时是绿的
+    #    ```
+    #
+    #    而正文那一侧是对的：`build_investigation_report` 用的是
+    #    **事件 metadata 里的** `agent_space_id`（DA 盖章的、必然正确）。
+    #    也就是同一次回调里「正文取到了、trace 是空的」——
+    #    正是本函数 docstring 警告过的那种半通状态，只是原因不是授权而是 space。
+    #
+    # ⚠️ 空字符串才回落到 mapping：排障链路没有第二个 space，行为不变。
+    agent_space_id = (agent_space_id or "").strip() or mapping.get("agent_space_id")
     if not agent_space_id:
         logger.warning(
             "账户配置缺少 agent_space_id: target_account=%s", target_account_id,
@@ -739,14 +907,26 @@ def list_journal_records_cross_account(
     }
     if record_type:
         params["recordType"] = record_type
+    # ⚠️ **页数上限**。原来是裸 `while True` —— AWS 若返回一个重复的 nextToken
+    #    （或我们把 params 传坏了），这里会一直转到 Lambda 超时。而超时是这个
+    #    项目反复踩的那类静默失败：finish_run 不执行、行停在 running、消息被删
+    #    不进 DLQ。2026-08-30 补上，同时它让「拿 MagicMock 当 client」的测试
+    #    不再死循环（MagicMock.get() 恒真）。
+    #    200 页 × 每页上限，远超任何一次真实 execution 的记录数。
+    _MAX_PAGES = 200
     try:
-        while True:
+        for page in range(_MAX_PAGES):
             resp = client.list_journal_records(**params)
             records.extend(resp.get("records", []))
             token = resp.get("nextToken")
             if not token:
                 break
             params["nextToken"] = token
+        else:
+            logger.error(
+                "列举 trace records 达到页数上限 %d，可能是 nextToken 不收敛："
+                "execution_id=%s target_account=%s 已拉 %d 条",
+                _MAX_PAGES, execution_id, target_account_id, len(records))
     except Exception as e:
         logger.warning(
             "列举 trace records 异常（返回已拉取的 %d 条）: execution_id=%s error=%s",

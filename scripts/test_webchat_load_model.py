@@ -1,5 +1,5 @@
 """
-webchat 模型构造测试（spec task 3.1 验收）。
+webchat 模型构造测试（验收）。
 
 `model/load.py` 改为由 DDB 目录驱动后，必须保证**构造出的模型参数与改造前逐项一致**
 （否则是回归：输出上限变小会截断长回答、prompt cache 误开会 API 报错、Mantle 区域

@@ -17,22 +17,18 @@ from __future__ import annotations
 
 import json as _json
 import logging
-import os
 from dataclasses import dataclass, field
 
-import boto3
-from core.lazy_boto import LazyClient
-
-from shared.model_config import get_bot_model_id
+from core import bot_llm
 
 logger = logging.getLogger(__name__)
 
-BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
-
-# 惰性构造（core/lazy_boto.py）：botocore 在**构造时**快照凭证，import 期建好的
-# client 会让后续 setenv AWS_BEARER_TOKEN_BEDROCK 完全失效（Bedrock API Key 模式
-# 因此无法生效）。代理转发属性访问，所有调用点写法不变。
-_bedrock = LazyClient("bedrock-runtime", region=BEDROCK_REGION)
+# 2026-09-01：本模块那几处「一个 system prompt + 一段文本 → 一段（通常是 JSON 的）
+# 文本」的调用，从手搓 Anthropic body 的 invoke_model 换成 core/bot_llm 的 Converse
+# 统一入口。理由与取舍全在 core/bot_llm.py 的模块 docstring 里。
+# 顺带删掉 `_bedrock` / `BEDROCK_REGION`：`invoke_llm` 每次调用自己建 client（比
+# LazyClient 更不会拿到过期凭证），而 BEDROCK_REGION 在三条部署路径里恒等于
+# `cdk.Aws.REGION` = Lambda 自己的区域 = boto3 默认区域，去掉是**零行为变化**。
 
 
 @dataclass
@@ -249,24 +245,8 @@ def translate_thinking_zh(text: str) -> str:
     if cached is not None:
         return cached
     try:
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 200,
-            "system": _TRANSLATE_SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": text}],
-        }
-        resp = _bedrock.invoke_model(
-            modelId=get_bot_model_id(),
-            contentType="application/json",
-            accept="application/json",
-            body=_json.dumps(body),
-        )
-        data = _json.loads(resp["body"].read())
-        translated = ""
-        for block in data.get("content", []):
-            if block.get("type") == "text":
-                translated = (block.get("text") or "").strip()
-                break
+        translated = bot_llm.invoke_bot_text(
+            _TRANSLATE_SYSTEM_PROMPT, text, max_tokens=200)
         if not translated:
             return text
         # Bound the cache to avoid unbounded growth across long-running
@@ -470,23 +450,8 @@ def summarize_progress(intent_summary: str, recent_tools: list[str],
         if latest_thinking:
             sections.append(f"agent 当前思考片段: {latest_thinking}")
         user_text = "\n".join(sections)
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 200,
-            "system": SUMMARY_SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": user_text}],
-        }
-        resp = _bedrock.invoke_model(
-            modelId=get_bot_model_id(),
-            contentType="application/json",
-            accept="application/json",
-            body=_json.dumps(body),
-        )
-        data = _json.loads(resp["body"].read())
-        for block in data.get("content", []):
-            if block.get("type") == "text":
-                return block["text"].strip()[:200]
-        return ""
+        return bot_llm.invoke_bot_text(
+            SUMMARY_SYSTEM_PROMPT, user_text, max_tokens=200)[:200]
     except Exception as e:
         logger.warning("summarize_progress failed: %s", e)
         return ""

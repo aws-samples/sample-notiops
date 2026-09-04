@@ -2,7 +2,7 @@
 Pin down the new `case_analyze` intent classification.
 
 We exercise both the slash-style fast path (deterministic, no Bedrock)
-and the Bedrock NL path (Bedrock invoke_model is mocked so we control the
+and the Bedrock NL path (the model call is mocked so we control the
 returned JSON). Failures in either path are loud — these are the
 guarantees the platform routers depend on:
 
@@ -28,7 +28,10 @@ import unittest.mock as mock
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 
-# `bedrock_intent` constructs a boto3 client at import time. Stub it.
+# Defense in depth: `bedrock_intent` no longer builds any client (2026-09-01 it
+# went through `core/bot_llm` → `shared/llm_provider.invoke_llm`, which builds
+# per call), but every model call in this file is patched out anyway, so a stub
+# here just guarantees a stray real client can never be constructed.
 import boto3 as _boto3
 _boto3.client = mock.MagicMock()
 
@@ -51,13 +54,6 @@ def _check(label: str, cond: bool, detail: str = "") -> None:
         print(f"  {FAIL} {label}{(' :: ' + detail) if detail else ''}")
 
 
-def _bedrock_response(payload: dict) -> dict:
-    """Build the boto3-shape response that bedrock_intent expects."""
-    body = json.dumps({"content": [{"type": "text",
-                                    "text": json.dumps(payload)}]})
-    fake_body = mock.MagicMock()
-    fake_body.read.return_value = body.encode("utf-8")
-    return {"body": fake_body}
 
 
 # ---------------------------------------------------------------------------
@@ -100,11 +96,19 @@ def test_slash_analyze_no_id_falls_back_to_list():
 # Bedrock NL path
 # ---------------------------------------------------------------------------
 def _patch_bedrock(payload: dict):
-    """Return a context manager that patches `_bedrock.invoke_model` to
-    return `payload` shape."""
+    """Patch the model call so `analyze_intent` sees exactly `payload`.
+
+    Patched at `bedrock_intent.bot_llm.invoke_bot_text` — i.e. one layer below
+    the module under test and one layer above the wire. That is deliberate:
+    `invoke_bot_text` is the seam whose contract is "returns fence-stripped
+    text", so this stub returns raw JSON text and the test still exercises
+    `bedrock_intent`'s own `_loose_load_json` / fallback logic. Patching
+    `invoke_llm` instead would drag the provider dispatch and its response
+    envelope into every case for no added coverage.
+    """
     return mock.patch.object(
-        bedrock_intent._bedrock, "invoke_model",
-        return_value=_bedrock_response(payload),
+        bedrock_intent.bot_llm, "invoke_bot_text",
+        return_value=json.dumps(payload),
     )
 
 

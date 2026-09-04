@@ -1,23 +1,28 @@
 /**
  * 授权核心（BFF 安全边界）。
  *
- *   - PRESET_ROLES         预置角色定义（seed 用，需求 7.1）
+ *   - PRESET_ROLES         预置角色定义（seed 用）
  *   - effective(...)       计算用户生效权限 {grants, denies}
  *   - satisfies(eff, key)  判定是否满足某 permissionKey（deny 优先、* 短路、:* 前缀通配）
  *   - authorize(...)       请求级门禁：路由→node→模块开关→satisfies；fail-closed
  *   - filterDashboard(...) dashboard 单次返回的 response-side subtab 过滤
  *   - visibleTree(...)     计算某用户可见能力子树（/api/me/capabilities 用）
  *
- * effective/satisfies 同时被 authorize 与 visibleTree 复用，避免前后端判定漂移（需求 3.4）。
+ * effective/satisfies 同时被 authorize 与 visibleTree 复用，避免前后端判定漂移。
  */
 import { matchRoute, subtabsOf, rootTabOf, allNodes, getNode } from "./capabilities.mjs";
 import { getUserPerm, getRole, getDisabledModules, getGroupMap } from "./rbac_store.mjs";
 
-/** 预置角色（需求 7.1）。key 为角色名，值为 permissions 数组。 */
+/** 预置角色。key 为角色名，值为 permissions 数组。 */
 export const PRESET_ROLES = {
   "role:admin": ["*"],
-  "role:finops": ["nav:chat", "nav:notifications", "nav:finops:*"],
-  "role:support": ["nav:chat", "nav:notifications", "nav:investigate", "nav:cases:*", "action:cases:*"],
+  // 巡检的闲置/成本页是 finops 的直接工作面（可删可降配 + savings 估算）。
+  // ⚠️ `nav:inspection:*` 的 `key === base` 分支会同时覆盖 tab 本身
+  //    （见 matchesAny），所以不需要再单列 `nav:inspection`。
+  "role:finops": ["nav:chat", "nav:notifications", "nav:finops:*", "nav:inspection:*"],
+  // ⚠️ 巡检看板给 support 与 finops 两个角色：高负载/结构性是可靠性视角（support），
+  //    闲置/成本是成本视角（finops）。只给一个会让另一半人看不到本该他们看的页。
+  "role:support": ["nav:chat", "nav:notifications", "nav:investigate", "nav:cases:*", "action:cases:*", "nav:inspection:*"],
   "role:service-manager": [
     "nav:chat",
     "nav:cases:overview", "nav:cases:waiting", "nav:cases:incidents", "nav:cases:sla",
@@ -26,6 +31,20 @@ export const PRESET_ROLES = {
   "role:viewer": [
     "nav:chat", "nav:notifications",
     "nav:finops:*",
+    // 只读角色 —— 巡检看板的六个端点全是只读，给它不引入任何写能力。
+    //
+    // ⚠️ `nav:inspection:*` **不会**顺带给到 `action:inspection:scope` /
+    //    `action:inspection:schedule`：`matchesAny` 的前缀通配比的是
+    //    `nav:inspection:`，而那两个 key 的前缀是 `action:inspection:`。
+    //    两个写端点的能力节点是 level=action 且**没有子节点**，所以
+    //    `authorize` 的 subtab 兜底（subs.length && …）也够不到它们。
+    //
+    // 🔴 三个预置角色（finops / support / viewer）**都不含**写能力 ——
+    //    写入至今只有 `role:admin` 的 `*` 能满足。这是刻意的：排除清单直接
+    //    决定巡检覆盖面，而「把生产库摘出巡检范围」没有任何运行时信号。
+    //    要放开就在「角色」页给具体角色显式加 `action:inspection:scope`，
+    //    别加进这里 —— 预置角色是所有部署的默认值，收紧比放开难得多。
+    "nav:inspection:*",
     "nav:cases:overview", "nav:cases:waiting", "nav:cases:incidents", "nav:cases:sla",
   ],
 };
@@ -47,7 +66,7 @@ export const DEFAULT_GROUP_ROLE_MAP = {
 };
 
 /**
- * 登录即可访问、无需功能级权限的路由（需求 2.7）。
+ * 登录即可访问、无需功能级权限的路由。
  *
  * ⚠️ 这些是**后缀**正则，而 index.mjs 的路由分发**也是**后缀匹配。两个后缀匹配器
  * 叠在一起意味着：一个路径可以同时满足这里的某条正则、又落到某个特权 handler 上。
@@ -75,6 +94,29 @@ const LOGIN_ONLY = [
 
 function isLoginOnly(path) {
   return LOGIN_ONLY.some((re) => re.test(path));
+}
+
+/**
+ * 能力节点声明的外部依赖（capabilities.json 的 `requiresEnv`）是否已配置。
+ *
+ * 用于「可选外部数据源」类能力：客户 CUR 四个 sheet 依赖 COST_AGENT_MCP_URL，
+ * 客户没接这个数据源时，这些入口**不该出现在侧栏**（渲染出来再报"数据源未配置"
+ * 等于把一个坏掉的界面交给用户）。
+ *
+ * 判据故意做严：值必须非空、且不是 `__FOO__` 形式的未替换占位符 —— CDK/部署脚本
+ * 漏替换时应当表现为「功能不出现」，而不是「入口在、点了就崩」（不许静默降级）。
+ * 支持多个依赖（数组或逗号分隔），全部满足才算配置好。
+ */
+export function envConfigured(requiresEnv, env = process.env) {
+  if (!requiresEnv) return true;
+  const names = Array.isArray(requiresEnv) ? requiresEnv : String(requiresEnv).split(",");
+  return names.every((raw) => {
+    const name = raw.trim();
+    if (!name) return true;
+    const v = (env[name] || "").trim();
+    if (!v) return false;
+    return !(v.startsWith("__") && v.endsWith("__"));
+  });
 }
 
 /** 前缀通配匹配：p 命中 key（p===key，或 p 以 ":*" 结尾且 key 落在其子树）。 */
@@ -130,7 +172,7 @@ async function rolePerms(roleName) {
  * 计算用户生效权限（并集模型）。
  *   grants = (逐人分配角色的权限)  ∪  (cognito group 映射到的角色权限)
  *   denies = 用户记录里的 denies（deny 优先）
- * admin group 兜底：属 cognito "admin" group → 直接授予 "*"（保证首次部署 admin 可用，需求 5.5）。
+ * admin group 兜底：属 cognito "admin" group → 直接授予 "*"（保证首次部署 admin 可用）。
  * 用户无 userperm 记录时，仍可通过 group 映射获得权限（Option B 核心）。
  */
 export async function effective(sub, cognitoGroups = []) {
@@ -172,13 +214,13 @@ export async function authorize({ method, path, query, body }, eff, { disabledMo
   const node = matchRoute(method, path, query, body);
   if (!node) {
     if (isLoginOnly(path)) return { allow: true };
-    return { allow: false, status: 403, required: "unknown_route" }; // fail-closed（需求 2.8）
+    return { allow: false, status: 403, required: "unknown_route" }; // fail-closed
   }
 
   // alwaysOn 节点（chat）：任何登录用户放行（需求 schema alwaysOn）
   if (node.alwaysOn) return { allow: true };
 
-  // 模块开关优先（需求 2.6）：node 所属顶层 tab 被关 → 拒绝
+  // 模块开关优先：node 所属顶层 tab 被关 → 拒绝
   const rootTab = rootTabOf(node.key);
   const disabled = disabledModules || (await getDisabledModules());
   if (rootTab && disabled.includes(rootTab)) {
@@ -201,7 +243,7 @@ export async function authorize({ method, path, query, body }, eff, { disabledMo
 }
 
 /**
- * dashboard 单次返回的 response-side subtab 过滤（需求 2.9）。
+ * dashboard 单次返回的 response-side subtab 过滤。
  * 删除用户无权 subtab 的 responseKey 字段；无 responseKey 的元数据字段保留。
  */
 export function filterDashboard(tabKey, payload, eff) {
@@ -237,6 +279,10 @@ export async function visibleTree(eff, { disabledModules = null } = {}) {
   const isVisible = (node) => {
     const rootTab = rootTabOf(node.key);
     if (rootTab && disabled.includes(rootTab)) return false;
+    // 依赖的外部数据源未配置 → 整个节点不下发（前端因此不渲染入口）。
+    // 比"渲染了入口、点进去空白/报错"强：那种半通的界面对用户就是坏体验。
+    // 这一条压在 alwaysOn 之前：没有数据源时，「恒显示」也不该显示。
+    if (!envConfigured(node.requiresEnv)) return false;
     if (node.alwaysOn) return true;
     // 与 authorize() 同源：侧栏若显示了 admin 但端点 403，用户点进去就是白屏 + 403。
     if (node.adminOnly) return satisfiesAdmin(eff);

@@ -462,7 +462,7 @@ def collect_ec2_trusted_advisor(context) -> dict:
         try:
             # STS AssumeRole — 部署账号(role_arn 为空)用 Lambda 自身角色
             if account.role_arn:
-                credentials = assume_role(account.role_arn)
+                credentials = assume_role(account.role_arn, account.account_id)
                 if credentials is None:
                     logger.warning(
                         "EC2 collection: skipping account %s, AssumeRole failed",

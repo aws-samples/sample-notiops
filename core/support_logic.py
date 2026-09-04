@@ -8,6 +8,8 @@ Each chat platform builds its own UI on top.
 Public surface:
   - SEVERITY_CODES / SEVERITY_LABELS / DEFAULT_SEVERITY
   - LANGUAGE_CODES  / LANGUAGE_LABELS  / DEFAULT_LANGUAGE
+  - ISSUE_TYPE_CODES / issue_type_label(s) / DEFAULT_ISSUE_TYPE
+  - apply_case_overrides(classification, service_text=, issue_type=)
   - load_support_context(incident_id) -> dict | None
   - claim_inflight(idempotency_key)   -> bool
   - create_case(...)                  -> CaseResult dataclass
@@ -28,6 +30,7 @@ from botocore.exceptions import ClientError
 
 from . import case_classifier
 from . import ddb_state
+from . import i18n
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +97,39 @@ LANGUAGE_LABELS = {
     "ko": "Korean / 한국어",
 }
 DEFAULT_LANGUAGE = "zh"
+
+# AWS 案例类型（`issueType`）—— 与 web 端案例面板的 `ISSUE_TYPE_OPTS` 逐条对齐
+# （`frontend/chat-app/src/components/Message.tsx`）。IM 面板 2026-09-03 补上这一项，
+# 在此之前 IM 端只能由分类器猜，猜错就落进错误的 Support 队列。
+# **顺序即 UI 顺序**，第一项是默认值。
+ISSUE_TYPE_CODES = ["technical", "customer-service", "service-limit-increase"]
+DEFAULT_ISSUE_TYPE = "technical"
+_ISSUE_TYPE_LABELS_BY_LOCALE: dict[str, dict[str, str]] = {
+    "zh": {
+        "technical": "技术问题",
+        "customer-service": "账单和账户",
+        "service-limit-increase": "提高服务限制",
+    },
+    "en": {
+        "technical": "Technical",
+        "customer-service": "Account & billing",
+        "service-limit-increase": "Service limit increase",
+    },
+}
+
+
+def issue_type_label(code: str, locale: str = "en") -> str:
+    """案例类型的人类可读标签。回退顺序：locale → en → code 本身。"""
+    by_loc = _ISSUE_TYPE_LABELS_BY_LOCALE.get(locale) \
+        or _ISSUE_TYPE_LABELS_BY_LOCALE["en"]
+    return by_loc.get((code or "").lower()) or code
+
+
+def issue_type_labels(locale: str = "en") -> dict[str, str]:
+    """给案例类型选择器用的 code→label 全表。"""
+    return dict(_ISSUE_TYPE_LABELS_BY_LOCALE.get(locale)
+                or _ISSUE_TYPE_LABELS_BY_LOCALE["en"])
+
 
 # Body cap matching AWS Support API (8000 chars hard limit; we leave headroom).
 _BODY_MAX_CHARS = 7900
@@ -187,16 +223,119 @@ def build_body(ctx: dict, severity: str, extra: str, operator_name: str,
 
     body = "\n".join(parts)
     if len(body) > _BODY_MAX_CHARS:
-        body = body[:_BODY_MAX_CHARS] + "\n\n[truncated — see report URL for full content]"
+        # 截断提示本身也算进 body 长度 —— 先给它留出位置再切，否则"截断后"的正文
+        # 反而比上限还长（7900 + 提示语），把留给 API 8000 硬限的余量吃掉一半。
+        notice = "\n\n[truncated — see report URL for full content]"
+        body = body[:_BODY_MAX_CHARS - len(notice)] + notice
     return body
 
 
+def category_display(classification: dict, locale: str = "zh") -> str:
+    """结果卡上「Category」那一格要显示的串 —— 类别 code **加上它是怎么定下来的**。
+
+    四张结果卡（Slack/飞书 × `/案例` 面板/调查报告升级）共用这一个口径：只印一个
+    code 是静默的 —— 用户分不清这个类别是自己在面板里指定的、还是我们按服务推的，
+    而类别直接决定案例进哪个工程师队列。
+    """
+    cls = classification or {}
+    code = str(cls.get("categoryCode") or "")
+    if not code:
+        return ""
+    key = ("case.create.category_source_chosen"
+           if cls.get("categorySource") == "matched"
+           else "case.create.category_source_auto")
+    return f"{code} {i18n.t(key, locale)}"
+
+
+def apply_case_overrides(classification: dict, *, service_text: str = "",
+                         issue_type: str = "", category_text: str = "") -> dict:
+    """把用户在面板里**手选/手打**的服务、类别、案例类型盖到分类器的结果上。
+
+    为什么盖而不是替代分类器：CreateCase 要求 service + category 是同一服务下的合法
+    组合。所以服务一旦被用户改掉，类别必须跟着换成**新服务名下**的一个，否则报
+    `No service exists for combination`（用户填得越具体反而越开不出来）。
+
+    `category_text` 是用户在面板里手打的类别（2026-09-04 补齐，与 web 端对齐；为什么
+    是手打而不是下拉，见 `case_classifier.resolve_category_detail` 的 docstring）。
+    它**只在该服务名下**反查（`resolve_category_detail`），所以无论用户打什么都不可能
+    拼出非法组合；匹配不上就退回通用类别，并在 `categorySource` 里记下是"匹配到的"
+    还是"推导的"，由结果卡如实告诉用户（别让人猜案例落到了哪个类别）。
+
+    匹配不上就**保留分类器的结果**，不硬塞编造的 code。返回新 dict（不改入参），
+    额外带一个 `override` 字段说明这次盖了什么，方便日志和结果卡溯源。
+    """
+    out = dict(classification or {})
+    applied: list[str] = []
+    cat_q = (category_text or "").strip()
+
+    if service_text.strip():
+        hit = case_classifier.resolve_service(service_text)
+        if hit and hit.get("code") and hit.get("category"):
+            out["serviceCode"] = hit["code"]
+            # 类别必须换成新服务名下的 —— 沿用旧的就是非法组合。
+            out["categoryCode"] = hit["category"]
+            out["serviceName"] = hit.get("name", "")
+            applied.append(f"service={hit['code']}")
+        elif hit and hit.get("code"):
+            # 匹配到了服务但它名下**一个类别都没有** —— 拿不出合法组合，只能整条放弃。
+            # 硬写 serviceCode + 空 categoryCode 一定会被 CreateCase 拒。
+            logger.warning("case override: service %r has no categories; "
+                           "keeping classifier pick", hit["code"])
+            out["serviceUnmatched"] = service_text.strip()[:120]
+        else:
+            # 说清楚"你填的服务没匹配上，用的是分类器挑的" —— 静默忽略最坑：
+            # 用户以为自己指定了服务，案例却落到 general-info。
+            logger.warning("case override: service %r not found in catalog; "
+                           "keeping classifier pick %r",
+                           service_text[:60], out.get("serviceCode"))
+            out["serviceUnmatched"] = service_text.strip()[:120]
+
+    # 类别放在服务**后面**处理：要在"最终定下来的那个服务"名下反查，否则可能拼出
+    # 跨服务的非法组合。`categorySource` 一律写上，结果卡靠它区分"你选的"和"自动的"。
+    if cat_q:
+        detail = case_classifier.resolve_category_detail(
+            out.get("serviceCode") or "", cat_q)
+        if detail["source"] == "matched":
+            out["categoryCode"] = detail["code"]
+            out["categoryName"] = detail.get("name") or ""
+            out["categorySource"] = "matched"
+            applied.append(f"category={detail['code']}")
+        else:
+            # 打了但这个服务名下没有 → 退回通用类别（已经在 categoryCode 里了），
+            # 但必须让用户看见"你打的那个没用上"。
+            logger.warning("case override: category %r not found under service "
+                           "%r; keeping %r", cat_q[:60],
+                           out.get("serviceCode"), out.get("categoryCode"))
+            out["categoryUnmatched"] = cat_q[:120]
+            out["categorySource"] = "derived"
+    else:
+        out.setdefault("categorySource", "derived")
+
+    it = (issue_type or "").strip().lower()
+    if it and it in ISSUE_TYPE_CODES:
+        # 用户明确选了 → 不再走分类器那道 `_CUSTOMER_SERVICE_ALLOWED` 降级
+        # （那道防线是为了纠正**模型**乱标，不该否决人的选择）。
+        out["issueType"] = it
+        applied.append(f"issueType={it}")
+
+    if applied:
+        out["override"] = ",".join(applied)
+        logger.info("Case classification overridden by panel: %s", out["override"])
+    return out
+
+
 def create_case(ctx: dict, *, platform: str, severity: str, language: str,
-                extra: str, operator_name: str) -> CaseResult:
+                extra: str, operator_name: str,
+                service_text: str = "", issue_type: str = "",
+                category_text: str = "") -> CaseResult:
     """Classify the investigation and call support:CreateCase.
 
     Pure logic — no card rendering, no Feishu/Slack SDK calls.
     Returns a CaseResult the caller renders into a platform-specific card.
+
+    `service_text` / `issue_type` / `category_text` 是**面板里用户填的**（IM 端
+    2026-09-03 补服务与类型、2026-09-04 补类别，与 web 端案例面板对齐）。全部留空
+    = 完全交给分类器，即历史行为。
     """
     if severity not in SEVERITY_CODES:
         return CaseResult(ok=False, error_code="InvalidSeverity",
@@ -213,6 +352,10 @@ def create_case(ctx: dict, *, platform: str, severity: str, language: str,
         summary_md=ctx.get("summary_md", ""),
     )
     logger.info("Case classification: %s", classification)
+    classification = apply_case_overrides(classification,
+                                          service_text=service_text,
+                                          issue_type=issue_type,
+                                          category_text=category_text)
 
     try:
         resp = _support.create_case(

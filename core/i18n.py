@@ -574,6 +574,26 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
                "\nJust tell me what to look at, e.g. "
                "\"list all EC2 in us-east-1\"."),
     },
+    # 模型超时专用。与 `chitchat.downgraded` 分开是有意的：那条是「你好，我能帮你…」
+    # 的能力介绍，用户真问了个问题、等了 5 分钟、拿到一段自我介绍，只会以为 bot 坏了。
+    # 这里如实说「等了多久、为什么、下一步做什么」。
+    # ⚠️ 文案里的「5 分钟」对应 core/bedrock_chat.py 的 read_timeout=300；改一处要改两处。
+    "chitchat.model_timeout": {
+        "zh": ("⏳ 模型 5 分钟内没有返回内容,这一轮我先停下了。\n"
+               "\n通常是问题比较重、模型在做很长的推理。可以试:\n"
+               "• 把问题拆小一点(只问一个服务、缩小时间范围)再发一次\n"
+               "• 或换个出字更快的模型:`@bot model claude`\n"
+               "• 要做长时间排查的话,直接说「排查 …」走深度调查那条路"),
+        "en": ("⏳ The model returned nothing within 5 minutes, so I stopped "
+               "waiting on this one.\n"
+               "\nThat usually means the question is heavy and the model is "
+               "doing a long reasoning pass. You can:\n"
+               "• Narrow it down (one service, a shorter time range) and send "
+               "again\n"
+               "• Or switch to a faster model: `@bot model claude`\n"
+               "• For a genuinely long investigation, say \"investigate …\" to "
+               "take the deep-investigation path"),
+    },
     "gpt.output_blocked": {
         "zh": ("⚠️ 当前模型(GPT-5.6 Terra)的本轮输出被审计拦截"
                "(疑似协议碎片或低质 token 混入),已跳过避免给你看到 garbage。\n"
@@ -672,6 +692,18 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "⚠ 调用失败",
         "en": "⚠ call failed",
     },
+    # 工具循环调过工具、但没给出文本(撞迭代上限 / 中途 Throttling / 收尾轮失败),
+    # 于是回答退回一次**不带任何工具结果**的裸调用 —— 这时 `📚 来源` 与
+    # `🔧 调用的 MCP 工具` 两块都被清掉(它们描述的是没进入这段回答的东西),
+    # 换成这一句。⚠️ 不许改成静默清掉:「没有来源」与「有来源但我没显示」
+    # 对读者是两件事,而后者会被当成前者。
+    "mcp.ungrounded_notice": {
+        "zh": "⚠ 本次查阅 AWS 文档的调用没有返回结果,以上回答来自模型自身知识,"
+              "未经文档核对 —— 请自行复核关键结论。",
+        "en": "⚠ The AWS documentation lookup returned nothing this time, so the "
+              "answer above comes from the model's own knowledge and was not "
+              "checked against the docs — please verify key claims yourself.",
+    },
 
     # -- @bot model command (per-chat LLM provider switching) -------------
     # Anyone in a chat can switch which model the bot uses for that chat;
@@ -711,6 +743,92 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
     "model.usage": {
         "zh": "用法:`model` 查看 · `model list` 列出 · `model <alias>` 切换 · `model default` 清除偏好",
         "en": "Usage: `model` to view · `model list` to list · `model <alias>` to switch · `model default` to clear preference",
+    },
+    "model.switch_nl_hint": {
+        # NL "换个模型" can't name a specific alias (aliases are dynamic), so
+        # we surface the list and let the user pick.
+        "zh": "想换模型?下面是可用列表,回复 `model <alias>` 切换:",
+        "en": "Want a different model? Here's the list — reply `model <alias>` to switch:",
+    },
+
+    # -- /help — the command menu. Bilingual, lists BOTH language forms of
+    # every command because a Chinese user won't guess `/调查` exists unless
+    # we tell them. Rendered from core.nl_router.HELP_COMMANDS. --------------
+    "help.title": {
+        "zh": "🤖 NotiOps 命令菜单",
+        "en": "🤖 NotiOps command menu",
+    },
+    "help.intro": {
+        "zh": "你可以直接用大白话跟我说话,也可以用下面这些命令(中英文都行,`/` 可省略):",
+        "en": "Talk to me in plain language, or use any of these commands "
+              "(either language; the leading `/` is optional):",
+    },
+    # ⚠️ 每一行的自然语言示例都必须**中英各至少一条**,而不是"英文菜单只给英文例子"。
+    # 抬头那句说的是「中英文都行」,例子却只有一种语言,等于自己拆自己的台 —— 看英文
+    # 菜单的人不会知道「深入调查…」也认。所有示例一律用引号包起来(中文 「」、英文 “”),
+    # `tests/test_im_help_menu.py::TestHelpExamplesActuallyRoute` 会**把引号里的字抽出来
+    # 真的喂给 `nl_router.classify`**:菜单里承诺的每一句都必须真的命中对应意图。
+    # 所以改这几行时不要凭感觉换措辞 —— 换了不匹配的说法测试会当场挂。
+    "help.row.investigate": {
+        "zh": "🔍 **深度调查** — `/investigate <内容>` 或 `/调查 <内容>`;也可以直接说「深度调查一下…」「根因分析」,英文 “deep dive on …” 一样认",
+        "en": "🔍 **Deep investigation** — `/investigate <text>` or `/调查 <text>`; "
+              "or just say “deep dive on …” / “root cause”, "
+              "or in Chinese 「深入调查…」",
+    },
+    "help.row.case": {
+        "zh": "🎫 **支持案例** — `/case`、`/cases`、`/案例`、`/工单`;也可以直接说「我要开案例」「转人工」,英文 “open a case” 一样认",
+        "en": "🎫 **Support cases** — `/case`, `/cases`, `/案例`, `/工单`; "
+              "or just say “open a case” / “escalate”, "
+              "or in Chinese 「我要开案例」",
+    },
+    "help.row.model": {
+        "zh": "🧠 **切换模型** — `/model`、`/model list`、`/模型 list`;也可以说「换个模型」,英文 “switch model” 一样认",
+        "en": "🧠 **Switch model** — `/model`, `/model list`, `/模型 list`; "
+              "or say “switch model”, or in Chinese 「换个模型」",
+    },
+    "help.row.language": {
+        "zh": "🌐 **切换语言** — `/language zh|en`、`/语言 zh|en`;也可以说「切换到英文」「说中文」,英文 “switch to English” 一样认",
+        # ⚠️ 「说中文」用中文引号 —— 引号样式是上面那条测试分辨"这条示例是哪种语言"的
+        # 唯一依据(「」=中文示例、“”=英文示例),用错了这一行就会被判成"没有中文示例"。
+        "en": "🌐 **Switch language** — `/language zh|en`, `/语言 zh|en`; "
+              "or say “switch to English” / 「说中文」",
+    },
+    # ⚠️ 没有 `help.row.skills`：IM 侧不提供 skills（原因见 nl_router.HELP_COMMANDS
+    # 下面那段注释）。打了 `/skills` 回下面这句指路，不是菜单项。
+    "skill.im_web_only": {
+        "zh": "🧩 Skills（技能）目前只能在 NotiOps Web 控制台里创建和管理 —— IM 这边不支持。"
+              "你可以直接把想做的事说给我听，我按需调查。",
+        "en": "🧩 Skills are created and managed in the NotiOps web console only — "
+              "not available here in chat. Just tell me what you need and I'll look into it.",
+    },
+    "help.row.help": {
+        "zh": "❓ **帮助** — `/help`、`/帮助`",
+        "en": "❓ **Help** — `/help`, `/帮助`",
+    },
+    "help.footer": {
+        "zh": "_其它任何问题直接问我就行,不用记命令。_",
+        "en": "_For anything else, just ask — no command needed._",
+    },
+
+    # -- Bidirectional fallback buttons (all 0 token). Two of the three reuse
+    # existing handlers (support_flow / next_step_dispatch). See
+    # ------------------------------------------------------------------------
+    "router.btn.escalate_investigate": {
+        "zh": "🔍 转深度调查",
+        "en": "🔍 Escalate to deep dive",
+    },
+    "router.btn.open_case": {
+        "zh": "🎫 开支持案例",
+        "en": "🎫 Open a support case",
+    },
+    "router.btn.just_answer": {
+        "zh": "💬 改为快速问答",
+        "en": "💬 Just answer quickly",
+    },
+    # Visibility line — 0 token must not look like "nothing happened".
+    "router.direct_no_token": {
+        "zh": "⚡ 直连 DevOps Agent · 无模型消耗",
+        "en": "⚡ Direct to DevOps Agent · no model usage",
     },
 
     # =====================================================================
@@ -911,6 +1029,51 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
                "More detail = faster, more accurate engineer / Agent reply.\n\n"
                "Example:\nRegion: us-east-1\nResource: i-0abc...\n"
                "Time: 2026-05-25 12:00 UTC\nSymptom: ...\nTried: ..."),
+    },
+    # 服务名称 / 案例类型（飞书卡片，2026-09-03 补齐；与 web 端案例面板对齐）。
+    # 服务名是**自由文本**（AWS Support 目录 400+ 条），服务端反查真实目录。
+    # 飞书卡片版的「服务名称」两栏（Slack modal 用上面 `*_short` / `*_select_*` 那组，
+    # 文案更短是因为 modal 的 label 空间小）。下拉优先于自由文本 —— 见
+    # `case.create.service_select_label` 那组的注释。
+    "case.create.service_select_label": {
+        "zh": "**服务名称**(常用)",
+        "en": "**Service** (common)",
+    },
+    "case.create.service_label": {
+        "zh": "**其他服务**(可选,上面列表里没有就填这里)",
+        "en": "**Other service** (optional, if not in the list above)",
+    },
+    "case.create.service_placeholder": {
+        "zh": "例:Bedrock / Redshift / Cost Explorer",
+        "en": "e.g. Bedrock / Redshift / Cost Explorer",
+    },
+    # 类别（飞书卡片，2026-09-04 补齐；与 web 端的「类别」对齐）。
+    # 为什么是手打而不是像 web 那样的下拉：类别选项取决于先选了哪个服务，联动要在面板
+    # 中途回一趟服务端重绘卡片，而飞书表单容器里的数据**只在点提交时**才回调 ——
+    # 中途重绘就会把用户已经打好的主题/描述清空。理由与实测数据见
+    # `core/case_classifier.resolve_category_detail` 的 docstring。
+    # 目录是英文的（Support API 只支持 en / ja），所以 placeholder 必须给英文关键词示例。
+    "case.create.category_label": {
+        "zh": "**类别**(可选,留空按服务自动挑)",
+        "en": "**Category** (optional, auto-picked from the service if blank)",
+    },
+    "case.create.category_placeholder": {
+        "zh": "英文关键词,例:performance / network / limit",
+        "en": "English keyword, e.g. performance / network / limit",
+    },
+    "case.create.issue_type_label": {
+        "zh": "**案例类型**",
+        "en": "**Case type**",
+    },
+    "case.create.issue_type_placeholder": {
+        "zh": "选择案例类型",
+        "en": "Select case type",
+    },
+    "case.create.service_unmatched_block": {
+        "zh": ("\n_⚠️ 未在 AWS Support 服务目录中匹配到「{text}」,"
+               "已改用自动判断的服务。_"),
+        "en": ("\n_⚠️ \"{text}\" did not match any service in the AWS Support "
+               "catalog; the auto-detected service was used instead._"),
     },
     "case.create.severity_label": {
         "zh": "**Severity**",
@@ -1557,6 +1720,90 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": ("Include: Region · resource ID · time window · raw error · "
                "what you have tried.\nMore detail = faster, more accurate "
                "engineer / Agent reply."),
+    },
+    # 服务名称 / 案例类型（2026-09-03 补齐，与 web 端案例面板对齐）。
+    # 服务名是**自由文本**（AWS Support 目录 400+ 条，装不进 Slack 的 100 选项上限），
+    # 服务端对着真实目录反查；所以 placeholder 要明确"可以留空"。
+    # 「服务名称」在 IM 面板上是**两个控件**：常用服务下拉（这一组）+ 长尾自由文本
+    # （下面 `service_label_short` 那组）。下拉里只有二十条常用的 —— 真实目录 323 条
+    # 装不进 Slack `static_select`（上限 100）和飞书卡片选择器，所以冷门服务照样得能
+    # 手打。两个都不给就交给分类器自动判断。见 core/case_classifier.popular_services。
+    # ⚠️ 这条是 Slack modal 用的**纯文本**版：Slack 的 `label` 是 `plain_text`，
+    # 带 `**` 会原样显示成星号。飞书卡片那版（markdown，带粗体）叫
+    # `case.create.service_select_label`，别把两者合成一个 key。
+    "case.create.service_select_label_short": {
+        "zh": "服务名称(常用)",
+        "en": "Service (common)",
+    },
+    "case.create.service_select_auto": {
+        "zh": "自动判断(推荐)",
+        "en": "Auto-detect (recommended)",
+    },
+    "case.create.service_select_placeholder": {
+        "zh": "不选则自动判断",
+        "en": "Leave as auto-detect",
+    },
+    # 自由文本那一栏的标签要说清它跟下拉的关系，否则两个都填时用户不知道谁生效
+    # （答案：下拉优先，这条也写在 label 里）。
+    "case.create.service_label_short": {
+        "zh": "其他服务(可选,上面没有就填这里)",
+        "en": "Other service (optional, if not in the list above)",
+    },
+    "case.create.service_placeholder_short": {
+        "zh": "例如 Bedrock / Redshift / Cost Explorer",
+        "en": "e.g. Bedrock / Redshift / Cost Explorer",
+    },
+    # 目录读不到时（`describe_services` 需要 Business/Enterprise 支持计划）下拉整块
+    # 去掉，只留自由文本 —— 但**必须说出来**，不许留一个空下拉或者静默少一个控件。
+    "case.create.service_catalog_unavailable": {
+        "zh": "ℹ️ 暂时读不到 AWS Support 服务目录,「服务名称」这次请手填(或留空由我们判断)。",
+        "en": "ℹ️ The AWS Support service catalog is unavailable right now — "
+              "type the service name below, or leave it blank and we'll detect it.",
+    },
+    # 类别（Slack modal 的**纯文本** label 版；飞书 markdown 版见
+    # `case.create.category_label`，理由同上面服务那组，别合成一个 key）。
+    "case.create.category_label_short": {
+        "zh": "类别(可选,留空按服务自动挑)",
+        "en": "Category (optional, auto-picked from the service if blank)",
+    },
+    "case.create.category_placeholder_short": {
+        "zh": "英文关键词,例:performance / network / limit",
+        "en": "English keyword, e.g. performance / network / limit",
+    },
+    "case.create.issue_type_label_short": {
+        "zh": "案例类型",
+        "en": "Case type",
+    },
+    "case.create.service_unmatched_line": {
+        "zh": ("\n_⚠️ 未在 AWS Support 服务目录中匹配到「{text}」,"
+               "已改用自动判断的服务。_"),
+        "en": ("\n_⚠️ \"{text}\" did not match any service in the AWS Support "
+               "catalog; the auto-detected service was used instead._"),
+    },
+    # 类别没匹配上也**必须说出来**（与服务那条同一口径）：类别决定案例进哪个工程师
+    # 队列，用户以为自己指定了、实际落到通用类别，是最容易白等的那种坑。
+    # `_line` = Slack、`_block` = 飞书，两边文案一致（沿用服务那两条的分法）。
+    "case.create.category_unmatched_line": {
+        "zh": ("\n_⚠️ 「{service}」名下没有匹配「{text}」的类别,"
+               "已改用 `{category}`。_"),
+        "en": ("\n_⚠️ No category under \"{service}\" matched \"{text}\"; "
+               "`{category}` was used instead._"),
+    },
+    "case.create.category_unmatched_block": {
+        "zh": ("\n_⚠️ 「{service}」名下没有匹配「{text}」的类别,"
+               "已改用 `{category}`。_"),
+        "en": ("\n_⚠️ No category under \"{service}\" matched \"{text}\"; "
+               "`{category}` was used instead._"),
+    },
+    # 结果卡上「Category」那一格的来源标注。只印一个 code 是静默的 —— 用户分不清
+    # 这个类别是自己指定的还是我们按服务推的，而这直接决定案例的路由质量。
+    "case.create.category_source_chosen": {
+        "zh": "(你指定)",
+        "en": "(as specified)",
+    },
+    "case.create.category_source_auto": {
+        "zh": "(自动挑选)",
+        "en": "(auto-picked)",
     },
     "case.create.severity_label_short": {
         "zh": "Case 严重等级",
@@ -2688,7 +2935,217 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "✅ 没有闲置 skill（都在用）",
         "en": "✅ No stale skills (all in use)",
     },
+    "out_of_scope.change_request": {
+        "zh": "⚠️ NotiOps 是只读界面，不能代替你做变更类操作。请到 AWS Console，"
+              "或让 DevOps Agent 走人工确认流程完成这项变更。",
+        "en": "⚠️ NotiOps is read-only and won't perform change actions. "
+              "Use the AWS Console, or run this via DevOps Agent's "
+              "human-approval flow.",
+    },
 
+    # ── IM webhook (Lambda) 卡片文案 ────────────────────────────────────────
+    # 这批 key 只被 platforms/*/caps.py 用。全部是确定性渲染（0 token）：
+    # 没有任何一条会去过模型，所以文案必须自己是双语的，不能靠运行时翻译。
+    "im.chat.card_title": {
+        "zh": "DevOps Agent 回答",
+        "en": "DevOps Agent answer",
+    },
+    # 「边想边看」三条 —— 见 platforms/common/live_card.py。
+    # 立刻回一张这个标题的卡（不等答案），用户才知道"收到了、要等一会儿"：实测一个
+    # 「列出所有 S3 桶及其大小」的问题跑了 347 秒，M1 那版全程静默，看着像后台挂了。
+    "im.chat.thinking_title": {
+        "zh": "🤔 思考中 · 已用时 {seconds} 秒",
+        "en": "🤔 Thinking · {seconds}s elapsed",
+    },
+    # 开场话有 5 种说法，按消息 id 确定性选一条 —— 见 platforms/common/ack_variants.py
+    # （那里也解释了为什么是"确定性"而不是 random，以及为什么「NotiOps」那三个字不在
+    # 我们手里）。客户反馈原话：「机制很好，但文案生硬」—— 每问一次就一字不差地重复
+    # 同一句，问到第十次就像在跟一台自动应答机说话。
+    #
+    # ⚠️ 五条都**必须**留着那句「不用重复发问 / no need to ask again」和「这张卡片 /
+    # this card」。这不是客套：它是唯一拦住用户重复发问的东西，而重复发问会撞上 §3.22
+    # 的会话排队 —— 把自己排到自己后面，越急越慢。`tests/test_im_ack_variants.py` 用
+    # 断言钉住这条不变量，加第六条时漏了那句话测试会挂。
+    #
+    # ⚠️ 也别在这里引入 `{占位符}`：`t()` 的 `format()` 包在 `except KeyError` 里，
+    # 少传一个 kwarg 不会报错，会把 `{opener}` 原样发给客户。宁可 5 份尾句重复。
+    "im.chat.ack_body.1": {
+        "zh": "已收到，正在让 DevOps Agent 分析。复杂问题可能要跑几分钟，"
+              "过程和结论都会**更新到这张卡片**上，不用重复发问。",
+        "en": "Got it — the DevOps Agent is working on this. Complex questions "
+              "can take a few minutes; progress and the answer will both "
+              "**update in this card**, so no need to ask again.",
+    },
+    "im.chat.ack_body.2": {
+        "zh": "收到，DevOps Agent 已经开始查了。复杂一点的问题要跑几分钟，"
+              "查到哪一步、结论是什么，都会**写在这张卡片**里，不用重复发问。",
+        "en": "On it — the DevOps Agent has started digging. Anything "
+              "non-trivial takes a few minutes; each step and the final answer "
+              "land **in this card**, so no need to ask again.",
+    },
+    "im.chat.ack_body.3": {
+        "zh": "这个问题交给 DevOps Agent 了，正在翻数据。可能要等几分钟，"
+              "中间的进展和最后的结论都会**刷到这张卡片**上，不用重复发问。",
+        "en": "Handed this to the DevOps Agent — it is pulling the data now. "
+              "This can take a few minutes; progress and the final answer both "
+              "refresh **in this card**, so no need to ask again.",
+    },
+    "im.chat.ack_body.4": {
+        "zh": "好，DevOps Agent 接手了。查得细的时候会慢一点，"
+              "但每一步都会**同步到这张卡片**，结论也在这里，不用重复发问。",
+        "en": "Sure — the DevOps Agent has picked this up. A thorough look "
+              "takes a bit longer, but every step syncs **into this card** and "
+              "the answer lands here too, so no need to ask again.",
+    },
+    "im.chat.ack_body.5": {
+        "zh": "收到了，正在查。DevOps Agent 挖得深一些需要几分钟，"
+              "过程和结论会一起**更新在这张卡片**上，不用重复发问。",
+        "en": "Got it, looking into this now. A deeper dig by the DevOps Agent "
+              "needs a few minutes; progress and conclusion both **update in "
+              "this card**, so no need to ask again.",
+    },
+    "im.chat.steps_title": {
+        "zh": "**过程**",
+        "en": "**Progress**",
+    },
+    # 「正文放不下」三条 —— 见 platforms/common/long_answer.py。
+    # 飞书卡片正文上限 3500 / Slack section 2900，原来是裸切片，客户看到的是一个
+    # 在第 3500 字符处**无声**断掉的答案。截断本身不可避免，但必须说出来 + 给下文。
+    "im.chat.truncated_report": {
+        "zh": "⚠️ 回答太长（{total} 字），这里只显示了开头。**完整内容**在这份网页报告里"
+              "（{hours} 小时内有效）：\n{url}",
+        "en": "⚠️ The answer is too long ({total} chars) to fit here, so only the "
+              "beginning is shown. **Full version** (valid for {hours}h):\n{url}",
+    },
+    "im.chat.truncated_nolink": {
+        "zh": "⚠️ 回答太长（{total} 字），这里只显示了开头；完整报告没能生成"
+              "（{reason}），请把问题拆小一点再问一次。",
+        "en": "⚠️ The answer is too long ({total} chars) to fit here, so only the "
+              "beginning is shown. The full report could not be generated "
+              "({reason}) — try narrowing the question.",
+    },
+    # 过程行 / 进度卡正文这类"天天在变"的位置用它：不落报告，但也不许看不出被切了。
+    "im.chat.clipped_marker": {
+        "zh": "…（内容过长，此处已截断）",
+        "en": "… (truncated — too long to display here)",
+    },
+    # 「排队」三条 —— 见 platforms/common/chat_lease.py。同一个会话同时只跑一个问题
+    # （多轮上下文是一个 chat 一个 execution_id），第二个问题排队而不是并发抢 agent。
+    # 标题与「思考中」分开：还没轮到就写"思考中"是在骗用户（正是本次要修的那类 bug）。
+    "im.chat.queued_title": {
+        "zh": "⏳ 排队中 · 已等 {seconds} 秒",
+        "en": "⏳ Queued · waiting {seconds}s",
+    },
+    "im.chat.queued_body": {
+        "zh": "已收到。这个会话里前一个问题**还在跑**（同一个会话一次只跑一个，"
+              "并发会互相拖慢），你排在它后面。轮到你时这张卡片会自己变成"
+              "「思考中」，不用重复发问。",
+        "en": "Got it. The previous question in this conversation is **still "
+              "running** — one at a time per conversation, since running them "
+              "concurrently makes both slower. This card will switch to "
+              "'Thinking' when your turn starts, so no need to ask again.",
+    },
+    "im.chat.queue_timeout": {
+        "zh": "⚠️ 这个会话里前一个问题跑得比预期久，你这个问题**没能开始**。"
+              "请稍后再发一次；如果很急，可以私聊我（私聊是另一个会话，不用排队）。",
+        "en": "⚠️ The previous question in this conversation is taking longer "
+              "than expected, so yours **never started**. Please send it again "
+              "in a bit — or DM me, which is a separate conversation with its "
+              "own queue.",
+    },
+    "im.investigate.need_text": {
+        "zh": "请把要调查的内容写在命令后面，例如：`/调查 生产环境 RDS 连接数暴涨`。",
+        "en": "Add what you want investigated after the command, e.g. "
+              "`/investigate RDS connections spiking in prod`.",
+    },
+    "im.investigate.card_title": {
+        "zh": "深度调查已发起",
+        "en": "Deep investigation dispatched",
+    },
+    # 卡片发不出去 → 实时进度就没有落点可以 PATCH。**必须明说**（不许静默降级）：
+    # 调查本身已经在跑，用户得知道去哪儿看。
+    "im.investigate.card_failed": {
+        "zh": "⚠️ 卡片发送失败，这里无法推送实时进度。调查已经在运行，请用上面的链接"
+              "在 Operator App 里查看。",
+        "en": "⚠️ Couldn't post the card, so live progress won't stream here. "
+              "The investigation is running — use the link above to follow it "
+              "in the Operator App.",
+    },
+    # ── 「问一条已有调查的进展」（0 token 回读，**不新建任何东西**）──────────────
+    # 为什么要单独一组文案而不复用 `im.investigate.*`：现网 2026-09-03 的反馈是用户
+    # 拿着 `[[investigation:…]]` 追问进展，结果每追问一次就**再开一条新调查**。修好
+    # 路由之后这条路径必须有自己的说法 —— 回一句「深度调查已发起」正是那个误导的来源。
+    "im.investigate.status.title": {
+        "zh": "调查进展",
+        "en": "Investigation progress",
+    },
+    "im.investigate.status.header": {
+        "zh": "**{title}**\n状态：`{status}`",
+        "en": "**{title}**\nStatus: `{status}`",
+    },
+    "im.investigate.status.no_lines": {
+        "zh": "还没有可展示的过程记录 —— 调查刚开始，过一会儿再看。",
+        "en": "No progress entries yet — the investigation just started; check "
+              "back in a moment.",
+    },
+    # 非终态 + 这条调查还没有别的卡片在刷 → 把这张新卡挂到每分钟的进度轮询上。
+    "im.investigate.status.attached": {
+        "zh": "这张卡片会自动刷新后续进展，不用重复追问。",
+        "en": "This card refreshes itself as the investigation progresses — no "
+              "need to ask again.",
+    },
+    # 非终态，但已经有一张卡在刷同一条调查 → 只给快照。再挂一张会变成两张卡刷同一次
+    # 调查（纯噪音，见 `core.ddb_state.link_im_investigation` 的说明）。
+    "im.investigate.status.watching_elsewhere": {
+        "zh": "这条调查已经有一张卡片在自动刷新了，这里只给一次快照。",
+        "en": "Another card is already refreshing this investigation live — this "
+              "is a one-off snapshot.",
+    },
+    # 用户**明确**写了引用但查不到 → 照实说，并且明说没有替他新建（这正是本次修的 bug）。
+    "im.investigate.status.not_found": {
+        "zh": "没有找到调查 `{ref}`。请确认引用是否完整（形如 "
+              "`[[investigation:<id>]]`），或者它属于另一个 AWS 账号。"
+              "**没有**为你新建调查 —— 需要新起一条请直接说「深入调查 …」。",
+        "en": "Couldn't find investigation `{ref}`. Check that the reference is "
+              "complete (like `[[investigation:<id>]]`) — it may also belong to a "
+              "different AWS account. **No** new investigation was created; say "
+              "\"deep dive on …\" if you want to start one.",
+    },
+    "im.action.unknown": {
+        "zh": "这个按钮已失效（会话可能已过期）。请重新发起一次。",
+        "en": "This button is no longer active (the conversation may have "
+              "expired). Please start again.",
+    },
+    "im.action.no_context": {
+        "zh": "按钮里没有带上原始问题，无法继续。请重新发一条消息。",
+        "en": "The button didn't carry the original question, so it can't "
+              "continue. Please send a new message.",
+    },
+    # Slack 专用：`views_open` 的 trigger_id 只有约 3 秒有效，worker 冷启动可能吃掉
+    # 大半。与其调一个必然失败的 views_open（case_flow 会把异常自己吞掉，用户侧表现
+    # 成"点了没反应"），不如原样重发这个按钮 —— 第二次 worker 是热的。
+    "im.action.retry_hint": {
+        "zh": "刚才这一下没赶上 Slack 的弹窗时限（约 3 秒）。请点下面的按钮再试一次，"
+              "这次会立刻打开。",
+        "en": "That click missed Slack's ~3s dialog window. Tap the button below "
+              "to try again — it will open right away this time.",
+    },
+    "im.action.retry_btn": {
+        "zh": "再试一次",
+        "en": "Try again",
+    },
+    # 用户对着一条历史消息提问，但那条正文取不回来（bot 不在那个会话里 / 消息已撤回 /
+    # 纯图片纯文件 / 权限还没发版本）。**必须说出来** —— 这条需求就是从"静默当没有、
+    # 然后回一句『你的问题好像没发过来』"这个体验来的（B8 第 7 项）。
+    "im.quoted.fetch_failed": {
+        "zh": "⚠️ 没能读到你回复的那条历史消息（可能是我不在那个会话里、消息已撤回，"
+              "或者那条只有图片/文件没有文字）。下面只按你这一句来回答 —— 如果需要"
+              "结合那条消息，把关键内容直接贴过来最快。",
+        "en": "⚠️ I couldn't read the message you replied to (I may not be in that "
+              "conversation, it may have been recalled, or it may contain only "
+              "images/files with no text). I'll answer based on your message alone "
+              "— paste the key content here if it matters.",
+    },
 }
 
 

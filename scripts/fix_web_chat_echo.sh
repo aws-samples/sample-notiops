@@ -390,8 +390,11 @@ REPORTS_CDN="$(aws cloudformation describe-stacks --region "$REGION" --stack-nam
 # 显式传 reportsCdnDomain:不传的话 WebChatStack 会引用主栈的 Export,`--exclusively`
 # 就不再是"只动 WebChatStack"（会被迫先 update 主栈，顺带带上主栈上所有未部署的改动）。
 [ -n "$REPORTS_CDN" ] && CDK_CTX+=(-c "reportsCdnDomain=$REPORTS_CDN")
-# enabledPlatforms=none 只是让 synth 跳过 BotStack（否则 fromAsset("../") 扫整个 repo，
-# 慢十几分钟）。配合 --exclusively 不会动到已部署的 BotStack —— CDK 从不删除"不在 app 里"的栈。
+# enabledPlatforms=none 只是让 synth 跳过 IM 侧（ImStack）。配合 --exclusively 不会动到
+# 已部署的 IM 栈 —— CDK 从不删除"不在 app 里"的栈。
+# 历史：M2（2026-09-03）之前这一行的主要作用是跳过 BotStack 那 5 处
+# `ContainerImage.fromAsset("../")`（扫整个 repo 当 Docker context，慢十几分钟）。
+# BotStack 退役后 synth 本来就快，这一行只是继续少动一个栈。
 CDK_CTX+=(-c "enabledPlatforms=none")
 
 [ -d "$PROJECT_ROOT/infra/node_modules" ] || ( cd "$PROJECT_ROOT/infra" && npm ci --no-audit --no-fund )

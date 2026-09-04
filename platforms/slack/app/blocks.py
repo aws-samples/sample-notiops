@@ -200,6 +200,24 @@ def trim(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
 
+def to_mrkdwn(s: str) -> str:
+    """把「标准 markdown 的粗体」`**x**` 换成 Slack mrkdwn 的 `*x*`。
+
+    为什么需要：共享的 i18n 文案（`core/i18n.py`）是按飞书/钉钉的 markdown 写的，
+    粗体是 `**x**`。Slack 的 mrkdwn 里粗体只认**单个**星号，`**x**` 会渲染成
+    「*x*」—— 星号原样显示给用户看。2026-09-03 现网就是这么暴露的（`/help` 菜单
+    「直接是源码」）。
+
+    ⚠️ 只处理粗体。斜体不动：markdown 的 `*x*` 与 Slack 的斜体 `_x_` 冲突，盲目
+    互换会把已经正确的 mrkdwn 弄坏。反引号两边一致，不用管。
+
+    实现委托给 `platforms.common.im_markdown.bold_to_mrkdwn` —— agent 回答的降级
+    （`im_markdown.to_slack`）也要这一条，同一条规则两处各写一遍就会漂移。
+    """
+    from platforms.common.im_markdown import bold_to_mrkdwn
+    return bold_to_mrkdwn(s)
+
+
 def escape_mrkdwn(s: str) -> str:
     """Slack mrkdwn treats `<`, `>`, `&` literally only when escaped.
     For user-supplied text that might contain these, escape so they

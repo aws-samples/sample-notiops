@@ -1,5 +1,5 @@
 """
-LLM 目录读取器测试（spec task 1.2 / 1.3 验收）。
+LLM 目录读取器测试（验收）。
 
 覆盖 webchat（agent-build）与 IM（core）两份对等实现的共同契约：
 

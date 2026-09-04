@@ -28,6 +28,7 @@ from shared.queries.reports import (
 from shared.queries.metrics import get_latest_monitoring_date
 from shared.queries._client import config_table
 from api.routes.rds_health_check import _get_models, mask_api_key
+from api.errors import NotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -125,15 +126,15 @@ def _get_latest() -> dict:
     """返回最新 report_date 的 summary 类型报告。"""
     latest = get_latest_health_summary("elasticache")
     if not latest:
-        raise KeyError("No summary report found")
+        raise NotFoundError("No summary report found")
 
     date_val = latest.get("latest_date")
     if not date_val:
-        raise KeyError("No summary report found")
+        raise NotFoundError("No summary report found")
 
     record = get_health_report("elasticache", date_val, "summary")
     if not record:
-        raise KeyError("No summary report found")
+        raise NotFoundError("No summary report found")
     record.setdefault("report_date", record.get("date", ""))
     record.setdefault("report_type", record.get("type", ""))
     account_val = record.get("account", "")
@@ -160,7 +161,7 @@ def _get_detail(report_id: str, query_params: dict) -> dict:
             record = None
 
     if not record:
-        raise KeyError(f"Health check report {report_id} not found")
+        raise NotFoundError(f"Health check report {report_id} not found")
 
     # 字段映射（和 _get_list 一致）
     record.setdefault("report_date", record.get("date", ""))

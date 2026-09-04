@@ -92,12 +92,18 @@ def test_import_builds_no_bedrock_client() -> None:
 
     # The proxy must still be usable exactly like a client object: attribute
     # access forwards, and truthiness holds (call sites do `x or _bedrock`).
-    from core import bedrock_intent
+    #
+    # 2026-09-01: `core/bedrock_chat.py` is the **only** module left holding a
+    # module-level LazyClient — the other seven moved to `core/bot_llm.py` →
+    # `shared/llm_provider.py::invoke_llm`, which builds its client per call.
+    # Asserting on bedrock_chat (not bedrock_intent, which no longer has one)
+    # keeps this test measuring the thing that still exists.
+    from core import bedrock_chat
     _check("_bedrock is truthy (call sites rely on `client or _bedrock`)",
-           bool(bedrock_intent._bedrock))
+           bool(bedrock_chat._bedrock))
     _check("_bedrock is a lazy proxy, not a built client",
-           type(bedrock_intent._bedrock).__name__ == "LazyClient",
-           type(bedrock_intent._bedrock).__name__)
+           type(bedrock_chat._bedrock).__name__ == "LazyClient",
+           type(bedrock_chat._bedrock).__name__)
 
 
 def _probe_auth_scheme(client) -> tuple[str, str]:
@@ -215,13 +221,13 @@ def test_proxy_stays_patchable_and_copyable() -> None:
     except Exception as e:  # noqa: BLE001
         _check("mock.patch.object on the proxy works", False, f"{type(e).__name__}: {e}")
 
-    # Patching the *module* attribute (15 existing call sites do this) must also
-    # keep working — the proxy is just a value there.
-    from core import bedrock_intent
+    # Patching the *module* attribute must also keep working — the proxy is just
+    # a value there. (Was bedrock_intent; that module no longer holds a client.)
+    from core import bedrock_chat
     sentinel = object()
-    with mock.patch.object(bedrock_intent, "_bedrock", sentinel):
+    with mock.patch.object(bedrock_chat, "_bedrock", sentinel):
         _check("patching the module attribute still works",
-               bedrock_intent._bedrock is sentinel)
+               bedrock_chat._bedrock is sentinel)
 
 
 def main() -> int:

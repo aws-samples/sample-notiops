@@ -14,6 +14,8 @@ import time
 import urllib.request
 import urllib.error
 
+from core.feishu_card import card_config
+
 logger = logging.getLogger("shared.feishu_sender")
 
 # Card Kit API base URL
@@ -83,14 +85,14 @@ class FeishuSender:
 
         card_json = {
             "schema": "2.0",
-            "config": {
-                "streaming_mode": True,
-                "summary": {"content": "... thinking ..."},
-                "streaming_config": {
+            "config": card_config(
+                streaming_mode=True,
+                summary={"content": "... thinking ..."},
+                streaming_config={
                     "print_frequency_ms": {"default": 50},
                     "print_step": {"default": 1},
                 },
-            },
+            ),
             "header": {
                 "title": {"tag": "plain_text", "content": "AI Assistant"},
                 "template": "blue",
@@ -216,10 +218,12 @@ class FeishuSender:
         url = f"{_API_BASE}/cardkit/v1/cards/{card_id}/settings"
         payload = json.dumps({
             "settings": json.dumps({
-                "config": {
-                    "streaming_mode": False,
-                    "summary": {"content": summary},
-                },
+                # 这里的 config 会**整体替换**卡片原有 config —— 不带 width_mode
+                # 的话，流式一结束卡片就缩回默认宽度。所以照样走 card_config()。
+                "config": card_config(
+                    streaming_mode=False,
+                    summary={"content": summary},
+                ),
             }),
             "sequence": sequence,
         }, ensure_ascii=False).encode("utf-8")

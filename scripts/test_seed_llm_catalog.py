@@ -93,8 +93,17 @@ class _FakeTable:
         gen = (self.item or {}).get("generation")
         if gen is not None and int(gen) != 0:
             raise self._conflict("UpdateItem")   # 与真表一致：条件不满足就抛
-        self.item = {**(self.item or {}),
-                     "models": kw["ExpressionAttributeValues"][":m"]}
+        # 只应用 UpdateExpression 真的 SET 了的属性 —— 别在这里硬编码 `:m`，
+        # 否则"只写 default_model"那条路径在假表上 KeyError，而在真表上好得很。
+        names = kw.get("ExpressionAttributeNames") or {}
+        values = kw["ExpressionAttributeValues"]
+        expr = kw["UpdateExpression"]
+        assert expr.startswith("SET "), expr
+        applied = {}
+        for clause in expr[len("SET "):].split(","):
+            lhs, rhs = (part.strip() for part in clause.split("="))
+            applied[names.get(lhs, lhs)] = values[rhs]
+        self.item = {**(self.item or {}), **applied}
         return {}
 
     @staticmethod
@@ -371,6 +380,70 @@ def test_tops_up_models_added_after_the_first_deploy() -> None:
            merged[-1]["alias"] == "custom-model", str([m["alias"] for m in merged]))
 
 
+def test_follows_default_model_changes_in_the_catalogue() -> None:
+    """A changed `default_model` must reach already-seeded environments too.
+
+    2026-09-02 in production: the catalogue's default moved from
+    `claude-sonnet-5` to `xai-grok-4-6`. The top-up added `xai-grok-4-6` to the
+    model list and the stored `default_model` stayed on Sonnet 5, because the
+    write only ever touched `models`. Every other slot -- the
+    `/notiops/agent/model_id` SSM parameter, the health-checker's
+    `BEDROCK_MODEL_ID` -- had followed the change, so the environment looked
+    consistent from the CLI while the web chat still opened on Sonnet 5.
+
+    Note what is NOT being tested: "the newest model wins". The value written is
+    the one the catalogue *declares* as its default; a model merely being added
+    must still never become the default.
+    """
+    print("test_follows_default_model_changes_in_the_catalogue")
+    mod = _load_seeder()
+    cfg = mod._load(SEED_FILE)                      # noqa: SLF001
+    seed_default = cfg["default_model"]
+    other = next(m["alias"] for m in cfg["models"]
+                 if m["alias"] != seed_default and m.get("enabled"))
+
+    # 现网那个形态：模型列表已经齐了，只有 default_model 落后
+    drifted = _FakeTable(existing={"PK": "llmcfg", "SK": "meta", "generation": 0,
+                                   "default_model": other,
+                                   "models": [dict(m) for m in cfg["models"]]})
+    rc = _run_seeder(mod, drifted, ["--table", "t", "--region", "us-east-1"])
+    _check("drifted default: exits 0", rc == 0, f"rc={rc}")
+    _check("drifted default: follows the catalogue",
+           drifted.item["default_model"] == seed_default,
+           str(drifted.item["default_model"]))
+    _check("drifted default: the write is conditional on generation",
+           any("generation = :zero" in (c or "") for c in drifted.conditions),
+           str(drifted.conditions))
+    _check("drifted default: generation stays 0 (still seed-managed)",
+           drifted.item.get("generation") == 0, str(drifted.item.get("generation")))
+    _check("drifted default: models left byte-for-byte alone",
+           [m["alias"] for m in drifted.item["models"]]
+           == [m["alias"] for m in cfg["models"]])
+
+    # 管理员**故意**选了别的默认模型 → 升级不许改回来
+    admin = _FakeTable(existing={"PK": "llmcfg", "SK": "meta",
+                                 "generation": 1760000000000,
+                                 "default_model": other,
+                                 "models": [dict(m) for m in cfg["models"]]})
+    rc = _run_seeder(mod, admin, ["--table", "t", "--region", "us-east-1"])
+    _check("admin-chosen default: not overridden by a re-deploy",
+           rc == 0 and admin.updates == 0 and admin.item["default_model"] == other,
+           f"rc={rc} updates={admin.updates} default={admin.item['default_model']}")
+
+    # 目录默认指向一个 disabled 的模型 → 不写（否则这个 surface 没有可用模型）
+    bad = dict(cfg, default_model="deliberately-disabled",
+               models=[*[dict(m) for m in cfg["models"]],
+                       {"alias": "deliberately-disabled", "enabled": False}])
+    item = {"PK": "llmcfg", "SK": "meta", "generation": 0, "default_model": other,
+            "models": [dict(m) for m in cfg["models"]]}
+    _check("a disabled default is never written",
+           mod.default_model_drift(item, bad) is None)
+    _check("an unknown default is never written",
+           mod.default_model_drift(item, dict(cfg, default_model="no-such-model")) is None)
+    _check("no drift when they already agree",
+           mod.default_model_drift(dict(item, default_model=seed_default), cfg) is None)
+
+
 def test_setup_sh_wires_it_up() -> None:
     """setup.sh must actually call the seeder, and tolerate its failure."""
     print("test_setup_sh_wires_it_up")
@@ -391,6 +464,7 @@ def main() -> int:
     test_sanity_check_catches_a_broken_seed()
     test_idempotent_and_force()
     test_tops_up_models_added_after_the_first_deploy()
+    test_follows_default_model_changes_in_the_catalogue()
     test_setup_sh_wires_it_up()
     if _failed:
         print(f"\n{FAIL} {_failed} check(s) failed")

@@ -155,7 +155,7 @@ def handler(event: dict, context) -> dict:
 
             # STS AssumeRole — 部署账号(role_arn 为空)跳过,用 Lambda 自身角色
             if account.role_arn:
-                credentials = assume_role(account.role_arn)
+                credentials = assume_role(account.role_arn, account.account_id)
                 if credentials is None:
                     logger.warning(
                         "Skipping account %s: AssumeRole failed", account.account_id

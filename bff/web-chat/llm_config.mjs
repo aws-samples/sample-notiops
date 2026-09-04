@@ -1611,7 +1611,7 @@ export async function apiRollbackLlmConfig(body, actor = {}) {
   };
 }
 
-/* ───────────────── Admin: 只读诊断（spec R9.4 / task 9.2）───────────────── */
+/* ───────────────── Admin: 只读诊断（spec R9.4）───────────────── */
 
 /**
  * 「现在到底是什么状态」的单一入口。

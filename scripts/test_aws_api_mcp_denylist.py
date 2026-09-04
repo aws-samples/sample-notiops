@@ -348,7 +348,7 @@ def test_header_no_longer_overclaims() -> None:
         _check(f"{label}: the header names the actual implementation",
                "is_denied_command" in header,
                "the header should point at the code that implements the claim")
-        _check(f"{label}: the header states this is defence-in-depth, not a boundary",
+        _check(f"{label}: the header states this is defense-in-depth, not a boundary",
                "IAM" in header)
         _check(f"{label}: the header documents the credential stripping",
                "AWS_BEARER_TOKEN" in header)

@@ -106,12 +106,115 @@ export async function removeUserFromGroup(group: string, username: string): Prom
 // ── 成员账号一键接入（Organizations + StackSets；org 模式部署时可用）──
 export interface MemberAccountRec {
   accountId: string; name: string; email: string;
-  onboarded: boolean; enabled: boolean; orgOnboardStatus: string; regions: string[];
+  /**
+   * `name` 是不是**人手填的 alias**（后端 `alias_source === "manual"`）。
+   *
+   * 🔴 这一位存在的理由是「改名」那个按钮要能区分两种状态：
+   *
+   * ```
+   * aliasManual: true    这是客户自己起的名字 → 输入框预填它，行上标「自定义」
+   * aliasManual: false   这是 Organizations 的账号名（或空）
+   *                      → 输入框**留空**，占位符写 org 名
+   * ```
+   *
+   * 预填 org 名的表现是：客户点开「改名」什么都不改就保存 → 那个 org 名被
+   * 标记成 manual 落库 → 以后 AWS 上改了账号名，这里再也不跟着变了，
+   * 而客户从没输入过任何东西。
+   */
+  aliasManual?: boolean;
+  onboarded: boolean; enabled: boolean; orgOnboardStatus: string;
+  /**
+   * 「采集 Region」。**老采集链路与资源巡检共用这一个字段**（2026-08-29 起）。
+   *
+   * ```
+   * ["us-east-1","us-west-2"]  两条链路都只扫这两个
+   * ["*"]                      巡检枚举全部；老链路把 `*` 滤掉后落回默认 region
+   * [] / 无                     读时默认 ["us-east-1"]
+   * ```
+   *
+   * ⚠️ 这段 docstring 在 2026-08-29 之前写的是「**资源巡检不读它**」——
+   * 那是真的（巡检恒扫全部 region），也正是那时的缺陷：客户填 `us-east-1`
+   * 保存成功，第二天在报告里看到 eu-west-1 的 finding，改这个框改成什么都没用。
+   * 现在它生效了，代价是「全部」要显式写成 `*`。
+   *
+   * ⚠️ 后端在 `regions` 为空时返回 `["us-east-1"]`（读时默认，不改库）。
+   */
+  regions: string[];
   /** 第二步（DevOps Agent 关联）状态：'' | pending | template_generated | payload_saved | tested | enabled */
   devopsAgentStatus?: string;
+  /**
+   * 这个账号需不需要**重新部署 CFN 栈**才能做巡检判读。
+   *
+   * 判据（后端算）：`da#` 行 active + 有 `agent_space_id` + **没有**
+   * `inspect_agent_space_id` → 部署的是旧模板（没有巡检 space），
+   * 或部署了新模板但回填时那一栏留空。
+   *
+   * 🔴 不显示它的后果：那些账号采集照跑（`enabled_accounts` 与这个字段无关）、
+   * 花 GetMetricData，而判读永远为空 —— 而看板上「N 条未做根因分析」与
+   * 「DA 说这些没问题」长得一样。管理页是唯一能看出「要重新部署栈」的地方。
+   */
+  needsStackUpdate?: boolean;
+  /**
+   * 这个账号**不在部署账号所属的组织里**（跨 Payer 手动接入）。
+   *
+   * 🔴 后端此前只列 `organizations:ListAccounts` 返回的账号 ⇒ 跨 org 接入的
+   * 账号即使两行都写好、巡检也照常扇出它（`enabled_accounts` 读 `da#accounts`
+   * GSI，与 org 无关），管理页上它**永远不存在**。而手动接入流程本身全绿、
+   * 页面提示「已保存并激活」—— 运维看到成功，然后在列表里找不到它。
+   *
+   * ⚠️ UI SHALL 标出它，因为**能做的操作不同**：一键接入走 StackSet，
+   * 覆盖不到组织外账号 ⇒ 那个按钮对它必须不渲染（不是灰着 —— 灰着等于摆一个
+   * 用户无法解决的问题，本文件既有约定）。
+   */
+  outOfOrg?: boolean;
+  /**
+   * 接入方式：`"manual"` = 客户自己部署 CFN；`""` = 一键接入（或老记录）。
+   *
+   * 🔴 UI SHALL 显示它，因为**下线的回收范围按它分岔**：
+   *
+   * ```
+   * 一键接入   DeleteStackInstances → 成员账号里的栈真的被删，资源全回收
+   * 手动接入   StackSet 里没有它 → 只清本地登记，成员账号里的
+   *            agent space + IAM 角色**留着**，要客户自己去删那个栈
+   * ```
+   *
+   * 两种账号在列表里长得一样、按钮也一样，而点下去的结果完全不同 ——
+   * 不标出来客户会以为下线就清干净了（agent space 是计费资源）。
+   */
+  onboardSource?: string;
 }
-export async function fetchMemberAccounts(): Promise<MemberAccountRec[]> {
-  return (await req<{ items: MemberAccountRec[] }>("GET", "/admin/member-accounts")).items || [];
+/**
+ * 成员账号列表 + 两个能力标记。
+ *
+ * 🔴 三件事分开报，**不要合并**（2026-08-25）：
+ *
+ * ```
+ * items            列表本身
+ * orgListable      能不能从 Organizations 列账号
+ *                  partner-resold 客户（无 payer 权限、系统部署在某个 linked
+ *                  account 上）是 false —— 那时只列 DDB 里已登记的账号
+ * oneClickOnboard  StackSet 一键接入可不可用（要 org 模式 + 管理账号）
+ * ```
+ *
+ * ⚠️ 原来这三件事挤在「后端抛不抛 `org_mode_disabled`」一个信号里，于是
+ * 「列不出账号」被当成「整页不可用」，而跨 payer 流程（两者都不需要）
+ * 也被一起挡掉 —— 那条流程恰恰是为这类客户设计的。
+ */
+export interface MemberAccountsResp {
+  items: MemberAccountRec[];
+  orgListable: boolean;
+  oneClickOnboard: boolean;
+}
+export async function fetchMemberAccounts(): Promise<MemberAccountsResp> {
+  const r = await req<Partial<MemberAccountsResp>>("GET", "/admin/member-accounts");
+  return {
+    items: r.items || [],
+    // ⚠️ 缺省按 **true** 兜底：存量 BFF（这次改动之前）不返回这两个字段，
+    //    而那时的行为就是「能列出来 + 能一键接入」。默认 false 会让老部署
+    //    突然显示一堆「不可用」提示。
+    orgListable: r.orgListable !== false,
+    oneClickOnboard: r.oneClickOnboard !== false,
+  };
 }
 export async function onboardMemberAccount(accountId: string, regions: string[]): Promise<{ operationId: string; accountId: string }> {
   return req("POST", "/admin/member-accounts", { accountId, regions });
@@ -119,10 +222,55 @@ export async function onboardMemberAccount(accountId: string, regions: string[])
 export async function memberOnboardStatus(operationId: string, accountId: string): Promise<{ status: string }> {
   return req("GET", `/admin/member-accounts/status/${encodeURIComponent(operationId)}?account_id=${encodeURIComponent(accountId)}`);
 }
+/**
+ * 只改「采集 Region」，**不触发 StackSet 下发**。
+ *
+ * 🔴 不要用 `onboardMemberAccount` 代替：那个会 `CreateStackInstances`
+ * 重新下发两个 StackSet（几分钟、会动成员账号里的资源）。客户在列表里改一下
+ * region 不该付那个代价。
+ *
+ * ⚠️ 后端会**拒绝**打错形状的 region（`us-east1` 这种）而不是静默过滤 ——
+ * 静默过滤会让客户以为存进去了，而那条链路的表现是「那个区一直没被采」，
+ * 与「region 名打错了」在界面上完全一样。错误原文要原样显示。
+ */
+export async function setMemberAccountRegions(
+  accountId: string, regions: string[],
+): Promise<{ accountId: string; regions: string[] }> {
+  return req("PUT", `/admin/member-accounts/${encodeURIComponent(accountId)}/regions`,
+    { regions });
+}
+
+/**
+ * 改账号显示名。**空串 = 清空**，回退到 Organizations 的账号名。
+ *
+ * 后端会同时写两处（`account#` 的 `account_name` + `da#` 的 `account_alias`），
+ * 回传的 `pushLabelUpdated` 说的是**第二处**改了没有 —— `da#` 行不存在
+ * （还没做 DevOps Agent 关联）时是 false，那种账号本来就不进 IM 推送。
+ *
+ * ⚠️ **不会重命名已经建好的 DevOps Agent space**（创建时定死，没有 rename API）。
+ */
+export async function setMemberAccountAlias(
+  accountId: string, alias: string,
+): Promise<{ accountId: string; alias: string; pushLabelUpdated: boolean }> {
+  return req("PUT", `/admin/member-accounts/${encodeURIComponent(accountId)}/alias`,
+    { alias });
+}
+
 export async function setMemberAccountEnabled(accountId: string, enabled: boolean): Promise<{ enabled: boolean }> {
   return req("POST", `/admin/member-accounts/${encodeURIComponent(accountId)}/${enabled ? "enable" : "disable"}`);
 }
-export async function offboardMemberAccount(accountId: string): Promise<{ operationId: string; status: string }> {
+/**
+ * 下线。回收范围按接入方式分岔 —— 见 `stackRetained`。
+ *
+ * 🔴 `stackRetained: true` 表示成员账号里那个 CloudFormation 栈**没被删**
+ * （手动接入的账号：StackSet 里没有它的 instance，我们碰不到）。这时
+ * `stackName` 给出要客户自己去删的栈名 —— agent space 是计费资源，
+ * 不说清楚等于让它一直挂着。
+ */
+export async function offboardMemberAccount(accountId: string): Promise<{
+  operationId: string; status: string;
+  stackRetained?: boolean; stackName?: string; stackRegion?: string;
+}> {
   return req("DELETE", `/admin/member-accounts/${encodeURIComponent(accountId)}`);
 }
 export async function associateDevopsAgent(accountId: string): Promise<{ operationId: string }> {
@@ -146,7 +294,11 @@ export async function deleteAccountAccess(kind: "user" | "group", id: string): P
 
 // ── 飞书机器人通知配置（Admin「通知」板块;存 Secrets Manager,与老管理前端解耦）──
 export interface FeishuConfig { app_id: string; app_secret: string; verification_token?: string; encrypt_key?: string; notify_chat_ids: string }
-export async function fetchNotificationConfig(): Promise<{ feishu: FeishuConfig }> {
+/** GET 额外回带一个**只读**字段 `webhook_url`：IM 入口的 webhook 地址，后端按名字查
+ *  HTTP API 得到（bff/web-chat/feishu_config.mjs）。它不是凭证、不脱敏，给抽屉第 3 步
+ *  显示 + 一键复制用。**没装 IM / 查不到时是空串**，界面据此退回"去 Outputs 里找"。
+ *  故意不放进 `FeishuConfig` —— PUT 不接受这个字段，写进去会让它看着像可改的。 */
+export async function fetchNotificationConfig(): Promise<{ feishu: FeishuConfig & { webhook_url?: string } }> {
   return req("GET", "/admin/notification-config");
 }
 export async function putNotificationConfig(config: Partial<FeishuConfig>): Promise<{ message: string }> {
@@ -160,11 +312,35 @@ export async function testNotificationSend(chatId: string): Promise<{ success: b
 export async function generateLaunchStack(accountId: string): Promise<{ launchStackUrl: string; templateUrl: string; expiresHours: number }> {
   return req("POST", `/admin/member-accounts/${encodeURIComponent(accountId)}/launch-stack`);
 }
-export async function saveManualPayload(accountId: string, payload: { agent_space_id: string; trigger_role_arn: string }): Promise<{ status: string; message: string }> {
+export async function saveManualPayload(accountId: string, payload: {
+  agent_space_id: string;
+  trigger_role_arn: string;
+  /**
+   * 巡检判读用的第二个 space（模板输出 `InspectionAgentSpaceId`）。
+   *
+   * ⚠️ **可选**：存量账号部署的是旧模板，没有这个输出。缺它的后果是那个账号
+   * 不派巡检判读（executor 侧显式报错，不是静默），但排障那半照常工作 ——
+   * 所以不能做成必填，否则存量账号连排障都回填不了。
+   */
+  inspect_agent_space_id?: string;
+}): Promise<{ status: string; message: string }> {
   return req("PUT", `/admin/member-accounts/${encodeURIComponent(accountId)}/payload`, payload);
 }
-export async function testDaConnection(accountId: string): Promise<{ success: boolean; step?: string; error?: string; agentSpaceId?: string }> {
-  return req("POST", `/admin/member-accounts/${encodeURIComponent(accountId)}/test-connection`);
+/**
+ * 测试跨账号连接（AssumeRole → GetAgentSpace）。
+ *
+ * 🔴 `probe` 传当前**输入框里**的值 —— 不传就只测已保存的记录。
+ * 原来只测已保存的，于是客户填完两个框先点「测试连接」（两个按钮并排，
+ * 很自然的顺序）就会拿到「account not configured (missing trigger_role_arn
+ * or agent_space_id)」—— 而他明明刚填了那两个值。
+ */
+export async function testDaConnection(
+  accountId: string,
+  probe?: { agent_space_id: string; trigger_role_arn: string },
+): Promise<{ success: boolean; step?: string; error?: string; agentSpaceId?: string }> {
+  return req("POST",
+    `/admin/member-accounts/${encodeURIComponent(accountId)}/test-connection`,
+    probe);
 }
 
 // ── LLM 模型目录与凭证（DDB llmcfg + Secrets Manager；spec: llm-provider-and-model-management）──
@@ -307,4 +483,112 @@ export async function fetchBackendTasks(): Promise<{ tasks: BackendTaskRow[]; ge
 export async function putBackendTasks(body: Record<string, string | null>):
 Promise<{ message: string; generation: number; warning?: string }> {
   return req("PUT", "/admin/llm-config/backend-tasks", body);
+}
+
+// ---------------------------------------------------------------------------
+// 跨账号**巡检**的前置（2026-08-25）
+//
+// 与 onboard / DA 关联是独立的两件事：那些让账号「接进来」，这些让**巡检**
+// 能真的采到它。
+// ---------------------------------------------------------------------------
+
+export interface InspectionCrossAccountStatus {
+  ok: true;
+  accountId: string;
+  systemAccountId: string;
+  /**
+   * 巡检共用的那**一个** agent space（在系统账号里）。
+   *
+   * 🔴 巡检共用一个 space，根因调查才是每账号一个。所以这里显示的是
+   * 「把成员账号加进哪个 space」，不是「它自己的 space」。
+   * ⚠️ 前端 SHALL NOT 硬编码这个 id —— 重建栈它就变了。
+   */
+  inspectionSpace: { id: string; name: string; region: string };
+  /** ① 采集凭证 —— **巡检必需**，缺了整轮直接失败。 */
+  collection: {
+    /** 只表示登记过，不代表 assume 通得过（那要 verify 一次）。 */
+    registered: boolean;
+    roleArn: string;
+    /** 模板会建出来的那个 ARN（角色名固定，所以能推导）。 */
+    expectedRoleArn: string;
+    /** 登记的与预期不一致 —— 手工贴错，或换过部署账号。 */
+    mismatch: boolean;
+  };
+  /** ② 判读深度 —— 可选，缺了判读仍出结论但少了主动深挖。 */
+  monitorAssociation: {
+    /** `null` = 查不到（无权 / SDK 缺），**不等于**没关联。 */
+    linked: boolean | null;
+    /**
+     * `"" | "valid" | "invalid" | "pending-confirmation"`
+     *
+     * 🔴 `invalid` 与「没关联」是**两回事**：关联建了，但成员账号里那个角色
+     * 不存在或信任策略不对，DA assume 不进去。只看 `linked` 会把这种情况
+     * 显示成「已关联 ✓」。
+     */
+    status: string;
+    /** 模板固定命名，能推导 —— 不让客户手贴。 */
+    expectedRoleArn: string;
+  };
+}
+
+export async function fetchInspectionCrossAccount(
+  accountId: string,
+): Promise<InspectionCrossAccountStatus> {
+  return req("GET",
+    `/admin/member-accounts/${encodeURIComponent(accountId)}/inspection`);
+}
+
+/**
+ * 验证并登记采集角色。**会真的 AssumeRole 一次**，通了才写库。
+ *
+ * ⚠️ 失败时后端返回 `cross_account_unavailable` 并带 AWS 原话
+ * （`AccessDenied` 与 `NoSuchEntity` 指向完全不同的动作），UI SHALL 原样显示。
+ */
+export async function verifyInspectionCollectionRole(
+  accountId: string,
+): Promise<{ ok: true; accountId: string; roleArn: string; verified: boolean }> {
+  return req("POST",
+    `/admin/member-accounts/${encodeURIComponent(accountId)}/inspection/verify-role`);
+}
+
+/**
+ * 采集角色模板的 Launch Stack URL —— **兜底用**。
+ *
+ * ⚠️ 2026-08-26 起采集角色已经合并进手动接入那个模板
+ * （`infra/member-devops-agent.yaml` 的 `IdleDetectionRole`），所以正常流程
+ * 客户只部署**一个**栈，不需要这个。留着它是给两种账号收尾：
+ * 用合并前的老模板部署过的、以及部署时把 `CreateCollectionRole` 选成了 no 的。
+ */
+export async function generateInspectionCollectionStack(
+  accountId: string,
+): Promise<{
+  accountId: string; templateUrl: string; launchStackUrl: string;
+  expiresHours: number; expectedRoleArn: string;
+}> {
+  return req("POST",
+    `/admin/member-accounts/${encodeURIComponent(accountId)}/inspection/launch-stack`);
+}
+
+/**
+ * ②：把这个账号关联进**系统账号**的巡检 Agent Space（辅助云来源）。
+ *
+ * 原来这一步只能让客户进 DevOps Agent 控制台走「添加辅助云来源」向导 —— 7 步，
+ * 其中 6 步是手抄一段自定义信任策略去建 IAM 角色。拆开之后：
+ *
+ * ```
+ * 角色（成员账号里建 IAM）   → 合并后的 CFN 模板建好，客户看不见
+ * 关联（系统账号的 API）     → 这个按钮，BFF 就跑在系统账号里
+ * ```
+ *
+ * ⚠️ 后端把「已存在」当成功（客户可能自己在控制台做过），所以这个按钮可以
+ * 重复点。返回的 `status` 才是真相：`invalid` 表示关联建了但角色那半没到位。
+ */
+export async function associateInspectionSource(
+  accountId: string,
+): Promise<{
+  ok: true; accountId: string; created: boolean; roleArn: string;
+  status: string; spaceId: string;
+}> {
+  return req("POST",
+    `/admin/member-accounts/${encodeURIComponent(accountId)}/inspection/associate`);
 }

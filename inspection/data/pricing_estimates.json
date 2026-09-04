@@ -1,0 +1,29 @@
+{
+  "_note": "月成本估算表。用途只有两个：R4.6 的跨服务排序需要一个共同标尺，以及给客户一个量级感。SHALL NOT 当成账单或成本承诺（R11e.3）。",
+  "_ops": "⚠️ 每季度核对，或改为从 AWS Price List API 自动生成。核对后更新 as_of。",
+  "as_of": "2026-06-02",
+  "as_of_source": "git log 显示 lambda2_analyzer/aws_pricing_estimates.json 自该日提交后从未更新",
+  "region": null,
+  "region_verified": false,
+  "_region_note": "⚠️ 原表来源写的是「extracted from capacity-audit report」，没有记录区域。价格按区域差异可达 30%+，所以在 region 未核实之前，**本表的任何取值都标记为 coarse**（见 pricing.PricePrecision）。不要凭猜测填一个区域进来。",
+  "currency": "USD",
+  "monthly_usd": {
+    "rds": {
+      "db.m8g.4xlarge": 1664.0,
+      "db.m8g.large": 387.0,
+      "db.m8g.xlarge": 768.0,
+      "db.r5.large": 212.0,
+      "db.r5.xlarge": 424.0,
+      "db.r8g.2xlarge": 1061.0
+    },
+    "elasticache_node": {
+      "cache.c7gn.2xlarge": 876.0,
+      "cache.c7gn.4xlarge": 1752.0,
+      "cache.c7gn.8xlarge": 3504.0,
+      "cache.c7gn.large": 219.0,
+      "cache.m5.large": 88.0,
+      "cache.m6g.large": 80.0
+    }
+  },
+  "_incomplete": "⚠️ 这里只抄录了原表中我能逐条核对到的条目。原表共 15 个 RDS + 22 个 ElastiCache 机型，完整迁移属于 —— 迁移时 SHALL 逐条对照 AWS Price List API 而不是照抄，因为原表既无区域也无日期，照抄等于把不可信数据换个地方放。在 3.5a 完成前，未命中本表的机型走关键字兜底并标 coarse。"
+}

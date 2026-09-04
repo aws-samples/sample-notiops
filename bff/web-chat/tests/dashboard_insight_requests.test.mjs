@@ -19,9 +19,11 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 
 let failed = 0;
+let ok = 0;
 async function t(name, fn) {
   try {
     await fn();
+    ok++;
     console.log(`  ok   ${name}`);
   } catch (e) {
     failed += 1;
@@ -59,5 +61,5 @@ for (const file of FILES) {
   });
 }
 
-console.log(failed ? `\nFAILED: ${failed} check(s)` : "\nPASSED");
+console.log(failed ? `\nFAILED: ${failed} check(s)` : `\nPASSED: ${ok} ok, 0 failed`);
 process.exit(failed ? 1 : 0);

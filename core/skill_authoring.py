@@ -10,12 +10,13 @@ update is expanded to AWS best practice and shown to the admin for explicit
 approval before anything is written to S3.
 
 This module deliberately mirrors the sibling `core/skill_dispatcher.py` module:
-  * One Amazon Bedrock `invoke_model` call per model request, in the Anthropic
-    Messages format, with lenient JSON parsing and a fail-safe fallback (same
-    approach as the existing `core/bedrock_intent.py` — note: this uses the
-    Messages API, not the Bedrock Converse API).
-  * The Bedrock client is passed in (`bedrock_client=`) so tests never touch a
-    real client.
+  * One `core.bot_llm` call per model request, with lenient JSON parsing and a
+    fail-safe fallback (same approach as `core/bedrock_intent.py`). Since
+    2026-09-01 that goes over the Bedrock **Converse** API, not the hand-rolled
+    Anthropic Messages body — see `core/bot_llm.py` for why.
+  * 2026-09-01: the old injectable `bedrock_client=` parameter is gone (nothing
+    ever passed it; `invoke_llm` builds its own client). To fake the model,
+    patch `skill_authoring.bot_llm.invoke_bot_text`.
   * It returns **plain data structures only** — no finished user-facing
     sentences, and no Chinese-language string literals. Every piece of text the
     admin sees is looked up by a translation key through `core.i18n.t(...)` in
@@ -23,7 +24,7 @@ This module deliberately mirrors the sibling `core/skill_dispatcher.py` module:
 
 Public API
 ----------
-- enrich(goal, *, locale="en", bedrock_client=None) -> dict | None
+- enrich(goal, *, locale="en") -> dict | None
     Expand a loose goal into a structured skill draft:
     {suggested_skill_id, name, description, prompt, parameters[], tags[]}.
     Returns None on any failure (caller keeps the raw goal / asks again).
@@ -34,8 +35,7 @@ Public API
     "error" (block save) or "warn" (show, allow save). Pure — no Bedrock.
     Catches the placeholder↔parameter mismatches an LLM commonly produces.
 
-- propose_semver(current_version, old_prompt, new_prompt, *, locale="en",
-                 bedrock_client=None) -> dict
+- propose_semver(current_version, old_prompt, new_prompt, *, locale="en") -> dict
     Ask the LLM to classify an update's magnitude (patch/minor/major) and
     compute the resulting version. Fail-safe: any error → patch bump (the
     safest, smallest assumption). Returns {bump_level, next_version, reason}.
@@ -54,25 +54,21 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from datetime import datetime, timezone
 
-import boto3
-from core.lazy_boto import LazyClient
-
+from core import bot_llm
 from core import skill_registry
-from shared.model_config import get_bot_model_id
 
 logger = logging.getLogger(__name__)
 
 # ── Bedrock config — same client + model family as the dispatcher / intent ───
-BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
-
-# 惰性构造（core/lazy_boto.py）：botocore 在**构造时**快照凭证，import 期建好的
-# client 会让后续 setenv AWS_BEARER_TOKEN_BEDROCK 完全失效（Bedrock API Key 模式
-# 因此无法生效）。代理转发属性访问，所有调用点写法不变。
-_bedrock = LazyClient("bedrock-runtime", region=BEDROCK_REGION)
+# 2026-09-01：本模块那几处「一个 system prompt + 一段文本 → 一段（通常是 JSON 的）
+# 文本」的调用，从手搓 Anthropic body 的 invoke_model 换成 core/bot_llm 的 Converse
+# 统一入口。理由与取舍全在 core/bot_llm.py 的模块 docstring 里。
+# 顺带删掉 `_bedrock` / `BEDROCK_REGION`：`invoke_llm` 每次调用自己建 client（比
+# LazyClient 更不会拿到过期凭证），而 BEDROCK_REGION 在三条部署路径里恒等于
+# `cdk.Aws.REGION` = Lambda 自己的区域 = boto3 默认区域，去掉是**零行为变化**。
 
 # Mirror skill_registry's id rule so a suggested id never fails create_skill.
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
@@ -133,7 +129,7 @@ def _scan_prompt_safety(prompt: str) -> list[str]:
 
 # ── 1. enrich: goal → structured draft ───────────────────────────────────────
 
-def enrich(goal: str, *, locale: str = "en", bedrock_client=None) -> dict | None:
+def enrich(goal: str, *, locale: str = "en") -> dict | None:
     """Expand a one-line goal into a structured skill draft.
 
     Returns a dict {suggested_skill_id, name, description, prompt,
@@ -142,8 +138,7 @@ def enrich(goal: str, *, locale: str = "en", bedrock_client=None) -> dict | None
     """
     if not (goal or "").strip():
         return None
-    client = bedrock_client or _bedrock
-    raw = _ask_bedrock(client, _enrich_system_prompt(locale), goal.strip())
+    raw = _ask_bedrock(_enrich_system_prompt(locale), goal.strip())
     if not isinstance(raw, dict):
         return None
     return _normalize_draft(raw, goal)
@@ -316,7 +311,7 @@ def has_blocking_findings(findings: list[dict]) -> bool:
 # ── 3. propose_semver: LLM-classified update magnitude ────────────────────────
 
 def propose_semver(current_version: str, old_prompt: str, new_prompt: str, *,
-                   locale: str = "en", bedrock_client=None) -> dict:
+                   locale: str = "en") -> dict:
     """Classify an update's magnitude and compute the next version.
 
     Returns {bump_level, next_version, reason}. Fail-safe: any error / unusable
@@ -330,10 +325,9 @@ def propose_semver(current_version: str, old_prompt: str, new_prompt: str, *,
         # Identical text — nothing changed; still return a patch (caller decides).
         return fallback
 
-    client = bedrock_client or _bedrock
     user = (f"CURRENT VERSION: {cur}\n\n--- OLD PROMPT ---\n{old_prompt or ''}\n\n"
             f"--- NEW PROMPT ---\n{new_prompt or ''}")
-    raw = _ask_bedrock(client, _semver_system_prompt(locale), user)
+    raw = _ask_bedrock(_semver_system_prompt(locale), user)
     if not isinstance(raw, dict):
         return fallback
     level = str(raw.get("bump_level") or "").strip().lower()
@@ -452,32 +446,17 @@ def merge_admin_edits(draft: dict, edits: dict) -> dict:
 
 # ── Bedrock call (mirrors skill_dispatcher._ask_bedrock) ──────────────────────
 
-def _ask_bedrock(client, system_prompt: str, user_text: str) -> dict | None:
-    """One invoke_model call, Anthropic Messages format, loose-JSON parse.
+def _ask_bedrock(system_prompt: str, user_text: str) -> dict | None:
+    """One `bot_llm` call (Converse), loose-JSON parse.
     Returns the parsed dict or None on any failure. Never raises."""
     try:
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 4096,   # 1500 truncated the draft JSON mid-output
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_text or ""}],
-        }
-        resp = client.invoke_model(
-            modelId=get_bot_model_id(),
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(body),
+        text = bot_llm.invoke_bot_text(
+            system_prompt, user_text or "",
+            max_tokens=4096,   # 1500 truncated the draft JSON mid-output
         )
-        data = json.loads(resp["body"].read())
-        text = ""
-        for block in data.get("content", []):
-            if block.get("type") == "text":
-                text = block["text"].strip()
-                break
         logger.info("llm_audit: caller=skill_author model=%s in_len=%d out_len=%d",
-                    get_bot_model_id(), len(user_text or ""), len(text))
+                    bot_llm.get_bot_model_id(), len(user_text or ""), len(text))
         if not text:
-            logger.warning("skill_author: Bedrock returned no text block")
             return None
         return _loose_load_json(text)
     except Exception as e:  # noqa: BLE001 — authoring must never crash the handler

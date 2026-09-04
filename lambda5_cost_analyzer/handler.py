@@ -66,7 +66,27 @@ def _load_enabled_accounts() -> list[dict]:
 
 
 def _assume_role(role_arn: str, account_id: str) -> boto3.Session | None:
-    """STS AssumeRole 获取临时 Session。失败返回 None。"""
+    """STS AssumeRole 获取临时 Session。失败返回 None。
+
+    🔴 `role_arn` 的账号段必须 == `account_id`。写侧
+       （`api/routes/accounts.py`）此前对 `role_arn` 零校验，所以这一道是
+       必须的 —— 详见 `shared.account_scope.assert_role_belongs_to`。
+       ⚠️ 这里的形参**一直**带着 `account_id`（只为 session name 用），
+          也就是说判据一直在手里、只是没人取。
+    """
+    from shared.account_scope import (
+        CrossAccountRoleMismatch, assert_role_belongs_to,
+    )
+
+    try:
+        assert_role_belongs_to(role_arn, account_id,
+                               what=f"account#{account_id}.role_arn")
+    except CrossAccountRoleMismatch as e:
+        # ⚠️ 本函数的既有约定是「失败返回 None，调用方跳过该账户」——
+        #    照它来，但用 ERROR 而不是 WARNING：这不是瞬时故障。
+        logger.error("拒绝跨账号 AssumeRole: %s", e)
+        return None
+
     try:
         sts = boto3.client("sts")
         resp = sts.assume_role(

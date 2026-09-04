@@ -45,8 +45,22 @@ export const IconSecurity = ({ size = 18 }: P) => (
 );
 
 // 巡检&报告 — 折线图/报告
+// ⚠️ 这个是**旧的外链入口**（外链到 idle 控制台）在用，由 Sidebar 的
+//    SHOW_INSPECTIONS 关着。站内的资源巡检看板用下面的 IconInspection ——
+//    共用一个图标会让将来恢复外链时两个入口长得一模一样。
 export const IconReports = ({ size = 18 }: P) => (
   <svg {...base(size)}><rect x="3.5" y="3.5" width="17" height="17" rx="2.2" /><path d="M7.5 14.5 10.5 11l2.5 2.5L16.5 9" /></svg>
+);
+
+// 资源巡检（站内看板）— 放大镜扫过数据库柱体
+export const IconInspection = ({ size = 18 }: P) => (
+  <svg {...base(size)}>
+    <ellipse cx="8.5" cy="5.2" rx="5" ry="2.2" />
+    <path d="M3.5 5.2v9.6c0 1.2 2.24 2.2 5 2.2" />
+    <path d="M3.5 10c0 1.2 2.24 2.2 5 2.2" />
+    <circle cx="15.8" cy="14.2" r="3.6" />
+    <path d="M18.6 17 21 19.4" />
+  </svg>
 );
 
 export const IconMore = ({ size = 18 }: P) => (

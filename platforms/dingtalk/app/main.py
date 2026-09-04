@@ -45,6 +45,7 @@ import dingtalk_stream
 import case_flow
 import dingtalk_utils
 from core import bedrock_intent
+from core import nl_router
 from core import dispatch_compose
 from core import i18n
 from core import llm_pref_resolver
@@ -81,10 +82,25 @@ def _looks_strongly_change(text: str) -> bool:
     return bool(_STRONG_CHANGE_RE.search(text or ""))
 
 
-_LANG_CMD_RE = re.compile(r"^\s*/?\s*language(?:\s+(\S+))?\s*$",
+# ASCII-only regexes; the Chinese command aliases `/语言` / `/模型` are folded
+# in via `nl_router.parse_command` so this file stays CJK-free for i18n lint.
+_LANG_CMD_RE = re.compile(r"^\s*/?\s*(?:language|lang)(?:\s+(\S+))?\s*$",
                            re.IGNORECASE)
 _MODEL_CMD_RE = re.compile(r"^\s*/?\s*model(?:\s+(\S+))?\s*$",
                             re.IGNORECASE)
+
+
+def _help_text(locale: str) -> str:
+    """Bilingual command menu (rendered from i18n `help.*`). Lists BOTH
+    language forms of every command."""
+    rows = "\n".join(
+        i18n.t(f"help.row.{feature}", locale)
+        for feature, _en, _zh in nl_router.HELP_COMMANDS
+    )
+    return (f"**{i18n.t('help.title', locale)}**\n\n"
+            f"{i18n.t('help.intro', locale)}\n\n"
+            f"{rows}\n\n"
+            f"{i18n.t('help.footer', locale)}")
 
 
 # ---------- Inline command handlers ---------------------------------------
@@ -98,14 +114,27 @@ def _maybe_handle_language_command(*, handler: "ChatBotHandler",
                                     user_id: str, raw_text: str,
                                     locale: str) -> bool:
     m = _LANG_CMD_RE.match(raw_text or "")
-    nl_target = "" if m else i18n.parse_language_switch_intent(raw_text or "")
-    if not m and not nl_target:
+    # zh command alias `/语言` via the shared router (kept out of the ASCII
+    # regex above for i18n-lint hygiene).
+    zh_cmd_arg: str = ""
+    if not m:
+        _route = nl_router.parse_command(raw_text or "")
+        if _route.kind == "language":
+            zh_cmd_arg = _route.arg
+    nl_target = "" if (m or zh_cmd_arg) else i18n.parse_language_switch_intent(raw_text or "")
+    if not m and not zh_cmd_arg and not nl_target:
         return False
     if not user_id:
         handler.reply_text(i18n.t("main.failed_user_id", locale), msg)
         return True
-    arg = nl_target or (i18n.normalize_locale(m.group(1)) if m and m.group(1)
-                        else "")
+    if nl_target:
+        arg = nl_target
+    elif m and m.group(1):
+        arg = i18n.normalize_locale(m.group(1))
+    elif zh_cmd_arg:
+        arg = i18n.normalize_locale(zh_cmd_arg)
+    else:
+        arg = ""
     if not arg:
         cur, source = locale_resolver.resolve(
             user_id=user_id, platform=PLATFORM, text=raw_text)
@@ -139,9 +168,25 @@ def _maybe_handle_model_command(*, handler: "ChatBotHandler",
                                  is_dm: bool, raw_text: str,
                                  locale: str) -> bool:
     m = _MODEL_CMD_RE.match(raw_text or "")
+    zh_cmd_arg: str = ""
     if not m:
-        return False
-    arg = (m.group(1) or "").strip().lower()
+        _route = nl_router.parse_command(raw_text or "")
+        if _route.kind == "model":
+            zh_cmd_arg = _route.model_arg
+    if not m and not zh_cmd_arg:
+        # NL "换个模型" / "switch model" — surface the list and let the user
+        # pick (no specific alias nameable in NL). 0 token, pre-Bedrock.
+        if not nl_router.parse_model_switch_intent(raw_text or ""):
+            return False
+        rows = "\n".join(
+            i18n.t("model.list_row", locale, alias=e.alias, label=e.label)
+            for e in model_catalog.all_entries()
+        )
+        text = (i18n.t("model.switch_nl_hint", locale) + "\n" + rows
+                + "\n\n" + i18n.t("model.usage", locale))
+        handler.reply_text(text, msg)
+        return True
+    arg = ((m.group(1) if m else zh_cmd_arg) or "").strip().lower()
 
     if not arg:
         alias, source = llm_pref_resolver.resolve(
@@ -269,11 +314,55 @@ class ChatBotHandler(dingtalk_stream.ChatbotHandler):
                 locale=locale):
             return dingtalk_stream.AckMessage.STATUS_OK, "ok"
 
+        # `/help` / `/帮助` / `怎么用` — command menu (deterministic, 0 token).
+        if nl_router.parse_command(raw_text).kind == "help":
+            self.reply_text(_help_text(locale), msg)
+            return dingtalk_stream.AckMessage.STATUS_OK, "ok"
+
         # Layer 1: blatant change request → canned refusal at zero LLM
         # cost. Same gate feishu/slack run.
         if _looks_strongly_change(raw_text):
             self.reply_text(i18n.t("refusal.change_request", locale), msg)
             return dingtalk_stream.AckMessage.STATUS_OK, "ok"
+
+        # ── Deterministic 0-token routing (core.nl_router) ──────────────
+        # Explicit / clearly-worded case requests route straight to the case
+        # flow with NO Bedrock classify. Explicit investigate commands force
+        # the investigate route. The strong-change gate above already refused
+        # mutations, so no extra guard is needed here. Mirror of feishu/slack.
+        _route = nl_router.classify(raw_text)
+        _force_investigate = False
+        if _route.kind == "case":
+            cc, cid = _route.case_command, _route.case_id
+            logger.info("nl_router: case route command=%s id=%s form=%s (0 token)",
+                        cc, cid, _route.form)
+            if cc == "case_view":
+                case_flow.handle_view(handler=self, msg=msg, display_id=cid,
+                                      locale=locale)
+            elif cc == "case_reply":
+                case_flow.handle_reply(handler=self, msg=msg, display_id=cid,
+                                       body=raw_text, locale=locale)
+            elif cc == "case_resolve":
+                case_flow.handle_resolve(handler=self, msg=msg, display_id=cid,
+                                         locale=locale)
+            elif cc == "case_analyze":
+                case_flow.handle_analyze(handler=self, msg=msg, display_id=cid,
+                                         locale=locale)
+            elif cc == "case_create":
+                case_flow.start_create(handler=self, msg=msg,
+                                       conversation_id=conversation_id,
+                                       user_id=user_id, raw_text=raw_text,
+                                       intent_summary="", locale=locale)
+            else:  # case_list + any unmapped canonical
+                case_flow.handle_list(handler=self, msg=msg,
+                                      status_filter="recent", locale=locale)
+            return dingtalk_stream.AckMessage.STATUS_OK, "ok"
+        if _route.kind == "investigate" and _route.form == "command":
+            _inv = _route.arg.strip()
+            if _inv:
+                raw_text = _inv   # strip the `/调查` prefix
+            _force_investigate = True
+            logger.info("nl_router: investigate command route (forced)")
 
         # LLM intent classification.
         try:
@@ -285,6 +374,9 @@ class ChatBotHandler(dingtalk_stream.ChatbotHandler):
                         "suggestions": [], "is_change_request": False}
 
         cmd = (analysis.get("command") or "investigate").strip()
+        # Explicit `/调查 …` command overrides the classifier.
+        if _force_investigate:
+            cmd = "investigate"
 
         # Layer 2: LLM flagged the message as a change request → refuse.
         if analysis.get("is_change_request"):
@@ -408,7 +500,7 @@ class ChatBotHandler(dingtalk_stream.ChatbotHandler):
 
 
 def main() -> None:
-    # Bedrock API Key 注入（spec task 4.5）：注册 bedrock 客户端的构造前钩子并做一次
+    # Bedrock API Key 注入：注册 bedrock 客户端的构造前钩子并做一次
     # 初次收敛。必须在任何 Bedrock 调用之前 —— botocore 在**构造时**快照 token provider，
     # 设晚了会 NoAuthTokenError 硬失败而非回退 IAM。之后每条消息 / 每轮轮询各自 refresh()。
     try:

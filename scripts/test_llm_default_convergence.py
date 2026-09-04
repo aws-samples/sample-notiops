@@ -1,5 +1,5 @@
 """
-IM 默认模型优先级收敛测试（spec task 0.2 / R8.2 验收）。
+IM 默认模型优先级收敛测试（R8.2 验收）。
 
 验收标准：**Admin 在控制台改默认模型后，IM 端实际生效。**
 
@@ -12,7 +12,7 @@ DDB 目录里的 `default_model` 完全不在链上——admin 改了默认，IM
   * source 三值收敛为 chat / dm / default（"env" 已退场；该值会被插进用户可见文案）
   * DDB 不可用时不抛错（llm_config 内部回退内置目录）
   * 别名桥接：DDB 存规范 alias（claude-sonnet-5），IM 侧消费短别名（claude），
-    过渡期由 `_admin_default()` 负责映射（task 4.1 目录 DDB 化后此桥拆除）
+    过渡期由 `_admin_default()` 负责映射（目录 DDB 化后此桥拆除）
 
 不触网：DDB 读取全部 stub。
 

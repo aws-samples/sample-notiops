@@ -53,7 +53,18 @@
 - ❌ **Bypass IAM**: the resources you can investigate = the resources the AWS DevOps Agent role can read. The bot will not escalate on your behalf
 - ❌ **Store sensitive data beyond 7 days**: chat history is auto-cleared by DDB TTL after 7 days; locale preferences after 90 days
 
-> Curious why the bot is so "conservative"? See [TECHNICAL_DESIGN.en.md §4.2 three-layer defense](TECHNICAL_DESIGN.en.md#42-general-conversation--three-layer-defense-bedrock_chat).
+> **Who enforces "read-only" (the wording changed on 2026-09-03 — go by the new version)**:
+> on the IM side your question goes **straight to AWS DevOps Agent** with no LLM on the NotiOps
+> side (that's why it costs 0 token), so **refusing mutations is enforced by DevOps Agent plus
+> the read-only IAM role it assumes** — not by NotiOps spending an LLM call to guess whether you
+> meant to change something. NotiOps keeps exactly one **regex second gate**
+> (`platforms/common/router.py`) for obvious mutation wording and prompt injection.
+> The net effect is unchanged: **mutation requests still never reach execution.**
+> Details in [TECHNICAL_DESIGN.en.md §5 Security design](TECHNICAL_DESIGN.en.md#5-security-design);
+> §4.2's "three-layer defense" describes `core/bedrock_chat.py`, which runs only on the
+> rollback path (the resident ECS apps retired with `BotStack`) — **neither the web console
+> nor the IM entry point runs it**; see §5.3 of that same document for the defenses that
+> actually apply to each entry point.
 
 ---
 
@@ -530,7 +541,9 @@ Why so complicated? Because:
 
 ### Q1: Can I have the bot restart an EC2 for me?
 
-**No**. The bot is read-only — a product-level hard rule that cannot be bypassed. See [TECHNICAL_DESIGN.en.md §5 Security design](TECHNICAL_DESIGN.en.md#5-security-design).
+**No**. The bot is read-only — a product-level hard rule that cannot be bypassed, enforced by
+AWS DevOps Agent plus the read-only IAM role it assumes, with a regex second gate on the
+NotiOps side. See [TECHNICAL_DESIGN.en.md §5 Security design](TECHNICAL_DESIGN.en.md#5-security-design).
 
 Workaround: **ask the bot how to restart it** (tutorial-style), and it will teach you the CLI commands. You review them, then run them yourself.
 
@@ -597,7 +610,7 @@ What works on Feishu / Slack is being delivered to DingTalk **in stages**. This 
 | Model switching (`@bot model claude/nova/gpt`) | ✅ |
 | Language switching (`language zh/en` / natural language) | ✅ |
 | Investigation report markdown writeback | ✅ (operator must add a custom robot to the target group; see [DEPLOYMENT.en.md §3.3](DEPLOYMENT.en.md) step 6) |
-| Zero-change promise (any mutation request is refused) | ✅ |
+| Zero-change promise (any mutation request is refused; enforced by DevOps Agent + the read-only role, with a NotiOps-side regex second gate) | ✅ |
 
 ### 9.5.2 Not yet available (Phase 2 roadmap)
 
@@ -694,7 +707,7 @@ Just @ the bot in the channel: `@bot I wish you could...`. The bot won't "unders
 
 In addition to the bot in Feishu / Slack, NotiOps also ships a **browser-based agentic AI assistant — Web Chat**. You open it in a browser, sign in, and use natural language to view alarm notifications, run failure investigations, ask cost questions, create Support cases, and invoke your own Skills. This section covers **how to operate it and what you'll see**.
 
-> Web Chat and the IM bot are two parallel entry points that share the same read-only backend safeguards (strictly read-only; the backend's three-layer defense carries over). It doesn't replace the IM bot — it's a web workbench better suited to "sitting down to focus on an investigation or filing a case."
+> Web Chat and the IM bot are two parallel entry points that are **both strictly read-only**, but each of them enforces that **on its own**: Web Chat relies on a read-only IAM role (the hard boundary) + tool-level read-only enforcement + a command-level denylist + a read-only system prompt; the IM side relies on the read-only agent on the DevOps Agent side plus the read-only role it assumes, with a mutation-wording regex as a second gate on the NotiOps side (see "Who enforces 'read-only'" above). It doesn't replace the IM bot — it's a web workbench better suited to "sitting down to focus on an investigation or filing a case."
 
 ### 12.1 Sign-in and overall layout
 
@@ -808,7 +821,7 @@ Web Chat offers **two case-filing paths; you pick one**. Both run **deterministi
 - **What's New**: view the latest AWS announcements.
 - **"/" commands**: type `/` in the input box to pop up a command menu listing **every Skill you have** (the header shows the total count and the list scrolls — nothing is sampled or truncated); keep typing to filter by id / name; **↑ / ↓** moves the highlight, **Enter** picks, **Esc** closes. "Manage Skills" and "New Skill" stay pinned at the bottom. Picking one prefills the composer with `Use the "xxx" skill`, so you can just press Enter.
 - **Sources panel**: passes through tool calls and sources so you can verify what the assistant based its answer on.
-- **Read-only safety**: Web Chat carries over the backend's strict read-only constraints (three-layer defense) and will not modify your AWS environment.
+- **Read-only safety**: Web Chat is strictly read-only — a read-only IAM role (the hard boundary) + tool-level read-only enforcement + a command-level denylist (it even blocks actions that are technically reads but shouldn't be, such as `get-secret-value`) + a read-only system prompt; creating / replying to / closing a case only produces a preview, executed after you confirm. It will not modify your AWS environment.
 
 ### 12.9 Things to know (please read)
 

@@ -86,7 +86,7 @@ export function adminSwallowingWildcards(permissions) {
       && matchesAny([p], "nav:admin"));
 }
 
-/** 建/改角色。role:admin 恒为 * 不可改（需求 4.5）；key 必须存在（需求 4.4）。 */
+/** 建/改角色。role:admin 恒为 * 不可改；key 必须存在。 */
 export async function apiSaveRole(name, permissions) {
   if (!name || !/^[A-Za-z0-9:_-]{2,64}$/.test(name)) {
     return { status: 400, body: { error: "invalid_role_name" } };
@@ -106,7 +106,7 @@ export async function apiSaveRole(name, permissions) {
   return { status: 200, body: { name, permissions: perms } };
 }
 
-/** 删角色。role:admin 不可删；被引用则 409（需求 4.5）。 */
+/** 删角色。role:admin 不可删；被引用则 409。 */
 export async function apiDeleteRole(name) {
   if (name === ADMIN_ROLE) return { status: 400, body: { error: "cannot_delete_admin_role" } };
   const inUse = await countUsersWithRole(name);
@@ -198,7 +198,7 @@ export async function apiDeleteUser(username, sub, currentUsername) {
 }
 
 /**
- * 写用户 roles/denies。末位 admin 保护（需求 5.4）：
+ * 写用户 roles/denies。末位 admin 保护：
  * 若此次变更会导致系统中 role:admin 持有者归零 → 409。
  * @param currentSub 发起操作者的 sub（阻止自我降权为最后 admin）
  */

@@ -282,6 +282,34 @@ _STATUS_EMOJI = {"COMPLETED": "✅", "FAILED": "❌",
                  "TIMED_OUT": "⏰", "CANCELLED": "🚫"}
 
 
+def _summary_blocks(summary_md: str, locale: str, *,
+                    header_text: str = "") -> list[dict]:
+    """GFM markdown → Slack blocks, with both hard caps applied.
+
+    Extracted from `send_report` so the inspection broadcast layer
+    (`send_markdown`) renders through the exact same path — two copies of
+    the 8000-char / 48-block caps would drift, and the drift only shows up
+    on a long report as `invalid_blocks` (Slack rejects the WHOLE message,
+    so the symptom is "that channel got nothing" with no partial output).
+    """
+    header = header_text or i18n.t("report.summary_header", locale)
+    text = (summary_md or "(no summary)").strip()
+    if len(text) > 8000:
+        text = text[:8000] + "\n\n" + i18n.t("report.summary_truncated", locale)
+    try:
+        from shared.report_delivery.slack_mrkdwn import to_blocks as _to_blocks
+        blocks = _to_blocks(text, header_text=header)
+    except Exception as e:
+        logger.warning("slack_mrkdwn rendering failed; falling back to plain: %s",
+                       _safe_err(e))
+        blocks = [_header(header), _section(text)]
+    # Slack caps per-message blocks at 50; truncate aggressively if needed.
+    if len(blocks) > 48:
+        blocks = blocks[:47] + [
+            _section("_" + i18n.t("report.summary_truncated", locale) + "_")]
+    return blocks
+
+
 def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
                 detail_type: str, task_id: str, report_url: str, trace_url: str,
                 summary_md: str, incident_id: str = "",
@@ -296,22 +324,9 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
     # 1. Summary message — convert the agent's GFM markdown to a list of
     # Slack blocks (real headers / table rows / code blocks) so it
     # renders properly instead of dumping raw markdown text.
-    summary_text = (summary_md or "(no summary)").strip()
     summary_header = i18n.t("report.summary_header", locale)
-    if len(summary_text) > 8000:
-        summary_text = summary_text[:8000] + "\n\n" \
-            + i18n.t("report.summary_truncated", locale)
-    try:
-        from shared.report_delivery.slack_mrkdwn import to_blocks as _to_blocks
-        summary_blocks = _to_blocks(summary_text,
-                                    header_text=summary_header)
-    except Exception as e:
-        logger.warning("slack_mrkdwn rendering failed; falling back to plain: %s", _safe_err(e))
-        summary_blocks = [_header(summary_header), _section(summary_text)]
-    # Slack caps per-message blocks at 50; truncate aggressively if needed.
-    if len(summary_blocks) > 48:
-        summary_blocks = summary_blocks[:47] + [
-            _section("_" + i18n.t("report.summary_truncated", locale) + "_")]
+    summary_blocks = _summary_blocks(summary_md, locale,
+                                     header_text=summary_header)
     _post("/chat.postMessage", {
         "channel": chat_id,
         "thread_ts": root_message_id or None,
@@ -400,6 +415,28 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
         "text": f"{emoji} NotiOps Report ({status})",
         "blocks": blocks_out,
     })
+
+
+def send_markdown(chat_id: str, markdown: str, *, locale: str = "en") -> bool:
+    """Post a standalone markdown body into a channel. True on success.
+
+    Added for the inspection broadcast layer . `send_report` is
+    not reusable there: it posts a second "header card" with status /
+    priority / task_id / report buttons that a cron digest has no values
+    for, and it returns None so a fan-out can't tell which channels failed.
+
+    `thread_ts` is omitted on purpose — a cron broadcast has no thread root.
+    """
+    if not is_configured():
+        logger.warning("Slack not configured — skipping send_markdown")
+        return False
+    header = i18n.t("report.summary_header", locale)
+    data = _post("/chat.postMessage", {
+        "channel": chat_id,
+        "text": header,
+        "blocks": _summary_blocks(markdown, locale, header_text=header),
+    })
+    return bool(data.get("ok"))
 
 
 # ---------------------------------------------------------------------------

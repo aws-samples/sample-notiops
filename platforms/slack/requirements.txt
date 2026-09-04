@@ -1,3 +1,12 @@
+# ⚠️ slack-bolt 只被 Fargate 路径（platforms/slack/app/main.py）用。IM 重构后的
+# Lambda 路径**不装 bolt**（见 scripts/build_im_layer.sh 里 SLACK_SDK_VERSION 处的说明：
+# bolt 在 import 期就会构造 App(token=...) 并进入 while True: sleep，在 Lambda 上必然超时）。
 slack-bolt>=1.20
 slack-sdk>=3.27
-boto3>=1.34
+# boto3/botocore 钉 1.43.65 —— 与 lambda_layer/（setup.sh）、lambda_layer_im/
+# （scripts/build_im_layer.sh）三处必须同版本。原先是个下限约束（>=1.34）：能装上，
+# 但旧 botocore 里没有 botocore/data/devops-agent/ 服务模型，core/devops_agent.py
+# 那句 boto3.client("devops-agent") 会在**运行时**抛 UnknownServiceError —— 构建全绿，
+# 上线才炸。见「依赖必钉版本」。
+boto3==1.43.65
+botocore==1.43.65

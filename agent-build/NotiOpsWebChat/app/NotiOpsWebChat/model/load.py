@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 
+from botocore.config import Config as BotocoreConfig
 from strands.models.bedrock import BedrockModel
 
 from core import llm_config
@@ -38,6 +39,33 @@ except ImportError:  # pragma: no cover — 老版本 strands
 # 又多一个会和目录漂移的真源。main 在其上新增的提示缓存 TTL 逻辑则完整保留（见下）。
 
 logger = logging.getLogger(__name__)
+
+
+# ── Bedrock 客户端超时 ───────────────────────────────────────────────────────
+# 背景（客户实测，2026-09-01）：Grok / GLM 这类**先想很久再吐第一个 token** 的模型，
+# 在复杂问题上会直接撞客户端读超时，表现是「⚠️ 模型调用失败（ReadTimeoutError）」。
+#
+# 关键事实：**Bedrock 服务端没有客户可配的推理超时**，这条线的超时全部在客户端（botocore）。
+# AWS 自己的建议也是调 `read_timeout`（Nova 用户指南的 Timeout configuration 一节直接给
+# `read_timeout=3600` 的示例）。而我们此前**一个字都没配**，于是吃的是 Strands 的默认值
+# `DEFAULT_READ_TIMEOUT = 120`（strands/models/bedrock.py）—— 只要模型 120 秒内没吐出
+# 下一个 chunk 就断。120s 对 Sonnet 够，对 Grok 的长推理不够。
+#
+# 为什么是 300s：整条链路上比它更紧的两道闸是 BFF Lambda 的 15 分钟（web-chat-core.ts）
+# 与 AgentCore Runtime 的流式 60 分钟上限，300s 离它们都很远；同时一轮里可能有多个 cycle
+# （工具调用），单 cycle 再放宽就有「一轮打不完 15 分钟」的风险。
+#
+# ⚠️ `max_attempts` 必须**同时**收紧，这是这段配置里最容易踩的地方：botocore 默认是
+# legacy 模式 5 次尝试，300 × 5 = 1500s > Lambda 的 15 分钟 → 客户端还在重试、Lambda
+# 先被杀，前端看到的又是「（无响应）」那种最糟的失败形态。2 次尝试的最坏值 600s 才安全。
+# 注：流**中途**的 read timeout 本来就不会被重试（重试只包 HTTP 响应头那一段，事件流是
+# 调用方惰性消费的），所以收紧重试次数并不会削弱正常的抗抖动能力。
+BEDROCK_READ_TIMEOUT_SEC = 300
+_BOTO_CLIENT_CONFIG = BotocoreConfig(
+    read_timeout=BEDROCK_READ_TIMEOUT_SEC,
+    connect_timeout=10,          # 建连本身要么快要么就是网络坏了，没有等 60s 的道理
+    retries={"max_attempts": 2, "mode": "standard"},
+)
 
 
 def resolve_model_id(model_key: str | None = None) -> str:
@@ -86,6 +114,10 @@ def _make_mantle_responses_model(spec: llm_config.ResolvedModel):
             api_key = llm_config.get_bedrock_api_key()
             if api_key:
                 args["api_key"] = api_key
+            # 超时与 Bedrock 那条路取同一个数（见上面 `BEDROCK_READ_TIMEOUT_SEC`）。
+            # openai-python 的默认是 600s，比 BFF Lambda 的 15 分钟只差 5 分钟 —— GPT 那轮
+            # 一旦真的卡住，Lambda 会先被杀，前端拿到的是「（无响应）」而不是我们的友好提示。
+            args["timeout"] = float(BEDROCK_READ_TIMEOUT_SEC)
             return args
 
     return _MantleResponsesModel(
@@ -165,7 +197,14 @@ def _bedrock_kwargs(spec: llm_config.ResolvedModel) -> dict:
     ⚠️ 混用 TTL 时长的约束（AWS 文档）：长 TTL 的 checkpoint 必须在短 TTL 之前。这里两个
     checkpoint 用**同一个** ttl，天然满足。
     """
-    kwargs: dict = {"model_id": spec.model_id, "max_tokens": spec.max_output_tokens}
+    kwargs: dict = {
+        "model_id": spec.model_id,
+        "max_tokens": spec.max_output_tokens,
+        # 传了这个，Strands 就**不会**再套它自己的 120s 默认（它只在
+        # `boto_client_config is None` 时兜底，见 strands/models/bedrock.py 的
+        # `client_config = ...` 分支）。它仍会把 `strands-agents` merge 进 user_agent。
+        "boto_client_config": _BOTO_CLIENT_CONFIG,
+    }
     if spec.supports_prompt_cache:
         _ttl = _cache_ttl_for(spec.model_id)
         if _HAS_CACHE_CONFIG:

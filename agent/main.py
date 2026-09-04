@@ -69,7 +69,7 @@ _TOPIC_FOCUS = {
 app = BedrockAgentCoreApp()
 
 # 模型可由 BFF 通过 payload.model 覆盖；默认跟随 config/llm-model-catalog.json 的
-# default_model（现为 Claude Sonnet 5）。
+# default_model（2026-09-01 起为 Grok 4.6）。
 #
 # ⚠️ 这份 alias→model_id 映射是**离线镜像**，不是运行时权威。部署的 agent
 # （agent-build/NotiOpsWebChat/app/NotiOpsWebChat/model/load.py）从 DDB 的模型目录
@@ -77,12 +77,12 @@ app = BedrockAgentCoreApp()
 # （见该文件顶部注释）。所以这里只需与 config/llm-model-catalog.json 的 seed 值同值，
 # 加新模型时**先改目录**，这张表只是让本目录能独立跑起来。
 _DEFAULT_MODEL = os.environ.get(
-    "NOTIOPS_DEFAULT_MODEL", "global.anthropic.claude-sonnet-5"
+    "NOTIOPS_DEFAULT_MODEL", "global.xai.grok-4.6"
 )
 
 _MODEL_MAP = {
-    "xai-grok-4-6": "global.xai.grok-4.6",
-    "claude-sonnet-5": "global.anthropic.claude-sonnet-5",  # 目录 default_model
+    "xai-grok-4-6": "global.xai.grok-4.6",  # 目录 default_model
+    "claude-sonnet-5": "global.anthropic.claude-sonnet-5",
     "claude-opus-5": "global.anthropic.claude-opus-5",
     "claude-haiku-4-5": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
     "claude-sonnet-4-6": "global.anthropic.claude-sonnet-4-6",  # 目录里已 disabled，留给老会话

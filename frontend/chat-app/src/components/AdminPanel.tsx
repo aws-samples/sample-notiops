@@ -1,21 +1,27 @@
 /**
  * Admin 管理面板：角色 / 用户 / 组映射 / 模块 四视图。
  * 权限树从后端全量能力清单（GET /admin/capabilities）动态生成——新增 dashboard
- * 只需在 config/capabilities.json 加节点，此处自动出现（需求 4.6）。
+ * 只需在 config/capabilities.json 加节点，此处自动出现。
  *
  * 视觉：统一使用全站设计 token（--card/--line/--text/--muted/--orange/--blue/--green/--page），
  * 与 FinOps 等 tab 一致（此前用未定义的 --border/--danger/--ok/--accent → 吃死色 hex、不跟随主题）。
  */
-import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { useT, useLocale } from "../i18n";
 import { loadConfig } from "../config";
+import FeishuGuideDrawer from "./FeishuGuideDrawer";
 import {
   fetchAllCapabilities, fetchRoles, saveRole, deleteRole,
   fetchUsers, putUser, createUser, deleteUser, fetchModules, putModules,
   fetchGroups, putGroupMap, createGroup, deleteGroup, fetchGroupMembers, addUserToGroup, removeUserFromGroup,
   fetchEol, putEol,
-  fetchMemberAccounts, onboardMemberAccount, memberOnboardStatus, setMemberAccountEnabled, offboardMemberAccount,
+  fetchMemberAccounts, onboardMemberAccount, memberOnboardStatus, setMemberAccountEnabled,
+  setMemberAccountRegions, setMemberAccountAlias, offboardMemberAccount,
   associateDevopsAgent, devopsAgentAssocStatus,
+  fetchInspectionCrossAccount, verifyInspectionCollectionRole,
+  associateInspectionSource,
+  generateInspectionCollectionStack,
+  type InspectionCrossAccountStatus,
   fetchAccountAccess, putAccountAccess, deleteAccountAccess,
   fetchNotificationConfig, putNotificationConfig, testNotificationSend,
   generateLaunchStack, saveManualPayload, testDaConnection,
@@ -136,37 +142,158 @@ export default function AdminPanel() {
 /* ───────────────── 通知（飞书机器人配置）─────────────────
  * 自 web-chat 原生实现（存 Secrets Manager notiops/im-bot-feishu），与老管理前端
  * (frontend-app /settings/notifications) 完全解耦 —— 老页面 sunset 时此板块不受影响。
- * 敏感字段(app_secret)后端脱敏为 ****后4位；保存时回传脱敏值 = 不修改。 */
+ * 敏感字段(app_secret / encrypt_key / verification_token)后端脱敏为 ****后4位；
+ * 保存时回传脱敏值 = 不修改（bff/web-chat/feishu_config.mjs 的 mergeIfMasked）。
+ *
+ * Encrypt Key / Verification Token 为什么必须在这里能填:webhook 模式下它们是**唯一**
+ * 鉴权手段，IM 入口冷启动硬校验、缺一即起不来。以前只能让客户
+ * `aws secretsmanager put-secret-value` 手改 JSON —— 只有浏览器的客户走不通那条路，
+ * 「一键集成 IM」就断在这一步。四个凭证齐了，客户不碰 CLI 也能配完。
+ * ⚠️ 这两个值和 app_secret 一样:不打日志、连长度都不打（docs/LOGGING_STANDARD.md）。 */
+type SecretKey = "app_secret" | "encrypt_key" | "verification_token";
+
+/**
+ * 飞书三个密钥框。三件事都不是样式问题：
+ *
+ * ① **没动过时 `type="text"`** —— 值是服务端给的脱敏串 `****后4位`，用 `password`
+ *    会把后 4 位也画成圆点，旁边那句「仅显示后 4 位」就成了空话，客户也无从确认
+ *    自己配的是哪一把。一旦用户开始输入立刻切 `password`（真明文不能明着摆在屏幕上，
+ *    这一页经常是在共享屏幕里打开的）。
+ * ② **autofill 谢绝**：`autoComplete="new-password"` + 各家密码管理器的忽略属性。
+ *    自动填充进来的值不以 `****` 开头，后端会当成"改了新值"直接覆盖 Secrets Manager。
+ * ③ **静默填充兜底**：`NotificationsView` 的 `touched` —— 没动过的框回传服务端原值，
+ *    所以"不触发 input 事件"那种填充（直接改 DOM value）填了也改不了。这一层不依赖
+ *    浏览器是否尊重 ②。**诚实的边界**：会正常派发 input 事件的密码管理器仍会把框标成
+ *    touched，那种情况靠 ② 拦、靠 ① 让用户看得见值变了 —— 不是数学上的消除。
+ */
+function SecretField({ label, k, value, onChange, touched, setTouched, hint, placeholder }: {
+  label: string;
+  k: SecretKey;
+  value: string;
+  onChange: (v: string) => void;
+  touched: Record<SecretKey, boolean>;
+  setTouched: React.Dispatch<React.SetStateAction<Record<SecretKey, boolean>>>;
+  hint: string;
+  placeholder: string;
+}) {
+  const isMasked = !touched[k] && value.startsWith("****");
+  return (
+    <div>
+      <FieldLabel>{label}</FieldLabel>
+      <input
+        type={isMasked ? "text" : "password"}
+        // 名字刻意不叫 password / secret：密码管理器按 name/id 猜字段。
+        name={`notiops-feishu-${k}`}
+        autoComplete="new-password"
+        autoCorrect="off"
+        autoCapitalize="off"
+        spellCheck={false}
+        data-1p-ignore
+        data-lpignore="true"
+        data-bwignore
+        // 点进来先整串选中：第一个按键就把 `****WXYZ` 整个替换掉，而不是追加在它后面
+        //（追加出来的 `****WXYZ<新>` 长度 >8，后端会当成真的新值写进 Secret）。
+        // 刻意**不**在 focus 时清空、也不标 touched —— 那样"点错了又点走"就会把钥匙清掉。
+        onFocus={(e) => { if (isMasked) e.currentTarget.select(); }}
+        style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }}
+        value={value}
+        onChange={(e) => { setTouched((p) => ({ ...p, [k]: true })); onChange(e.target.value); }}
+        placeholder={placeholder}
+      />
+      <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>{hint}</div>
+    </div>
+  );
+}
+
 function NotificationsView() {
   const t = useT();
   const [loading, setLoading] = useState(true);
   const [appId, setAppId] = useState("");
   const [appSecret, setAppSecret] = useState("");
+  const [encryptKey, setEncryptKey] = useState("");
+  const [verifyToken, setVerifyToken] = useState("");
   const [chatIds, setChatIds] = useState<string[]>([""]);
+  // IM 入口 webhook 地址（后端只读回带；没装 IM / 查不到 = 空串 → 抽屉退回文字说明）
+  const [webhookUrl, setWebhookUrl] = useState("");
+  /**
+   * 三个密钥框「用户是否真的动过」。这不是体验优化，是**防覆盖**：
+   *
+   * ① 浏览器/密码管理器会往 `type=password` 框里自动填充，填进来的值不以 `****` 开头，
+   *    后端的 `mergeIfMasked`（`bff/web-chat/feishu_config.mjs`）就把它当成"用户改了新值"
+   *    直接写进 Secrets Manager —— 客户只是进这一页改个推送群组，三把钥匙就被静默换掉，
+   *    然后飞书那边开始「校验失败」，而他会去查请求地址。
+   * ② 所以保存时**没动过的框一律回传服务端给的原值**（脱敏串 = 保持不变），
+   *    不看框里现在是什么。autoComplete 之类的提示只是"请浏览器别填"，
+   *    这一条才是"填了也改不了"。
+   *
+   * 顺带解决显示问题：没动过时用 `type=text` 显示脱敏串，后 4 位才真的看得见
+   *（`type=password` 会把 `****WXYZ` 的后 4 位也画成圆点，那句「仅显示后 4 位」就成了空话）；
+   * 一动手输入立刻切回 `password`。
+   */
+  const [touched, setTouched] = useState<Record<"app_secret" | "encrypt_key" | "verification_token", boolean>>({
+    app_secret: false, encrypt_key: false, verification_token: false,
+  });
+  /** 服务端给的脱敏原值，用于「没动过 → 原样回传」。 */
+  const loaded = useRef({ app_secret: "", encrypt_key: "", verification_token: "" });
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState<number | null>(null);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [guide, setGuide] = useState(false);   // 右侧「详细配置步骤」抽屉
 
-  const load = () => {
-    setLoading(true);
+  // ⚠️ `silent` 是给**首次加载**用的：`loading` 的初值已经是 true，
+  //    那时再 `setLoading(true)` 是冗余的同步 setState —— React 19 的
+  //    `react-hooks/set-state-in-effect` 会报错（effect 里同步 setState 会
+  //    多触发一轮级联渲染）。手动重载时仍然要设，否则点了刷新没有反馈。
+  const load = (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setLoading(true);
     fetchNotificationConfig()
       .then((r) => {
         setAppId(r.feishu.app_id || "");
         setAppSecret(r.feishu.app_secret || "");
+        setEncryptKey(r.feishu.encrypt_key || "");
+        setVerifyToken(r.feishu.verification_token || "");
+        setWebhookUrl(r.feishu.webhook_url || "");
+        // 重新拉取（含保存后的那次）都要把"动过"清掉，否则保存一次之后
+        // 这三个框会一直被当成"用户改过的"，下次保存又把脱敏串当新值送上去。
+        loaded.current = {
+          app_secret: r.feishu.app_secret || "",
+          encrypt_key: r.feishu.encrypt_key || "",
+          verification_token: r.feishu.verification_token || "",
+        };
+        setTouched({ app_secret: false, encrypt_key: false, verification_token: false });
         const ids = (r.feishu.notify_chat_ids || "").split(",").map((s) => s.trim()).filter(Boolean);
         setChatIds(ids.length ? ids : [""]);
       })
       .catch((e) => setMsg({ ok: false, text: String(e?.message || e) }))
       .finally(() => setLoading(false));
   };
-  useEffect(load, []);
+  // 🔴 **下面那条 disable 是针对规则误报的，不是偷懒。** 判据：`load`/`reload` 的**同步执行路径上
+  //    已经没有 setState** 了（`silent: true` 跳过了唯一那一处）。剩下的
+  //    `setAccounts` / `setMsg` / `setLoading` 全在 `.then/.catch/.finally`
+  //    回调里 —— promise 回调是微任务，不在 effect 的同步路径上。
+  //
+  //    规则的静态分析追进被调函数体、看到里面有 setState 就报，分不清
+  //    同步与异步边界。
+  //
+  // ⚠️ 不要用「把 setState 包一层骗过规则」的写法绕它 —— 那会让下一个人
+  //    以为这里真有级联渲染问题，然后去改本来正确的代码。
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { load({ silent: true }); }, []);
 
   const save = async () => {
     setSaving(true); setMsg(null);
     try {
+      // 没动过的密钥框回传**服务端给的原值**（脱敏串 = 保持不变），不看框里现在是什么 ——
+      // 浏览器自动填充改不了任何一把钥匙。理由见 `touched` 的注释。
+      const keep = (k: keyof typeof loaded.current, cur: string) =>
+        touched[k] ? cur.trim() : loaded.current[k];
       const r = await putNotificationConfig({
         app_id: appId.trim(),
-        app_secret: appSecret,
+        // trim:这三个值是从飞书控制台**复制**来的，粘贴时带上尾随空格/换行是常事，
+        // 而后果是验签 401 —— 症状「飞书显示校验失败」和"地址填错"长得一模一样。
+        app_secret: keep("app_secret", appSecret),
+        encrypt_key: keep("encrypt_key", encryptKey),
+        verification_token: keep("verification_token", verifyToken),
         notify_chat_ids: chatIds.map((s) => s.trim()).filter(Boolean).join(","),
       });
       setMsg({ ok: true, text: r.message || t("admin.notif.saved") });
@@ -190,7 +317,7 @@ function NotificationsView() {
 
   return (
     <div>
-      <SectionHead title={t("admin.notif.title")} sub={t("admin.notif.sub")} />
+      <SectionHead title={t("admin.notif.title")} />
       {loading ? <div style={{ color: "var(--muted)", fontSize: 13 }}>{t("admin.notif.loading")}</div> : (
         <div style={{ ...box, padding: 18, maxWidth: 640, display: "flex", flexDirection: "column", gap: 14 }}>
           <div>
@@ -198,14 +325,21 @@ function NotificationsView() {
             <input style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} value={appId}
               onChange={(e) => setAppId(e.target.value)} placeholder="cli_xxxx" />
           </div>
-          <div>
-            <FieldLabel>App Secret</FieldLabel>
-            <input type="password" style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} value={appSecret}
-              onChange={(e) => setAppSecret(e.target.value)} placeholder={t("admin.notif.secretPh")} />
-            <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>{t("admin.notif.secretHint")}</div>
-          </div>
+          <SecretField label="App Secret" k="app_secret" value={appSecret} onChange={setAppSecret}
+            touched={touched} setTouched={setTouched} hint={t("admin.notif.secretHint")}
+            placeholder={t("admin.notif.secretPh")} />
+          {/* Encrypt Key / Verification Token —— webhook 模式的唯一鉴权手段，必填。
+              与 App Secret 同样脱敏回显 + 一动手输入就变圆点，避免在客户共享屏幕时露出。 */}
+          <SecretField label="Encrypt Key" k="encrypt_key" value={encryptKey} onChange={setEncryptKey}
+            touched={touched} setTouched={setTouched} hint={t("admin.notif.encryptHint")}
+            placeholder={t("admin.notif.secretPh")} />
+          <SecretField label="Verification Token" k="verification_token" value={verifyToken} onChange={setVerifyToken}
+            touched={touched} setTouched={setTouched} hint={t("admin.notif.tokenHint")}
+            placeholder={t("admin.notif.secretPh")} />
+          <div className="imx-steps-order">{t("admin.notif.keysRequired")}</div>
           <div>
             <FieldLabel>{t("admin.notif.chatIds")}</FieldLabel>
+            <div style={{ color: "var(--muted)", fontSize: 11.5, margin: "-2px 0 7px" }}>{t("admin.notif.chatIdsHint")}</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {chatIds.map((id, i) => (
                 <div key={i} style={{ display: "flex", gap: 8 }}>
@@ -227,6 +361,23 @@ function NotificationsView() {
           </div>
         </div>
       )}
+
+      {/* 飞书控制台那一半的活:四步速览摆在页面上（客户不必先去翻文档），
+          详细步骤放右侧抽屉 —— 表单不被遮住，能一边看一边填。 */}
+      <div className="imx-steps">
+        <div className="imx-steps-title">{t("admin.notif.steps.title")}</div>
+        <ol>
+          <li>{t("admin.notif.steps.s1")}</li>
+          <li>{t("admin.notif.steps.s2")}</li>
+          <li>{t("admin.notif.steps.s3")}</li>
+          <li>{t("admin.notif.steps.s4")}</li>
+        </ol>
+        <div className="imx-steps-order">{t("admin.notif.steps.order")}</div>
+        <button className="imx-guide-link" onClick={() => setGuide(true)}>
+          {t("admin.notif.guideLink")} <span aria-hidden="true">→</span>
+        </button>
+      </div>
+      <FeishuGuideDrawer open={guide} onClose={() => setGuide(false)} webhookUrl={webhookUrl} />
     </div>
   );
 }
@@ -398,8 +549,12 @@ function ModelsView() {
   const [auditOpen, setAuditOpen] = useState(false);
   const [audit, setAudit] = useState<Awaited<ReturnType<typeof fetchLlmAudit>>["entries"]>([]);
 
-  const load = () => {
-    setLoading(true);
+  // ⚠️ `silent` 是给**首次加载**用的：`loading` 的初值已经是 true，
+  //    那时再 `setLoading(true)` 是冗余的同步 setState —— React 19 的
+  //    `react-hooks/set-state-in-effect` 会报错（effect 里同步 setState 会
+  //    多触发一轮级联渲染）。手动重载时仍然要设，否则点了刷新没有反馈。
+  const load = (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setLoading(true);
     fetchLlmConfig()
       .then((c) => {
         setCfg(c);
@@ -414,7 +569,18 @@ function ModelsView() {
       .finally(() => setLoading(false));
     fetchBackendTasks().then((r) => setTaskRows(r.tasks)).catch(() => { /* 非关键：仅用于同步提示 */ });
   };
-  useEffect(load, []);
+  // 🔴 **下面那条 disable 是针对规则误报的，不是偷懒。** 判据：`load`/`reload` 的**同步执行路径上
+  //    已经没有 setState** 了（`silent: true` 跳过了唯一那一处）。剩下的
+  //    `setAccounts` / `setMsg` / `setLoading` 全在 `.then/.catch/.finally`
+  //    回调里 —— promise 回调是微任务，不在 effect 的同步路径上。
+  //
+  //    规则的静态分析追进被调函数体、看到里面有 setState 就报，分不清
+  //    同步与异步边界。
+  //
+  // ⚠️ 不要用「把 setState 包一层骗过规则」的写法绕它 —— 那会让下一个人
+  //    以为这里真有级联渲染问题，然后去改本来正确的代码。
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { load({ silent: true }); }, []);
 
   const loadCandidates = () => {
     setAdding(true);
@@ -669,7 +835,7 @@ function ModelsView() {
                 // webchat runtime（model/load.py）、IM bot（core/bedrock_credentials.py +
                 // core/openai_responses_client.py）、后端任务（shared/llm_provider.py），
                 // 且对 Converse 与 Mantle(GPT) 两类模型都生效。
-                // 此处原写「IM bot 尚未接线（task 4.5 待做）」+「GPT 系不受 Key 影响（R5.7）」，
+                // 此处原写「IM bot 尚未接线（待做）」+「GPT 系不受 Key 影响（R5.7）」，
                 // 两条都已不成立，别照着它把代码改回去。文案见 admin.models.credApiKeyScope。
                 <div style={{ ...errText, fontSize: 11.5, marginTop: 6 }}>
                   {t("admin.models.credApiKeyScope")}
@@ -1131,7 +1297,7 @@ function RolesView({ caps }: { caps: FullCapabilityNode[] }) {
   const hasExact = (key: string) => perms.has(key);
 
   const toggleExact = (key: string) => {
-    setPerms((prev) => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n; });
+    setPerms((prev) => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
   };
   const toggleWhole = (key: string) => {
     setPerms((prev) => {
@@ -1357,7 +1523,7 @@ function UsersView() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkRole, setBulkRole] = useState("");
   const [bulkMsg, setBulkMsg] = useState("");
-  const toggleSel = (sub: string) => setSelected((prev) => { const n = new Set(prev); n.has(sub) ? n.delete(sub) : n.add(sub); return n; });
+  const toggleSel = (sub: string) => setSelected((prev) => { const n = new Set(prev); if (n.has(sub)) n.delete(sub); else n.add(sub); return n; });
   const selectAllFiltered = () => setSelected(new Set(filtered.map((u) => u.sub)));
   const clearSel = () => setSelected(new Set());
   const bulkApply = async (add: boolean) => {
@@ -1670,11 +1836,41 @@ function ModulesView() {
 
 /* ───────────────── 账户（成员账号接入 + 数据可见性） ───────────────── */
 
-function AccountsView() {
+/**
+ * ⚠️ **只为测试而导出**（2026-08-30）。本文件 2000+ 行、零测试，而账号页上
+ * 有几个「不显示就完全静默」的信号 —— 最典型的是「待更新栈」徽章：
+ *
+ * ```
+ * 不显示它 → 存量账号不知道要重新部署栈
+ *          → 采集照跑（enabled_accounts 读 da# 行，与巡检字段无关）
+ *          → 花 GetMetricData、而判读永远为空
+ *          → 看板上「N 条未做根因分析」与「DA 说这些没问题」长得一样
+ * ```
+ *
+ * 整个 `AdminPanel` 渲染要 mock 十几个 API 并切到对应 tab；导出这一个子组件
+ * 让测试能直接渲染它。**不要**在生产代码里 import 这个名字 ——
+ * `AdminPanel` 内部照旧直接用它。
+ */
+export function AccountsView() {
   const t = useT();
   // ── 接入 ──
   const [accounts, setAccounts] = useState<MemberAccountRec[]>([]);
-  const [orgDisabled, setOrgDisabled] = useState(false);
+  /**
+   * 两个**互相独立**的能力，不能合成一个「org 模式开没开」。
+   *
+   * ```
+   * orgListable      能不能从 Organizations 列出账号
+   *                  partner-resold 客户（手里没有 payer 账号、系统部署在某个
+   *                  linked account 上）读不到 → false，那时只列已登记的
+   * oneClickOnboard  StackSet 一键接入可不可用（要 org 模式 + 管理账号）
+   * ```
+   *
+   * 🔴 原来这两件事挤在一个 `orgDisabled` 里，而它整页 early return，
+   *    于是「列不出账号」被当成「整页不可用」—— 连**手动接入**都被挡掉，
+   *    而那条路径两个能力都不需要。
+   */
+  const [orgListable, setOrgListable] = useState(true);
+  const [oneClick, setOneClick] = useState(true);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(true);
   const [target, setTarget] = useState<MemberAccountRec | null>(null);
@@ -1684,6 +1880,49 @@ function AccountsView() {
   const [consoleUrl, setConsoleUrl] = useState("");
   useEffect(() => { loadConfig().then((c) => setConsoleUrl(c.idleConsoleUrl || "")).catch(() => {}); }, []);
   const [daPolling, setDaPolling] = useState<Record<string, string>>({}); // opId -> accountId
+
+  /**
+   * 重取账号列表。
+   *
+   * 🔴 **必须定义在下面两个轮询 effect 之前**，而且要 `useCallback`。
+   *    原来它定义在两个 effect **之后**，于是 interval 回调里的 `reload()`
+   *    是「在声明前访问」（eslint 直接报 Cannot access variable before it
+   *    is declared）。运行时侥幸不炸 —— effect 在首次渲染**之后**执行，
+   *    那时函数体已经跑完、`reload` 已赋值；interval 回调更晚。
+   *
+   *    但它不在依赖数组里，而每次渲染都是**新函数**：闭包捕获的是首屏那个。
+   *    现在只调 setState（引用稳定）所以看不出问题 —— 哪天它引用了别的
+   *    state，interval 里读到的就是过期值，而这种 bug 极难复现。
+   *
+   * ⚠️ `silent` 同 `load` 那两处：首次加载时 `loading` 初值已是 true，
+   *    effect 里再同步 `setErr("")` 会触发级联渲染（React 19 的规则）。
+   */
+  const reload = useCallback((opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setErr("");
+    return fetchMemberAccounts()
+      .then((r) => {
+        setAccounts(r.items);
+        setOrgListable(r.orgListable);
+        setOneClick(r.oneClickOnboard);
+      })
+      // ⚠️ 不再把 `org_mode_disabled` 特殊处理成「整页不可用」——
+      //    后端已经不抛它了（改成两个标记）。这里只剩真正的错误。
+      .catch((e) => setErr(String((e as Error)?.message || e)))
+      .finally(() => setLoading(false));
+  }, []);
+  // 🔴 **下面那条 disable 是针对规则误报的，不是偷懒。** 判据：`load`/`reload` 的**同步执行路径上
+  //    已经没有 setState** 了（`silent: true` 跳过了唯一那一处）。剩下的
+  //    `setAccounts` / `setMsg` / `setLoading` 全在 `.then/.catch/.finally`
+  //    回调里 —— promise 回调是微任务，不在 effect 的同步路径上。
+  //
+  //    规则的静态分析追进被调函数体、看到里面有 setState 就报，分不清
+  //    同步与异步边界。
+  //
+  // ⚠️ 不要用「把 setState 包一层骗过规则」的写法绕它 —— 那会让下一个人
+  //    以为这里真有级联渲染问题，然后去改本来正确的代码。
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { reload({ silent: true }); }, [reload]);
+
   useEffect(() => {
     const ids = Object.keys(daPolling);
     if (!ids.length) return;
@@ -1699,19 +1938,8 @@ function AccountsView() {
       }
     }, 5000);
     return () => clearInterval(timer);
-  }, [daPolling]);
+  }, [daPolling, reload]);
 
-  const reload = () => {
-    setErr("");
-    return fetchMemberAccounts()
-      .then((items) => { setAccounts(items); setOrgDisabled(false); })
-      .catch((e) => {
-        const m = String((e as Error)?.message || e);
-        if (m === "org_mode_disabled") setOrgDisabled(true); else setErr(m);
-      })
-      .finally(() => setLoading(false));
-  };
-  useEffect(() => { reload(); }, []);
 
   // 轮询进行中的 StackSet operation（5s）
   useEffect(() => {
@@ -1731,7 +1959,74 @@ function AccountsView() {
       }
     }, 5000);
     return () => clearInterval(timer);
-  }, [polling]);
+  }, [polling, reload]);
+
+  /**
+   * 正在内联编辑采集 Region 的那个账号，以及输入框的当前值。
+   *
+   * 🔴 与 `target` / `regionsInput` **分开**：那两个是**接入流程**的状态
+   * （点「接入」会 CreateStackInstances 下发 StackSet，几分钟、会动成员账号里
+   * 的资源）。改一下 region 不该走那条路，也不该共用状态 —— 共用会让
+   * 「点编辑」意外触发一次接入。
+   */
+  const [editRegions, setEditRegions] = useState<
+    { accountId: string; value: string } | null>(null);
+  const [savingRegions, setSavingRegions] = useState(false);
+
+  const submitRegions = async () => {
+    if (!editRegions) return;
+    setSavingRegions(true); setErr("");
+    try {
+      const list = editRegions.value.split(/[,;\s]+/)
+        .map((r) => r.trim()).filter(Boolean);
+      await setMemberAccountRegions(editRegions.accountId, list);
+      setEditRegions(null);
+      await reload();
+    } catch (e) {
+      // ⚠️ 原样显示后端的话。它会明确拒绝打错形状的 region（`us-east1`）并把
+      //    哪几个错了列出来 —— 换成一句「保存失败」等于把那个信息丢掉，
+      //    而打错的 region 在运行时的表现是「那个区一直没被采」，看不出原因。
+      setErr(String((e as Error)?.message || e));
+    } finally { setSavingRegions(false); }
+  };
+
+  /**
+   * 显示名（alias）的内联编辑。与 `editRegions` 同构、**分开的 state**。
+   *
+   * 🔴 共用一个 state 的表现是：点「改名」把 region 输入框的内容当成 alias
+   *    提交（或者反过来），而两个提交都会「成功」—— region 字段能存任意字符串，
+   *    alias 也能。错的值要到第二天巡检没采到那个区才暴露。
+   */
+  const [editAlias, setEditAlias] = useState<
+    { accountId: string; value: string } | null>(null);
+  const [savingAlias, setSavingAlias] = useState(false);
+  /** 保存成功后的一句话反馈（说清 IM 推送标签改了没有）。 */
+  const [aliasMsg, setAliasMsg] = useState("");
+
+  const submitAlias = async () => {
+    if (!editAlias) return;
+    setSavingAlias(true); setErr(""); setAliasMsg("");
+    try {
+      const r = await setMemberAccountAlias(
+        editAlias.accountId, editAlias.value.trim());
+      setEditAlias(null);
+      /**
+       * 🔴 把 `pushLabelUpdated` 说出来。
+       *
+       *    `da#` 行不存在（账号只做了接入、还没做 DevOps Agent 关联）时后端
+       *    **跳过**那一行的写入 —— 也就是 IM 推送里那个账号的标签没有变。
+       *    不说的话「都改好了」与「页面改了但推送还是旧名字」在界面上一样，
+       *    而推送是客户看得最多的那一面。
+       */
+      setAliasMsg(r.pushLabelUpdated
+        ? t("admin.accounts.aliasSaved")
+        : t("admin.accounts.aliasSavedNoPush"));
+      await reload();
+    } catch (e) {
+      // ⚠️ 原样显示后端的话 —— 它会明确说「太长」/「不能是纯数字」以及为什么。
+      setErr(String((e as Error)?.message || e));
+    } finally { setSavingAlias(false); }
+  };
 
   const submitOnboard = async () => {
     if (!target) return;
@@ -1755,6 +2050,36 @@ function AccountsView() {
     else if (a.onboarded && a.enabled) { label = t("admin.accounts.stActive"); color = "var(--green)"; }
     else if (a.onboarded) { label = t("admin.accounts.stRegistered"); color = "var(--muted)"; }
     return <span style={{ fontSize: 11.5, fontWeight: 600, padding: "2px 10px", borderRadius: 100, color, border: `1px solid ${color}` }}>{label}</span>;
+  };
+
+  /**
+   * 接入方式徽章。
+   *
+   * 🔴 存在的理由只有一个：**下线的回收范围按它分岔**。
+   *
+   * ```
+   * 一键接入   DeleteStackInstances → 成员账号里的栈真被删，资源全回收
+   * 手动接入   StackSet 里没有它 → 只清本地登记；成员账号里的 agent space
+   *            + IAM 角色留着，要客户自己去删那个栈（agent space 计费）
+   * ```
+   *
+   * 原来两种账号在列表里长得一模一样，「下线」按钮也一样 —— 而点下去的结果
+   * 完全不同。客户点完手动接入账号的下线，会以为已经清干净了。
+   */
+  const sourceBadge = (a: MemberAccountRec) => {
+    if (!a.onboarded) return null;
+    const manual = a.onboardSource === "manual";
+    const color = manual ? "var(--blue)" : "var(--muted)";
+    return (
+      <span title={manual ? t("admin.accounts.srcManualTip")
+        : t("admin.accounts.srcOneClickTip")}
+        style={{
+          fontSize: 10.5, fontWeight: 600, padding: "1px 8px",
+          borderRadius: 100, color, border: `1px solid ${color}`,
+        }}>
+        {manual ? t("admin.accounts.srcManual") : t("admin.accounts.srcOneClick")}
+      </span>
+    );
   };
 
   // 第二步（DevOps Agent 关联）状态徽标：数据采集(第一步)完成后引导完成深度调查关联
@@ -1837,40 +2162,200 @@ function AccountsView() {
     } catch (e) { setErr(String((e as Error)?.message || e)); }
   };
 
-  if (orgDisabled) {
-    return (
-      <div>
-        <SectionHead title={t("admin.accounts.onboardTitle")} />
-        <div style={{ ...box, padding: 16, fontSize: 13, color: "var(--muted)", lineHeight: 1.7 }}>{t("admin.accounts.orgDisabled")}</div>
-      </div>
-    );
-  }
-
   return (
     <div style={{ display: "grid", gap: 24 }}>
       {err && <div style={errText}>{err}</div>}
+      {/* 🔴 改名的成功反馈**必须显示**，而且要说清 IM 推送标签改了没有。
+          `reload()` 之后列表上那个名字确实变了，但推送标签在 `da#` 行不存在时
+          是**没变**的 —— 两种结果在列表上长得一模一样。 */}
+      {aliasMsg && (
+        <div style={{ fontSize: 12.5, color: "var(--muted)",
+          whiteSpace: "pre-line" }}>{aliasMsg}</div>
+      )}
+
+      {/*
+        两个能力各自提示，**不再整页 early return**。
+        🔴 原来「列不出账号」和「不能一键接入」挤在一个 orgDisabled 里，
+           而它整页 return —— 于是手动接入（两个能力都不需要）也被挡掉。
+      */}
+      {!oneClick && (
+        <div style={{
+          // ⚠️ `whiteSpace: pre-line` —— 文案里用 \n 把两段分开
+          //    （「怎么启用一键接入」/「不想动部署怎么办」）。不加它两段会连成
+          //    一大坨，而那正是客户会跳过不读的形态（step2Hint 同理）。
+          ...box, padding: "12px 14px", fontSize: 12.5,
+          color: "var(--muted)", lineHeight: 1.7, whiteSpace: "pre-line",
+          borderLeft: "3px solid var(--orange)",
+        }}>
+          {t("admin.accounts.noOneClick")}
+        </div>
+      )}
+      {oneClick && !orgListable && (
+        <div style={{
+          // ⚠️ `whiteSpace: pre-line` —— 文案里用 \n 把两段分开
+          //    （「怎么启用一键接入」/「不想动部署怎么办」）。不加它两段会连成
+          //    一大坨，而那正是客户会跳过不读的形态（step2Hint 同理）。
+          ...box, padding: "12px 14px", fontSize: 12.5,
+          color: "var(--muted)", lineHeight: 1.7, whiteSpace: "pre-line",
+          borderLeft: "3px solid var(--orange)",
+        }}>
+          {t("admin.accounts.noOrgList")}
+        </div>
+      )}
 
       {/* 成员账号接入 */}
       <div>
-        <SectionHead title={t("admin.accounts.onboardTitle")} sub={t("admin.accounts.onboardDesc")} />
+        {/* 🔴 判据是 `oneClick`（有没有 StackSet），**不是** `orgListable`
+            （能不能列出组织账号）—— 那句文案讲的是一键接入这个机制。
+            2026-08-26 实测：部署账号恰好是 org 管理账号（能 ListAccounts →
+            orgListable=true）但没开 org 模式部署（MEMBER_ONBOARDING_STACKSET_NAME
+            为空）。于是标题写着「组织内账号一键接入（CloudFormation StackSets）」，
+            而列表里全是手动接入的账号、一键接入压根不可用 —— 客户看到手动接入的
+            外部账号出现在「组织内一键接入」下面，合理地怀疑是不是搞错了。 */}
+        <SectionHead title={t("admin.accounts.onboardTitle")}
+          sub={oneClick ? t("admin.accounts.onboardDesc")
+            : t("admin.accounts.onboardDescRegistered")} />
         <div style={{ ...box, padding: "4px 14px" }}>
           <div style={{ display: "flex", justifyContent: "flex-end", padding: "8px 0" }}>
-            <button onClick={reload} disabled={loading} style={{ fontSize: 12, padding: "4px 12px", borderRadius: 8, border: "1px solid var(--line)", background: "transparent", color: "var(--muted)", cursor: "pointer" }}>{t("admin.accounts.refresh")}</button>
+            <button onClick={() => reload()} disabled={loading} style={{ fontSize: 12, padding: "4px 12px", borderRadius: 8, border: "1px solid var(--line)", background: "transparent", color: "var(--muted)", cursor: "pointer" }}>{t("admin.accounts.refresh")}</button>
           </div>
-          {accounts.length === 0 && !loading && <div style={{ padding: "16px 0", color: "var(--muted)", fontSize: 13 }}>{t("admin.accounts.empty")}</div>}
+          {/* ⚠️ 空态文案按能力分岔：「组织里没有别的账号」与「还没登记过任何
+              账号」是两件完全不同的事，混成一句会让人以为组织是空的。 */}
+          {accounts.length === 0 && !loading && (
+            <div style={{ padding: "16px 0", color: "var(--muted)", fontSize: 13, lineHeight: 1.7 }}>
+              {orgListable ? t("admin.accounts.empty")
+                : t("admin.accounts.emptyRegistered")}
+            </div>
+          )}
           {accounts.map((a, i) => (
-            <div key={a.accountId} style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 0", borderTop: i === 0 ? "none" : "1px solid var(--line)" }}>
-              <div style={{ minWidth: 220 }}>
-                <div style={{ fontWeight: 600, fontSize: 13.5, color: "var(--text)" }}>{a.name || a.accountId}</div>
-                <div style={{ fontSize: 11.5, color: "var(--muted)" }}>{a.accountId}{a.email ? ` · ${a.email}` : ""}</div>
-                <div style={{ marginTop: 3 }}>{daBadge(a)}</div>
-              </div>
-              <div>{statusBadge(a)}</div>
-              <div style={{ fontSize: 11.5, color: "var(--muted)", flex: 1 }}>{(a.regions || []).join(", ")}</div>
-              {a.orgOnboardStatus !== "PROVISIONING" && a.orgOnboardStatus !== "OFFBOARDING" && !(a.onboarded && a.enabled) && (
+            <div key={a.accountId} style={{ borderTop: i === 0 ? "none" : "1px solid var(--line)" }}>
+            {/* 行布局：
+                  第 1 行  名称 ······················ 状态徽章  [操作按钮]
+                  第 2 行  账号号 · 邮箱 · region（一条 muted 行）
+                  第 3 行  DA 关联徽章（它很长，单独占一行）
+
+                🔴 原来是「名称块(minWidth 220) | 状态 | region(flex:1) | 按钮」
+                   四个并排。手动接入的账号 `regions` 是空数组，于是那个
+                   flex:1 的 div 撑出一大片空白，「已接入」孤零零飘在中间，
+                   而两个徽章被挤在 220px 里往下溢成第三行。 */}
+            <div style={{ padding: "11px 0" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ fontWeight: 600, fontSize: 13.5, color: "var(--text)",
+                  flex: 1, minWidth: 0, overflow: "hidden",
+                  textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {a.name || a.accountId}
+                </div>
+                {/* 状态 + 接入方式贴在一起靠右 —— 它们回答同一个问题
+                    「这个账号现在是什么情况」，中间不该被空白隔开 */}
+                <div style={{ display: "flex", gap: 6, alignItems: "center",
+                  flexShrink: 0 }}>
+                  {statusBadge(a)}
+                  {sourceBadge(a)}
+                  {/* 🔴 「组织外」徽章。后端此前只列 ListAccounts 返回的账号
+                      ⇒ 跨 org 接入的账号即使两行都写好、巡检也照常扇出它，
+                      管理页上它**永远不存在** —— 而手动接入流程本身全绿、
+                      页面提示「已保存并激活」。运维看到成功，然后在列表里
+                      找不到它。
+                      ⚠️ 标出来是因为**能做的操作不同**（一键接入/下线走
+                         StackSet，覆盖不到它）—— 不标的话运维会以为列表串了
+                         账号，或者反复去点那个对它无效的按钮。 */}
+                  {/* 「自定义名」徽章。
+                      ⚠️ 存在的理由是**排查跨账号问题时的对账**：行首那个名字
+                         如果是人手起的，它在 AWS 控制台里搜不到 ——
+                         不标的话运维会拿它去 Organizations 里找，找不到。
+                         标了之后第二行的账号号就是唯一可靠的抓手。 */}
+                  {a.aliasManual && (
+                    <span title={t("admin.accounts.aliasManualHint")}
+                      style={{ fontSize: 11, padding: "2px 8px",
+                        borderRadius: 6, border: "1px dashed var(--line)",
+                        color: "var(--muted)", cursor: "help",
+                        whiteSpace: "nowrap" }}>
+                      {t("admin.accounts.aliasManual")}
+                    </span>
+                  )}
+                  {a.outOfOrg && (
+                    <span title={t("admin.accounts.outOfOrgHint")}
+                      style={{ fontSize: 11, fontWeight: 600, padding: "2px 8px",
+                        borderRadius: 6, border: "1px solid var(--line)",
+                        color: "var(--muted)", cursor: "help",
+                        whiteSpace: "nowrap" }}>
+                      {t("admin.accounts.outOfOrg")}
+                    </span>
+                  )}
+                  {/* 🔴 「要重新部署栈」的徽章。这个账号采集照跑、花
+                      GetMetricData，而判读永远为空 —— 而看板上「N 条未做根因
+                      分析」与「DA 说这些没问题」长得一样。管理页是唯一能看出
+                      这件事的地方。
+                      ⚠️ 用 title 带出完整说明：徽章只有四个字，而客户需要知道
+                         「为什么」和「怎么做」。CFN 的 quick-create 链接**只支持
+                         创建**（官方文档确认没有更新栈的形式），所以这里只能给
+                         文字步骤，不能给一键链接。 */}
+                  {a.needsStackUpdate && (
+                    <span title={t("admin.accounts.needsUpdateHint")}
+                      style={{ fontSize: 11, fontWeight: 600, padding: "2px 8px",
+                        borderRadius: 6, border: "1px solid #d13212",
+                        color: "#d13212", background: "rgba(209,50,18,.08)",
+                        cursor: "help", whiteSpace: "nowrap" }}>
+                      {t("admin.accounts.needsUpdate")}
+                    </span>
+                  )}
+                </div>
+              {/* ⚠️ 一键接入要 StackSet —— 不可用时**不渲染**而不是灰着：
+                  灰着等于在界面上摆一个用户无法解决的问题（本文件既有约定）。 */}
+              {/* ⚠️ `!a.outOfOrg`：一键接入走 StackSet（SERVICE_MANAGED +
+                  OU 下发），**覆盖不到组织外账号**。渲染它会让运维点了之后
+                  拿到一个 StackSet 侧的错，而正确做法是走底部的「跨 Payer
+                  接入」重新生成链接。
+                  ⚠️ 不渲染而不是灰着 —— 灰着等于在界面上摆一个用户无法解决
+                     的问题（本文件既有约定）。 */}
+              {oneClick && !a.outOfOrg && a.orgOnboardStatus !== "PROVISIONING" && a.orgOnboardStatus !== "OFFBOARDING" && !(a.onboarded && a.enabled) && (
                 <button onClick={() => { setTarget(a); setRegionsInput(a.regions?.join(",") || "us-east-1"); }}
                   style={{ fontSize: 12.5, fontWeight: 600, padding: "5px 14px", borderRadius: 8, border: "1px solid var(--orange)", background: "rgba(255,153,0,.10)", color: "var(--text)", cursor: "pointer" }}>
                   {a.orgOnboardStatus === "FAILED" ? t("admin.accounts.retryBtn") : t("admin.accounts.onboardBtn")}
+                </button>
+              )}
+              {/* 🔴 采集 Region 的**内联编辑**。此前那个输入框只出现在「接入」
+                  流程里（`setTarget`），也就是说账号一旦上车就**再也改不了**
+                  它的采集范围 —— 而唯一的入口「接入」按钮在 `a.onboarded &&
+                  a.enabled` 之后就不渲染了。
+                  ⚠️ 走独立路由（PUT .../regions），不触发 StackSet 下发。 */}
+              {a.onboarded && (
+                <button onClick={() => setEditRegions(
+                  editRegions?.accountId === a.accountId
+                    ? null
+                    : { accountId: a.accountId, value: a.regions.join(",") })}
+                  style={{ fontSize: 12, padding: "5px 12px", borderRadius: 8,
+                    border: "1px solid var(--line)",
+                    background: editRegions?.accountId === a.accountId
+                      ? "rgba(255,153,0,.10)" : "transparent",
+                    color: "var(--muted)", cursor: "pointer" }}
+                  title={a.regions.join(", ")}>
+                  {t("admin.accounts.regionsEdit")}
+                </button>
+              )}
+              {/* 🔴 显示名（alias）的内联编辑。
+                  这两个字段此前**只在接入那一刻写一次**，来源是
+                  `organizations:DescribeAccount` 的 Account.Name ——
+                  而跨组织接入的账号那个调用拿不到东西（账号不在本组织里），
+                  于是客户在账号选择器和 IM 推送里看到的是**十二位数字**。
+                  ⚠️ 与「改 Region」同构：独立路由、不碰 StackSet。 */}
+              {a.onboarded && (
+                <button onClick={() => { setAliasMsg(""); setEditAlias(
+                  editAlias?.accountId === a.accountId
+                    ? null
+                    // 🔴 **只在 `aliasManual` 时预填**。预填 org 名的表现是：
+                    //    客户点开、什么都不改就保存 → 那个 org 名被标记成
+                    //    manual 落库 → 以后 AWS 上改了账号名这里再也不跟着变，
+                    //    而客户从没输入过任何东西。
+                    : { accountId: a.accountId, value: a.aliasManual ? a.name : "" });
+                }}
+                  style={{ fontSize: 12, padding: "5px 12px", borderRadius: 8,
+                    border: "1px solid var(--line)",
+                    background: editAlias?.accountId === a.accountId
+                      ? "rgba(255,153,0,.10)" : "transparent",
+                    color: "var(--muted)", cursor: "pointer" }}
+                  title={t("admin.accounts.aliasHint")}>
+                  {t("admin.accounts.aliasEdit")}
                 </button>
               )}
               {a.onboarded && a.orgOnboardStatus === "ACTIVE" && (
@@ -1881,11 +2366,24 @@ function AccountsView() {
               )}
               {a.onboarded && a.orgOnboardStatus !== "OFFBOARDING" && a.orgOnboardStatus !== "PROVISIONING" && (
                 <button onClick={async () => {
-                  const typed = window.prompt(`${t("admin.accounts.offboardConfirm")}\n${a.accountId}`);
+                  // 🔴 确认文案按接入方式分岔：手动接入的账号我们**删不掉**
+                  //    成员账号里那个栈（StackSet 里没有它的 instance）。
+                  //    不在确认框里说清楚，客户点完会以为资源都回收了，而
+                  //    agent space 还在那儿计费。
+                  const manual = a.onboardSource === "manual";
+                  const warn = manual ? `\n\n${t("admin.accounts.offboardManualWarn")}` : "";
+                  const typed = window.prompt(
+                    `${t("admin.accounts.offboardConfirm")}${warn}\n${a.accountId}`);
                   if (typed !== a.accountId) return;
                   try {
                     const r = await offboardMemberAccount(a.accountId);
                     if (r.operationId) setPolling((prev) => ({ ...prev, [r.operationId]: a.accountId }));
+                    // 后端确认那个栈没被删 → 把要删的栈名直接给出来，
+                    // 而不是让客户自己去 CloudFormation 里认哪个是我们的。
+                    if (r.stackRetained && r.stackName) {
+                      setErr(`${t("admin.accounts.offboardRetained")} ${r.stackName}`
+                        + (r.stackRegion ? ` (${r.stackRegion})` : ""));
+                    }
                     await reload();
                   } catch (e) { setErr(String((e as Error)?.message || e)); }
                 }}
@@ -1893,8 +2391,110 @@ function AccountsView() {
                   {t("admin.accounts.offboardBtn")}
                 </button>
               )}
+              </div>
+              {/* 第 2 行：号 · 邮箱 · region 合成一条，而不是各占一列 */}
+              <div style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 2 }}>
+                {[a.accountId, a.email, (a.regions || []).join(", ")]
+                  .filter(Boolean).join(" · ")}
+              </div>
+              {/* 采集 Region 的编辑行（点上面那个「改 Region」才展开） */}
+              {editRegions?.accountId === a.accountId && (
+                <div style={{ marginTop: 8, padding: 10, borderRadius: 8,
+                  border: "1px solid var(--line)", background: "var(--bg2, transparent)" }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <input value={editRegions.value}
+                      onChange={(e) => setEditRegions(
+                        { accountId: a.accountId, value: e.target.value })}
+                      onKeyDown={(e) => { if (e.key === "Enter") void submitRegions(); }}
+                      placeholder="us-east-1,us-east-2"
+                      style={{ flex: 1, padding: "6px 10px", borderRadius: 8,
+                        border: "1px solid var(--line)", background: "var(--bg)",
+                        color: "var(--text)", fontSize: 13 }} />
+                    <button onClick={() => void submitRegions()} disabled={savingRegions}
+                      style={{ fontSize: 12.5, fontWeight: 700, padding: "6px 14px",
+                        borderRadius: 8, border: "none", background: "var(--orange)",
+                        color: "#fff", cursor: savingRegions ? "default" : "pointer" }}>
+                      {t("admin.accounts.confirmBtn")}
+                    </button>
+                    <button onClick={() => setEditRegions(null)}
+                      style={{ fontSize: 12.5, padding: "6px 12px", borderRadius: 8,
+                        border: "1px solid var(--line)", background: "transparent",
+                        color: "var(--muted)", cursor: "pointer" }}>
+                      {t("admin.accounts.cancelBtn")}
+                    </button>
+                  </div>
+                  {/* 🔴 这一句必须在。客户在这里填 `us-east-1` 的自然预期是
+                      「只看这个区」，而**资源巡检不读这个字段** —— 它扫账号下
+                      全部已启用 region。不说清楚的话客户第二天在巡检报告里看到
+                      eu-west-1 的 finding，会回来反复改这个框，而改成什么都没用。 */}
+                  <div style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 6,
+                    whiteSpace: "pre-line" }}>
+                    {t("admin.accounts.regionsPrompt")}
+                  </div>
+                </div>
+              )}
+              {/* 显示名的编辑行（点上面那个「改名」才展开） */}
+              {editAlias?.accountId === a.accountId && (
+                <div style={{ marginTop: 8, padding: 10, borderRadius: 8,
+                  border: "1px solid var(--line)", background: "var(--bg2, transparent)" }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <input value={editAlias.value}
+                      onChange={(e) => setEditAlias(
+                        { accountId: a.accountId, value: e.target.value })}
+                      onKeyDown={(e) => { if (e.key === "Enter") void submitAlias(); }}
+                      maxLength={64}
+                      /* ⚠️ 占位符是**当前生效的名字**（org 名或账号号）——
+                         客户要能看出「留空会回退成什么」。写死一句
+                         「输入别名」会让「清空」这个操作的结果完全不可预测。 */
+                      placeholder={a.name || a.accountId}
+                      style={{ flex: 1, padding: "6px 10px", borderRadius: 8,
+                        border: "1px solid var(--line)", background: "var(--bg)",
+                        color: "var(--text)", fontSize: 13 }} />
+                    <button onClick={() => void submitAlias()} disabled={savingAlias}
+                      style={{ fontSize: 12.5, fontWeight: 700, padding: "6px 14px",
+                        borderRadius: 8, border: "none", background: "var(--orange)",
+                        color: "#fff", cursor: savingAlias ? "default" : "pointer" }}>
+                      {t("admin.accounts.confirmBtn")}
+                    </button>
+                    <button onClick={() => setEditAlias(null)}
+                      style={{ fontSize: 12.5, padding: "6px 12px", borderRadius: 8,
+                        border: "1px solid var(--line)", background: "transparent",
+                        color: "var(--muted)", cursor: "pointer" }}>
+                      {t("admin.accounts.cancelBtn")}
+                    </button>
+                  </div>
+                  {/* 🔴 三件事必须写在这里：改了会影响哪些地方、留空等于清空、
+                      以及**已经建好的 agent space 不会跟着改名**。
+                      最后那件不说的话客户改完会去 DevOps Agent 控制台找那个新
+                      名字，找不到，然后以为保存失败了。 */}
+                  <div style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 6,
+                    whiteSpace: "pre-line" }}>
+                    {t("admin.accounts.aliasPrompt")}
+                  </div>
+                </div>
+              )}
+              {/* 第 3 行：DA 徽章（含「立即关联」按钮时更长），单独一行 */}
+              {daBadge(a) && (
+                <div style={{ marginTop: 5 }}>{daBadge(a)}</div>
+              )}
+            </div>
+            {/* 巡检的跨账号前置。
+                ⚠️ 不用判「是不是部署账号」—— `listMemberAccounts()` 已经把
+                部署账号自己排除了（它不属于「成员接入」范畴，见那个函数的注释）。
+                只判 `onboarded`：没接进来的账号谈不上巡检前置。 */}
+            {a.onboarded && (
+              <InspectionCrossAccountSection accountId={a.accountId} />
+            )}
             </div>
           ))}
+          {/* 手动接入并进**同一张卡的底部** —— 它产出的账号就出现在上面那个
+              列表里，两者是一件事的两半。
+              🔴 原来它排在「账号数据可见性」**后面**，隔了一整个区块，于是
+                 「一键接入不可用」的部署上，客户看完列表往下翻先撞到一个
+                 无关的可见性配置，唯一能用的接入入口反而在最下面。 */}
+          <div style={{ borderTop: "1px solid var(--line)", padding: "10px 0 4px" }}>
+            <CrossPayerSection onDone={reload} />
+          </div>
         </div>
         {target && (
           <div style={{ ...box, padding: 16, marginTop: 10 }}>
@@ -1962,7 +2562,6 @@ function AccountsView() {
       </div>
 
       {/* ── 跨 Payer 接入(组织外账号) ── */}
-      <CrossPayerSection onDone={reload} />
     </div>
   );
 }
@@ -1977,6 +2576,10 @@ function CrossPayerSection({ onDone }: { onDone: () => void }) {
   // 回填
   const [spaceId, setSpaceId] = useState("");
   const [roleArn, setRoleArn] = useState("");
+  // 巡检判读用的第二个 space（模板输出 InspectionAgentSpaceId）。
+  // ⚠️ 可选 —— 存量账号部署的旧模板没有这个输出，做成必填会让他们连排障那半
+  //    都回填不了。所以下面「保存」按钮的 disabled 判据**不含**它。
+  const [inspectSpaceId, setInspectSpaceId] = useState("");
   const [saving, setSaving] = useState(false);
   // 测试连接
   const [testing, setTesting] = useState(false);
@@ -1995,7 +2598,14 @@ function CrossPayerSection({ onDone }: { onDone: () => void }) {
   const save = async () => {
     setSaving(true); setMsg(null);
     try {
-      await saveManualPayload(acctId.trim(), { agent_space_id: spaceId.trim(), trigger_role_arn: roleArn.trim() });
+      await saveManualPayload(acctId.trim(), {
+        agent_space_id: spaceId.trim(),
+        trigger_role_arn: roleArn.trim(),
+        // 空串时不传 —— BFF 侧对空值不写那个字段（写进去与没有它在读侧同结果，
+        // 但 DDB 上多一个看起来配过的空字段会让排查误导）。
+        ...(inspectSpaceId.trim()
+          ? { inspect_agent_space_id: inspectSpaceId.trim() } : {}),
+      });
       setMsg({ ok: true, text: t("admin.xpayer.saved") });
       onDone();
     } catch (e) { setMsg({ ok: false, text: String((e as Error)?.message || e) }); }
@@ -2005,7 +2615,22 @@ function CrossPayerSection({ onDone }: { onDone: () => void }) {
   const test = async () => {
     setTesting(true); setMsg(null);
     try {
-      const r = await testDaConnection(acctId.trim());
+      // 🔴 **把输入框里的值当 probe 传下去** —— 「测试」的语义本该是
+      //    「测我填的这些对不对」，而不是「测库里已经存着的那些」。
+      //
+      //    没有它的表现（2026-08-27 实测）：客户按自然顺序操作 ——
+      //    填完两个框 → 点「测试连接」（两个按钮并排）→ 拿到
+      //    「account not configured — fill in Agent Space ID and Trigger
+      //    Role ARN (or click Save first)」，而他**明明刚填了那两个值**。
+      //
+      // ⚠️ 这条修复的后端三环（member_accounts 的 probe 参数、index.mjs 的
+      //    路由透传、api/admin.ts 的签名）都改好了，唯独**这一行没接** ——
+      //    又是「算好了但调用方没取」那个形态。所以 scripts/lint_seams.py
+      //    只覆盖 Python 侧是不够的，前端同样会犯。
+      const probe = (spaceId.trim() && roleArn.trim())
+        ? { agent_space_id: spaceId.trim(), trigger_role_arn: roleArn.trim() }
+        : undefined;
+      const r = await testDaConnection(acctId.trim(), probe);
       if (r.success) setMsg({ ok: true, text: t("admin.xpayer.testOk") });
       else setMsg({ ok: false, text: `${r.step}: ${r.error}` });
     } catch (e) { setMsg({ ok: false, text: String((e as Error)?.message || e) }); }
@@ -2048,14 +2673,523 @@ function CrossPayerSection({ onDone }: { onDone: () => void }) {
                 <FieldLabel>Trigger Role ARN</FieldLabel>
                 <input style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} value={roleArn} onChange={(e) => setRoleArn(e.target.value)} placeholder="arn:aws:iam::123456789012:role/notiops-agent-trigger-..." />
               </div>
+              {/* 🔴 第三个框：巡检判读用的 space（模板输出 InspectionAgentSpaceId）。
+                  不接这个框的后果是**成员账号永远不派巡检判读** —— 那个字段的
+                  读取函数早就存在（accounts.inspect_space_id / inspect_space_ids），
+                  缺的一直是写入面。
+                  ⚠️ 标注「可选」并说清缺它会怎样：存量账号部署的旧模板没有这个
+                     输出，客户在 Outputs 里找不到它时需要知道那不是他填错了。 */}
+              <div>
+                <FieldLabel>{t("admin.xpayer.inspectSpaceLabel")}</FieldLabel>
+                <input style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }}
+                  value={inspectSpaceId}
+                  onChange={(e) => setInspectSpaceId(e.target.value)}
+                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+                <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>
+                  {t("admin.xpayer.inspectSpaceHint")}
+                </div>
+              </div>
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                {/* 🔴 顺序是「测试 → 保存」，不是反的。
+                    客户的自然动作是「填完先验一下，通过了再存」，而原来
+                    「保存」在左、且「测试」只测已保存的记录 —— 按自然顺序
+                    操作必然先撞一次 account not configured。
+                    ⚠️ 测试用的是输入框里的值（见 test() 里的 probe），
+                       所以先测后存现在是**成立**的。 */}
+                <button style={btnGhost}
+                  disabled={testing || !acctId.trim() || !spaceId.trim() || !roleArn.trim()}
+                  onClick={test}>
+                  {testing ? "..." : t("admin.xpayer.testBtn")}
+                </button>
                 <button style={btnPrimary} disabled={saving || !spaceId.trim() || !roleArn.trim()} onClick={save}>
                   {saving ? "..." : t("admin.xpayer.saveBtn")}
                 </button>
-                <button style={btnGhost} disabled={testing || !acctId.trim()} onClick={test}>
-                  {testing ? "..." : t("admin.xpayer.testBtn")}
-                </button>
               </div>
+            </>
+          )}
+          {msg && <div style={msg.ok ? okText : errText}>{msg.text}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ───────────────── 跨账号巡检的前置 ───────────────── */
+
+/**
+ * 让**巡检**能真的采到一个成员账号，需要两件互相独立的东西。
+ *
+ * 这个区块只做两件事：**告诉客户还缺什么**，以及把能自动化的那一步
+ * （采集角色的验证 + 登记）做成一个按钮。两个 CFN 模板都必须由账号所有者
+ * 在自己账号里点，我们代不了。
+ *
+ * ```
+ * ① 采集凭证   account#<id> 的 role_arn
+ *              executor 用它 AssumeRole 进去 describe / 读 CloudWatch
+ *              🔴 **必需** —— 缺了整轮巡检直接失败
+ *
+ * ② 判读深度   把该账号作为 monitor account 关联进**系统账号的巡检 space**
+ *              DA 判读时才能主动查它的 PI / events
+ *              ⚠️ 可选 —— 缺了判读仍出结论（payload 里有 7 天指标），
+ *                 只是少了主动深挖那一半
+ * ```
+ *
+ * 🔴 **巡检共用系统账号的一个 space**，根因调查才是每账号一个。所以 ② 是
+ * 「把成员账号加进那一个 space」，不是「给它建自己的 space」——
+ * 界面上必须写清这一点，否则客户会去成员账号自己的 space 里找。
+ */
+/**
+ * 巡检跨账号前置的一行状态。
+ *
+ * ```
+ * ① 采集角色（必需）   在此账号操作 → <账号号>   ●缺失（巡检会失败）   [验证]
+ * ```
+ *
+ * 🔴 「在哪个账号操作」必须带号码：①在成员账号里做、②在系统账号里做，
+ *    这是跨账号流程最容易搞错的一件事，而客户手里可能有好几个账号。
+ */
+function StepRow({ n, label, where, whereColor, ok, statusText, statusColor, action }: {
+  n: string; label: string; where: string; whereColor: string;
+  ok: boolean; statusText: string; statusColor: string; action: React.ReactNode;
+}) {
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap",
+      border: "1px solid var(--line)", borderRadius: 8, padding: "7px 10px",
+      borderLeft: `3px solid ${ok ? "var(--green)" : statusColor}`,
+    }}>
+      <span style={{ fontWeight: 600 }}>{n} {label}</span>
+      <span style={{
+        fontSize: 10.5, fontWeight: 700, padding: "1px 7px", borderRadius: 100,
+        color: whereColor, border: `1px solid ${whereColor}`, whiteSpace: "nowrap",
+      }}>{where}</span>
+      <span style={{ color: statusColor, flex: 1, minWidth: 90 }}>{statusText}</span>
+      <span style={{ display: "flex", gap: 6, alignItems: "center" }}>{action}</span>
+    </div>
+  );
+}
+
+function InspectionCrossAccountSection({ accountId }: { accountId: string }) {
+  const t = useT();
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState<InspectionCrossAccountStatus | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [stackUrl, setStackUrl] = useState("");
+  const [gen, setGen] = useState(false);
+  const [assoc, setAssoc] = useState(false);
+  /** 长说明的折叠位。默认收起 —— 客户展开这一块要的是「现在能不能采」，
+      而不是两段关于机制的解释。 */
+  const [why, setWhy] = useState(false);
+
+  /**
+   * 🔴 **挂载时就拉状态，不等客户展开。**
+   *
+   * 客户 2026-08-27 原话：「你做成这么小的一行，而且还自动折叠起来了，
+   * 我都没有发现，你不说我都不会去点开看，以为已经完全配置好了」。
+   *
+   * 一个折叠、不显示任何状态的标题栏，对客户的含义是「这里没事」。而实际
+   * 可能是「①采集角色缺失 → 整轮巡检直接失败」。上一版把信息密度压下去的
+   * 时候把**可见性**一起压掉了 —— 而这一块的全部价值就是让人看见缺什么。
+   *
+   * ⚠️ 代价是每个已接入账号一次请求（DDB get + 一次 ListAssociations）。
+   *    可接受：账号数是个位数，而漏报一个「巡检会失败」的代价是客户以为
+   *    配好了、然后每天收不到那个账号的任何结论。
+   */
+  /** 阻塞级问题只自动展开**一次**。用 ref 而不是 state —— 它不参与渲染。 */
+  const autoOpenedRef = useRef(false);
+
+  /**
+   * 落状态 + **阻塞级问题自动展开一次**。挂载探测与手动刷新共用。
+   *
+   * 徽章能让人看见「有问题」，但客户仍要点一下才知道怎么办 —— 而①缺失意味着
+   * 这个账号一条结论都产不出来，那个代价大到不该多一次点击。
+   *
+   * ⚠️ 只展开一次（`autoOpenedRef`）。每次刷新都强制展开会覆盖客户手动折叠的
+   *    动作 —— 那种「关不掉」的界面比藏起来更烦。
+   * ⚠️ 只对①（阻塞）展开，②（降级）不展开：自动展开每一个降级项会让账号
+   *    列表整页铺开。
+   */
+  const applyStatus = useCallback((d: InspectionCrossAccountStatus) => {
+    setData(d);
+    const blocking = Boolean(d?.collection)
+      && (!d.collection.registered || d.collection.mismatch);
+    if (blocking && !autoOpenedRef.current) {
+      autoOpenedRef.current = true;
+      setOpen(true);
+    }
+  }, []);
+
+  const load = useCallback(async (silent = false) => {
+    // ⚠️ `silent` 存在的唯一理由是**能在 useEffect 里调它**。
+    //    `setLoading(true)` 是同步 setState，放进 effect 会被 React 19 的
+    //    `react-hooks/set-state-in-effect` 直接报错。silent 模式跳过它，
+    //    第一次 setState 发生在 await 之后（已经出了同步的 effect 体）。
+    // 🔴 silent 模式下**两个 setState 都要跳过**，不只 setLoading。
+    //
+    //    `setMsg(null)` 原来是无条件的 → 它仍然是同步 setState，放进
+    //    `useEffect` 照样被 `react-hooks/set-state-in-effect` 拦下
+    //    （「Calling setState synchronously within an effect can trigger
+    //      cascading renders」）。
+    //
+    // ⚠️ 这不只是为了过 lint：后台静默刷新去清掉客户刚看到的那条提示
+    //    （比如「已关联进巡检 Agent Space」）本身就是错的 —— 他会以为
+    //    那次操作没生效。silent 的语义就该是「不动任何可见状态，只更新数据」。
+    if (!silent) { setLoading(true); setMsg(null); }
+    try {
+      applyStatus(await fetchInspectionCrossAccount(accountId));
+    } catch (e) {
+      setMsg({ ok: false, text: String((e as Error)?.message || e) });
+    } finally { if (!silent) setLoading(false); }
+  }, [accountId, applyStatus]);
+
+  /**
+   * 🔴 **挂载时就拉状态，不等客户展开。**
+   *
+   * 客户 2026-08-27 原话：「你做成这么小的一行，而且还自动折叠起来了，
+   * 我都没有发现，你不说我都不会去点开看，以为已经完全配置好了」。
+   *
+   * 一个折叠、不显示任何状态的标题栏，对客户的含义是「这里没事」。而实际
+   * 可能是「①采集角色缺失 → 整轮巡检直接失败」。上一版把信息密度压下去的
+   * 时候把**可见性**一起压掉了 —— 而这一块的全部价值就是让人看见缺什么。
+   *
+   * ⚠️ 必须放在 `load` **声明之后** —— 放前面 React Compiler 会报
+   *    「Cannot access variable before it is declared」（那不是风格问题：
+   *    闭包捕获的是初始化前的绑定，`load` 变化时这个 effect 不会更新）。
+   * ⚠️ 用 `silent` 模式：`setLoading(true)` 是同步 setState，放进 effect
+   *    会被 `react-hooks/set-state-in-effect` 拦。
+   */
+  useEffect(() => {
+    // ⚠️ effect **自己做 await**，不调 `load(true)`。
+    //    `load` 里那个 `if (!silent) setLoading(...)` 分支让 linter 静态证不了
+    //    「这次调用不会同步 setState」，于是 `react-hooks/set-state-in-effect`
+    //    照样报。这样写零同步 setState，而且 lint 能验证。
+    //
+    // ⚠️ `dead` 守卫是 `load` 路径**缺的东西**：账号切走或组件卸载之后，
+    //    在途的响应回来会 setState 到一个已经不存在的实例上
+    //    （React 会警告，而且对着新账号显示旧账号的状态）。
+    let dead = false;
+    (async () => {
+      try {
+        const d = await fetchInspectionCrossAccount(accountId);
+        if (!dead) applyStatus(d);
+      } catch {
+        // 🔴 挂载时的后台探测**静默失败**。这一步客户没有主动触发，
+        //    弹一条红字（比如没有 nav:inspection 权限时）会让整页看起来坏了。
+        //    真要看状态时点展开会走 `load()`，那条路径会如实报错。
+      }
+    })();
+    return () => { dead = true; };
+  }, [accountId, applyStatus]);
+
+
+  // 生成采集角色模板的 Launch Stack URL。客户在**目标账号**点开它部署。
+  // ⚠️ 我们不能代部署 —— 那要目标账号的 CFN 写权限，而我们只有只读跨账号角色
+  //    （而且那个角色本身就是这个模板要建的，鸡生蛋）。
+  const genStack = async () => {
+    setGen(true); setMsg(null);
+    try {
+      const r = await generateInspectionCollectionStack(accountId);
+      setStackUrl(r.launchStackUrl);
+    } catch (e) {
+      setMsg({ ok: false, text: String((e as Error)?.message || e) });
+    } finally { setGen(false); }
+  };
+
+  /**
+   * 复制到剪贴板。
+   *
+   * ⚠️ 跨账号操作时**复制才是主要用法** —— Launch Stack URL 要拿到另一个
+   * 浏览器会话（用目标账号登录）里打开，直接点会在当前账号建栈。
+   * space id 同理：要贴进 DevOps Agent 控制台的搜索框。
+   *
+   * ⚠️ `navigator.clipboard` 在非安全上下文里是 undefined（本地 http 调试）。
+   * 失败就提示手动复制，不静默 —— 客户点了没反应会以为按钮坏了。
+   */
+  const copy = async (text: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setMsg({ ok: true, text: `${label} ${t("admin.inspxacct.copied")}` });
+    } catch {
+      setMsg({ ok: false, text: t("admin.inspxacct.copyFailed") });
+    }
+  };
+
+  const verify = async () => {
+    setVerifying(true); setMsg(null);
+    try {
+      const r = await verifyInspectionCollectionRole(accountId);
+      setMsg({ ok: true, text: `${t("admin.inspxacct.verifyOk")}：${r.roleArn}` });
+      // 验证通过说明模板已经部署好了 —— 清掉那个链接，否则它还挂在界面上
+      // 诱导客户再点一次（presign 12h 内都能打开，重复建栈会报 AlreadyExists）。
+      setStackUrl("");
+      await load();
+    } catch (e) {
+      // ⚠️ 原样显示 AWS 的话 —— AccessDenied 与 NoSuchEntity 指向完全不同的动作
+      //    （前者信任策略不对，后者模板还没部署）。翻译成一句「失败」会让客户
+      //    无从下手。
+      setMsg({ ok: false, text: String((e as Error)?.message || e) });
+    } finally { setVerifying(false); }
+  };
+
+  /**
+   * ②：一键把这个账号关联进系统账号的巡检 Agent Space。
+   *
+   * 原来这一步只能让客户进 DevOps Agent 控制台走「添加辅助云来源」向导 ——
+   * 7 步，其中 6 步是手抄一段自定义信任策略去建 IAM 角色。拆开之后：
+   *
+   * ```
+   * 角色（要在成员账号里建 IAM）  → 接入那个 CFN 模板建好，客户看不见
+   * 关联（系统账号的一次 API）    → 这个按钮
+   * ```
+   *
+   * ⚠️ `status` 才是真相，不是「调用成功了」：角色那半没到位时关联照样能建，
+   *    状态是 invalid —— 只报「已关联 ✓」会把这种情况说成好的。
+   */
+  const link = async () => {
+    setAssoc(true); setMsg(null);
+    try {
+      const r = await associateInspectionSource(accountId);
+      const base = r.created ? t("admin.inspxacct.assocOk")
+        : t("admin.inspxacct.assocExists");
+      if (r.status === "invalid") {
+        setMsg({ ok: false, text: t("admin.inspxacct.assocInvalid") });
+      } else if (r.status === "pending-confirmation") {
+        setMsg({ ok: false, text: t("admin.inspxacct.assocPending") });
+      } else {
+        setMsg({ ok: true, text: base });
+      }
+      await load();
+    } catch (e) {
+      setMsg({ ok: false, text: String((e as Error)?.message || e) });
+    } finally { setAssoc(false); }
+  };
+
+  const sp = data?.inspectionSpace;
+  const col = data?.collection;
+  const mon = data?.monitorAssociation;
+  /** 「②真的到位了」= 关联在 + 校验没说 invalid。 */
+  const monOk = mon?.linked === true && mon?.status !== "invalid"
+    && mon?.status !== "pending-confirmation";
+
+  /** ①真的到位了 = 登记过 **且**与模板会建的那个一致（mismatch 会让 assume 永远失败）。 */
+  const colOk = Boolean(col?.registered) && !col?.mismatch;
+
+  /**
+   * 折叠标题上的状态徽章 —— 三档。
+   *
+   * ```
+   * 采集角色缺失/对不上   红   **巡检会失败**（整轮产不出任何结论）  → 自动展开
+   * 判读未关联/invalid    琥珀 采集正常，只是判读少了主动深挖那一半
+   * 全部就绪              绿   不用点开
+   * ```
+   *
+   * ⚠️ 三档而不是两档：①与②的**后果量级不同**。把它们并成一个「未配置完」
+   *    会让客户按同一个优先级处理，而①是阻塞、②是降级。
+   */
+  const headBadge = (() => {
+    if (!data) return null;                 // 还没拉到 / 无权限 → 不猜
+    const [text, color] = !colOk
+      ? [t("admin.inspxacct.headBlocking"), "var(--red)"]
+      : !monOk
+        ? [t("admin.inspxacct.headDegraded"), "var(--amber)"]
+        : [t("admin.inspxacct.headReady"), "var(--green)"];
+    return (
+      <span style={{
+        marginLeft: 8, fontSize: 11, fontWeight: 700, padding: "1px 8px",
+        borderRadius: 100, color, border: `1px solid ${color}`,
+        whiteSpace: "nowrap",
+      }}>{text}</span>
+    );
+  })();
+
+  /**
+   * 🔴 **阻塞级问题自动展开一次。**
+   *
+   * 徽章能让人看见「有问题」，但客户仍然要点一下才知道怎么办 —— 而①缺失
+   * 意味着这个账号一条结论都产不出来，那个代价大到不该多一次点击。
+   *
+   * ⚠️ 只自动展开**一次**（`autoOpened`）。每次 data 刷新都强制展开会把
+   *    客户手动折叠的动作覆盖掉 —— 那种「关不掉」的界面比藏起来更烦。
+   * ⚠️ 只对①（红）自动展开，②（琥珀）不展开：后者是降级不是阻塞，
+   *    自动展开每一个降级项会让账号列表整页铺开。
+   */
+
+
+  return (
+    <div style={{ marginTop: 10, borderTop: "1px solid var(--line)", paddingTop: 8 }}>
+      {/* ⚠️ 在**点击**里触发加载，不用 `useEffect(() => {...}, [open])`。
+          后者会在 effect 内同步 setState（`load()` 第一行就是 setLoading）——
+          React 19 的 `react-hooks/set-state-in-effect` 直接报错，
+          而且那会多一次级联渲染。点开才加载语义上也更对。 */}
+      <button onClick={() => {
+        const next = !open;
+        setOpen(next);
+        // 🔴 **每次展开都重新拉**，不是 `!data` 才拉。
+        //    第②步（把账号加进巡检 space 的 secondary accounts）是在
+        //    **AWS 控制台**里做的 —— 做完回到这个页面，状态灯必须能更新。
+        //    原来只在 `data` 为空时拉，于是第二次展开读的还是旧结果，
+        //    客户会以为「加了没生效」。
+        if (next) void load();
+      }}
+        style={{
+          background: "transparent", border: "none", cursor: "pointer",
+          color: "var(--text)", fontSize: 12.5, fontWeight: 600, padding: 0,
+        }}>
+        {open ? "▾" : "▸"} {t("admin.inspxacct.title")}
+        {/* 🔴 状态必须出现在**折叠状态下也看得见**的地方。
+            没有它，「①缺失（巡检会失败）」与「全部就绪」长得一模一样，
+            而前者意味着这个账号一条结论都产不出来。 */}
+        {headBadge}
+      </button>
+      {open && (
+        <div style={{ marginTop: 8, display: "grid", gap: 8, fontSize: 12.5 }}>
+          {loading && <div style={{ color: "var(--muted)" }}>…</div>}
+
+          {data && (
+            <>
+              {/* ── 两行状态，一眼看完 ──
+                  🔴 原来是两张大卡，每张 4 行说明文字 + 按钮。客户展开看到的是
+                     一屏文字，而他要的答案只有两个字：能采吗、判读全吗。
+                     说明搬进下面那个「这两件事分别是什么」折叠层。 */}
+              {/* 🔴 三态，不是两态。`registered` 只表示**登记过**（BFF 自己的注释
+                  写着「不代表 assume 通得过」），而 `mismatch`（登记的与模板会建
+                  的不一致）是第三个状态 —— 前端注释自己说那「两种都会让 assume
+                  永远失败」。
+
+                  原来颜色与文案只看 `registered` 一个布尔，于是同一张卡上会
+                  出现两个相反的结论：绿框 + 绿字「已完成」，下面一行琥珀字
+                  「登记的与预期不一致 arn:…」。绿灯会让客户停止排查，而每一轮
+                  巡检都在后台 assume 失败。
+
+                  ②那一步把 invalid / pending / null 三态都分开了，①没有。 */}
+              <StepRow
+                n="①"
+                label={t("admin.inspxacct.step1")}
+                where={`${t("admin.inspxacct.inTarget")} ${accountId}`}
+                whereColor="var(--blue)"
+                ok={Boolean(col?.registered) && !col?.mismatch}
+                statusText={!col ? t("admin.inspxacct.unknown")
+                  : col.mismatch ? t("admin.inspxacct.mismatchShort")
+                    : col.registered ? t("admin.inspxacct.done")
+                      : t("admin.inspxacct.missingRequired")}
+                statusColor={!col ? "var(--muted)"
+                  : col.mismatch ? "var(--amber)"
+                    : col.registered ? "var(--green)" : "var(--red)"}
+                action={(
+                  <button style={{ ...btnGhost, fontSize: 11, padding: "2px 9px" }}
+                    disabled={verifying} onClick={() => void verify()}>
+                    {t("admin.inspxacct.verifyBtn")}{verifying ? " …" : ""}
+                  </button>
+                )}
+              />
+              <StepRow
+                n="②"
+                label={t("admin.inspxacct.step2")}
+                where={`${t("admin.inspxacct.inSystem")} ${data?.systemAccountId || "—"}`}
+                whereColor="var(--orange)"
+                ok={monOk}
+                statusText={monOk ? t("admin.inspxacct.done")
+                  : mon?.status === "invalid" ? "invalid"
+                    : mon?.status === "pending-confirmation" ? "pending"
+                      : mon?.linked === false ? t("admin.inspxacct.missingOptional")
+                        /* null = 查不到，**不等于**没关联 */
+                        : t("admin.inspxacct.unknown")}
+                statusColor={monOk ? "var(--green)" : "var(--amber)"}
+                action={(
+                  <>
+                    <button style={{ ...btnGhost, fontSize: 11, padding: "2px 9px" }}
+                      disabled={loading} onClick={() => void load()}>
+                      {t("admin.inspxacct.recheckBtn")}{loading ? " …" : ""}
+                    </button>
+                    {/* ⚠️ 已关联时也不禁用 —— 后端把「已存在」当成功，重复点安全，
+                        而且会顺带 validate 一次把 invalid 翻出来。 */}
+                    <button style={{ ...btnPrimary, fontSize: 11, padding: "3px 11px" }}
+                      title={t("admin.inspxacct.assocTip")}
+                      disabled={assoc || !sp?.id} onClick={() => void link()}>
+                      {t("admin.inspxacct.assocBtn")}{assoc ? " …" : ""}
+                    </button>
+                  </>
+                )}
+              />
+
+              {/* ── ①缺失时的**唯一**下一步 ──
+                  🔴 这里不给「生成部署链接」当主动作。采集角色现在合并进了
+                     接入用的那个模板，所以缺它意味着**那个栈是旧模板部署的**，
+                     正确动作是 update 已有栈 —— 而 Launch Stack URL 是
+                     `#/stacks/create/review`，用它会去建**第二个**栈，然后
+                     撞 AlreadyExists 或者建出一堆重复角色。
+                  ⚠️ 我们拿不到成员账号里那个栈的 stackId（跨账号），所以给不了
+                     update 深链。给模板 URL + 三步指令是能给的最精确的东西。 */}
+              {!col?.registered && (
+                <div style={{
+                  border: "1px solid var(--line)", borderRadius: 8,
+                  padding: "9px 11px", borderLeft: "3px solid var(--orange)",
+                  lineHeight: 1.7, color: "var(--muted)",
+                  whiteSpace: "pre-line",
+                }}>
+                  {t("admin.inspxacct.updateStackHint")
+                    .replace("{stack}", `notiops-devops-agent-${accountId}`)
+                    .replace("{account}", accountId)}
+                  <div style={{ display: "flex", gap: 8, marginTop: 7,
+                    alignItems: "center", flexWrap: "wrap" }}>
+                    <button style={btnGhost} disabled={gen} onClick={genStack}>
+                      {t("admin.inspxacct.tmplBtn")}{gen ? " …" : ""}
+                    </button>
+                    {stackUrl && (
+                      <>
+                        <button style={{ ...btnPrimary, fontSize: 11, padding: "3px 11px" }}
+                          onClick={() => void copy(stackUrl, "Template URL")}>
+                          {t("admin.inspxacct.copyBtn")}
+                        </button>
+                        <code style={{ fontSize: 10.5, color: "var(--muted)",
+                          maxWidth: 320, overflow: "hidden",
+                          textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {stackUrl}
+                        </code>
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {!sp?.id && (
+                <div style={{ color: "var(--red)" }}>
+                  {t("admin.inspxacct.noSpace")}
+                </div>
+              )}
+
+              {/* ── 长说明收进这里 ── */}
+              <button onClick={() => setWhy((v) => !v)} style={{
+                background: "transparent", border: "none", cursor: "pointer",
+                color: "var(--muted)", fontSize: 11.5, padding: 0,
+                textAlign: "left",
+              }}>
+                {why ? "▾" : "▸"} {t("admin.inspxacct.whyToggle")}
+              </button>
+              {why && (
+                <div style={{
+                  color: "var(--muted)", lineHeight: 1.7, whiteSpace: "pre-line",
+                  borderLeft: "2px solid var(--line)", paddingLeft: 10,
+                }}>
+                  {t("admin.inspxacct.step1Hint")}
+                  {"\n\n"}
+                  {t("admin.inspxacct.step2Hint")}
+                  {"\n\n"}
+                  {t("admin.inspxacct.spaceLabel")}: {sp?.name || "—"}
+                  {sp?.id ? `  ${sp.id}` : ""}
+                  {"\n"}
+                  {t("admin.inspxacct.step1")}: {col?.expectedRoleArn || "—"}
+                  {"\n"}
+                  {t("admin.inspxacct.step2")}: {mon?.expectedRoleArn || "—"}
+                  {col?.mismatch && (
+                    <div style={{ color: "var(--amber)", marginTop: 6 }}>
+                      {t("admin.inspxacct.mismatch")} {col.roleArn}
+                    </div>
+                  )}
+                </div>
+              )}
             </>
           )}
           {msg && <div style={msg.ok ? okText : errText}>{msg.text}</div>}

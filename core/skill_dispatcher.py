@@ -33,13 +33,15 @@ skills ride the same dispatch machinery as normal investigations, the report
 routes back automatically and that bug can't recur.
 
 Design choices (matched to the existing codebase):
-  * The Bedrock call mirrors `core/bedrock_intent.py`: `invoke_model` with the
-    Anthropic Messages format, lenient JSON parsing, and a fail-safe fallback.
-    The fallback for routing is **None** (no skill) — never raise, never
-    guess: a flaky model degrades to free-form investigation, it does not
-    misroute.
-  * `bedrock_client` is injectable so tests never touch a real client. In
-    production it defaults to the module-level singleton, like bedrock_intent.
+  * The Bedrock call mirrors `core/bedrock_intent.py`: one `core.bot_llm`
+    call (Converse under the hood), lenient JSON parsing, and a fail-safe
+    fallback. The fallback for routing is **None** (no skill) — never raise,
+    never guess: a flaky model degrades to free-form investigation, it does
+    not misroute.
+  * 2026-09-01: the old injectable `bedrock_client=` parameter is gone. Nothing
+    ever passed it (grep-verified) and `core.bot_llm` builds its client inside
+    `invoke_llm`, so there is no singleton left to substitute. Tests that need
+    to fake the model patch `skill_dispatcher.bot_llm.invoke_bot_text`.
   * No language-specific string literals here — anything the user sees is
     composed by the platform router via `core.i18n.t(...)`, which keeps the
     bot bilingual. This module returns structured data only.
@@ -64,11 +66,8 @@ import os
 import re
 from datetime import datetime, timezone
 
-import boto3
-from core.lazy_boto import LazyClient
-
+from core import bot_llm
 from core import skill_registry
-from shared.model_config import get_bot_model_id
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +75,12 @@ logger = logging.getLogger(__name__)
 # classification-shaped task, so we deliberately stay consistent with
 # bedrock_intent rather than the Converse-based bedrock_executor (which only
 # uses Converse because it needs tool-use; the dispatcher does not).
-BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
+# 2026-09-01：本模块那几处「一个 system prompt + 一段文本 → 一段（通常是 JSON 的）
+# 文本」的调用，从手搓 Anthropic body 的 invoke_model 换成 core/bot_llm 的 Converse
+# 统一入口。理由与取舍全在 core/bot_llm.py 的模块 docstring 里。
+# 顺带删掉 `_bedrock` / `BEDROCK_REGION`：`invoke_llm` 每次调用自己建 client（比
+# LazyClient 更不会拿到过期凭证），而 BEDROCK_REGION 在三条部署路径里恒等于
+# `cdk.Aws.REGION` = Lambda 自己的区域 = boto3 默认区域，去掉是**零行为变化**。
 SKILLS_BUCKET = os.environ.get("SKILLS_BUCKET", "")
 
 # Confidence floor. Below this, we treat the message as "no confident skill
@@ -94,16 +98,10 @@ DISPATCH_ENABLED = os.environ.get(
     "SKILL_DISPATCH_ENABLED", "true").strip().lower() not in (
     "false", "0", "no", "off")
 
-# 惰性构造（core/lazy_boto.py）：botocore 在**构造时**快照凭证，import 期建好的
-# client 会让后续 setenv AWS_BEARER_TOKEN_BEDROCK 完全失效（Bedrock API Key 模式
-# 因此无法生效）。代理转发属性访问，所有调用点写法不变。
-_bedrock = LazyClient("bedrock-runtime", region=BEDROCK_REGION)
-
 
 # ── public API ───────────────────────────────────────────────────────────────
 
-def select(user_text: str, *, locale: str = "en",
-           bedrock_client=None) -> dict | None:
+def select(user_text: str, *, locale: str = "en") -> dict | None:
     """Map a natural-language message to a saved skill, or None.
 
     Steps:
@@ -122,7 +120,6 @@ def select(user_text: str, *, locale: str = "en",
     if not DISPATCH_ENABLED:
         logger.info("skill_dispatch: disabled via SKILL_DISPATCH_ENABLED → fallback")
         return None
-    client = bedrock_client or _bedrock
 
     try:
         catalogue = skill_registry.list_skills(status="active")
@@ -134,7 +131,7 @@ def select(user_text: str, *, locale: str = "en",
         logger.info("skill_dispatch: no active skills → fallback")
         return None
 
-    raw = _ask_bedrock(client, user_text, catalogue, locale)
+    raw = _ask_bedrock(user_text, catalogue, locale)
     if not raw:
         logger.info("skill_dispatch: model gave no usable answer → fallback")
         return None
@@ -428,36 +425,18 @@ def merge_param_overrides(decision: dict, submitted: dict) -> dict:
     return merged
 
 
-# ── Bedrock call (mirrors bedrock_intent.invoke_model + loose-JSON) ───────────
+# ── Bedrock call (mirrors bedrock_intent: one bot_llm call + loose-JSON) ──────
 
-def _ask_bedrock(client, user_text: str, catalogue: list[dict],
+def _ask_bedrock(user_text: str, catalogue: list[dict],
                  locale: str) -> dict | None:
     """One classification call. Returns the parsed decision dict, or None on
     any failure (the caller turns None into a free-form fallback)."""
     system_prompt = _build_system_prompt(catalogue, locale)
     try:
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 500,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_text or ""}],
-        }
-        resp = client.invoke_model(
-            modelId=get_bot_model_id(),
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(body),
-        )
-        data = json.loads(resp["body"].read())
-        text = ""
-        for block in data.get("content", []):
-            if block.get("type") == "text":
-                text = block["text"].strip()
-                break
+        text = bot_llm.invoke_bot_text(system_prompt, user_text or "", max_tokens=500)
         logger.info("llm_audit: caller=skill_dispatch model=%s in_len=%d out_len=%d",
-                    get_bot_model_id(), len(user_text or ""), len(text))
+                    bot_llm.get_bot_model_id(), len(user_text or ""), len(text))
         if not text:
-            logger.warning("skill_dispatch: Bedrock returned no text block")
             return None
         return _loose_load_json(text)
     except Exception as e:  # noqa: BLE001 — routing must never crash the handler

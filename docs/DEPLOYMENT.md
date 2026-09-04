@@ -35,6 +35,7 @@
 - §11 [完整参数参考](#11-完整参数参考)
 - **§12 [Web Chat 部署](#12-web-chat-部署)** — agentic AI 助手(浏览器端),独立于 IM bot
 - **§13 [CUR + Athena FinOps 数据源](#13-cur--athena-finops-数据源)** — FinOps 仪表盘的成本明细数据源(可选;复用既有 CUR 即时,新建 CUR ~24h)
+- **§14 [客户 CUR 仪表盘 + cost-agent MCP](#14-客户-cur-仪表盘--cost-agent-mcp可选)** — 接入客户/多 payer CUR 表（可选；TAM 场景，4 个仪表盘 sheet + 聊天问客户费用）
 
 ---
 
@@ -56,12 +57,17 @@
 
 首次运行会**交互式引导**:确认 AWS 账号 + region →(可选)PHD 事件转发 → **选 IM 平台(默认 `0` 暂不部署,只上 web 端;想启用飞书 / Slack 才选)**→ 构建前端(admin 控制台 + chat-app)→ 部署 Web Chat Agent(AgentCore Runtime)→ 走 CDK bootstrap → CDK synth → CDK deploy `--all`。**Web Chat + 后端 agent 默认就会部署**;IM 凭据**不在此处采集**——CDK 只创建**空的** Secret,部署完成后再按结尾提示填(见 §4 / §5)。
 
-> **关于钉钉**:`bot-stack.ts` 仍然定义了 DingtalkBotService(代码完整保留),但 v1 `setup.sh` 不显示这个选项 → `enabledPlatforms` 默认不含 `dingtalk` → 钉钉 task `desiredCount=0`,不启动不计费。v2 会开放钉钉的双 robot 凭据流程。
+> **关于钉钉**:钉钉的适配器代码(`platforms/dingtalk/`)完整保留,但 v1 `setup.sh` 不显示这个选项 → `enabledPlatforms` 默认不含 `dingtalk` → `ImStack` 不为钉钉创建任何 Lambda / webhook,不计费。v2 会开放钉钉的双 robot 凭据流程。
 
-部署的三栈(`cdk deploy --all` 一次部到位):
+部署的两栈(`cdk deploy --all` 一次部到位;选了 IM 平台时多一个 `ImStack`,共三栈):
 - `NotiOpsBackendStack`:共享后端(DDB、Lambda5 个、S3 报告 bucket、EventBridge rules)
-- `BotStack`:IM bot 平台栈(VPC、ECS Cluster、每个被勾选平台一个 Fargate Service + ECR;每个 task 内含 pricing + cost MCP sidecar)。**未选任何 IM 时该栈仍部署,但所有 bot `desiredCount=0`,不起容器、不计费**
+- `ImStack`(选了 IM 才建):**IM 的运行路径(唯一一条)** —— 每个平台一个 API Gateway HTTP API + 一对 Lambda(ingress + worker)+ 进度 Lambda + 依赖 Layer + 去重表。部署后要把它输出的 webhook 地址填进 IM 平台控制台,见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md)
 - `WebChatStack`:浏览器端 agentic AI 助手(**默认部署**;BFF Lambda + Function URL、DDB 单表 `notiops-web-chat`、静态前端、通知 handler)
+
+> ℹ️ **`BotStack`(ECS Fargate 长连接)已于 2026-09-03 退役**(IM 重构 M2),`infra/bin/app.ts`
+> 不再实例化它 —— 所以**不再需要 VPC,也不再需要 finch / docker**。
+> `infra/lib/bot-stack.ts` 与三个 Dockerfile 仍留在仓库里作长连接回滚路径(不被任何 app 引用);
+> `teardown.sh` 仍按名字删 `BotStack`,让 M2 之前装机的账号能清干净。
 
 后续重跑 `./setup.sh` 只补差异部分(已存在的 stack 走 `cdk diff` 增量更新,镜像有改动才重 build)。
 
@@ -118,13 +124,14 @@
 
 ## 1. 部署架构
 
-CDK 部署三个栈,`./setup.sh` 走 `cdk deploy --all` 一次部到位。**Web Chat(浏览器端主入口)与承载它的 AgentCore agent 默认就会部署** —— `setup.sh` 会先构建 chat-app 前端、跑 `scripts/deploy_agent.sh` 部署 agent,再 `cdk deploy --all`:
+CDK 部署三个栈(选了 IM 平台时是四个,多一个 `ImStack`),`./setup.sh` 走 `cdk deploy --all` 一次部到位。**Web Chat(浏览器端主入口)与承载它的 AgentCore agent 默认就会部署** —— `setup.sh` 会先构建 chat-app 前端、跑 `scripts/deploy_agent.sh` 部署 agent,再 `cdk deploy --all`:
 
 | 栈(CDK 名) | 必选 | 部署内容 |
 |---|---|---|
 | **`notiops-*`** | ✅ 必选 | Lambda × 5(collector / analyzer / health-checker / notifier / cost-analyzer)、共享 DDB 表、S3 报告 bucket、EventBridge rules(5 条 IM push 规则 + 10 条 web 通知规则 + notiops schedules)、agent-trigger Role(供 STS AssumeRole) |
 | **`WebChatStack`** | ✅ 默认部署 | 浏览器端 agentic AI 助手(**产品主入口**):BFF Lambda(`notiops-web-chat-bff`)+ Function URL(`AWS_IAM`)、DDB 单表 `notiops-web-chat`(会话/消息 + 通知收件箱)、静态前端(chat-app)、通知 handler。BFF 通过 `-c agentRuntimeArn` 注入上一步 agent 的 Runtime ARN |
-| **`BotStack`** | ✅ 部署(IM 可选) | VPC + Public Subnets、ECS Cluster(512 CPU / 1024 MB per task)、ECR repo、被勾选的 IM 平台 Fargate Service(v1: 飞书 / Slack)、**每个 task 内含 pricing + cost MCP sidecar**、Task Role、Security Group。**未选任何 IM 时该栈仍部署,但所有 bot `desiredCount=0`,不起容器、不计费** |
+| **`ImStack`** | 选了 IM 才建 | **IM 的正式运行路径**:每个平台一个 **API Gateway HTTP API**(公网入口,`$default` catch-all)+ 一对 Lambda —— ingress(只验签 + 异步投递,`reservedConcurrentExecutions=10`)+ worker(真正干活,900s)、共用的依赖 Layer、去重表。Outputs 里的 `FeishuWebhookUrl` / `SlackWebhookUrl` 就是你要填进 IM 平台控制台的请求地址(见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md)) |
+| ~~**`BotStack`**~~ | ❌ **已退役(2026-09-03)** | 曾经是:VPC + Public Subnets、ECS Cluster(512 CPU / 1024 MB per task)、ECR repo、每个被勾选平台一个 Fargate Service、每个 task 内含 pricing + cost MCP sidecar、Task Role、Security Group。IM 重构 M2 之后 `infra/bin/app.ts` **不再实例化它**,所以新装机不会有 VPC / ECS / ECR,也不需要 finch / docker。源码(`infra/lib/bot-stack.ts` + 三个 Dockerfile)故意保留在仓库里当长连接回滚路径 —— 真要回滚就重新 `new BotStack(...)`,比从头重建 VPC/ECS + 重写镜像便宜。M2 之前装过的账号里这个栈还在:`teardown.sh` 仍按名字删它,也可以单独 `aws cloudformation delete-stack --stack-name BotStack`(它**没有任何 CFN Export**,不会被别的栈引用) |
 
 **部署顺序**(`./setup.sh` 自动处理):
 ```
@@ -133,7 +140,7 @@ CDK 部署三个栈,`./setup.sh` 走 `cdk deploy --all` 一次部到位。**Web 
 (可选)想启用 IM 时:先 §3 注册 IM 应用,再重跑 setup.sh 选对应平台
 ```
 
-凭据流向:`setup.sh` **不采集 IM 凭据**——它只根据你选的平台设置 `enabledPlatforms` 开关。CDK 会创建**空的** Secret(`notiops/im-bot-feishu` / `notiops/slack-bot-token` / `notiops/slack-app-token`),部署完成后由你在 Web Chat admin 控制台「通知设置」填,或直接改 Secrets Manager 再强制重启对应 ECS 服务(见 §4)。CDK 栈始终通过 ARN 引用这些 secret,本地不留任何凭据文件。
+凭据流向:`setup.sh` **不采集 IM 凭据**——它只根据你选的平台设置 `enabledPlatforms` 开关。CDK 会创建**空的** Secret(`notiops/im-bot-feishu` / `notiops/slack-bot-token` / `notiops/slack-signing-secret`),部署完成后由你在 Web Chat 管理控制台 →「集成 IM」填(四个飞书凭证同一张表单),或直接改 Secrets Manager(见 §4.2 —— webhook 模式**不需要**重启任何服务)。CDK 栈始终通过 ARN 引用这些 secret,本地不留任何凭据文件。
 
 ---
 
@@ -146,7 +153,7 @@ CDK 部署三个栈,`./setup.sh` 走 `cdk deploy --all` 一次部到位。**Web 
 | AWS CLI v2 | ≥ 2.13(支持 Bedrock) | `aws --version` |
 | ~~AWS SAM CLI~~ | ~~≥ 1.100~~ | ~~`sam --version`~~ *(已废弃 — CDK 部署不需要 SAM CLI)* |
 | Node.js | ≥ 22 | `node --version` *(CDK 依赖)* |
-| 容器构建工具 | finch(推荐) / docker | `finch version` |
+| ~~容器构建工具~~ | ~~finch(推荐) / docker~~ | — *(2026-09-03 起**不再需要** — 见下方说明)* |
 | jq | 任意版本 | `jq --version` |
 | Python 3.12+(本地编译) | — | `python3 --version` |
 | **uv** | 任意版本 | `uv --version` |
@@ -158,12 +165,21 @@ CDK 部署三个栈,`./setup.sh` 走 `cdk deploy --all` 一次部到位。**Web 
 > `setup.sh` 现在会在 preflight 就拦住这种情况(除非 `SKIP_AGENT=true`)。
 > 注意 uv 官方安装器装到 `~/.local/bin`,非交互式 shell 常常不在 PATH —— 装完新开一个终端。
 
+> ℹ️ **容器构建工具(finch / docker)自 2026-09-03 起不再需要**,包括部署 IM。
+> 唯一需要它的地方是老 `BotStack` 里那 5 处 `ContainerImage.fromAsset("../")`(ECS Fargate
+> 长连接容器),而 IM 侧已于 IM 重构 M2 全量切到 Webhook + Lambda(`ImStack`),`infra/bin/app.ts`
+> 不再实例化 `BotStack`。IM 的 Python 依赖层由 `scripts/build_im_layer.sh` 用
+> `pip --platform manylinux2014_x86_64 --only-binary=:all:` 交叉下载,不需要容器。
+> 顺带的收益:`cdk synth` 不再把整个仓库根当 Docker build context 算 hash(实测 594s → 12s)。
+> ⚠️ 将来若又引入 Docker 资产,这一行、`setup.sh` 的 preflight、以及
+> `publish/README.public.{zh,en}.md` 要一起改回来。
+
 ### 2.2 AWS 账号准备
 
 - **AWS 账号**:有 admin 或同等权限
-- **VPC**:任何能跑 ECS Fargate 的 VPC + ≥ 2 个 AZ 的 public subnet(**仅当你启用 IM bot 时需要** —— Fargate task 出公网调 IM API;只用 web 端可忽略)
+- ~~**VPC**~~:**不再需要** —— IM 侧走 Webhook + Lambda(`ImStack`),没有 ECS Fargate task,也就不需要 VPC / public subnet(2026-09-03,IM 重构 M2)。只有走 `infra/lib/bot-stack.ts` 长连接回滚路径时才需要
 - **AWS DevOps Agent**:已开通(深度调查功能需要)。**无需自备 Agent Space** —— CDK 会在你账号下自动新建一个 `notiops-devops-<account>` space(详见 §5.3.5),你不用先手动创建或提供 space id
-- **Bedrock**:模型目录里**默认模型**对应的 model 在你的 region 已 enable(Bedrock 控制台 → Model access)。当前默认是 **Claude Sonnet 5**(`global.anthropic.claude-sonnet-5`);想让用户能切别的(Claude Opus 5 / Haiku 4.5、Nova Pro、DeepSeek、GLM 5、Grok 4.6、GPT-5.6 系列)就把对应的一并 enable
+- **Bedrock**:模型目录里**默认模型**对应的 model 在你的 region 已 enable(Bedrock 控制台 → Model access)。当前默认是 **xAI Grok 4.6**(`global.xai.grok-4.6`);想让用户能切别的(Claude Sonnet 5 / Opus 5 / Haiku 4.5、Nova Pro、DeepSeek、GLM 5、GPT-5.6 系列)就把对应的一并 enable
 
 ### 2.3 Region 选择
 
@@ -173,13 +189,13 @@ CDK 部署三个栈,`./setup.sh` 走 `cdk deploy --all` 一次部到位。**Web 
 |---|---|---|
 | **AWS DevOps Agent 服务** | **`us-east-1` 仅此一个** | AWS 当前服务限制(预览阶段单 region) |
 | **共享后端 Lambda 栈** | **强烈推荐 `us-east-1`** | 要调 DevOps Agent journal API,跨 region 增加延迟和 IAM 复杂度 |
-| **飞书 / Slack ECS bot 栈** | 任何 AWS region | 没有强制限制;就近选择降延迟 |
+| **飞书 / Slack IM 栈(`ImStack`)** | 任何 AWS region | 没有强制限制;就近选择降延迟。Webhook Function URL 就在这个 region |
 | **Bedrock** | 任何启用了 `claude-sonnet-4-6` 的 region | 通过 `BedrockRegion` 参数覆盖,可与运行 region 不同 |
-| **DDB / S3 / ECR** | 跟 Lambda / ECS 同 region | CFN 自动落到 stack 所在 region |
+| **DDB / S3** | 跟 Lambda 同 region | CFN 自动落到 stack 所在 region |
 
 **最简单的部署**:`setup.sh` 的 region 菜单默认选 `1) ap-northeast-1`(东京);直接回车即用该 region。DevOps Agent 服务相关能力仍以 `us-east-1` 为准(见上表)。
 
-**多 region 场景**:bot ECS 选离用户近的 region(比如 `ap-southeast-1`),Lambda + DevOps Agent 留在 `us-east-1`。各栈跨 region 调用,DevOps Agent journal 通过 IAM Resource ARN 中的 `DevOpsAgentRegion` 参数指定(默认 `us-east-1`)。
+**多 region 场景**:IM 栈选离用户近的 region(比如 `ap-southeast-1`),Lambda + DevOps Agent 留在 `us-east-1`。各栈跨 region 调用,DevOps Agent journal 通过 IAM Resource ARN 中的 `DevOpsAgentRegion` 参数指定(默认 `us-east-1`)。
 
 ### 2.4 IAM 部署权限
 
@@ -199,18 +215,64 @@ CDK 部署三个栈,`./setup.sh` 走 `cdk deploy --all` 一次部到位。**Web 
 
 ### 3.1 飞书企业自建应用
 
+> **注意配置顺序**:请求地址(Request URL)**必须等部署完成后才能填** —— 那个地址是
+> `ImStack` 部署出来的,现在还不存在。所以这一节只做「建应用 + 配权限 + 拿钥匙」,
+> 填地址那两步在 **[IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §1**(部署后执行)。
+> 顺序反了的症状:飞书保存地址时会立刻发一次校验请求,钥匙还没写进 Secret 就会
+> 显示「校验失败」,看起来像地址填错了。
+
 1. 访问 [飞书开放平台](https://open.feishu.cn/) → 用企业管理员账号登录
 2. **开发者后台 → 创建企业自建应用** → 填名称(例:NotiOps)
 3. **应用功能 → 机器人 → 启用**,设 bot 显示名
-4. **事件与回调 → 长连接** → **启用长连接模式**(无需公网 endpoint)
-5. **订阅事件**(点 + 添加):
-   - `im.message.receive_v1` — 接收用户消息
-   - `card.action.trigger` — 卡片按钮点击回调
-6. **权限管理 → 添加权限**:
-   - `im:message` / `im:message:send_as_bot` / `im:message:reply` / `im:chat` / `im:chat:readonly`
-7. **版本管理与发布 → 创建新版本** → 申请发布(自建应用 admin 可自批)
-8. **保存** App ID + App Secret ——`setup.sh` **不会**问你要凭据;部署完成后,在 **Web Chat admin 控制台「通知设置」**填入(或直接改 Secret `notiops/im-bot-feishu` 再强制重启 ECS 服务),详见 §4 / §5
-9. **把 bot 拉进群**。如果你想让主动推送(Health / 告警等)发到某个群,先拿到目标群的 `chat_id`:
+4. **权限管理 → 批量导入/导出权限** → 导入下面这段 JSON。**前 11 条一条都不能少**
+   ——`cardkit:*` 三条是卡片(进度卡、案例卡、按钮)用的,漏了的症状是消息能收、
+   卡片发不出;`im:message.group_at_msg:readonly` 漏了则群里 @bot 收不到正文。
+   最后那条 `im:message.reaction:write` 是**可选**的(见下面的说明):
+
+   ```json
+   {
+     "scopes": {
+       "tenant": [
+         "cardkit:card:read",
+         "cardkit:card:write",
+         "cardkit:template:read",
+         "im:chat",
+         "im:chat.access_event.bot_p2p_chat:read",
+         "im:message",
+         "im:message.group_at_msg:readonly",
+         "im:message.p2p_msg:readonly",
+         "im:message:readonly",
+         "im:message:send_as_bot",
+         "im:resource",
+         "im:message.reaction:write"
+       ],
+       "user": []
+     }
+   }
+   ```
+
+   ℹ️ `im:message.reaction:write`(2026-09-03 加的)只用来在「正在思考」卡片**之前**先给
+   用户那条消息加一个 👀 表情,把"收到了"的反馈提前到毫秒级。**不加也能用** ——
+   调用会返回非零码,ingress 日志里留一条 WARNING,答案不受任何影响,只是少了那个即时
+   反馈。权限是随版本下发的:补权限之后必须回到第 8 步**重新发一个版本**。
+
+5. **事件与回调 → 加密策略** → 拿到两把钥匙(webhook 模式下这是**唯一**的鉴权手段,
+   两个都必须有值):
+   - **Encrypt Key**:自己填一串随机字符串,建议 ≥32 位 —— `openssl rand -hex 24`
+   - **Verification Token**:这一页直接给出,**复制下来**
+6. **事件与回调 → 事件配置** → 订阅方式选 **「将事件发送至开发者服务器」**,
+   订阅事件加 `im.message.receive_v1`(接收用户消息)。
+   **请求地址先留空**,部署完再填(见上面的顺序提示)
+7. **事件与回调 → 回调配置** → 订阅方式同样选 **「将回调发送至开发者服务器」**,
+   订阅回调加 `card.action.trigger`(卡片按钮全靠它,漏了按钮点了没反应)。
+   请求地址同样部署后再填,**与第 6 步填同一个地址**
+8. **版本管理与发布 → 创建新版本** → 申请发布(自建应用 admin 可自批)
+9. **保存** App ID + App Secret + 第 5 步那两把钥匙 ——`setup.sh` **不会**问你要凭据;
+   部署完成后,在 **Web Chat 管理控制台 →「集成 IM」**填入 —— 四个凭证
+   (App ID / App Secret / Encrypt Key / Verification Token)都在同一张表单上,
+   保存即写进 Secret `notiops/im-bot-feishu`(也可以直接改那个 Secret,见 §5)。
+   详见 §4 / §5 与 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md)
+10. **把 bot 拉进群**。如果你想让主动推送(Health / 告警等)发到某个群,先拿到目标群的 `chat_id`:
 
 ```bash
 # 先拿 tenant_access_token
@@ -222,20 +284,32 @@ curl -X POST 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/inter
 curl 'https://open.feishu.cn/open-apis/im/v1/chats' \
   -H 'Authorization: Bearer <tenant_access_token>' | jq '.data.items[]'
 ```
-这个 `chat_id` 之后填进飞书 Secret 的 `notify_chat_ids`(或在 Web Chat admin「通知设置」里配),**不是** `setup.sh` 的交互项(可选,留空 = 关 push)。
+这个 `chat_id` 之后填进飞书 Secret 的 `notify_chat_ids`(或在 Web Chat 管理控制台 →「集成 IM」里配),**不是** `setup.sh` 的交互项(可选,留空 = 关 push)。
 
 ### 3.2 Slack App
 
+> 同 §3.1:**Request URL 要等部署完成后才填**,那三处地址在
+> [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §2。
+
 1. 访问 [api.slack.com/apps](https://api.slack.com/apps) → **Create New App → From scratch**
-2. **Settings → Socket Mode** → 打开,生成 App-Level Token(scope `connections:write`)
+2. ⚠️ **不要开 Socket Mode** —— 它与 webhook **互斥**,开了 Slack 就不再往 Request URL
+   发请求,bot 表现为完全没反应。也**不需要** App-Level Token(`xapp-...`)
 3. **OAuth & Permissions → Bot Token Scopes** → 添加:
    - `app_mentions:read` / `channels:history` / `channels:read` / `chat:write` / `chat:write.public`
    - `groups:history` / `im:history` / `im:write` / `users:read`
-4. **Event Subscriptions → Enable Events: ON** → **Subscribe to bot events**:
+   - `commands` — 斜杠命令(`/devops`、`/case` 等);漏了的症状是 `dispatch_failed`
+   - `reactions:write` — **可选**,提问后先加一个 👀 表情(即时反馈)。漏了只是没有表情,
+     答案不受影响;日志里是 `reactions.add error=missing_scope`
+4. **Basic Information → App Credentials → Signing Secret** → 复制下来。webhook 模式下
+   它是**唯一**的请求鉴权手段(取代 Socket Mode 时代的 App Token)
+5. **Event Subscriptions → Enable Events: ON** → **Subscribe to bot events**:
    - `app_mention` / `message.channels` / `message.groups` / `message.im`
-5. **Install App → Install to Workspace**,拿 Bot Token(`xoxb-...`)
-6. **保存** Bot Token + App Token ——`setup.sh` **不会**问你要凭据;部署完成后,在 **Web Chat admin 控制台「通知设置」**填入(或直接改 Secret `notiops/slack-bot-token` / `notiops/slack-app-token` 再强制重启 ECS 服务),详见 §4 / §5
-7. 在目标 channel 中 `/invite @YourBot`,channel 设置面板查 **Channel ID**(`C...`)。想开主动推送时,把这个 Channel ID 配进通知设置(**不是** `setup.sh` 的交互项)
+   - Request URL 部署后再填
+6. **Install App → Install to Workspace**,拿 Bot Token(`xoxb-...`)
+7. **保存** Bot Token + Signing Secret ——`setup.sh` **不会**问你要凭据;部署完成后填进
+   Secret `notiops/slack-bot-token` / `notiops/slack-signing-secret`,详见 §4 / §5 与
+   [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §2
+8. 在目标 channel 中 `/invite @YourBot`,channel 设置面板查 **Channel ID**(`C...`)。想开主动推送时,把这个 Channel ID 配进通知设置(**不是** `setup.sh` 的交互项)
 
 ### 3.3 钉钉(DingTalk)企业内部应用 — **v2 才开放**
 
@@ -258,7 +332,7 @@ curl 'https://open.feishu.cn/open-apis/im/v1/chats' \
    - 跳过这一步的后果:Phase 1 对话 / 调查派发依旧可用,**但调查结束后报告不会回贴到钉钉群**,客户需要去 Operator Home 主动查
    - 为什么需要两个机器人:钉钉把入站和出站分到两个机器人类:**H5-app Stream Mode 机器人**收消息回消息(用每条消息自带的 session_webhook),**自定义机器人**接收来自 AWS Lambda 的服务端推送(用它独立的 webhook URL)。两者都加进同一个群,从用户视角看就是一个 bot
 
-> 钉钉机器人**不需要任何公网入站**,跟飞书 / Slack 一样:Stream Mode 是 bot ECS 主动出站长连接,IT 安全友好。
+> 钉钉机器人**不需要任何公网入站**:Stream Mode 是 bot 侧主动出站长连接,IT 安全友好。⚠️ 但长连接的承载(`BotStack` 的 ECS task)已于 2026-09-03 退役 —— 钉钉要落地得先补一条 webhook 适配(M4,尚未做)。
 
 ---
 
@@ -283,20 +357,24 @@ CDK 部署不需要 `bootstrap.env` —— `./setup.sh` 第一次跑会**交互�
 
 `setup.sh` 部署时,CDK 会**创建空的** IM Secret;凭据在**部署完成后**填,两种方式(脚本结尾横幅也会提示):
 - **填法一(推荐)**:登录 Web Chat(admin) → 左侧「更多 → 巡检 & 报告」打开控制台 →「设置 → 通知设置」填入
-- **填法二**:直接更新下表的 Secret,再强制重启对应 ECS 服务加载新凭据:
-  `aws ecs update-service --cluster <BotStack-cluster> --service <service> --force-new-deployment`
+- **填法二**:直接更新下表的 Secret。**不需要重启任何东西** —— IM 走 Lambda,
+  凭据在冷启动时读,改完 Secret 下一次冷启动就生效(想立刻生效就等几分钟或改一次
+  Lambda 环境变量强制换实例)。⚠️ 旧文档里那条
+  `aws ecs update-service --force-new-deployment` 只对**回滚用的** `BotStack` 长连接容器
+  有意义,webhook 模式下对它做什么都不影响。
 
 CDK 栈始终通过 ARN 引用这些 secret,**本地不落任何凭据文件**。
 
 | Secret 名(自动建,初始为空) | 用途 |
 |---|---|
-| `notiops/im-bot-feishu` | 飞书机器人凭证(单个 Secret,JSON:`app_id` / `app_secret` / `verification_token` / `encrypt_key` / `notify_chat_ids`) |
+| `notiops/im-bot-feishu` | 飞书机器人凭证(单个 Secret,JSON:`app_id` / `app_secret` / `verification_token` / `encrypt_key` / `notify_chat_ids`)。⚠️ webhook 模式下 `encrypt_key` 与 `verification_token` **两个都必填**,少一个 ingress 冷启动就崩(见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §1.2) |
 | `notiops/slack-bot-token` | Slack bot token(`xoxb-`) |
-| `notiops/slack-app-token` | Slack app-level token(`xapp-`,Socket Mode) |
+| `notiops/slack-signing-secret` | Slack signing secret —— **webhook 模式下唯一的请求鉴权手段**,必填 |
+| `notiops/slack-app-token` | Slack app-level token(`xapp-`,Socket Mode)。webhook 模式**用不到**,只有切回 `BotStack` 长连接回滚时才需要 |
 | `notiops/bedrock-api-key` | Bedrock API Key(跨账号模型调用认证;部署后手动填充,留空则走 IAM) |
 | `notiops/litellm-config` | LiteLLM 凭据(JSON:`base_url` / `api_key` / `default_model`;用 LiteLLM 才需要) |
 
-> 钉钉 Secret(`notiops/dingtalk-app-key` / `notiops/dingtalk-app-secret`)**不由 CDK 创建** —— bot-stack 引用但需手动 `create-secret`(⏳ v2 才走 `setup.sh` 自动采集)。**不存在 `bot-stack-*/` 前缀的 Secret,也不存在 `notiops/devops-agent-config`**(Agent Space id 等元数据走 DDB onboard 记录 + CDK context,不落 Secret)。
+> 钉钉 Secret(`notiops/dingtalk-app-key` / `notiops/dingtalk-app-secret`)**不由 CDK 创建** —— 需手动 `create-secret`(⏳ v2 才走 `setup.sh` 自动采集)。**不存在 `bot-stack-*/` 前缀的 Secret,也不存在 `notiops/devops-agent-config`**(Agent Space id 等元数据走 DDB onboard 记录 + CDK context,不落 Secret)。
 
 ### 4.3 可选 override(改默认行为)
 
@@ -331,7 +409,7 @@ CDK 栈始终通过 ARN 引用这些 secret,**本地不落任何凭据文件**�
 
 ### 5.1 setup.sh 都做了什么
 
-1. 依赖检查:`node` ≥ 22 / `npm` / `npx cdk` / `aws` / `jq` / `python3` / `uv`(**缺 uv 直接退出** —— 否则 agent 部署失败会让 Web Chat 静默退化成回显;`SKIP_AGENT=true` 时不检查)。**容器构建工具(`finch` 或 `docker`)是可选的** —— 只有你选了要部署 IM 平台时才强制要求(IM bot 的 ECS 镜像本地构建);只上 web 端不需要
+1. 依赖检查:`node` ≥ 22 / `npm` / `npx cdk` / `aws` / `jq` / `python3` / `uv`(**缺 uv 直接退出** —— 否则 agent 部署失败会让 Web Chat 静默退化成回显;`SKIP_AGENT=true` 时不检查)。**已经完全不需要容器构建工具** —— 2026-09-03(IM 重构 M2)起 `finch` / `docker` 都不再是前置条件,见 §2.1
 2. 让你从本地 `~/.aws` profile 列表选部署 Profile(或保持当前)
 3. 调 `aws sts get-caller-identity` 检测账号,要你确认
 4. 让你从 6 个选项里选 deploy region(默认 `ap-northeast-1`;含"自定义输入")
@@ -339,9 +417,9 @@ CDK 栈始终通过 ARN 引用这些 secret,**本地不落任何凭据文件**�
 6. 让你选要部署哪些 IM 平台(**默认 `0` 暂不部署,只上 web 端**;`1` 飞书 / `2` Slack 可多选)。**只设 `enabledPlatforms` 开关,不采集凭据**
 7. **`[1/4]` 构建前端** —— admin 控制台(`frontend/frontend-app`)**和** Web Chat 前端(`frontend/chat-app`)都构建
 8. **部署 Web Chat Agent** —— 跑 `scripts/deploy_agent.sh`,把 Strands agent 部署到 AgentCore Runtime,拿到 Runtime ARN(经 `-c agentRuntimeArn` 注入 WebChatStack;`SKIP_AGENT=true` 可跳过,BFF 回退 echo)
-9. **`[2/4]` 安装 Lambda 依赖**(boto3 / powertools / jinja2,`--platform manylinux2014_x86_64` 装 Linux 二进制)
+9. **`[2/4]` 安装 Lambda 依赖**(boto3 / powertools / jinja2,`--platform manylinux2014_x86_64` 装 Linux 二进制)。**选了 IM 时**还会跑 `scripts/build_im_layer.sh` 构建 IM 依赖 Layer(`lark-oapi` / `slack-sdk` / `boto3`,同样是 manylinux 轮子);这一步失败会**当场中断**而不是静默跳过 —— Layer 里缺包时 `ImStack` synth 就直接报错
 10. CDK bootstrap(如果该账号 + region 还没 bootstrap 过;已 bootstrap 且健康则复用)
-11. **`[3/4]`** CDK synth → IAM 一致性检查 → **CDK deploy `--all`**(`NotiOpsBackendStack` + `BotStack` + **`WebChatStack`**;选了 IM 时才触发 Docker build 把 bot 镜像 push 到 ECR)
+11. **`[3/4]`** CDK synth → IAM 一致性检查 → **CDK deploy `--all`**(`NotiOpsBackendStack` + **`WebChatStack`**;选了 IM 时再加 **`ImStack`**)。**不再有任何镜像 build** —— `BotStack` 已退役(见 §0.1)
 12. **CUR + Athena FinOps 数据源**引导(检测 / 复用 / 新建,详见 §13)
 13. **创建 Cognito `admin` 用户 + 临时密码**(首次部署),并把它加进 admin 组
 14. **`[4/4]`** 把 outputs 写到 `cdk-outputs.json`,并打印**以 Web Chat 为主入口**的完成横幅(Web Chat 地址 + `admin` 登录凭据在最上方)
@@ -361,12 +439,12 @@ CDK 栈始终通过 ARN 引用这些 secret,**本地不落任何凭据文件**�
 ```bash
 cd infra
 
-# 改了 cdk.json context 后只 redeploy(不 rebuild 镜像)
+# 改了 cdk.json context 后只 redeploy
 npx cdk deploy --all
 
 # 单独 redeploy 一个栈
 npx cdk deploy NotiOpsBackendStack
-npx cdk deploy BotStack
+npx cdk deploy ImStack       # IM 侧(飞书 / Slack webhook + Lambda)
 
 # Diff 看会变什么
 npx cdk diff --all
@@ -457,26 +535,45 @@ CDK 模板默认 `CfnAgentSpace` 是 **CREATE 一个新的**,理由:
 
 更完整的 Web Chat 冒烟见 §12.6。
 
-### 6.1 ECS task 跑起来了(仅当启用了 IM)
+### 6.1 Webhook 入口活着(仅当启用了 IM)
 
-> §6.1-6.3 **只在你启用了 IM 平台(飞书 / Slack)时适用**。只上 web 端时 BotStack 的 bot `desiredCount=0`,以下命令会显示 `0 0`,属正常。
+> §6.1-6.3 **只在你启用了 IM 平台(飞书 / Slack)时适用**。只上 web 端时这几条都不用看。
 
-
-```bash
-aws ecs describe-services --region $AWS_REGION \
-  --cluster <cluster> \
-  --services <service> \
-  --query 'services[0].deployments[0].[runningCount,desiredCount,rolloutState]' \
-  --output text
-# 期望:1   1   COMPLETED
-```
-
-### 6.2 长连接 / Socket Mode 已建立
+IM 走的是 **API Gateway HTTP API + Lambda webhook**,没有常驻容器可看,判据是「地址存在 + 有日志」:
 
 ```bash
-aws logs tail <log-group> --region $AWS_REGION --since 5m | \
-  grep -E "Lark connected|Bolt app is running"
+# 地址(这就是要填到飞书 / Slack 控制台的那个)
+aws cloudformation describe-stacks --stack-name ImStack --region $AWS_REGION \
+  --query 'Stacks[0].Outputs[?OutputKey==`FeishuWebhookUrl`||OutputKey==`SlackWebhookUrl`]' \
+  --output table
 ```
+
+> ℹ️ **没有容器了**:`BotStack` 那套 ECS Fargate 长连接容器已于 2026-09-03(IM 重构 M2)退役,
+> 新装机不会创建 VPC / ECS / ECR。要回滚到长连接,得先在 `infra/bin/app.ts` 里把
+> `new BotStack(...)` 加回来、`cdk deploy BotStack`,再把 IM 平台控制台的订阅方式改回
+> 「长连接 / Socket Mode」。M2 之前装机的账号里 `BotStack` 可能还在(`desiredCount=1`,起着、计费),
+> 想省钱可以直接删掉整个栈,或先缩到 0:
+>
+> ```bash
+> aws ecs update-service --cluster <BotStack 的 cluster> \
+>   --service <FeishuBotService> --desired-count 0 --region $AWS_REGION
+> ```
+
+### 6.2 收到并处理了消息
+
+在群里 @bot 一句话,然后看两个 Lambda 的日志(以飞书为例,Slack 把 `feishu` 换成 `slack`):
+
+```bash
+aws logs tail /aws/lambda/notiops-im-ingress-feishu --region $AWS_REGION --since 5m
+aws logs tail /aws/lambda/notiops-im-worker-feishu  --region $AWS_REGION --since 5m
+```
+
+| 症状 | 说明 |
+|---|---|
+| 两个都有日志 | ✅ 正常 |
+| ingress 有、worker 没有 | 验签过了但异步投递失败 —— 看 ingress 的报错 |
+| ingress 里有 `401 (signature/token)` | 两把钥匙与控制台不一致,回 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §1.2 |
+| 两个都没日志 | 飞书 / Slack 根本没发出来 —— 订阅方式是不是还停在长连接 / Socket Mode |
 
 ### 6.3 端到端
 
@@ -490,6 +587,16 @@ aws logs tail <log-group> --region $AWS_REGION --since 5m | \
 2. 点 **🚀 派发调查** → 卡片更新成 **✅ 已派发,⏳ 调查启动中**
 3. 几秒后 **🔭 调查已开始** 卡片 + 进度更新
 4. 1-3 分钟后 **📝 Report Summary** + **✅ Report** 头部卡到达原群
+
+再验一条**不是调查**的普通提问(走 DevOps 对话,例:`@NotiOps 帮我列出所有 S3 桶的名称和其大小`):
+
+5. **1-2 秒内**出一张 **🤔 思考中 · 已用时 N 秒** 卡片(这是判据 —— 立刻有卡)
+6. 同一张卡上正文、⚙️ 过程逐步刷新,标题秒数一直在涨(前 30 秒约 2 秒一刷,之后变慢,见
+   [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §6.2)
+7. 跑完(可能几分钟)卡片定版为答案 + 两颗按钮
+
+⚠️ 「跑了几分钟才出答案」**不是**故障 —— 判据只有一条:**发完问题有没有立刻出那张思考卡**。
+用户可见口径在 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §6,别把它当回归报上来。
 
 如果失败 → §10 [Top 5 部署常见错误](#10-top-5-部署常见错误)。
 
@@ -518,7 +625,7 @@ $EDITOR infra/cdk.json
 cd infra && npx cdk deploy NotiOpsBackendStack
 ```
 
-> 飞书还可把目标群写进 Secret `notiops/im-bot-feishu` 的 `notify_chat_ids`,或在 Web Chat admin「通知设置」里配。
+> 飞书还可把目标群写进 Secret `notiops/im-bot-feishu` 的 `notify_chat_ids`,或在 Web Chat 管理控制台 →「集成 IM」里配。
 
 ### 7.2 调整 push 事件源
 
@@ -573,38 +680,47 @@ aws events put-events --region $AWS_REGION --entries '[{
 
 ## 8. 日常运维
 
-### 8.1 配置变更速查(无需 rebuild 镜像)
+### 8.1 配置变更速查
 
-改 `infra/cdk.json` 里对应 context,跑 `npx cdk deploy` 单栈,~2 分钟生效(走 ECS rolling update,不重 build 镜像):
+改 `infra/cdk.json` 里对应 context,跑 `npx cdk deploy` 单栈,~2 分钟生效:
 
 | 改什么 | 改哪个 context | 部哪个栈 |
 |---|---|---|
-| 切换 chitchat 模式 | `agenticChatMode` | `bot-stack` |
-| 切换 MCP 模式 | `awsMcpMode` | `bot-stack` |
-| 改默认语言 | `defaultLocale` | `bot-stack` |
-| 改 chat_id 白名单 | `allowedChatIds`(JSON 数组) | `bot-stack` |
-| 改默认 LLM | `defaultLlmProvider` | `bot-stack` |
-| 开关单个 push 事件源 | `enable*Push` 系列 | `notiops` |
+| 改 chat_id 允许清单 | `imAllowedChatIds`(逗号分隔) | `ImStack` |
+| 增删 IM 平台 | `enabledPlatforms`(`none` = 整个 IM 侧不部署) | `ImStack` |
+| 开关单个 push 事件源 | `enable*Push` 系列 | `NotiOpsBackendStack` |
+
+> ⚠️ **不再走 context 的项**(M2 / 2026-09-03 起):chitchat 模式、MCP 模式、默认语言、默认 LLM。
+> 原来那几个 key(`agenticChatMode` / `awsMcpMode` / `defaultLocale` / `defaultLlmProvider`)只喂过
+> `BotStack` 的 Fargate 容器,栈退役后**传了也不生效**(静默无效)。现在:
+> 模式类在 `infra/lib/constructs/im-core.ts` 里写死;**默认语言**在群里 `@bot 中文` / `@bot english`
+> 按会话切(`core/locale_resolver.py`);**默认 LLM** 由 admin 在 Web 控制台的模型目录里设
+> `default_model`,用户可 `@bot model <alias>` 单会话覆盖(`core/llm_pref_resolver.py`)。
+> 完整口径见 §11.1。
 
 ### 8.2 部署新代码
 
 ```bash
 git pull
-./setup.sh            # 重新 build 镜像 + cdk deploy --all
+./setup.sh            # cdk deploy --all（不再有镜像 build）
 ```
 
 `setup.sh` 在重跑时会跳过已经存在 + 不变的资源,只更新差异部分。
 
-### 8.3 强制重启 task(不改任何配置)
+### 8.3 强制换一批 Lambda 实例(不改任何配置)
+
+IM 走 Lambda,**没有"重启 task"这回事** —— 改完 Secret 等下一次冷启动就生效。想立刻换掉所有
+活着的实例(比如刚改了凭据要马上验),改一次环境变量即可(改任意值都会让 Lambda 换新实例):
 
 ```bash
-aws ecs update-service --region $AWS_REGION \
-  --cluster <cluster> \
-  --service <service> \
-  --force-new-deployment
+aws lambda update-function-configuration --region $AWS_REGION \
+  --function-name notiops-im-worker-feishu \
+  --environment "Variables={FORCE_ROLL=$(date +%s)}"
 ```
 
-资源真名查法见 §6 顶部提示。
+⚠️ 这条命令会**覆盖**整个环境变量表 —— 先 `get-function-configuration` 读出现有的 `Variables`
+再整份带上,别只传一个 key。更稳的做法是直接 `cdk deploy ImStack`。
+(老装机上还有 ECS 时的做法是 `aws ecs update-service --force-new-deployment`。)
 
 ### 8.4 看日志
 
@@ -640,12 +756,12 @@ aws dynamodb delete-item --table-name <conv-table> \
 | 级别 | 操作 | 影响 |
 |---|---|---|
 | **L1 关闭单个功能** | 改 `infra/cdk.json`(如 `enableHealthPush: false`)→ `cdk deploy NotiOpsBackendStack` | 单个事件源,~2 分钟 |
-| **L2 关闭整个对话档位** | 改 `agenticChatMode: "disabled"` → `cdk deploy BotStack` | chitchat / general_qa 路径 |
-| **L3 回到上一个镜像** | `cdk deploy BotStack`(CDK 会用上次 build 的 ECR digest 触发滚动)| 单平台,~2 分钟 |
-| **L4 关闭整个 bot** | `aws ecs update-service --desired-count 0 ...` | 单平台,瞬时 |
+| **L2 关闭整个对话档位** | 改 `agenticChatMode: "disabled"` → `cdk deploy ImStack` | chitchat / general_qa 路径 |
+| **L3 IM 从 webhook 退回长连接** | ⚠️ **2026-09-03(M2)之后这条不再是"分钟级"** —— `BotStack` 已不再由 `infra/bin/app.ts` 实例化,得先把 `new BotStack(...)` 加回去、装好 finch/docker、`cdk deploy BotStack`(要建 VPC/ECS/ECR + build 镜像),再把飞书 / Slack 控制台的订阅方式改回长连接 / Socket Mode。老装机(栈还在)仍是分钟级:改订阅方式 + `aws ecs update-service --desired-count 1 ...` | 单平台;新装机 ~20 分钟,老装机分钟级([IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §1.6)|
+| **L4 关闭整个 bot** | webhook 模式:`aws lambda put-function-concurrency --reserved-concurrent-executions 0`(ingress 立刻全部 429);长连接模式:`aws ecs update-service --desired-count 0 ...` | 单平台,瞬时 |
 | **L5 删栈** | `cd infra && npx cdk destroy <stack-name>` | 整个 stack |
 
-> ⚠️ 删栈会清掉 ECR / IAM / SG / ECS 相关资源。**DDB 表和 S3 报告 bucket 不会被自动删**(`removalPolicy: RETAIN`),需要手动清理。本项目所有 AWS 资源默认带 `auto-delete=no` 标签,避免被自动清理任务误删。
+> ⚠️ 删栈会清掉 Lambda / API Gateway / IAM 相关资源(老装机上还有 ECR / SG / ECS)。**DDB 表和 S3 报告 bucket 不会被自动删**(`removalPolicy: RETAIN`),需要手动清理。本项目所有 AWS 资源默认带 `auto-delete=no` 标签,避免被自动清理任务误删。
 >
 > 要**删掉整个环境**(而不是回滚单个栈),别逐个 `cdk destroy` —— 用仓库根目录的
 > `./teardown.sh`:它按依赖倒序删栈,并收掉 CDK 之外的尾巴(CUR 报告定义、一次性
@@ -659,9 +775,9 @@ aws dynamodb delete-item --table-name <conv-table> \
 | 现象 | 可能原因 | 排查 / 修 |
 |---|---|---|
 | **Secrets Manager 报 access denied** —— CDK deploy 建空 Secret 时,或事后填 IM 凭据时 | 部署用户缺 Secrets Manager 权限 | `aws iam attach-user-policy --policy-arn arn:aws:iam::aws:policy/SecretsManagerReadWrite` |
-| **CDK deploy 报 `CannotPullContainerError`** | 主 app 镜像 build 失败 / ECR 没 push 完整 | `cd infra && npx cdk deploy BotStack` 重跑(CDK Asset 会重新 build + push)|
-| **bot 不响应 @ — ECS 日志显示 `auth failed`** | IM 凭据错 / Secret 内容错 | `aws secretsmanager get-secret-value --secret-id <name>` 比对凭据原值,改对了重跑 `setup.sh` |
-| **bot 派发成功但报告不回群** | report-handler Lambda 没拿到 IM 凭据 | 检查 Lambda 环境变量里的 Secret ARN 与 Bot Stack 是否一致;重跑 `cdk deploy NotiOpsBackendStack` |
+| **`ImStack` synth 就报错说 Layer 里缺包** | `scripts/build_im_layer.sh` 没跑 / 跑失败 | 重跑 `bash scripts/build_im_layer.sh`(用 `pip --platform manylinux2014_x86_64 --only-binary=:all:` 交叉下载,**不需要容器**)|
+| **bot 不响应 @ — worker 日志显示 `auth failed`** | IM 凭据错 / Secret 内容错 | `aws secretsmanager get-secret-value --secret-id <name>` 比对凭据原值,改对了等下一次冷启动(不需要重部)|
+| **bot 派发成功但报告不回群** | report-handler Lambda 没拿到 IM 凭据 | 检查 Lambda 环境变量里的 Secret ARN 与 `ImStack` 是否一致;重跑 `cdk deploy NotiOpsBackendStack` |
 | **`Bedrock InvokeModel` AccessDeniedException** | task role 缺权限 / region 没 enable model | IAM 加 `bedrock-runtime:InvokeModel`,或 Bedrock 控制台 → Model access |
 
 ---
@@ -670,20 +786,27 @@ aws dynamodb delete-item --table-name <conv-table> \
 
 所有可调参数在 `infra/cdk.json` 的 `context` 块。改完后 `cd infra && npx cdk deploy <stack>`。
 
-### 11.1 BotStack(IM bot 平台栈)
+### 11.1 ImStack(IM 平台栈)
+
+`ImStack` 实际读的 context **只有三个**(`infra/lib/im-stack.ts`):
 
 | context key | 默认 | 说明 |
 |---|---|---|
-| `bedrockModelId` | `us.anthropic.claude-sonnet-4-6` | Bedrock 推理 profile |
-| `bedrockRegion` | (deploy region) | Bedrock 调用 region(可与运行 region 不同) |
-| `agenticChatMode` | `enabled` | `disabled` / `qa_only` / `enabled` |
-| `defaultLlmProvider` | `claude` | 默认 LLM 别名:`claude` / `nova` / `gpt`。任何用户可在群里 `@bot model <alias>` 切换(无 admin 控制)。详见 [USER_GUIDE.md §7](USER_GUIDE.md#7-模型选择切换-llm) |
-| `gptRegion` | `us-east-2` | 当 `gpt` 别名生效时,Bedrock Mantle Responses 端点所在 region(可选 `us-east-2` / `us-west-2` / `us-gov-west-1`) |
-| `awsMcpMode` | `docs_only` | `disabled` / `docs_only` |
-| `enableMcpPricing` | `true` | Pricing MCP sidecar |
-| `defaultLocale` | `en` | `zh` / `en` resolver 兜底语言 |
-| `allowedChatIds` | `[]` | chat_id 白名单(空数组 = 不限制) |
-| `enabledPlatforms` | `feishu` | 启用的 IM 平台(逗号分隔,如 `feishu,slack`)。未列出的平台 ECS Service `desiredCount=0`,不启动 |
+| `enabledPlatforms` | `feishu` | 启用的 IM 平台(逗号分隔,如 `feishu,slack`)。`none` = 整个 `ImStack` 不实例化(`infra/bin/app.ts`),未列出的平台不创建任何 Lambda / webhook |
+| `imAllowedChatIds` | (空) | chat_id 允许清单(逗号分隔;空 = 不限制)。注入 worker 的 `ALLOWED_CHAT_IDS` |
+| `organizationId` | (空) | 非空 = 多账号(Organizations)模式,与 `NotiOpsBackendStack` 同口径 |
+
+> ⚠️ **M2(2026-09-03)之后这些 key 已失效**,别照着老文档传:
+> `bedrockModelId` / `bedrockRegion` / `agenticChatMode` / `defaultLlmProvider` / `gptRegion` /
+> `awsMcpMode` / `enableMcpPricing` / `defaultLocale` / `allowedChatIds`。
+> 它们只喂过 `BotStack` 的 Fargate 容器 environment,而那个栈已退役。现在 IM 侧对应的值是
+> **在 `infra/lib/constructs/im-core.ts` 里写死的**(`AGENTIC_CHAT_MODE=enabled`、
+> `AWS_MCP_MODE=docs_only`、`AWS_MCP_PRICING_ENABLED=false` / `AWS_MCP_COST_ENABLED=false`
+> —— Lambda 里没有 sidecar 可连)。**模型**由运行期决定:群 / DM 的 `@bot model <alias>` →
+> DDB 模型目录的 `default_model`(`core/llm_pref_resolver.py`,见
+> [USER_GUIDE.md §7](USER_GUIDE.md#7-模型选择切换-llm));**语言**由 `core/locale_resolver.py`
+> 的 user / DM / thread / incident 记录决定,没有记录时兜底 `en`(`DEFAULT_LOCALE` 没被注入)。
+> 传这些 `-c` 不会报错、也不会生效 —— 这是**静默无效**,所以特意在这里列清。
 
 ### 11.2 NotiOpsBackendStack(共享后端 + push)
 
@@ -719,7 +842,7 @@ aws dynamodb delete-item --table-name <conv-table> \
 | **鉴权** | Cognito(复用 notiops 的 user pool)+ Identity Pool,前端拿临时凭据对 Function URL 做 **SigV4** 签名 |
 | **数据** | CDK `WebChatStack` 建 DDB 单表 `notiops-web-chat`(会话/消息 + 持久化通知收件箱 `notif#` 段,90 天 TTL,账号级共享) |
 
-数据面全程沿用后端的**严格只读**约束(三层防御),Web Chat 不放宽这些限制。
+数据面全程**严格只读**:硬边界是只读 IAM 角色,之上是工具层只读(`READ_OPERATIONS_ONLY` + 精选只读 MCP 允许清单)+ 命令级 denylist + 只读 system prompt(纵深防线的完整构成见 [TECHNICAL_DESIGN.md](TECHNICAL_DESIGN.md) §5.3)。Web Chat 不放宽这些限制。
 
 ### 12.2 部署顺序
 
@@ -910,3 +1033,76 @@ aws s3 ls s3://<CUR_BUCKET>/<report-prefix>/<report-name>/ --recursive | grep cr
 执行 `setup.sh` 的 IAM 身份需要额外具备:`cur:PutReportDefinition` / `cur:DescribeReportDefinitions`、`s3:CreateBucket`、`scheduler:CreateSchedule`、`iam:PassRole`(传给 `notiops-cur-finalizer-scheduler-role`);以及配置 Athena FinOps 保存查询所需的 `athena:GetWorkGroup` / `athena:UpdateWorkGroup`(给 primary workgroup 设结果输出位置)+ `athena:ListNamedQueries` / `athena:BatchGetNamedQuery` / `athena:CreateNamedQuery`。CDK 部署的 `notiops-cur-finalizer-role`(见 §13.3)与 Web Chat BFF role(含查 CUR 所需的 `athena:*Query*` + `athena:ListNamedQueries`/`BatchGetNamedQuery`/`GetNamedQuery`(Cost Deep Dive 取保存查询)、`glue:Get*`、CUR 桶只读,结果桶的 `s3:GetBucketLocation` + `s3:GetObject`/`s3:PutObject`(`GetObject` 供 Deep Dive CSV 下载重签);Cost Deep Dive 的 AI 洞察需 `bedrock:InvokeModel`(Claude Sonnet 推理档),当天结果缓存需 `dynamodb:PutItem`(`notiops-config` 表)——缺 `GetBucketLocation` 时 Athena 会报 "Unable to verify/create the output bucket")无需手动授权。
 
 CUR 就绪后(复用既有 CUR 时几分钟内),`setup.sh` 自动:① 给 primary workgroup 设结果输出位置(`s3://notiops-data-<account>-<region>/athena-results/`,已有则不覆盖)② 用【动态发现的库/表名】幂等创建 **6 条** Athena 保存查询——`NotiOps - DevOps Agent Usage & Credit`(与仪表盘 credit 卡同口径)、`NotiOps - EDP Commitment Attainment`(改 `params` 里年度承诺额 + 合同起止即可直接跑),以及 4 条 **Cost Deep Dive** 明细查询:`CloudWatch cost by usage type` / `Data Transfer by service` / `EC2 cost by instance type` / `S3 cost by storage class`(供仪表盘"成本深挖"卡按需运行)。仪表盘 Commitments & Programs 卡的"在 Athena 查看 SQL"链接即指向这里;Cost Deep Dive 各场景的 SQL 也从这些保存查询取(单一真源,可在 Athena 控制台直接改),BFF 跑完后把真实结果行交给 Bedrock 出图表+洞察,并把当天结果缓存到 `notiops-config` 表(同一天再点只重签 CSV 下载链接,不重复跑 SQL/调 AI)。
+
+---
+
+## 14. 客户 CUR 仪表盘 + cost-agent MCP（可选）
+
+> 与 §13 的区别：§13 查的是**本部署账号**的 CUR（NotiOps 自动创建）；本节接入的是**客户/多 payer 的 CUR 表**（行级明细，TAM 场景），通过一个独立的 cost-agent MCP Lambda 查询。不配置本节，FinOps 页不显示 4 个 CUR sheet、聊天里也不挂载客户 CUR 工具，其余功能不受影响（fail-closed）。
+
+### 14.1 提供什么
+
+| 能力 | 入口 | 说明 |
+|---|---|---|
+| 4 个 CUR 仪表盘 sheet | FinOps 页：费用趋势（交叉筛选）/ Credit / 扩展支持 / Savings Plans | 数据 BFF 当天缓存，每日预热后秒开 |
+| 聊天问客户费用 | 对话页直接问（如"客户 7 月总费用"） | agent 经 2 个元工具（list_cost_tools/call_cost_tool）调 MCP 的 45 个 CUR 工具 |
+| 内联图表 | 聊天回答 ≥3 数据点自动附图 | 工具返回值带 display_hint，前端渲染 ```chart 围栏 |
+
+### 14.2 部署 cost-agent MCP Lambda（客户特定，前置）
+
+这个 Lambda 的代码在一个**独立仓库**里（Python，streamable-http MCP over Lambda
+Function URL，`AuthType=AWS_IAM`），不在本仓库内 —— 具体地址问维护者。
+每个客户一个 Lambda，差异全部收敛在环境变量：
+
+| 环境变量 | 说明 | 示例 |
+|---|---|---|
+| `CUR_TABLE` | 客户 CUR 表（库.表） | `customer_cur_data.customer_all` |
+| `PARTITION_STYLE` | 分区形态：`year-month` / `billing-period` / `flat` | `year-month` |
+| `ATHENA_WORKGROUP` / `ATHENA_OUTPUT` | 查询 workgroup / 结果位置（空=随 workgroup） | `primary` |
+| `CUR_ACCESS_KEY_ID/SECRET/TOKEN` | 跨账号查询时注入临时凭据；同账号留空走执行角色 | — |
+
+> ⚠️ 口径提示：45 个工具的 SQL 按参考客户（多 payer、EDP、SP/ODCR 重度使用）调校。基础工具（总额/趋势/维度拆分/SP/RI/扩展支持）换表即用；个别派生口径（LOB 标签映射、SP per_vcpu_rate 的历史窗口）建议按客户的 CUR 结构核对后再交付。
+
+### 14.3 NotiOps 侧接线（两条部署路径都已入 IaC，只需给两个值）
+
+需要给的就是**两个值**，且必须成对：Function URL 里不含函数 ARN，而 `lambda:InvokeFunctionUrl` 只能按资源授权 —— 只填一半会部署出一个「看起来装好了、每次调用 403」的数据源，而 403 只在 CloudTrail 里看得到。所以两条路径都在**动手之前**拦住这种半配置。
+
+| | 怎么给 | 拦「只填一半」的位置 |
+|---|---|---|
+| 方式 A（一键 CFN） | 参数页 → *Optional: your own CUR data source* → `CostAgentMcpUrl` + `CostAgentFunctionArn`（可在首次部署后更新栈再填） | `CostAgentArnRequiredWithUrl`（CfnRule，参数校验阶段，栈根本不会创建） |
+| 方式 B（setup.sh） | `COST_AGENT_MCP_URL=... COST_AGENT_FN_ARN=... ./setup.sh` | setup.sh 的前置校验（在 20 分钟的 agent 部署**之前**） |
+
+给了以后，两条路径自动落地全部四件（不再有手工步骤）：
+
+1. **Agent（聊天问答）**：runtime 环境变量 `COST_AGENT_MCP_URL` + 执行角色的 `InvokeCostAgentMcp`（`lambda:InvokeFunctionUrl`）。
+2. **BFF（仪表盘数据）**：同名环境变量 + `InvokeCostAgentMcp` + 缓存前缀的 S3 读写（`CurDashCache`）。
+3. **缓存生命周期**：数据桶 `cur-dash-cache/` 前缀 3 天过期。
+4. **每日预热**：EventBridge 规则 `CurDashWarmup`。
+
+> ⚠️ **升级注意**：这些以前是手工配的（v1.0.x 的旧 §14.3/§14.4）。现在 CDK **拥有** BFF 的环境变量与那条规则 —— 下一次部署会用参数值**覆盖**你手工设的 `COST_AGENT_MCP_URL`。所以升级时要把 URL 与函数 ARN 一起传给 setup.sh（或填进一键部署的参数），否则手工配置会被清成空 → 4 个 sheet 静默消失（能力节点被 `requiresEnv` 摘掉）。手工建的 EventBridge 规则请删掉，避免每天预热两次。
+
+**IAM 双向**：identity 侧两条角色的授权已入 IaC；**resource policy 仍在 cost-agent 那一侧**（那是客户自己的部署，不在本仓库里）—— 要允许上面两个角色调用它的 Function URL。实测坑：identity policy **不能**带 `lambda:FunctionUrlAuthType` Condition，带了恒 403。
+
+### 14.4 数据源挂了会怎样（降级链，绝不阻断整个工具）
+
+这是个**外部**依赖，所以按四层失败安全设计，且降级一律**明说**（静默降级比报错更危险 —— CE 的聚合数字冒充 CUR 的行级数字，会让客户拿错数去对账）：
+
+| 层 | 场景 | 客户看到 |
+|---|---|---|
+| 部署期 | 没填参数 | 这项能力**按设计不存在**：4 个 `nav:finops:cur-*` 节点被 `requiresEnv` 摘掉（不会出现点了没反应的菜单）；agent 侧一个工具都不挂 |
+| BFF | MCP 不可达/超时 | 只有那 4 张表显示「暂时不可用」（HTTP 200 + `available:false`），页面其余部分照常 |
+| Agent | MCP 不可达/超时 | 回答照出：**客户 CUR（行级）→ CE MCP（聚合，部署账号）→ `call_aws` / `aws_readonly`**，并明确告知换了数据源与口径 |
+| Agent | 连续 2 次传输层失败 | 熔断 10 分钟内直接快速失败（不再每轮干等 300s —— 那才是真正的"整个工具被 block"） |
+
+单个工具的**逻辑错**（参数不对）不计入熔断：数据源还活着，让模型改参数重试。判据：`tests/test_cost_agent_mcp_failsoft.py`、`bff/web-chat/tests/cur_dashboard_failsoft.test.mjs`。
+
+预热动作：BFF 收到 `{"source":"notiops.curdash.warmup"}` 后以默认时间窗（T-33 ~ T-3，CUR 最近 3 天未出全故封窗）并发查 4 个 panel 写入当天缓存；用户白天首次打开即秒出。cron 是 `cron(0 22 * * ? *)`（UTC 22:00 = 北京 6:00）——**缓存 key 的日期基准是 UTC+8**，改时区要两处一起改。验证：手动 `aws lambda invoke --invocation-type Event` 发同一 payload，日志应出现 `curdash warmup: cube:fulfilled credit:fulfilled es:fulfilled sp:fulfilled`。
+
+### 14.5 常见问题
+
+| 症状 | 原因 |
+|---|---|
+| 4 个 sheet 显示"数据源未配置" | BFF 缺 `COST_AGENT_MCP_URL` 或 IAM 未通 |
+| 调 MCP 持续 403 | identity policy 带了 FunctionUrlAuthType Condition（去掉）；或 resource policy 没加调用方角色 |
+| 每天首开仍加载 1-5 分钟 | 预热没跑或时区错位——缓存 key 的日期基准是 UTC+8，EventBridge cron 与之配套；查 BFF 日志的 warmup 行 |
+| warmup 全 rejected | 多为 MCP 侧 Athena 失败（跨账号凭据过期等），BFF 日志有每个 panel 的 reason |

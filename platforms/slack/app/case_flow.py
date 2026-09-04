@@ -33,22 +33,24 @@ this bot ships into is English by default — feishu defaults to "zh".
 from __future__ import annotations
 
 import json as _json
-import os
 import logging
 import threading
 
 from core import case_analyze
+from core import case_classifier
 from core import case_management
 from core import ddb_state
 from core import i18n
 from core import support_logic
 from core import webhook_dispatch  # noqa: F401 — reserved for future skill paths
-from shared.devops_agent import create_investigation
 from core.case_management import CaseSummary, Communication
 from core.support_logic import (
-    DEFAULT_LANGUAGE, DEFAULT_SEVERITY,
+    DEFAULT_ISSUE_TYPE, DEFAULT_LANGUAGE, DEFAULT_SEVERITY,
+    ISSUE_TYPE_CODES,
     LANGUAGE_CODES, LANGUAGE_LABELS,
     SEVERITY_CODES,
+    issue_type_label,
+    issue_type_labels,
     severity_label,
     severity_labels,
 )
@@ -304,6 +306,16 @@ def handle_action(action_id: str, body: dict, client) -> None:
     # rest of the router can match against the canonical names.
     base_action = action_id.split(":", 1)[0]
 
+    # 「同步到案例」的实现在 support_flow（它才有 support context 那套读写），
+    # 但 `^case_` 的分流两条路径（`main.py` 长连接 / `lambda_worker.py` webhook）
+    # 都先命中这里 —— 所以 support_flow 那个分支**在两条路径上都到不了**，按钮
+    # 点了完全没反应、也不报错。在这里转发过去，两条路径一次修好、不产生行为差异。
+    # 延迟 import：support_flow 在模块顶部 import 了本模块，顶层 import 会成环。
+    if base_action == "case_sync_report":
+        from platforms.slack.app import support_flow
+        support_flow.handle_action("case_sync_report", body, client)
+        return
+
     # Locale priority: per-action JSON value (preferred — preserves
     # whichever locale we rendered the card in) > thread/dm lock > en.
     locale = _locale_from_action(action_value)
@@ -460,6 +472,18 @@ def _on_create_submit(ack, body: dict, view: dict, client) -> None:
     severity = select("severity_block", "severity_select") or DEFAULT_SEVERITY
     language = select("language_block", "language_select") or DEFAULT_LANGUAGE
     dispatch_choice = select("dispatch_block", "dispatch_select") or "no"
+    # 服务名称 / 类别 / 案例类型（2026-09-03 补前两项、2026-09-04 补类别，与 web 端案例
+    # 面板对齐）。服务名与类别留空 = 交给分类器；案例类型总有默认值
+    # （`initial_value=DEFAULT_ISSUE_TYPE`），拿不到就退回默认，**不校验报错** ——
+    # 这几项都不该拦住用户开案例。类别匹配不上也不拦，改在结果卡上如实说明。
+    service_text = _picked_service_code(
+        select("service_select_block", "service_select"),
+        field("service_block", "service_text"))
+    category_text = field("category_block", "category_text").strip()
+    issue_type = select("issue_type_block", "issue_type_select") \
+        or DEFAULT_ISSUE_TYPE
+    if issue_type not in ISSUE_TYPE_CODES:
+        issue_type = DEFAULT_ISSUE_TYPE
 
     pm_raw = view.get("private_metadata") or "{}"
     try:
@@ -533,6 +557,8 @@ def _on_create_submit(ack, body: dict, view: dict, client) -> None:
         target=_create_case_worker,
         args=(client, channel_id, thread_ts, ctx, severity, language, extra,
               subject, body_text, dispatch_choice == "with_dispatch", locale),
+        kwargs={"service_text": service_text, "issue_type": issue_type,
+                "category_text": category_text},
         daemon=True,
     ).start()
 
@@ -541,11 +567,15 @@ def _create_case_worker(client, channel_id: str, thread_ts: str, ctx: dict,
                         severity: str, language: str, extra: str,
                         subject: str, body_text: str,
                         dispatch_after: bool,
-                        locale: str = "en") -> None:
+                        locale: str = "en", *,
+                        service_text: str = "", issue_type: str = "",
+                        category_text: str = "") -> None:
     try:
         result = support_logic.create_case(
             ctx, platform=PLATFORM, severity=severity, language=language,
             extra=extra, operator_name="",
+            service_text=service_text, issue_type=issue_type,
+            category_text=category_text,
         )
         result_blocks = _create_result_blocks(
             result, severity, language, subject, body_text, dispatch_after,
@@ -688,6 +718,20 @@ def _dispatch_for_case(client, channel_id: str, thread_ts: str,
                        user_id: str, display_id: str,
                        subject: str, body_text: str,
                        locale: str = "en") -> None:
+    """「开案例 + 起调查」的调查那一半。飞书侧的对位实现是
+    `platforms/feishu/app/case_flow.py::_dispatch_for_case`，两边必须对等。
+
+    ── 2026-09-03：从 Fargate 那条老路径切到 IM Lambda 路径 ─────────────────────
+    改动的理由与飞书侧逐字相同（`link_incident` 要求先有 `event#` 行、派发完只有一条
+    纯文本没有进度卡、依赖 `DEFAULT_INVESTIGATION_ACCOUNT_ID` 没配就静默跳过整个调查）。
+    现在与 `platforms/slack/caps.py::investigate` 完全同款：`start_investigation`
+    → 发 `dispatch_blocks` → `put_im_task`（进度 Lambda 每分钟 `chat.update` 这条）
+    → `link_im_investigation`（最终报告卡回到这个 thread）。
+
+    `incident_id` 仍然是 `slack-case-<display_id>`：report_handler 的
+    `_extract_case_display_id()` 靠这个形状认出「这次调查是某个案例带起来的」，从而在
+    报告卡上给出「同步到案例」按钮。**别改成 `slack-<event_id>`**。
+    """
     if not channel_id or not display_id:
         return
     if not support_logic.claim_inflight(
@@ -697,6 +741,9 @@ def _dispatch_for_case(client, channel_id: str, thread_ts: str,
                 channel=channel_id, user=user_id,
                 text=i18n.t("case.dispatch.processing_ephemeral", locale))
         return
+    from core import devops_agent
+    from platforms.slack import im_blocks
+
     incident_id = f"{PLATFORM}-case-{display_id}"
     user_text = (
         f"AWS Support case {display_id} was just opened with subject:\n"
@@ -705,48 +752,193 @@ def _dispatch_for_case(client, channel_id: str, thread_ts: str,
         f"Please investigate this issue in parallel with AWS Support so the "
         f"customer gets a faster diagnostic. Reference the case as needed."
     )
-    synth_event_id = f"case-{display_id}"
-    is_new = ddb_state.put_new_event(synth_event_id, platform=PLATFORM,
-                                     chat_id=channel_id,
-                                     root_message_id=thread_ts or "",
-                                     user_id=user_id, raw_text=user_text)
-    if not is_new:
-        client.chat_postEphemeral(
-            channel=channel_id, user=user_id or "U000",
-            text=i18n.t("case.dispatch.already_dispatched_ephemeral", locale))
-        return
-    # Dispatch via STS AssumeRole + create_investigation (post-fusion primary
-    # path). incident_id gets embedded as <!--notiops:...--> in the description
-    # so report-handler can recover routing context from journal records.
-    target_account_id = os.environ.get("DEFAULT_INVESTIGATION_ACCOUNT_ID", "")
-    if not target_account_id:
-        logger.error("DEFAULT_INVESTIGATION_ACCOUNT_ID not configured; "
-                     "case %s investigation skipped", display_id)
-        return
-    raw_result = create_investigation(
-        title=f"[{PLATFORM.capitalize()}#case-{display_id}] {subject[:50]}",
-        description=user_text,
-        priority="MEDIUM",
-        source=f"{PLATFORM}-case-create-dispatch",
-        target_account_id=target_account_id,
-        incident_id=incident_id,
+    # 幂等：一个案例只起一次调查。`imtask#` 那行的 TTL 覆盖整个调查生命周期，比
+    # `claim_inflight` 的短时效在飞（几秒）更可靠 —— 用户隔一分钟再点一次也拦得住。
+    try:
+        if ddb_state.get_im_task(incident_id):
+            client.chat_postEphemeral(
+                channel=channel_id, user=user_id or "U000",
+                text=i18n.t("case.dispatch.already_dispatched_ephemeral", locale))
+            return
+    except Exception as e:                        # noqa: BLE001
+        # 查不到就当没派过 —— 宁可重复派一次，也不能因为 DDB 抖动就把调查吞掉。
+        logger.warning("get_im_task for case dispatch failed: %s", type(e).__name__)
+
+    title = f"[{PLATFORM.capitalize()}#case-{display_id}] {subject[:50]}"
+    raw_result = devops_agent.start_investigation(
+        title=title, description=user_text, priority="MEDIUM",
+        source=f"notiops-im-{PLATFORM}-case",
     )
-    if not raw_result.get("success"):
+    if raw_result.get("error"):
         logger.error("Investigation dispatch for case %s failed: %s",
-                     display_id, raw_result.get("error"))
+                     display_id, raw_result["error"])
+        if user_id:
+            client.chat_postEphemeral(
+                channel=channel_id, user=user_id,
+                text=str(raw_result.get("message") or raw_result["error"]))
         return
-    ddb_state.link_incident(synth_event_id, incident_id, platform=PLATFORM,
-                            task_id=raw_result.get("task_id"))
-    client.chat_postMessage(
-        channel=channel_id, thread_ts=thread_ts or None,
-        text=i18n.t("case.dispatch.dispatched_inline", locale,
-                    display_id=display_id),
-    )
+
+    task_id = raw_result.get("task_id") or ""
+    home = raw_result.get("console_home") or ""
+    deep = raw_result.get("console_url") or ""
+
+    # 进度消息（取代原来那条纯文本）—— 与 `/investigate` 那条路径同一套 blocks。
+    body = i18n.t("case.dispatch.dispatched_inline", locale,
+                  display_id=display_id)
+    card_ts = ""
+    try:
+        resp = client.chat_postMessage(
+            channel=channel_id, thread_ts=thread_ts or None, text=body,
+            blocks=im_blocks.dispatch_blocks(body, locale, deep_link=deep,
+                                             home=home, state="dispatched"))
+        card_ts = im_blocks.ts_of(resp)
+    except Exception as e:                        # noqa: BLE001
+        logger.error("case dispatch blocks post failed: %s", type(e).__name__)
+    if not card_ts:
+        # 消息没发出去 → 没有 update 落点。**不落 `imtask#`**（否则进度 Lambda 会对着
+        # 空 ts 重试 30 分钟）。调查本身已经起来了，退纯文本把这件事说清楚。
+        logger.error("case %s: dispatch blocks failed; falling back to text",
+                     display_id)
+        line = body
+        if deep:
+            line += f"\n{i18n.t('progress.btn.open_link', locale)}: {deep}"
+        elif home:
+            line += f"\n{i18n.t('progress.btn.open_home', locale)}: {home}"
+        try:
+            client.chat_postMessage(channel=channel_id,
+                                    thread_ts=thread_ts or None, text=line)
+        except Exception as e:                    # noqa: BLE001
+            logger.error("case dispatch text fallback failed: %s", type(e).__name__)
+    else:
+        ddb_state.put_im_task(
+            incident_id,
+            platform=PLATFORM, chat_id=channel_id, message_id=card_ts,
+            locale=locale, account_id=raw_result.get("account_id") or "",
+            task_id=task_id,
+            execution_id=raw_result.get("execution_id") or "",
+            agent_space_id=raw_result.get("agent_space_id") or "",
+            user_id=user_id, title=title,
+            console_url=deep, console_home=home,
+        )
+
+    # 第二行路由：最终报告卡走 EventBridge → notiops-devops-callback →
+    # report_handler，它只认 `incident#` / `task#`。少了这一步，进度消息会一路刷到
+    # 「已完成」，但报告只躺在 S3 里 —— 而且案例流程还会因此失去「同步到案例」按钮。
+    try:
+        ddb_state.link_im_investigation(
+            incident_id, task_id, platform=PLATFORM, chat_id=channel_id,
+            root_message_id=card_ts or (thread_ts or ""), locale=locale,
+            user_id=user_id, raw_text=user_text[:1000],
+        )
+    except Exception as e:                        # noqa: BLE001
+        logger.warning("link_im_investigation for case dispatch failed: %s",
+                       type(e).__name__)
+
+    logger.info("Dispatched investigation for case %s incident_id=%s task_id=%s",
+                display_id, incident_id, task_id)
 
 
 # ===========================================================================
 # View builders (modals)
 # ===========================================================================
+#: 下拉里"不指定，你们自己判断"那一项的值。Slack 不接受空 `value`，所以用哨兵；
+#: 提交时 `_picked_service_code()` 把它折回空串。
+SERVICE_AUTO = "__auto__"
+
+
+def _service_select_blocks(locale: str) -> list[dict]:
+    """常用服务下拉（拿不到目录就换成一句说明）。
+
+    ⚠️ 目录读不到时**不给空下拉**：一个只有"自动判断"一项的选择器看着像功能坏了，
+    而客户其实还有自由文本那条路。所以这里换成一条 context 说明 —— 不许静默少一个控件。
+    """
+    try:
+        services = case_classifier.popular_services()
+    except Exception as e:                            # noqa: BLE001
+        # 面板不能因为拉目录失败就打不开 —— 案例是客户在出事时才开的东西。
+        logger.warning("popular_services failed: %s", type(e).__name__)
+        services = []
+    # `blocks.static_select` 会把 value 截到 75 字符 —— 截断过的 code 一定被 CreateCase
+    # 拒收，宁可这条不进下拉（自由文本照样能填）。
+    options = [(s["code"], s["name"]) for s in services if len(s["code"]) <= 75]
+    if not options:
+        return [blocks.context(
+            i18n.t("case.create.service_catalog_unavailable", locale))]
+    return [blocks.static_select(
+        i18n.t("case.create.service_select_label_short", locale),
+        "service_select",
+        options=[(SERVICE_AUTO,
+                  i18n.t("case.create.service_select_auto", locale)), *options],
+        initial_value=SERVICE_AUTO,
+        block_id="service_select_block",
+        placeholder=i18n.t("case.create.service_select_placeholder", locale),
+    )]
+
+
+def _picked_service_code(dropdown: str, free_text: str) -> str:
+    """下拉优先、自由文本兜底 —— 汇成一个交给 `resolve_service` 的字符串。
+
+    下拉给的是真实 code（走 `resolve_service` 第 1 级精确命中），自由文本走模糊反查。
+    两个都空 = 分类器自动判断（历史行为）。
+    """
+    picked = (dropdown or "").strip()
+    if picked and picked != SERVICE_AUTO:
+        return picked
+    return (free_text or "").strip()
+
+
+def service_and_type_blocks(locale: str) -> list[dict]:
+    """「服务名称」+「类别」+「案例类型」这一组控件 —— **两个开案例面板共用同一份**。
+
+    为什么抽出来:开案例有**两个**入口 —— `/案例` 面板(`_build_create_view`)和调查报告卡
+    上的「🆘 Escalate to AWS Support」(`support_flow._build_form_view`)。这两项当初只加在
+    前一个上,后一个就少了 —— 复制一份的话下次改动照样长歪(选项不同 / 默认值不同 /
+    目录挂了的退化行为不同),而这种不一致**不报错**,只是同一个操作从两个入口进去开出
+    不同的案例。所以两边都调这一个函数,并有测试钉住"两个面板都调了它"。
+
+    四件东西按客户填写顺序:常用服务下拉 → 长尾自由文本 → 类别 → 案例类型。
+    「类别」是**手打**而不是像 web 那样跟着服务联动的下拉 —— 联动要在面板中途回一趟
+    服务端重绘,Slack 做得到(modal 的 `block_actions` 带着整个 `state.values`),飞书
+    做不到(表单容器的数据只在点提交时才回调,中途重绘会清空已填内容)。两端统一用
+    "手打 + 服务端在该服务名下反查",理由与实测数据见
+    `core.case_classifier.resolve_category_detail`。
+    """
+    it_labels = issue_type_labels(locale)
+    return [
+        # 下拉里的 value 是**真实 code**（`popular_services()` 从现网目录反查，见那边的
+        # 注释），所以提交时原样交给 `resolve_service` 就能精确命中；目录读不到时
+        # `_service_select_blocks` 返回一条说明而不是空下拉。
+        *_service_select_blocks(locale),
+        blocks.text_input(
+            i18n.t("case.create.service_label_short", locale),
+            "service_text", block_id="service_block",
+            placeholder=i18n.t("case.create.service_placeholder_short", locale),
+            max_length=100, optional=True,
+        ),
+        # 类别 —— 留空就按服务挑一个通用类别（`resolve_category_detail`），填了就在
+        # **该服务名下**反查，所以怎么填都不可能拼出 CreateCase 拒收的非法组合。
+        blocks.text_input(
+            i18n.t("case.create.category_label_short", locale),
+            "category_text", block_id="category_block",
+            placeholder=i18n.t("case.create.category_placeholder_short", locale),
+            max_length=100, optional=True,
+        ),
+        # 案例类型 —— 与 web 端案例面板同三项（`core.support_logic.ISSUE_TYPE_CODES`）。
+        blocks.static_select(
+            i18n.t("case.create.issue_type_label_short", locale),
+            "issue_type_select",
+            options=[(c, it_labels[c]) for c in ISSUE_TYPE_CODES],
+            initial_value=DEFAULT_ISSUE_TYPE,
+            block_id="issue_type_block",
+        ),
+    ]
+
+
+def picked_service_code(dropdown: str, free_text: str) -> str:
+    """`_picked_service_code` 的公开别名 —— 给另一个面板（`support_flow`）用。"""
+    return _picked_service_code(dropdown, free_text)
+
+
 def _build_create_view(*, channel_id: str, thread_ts: str,
                        initial_subject: str, locale: str = "en") -> dict:
     sev_labels = severity_labels(locale)
@@ -792,6 +984,9 @@ def _build_create_view(*, channel_id: str, thread_ts: str,
                                    locale),
                 multiline=True, max_length=1000,
             ),
+            # 服务名称 + 案例类型 —— 与调查报告卡上的「🆘 Escalate」面板**共用**同一份
+            # 控件（`service_and_type_blocks`），两个入口不会长歪。
+            *service_and_type_blocks(locale),
             blocks.static_select(
                 i18n.t("case.create.severity_label_short", locale),
                 "severity_select",
@@ -1115,9 +1310,24 @@ def _create_result_blocks(result: support_logic.CaseResult,
         classification_block = i18n.t(
             "case.create.classification_lines", locale,
             service=cls.get("serviceCode", ""),
-            category=cls.get("categoryCode", ""),
-            issue_type=cls.get("issueType", ""),
+            # 类别后面缀"你指定/自动挑选" —— 光印一个 code 用户分不清是谁定的。
+            category=support_logic.category_display(cls, locale),
+            # 显示本地化标签而不是 `technical` 这种 API code —— 用户在面板里选的是标签。
+            issue_type=issue_type_label(cls.get("issueType", ""), locale),
         )
+    # 用户填了服务名但目录里没有 → **必须说出来**。静默忽略最坑：用户以为自己指定了
+    # 服务，案例却落在分类器挑的（可能是 general-info）那条上。
+    if cls.get("serviceUnmatched"):
+        classification_block += i18n.t(
+            "case.create.service_unmatched_line", locale,
+            text=blocks.escape_mrkdwn(str(cls["serviceUnmatched"])))
+    # 类别同理：填了但这个服务名下没有 → 说清用的是哪个，别让人以为按自己填的走了。
+    if cls.get("categoryUnmatched"):
+        classification_block += i18n.t(
+            "case.create.category_unmatched_line", locale,
+            text=blocks.escape_mrkdwn(str(cls["categoryUnmatched"])),
+            service=cls.get("serviceCode", ""),
+            category=cls.get("categoryCode", ""))
     subject_line = (
         i18n.t("case.create.success_subject_line", locale,
                subject=blocks.escape_mrkdwn(subject.strip()))
@@ -1137,34 +1347,22 @@ def _create_result_blocks(result: support_logic.CaseResult,
                    language=LANGUAGE_LABELS.get(language, language),
                    classification=classification_block)),
     ]
+    # ⚠️ No "start an Agent investigation" button here any more (removed
+    # 2026-09-02, same change as the Feishu twin in
+    # platforms/feishu/app/case_flow.py). Opening a case and investigating are
+    # two separate decisions; the button turned the success card of the first
+    # into a nudge for the second. `case_create_dispatch_after` stays wired up
+    # in the action handler so already-posted cards don't dead-click.
     if dispatched:
         out.append(blocks.section(
             i18n.t("case.create.dispatched_section", locale)))
-        out.append(blocks.actions(
-            blocks.button(i18n.t("case.create.btn.open_case_short", locale),
-                          "open_case_url",
-                          url=result.case_url, style="primary"),
-            blocks.button(i18n.t("case.create.btn.my_cases_short", locale),
-                          "case_list_open"),
-        ))
-    else:
-        out.append(blocks.section(
-            i18n.t("case.create.dispatch_prompt_section", locale)))
-        action_val = _json.dumps({
-            "display_id": result.display_id,
-            "subject": subject[:200],
-            "body": body_text[:1000],
-            "locale": locale,
-        }, ensure_ascii=False)
-        out.append(blocks.actions(
-            blocks.button(i18n.t("case.create.btn.start_agent_short", locale),
-                          "case_create_dispatch_after",
-                          value=action_val, style="primary"),
-            blocks.button(i18n.t("case.create.btn.open_case_short", locale),
-                          "open_case_url", url=result.case_url),
-            blocks.button(i18n.t("case.create.btn.my_cases_short", locale),
-                          "case_list_open"),
-        ))
+    out.append(blocks.actions(
+        blocks.button(i18n.t("case.create.btn.open_case_short", locale),
+                      "open_case_url",
+                      url=result.case_url, style="primary"),
+        blocks.button(i18n.t("case.create.btn.my_cases_short", locale),
+                      "case_list_open"),
+    ))
     return out
 
 

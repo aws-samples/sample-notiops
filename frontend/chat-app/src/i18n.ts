@@ -18,8 +18,584 @@ export const STRINGS: Dict = {
   "topic.general": { zh: "通用", en: "General" },
   "whatsnew.card": { zh: "What's New", en: "What's New" },
   "whatsnew.cardSub": { zh: "AWS 最新发布 · 与你的业务结合", en: "Latest AWS launches · tied to your workloads" },
+  // ⚠️ 下面这条是**旧的外链入口**（外链到 idle 控制台），由
+  //    `Sidebar.tsx` 的 `SHOW_INSPECTIONS = false` 关着，代码保留未删。
+  //    站内的资源巡检看板用 `insp.*` 命名空间，**不要复用这条** ——
+  //    复用会让「外链到控制台」与「站内看板」共用一个文案，
+  //    将来恢复外链时两个入口显示同一个名字。
   "nav.inspections": { zh: "巡检 & 报告", en: "Inspections & reports" },
   "nav.admin": { zh: "管理", en: "Admin" },
+
+  // ── 资源巡检看板（R10.9）──────────────────────────────
+  // 导航与页签
+  "insp.title": { zh: "资源巡检", en: "Resource Inspection" },
+  /**
+   * 默认落地页。**「待处置」而不是「总览」** —— 客户打开看板要回答的是
+   * 「今天我要处置什么」，而总览回答的是「巡检系统本身正常吗」。
+   */
+  "insp.tab.triage": { zh: "待处置", en: "To act on" },
+  /**
+   * ⚠️ 导航里已经没有这一项了（内容进了待处置页的「系统状态」折叠区），
+   * 但**保留这个 key** —— 系统状态区的标题与 IM 深链 `?tab=overview`
+   * 的兼容映射还引用它。删了会让那里显示 `insp.tab.overview` 字面量。
+   */
+  "insp.tab.overview": { zh: "巡检总览", en: "Overview" },
+  "insp.tab.highLoad": { zh: "高负载", en: "High Load" },
+  "insp.tab.idle": { zh: "闲置与成本", en: "Idle & Cost" },
+  // 「结构性风险」→「配置检查」（2026-08-25）。客户原话：「我也没有要结构性
+  // 风险，不知道这个是做什么的」—— 而这一页查的就是**配置**（证书临期 /
+  // 引擎 EOL / 备份未开 / 单 AZ / gp2），不看任何指标。
+  // 「结构性」是我们内部的分类词，客户词汇表里没有它。
+  "insp.tab.structural": { zh: "配置检查", en: "Config Checks" },
+  "insp.tab.scope": { zh: "巡检范围", en: "Scope" },
+  "insp.tab.config": { zh: "阈值与定时", en: "Thresholds & Schedule" },
+  "insp.group.findings": { zh: "巡检发现", en: "Findings" },
+  "insp.group.settings": { zh: "配置", en: "Settings" },
+
+  // KPI 卡
+  "insp.kpi.total": { zh: "风险总数", en: "Total findings" },
+  "insp.kpi.lastRun": { zh: "最近巡检", en: "Last run" },
+  "insp.kpi.completeness": { zh: "采集完整度", en: "Data completeness" },
+  "insp.kpi.noAnalysis": { zh: "未做根因分析", en: "Without analysis" },
+  "insp.kpi.vsPrev": { zh: "较上一轮", en: "vs previous run" },
+
+  // 严重度（与后端 Severity 四值一一对应）
+  "insp.sev.CRITICAL": { zh: "紧急", en: "Critical" },
+  "insp.sev.HIGH": { zh: "高", en: "High" },
+  "insp.sev.MEDIUM": { zh: "中", en: "Medium" },
+  "insp.sev.INFO": { zh: "提示", en: "Info" },
+
+  // finding 状态机四态
+  "insp.state.new": { zh: "新增", en: "New" },
+  "insp.state.active": { zh: "持续", en: "Active" },
+  "insp.state.resolving": { zh: "缓解中", en: "Resolving" },
+  "insp.state.resolved": { zh: "已解决", en: "Resolved" },
+  // 🔴 后端状态机有**五**个态（`FindingState`），这里原来只登记了四个 ——
+  //    `chronic` 的卡片徽章上直接印出 `insp.state.chronic` 这串 key 给客户看。
+  //    `t()` 找不到键就返回键名本身，不抛不告警。
+  //
+  // ⚠️ 这不是 `check_frontend_keys` 能抓的：key 是从后端枚举**动态拼**的
+  //    （`t(\`insp.state.${f.state}\`)`），静态扫不到。所以另有一条枚举一致性
+  //    断言钉住「五个态都有文案」（见 inspection.test.ts）。
+  //
+  // ⚠️ chronic 恰恰是最需要解释的那一态：本轮未命中但水位没回健康区，
+  //    卡片上同时挂着「数据截至 X 天前」的琥珀标 —— 而客户看到的是一行代码。
+  "insp.state.chronic": { zh: "长期高位", en: "Chronic" },
+  // 判读回来了（有正文）但没解析出结论。
+  // 🔴 原来这种情况卡片上那一行整个消失 —— 既没有「判读结论」也没有「判读缺失」，
+  //    而 FindingCard 自己写着「必须二者之一，都不显示会让『DA 说没问题』与
+  //    『判读没回来』长得一样（R12.4）」。
+  "insp.degraded.partialNoVerdict": {
+    zh: "已有判读，但没解析出结论 —— 点「详情」看全文",
+    en: "Analysis returned but no verdict was parsed - open details for the full text",
+  },
+  // 🔴 判读**回来了但是空的** —— 与「还在路上」必须分开。
+  //    `callback_apply.py` 对 EMPTY / missing_section 只写 parse_status，
+  //    不写 body，于是「da_task_id 有、da_body 空」这个组合会**永久**存在。
+  //    上一版的判据是 `dispatched && !hasJudgment` → 恒真 → 永远显示
+  //    蓝色「1~3 分钟后回来」，客户一直刷新等一个不会来的东西。
+  "insp.judge.failed": {
+    zh: "判读已返回但没有内容 —— 不会再变了，需要重新派发",
+    en: "The analysis came back empty; it will not change - dispatch again",
+  },
+  // 🔴 有正文但解析没对上号 —— 那段正文可能是**同批别的 finding** 的分析
+  //    （一个 task 最多装 6 条，parse_failed 时挂的是整份报告原文）。
+  //    不标注就等于宣称它是本条的结论。
+  // ⚠️ 这里**不要**写 markdown 的 `**` —— 它渲染在 `Alert` 的 children 里，
+  //    是纯文本，星号会字面显示给客户看。
+  "insp.judge.rawWarning": {
+    zh: "下面这段是整份报告原文，没能按 finding 切开 —— 它可能包含同一批"
+      + "其它资源的分析，不要当成这一条的结论。",
+    en: "The text below is the raw report; it could not be split per finding, "
+      + "so it may describe other resources from the same batch.",
+  },
+  // `da_parse_status` 的四档 + 两个降级原因 → 人话。
+  // ⚠️ 与 `report_parse.ParseStatus` 对齐；认不出的取值原样显示（见
+  //    `format.ts::parseStatusLabel`）。
+  // 🔴 闲置分**判据不足**。与「闲置分很低」必须分开 ——
+  //    后端为此专门把 0 改成了 `None`（`dto.py::IdleScore.available_weight`：
+  //    「0 在排序里等于『完全不闲』——『什么都不知道』被呈现成了『非常确定
+  //    不闲』」），而读侧原来把 `None` 退回灰色的「提示」徽标，
+  //    与低分卡片长得一模一样，那份努力就白费了。
+  //    两者的处置动作完全不同：一个不用管，一个要去查为什么没有指标。
+  "insp.idle.undecided": { zh: "未判定", en: "not scored" },
+  "insp.idle.undecidedWhy": {
+    zh: "监控数据不足，本轮未判定 —— 不是「不闲」，是我们还不知道。"
+      + "去查这台资源的 CloudWatch 指标为什么读不到。",
+    en: "Not enough monitoring data to score this round; this is not "
+      + "a statement that the resource is busy.",
+  },
+  /* ── 7.9a skill 门禁的 8 档降级（D22）───────────────────────────────────
+     真源是后端 `inspection/domain/journal_gate.py::Degradation`。
+     ⚠️ 那边加了新档就要在这里补一条 —— `degradationLabel` 认不出时**原样
+        返回英文枚举**（不返回空串），所以漏了不会白屏，但客户会看到
+        `no_data_access` 这种字。有源码级断言钉住 8 档齐全。
+     🔴 文案要写「下一步去查什么」，不是只翻译枚举名。这几档的价值全在
+        「客户/运维读完知道该动哪里」——「读不到 journal」远不如
+        「无法证明 skill 加载过（可能调查还在跑，也可能是我们权限不足）」。 */
+  // 前四档 ⇒ 判定为**不可信**（trustworthy=false）
+  "insp.gate.skill_not_loaded": {
+    zh: "我们的判读 skill 一份都没加载 —— 结论等于通用 AI 发挥，不是按我们的方法论判的",
+    en: "none of our judgement skills were loaded; the conclusion is generic AI output, not our methodology",
+  },
+  "insp.gate.wrong_skill": {
+    zh: "加载的是另一份判读 skill（派发措辞路由写偏了）—— 用错了方法论",
+    en: "a different judgement skill was loaded (dispatch wording mis-routed); wrong methodology applied",
+  },
+  "insp.gate.no_journal": {
+    zh: "读不到调查日志，无法证明 skill 加载过 —— 可能调查还在跑，也可能是我们权限不足；「无法证明」不等于「没问题」",
+    en: "the investigation journal was unreadable, so skill loading cannot be proven; the run may still be in flight, or our permissions may be insufficient. Unproven is not the same as fine",
+  },
+  "insp.gate.no_data_access": {
+    zh: "AI 拿不到这个账号的数据（Agent Space 少了账号关联）—— 报告格式完好但里面没有真实分析，去管理页把该账号关联进巡检 space",
+    en: "the agent could not read this account's data (the agent space is missing the account association); the report looks complete but contains no real analysis. Link the account in the admin page",
+  },
+  // 后四档：方法论**已生效**，只是有折扣（trustworthy=true）
+  "insp.gate.compaction": {
+    zh: "上下文被压缩过，这批判读有精度损失（载荷偏长时会发生）",
+    en: "the context window was compacted, so this batch lost some precision (happens on long payloads)",
+  },
+  "insp.gate.analysis_gap": {
+    zh: "部分证据拿不到，结论基于不完整的数据（不是什么都拿不到）",
+    en: "some evidence was unavailable, so the conclusion rests on incomplete data (not a total blackout)",
+  },
+  "insp.gate.extra_skill": {
+    zh: "同时还命中了别的 skill（可能是这个账号自己装的）—— 结论的依据混了两套方法论",
+    en: "another skill was also activated (possibly one installed in this account); the conclusion mixes two methodologies",
+  },
+  "insp.gate.parse_failed": {
+    zh: "AI 的输出解析不出来，原文已保留（去查输出是否被截断）",
+    en: "the agent's output could not be parsed; the raw text is kept (check whether the output was truncated)",
+  },
+  /* 两个徽标的**面上文字**。
+     ⚠️ 键名故意用 camelCase：这个前缀下 snake_case 的那些是后端
+        `Degradation` 的枚举值（有 `test_前端的降级码译名没有多余项` 逐个对着
+        后端核）。camelCase = 纯 UI 文案、后端没有对应档。混用大小写风格在
+        这里是**判据的一部分**，不是随手写的。
+     ⚠️ `{n}` 靠 `.replace("{n}", …)` 填，占位符名字改了界面上就显示原文
+        （`insp.warn.dispatchGap` 同套，那条有断言钉着）。 */
+  "insp.gate.badgeUntrusted": {
+    zh: "判读不可信 ⓘ", en: "unverified judgement ⓘ",
+  },
+  "insp.gate.badgeCaveats": {
+    zh: "判读有降级 {n} ⓘ", en: "{n} caveat(s) ⓘ",
+  },
+  /* 开头句 —— 徽标 `title`（悬浮/屏幕阅读器）与详情抽屉的 Alert header
+     共用**同一对键**：两处说的是同一件事，各写一份迟早漂移。
+     ⚠️ 不带结尾冒号：抽屉 header 单独成行用不上，`degradeTitle` 拼接时自己加。 */
+  "insp.gate.headUntrusted": {
+    zh: "这份判读没能证明是按我们的判读方法论做出来的，结论仅供参考",
+    en: "This judgement could not be shown to follow our methodology",
+  },
+  "insp.gate.headDegraded": {
+    zh: "方法论已生效，但这份判读有以下折扣",
+    en: "Methodology applied, with the following caveats",
+  },
+  /* 「实际加载了什么」—— 排查 wrong_skill / skill_not_loaded 的唯一直接线索。
+     空数组说成「一个都没加载」（那正是 skill_not_loaded 的形态），不省略。 */
+  "insp.gate.skillsLoaded": {
+    zh: "实际加载的 skill：{s}", en: "skills actually loaded: {s}",
+  },
+  "insp.gate.skillsNone": {
+    zh: "实际一个判读 skill 都没加载",
+    en: "no judgement skill was loaded at all",
+  },
+  "insp.parse.ok": { zh: "解析正常", en: "parsed cleanly" },
+  "insp.parse.partial": {
+    zh: "只对上了一部分 —— 缺的那几条判读是缺失的，不是「没问题」",
+    en: "only partially matched; the missing ones are missing, not clean",
+  },
+  "insp.parse.parse_failed": {
+    zh: "一节都没对上号（去查 skill 有没有加载 / 输出被截断）",
+    en: "no section matched (check skill loading / truncated output)",
+  },
+  "insp.parse.empty": {
+    zh: "DA 没有返回内容（去查 DA 那侧）",
+    en: "the agent returned nothing (check the agent side)",
+  },
+  "insp.parse.missing_section": {
+    zh: "这一条没有出现在判读里（同批其它条目对上了）",
+    en: "this finding did not appear in the analysis (others in the batch did)",
+  },
+  // 🔴 「本轮被跳过」必须与「跑完了」分开说。后端 try_acquire_run_lock 的条件
+  //    不放行「今天已有成功的一轮」，而跳过是静默的（消息删除、不进 DLQ）。
+  //    原来前端把这种情况显示成绿字「跑完了」—— 客户以为看到的是刚拉的指标。
+  "insp.run.skippedToday": {
+    zh: "本轮被跳过 —— 今天已经有一轮成功的巡检，指标没有重新采集。"
+      + "看板上显示的仍是那一轮的数据。要强制重跑请改用后台触发（或等明天）。",
+    en: "This run was skipped - a successful run already happened today, so "
+      + "metrics were not re-collected. The dashboard still shows that run's "
+      + "data. Use a backend trigger to force a re-run (or wait for tomorrow).",
+  },
+  // 手动一轮会占掉当天的槽位 —— 这件事必须在按钮旁边说清楚。
+  "insp.run.takesTodaySlot": {
+    // ⚠️ 纯文本容器（tooltip），不能用 `**`。
+    zh: "手动一轮会占用今天的巡检槽位：跑完之后当天的定时轮不再执行"
+      + "（调度只看「今天有没有成功的一轮」）。也就是说当天不会有状态机推进、"
+      + "不会判「已解决」、不会推送。"
+      // 🔴 「会派 AI 判读」这半必须说 —— 它花 DA 额度（按秒计费）。
+      //    2026-08-29 之前手动轮**不派** DA（`dry_run` 顺带关掉了它），
+      //    所以客户点完永远看不到根因分析，而界面上不说为什么。现在派了，
+      //    那就必须把成本讲清楚：点一次就是买一次判读。
+      + "会派 AI 判读（按秒计费）。",
+    en: "A manual run takes today's inspection slot: the scheduled run for "
+      + "today will be skipped (scheduling only checks whether a successful run "
+      + "happened today). That means no state-machine progress, no resolved "
+      + "detection and no push for the day. "
+      + "It does dispatch AI judgement (billed per second).",
+  },
+  /* ── 批量触发的护栏（2026-09-01 从五行确认屏压成一行）────────────────────
+     🔴 这一行是这个功能的**唯一**护栏，四件事一件都不能省：
+        ① 会真花钱（GetMetricData 按指标计费 + AI 判读按秒计费）
+        ② 占掉今天的巡检槽位（当天的定时轮不再执行）
+        ③ 撤不回来（后端没有批量取消）
+        ④ 今天已成功跑过的账号会被静默跳过（不重复花钱，也拿不到新数据）
+
+     🔴 为什么从五行压成一行：上一版是「选账号 →『全部账号』→ 第二屏五行
+        说明 → 确认」。客户原话：「我点全部账号后又出来一大堆内容，絮絮叨叨
+        贫死了。能不能别加这么多文字？不要再出现第二步和描述性的大段文字了。」
+        —— 一段没人读的说明等于没有护栏，而它还挡住了下面的账号列表。
+
+     ⚠️ 不用 `**` 加粗：这一行渲染在纯文本容器里（不经过 Message.tsx 那个
+        markdown 渲染器），星号会**字面显示**给客户。
+     ⚠️ 也**不许再加长**。`weekdaysAndBatchRun.render.test.tsx` 同时钉住
+        「四件事都在」和「不超过 80 字、不含换行」—— 两条一起才是这次的要求。 */
+  "insp.run.costLine": {
+    zh: "会真调 GetMetricData 并派 AI 判读（都计费）、占掉今天的巡检槽位、"
+      + "撤不回来；今天已成功跑过的账号会跳过。",
+    en: "Really calls GetMetricData and dispatches AI judgement (both billed), "
+      + "consumes today's slot, cannot be cancelled; accounts that already "
+      + "succeeded today are skipped.",
+  },
+  /* 🔴 「已提交」不能说成「跑完了」。这条路**不轮询**（一个槽位盯不了 N 个
+        账号的 run 行），所以我们只知道 invoke 成功了。提示条那侧也把它映成
+        琥珀而不是绿色 —— 见 `RunPhase` 的 `submitted`。 */
+  "insp.run.allSubmitted": {
+    // ⚠️ 纯文本容器，不能用 `**`（星号会字面显示）。
+    zh: "已提交 {n} 个账号。批量触发不做轮询，这里不显示每个账号的结果 —— "
+      + "几分钟后点右上角「刷新」；想盯住某一个账号，用弹层里那个账号单独点。",
+    en: "Submitted {n} accounts. Per-account results are NOT shown here - "
+      + "batch triggers are not polled. Refresh the dashboard in a few "
+      + "minutes, or trigger a single account to watch it complete.",
+  },
+  /* ── 按需判读（「深入分析」，2026-08-31）────────────────────────────────
+     🔴 这条路是「批量不派、人点了就派」：闲置轮设计上不派 DA
+        （`DETERMINISTIC_RUN_TYPES = {"idle"}`），于是 `inspection-cost-idle`
+        那份 skill 的 idle 那一半成了死代码 —— 而它回答的正是客户唯一真正
+        关心的问题：这台是真闲，还是**有理由地**闲着。 */
+    // 按钮 tooltip。🔴 从 128 字压到一行 —— 没人读 128 字的 tooltip，
+  // 而且它与 `insp.judge.what`（弹窗正文）内容 80% 重复：点一下就看到完整说明，
+  // tooltip 只需要回答「点下去会不会立刻花钱」。
+  "insp.judge.hint": {
+    zh: "派一次 AI 判读（会先确认）",
+    en: "Dispatch an AI review (asks first)",
+  },
+  "insp.judge.ok": {
+    // 成功提示条。1~3 分钟 + 刷新的说明已经在卡片徽章与抽屉那块里了，
+    // 这里只需要回执（task id 是客户去 DA 后台核对的唯一凭据）。
+    zh: "已派发 · task {task}",
+    en: "Dispatched · task {task}",
+  },
+  /* 🔴 已派过时**不给再派一次的机会**（客户明确要的）：重复派发会重复烧 DA
+        额度，而两份判读回填到同一行只会互相覆盖。所以这条文案要说清
+        「等它」而不是「再试」。 */
+  "insp.judge.dispatched": {
+    // ⚠️ 不再说「结论会出现在下方『AI 判读』里」：这块只在**判读还没回来**时
+    //    渲染，那时下方那一节还是空的，指过去反而让人去找。回来之后本块消失、
+    //    正文自然出现在同一位置。
+    zh: "判读已派发，1~3 分钟后回来。点右上角「刷新」查看。",
+    en: "Review dispatched; back in 1-3 min. Use Refresh (top right) to check.",
+  },
+  /* 🔴 列表行上的徽章。客户实测原话：「这里也没有标注出来哪一条 finding
+        触发了深度分析」—— 派发之后列表回到 N 条一模一样的卡片，唯一的痕迹是
+        顶部那条会被关掉的提示条。于是客户不知道派过哪一条，会重复点。 */
+  "insp.judge.badge": { zh: "⏳ 判读中", en: "⏳ Reviewing" },
+  "insp.judge.go": { zh: "派发判读", en: "Dispatch review" },
+  "insp.judge.noteLabel": { zh: "补充背景（可选）", en: "Add context (optional)" },
+  /* 弹窗里「会做什么」那一段。
+     🔴 「在**这个资源所在的账号**里」这半句必须写出来 —— 客户实测时问过
+        「我这个深入分析是在哪个账号内进行的」，而旧实现的答案是「聊天页顶部
+        选择器选的那个账号」，与这条 finding 无关。现在是对的，但那个疑问
+        本身说明这件事不明说就没人知道。 */
+  "insp.judge.what": {
+    // 🔴 从 143 字压到两行。原文把三件事（在哪跑 / 判什么 / 代价）揉成一段
+    //    散文，而弹窗的任务只是「这件事花钱，确认吗」。
+    // ⚠️ 不能用 `**` 加粗 —— 渲染容器是纯文本，星号会字面显示。
+    //    「这个资源所在的账号」也不再是抽象指代：`{where}` 由调用方填成
+    //    真实的「<账号> · <region>」，客户当初问的就是「在哪个账号内进行」。
+    // ⚠️ 「判断是真闲置还是有理由地闲着」后面那四个例子挪进备注框的
+    //    placeholder（那里本来就有同一批词，原来是重复的）。
+    zh: "在 {where} 里跑，判断它是真闲置还是有理由地闲着。\n"
+      + "按秒计费 · 1~3 分钟后回填 · 不能撤回、不能重复派。",
+    en: "Runs in {where}. Decides whether the resource is genuinely idle or "
+      + "idle for a reason.\n"
+      + "Billed per second · lands in 1-3 min · cannot be cancelled or repeated.",
+  },
+  "insp.judge.notePlaceholder": {
+    zh: "例：这台是灾备备库，平时确实没流量／只在月末跑批／缓存刻意保持预热",
+    en: "e.g. this is the DR standby, batch only runs at month end, cache is "
+      + "deliberately kept warm",
+  },
+  /* 🔴 「不是指令」这句必须在。不说的话客户会写「这台没问题别报了」——
+        而严重度是判定层的事。skill 那侧的第 6 条硬边界就是为此加的
+        （它会把这句话当成**待核实的主张**而不是指令），
+        但界面上也要先说清，否则客户以为写了就能关掉这条。 */
+  "insp.judge.noteHint": {
+    // 🔴 从 130 字压到两行（原来这段提示比输入框本身还高）。
+    // ⚠️ 「是背景不是指令」这一句**不能删** —— 不说的话客户会写「这台没问题
+    //    别报了」，然后照样被报，他会认为「填了没用」。但一句话够了，
+    //    不需要解释 skill 那侧怎么处理它。
+    // ⚠️ 不能用 `**`（纯文本容器，星号字面显示）。
+    zh: "写一句「为什么它看起来闲」—— 规则看得出低利用率，看不出原因。\n"
+      + "这是背景不是指令：不会改严重度，也不会让这条消失。",
+    en: "Say WHY it looks idle - the rules see low utilisation, not the reason.\n"
+      + "This is context, not an instruction: it changes neither the severity "
+      + "nor whether the finding shows.",
+  },
+  "insp.scope.neverExpiresNoRenew": {
+    zh: "这条排除永不过期，不需要续期 —— 点续期反而会给它加上 30 天后的到期日",
+    en: "This exclusion never expires; renewing would actually give it a "
+      + "30-day expiry",
+  },
+
+  // finding 字段
+  "insp.field.instance": { zh: "资源", en: "Resource" },
+  "insp.field.metric": { zh: "指标", en: "Metric" },
+  "insp.field.severity": { zh: "严重度", en: "Severity" },
+  "insp.field.daysActive": { zh: "已持续", en: "Active for" },
+  "insp.field.days": { zh: "天", en: "d" },
+  "insp.field.verdict": { zh: "判读结论", en: "Verdict" },
+  "insp.field.savings": { zh: "预计月节省", en: "Est. monthly saving" },
+  "insp.field.firstSeen": { zh: "首次发现", en: "First seen" },
+  "insp.field.region": { zh: "区域", en: "Region" },
+
+  // 判读缺失（对应后端 DegradedReason，标注「判读缺失」是 R12.4 的硬要求）
+  // 🔴 确定性结论（2026-08-31 实机暴露）。闲置轮**不派 DA**，判定是纯计算的
+  //    （CPU 均值 × 权重 + 内存 + 请求数 → 加权分）—— 它有结论。
+  //    此前那个结论不落库，卡片只能显示「判读缺失」、详情里显示红色的
+  //    「读取失败: not_found」，而功能完全正常 ⇒「看起来全坏了」。
+  // ⚠️ 标签刻意**不叫**「AI 判读」——它不是 AI 出的。叫「规则结论」，
+  //    与 DA 那条（`insp.field.verdict`）在视觉上就区分开。
+  "insp.field.ruleVerdict": { zh: "规则结论", en: "Rule-based" },
+
+  // ── DA verdict 的四个取值 → 人话（2026-09-01 客户实测）──
+  //
+  // 🔴 `da_verdict` 是 **skill 输出信封里的机器枚举**
+  //    （`inspection/domain/report_parse.py` 的 `VERDICTS`），而卡片原来直接
+  //    `<b>{f.da_verdict}</b>` 打出来 —— 客户看到的是「判读结论 warm_up」。
+  //    用户原话：「看起来不像是人类可读的词」。
+  //
+  // ⚠️ 键名必须是 `insp.verdict.<枚举值>`，逐字对上后端那四个值。
+  //    `tests/test_inspection_gating.py` 有元断言钉住「四个值都有译名」——
+  //    漏一个的表现就是那一档继续显示英文枚举，而它只在那一档命中时出现
+  //    （最难被发现的那种）。
+  //
+  // ⚠️ 措辞是**结论**而不是形容词，因为它出现在「判读结论 …」后面。
+  //    `expected_behaviour` 不能译成「预期」——「预期行为」才说清了
+  //    「这个闲置/高负载是有原因的，不用动」。
+  "insp.verdict.real_degradation": { zh: "确有劣化", en: "Real degradation" },
+  "insp.verdict.expected_behaviour": { zh: "预期行为", en: "Expected behaviour" },
+  "insp.verdict.warm_up": { zh: "预热期，证据不足", en: "Warm-up, too early" },
+  "insp.verdict.insufficient_evidence": { zh: "证据不足", en: "Insufficient evidence" },
+  "insp.degraded.title": { zh: "判读缺失", en: "Analysis missing" },
+
+  "insp.error.load": { zh: "加载失败", en: "Failed to load" },
+  "insp.error.forbidden": { zh: "没有访问权限", en: "You do not have access" },
+  "insp.retry": { zh: "重试", en: "Retry" },
+
+  // 🔴 派发缺口：有 task 发出去了却没落映射 → 那些判读永久回不来。
+  //    必须能在看板上看见，否则它只表现为「finding 旁边是空的」。
+  "insp.warn.dispatchGap": {
+    zh: "有 {n} 条判读任务已派发但未能关联，其分析结果无法回填",
+    en: "{n} analysis tasks were dispatched but could not be matched back",
+  },
+  // R10.6：明示「另有 N 项未做根因分析」——不显示会让客户以为看板就是全部。
+  "insp.warn.notAnalysed": {
+    zh: "另有 {n} 项未做根因分析",
+    en: "{n} more findings have no root-cause analysis",
+  },
+
+  // 范围与配置
+  "insp.scope.exclusions": { zh: "排除清单", en: "Exclusions" },
+  "insp.scope.targets": { zh: "巡检范围", en: "In scope" },
+  "insp.scope.expiresOn": { zh: "到期", en: "Expires" },
+  "insp.scope.reason": { zh: "原因", en: "Reason" },
+  // ⚠️ 两份清单是**独立**的（R1.2）。UI 必须分开呈现 ——
+  //    合成一份会让客户以为「别报 CPU」等于「别管闲置」。
+  "insp.scope.listHigh": { zh: "高负载轮", en: "High-load run" },
+  "insp.scope.listIdle": { zh: "闲置轮", en: "Idle run" },
+  "insp.config.cron": { zh: "执行时刻", en: "Schedule" },
+  "insp.config.nextRun": { zh: "下一轮", en: "Next run" },
+  // R13.5：改了阈值必须明示「下一轮生效」——否则客户会等着看即时变化。
+  "insp.config.effectiveNext": {
+    zh: "修改在下一轮巡检生效",
+    en: "Changes take effect on the next run",
+  },
+  "insp.config.globalNote": {
+    zh: "执行时刻按巡检类型全局设置，不按账号",
+    en: "The schedule is global per run type, not per account",
+  },
+
+  // ── 判定阈值（R13.4）─────────────────────────────────────────────
+  "insp.rules.title": { zh: "判定阈值", en: "Detection thresholds" },
+  "insp.rules.secThreshold": { zh: "高负载阈值", en: "High-load thresholds" },
+  "insp.rules.secIdle": { zh: "闲置判定", en: "Idle detection" },
+  "insp.rules.secCapacity": { zh: "容量与否决", en: "Capacity & vetoes" },
+  // ⚠️ 与 `insp.tab.structural` 保持同一个词。两处不一致（一处「配置检查」
+  //    一处「结构性风险」）会让客户以为阈值页配的不是那一页的规则。
+  "insp.rules.secStructural": { zh: "配置检查", en: "Config checks" },
+  "insp.rules.default": { zh: "默认", en: "default" },
+  "insp.rules.range": { zh: "范围", en: "range" },
+  "insp.rules.customized": { zh: "已自定义", en: "customized" },
+  "insp.rules.reset": { zh: "恢复默认", en: "Reset to default" },
+  "insp.rules.resetAll": { zh: "全部恢复默认", en: "Reset all" },
+  // 🔴 必须说出来。改阈值不只是「以后按新标准判」——按 R6.9，配置变更会把
+  //    现有 finding 全部 resolve 再按新阈值重建，看板上的数字会变。
+  //    不说的话客户会以为看板出错了。
+  "insp.rules.recountNote": {
+    zh: "改动会在下一轮生效，并按新阈值重新计数现有风险项",
+    en: "Changes apply on the next run and re-count existing findings",
+  },
+  "insp.rules.orNote": {
+    zh: "任一指标越界即判高负载 —— 调高某一项只会让那一项少报",
+    en: "Any single metric over its threshold flags high load",
+  },
+  "insp.rules.andNote": {
+    zh: "须同时满足才算闲置候选 —— 调大任一项都会让更多资源被判闲置",
+    en: "All must hold to flag idle — raising any one flags more resources",
+  },
+  "insp.rules.tagsHint": {
+    zh: "逗号分隔的 tag 值",
+    en: "Comma-separated tag values",
+  },
+  "insp.rules.outOfRange": { zh: "超出允许范围", en: "Out of allowed range" },
+  "insp.rules.noChange": { zh: "没有改动", en: "No changes" },
+  "insp.rules.readOnly": {
+    zh: "你没有改阈值的权限（需要 action:inspection:threshold）",
+    en: "You cannot edit thresholds (needs action:inspection:threshold)",
+  },
+
+  // ── 服务筛选器 ───────────────────────────────────────────────────
+  "insp.rules.filterBy": { zh: "按服务查看", en: "View by service" },
+  "insp.rules.allServices": { zh: "全部", en: "All" },
+  // 🔴 必须说清「筛选器不是作用域」。阈值是全局一份 —— 不说的话客户会以为
+  //    「我只调了 Redis」,而 RDS 也跟着变了,且没有任何运行时信号。
+  "insp.rules.scopeNote": {
+    zh: "阈值是全局共用的一份；选服务只决定显示哪些项，改动会影响所有用到该指标的服务",
+    en: "Thresholds are one shared set. Picking a service only filters what is shown — a change affects every service using that metric",
+  },
+  // ⚠️ 用 `{n}` / `{total}` 占位符而不是把量词拆成独立 key —— 拆开后英文那侧
+  //    的量词会是空串（「项」在英文里不需要），而 i18n lint 要求每个 key 两种
+  //    语言都非空。既有惯例见 `admin.models.matchCount`。
+  "insp.rules.shownOf": { zh: "显示 {n} / 共 {total} 项", en: "Showing {n} of {total}" },
+  "insp.rules.totalOnly": { zh: "共 {total} 项", en: "{total} settings" },
+  "insp.rules.hiddenDirty": {
+    zh: "另有 {n} 项改动在当前筛选之外，保存时一并生效",
+    en: "{n} more pending change(s) outside the current filter will also be saved",
+  },
+  "insp.rules.appliesAll": { zh: "全部服务", en: "All services" },
+  "insp.rules.appliesOnly": { zh: "仅", en: "Only" },
+  // 选了某服务后有些 section 会整段空掉 —— 明示比静默消失好
+  "insp.rules.noneForService": {
+    zh: "该服务没有可调的此类阈值",
+    en: "No thresholds of this kind apply to this service",
+  },
+
+  // ── 写侧────────────────────────────────────────
+  // 通用动作
+  "insp.act.save": { zh: "保存", en: "Save" },
+  "insp.act.saving": { zh: "保存中…", en: "Saving…" },
+  "insp.act.cancel": { zh: "取消", en: "Cancel" },
+  "insp.act.saved": { zh: "已保存", en: "Saved" },
+  "insp.act.failed": { zh: "操作失败", en: "Request failed" },
+
+  // 排除清单写侧
+  "insp.scope.add": { zh: "新增排除", en: "Add exclusion" },
+  "insp.scope.renew": { zh: "续期 30 天", en: "Renew 30d" },
+  // 🔴 「挪出白名单」（2026-09-01）。在这之前清单上唯一的动作是续期，
+  //    于是手滑排除一台生产库之后只能等 30 天过期 —— 而那 30 天里
+  //    「没有告警」会被读成「一切正常」，没有任何运行时信号。
+  //    客户原话：「也没有任何位置让我取消移除。如果用户误操作，
+  //    岂不是要等待 30 天？」
+  // ⚠️ 用「挪出白名单」而不是「删除」：客户自己用的就是这个词，
+  //    而「删除」会让人担心是不是把历史记录也删了。
+  "insp.scope.remove": { zh: "挪出白名单", en: "Remove" },
+  // R1.4：到期条目**保留记录但不生效**。列表里仍在，所以必须打标 ——
+  // 不打标会让「排除还生效着」与「早就过期了」在界面上一模一样。
+  "insp.scope.expired": { zh: "已过期", en: "Expired" },
+  "insp.scope.neverExpires": { zh: "永不过期", en: "Never" },
+  "insp.scope.level": { zh: "层级", en: "Level" },
+  // ⚠️ `level` 是级联排除的判据 —— 缺了它「勾中集群即排除其下成员」会
+  //    静默失效（UI 上是勾选的，成员照样出现）。所以表单里它是必选项。
+  "insp.scope.levelHint": {
+    zh: "层级决定级联范围：选 cluster 会连同其下成员一起排除",
+    en: "Level drives cascading: cluster also excludes its members",
+  },
+  "insp.scope.lv.instance": { zh: "实例", en: "Instance" },
+  "insp.scope.lv.cluster": { zh: "集群", en: "Cluster" },
+  "insp.scope.lv.group": { zh: "组", en: "Group" },
+  "insp.scope.lv.account": { zh: "整账号", en: "Whole account" },
+  "insp.scope.service": { zh: "服务", en: "Service" },
+  "insp.scope.resourceId": { zh: "资源 ID", en: "Resource ID" },
+  "insp.scope.resourceIdHint": {
+    zh: "留空 = 整账号排除",
+    en: "Leave empty to exclude the whole account",
+  },
+  "insp.scope.accountId": { zh: "账号", en: "Account" },
+  "insp.scope.reasonHint": {
+    zh: "必填。没有理由的排除会越积越多，最后没人敢删",
+    en: "Required. Exclusions without a reason pile up and nobody dares remove them",
+  },
+  // R1.7：整账号排除会让该账号整体退出巡检，且**没有任何运行时信号** ——
+  //   下一轮就是少了那些资源，报告上不会写「有一个账号被排除了」。
+  "insp.scope.confirmAccountWide": {
+    zh: "这会让账号 {a} 整体退出「{k}」巡检，下一轮起该账号的资源都不再被检查。确认？",
+    en: "This removes account {a} from the \"{k}\" inspection entirely. Confirm?",
+  },
+  "insp.scope.expiresAtHint": {
+    zh: "留空 = 30 天后到期",
+    en: "Leave empty for 30 days",
+  },
+
+  // 定时写侧
+  "insp.config.atUtc": { zh: "执行时刻 (UTC)", en: "Run at (UTC)" },
+  // 🔴 调度是 EventBridge 的 15 分钟 tick。填 02:07 得到的是一个**永远不被
+  //    精确命中**的配置：只能靠补跑在 02:15 执行，表现为「报告总是慢 8 分钟」
+  //    而不是任何报错。所以这条提示必须在输入框旁边，不能只靠后端 400。
+  "insp.config.atUtcHint": {
+    zh: "分钟须为 15 的整数倍（调度粒度 15 分钟，其他时刻只会靠补跑）",
+    en: "Minutes must be a multiple of 15 (scheduler ticks every 15 min)",
+  },
+  "insp.config.atUtcBad": {
+    zh: "格式 HH:MM，且分钟为 00/15/30/45",
+    en: "Use HH:MM with minutes 00/15/30/45",
+  },
+  "insp.config.enabled": { zh: "启用", en: "Enabled" },
+  "insp.config.weekdays": { zh: "执行日", en: "Days" },
+  /* 🔴 原来这里是 `insp.config.everyDay`（「每天」那行小字），2026-08-31 连同
+     那行小字一起删了：七个 chip 全亮**就是**每天，而原来的表现是七个全灭
+     + 旁边写「每天」—— 屏幕上说「一天都不跑」，小字说「天天跑」，两者矛盾。 */
+  "insp.config.weekdaysMin": {
+    zh: "至少留一天。要停掉这一类巡检请用上面的「启用」开关 —— 一天都不选在库里等于「每天」，点灭最后一天会变成天天跑。",
+    en: "Keep at least one day. To stop this inspection use the Enabled switch above: an empty selection means \"every day\" in storage, so clearing the last day would run it daily.",
+  },
+  // `persisted: false` = 用的是代码默认值，而巡检**已经在跑**。
+  // 不标出来会让客户以为「还没配所以没跑」，于是去等一个已经发生的事。
+  "insp.config.notPersisted": {
+    zh: "使用默认值（尚未保存过，但巡检已按此执行）",
+    en: "Using defaults (never saved, but the run already follows it)",
+  },
+  // 🔴 键是 **1~7（1 = 周一 … 7 = 周日）**，对齐调度器的 `date.isoweekday()`
+  //    （`inspection/domain/schedule.py::matches_day`）。曾用 0~6（以为对齐的是
+  //    `weekday()`），后果完全静默：选「周一」存 0，而 isoweekday() 永不返回 0
+  //    → 那类巡检永远不跑。
+  "insp.wd.1": { zh: "一", en: "Mon" },
+  "insp.wd.2": { zh: "二", en: "Tue" },
+  "insp.wd.3": { zh: "三", en: "Wed" },
+  "insp.wd.4": { zh: "四", en: "Thu" },
+  "insp.wd.5": { zh: "五", en: "Fri" },
+  "insp.wd.6": { zh: "六", en: "Sat" },
+  "insp.wd.7": { zh: "日", en: "Sun" },
   "admin.tab.roles": { zh: "角色", en: "Roles" },
   "admin.tab.users": { zh: "用户", en: "Users" },
   "admin.tab.groups": { zh: "组映射", en: "Group mapping" },
@@ -158,11 +734,27 @@ export const STRINGS: Dict = {
   "admin.models.auditEmpty": { zh: "暂无变更记录。", en: "No changes recorded yet." },
   "admin.models.rollback": { zh: "回滚到此前", en: "Roll back to before" },
   "admin.notif.title": { zh: "飞书机器人", en: "Feishu Bot" },
-  "admin.notif.sub": { zh: "配置飞书自建应用凭证与推送群组;每日报告、告警推送、调查回调等都会发到这些群。", en: "Configure the Feishu app credentials and target group chats; daily reports, alert pushes and investigation callbacks are delivered to these chats." },
   "admin.notif.loading": { zh: "加载中…", en: "Loading…" },
   "admin.notif.secretPh": { zh: "留空或保持 **** 不变则不修改", en: "Leave masked (****) to keep unchanged" },
   "admin.notif.secretHint": { zh: "仅显示后 4 位;输入新值将覆盖。", en: "Only last 4 chars shown; enter a new value to replace." },
+  // Encrypt Key / Verification Token:webhook 模式下的唯一鉴权手段。ingress 冷启动硬校验,
+  // 任一为空直接崩(platforms/feishu/lambda_ingress.py「硬约束 A」)—— 所以这里写"必填",
+  // 不写"可选"。
+  "admin.notif.encryptHint": { zh: "自己生成的随机串(建议 ≥32 位),必须与飞书「加密策略」页填的完全一致。仅显示后 4 位。", en: "A random string you generate (32+ chars recommended); must match the Encryption Strategy page in the Feishu console exactly. Only last 4 chars shown." },
+  "admin.notif.tokenHint": { zh: "飞书「加密策略」页直接给出,复制过来。仅显示后 4 位。", en: "Shown on the Feishu Encryption Strategy page — copy it here. Only last 4 chars shown." },
+  "admin.notif.keysRequired": { zh: "Webhook 模式下这两把钥匙是必填项:缺任一,IM 入口会在冷启动时直接失败(飞书那边显示「校验失败」)。必须先在这里保存,再去飞书填请求地址。", en: "Both keys are required in webhook mode: if either is empty the IM entry point fails at cold start (Feishu shows a verification failure). Save them here BEFORE setting the request URL in Feishu." },
   "admin.notif.chatIds": { zh: "推送群组 Chat ID", en: "Target group chat IDs" },
+  "admin.notif.chatIdsHint": { zh: "出方向:每日报告、告警推送、调查回调发到这些群。群里 @机器人 的收方向不用在这里登记,由飞书的事件订阅决定。", en: "Outbound only: daily reports, alerts and investigation callbacks go to these chats. Inbound (@mention in a chat) needs no entry here — it is driven by the Feishu event subscription." },
+  // 页面上的四步速览 + 打开右侧抽屉的超链接。详细步骤内容在 content/feishuGuide.ts。
+  "admin.notif.steps.title": { zh: "在飞书开放平台要做的四步", en: "Four steps in the Feishu console" },
+  "admin.notif.steps.s1": { zh: "创建/打开自建应用,开通机器人能力与 im / cardkit 权限,创建版本并发布。", en: "Create or open a custom app, enable the bot capability plus the im / cardkit scopes, then publish a version." },
+  "admin.notif.steps.s2": { zh: "事件与回调 → 加密策略:填一个 Encrypt Key、复制 Verification Token,回到上面保存。", en: "Events & Callbacks → Encryption Strategy: set an Encrypt Key, copy the Verification Token, then save both above." },
+  "admin.notif.steps.s3": { zh: "事件配置:订阅方式改为「将事件发送至开发者服务器」,请求地址填栈输出的 FeishuWebhookUrl,订阅 im.message.receive_v1。", en: "Event config: switch delivery to \"send to developer server\", set the request URL to the stack output FeishuWebhookUrl, and subscribe im.message.receive_v1." },
+  "admin.notif.steps.s4": { zh: "回调配置:同一个 URL,订阅 card.action.trigger(卡片按钮全靠它)。", en: "Callback config: the same URL, subscribe card.action.trigger (card buttons depend on it)." },
+  "admin.notif.steps.order": { zh: "顺序是硬的:先保存上面两把钥匙,再去飞书填请求地址。反了的症状是飞书显示「校验失败」,看起来像地址填错了。", en: "The order is not optional: save the two keys above first, then set the request URL in Feishu. Doing it the other way round shows up as \"verification failed\" in Feishu, which looks like a wrong URL." },
+  "admin.notif.guideLink": { zh: "查看详细配置步骤", en: "View the detailed setup steps" },
+  "admin.notif.guideTitle": { zh: "配置飞书机器人", en: "Set up the Feishu bot" },
+  "admin.notif.guideSub": { zh: "本页保存凭证,飞书控制台改订阅方式与请求地址。两边都做完才通。", en: "Credentials are saved on this page; delivery mode and request URL are set in the Feishu console. It only works once both are done." },
   "admin.notif.test": { zh: "测试", en: "Test" },
   "admin.notif.testing": { zh: "发送中…", en: "Sending…" },
   "admin.notif.testTip": { zh: "向该群发送一条测试消息(真实发送)", en: "Send a real test message to this chat" },
@@ -170,20 +762,203 @@ export const STRINGS: Dict = {
   "admin.notif.save": { zh: "保存", en: "Save" },
   "admin.notif.saving": { zh: "保存中…", en: "Saving…" },
   "admin.notif.saved": { zh: "已保存", en: "Saved" },
-  "admin.xpayer.title": { zh: "添加组织外账号(跨 Payer)", en: "Add external account (cross-payer)" },
-  "admin.xpayer.desc": { zh: "适用于不在同一 AWS Organization 的账号。系统生成 CloudFormation Launch Stack 链接,客户在自己的账号里部署后,把 Outputs 回填到这里即可。", en: "For accounts outside this AWS Organization. Generate a CloudFormation Launch Stack link, have the account owner deploy it, then paste the Outputs back here." },
+  // 抽屉第 3 步的 webhook 地址框。地址本身由后端查出来（不是文案），这里只有周边的界面字。
+  "admin.notif.url.label": { zh: "飞书请求地址(Webhook)", en: "Feishu request URL (webhook)" },
+  "admin.notif.url.copy": { zh: "复制", en: "Copy" },
+  "admin.notif.url.copied": { zh: "已复制", en: "Copied" },
+  // 空串的三种原因（没装 IM / 名字对不上 / 查询无权限）对客户是同一个动作：去 Outputs 里看。
+  // 所以不分开报 —— 分开报要么泄露内部细节,要么让客户面对一个他解决不了的区分。
+  "admin.notif.url.missing": { zh: "取不到地址。请到 CloudFormation 控制台 → 你的栈 → Outputs → FeishuWebhookUrl 里复制(只装了 web 的栈没有这一项)。", en: "Could not retrieve the URL. Copy it from the CloudFormation console → your stack → Outputs → FeishuWebhookUrl (a web-only stack has no such output)." },
+  // 🔴 原名「添加组织外账号(跨 Payer)」对一大类客户是**错的**：
+  //    partner-resold 客户手里没有 payer 账号、系统部署在某个 linked account
+  //    上，他要加的 456 与部署账号 123 **在同一个组织里** —— 只是他没有管理
+  //    账号权限。看到「组织外」他会以为这条路不适用自己。
+  //    判据不是「在不在同一组织」，而是「有没有管理账号权限」。
+  "admin.xpayer.title": { zh: "手动接入账号（不需要管理账号权限）", en: "Manual onboarding (no management-account access needed)" },
+
+  // ── 跨账号**巡检**的前置（2026-08-25）──
+  //
+  // 与上面的接入 / DA 关联是独立的两件事：那些让账号「接进来」，
+  // 这些让**巡检**能真的采到它。
+  //
+  // 🔴 文案里必须说清「巡检共用系统账号的一个 space」—— 否则客户会去
+  //    成员账号自己的 space 里找 monitor account 的设置，而那里没有。
+  "admin.inspxacct.title": {
+    zh: "巡检的跨账号前置", en: "Cross-account prerequisites for inspection" },
+  "admin.inspxacct.desc": {
+    zh: "巡检要采到这个账号，需要下面两件。① 是必需的，缺了整轮巡检直接失败；② 影响 AI 判读能挖多深，缺了判读仍会出结论。两个都要账号所有者在自己账号里部署 CloudFormation，我们代不了。",
+    en: "Two independent things are needed. ① is required — without it the whole inspection run fails. ② affects how deep the AI analysis can dig; without it the analysis still concludes. Both require the account owner to deploy CloudFormation in their own account.",
+  },
+  "admin.inspxacct.step1": { zh: "采集角色（必需）", en: "Collection role (required)" },
+  "admin.inspxacct.step1Hint": {
+    zh: "巡检用它 AssumeRole 进目标账号读 RDS / ElastiCache / CloudWatch。接入时那个 CloudFormation 栈已经建好它了（同 Org 的一键接入也一样），保存账号时会自动 AssumeRole 验一次。显示缺失说明栈是老模板部署的、或者部署时把 CreateCollectionRole 选成了 no —— 那就用下面的链接补一个栈。",
+    en: "Inspection assumes it to read RDS / ElastiCache / CloudWatch in the target account. The onboarding CloudFormation stack already creates it (same for one-click onboarding), and saving the account verifies it automatically. If it shows missing, the stack predates that change or was deployed with CreateCollectionRole=no - use the link below to add it.",
+  },
+
+  "admin.inspxacct.step2": {
+    zh: "关联进巡检 Agent Space（可选）", en: "Link into the inspection agent space (optional)" },
+  "admin.inspxacct.step2Hint": {
+    zh: "让 AI 判读能主动查目标账号的 Performance Insights / 事件，不只看我们打包进去的指标。成员账号那一侧的角色已经由接入的那个栈建好，剩下的关联是系统账号里的一次 API 调用 —— 点「一键关联」即可，不用进 DevOps Agent 控制台。\n\n不做这一步巡检照常采集和判定，只是判读少了主动深挖那一半。",
+    en: "Lets the AI analysis query Performance Insights and events in the target account directly, instead of only the metrics we package for it. The role on the member side is already created by the onboarding stack; linking it is a single API call in the system account - just click Link, no console trip needed.\n\nWithout this, inspection still collects and scores normally; the analysis just cannot dig deeper on its own.",
+  },
+
+  "admin.inspxacct.spaceLabel": { zh: "巡检 Agent Space", en: "Inspection agent space" },
+  // 🔴 两步在**不同账号**里操作 —— 这是跨账号流程最容易搞错的一件事。
+  //    徽章直接写出账号号码，不要只说「目标账号」/「系统账号」
+  //    （客户手里可能有好几个账号，"系统账号"是哪个他未必记得）。
+  "admin.inspxacct.inTarget": { zh: "在此账号操作 →", en: "do this in →" },
+  "admin.inspxacct.inSystem": { zh: "在系统账号操作 →", en: "do this in the system account →" },
+  "admin.inspxacct.copyBtn": { zh: "复制", en: "Copy" },
+  "admin.inspxacct.copied": { zh: "已复制", en: "copied" },
+  "admin.inspxacct.copyFailed": {
+    zh: "复制失败（浏览器不允许访问剪贴板）—— 请手动选中复制。",
+    en: "Copy failed (clipboard blocked) — please select and copy manually." },
+  // 🔴 第②步是在 AWS 控制台里做的，做完必须有办法让状态灯更新 ——
+  //    这个按钮是那一步唯一的反馈渠道。
+  "admin.inspxacct.recheckBtn": { zh: "重新检查", en: "Re-check" },
+  "admin.inspxacct.stackBtn": { zh: "生成部署链接", en: "Get deploy link" },
+  "admin.inspxacct.stackOpen": {
+    zh: "在目标账号打开 CloudFormation 部署 ↗",
+    en: "Open CloudFormation in the target account ↗" },
+  "admin.inspxacct.stackHint": {
+    zh: "⚠️ 用**目标账号**的控制台登录后再点这个链接（不是系统账号）。参数已经填好，直接下一步到底、勾选 IAM 确认框即可。链接 12 小时内有效。部署完回来点「验证并登记」。",
+    en: "⚠️ Sign in to the TARGET account's console before opening this link (not the system account). Parameters are pre-filled — just proceed and tick the IAM acknowledgement. Link valid for 12h. Come back and click Verify afterwards.",
+  },
+  "admin.inspxacct.verifyBtn": { zh: "验证并登记采集角色", en: "Verify & register role" },
+  "admin.inspxacct.verifyOk": { zh: "AssumeRole 通过，已登记", en: "AssumeRole succeeded, registered" },
+  "admin.inspxacct.done": { zh: "已完成", en: "done" },
+  "admin.inspxacct.missingRequired": { zh: "缺失（巡检会失败）", en: "missing (inspection will fail)" },
+  "admin.inspxacct.missingOptional": { zh: "未关联（判读会降级）", en: "not linked (analysis degraded)" },
+  // ⚠️ 「查不到」与「没关联」必须分开：前者去查我们的权限，后者去关联。
+  "admin.inspxacct.unknown": { zh: "查不到（不等于未关联）", en: "unknown (not the same as unlinked)" },
+  "admin.inspxacct.mismatch": {
+    zh: "⚠️ 已登记的 ARN 与模板会建出来的不一致 —— 可能贴错了，或换过部署账号。AssumeRole 会一直失败：",
+    en: "⚠️ The registered ARN differs from what the template creates — wrong paste, or the deployment account changed. AssumeRole will keep failing:",
+  },
+  // 折叠标题上的状态徽章。三档，因为①与②的**后果量级不同**：
+  // ①缺失 = 整轮巡检失败（阻塞）；②未关联 = 判读少了主动深挖那一半（降级）。
+  // 🔴 客户 2026-08-27 原话：「做成这么小的一行，而且还自动折叠起来了，
+  //    我都没有发现，以为已经完全配置好了」—— 折叠且不显示状态 = 「这里没事」。
+  "admin.inspxacct.headBlocking": {
+    zh: "缺采集角色 · 巡检会失败", en: "collection role missing - inspection will fail",
+  },
+  "admin.inspxacct.headDegraded": {
+    zh: "判读未关联 · 会降级", en: "analysis not linked - degraded",
+  },
+  "admin.inspxacct.headReady": { zh: "已就绪", en: "ready" },
+  "admin.inspxacct.whyToggle": {
+    zh: "这两件事分别是什么、角色 ARN 是哪些",
+    en: "What these two are, and which role ARNs",
+  },
+  "admin.inspxacct.tmplBtn": { zh: "生成模板 URL", en: "Get template URL" },
+  // 🔴 ①缺失时的唯一下一步。采集角色已经合并进接入用的那个模板，所以缺它
+  //    意味着**那个栈是旧模板部署的** —— 正确动作是 update 已有栈，不是再建
+  //    一个（Launch Stack URL 是 create/review，会去建第二个栈）。
+  // ⚠️ 拿不到成员账号里那个栈的 stackId（跨账号），给不了 update 深链，
+  //    所以给模板 URL + 三步指令。
+  "admin.inspxacct.updateStackHint": {
+    zh: "采集角色现在由接入时那个 CloudFormation 栈一并建出来 —— 显示缺失说明"
+      + "那个栈是这次改动之前部署的，更新一次就能同时补齐①和②。\n"
+      + "在账号 {account} 的 CloudFormation 里选中栈 {stack} → 更新 → "
+      + "替换现有模板 → 粘贴下面这个 S3 URL → 两个新参数保持预填值 → 更新。"
+      + "完成后点上面①的「验证并登记采集角色」。",
+    en: "The collection role is now created by the same onboarding CloudFormation "
+      + "stack - showing missing means that stack predates this change. Updating "
+      + "it once satisfies both steps.\nIn account {account}, open CloudFormation, "
+      + "select stack {stack} -> Update -> Replace existing template -> paste the "
+      + "S3 URL below -> keep the prefilled values for the two new parameters -> "
+      + "Update. Then click Verify in step 1 above.",
+  },
+  "admin.inspxacct.assocBtn": { zh: "一键关联", en: "Link now" },
+  // 🔴 客户 2026-08-27 原话：「我也不懂什么叫一键关联，关联的是什么？谁来操作？」
+  //    「一键关联」这四个字既没说做什么、也没说谁在做。徽章说了「在系统账号操作」，
+  //    但那回答的是「在哪」不是「谁」—— 客户合理地以为要他自己去那个账号操作。
+  "admin.inspxacct.assocTip": {
+    zh: "由 NotiOps 代做，你不用进控制台。做的是控制台「添加辅助云来源」向导的"
+      + "最后一步（第 7 步「连接到代理」）：把这个账号的角色注册到系统账号的巡检"
+      + "Agent Space 上。前 6 步（建 IAM 角色 + 抄信任策略）已经由接入时那个"
+      + "CloudFormation 栈做完了。",
+    en: "NotiOps does this for you - no console needed. It performs the last step "
+      + "of the console's \"add secondary cloud source\" wizard (step 7, \"connect "
+      + "to agent\"): registering this account's role on the inspection agent space "
+      + "in the system account. Steps 1-6 (creating the IAM role and pasting the "
+      + "trust policy) were already done by the onboarding CloudFormation stack.",
+  },
+  // 🔴 「已登记但对不上」是独立的一态，不能显示成「已完成」。
+  //    登记的 ARN 与模板会建的不一致 = 贴错过账号 / 换过部署账号，
+  //    两种都会让 AssumeRole 永远失败，而每一轮巡检都在后台失败一次。
+  "admin.inspxacct.mismatchShort": {
+    zh: "已登记但与预期不符（巡检会失败）",
+    en: "registered but does not match (inspection will fail)",
+  },
+  "admin.inspxacct.assocOk": {
+    zh: "已关联进巡检 Agent Space",
+    en: "Linked into the inspection agent space",
+  },
+  "admin.inspxacct.assocExists": {
+    zh: "本来就已关联（没有重复创建）",
+    en: "Already linked (nothing created)",
+  },
+  // 🔴 `invalid` 与「未关联」是两回事：关联建了，但成员账号里那个角色不存在
+  //    或信任策略不对 —— DA assume 不进去。显示成「已关联」会掩盖它。
+  "admin.inspxacct.assocInvalid": {
+    zh: "关联已建但校验为 invalid —— 目标账号里那个角色不存在或信任策略不对。"
+      + "去目标账号确认接入栈里的 InspectionMonitorRole 建出来了（部署时 "
+      + "InspectionAgentSpaceArn 留空就不会建），然后再点一次「重新检查」。",
+    en: "Linked but validation says invalid - the role in the target account is "
+      + "missing or its trust policy does not match. Check that the onboarding "
+      + "stack created InspectionMonitorRole (it is skipped when "
+      + "InspectionAgentSpaceArn is left empty), then re-check.",
+  },
+  "admin.inspxacct.assocPending": {
+    zh: "关联待确认 —— 稍等几秒再点「重新检查」（IAM 角色刚建完需要传播）。",
+    en: "Link pending confirmation - wait a few seconds and re-check (a freshly "
+      + "created IAM role takes a moment to propagate).",
+  },
+  "admin.inspxacct.noSpace": {
+    zh: "🔴 读不到巡检 Agent Space ID —— 主栈的 InspectionAgentSpaceId 没注入到 BFF，重新部署 NotiOpsBackendStack 与 WebChatStack。",
+    en: "🔴 Inspection agent space ID unavailable — the main stack's InspectionAgentSpaceId is not wired into the BFF. Redeploy NotiOpsBackendStack and WebChatStack.",
+  },
+  "admin.xpayer.desc": { zh: "两种情况都走这条：① 账号不在本组织；② 在同一组织但你没有管理账号权限（例如 partner-resold，手里只有 linked account）。流程：输入账号 ID → 生成 CloudFormation 链接 → 用**那个账号**登录控制台部署 → 把 Outputs 回填到这里。全程不需要 Organizations 权限。", en: "Use this for either case: (1) the account is outside this organization, or (2) it is in the same organization but you lack management-account access (e.g. partner-resold, you only hold linked accounts). Flow: enter account ID → generate a CloudFormation link → sign in AS THAT ACCOUNT and deploy → paste the Outputs back here. No Organizations permissions required." },
   "admin.xpayer.acctLabel": { zh: "目标账号 ID (12 位)", en: "Target account ID (12 digits)" },
   "admin.xpayer.invalidId": { zh: "账号 ID 格式错误(需 12 位数字)", en: "Invalid account ID (must be 12 digits)" },
   "admin.xpayer.genBtn": { zh: "生成链接", en: "Generate link" },
   "admin.xpayer.openStack": { zh: "→ 点此在目标账号的 AWS 控制台部署", en: "→ Click to deploy in the target account's AWS console" },
   "admin.xpayer.stackHint": { zh: "将此链接发给目标账号管理员,在其 AWS 控制台中一键部署;完成后把 Stack Outputs 里的 AgentSpaceId 和 TriggerRoleArn 贴回下方。", en: "Share this link with the target account admin to deploy via their AWS console; once done, paste the AgentSpaceId and TriggerRoleArn from the Stack Outputs below." },
   "admin.xpayer.saveBtn": { zh: "保存并激活", en: "Save & activate" },
+  // 🔴 **别再写「（可选）」。** 2026-08-31 实机接入时用户明确反馈「我被误导了」。
+  //
+  //    「可选」只对一种人成立：栈是**旧版**、Outputs 里压根没有
+  //    `InspectionAgentSpaceId` 这一项。而任何部署**当前**模板的人，那个 Output
+  //    就摆在栈的 Outputs 页上 —— 对他们来说这是必填，留空唯一的效果是把这个
+  //    账号的 AI 判读整个关掉。
+  //
+  //    而留空是**静默**的：写侧不拒、不 warning，那个字段直接不进
+  //    UpdateExpression（`member_accounts.mjs` 的 `inspectSpaceId ? ... : ""`）。
+  //    表现是巡检看板上 finding 照出、每条旁边的判读永远空着，
+  //    而看板上「判读为空」与「DA 说这条没问题」长得一样。
+  //
+  // ⇒ 标签改成「必填」，把「旧版模板可留空」降级成提示里的一句例外。
+  //   ⚠️ **不能**直接做成表单必填校验 —— 那会把旧模板的存量账号挡在门外，
+  //     而他们除了重新部署栈别无他法。所以是「文案上必填 + 校验上允许空」。
+  "admin.xpayer.inspectSpaceLabel": {
+    zh: "巡检 Agent Space ID（必填）",
+    en: "Inspection Agent Space ID (required)" },
+  "admin.xpayer.inspectSpaceHint": {
+    zh: "填模板输出里的 InspectionAgentSpaceId（与上面那个 Agent Space ID 是**两个不同**的值）。"
+      + "🔴 留空 = 这个账号不做 AI 判读：采集与确定性规则照跑、finding 照出，"
+      + "但每条 finding 旁边的判读永远是空的，而看板上「判读为空」与「DA 说这条没问题」长得一样。"
+      + "排障不受影响。只有一种情况该留空：你的栈是旧版模板、Outputs 里没有这一项 —— 那要重新部署栈才有。",
+    en: "Paste the InspectionAgentSpaceId output (a **different** value from the Agent Space ID above). "
+      + "Leaving it empty disables AI judgment for this account: collection and rule-based findings still run, "
+      + "but every finding's analysis stays empty -- and on the dashboard \"no analysis\" looks exactly like "
+      + "\"the agent found nothing wrong\". Troubleshooting is unaffected. The only reason to leave it empty is "
+      + "an older template whose Outputs do not expose it -- redeploy the stack to get it." },
   "admin.xpayer.saved": { zh: "已保存并激活", en: "Saved and activated" },
   "admin.xpayer.testBtn": { zh: "测试连接", en: "Test connection" },
   "admin.xpayer.testOk": { zh: "✅ 连接成功", en: "✅ Connection successful" },
   "admin.accounts.onboardTitle": { zh: "成员账号接入", en: "Member account onboarding" },
   "admin.accounts.onboardDesc": { zh: "组织内账号一键接入：自动下发只读采集角色 + DevOps/PHD 事件转发（CloudFormation StackSets），完成后自动登记并启用。", en: "One-click onboarding for organization accounts: provisions the read-only role + DevOps/PHD event forwarding via CloudFormation StackSets, then registers and enables the account." },
-  "admin.accounts.orgDisabled": { zh: "当前部署未启用 Organizations 多账号模式。请在组织管理账号(或 StackSets 委派管理员账号)用 ./setup.sh --multi-account 重新部署；非组织场景请在目标账号手动部署 infra/member-account-onboarding.yaml。", en: "This deployment does not have Organizations multi-account mode enabled. Redeploy with ./setup.sh --multi-account from the management account (or a StackSets delegated-admin account), or manually deploy infra/member-account-onboarding.yaml in target accounts." },
   "admin.accounts.colAccount": { zh: "账号", en: "Account" },
   "admin.accounts.colStatus": { zh: "接入状态", en: "Status" },
   "admin.accounts.colRegions": { zh: "采集 Region", en: "Regions" },
@@ -195,7 +970,107 @@ export const STRINGS: Dict = {
   "admin.accounts.stNone": { zh: "未接入", en: "Not onboarded" },
   "admin.accounts.onboardBtn": { zh: "一键接入", en: "Onboard" },
   "admin.accounts.retryBtn": { zh: "重试接入", en: "Retry" },
-  "admin.accounts.regionsPrompt": { zh: "采集 Region（逗号分隔）", en: "Regions to collect (comma-separated)" },
+  // 🔴 `*` 那句提示是这个字段的**全部**用户文档。没有它的话「怎么让它扫
+  //    全部 region」在界面上无从得知（2026-08-29 之前巡检恒扫全部、压根不
+  //    读这个字段，客户填 us-east-1 保存成功，第二天报告里冒出 eu-west-1 的
+  //    finding，回来改这个框改成什么都没用）。现在它生效了，代价是「全部」
+  //    要显式表达 —— 就是这个 `*`。
+  "admin.accounts.regionsPrompt": {
+    zh: "采集 Region（逗号分隔，如 us-east-1,us-east-2）。填 * 表示所有 region；不填默认 us-east-1",
+    en: "Regions to collect (comma-separated, e.g. us-east-1,us-east-2). Use * for all regions; defaults to us-east-1" },
+  "admin.accounts.regionsEdit": { zh: "改 Region", en: "Edit regions" },
+  "admin.accounts.regionsSaved": { zh: "采集 Region 已更新", en: "Regions updated" },
+  /* ── 账号显示名（alias）─────────────────────────────────────────────────
+     🔴 这几条为什么重要：`account_name` / `account_alias` 此前**只在接入那一刻
+        写一次**，来源是 `organizations:DescribeAccount` 的 Account.Name。
+        跨组织接入的账号那个调用拿不到东西（账号不在本组织里）→ 两个字段都空
+        → 客户在账号选择器和 IM 推送里看到的是**十二位数字**，
+        而他手里可能有五个这样的账号。 */
+  "admin.accounts.aliasEdit": { zh: "改名", en: "Rename" },
+  "admin.accounts.aliasHint": {
+    zh: "改这个账号在选择器、看板和 IM 推送里显示的名字。不动任何 AWS 资源。",
+    en: "Change how this account is labelled in the selector, dashboards and IM "
+      + "pushes. Touches no AWS resources.",
+  },
+  "admin.accounts.aliasManual": { zh: "自定义名", en: "Custom name" },
+  "admin.accounts.aliasManualHint": {
+    zh: "这个名字是在这里手填的，不是 AWS Organizations 里的账号名 —— "
+      + "在 AWS 控制台里搜不到它。排查时请用下面那个 12 位账号号。",
+    en: "This label was set here, not in AWS Organizations - you will not find "
+      + "it in the AWS console. Use the 12-digit account ID below when "
+      + "troubleshooting.",
+  },
+  "admin.accounts.aliasPrompt": {
+    zh: "影响：账号选择器、各看板的账号列、IM 推送的标题标签、调查记录的账号名。\n"
+      // 🔴 「留空 = 清空」这条必须说 —— 否则清空之后回退成什么完全不可预测。
+      + "留空 = 清空自定义名，回退成 AWS Organizations 里的账号名"
+      + "（取不到时显示 12 位账号号）。\n"
+      // 🔴 这条不说的话客户改完会去 DevOps Agent 控制台找那个新名字，找不到，
+      //    然后以为保存失败了、反复重试。space 创建时名字就定死了，没有 rename API。
+      + "⚠️ 不会重命名已经建好的 DevOps Agent space —— 那个名字在创建时就定死了。\n"
+      + "最多 64 个字符；不能是纯数字（列表里显示成「名字 · 账号号」，"
+      + "两串数字并排分不出哪个是账号号）。",
+    en: "Affects: the account selector, the account column on every dashboard, "
+      + "the IM push title label and the account name on investigation records.\n"
+      + "Leave empty to clear the custom name and fall back to the AWS "
+      + "Organizations account name (or the 12-digit ID if unavailable).\n"
+      + "Note: this does NOT rename an existing DevOps Agent space - that name "
+      + "is fixed at creation time.\n"
+      + "Max 64 characters; cannot be all digits (the list renders "
+      + "\"name - account id\", and two number strings side by side are "
+      + "indistinguishable).",
+  },
+  "admin.accounts.aliasSaved": {
+    zh: "显示名已更新 —— 选择器、看板和 IM 推送的标签都改好了。",
+    en: "Name updated - the selector, dashboards and IM push labels all reflect it.",
+  },
+  /* 🔴 `da#` 行不存在（只做了接入、还没做 DevOps Agent 关联）时后端跳过那一行，
+        也就是 IM 推送里那个账号的标签**没有变**。两种结果在列表上长得一样，
+        所以必须分成两条文案。 */
+  "admin.accounts.aliasSavedNoPush": {
+    zh: "显示名已更新（选择器与看板）。\n"
+      + "⚠️ IM 推送的标签**没有改** —— 这个账号还没做 DevOps Agent 关联，"
+      + "推送里用的仍然是「账号 <账号号>」。做完关联后再改一次名即可。",
+    en: "Name updated for the selector and dashboards.\n"
+      + "Note: the IM push label was NOT changed - this account has no DevOps "
+      + "Agent association yet, so pushes still use \"account <id>\". "
+      + "Rename again after associating.",
+  },
+  // 🔴 存量账号的升级信号（per-account agent space 之后）。
+  //    不显示它的后果：那些账号采集照跑、花 GetMetricData，而判读永远为空，
+  //    而看板上「N 条未做根因分析」与「DA 说这些没问题」长得一样。
+  "admin.accounts.needsUpdate": { zh: "待更新栈", en: "Stack update needed" },
+  "admin.accounts.outOfOrg": { zh: "组织外", en: "Outside organization" },
+  "admin.accounts.outOfOrgHint": {
+    zh: "这个账号不在部署账号所属的 AWS Organizations 里，是通过「跨 Payer 接入」"
+      + "手动加进来的。它照常被巡检采集与判读，但一键接入 / 一键下线走 StackSet，"
+      + "覆盖不到它 —— 那两个按钮对它不显示。要调整它的部署内容，"
+      + "去它自己的 CloudFormation 控制台改那个栈。",
+    en: "This account is not in the deployment account's AWS Organizations; it was "
+      + "added manually via cross-payer onboarding. It is collected and analyzed "
+      + "normally, but one-click onboarding/offboarding goes through StackSets and "
+      + "cannot reach it, so those buttons are hidden. To change what is deployed "
+      + "there, edit the stack in that account's own CloudFormation console.",
+  },
+  // ⚠️ 提示里必须给**具体步骤**，因为 CloudFormation 的 quick-create 链接
+  //    只支持「创建」（官方文档确认没有更新栈的形式），我们给不了一键链接。
+  //    也必须覆盖两种读法：旧模板没有那个输出 / 新模板但回填时留空了。
+  "admin.accounts.needsUpdateHint": {
+    zh: "这个账号还没有登记巡检 Agent Space，所以只有规则判定、没有 AI 判读"
+      + "（采集与排障不受影响）。两种原因："
+      + "① 部署的是旧版模板（Outputs 里没有 InspectionAgentSpaceId）——"
+      + "去 CloudFormation 控制台选中 notiops-devops-agent-<账号> 栈 → 更新 →"
+      + "替换现有模板 → 用上面「生成部署链接」拿到的模板 URL；"
+      + "② 部署过新模板但回填时那一栏留空 —— 直接回填即可。",
+    en: "This account has no inspection Agent Space registered, so it gets "
+      + "rule-based findings only, no AI judgment (collection and "
+      + "troubleshooting are unaffected). Two possible causes: "
+      + "(1) it runs an older template version with no InspectionAgentSpaceId "
+      + "output - in the CloudFormation console select the "
+      + "notiops-devops-agent-<account> stack, choose Update, replace the "
+      + "existing template with the URL from \"Generate deploy link\"; "
+      + "(2) it runs the new template but the field was left blank when "
+      + "filling back the outputs - just fill it in." },
   "admin.accounts.confirmBtn": { zh: "确认接入", en: "Confirm" },
   "admin.accounts.cancelBtn": { zh: "取消", en: "Cancel" },
   "admin.accounts.refresh": { zh: "刷新", en: "Refresh" },
@@ -210,6 +1085,79 @@ export const STRINGS: Dict = {
   "admin.accounts.visSaved": { zh: "已保存", en: "Saved" },
   "admin.accounts.visPick": { zh: "选择用户或组以配置可见账号", en: "Select a user or group to configure visible accounts" },
   "admin.accounts.empty": { zh: "组织内没有 ACTIVE 账号", en: "No ACTIVE accounts in the organization" },
+  // ⚠️ 「组织里没有别的账号」与「还没登记过任何账号」是两件不同的事 ——
+  //    混成一句会让人以为组织是空的。
+  "admin.accounts.emptyRegistered": {
+    zh: "还没有接入任何账号。用下面的「手动接入账号」加第一个。",
+    en: "No accounts onboarded yet. Use Manual onboarding below to add the first one." },
+  "admin.accounts.onboardDescRegistered": {
+    zh: "已接入的账号（一键接入与手动接入都列在这里）。一键接入需要组织管理账号"
+      + "权限并以多账号模式部署，当前不可用 —— 用下面的「手动接入账号」逐个加。",
+    en: "Onboarded accounts (both one-click and manual are listed here). One-click "
+      + "onboarding needs management-account permissions and a multi-account "
+      + "deployment, which is not available here - use \"Manual onboarding\" below.",
+  },
+  // 🔴 这个键漏加过一次，页面上直接印出 "admin.accounts.noOneClick" 原文。
+  //    `t()` 找不到键就返回键名本身 —— 不抛、不告警，而 scripts/lint_i18n.py
+  //    只查 core/i18n.py（Python 侧），压根不查这个文件。已在那个脚本里补上
+  //    前端键的存在性检查。
+  "admin.accounts.noOneClick": {
+    // 🔴 **必须带上那条具体命令。** 改这段文案时我一度只写了「以多账号模式
+    //    部署」，把 `./setup.sh --multi-account` 丢了 —— 而运维看到「需要多账号
+    //    模式」之后的第一个问题就是「怎么开」。老那句
+    //    （`admin.accounts.orgDisabled`，已删）是有命令的，这是可操作性的退步。
+    //
+    // ⚠️ 老那句还有半句「非组织场景请在目标账号手动部署
+    //    infra/member-account-onboarding.yaml」—— 那句**现在是错的**：
+    //    采集角色已经合并进 member-devops-agent.yaml，手动接入只部署一个栈，
+    //    而且那条路有 UI 入口（下面那个折叠区），不需要人去翻仓库里的 yaml。
+    zh: "一键接入不可用 —— 它要 CloudFormation StackSets，只有组织管理账号"
+      + "（或 StackSets 委派管理员）以多账号模式部署才有。"
+      + "要启用：在组织管理账号上重新部署一次 `./setup.sh --multi-account`。\n"
+      + "不想动部署的话用下面的「手动接入账号」：生成一条 CloudFormation 链接，"
+      + "让账号所有者在自己账号里点一下部署，回填两个值即可 —— "
+      + "不需要任何组织权限，也不需要重新部署。",
+    en: "One-click onboarding is unavailable - it needs CloudFormation StackSets, "
+      + "which requires a multi-account deployment from the organization "
+      + "management account (or a StackSets delegated admin). "
+      + "To enable it, redeploy with `./setup.sh --multi-account` from the "
+      + "management account.\n"
+      + "If you would rather not touch the deployment, use \"Manual onboarding\" "
+      + "below: we generate a CloudFormation link, the account owner deploys it in "
+      + "their own account, and you paste two values back - no organization "
+      + "permissions and no redeploy needed.",
+  },
+  "admin.accounts.srcOneClick": { zh: "一键接入", en: "one-click" },
+  "admin.accounts.srcManual": { zh: "手动接入", en: "manual" },
+  "admin.accounts.srcOneClickTip": {
+    zh: "由 CloudFormation StackSets 下发。下线时成员账号里的栈会被一并删除。",
+    en: "Provisioned by CloudFormation StackSets. Offboarding also deletes the "
+      + "stack in the member account.",
+  },
+  "admin.accounts.srcManualTip": {
+    zh: "客户在自己账号里部署的 CloudFormation 栈。下线只清本地登记 —— 那个栈"
+      + "我们删不了，要账号所有者自己删。",
+    en: "A CloudFormation stack the account owner deployed themselves. Offboarding "
+      + "only clears our records - we cannot delete that stack, the owner must.",
+  },
+  "admin.accounts.offboardManualWarn": {
+    zh: "⚠️ 这是手动接入的账号：下线只会清掉我们这边的登记。目标账号里的 "
+      + "CloudFormation 栈（Agent Space + IAM 角色）我们删不了，要账号所有者"
+      + "自己去删 —— Agent Space 是计费资源。",
+    en: "WARNING this account was onboarded manually: offboarding only clears our "
+      + "records. We cannot delete the CloudFormation stack in the target account "
+      + "(agent space + IAM roles) - the account owner must. An agent space is a "
+      + "billed resource.",
+  },
+  "admin.accounts.offboardRetained": {
+    zh: "已清除登记。请让账号所有者在目标账号删除这个 CloudFormation 栈：",
+    en: "Records cleared. Ask the account owner to delete this CloudFormation "
+      + "stack in the target account:",
+  },
+  "admin.accounts.noOrgList": {
+    zh: "读不到组织账号列表（当前身份没有 organizations:ListAccounts —— partner-resold 或 linked account 部署时是正常的）。所以上面只显示已接入的账号，加新账号请用下面的「手动接入账号」输入账号 ID。",
+    en: "Cannot list organization accounts (this identity lacks organizations:ListAccounts — normal for partner-resold or linked-account deployments). Only onboarded accounts are listed above; add new ones by account ID via Manual onboarding below.",
+  },
   "admin.accounts.disableBtn": { zh: "停用", en: "Disable" },
   "admin.accounts.enableBtn": { zh: "启用", en: "Enable" },
   "admin.accounts.offboardBtn": { zh: "下线", en: "Offboard" },
@@ -468,9 +1416,18 @@ export const STRINGS: Dict = {
   "cz.da.publishedTip": { zh: "已发布到 DevOps Agent 的 Agent Space", en: "Published to DevOps Agent's Agent Space" },
   "cz.da.title": { zh: "发布到 DevOps Agent", en: "Publish to DevOps Agent" },
   "cz.da.subtitle": { zh: "把「{name}」作为 skill 装进 DevOps Agent 的 Agent Space", en: "Install “{name}” as a skill in DevOps Agent's Agent Space" },
+  // 🔴 必须说清「不影响巡检判读」。这里发布的目标是**排障** Agent Space
+  //    （DEVOPS_AGENT_SPACE_ID），而巡检判读用的是另一个专属 space
+  //    （INSPECT_AGENT_SPACE_ID）。两个刻意拆开：
+  //      · 判读 skill 进排障 space → 客户的深度调查可能误加载它们
+  //        （skill 激活是 description 语义匹配，命中并不精确）
+  //      · 通用 skill 进巡检 space → 判读被带偏，而判读有严格的输出信封契约
+  //        （必须按 `## <finding_id>` 分节），偏了就 parse_failed
+  //    不说明的话客户会以为「发布了就会影响巡检结论」，然后为巡检的判读质量
+  //    在这里反复发布 skill —— 而那永远不会生效。
   "cz.da.intro": {
-    zh: "发布后，DevOps Agent 在做深度调查时会按 skill 的描述自动决定是否使用它。仅上传文档（不含脚本），只读边界不受影响。",
-    en: "Once published, DevOps Agent decides whether to use this skill during deep investigations, based on its description. Documents only (no scripts); the read-only boundary is unaffected.",
+    zh: "发布后，DevOps Agent 在做**深度调查**时会按 skill 的描述自动决定是否使用它。仅上传文档（不含脚本），只读边界不受影响。\n\n⚠️ 这里发布的 skill **不影响资源巡检的 AI 判读** —— 巡检用的是另一个专属 Agent Space，它的判读 skill 随代码发布（`inspection/skills/`），刻意与调查隔离，避免互相误激活。",
+    en: "Once published, DevOps Agent decides whether to use this skill during DEEP INVESTIGATIONS, based on its description. Documents only (no scripts); the read-only boundary is unaffected.\n\n⚠️ Skills published here do NOT affect resource-inspection AI analysis — inspection uses a separate dedicated Agent Space whose judgement skills ship with the code (`inspection/skills/`), deliberately isolated to avoid cross-activation.",
   },
   "cz.da.noTargets": {
     zh: "暂无可用的 Agent Space。请先在「管理 → 账户」里接入 DevOps Agent。",
@@ -789,10 +1746,6 @@ export const STRINGS: Dict = {
   "thinking": { zh: "思考中", en: "Thinking" },
   "reasoning.show": { zh: "查看思考过程", en: "Show reasoning" },
   "reasoning.hide": { zh: "隐藏思考过程", en: "Hide reasoning" },
-  "model.effort.fast": { zh: "快速", en: "Fast" },
-  "model.effort.balanced": { zh: "均衡", en: "Balanced" },
-  "model.effort.deep": { zh: "深度", en: "Deep" },
-  "model.effort.label": { zh: "回复力度", en: "Effort" },
   "model.desc.opus": { zh: "最强推理 · 深度分析/复杂根因 · 经 Bedrock", en: "Most capable · deep analysis & complex RCA · via Bedrock" },
   "model.desc.claude": { zh: "推理与编码均衡 · 全能 · 经 Bedrock", en: "Balanced reasoning & coding · all-rounder · via Bedrock" },
   "model.desc.haiku": { zh: "快速轻量 · 支持提示缓存 · 经 Bedrock", en: "Fast & lightweight · prompt caching · via Bedrock" },
@@ -829,12 +1782,16 @@ export const STRINGS: Dict = {
   "menu.soon": { zh: "即将上线", en: "Coming soon" },
   "sources.empty": { zh: "暂无来源", en: "No sources" },
   "panel.close": { zh: "关闭", en: "Close" },
-  // 调查过程面板
-  "inv.panel.title": { zh: "调查过程", en: "Investigation" },
+  // DevOps Agent 后台深链（只有 DevOps 那条过程有；面板本身与普通对话共用同一套文案）
   "inv.panel.console": { zh: "在 DevOps Agent 后台查看", en: "View in DevOps Agent console" },
-  "inv.panel.empty": { zh: "分析过程将在这里实时更新…", en: "Analysis steps will stream here…" },
-  "inv.entry": { zh: "查看调查过程", en: "View investigation" },
-  "inv.entry.count": { zh: "{n} 步分析", en: "{n} steps" },
+  // 思考过程面板 —— **所有路径共用**（DevOps Agent 与普通对话必须一致，2026-09-04 客户要求）。
+  // 原来 DevOps 那条有自己的 inv.panel.title「调查过程」/ inv.entry「查看调查过程」，已删除。
+  "think.panel.title": { zh: "思考过程", en: "Thinking" },
+  "think.panel.empty": { zh: "思考与工具调用过程将在这里实时更新…", en: "Reasoning and tool calls will stream here…" },
+  "think.panel.live": { zh: "进行中", en: "Live" },
+  "think.entry": { zh: "查看思考过程", en: "View thinking" },
+  "think.entry.count": { zh: "{n} 步", en: "{n} steps" },
+  "think.repeat": { zh: "×{n}", en: "×{n}" },
   "sidebar.collapse": { zh: "收起侧边栏", en: "Collapse sidebar" },
   "sidebar.expand": { zh: "展开侧边栏", en: "Expand sidebar" },
 };

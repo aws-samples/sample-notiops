@@ -14,6 +14,7 @@ from shared.queries.whitelist import (
     remove_whitelist,
     set_whitelist_expiry,
 )
+from api.errors import NotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +134,7 @@ def _remove_whitelist(body: dict | None) -> dict:
 
     existed = remove_whitelist("waste", account_id, instance_id)
     if not existed:
-        raise KeyError(f"Whitelist entry {instance_id}/{account_id} not found")
+        raise NotFoundError(f"Whitelist entry {instance_id}/{account_id} not found")
     return {"message": "Whitelist entry removed"}
 
 
@@ -176,5 +177,5 @@ def _update_whitelist_expiry(body: dict | None) -> dict:
 
     found = set_whitelist_expiry("waste", account_id, instance_id, expires_at=expires_at)
     if not found:
-        raise KeyError(f"Whitelist entry {instance_id}/{account_id} not found")
+        raise NotFoundError(f"Whitelist entry {instance_id}/{account_id} not found")
     return {"message": "Whitelist expiry updated"}

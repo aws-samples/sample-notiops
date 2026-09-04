@@ -257,9 +257,21 @@ def _artifacts_upsert(props) -> dict:
             "Run scripts/postprocess_template.py on the synthesized template.")
     base = (props.get("ArtifactBaseUrlOverride") or "").strip().rstrip("/") \
         or props["DefaultArtifactBaseUrl"].rstrip("/")
-    staged = {}
+    # IM（飞书 / Slack）是加装项。只装 web 时那两个 `im-*` 产物没有任何引用者，白搬
+    # 一遍要多花十几秒、还会在 staging 桶里留下客户没装的东西。
+    # 判据是**产物名前缀**而不是安装选项的具体取值："web+dingtalk" 之类以后新增的
+    # 选项自动落到"要装 IM"这一侧，不需要再回来改这里。
+    # 反过来也成立：`InstallOption` 属性变了（web → web+feishu）就是一次 Update，
+    # 这个函数会重跑并把缺的产物补下来。
+    skip_im = (props.get("InstallOption") or "web").strip() == "web"
+    staged, skipped = {}, []
     for a in artifacts:
+        if skip_im and a["name"].startswith("im-"):
+            skipped.append(a["name"])
+            continue
         staged[a["name"]] = _fetch_to_s3(f"{base}/{a['name']}", bucket, a["key"], a["sha256"])
+    if skipped:
+        print(f"skipped {len(skipped)} IM artifact(s) (InstallOption=web): {skipped}")
     return {"StagedCount": str(len(staged)), "TotalBytes": str(sum(staged.values()))}
 
 
@@ -339,48 +351,89 @@ def _merge_missing_models(existing, catalog):
     return merged, added
 
 
+def _default_model_drift(item, cfg):
+    """种子里的 `default_model` 与库里不一致时返回它，否则返回 None。
+
+    只返回**写得进去**的值：alias 必须在目录里、且 enabled（`enabled: False` 的
+    默认模型等于把这个 surface 变成没有可用模型）。
+
+    与 `scripts/seed_llm_catalog.py::default_model_drift` 一一对应（一键路径不能
+    import 这个仓库），由 `scripts/test_oneclick_parity.py` 保证两边不漂。
+    """
+    seed_default = cfg.get("default_model")
+    if not seed_default or seed_default == item.get("default_model"):
+        return None
+    hit = next((m for m in cfg.get("models") or []
+                if isinstance(m, dict) and m.get("alias") == seed_default), None)
+    if hit is None or not hit.get("enabled"):
+        return None
+    return seed_default
+
+
 def _top_up_llm_catalog(table, cfg) -> str:
-    """目录已存在时，把**后来加进目录的**模型补上。
+    """目录已存在时，把升级允许同步的东西同步过去。
 
     为什么必须有这一步：条件写让"已存在"成为每次升级的常态路径，于是首次部署之后
-    再加进 `config/llm-model-catalog.json` 的模型**永远到不了已经装好的环境** ——
-    症状不是报错，而是管理台「模型」页和聊天里的模型选择器都缺了它，客户合理地以为
-    "这功能没做"。2026-08-27 现网实际发生：`zai-glm-5` 前一天进了目录，列表里没有。
+    再改 `config/llm-model-catalog.json` 的东西**永远到不了已经装好的环境**。
+    两类漂移，都是"不报错、只是不对"：
 
-    闸门是 `generation == 0`（已 seed、从未被管理员编辑过）。管理员一保存这页就归他管：
-    他可能是**故意**没留某个模型，一次升级把它复活跟覆盖整份配置是同一类缺陷。
-    那种情况只打印缺哪几个，把决定权留给他 —— 这里静默无动作正是原缺陷难发现的原因。
+    1. **目录里新增的模型** —— 症状是管理台「模型」页和聊天的模型选择器缺了它，
+       客户合理地以为"这功能没做"。2026-08-27 现网实际发生：`zai-glm-5` 前一天
+       进了目录，列表里没有。
+    2. **`default_model`** —— 2026-09-02 现网实际发生：目录默认从 `claude-sonnet-5`
+       换成 `xai-grok-4-6`，`xai-grok-4-6` 确实被补进了模型列表，而默认**还停在
+       Sonnet 5**。旧代码只写 `models`，理由是"新模型绝不能顺手变成默认模型" ——
+       那个理由今天依然成立，而这里做的**不是**那件事：写进去的是目录**声明**的
+       默认值，不是"刚补进来的那个"。这个坑之所以难查：其它每个槽位
+       （`/notiops/agent/model_id` SSM 参数、health-checker 的 `BEDROCK_MODEL_ID`）
+       都跟着改了 —— 从 CLI 看整个环境是一致的，只有 web 聊天还开在 Sonnet 5。
+
+    两类都以 `generation == 0` 为闸门（已 seed、从未被管理员编辑过）。管理员一保存
+    这页就归他管：他可能是**故意**没留某个模型、或**故意**选了别的默认模型，一次升级
+    把它改掉跟覆盖整份配置是同一类缺陷。那种情况只打印"本来会改什么"，把决定权留给他
+    —— 这里静默无动作正是上面两个缺陷都难发现的原因。
     """
     item = table.get_item(Key={"PK": "llmcfg", "SK": "meta"}).get("Item") or {}
     merged, added = _merge_missing_models(item.get("models") or [],
                                          cfg.get("models") or [])
-    if not added:
+    new_default = _default_model_drift(item, cfg)
+    if not added and not new_default:
         print("llm catalogue already present and complete; left untouched")
         return "already present"
 
+    pending = list(added) + ([f"default_model -> {new_default}"] if new_default else [])
     gen = item.get("generation")
     if gen is not None and int(gen) != 0:
         print(f"llm catalogue edited in console (generation={int(gen)}); "
-              f"not adding {added}")
-        return f"already present (admin-managed; {len(added)} not added)"
+              f"not applying {pending}")
+        return f"already present (admin-managed; {len(pending)} not applied)"
 
+    # 只写漂了的那几个属性：credential_mode / backend_tasks 和库里每一条模型
+    # 条目都保持原样。
+    sets, names, values = [], {}, {":zero": 0}
+    if added:
+        sets.append("#m = :m")
+        names["#m"] = "models"
+        values[":m"] = merged
+    if new_default:
+        sets.append("#d = :d")
+        names["#d"] = "default_model"
+        values[":d"] = new_default
     try:
         table.update_item(
             Key={"PK": "llmcfg", "SK": "meta"},
-            # 只动 models：default_model / credential_mode / backend_tasks 一律不碰，
-            # 新模型绝不能顺手变成默认模型。
-            UpdateExpression="SET #m = :m",
-            ExpressionAttributeNames={"#m": "models"},
-            ExpressionAttributeValues={":m": merged, ":zero": 0},
+            UpdateExpression="SET " + ", ".join(sets),
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
             ConditionExpression="attribute_not_exists(generation) OR generation = :zero",
         )
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            print(f"llm catalogue edited concurrently; not adding {added}")
-            return "already present (raced; nothing added)"
+            print(f"llm catalogue edited concurrently; not applying {pending}")
+            return "already present (raced; nothing applied)"
         raise
-    print(f"llm catalogue topped up: added {added}")
-    return f"topped up ({len(added)} models)"
+    print(f"llm catalogue topped up: applied {pending}")
+    return f"topped up ({len(pending)} changes)"
 
 
 def _seed_llm_catalog(props) -> str:
@@ -524,9 +577,16 @@ def _teardown_site(props) -> dict:
         except Exception as exc:  # noqa: BLE001
             if not _ignore_missing(exc):
                 raise
-    # Bedrock API Key 的 secret 不是栈内资源 —— 管理员在 Admin「模型」页选「API Key」
-    # 凭证方式时由 BFF 按需 CreateSecret（见 bff/web-chat/llm_config.mjs），CFN 因此
-    # 完全不知道它存在。DeleteEverything 却承诺"不留东西"，所以必须在这里收尾。
+    # 这几个 secret 都不是栈内资源，CFN 完全不知道它们存在，而 DeleteEverything 承诺
+    # "不留东西"，所以必须在这里收尾：
+    #   · notiops/bedrock-api-key —— 管理员在 Admin「模型」页选「API Key」凭证方式时
+    #     由 BFF 按需 CreateSecret（见 bff/web-chat/llm_config.mjs）；
+    #   · notiops/im-bot-feishu —— 装了 IM（InstallOption=web+feishu）时，管理控制台
+    #     「集成 IM」页保存凭证时由 BFF 建；
+    #   · notiops/slack-* —— 装了 web+slack 时客户按文档手建（Slack 侧没有在控制台里
+    #     填的入口，见 docs/IM_WEBHOOK_SETUP.md §2.2）。
+    # 名字**无条件**全列（模板侧同理），因为客户可能装过 IM 又改回只装 web：那时
+    # 凭证还在账号里，而属性里若没有它就永远删不掉了。
     # 用 ForceDeleteWithoutRecovery：默认的 30 天恢复期会让同账号同区重装时
     # CreateSecret 撞 InvalidRequestException（"scheduled for deletion"），
     # 而这是"客户明确要求全删"的路径。`setup.sh` 那条路径由 teardown.sh 做同一件事。

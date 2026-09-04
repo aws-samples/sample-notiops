@@ -1,4 +1,5 @@
 import type { SourceItem, TokenUsage, InvestigationStep } from "./api/chat";
+import type { TimelineStep } from "./thinking";
 
 export type Role = "user" | "assistant";
 
@@ -30,9 +31,14 @@ export interface ChatMessage {
   followups?: Followup[];  // 快捷后续按钮（点击=发送 prompt，如调查后的 生成缓解/转人工）
   investigationSteps?: InvestigationStep[]; // 调查分析过程（走右侧「调查过程」面板，不在气泡里）
   investigationConsoleUrl?: string;         // 本次调查的 DevOps Agent 后台深链（面板顶部）
+  thinkingSteps?: TimelineStep[];           // 思考/处理过程时间线（走右侧「思考过程」面板；任意长任务通用）
   usage?: TokenUsage;    // 本轮 token 用量（显示在署名行）
-  // 答案来源标记。"devops-agent" = 这条回答由**客户自己的 DevOps Agent** 生成（「DevOps 对话」
-  // 开关），署名行显示 "AWS DevOps Agent" 而不是 "AWS Bedrock (某模型)"。缺省=本地模型。
+  // 答案来源标记。缺省=本地模型（署名 "AWS Bedrock (某模型)"）。
+  //   "devops-agent" —— 由**客户自己的 DevOps Agent** 生成（「DevOps 对话」开关），署名
+  //                     "AWS DevOps Agent"；前端在发起时就知道，故建消息时即置。
+  //   "builtin"      —— agent 的**内置确定性回答**（如「你能做什么」），完全未调模型、
+  //                     0 token，署名 "NotiOps"。前端事先不知道，由 agent 在流里发
+  //                     `via` 事件告知（BFF 落库同字段，刷新后历史不被错误署名）。
   via?: string;
   accountId?: string;    // 本轮提问的目标 AWS 账号（多账号可切换，故按条记录，让历史回复能标明针对哪个账号）
   streaming?: boolean;   // 正在流式输出
@@ -136,7 +142,7 @@ export interface Conversation {
 
 // 新对话默认模型的**兜底**值。真值由 GET /models 下发（管理员在「管理 → 模型」里定），
 // 见 models.ts 的 defaultModelId()。这里保留是为了首帧渲染和接口读不到时不至于没模型可用。
-export const DEFAULT_MODEL = "claude-sonnet-5";
+export const DEFAULT_MODEL = "xai-grok-4-6";
 
 export interface ModelOption {
   id: string;
@@ -148,16 +154,27 @@ export interface ModelOption {
 // 内置**兜底**目录：GET /models 读不到（未登录首帧 / 接口异常 / 目录未 seed）时用它。
 // 正常情况下界面展示的是管理员勾选的启用集，别在这里加模型来"上线"一个模型 ——
 // 真源是 config/llm-model-catalog.json + DynamoDB llmcfg。
-// 按显示名首字母升序排列（A→Z）。
+//
+// 顺序**必须与种子里 webchat 启用集的顺序一致**（不再按首字母排）：下拉框直接按数组顺序
+// 渲染，而服务端 `/models` 是原样保留种子/DDB 的数组顺序的 —— 这里自己排一遍的话，
+// 降级前后列表会重排，看起来像"模型换了一批"。默认模型放第一位（2026-09-03 用户要求：
+// Grok 置顶、GLM 次之，其余相对顺序不动）。
 export const MODELS: ModelOption[] = [
-  { id: "amazon-nova-pro", name: "Amazon Nova Pro", descKey: "model.desc.nova" },
-  { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", descKey: "model.desc.haiku" },
-  { id: "claude-opus-5", name: "Claude Opus 5", descKey: "model.desc.opus" },
-  { id: "claude-sonnet-5", name: "Claude Sonnet 5", descKey: "model.desc.claude" },
-  { id: "deepseek-v3-2", name: "DeepSeek V3.2", descKey: "model.desc.deepseek" },
-  { id: "zai-glm-5", name: "GLM 5", descKey: "model.desc.glm" },
-  { id: "gpt-5-6-luna", name: "GPT-5.6 Luna", descKey: "model.desc.gptLuna" },
-  { id: "gpt-5-6-sol", name: "GPT-5.6 Sol", descKey: "model.desc.gptSol" },
-  { id: "gpt-5-6", name: "GPT-5.6 Terra", descKey: "model.desc.gpt" },
   { id: "xai-grok-4-6", name: "Grok 4.6", descKey: "model.desc.grok" },
+  { id: "zai-glm-5", name: "GLM 5", descKey: "model.desc.glm" },
+  { id: "claude-sonnet-5", name: "Claude Sonnet 5", descKey: "model.desc.claude" },
+  { id: "claude-opus-5", name: "Claude Opus 5", descKey: "model.desc.opus" },
+  { id: "amazon-nova-pro", name: "Amazon Nova Pro", descKey: "model.desc.nova" },
+  { id: "deepseek-v3-2", name: "DeepSeek V3.2", descKey: "model.desc.deepseek" },
+  { id: "gpt-5-6", name: "GPT-5.6 Terra", descKey: "model.desc.gpt" },
+  { id: "gpt-5-6-sol", name: "GPT-5.6 Sol", descKey: "model.desc.gptSol" },
+];
+
+// 已从 Web 列表下架、但**历史消息里还留着**的模型。只用于把落款上的 id 还原成显示名
+// （见 models.ts 的 `modelDisplayName`）—— 不进任何可选清单。
+// 下架一个模型时把它从 MODELS 挪到这里，别直接删：删了之后翻回去看老对话，落款会从
+// 「Claude Haiku 4.5」变成裸 alias `claude-haiku-4-5`。
+export const RETIRED_MODELS: ModelOption[] = [
+  { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", descKey: "model.desc.haiku" },
+  { id: "gpt-5-6-luna", name: "GPT-5.6 Luna", descKey: "model.desc.gptLuna" },
 ];

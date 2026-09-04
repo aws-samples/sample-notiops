@@ -35,7 +35,7 @@
  * 后台再校验。这比拿代码里的快照兜底准得多 —— 它是**这个部署**真实的目录，不是编译期快照。
  */
 import { useSyncExternalStore } from "react";
-import { MODELS, DEFAULT_MODEL, type ModelOption } from "./types";
+import { MODELS, RETIRED_MODELS, DEFAULT_MODEL, type ModelOption } from "./types";
 import { fetchModels } from "./api/chat";
 import { getConfig } from "./config";
 
@@ -148,9 +148,11 @@ export function modelDisplayName(model?: string): string {
   if (byId) return byId.name;
   const byName = catalog.find((m) => m.name === model);
   if (byName) return byName.name;
-  // 内置清单里也找一遍：管理员下架某模型后，历史消息仍能显示出正常名字。
-  // 这是 MODELS 现在**唯一**的正当用途（历史落款），不再作为可选清单。
-  const legacy = MODELS.find((m) => m.id === model);
+  // 内置清单 + 已下架清单里也找一遍：管理员下架某模型（或我们把它从 Web 列表移走）后，
+  // 历史消息仍该显示它当时用的名字。这是 MODELS 现在**唯一**的正当用途（历史落款），
+  // 不再作为可选清单；RETIRED_MODELS 则只服务这一条路径。
+  const legacy = MODELS.find((m) => m.id === model)
+    || RETIRED_MODELS.find((m) => m.id === model);
   return legacy ? legacy.name : model;
 }
 

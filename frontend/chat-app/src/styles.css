@@ -230,6 +230,40 @@ a.um-item:visited { color: var(--text); }
 @keyframes skpulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
 @media (prefers-reduced-motion: reduce) { .sk { animation: none; } }
 
+/* ===== 巡检看板：三个必须写成类的样式 =====
+   本仓的仪表盘惯例是**内联样式 + CSS 变量，不写新类名**（见
+   `InspectionDashboard.tsx` 顶部的说明）。下面三个是例外，因为内联样式
+   表达不了它们：`@keyframes`、`::-webkit-scrollbar`、`:hover`。
+   都加了 `insp-` 前缀，作用域清楚。 */
+
+/* 按钮内的转圈。⚠️ 尺寸跟着 font-size 走（em），所以放在小号按钮里
+   也不会顶高行高 —— 用固定 px 的话小按钮会被撑大 1~2px，一排按钮不齐。 */
+.insp-spin {
+  display: inline-block; width: 1em; height: 1em;
+  border: 1.5px solid currentColor; border-top-color: transparent;
+  border-radius: 50%; animation: inspspin .7s linear infinite;
+  vertical-align: -.12em;
+}
+@keyframes inspspin { to { transform: rotate(360deg); } }
+/* 顶部细进度条：刷新时用。**不遮挡内容** —— 刷新期把内容换成骨架屏会让
+   页面跳一下，而用户此刻正在看那些内容。 */
+.insp-bar { position: relative; overflow: hidden; height: 2px; background: transparent; }
+.insp-bar::after {
+  content: ""; position: absolute; inset: 0; width: 35%;
+  background: var(--blue); animation: inspbar 1.1s ease-in-out infinite;
+}
+@keyframes inspbar {
+  0% { left: -35%; } 100% { left: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .insp-spin, .insp-bar::after { animation: none; }
+}
+/* 表格行 hover —— AWS Console 的表格靠它让「我正在看哪一行」不用靠数格子。 */
+.insp-row:hover { background: var(--menu-hover); }
+/* 可点卡片的 hover：整卡可点时必须有反馈，否则用户不知道它能点。 */
+.insp-clickable { transition: border-color .12s, background .12s; }
+.insp-clickable:hover { border-color: var(--blue); background: var(--menu-hover); }
+
 /* ===== Markdown 正文排版（bot 回复）=====
    统一标题/段落/列表/代码/链接/表格/引用，长内容（URL）一律换行不溢出。 */
 .md { font-size: 14.5px; line-height: 1.68; color: var(--text); overflow-wrap: anywhere; word-break: break-word; }
@@ -285,13 +319,10 @@ a.um-item:visited { color: var(--text); }
 .followup-btn:hover { border-color: var(--orange); color: var(--orange2); background: color-mix(in srgb, var(--orange) 10%, transparent); }
 a.followup-btn { text-decoration: none; }
 
-/* ── 调查过程：主聊天入口按钮 + 右侧面板 ── */
-.inv-entry { display: inline-flex; align-items: center; gap: 7px; margin: 10px 0 2px; border: 1px solid var(--line);
-  border-radius: 10px; padding: 8px 13px; font-size: 13px; cursor: pointer; font-family: inherit;
-  color: var(--text); background: var(--card); transition: all .15s; }
-.inv-entry:hover { border-color: var(--orange); color: var(--orange2); }
-.inv-entry-ic { display: inline-flex; color: var(--muted); }
-.inv-entry-count { color: var(--muted); font-size: 12px; }
+/* ── 过程面板（右侧「思考过程」）的时间线样式 ──
+   两条 agent 路径（DevOps Agent 的调查过程 / 通用长任务的思考过程）**共用同一个面板组件**
+   （ThinkingPanel.tsx），所以样式也只有这一份。类名仍是历史的 inv-*（面板最早只给 DevOps
+   调查用），纯改名收益不大就留着；别按名字以为还有第二套面板。 */
 .inv-console { display: flex; align-items: center; gap: 6px; margin: 0 16px 4px; padding: 8px 12px;
   border: 1px solid var(--line); border-radius: 9px; font-size: 12.5px; color: var(--link, #5a96ff);
   text-decoration: none; }
@@ -300,8 +331,36 @@ a.followup-btn { text-decoration: none; }
 .inv-timeline { display: flex; flex-direction: column; }
 .inv-step { display: flex; gap: 10px; padding: 8px 2px; position: relative; }
 .inv-step:not(:last-child)::before { content: ""; position: absolute; left: 4px; top: 20px; bottom: -8px; width: 1px; background: var(--line); }
-.inv-dot { flex-shrink: 0; width: 9px; height: 9px; border-radius: 50%; background: var(--orange2); margin-top: 5px; z-index: 1; }
 .inv-step-tx { font-size: 13px; line-height: 1.55; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* ── 「查看思考过程」入口：**两条 agent 路径共用这一个入口**，样式与行为必须一致 ── */
+/* 入口**必须**套在这个块级容器里：.think-entry 与 .thinking 都是 inline-flex，不套就会和
+   「… 正在思考 · 3s」挤到同一行（现网出过）。下边距也在这里给足 —— 贴着正文/思考态很难看。 */
+.think-entry-row { display: block; margin-bottom: 13px; }
+/* 入口本身要**低调**：纯文字灰链（对齐 .reasoning-toggle 的分量），不用带边框的卡片气泡 ——
+   它只是个"想看过程再点"的次要入口，不该比正文抢眼。 */
+.think-entry { display: inline-flex; align-items: center; gap: 6px; margin: 2px 0 0;
+  border: none; background: none; padding: 2px 0; cursor: pointer; font-family: inherit;
+  font-size: 12.5px; color: #9aa4b0; transition: color .15s; }
+.think-entry:hover { color: var(--blue); }
+.think-entry-ic { display: inline-flex; color: inherit; opacity: .85; }
+.think-entry-count { color: inherit; opacity: .75; font-size: 12px; }
+/* 面板头部的"进行中"脉冲徽标 */
+.think-live { display: inline-flex; align-items: center; gap: 5px; margin-left: 9px; font-size: 11px;
+  font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.think-live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green, #3fb950); animation: think-pulse 1.4s ease-in-out infinite; }
+@keyframes think-pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+/* 每步一个线性图标（按类别着色）；连接线仍靠 .inv-step::before */
+.think-ic { flex-shrink: 0; width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center;
+  color: var(--muted); background: var(--card); border-radius: 50%; margin-top: 2px; z-index: 1; }
+.think-step.think-tool .think-ic { color: var(--blue); }
+.think-step.think-result .think-ic { color: var(--green, #3fb950); }
+.think-step.think-thought .think-ic { color: var(--muted); }
+.think-step.think-thought .inv-step-tx { color: var(--muted); font-style: italic; }
+.think-step:not(:last-child)::before { left: 8px; }  /* 图标比圆点宽，连接线对齐图标中心 */
+.think-repeat { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 8px; font-size: 11px;
+  font-weight: 600; color: var(--muted); background: color-mix(in srgb, var(--muted) 16%, transparent); vertical-align: middle; }
+.think-detail { display: block; margin-top: 2px; font-size: 12px; color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .action-cards { display: flex; flex-direction: column; gap: 10px; margin: 12px 0 4px; }
 .actcard { border: 1px solid var(--orange); border-radius: 12px; background: color-mix(in srgb, var(--orange) 6%, var(--card)); overflow: hidden; }
@@ -638,7 +697,6 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 .account-sel:hover { border-color: var(--muted); }
 .modelsel { display: flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 10px; padding: 6px 11px; font-size: 13px; font-weight: 600; color: var(--text); cursor: pointer; background: var(--card); white-space: nowrap; }
 .modelsel:hover { background: var(--menu-hover); border-color: var(--line); }
-.modelsel .effort { font-weight: 400; color: var(--muted); font-size: 12px; }
 .modelsel .caret { color: var(--muted); font-size: 11px; }
 .send { width: 36px; height: 36px; border-radius: 10px; border: none; background: var(--orange); color: #000; font-size: 16px; cursor: pointer; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
 .send:hover { background: #ffad33; }
@@ -986,7 +1044,10 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 .cz-dialog-pub .cz-dialog-title { display: flex; align-items: center; gap: 9px; }
 .cz-dialog-pub .cz-dialog-title svg { color: var(--orange2); }
 .cz-pub-body { padding: 18px 24px 6px; }
-.cz-pub-intro { font-size: 13px; color: var(--muted); line-height: 1.6; margin: 0 0 16px; }
+/* ⚠️ `white-space: pre-line` —— cz.da.intro 用 \n\n 把「这个功能做什么」和
+   「⚠️ 不影响巡检判读」分成两段。不加它两段会连成一坨，而后面那句恰恰是
+   最容易被误解的地方（客户会以为在这里发布 skill 能改善巡检结论）。 */
+.cz-pub-intro { font-size: 13px; color: var(--muted); line-height: 1.6; margin: 0 0 16px; white-space: pre-line; }
 .cz-pub-loading, .cz-pub-none { text-align: center; color: var(--muted); font-size: 13.5px; padding: 28px 12px; }
 .cz-pub-targets { display: flex; flex-direction: column; gap: 10px; }
 .cz-pub-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 15px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); transition: border-color .12s; }
@@ -1109,3 +1170,116 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
   .notif-side-head, .notif-side-group { width: 100%; }
   .notif-navitem { width: auto; }
 }
+
+/* ── 巡检详情抽屉里的「AI 判读」markdown（2026-09-01）───────────────────────
+   上一版把判读全文按 `pre-wrap` 当纯文本渲染，理由是「表格在 560px 的抽屉里
+   会横向溢出」。那是 CSS 问题，不是渲染方式问题 —— 而不渲染的代价是客户
+   直接读到 `**verdict**:` 和反引号（实测截图）。
+   这一组样式就是那个理由的实际解法。
+
+   ⚠️ 全部选择器都挂在 `.insp-md` 下，不碰聊天页那个 `.md`（两者宽度、
+      字号、可用空间完全不同，共用会让某一边被另一边的调整弄坏）。 */
+.insp-md > :first-child { margin-top: 0; }
+.insp-md > :last-child { margin-bottom: 0; }
+.insp-md p { margin: 0 0 .6em; }
+.insp-md h1, .insp-md h2, .insp-md h3, .insp-md h4 {
+  /* 判读正文里的标题层级对一个 560px 的抽屉太重 —— 压到与正文同阶，
+     只靠字重区分。不压的表现是 `## <finding_id>` 那一行占掉三行高度。 */
+  font-size: 1em; font-weight: 700; margin: .9em 0 .35em; line-height: 1.5;
+}
+.insp-md ul, .insp-md ol { margin: .3em 0 .6em; padding-left: 1.35em; }
+.insp-md li { margin: .15em 0; }
+.insp-md li > p { margin: 0; }
+.insp-md code {
+  font-size: .92em; padding: .08em .32em; border-radius: 4px;
+  background: var(--menu-hover); word-break: break-word;
+}
+.insp-md pre {
+  /* 🔴 代码块**横向自己滚**，不撑破抽屉。`max-width: 100%` 单独不够 ——
+     `pre` 的内容不换行，需要显式给它一个滚动容器。 */
+  margin: .4em 0 .7em; padding: 8px 10px; border-radius: 6px;
+  background: var(--menu-hover); overflow-x: auto; max-width: 100%;
+}
+.insp-md pre code { background: none; padding: 0; word-break: normal; }
+/* 🔴 表格：`display: block` + `overflow-x: auto` 才能让它在窄容器里
+   自己滚。只给容器加 overflow 不行 —— table 是 block-level 但不收缩。
+   这一条就是当初「解析后的表格会横向溢出」那个顾虑的解法。 */
+.insp-md table {
+  display: block; overflow-x: auto; max-width: 100%;
+  border-collapse: collapse; margin: .4em 0 .7em; font-size: .95em;
+}
+.insp-md th, .insp-md td {
+  border: 1px solid var(--line); padding: 4px 8px; text-align: left;
+  white-space: nowrap;
+}
+.insp-md th { background: var(--menu-hover); font-weight: 600; }
+.insp-md blockquote {
+  margin: .4em 0; padding: .1em 0 .1em .7em;
+  border-left: 3px solid var(--line); color: var(--muted);
+}
+.insp-md hr { border: none; border-top: 1px solid var(--line); margin: .8em 0; }
+/* 长实例名 / ARN 不撑破抽屉。 */
+.insp-md { overflow-wrap: anywhere; }
+/* ── Admin「集成 IM」:飞书配置步骤抽屉（components/FeishuGuideDrawer.tsx）──
+ * 桌面端右侧停靠、不加遮罩 —— 客户要一边看步骤一边填左边的凭证表单。
+ * 窄屏（≤900px）表单已经占满宽度，此时才退化为覆盖式 + 遮罩。 */
+.imd-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); opacity: 0; visibility: hidden;
+  transition: opacity .2s, visibility .2s; z-index: 1200; display: none; }
+.imd-panel { position: fixed; top: 0; right: 0; bottom: 0; width: 460px; max-width: 100vw; background: var(--card);
+  border-left: 1px solid var(--line); box-shadow: -10px 0 34px rgba(13,27,42,.16);
+  transform: translateX(100%); transition: transform .24s ease; z-index: 1201;
+  display: flex; flex-direction: column; }
+.imd-panel.open { transform: translateX(0); }
+.imd-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px;
+  padding: 18px 20px 14px; border-bottom: 1px solid var(--line); }
+.imd-title { font-size: 16px; font-weight: 650; color: var(--text); }
+.imd-sub { font-size: 12.5px; color: var(--muted); margin-top: 5px; line-height: 1.5; }
+.imd-close { flex-shrink: 0; background: transparent; border: 1px solid var(--line); border-radius: 8px;
+  color: var(--muted); padding: 5px 7px; cursor: pointer; display: inline-flex; }
+.imd-close:hover { color: var(--text); border-color: var(--orange2); }
+.imd-body { flex: 1; overflow-y: auto; padding: 16px 20px 34px; }
+.imd-h { font-size: 13.5px; font-weight: 700; color: var(--text); margin: 20px 0 8px; padding-left: 9px;
+  border-left: 3px solid var(--orange); line-height: 1.35; }
+.imd-body > .imd-h:first-child { margin-top: 2px; }
+.imd-p { font-size: 13px; line-height: 1.65; color: var(--text); margin: 0 0 9px; word-break: break-word; }
+.imd-list { margin: 0 0 10px; padding-left: 20px; }
+.imd-list li { font-size: 13px; line-height: 1.65; color: var(--text); margin-bottom: 5px; }
+.imd-code { font-family: "SF Mono", Consolas, monospace; font-size: 11.5px; line-height: 1.6; color: var(--text);
+  background: var(--page); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  margin: 0 0 11px; overflow-x: auto; white-space: pre; }
+.imd-warn { font-size: 12.5px; line-height: 1.6; color: var(--text); background: color-mix(in srgb, var(--orange) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--orange) 38%, var(--line)); border-radius: 9px; padding: 10px 12px; margin: 0 0 11px; }
+.imd-kv { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; margin: 0 0 11px; }
+.imd-kv-row { display: flex; gap: 10px; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+.imd-kv-row:last-child { border-bottom: none; }
+.imd-kv-k { flex: 0 0 108px; font-size: 12px; font-weight: 600; color: var(--muted); line-height: 1.55; }
+.imd-kv-v { flex: 1; min-width: 0; font-size: 12.5px; color: var(--text); line-height: 1.55; word-break: break-word; }
+/* 第 3 步的真实 webhook 地址 + 复制按钮。地址长且不可截断（少一个字符就 404），所以
+   输入框 `min-width: 0` + 等宽字体让它横向滚动，而不是被 flex 挤成省略号。 */
+.imd-urlbox { display: flex; gap: 7px; align-items: stretch; margin: 0 0 11px; }
+.imd-url { flex: 1; min-width: 0; font-family: "SF Mono", Consolas, monospace; font-size: 11.5px;
+  color: var(--text); background: var(--page); border: 1px solid var(--line); border-radius: 8px;
+  padding: 9px 11px; }
+.imd-url:focus { outline: none; border-color: var(--orange2); }
+.imd-url-copy { flex-shrink: 0; display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
+  font-weight: 600; color: var(--orange); background: transparent; border: 1px solid var(--orange2);
+  border-radius: 8px; padding: 0 12px; cursor: pointer; white-space: nowrap; }
+.imd-url-copy:hover { background: color-mix(in srgb, var(--orange) 10%, transparent); }
+@media (max-width: 900px) {
+  .imd-overlay { display: block; }
+  .imd-overlay.open { opacity: 1; visibility: visible; }
+  .imd-panel { width: min(460px, 100vw); }
+}
+
+/* Admin「集成 IM」页内的四步速览卡 + 打开抽屉的超链接 */
+.imx-steps { margin-top: 14px; max-width: 640px; background: var(--card); border: 1px solid var(--line);
+  border-radius: 12px; padding: 16px 18px; }
+.imx-steps-title { font-size: 12.5px; font-weight: 700; color: var(--text); margin-bottom: 10px; }
+.imx-steps ol { margin: 0; padding-left: 19px; }
+.imx-steps li { font-size: 12.5px; line-height: 1.65; color: var(--muted); margin-bottom: 6px; }
+.imx-steps-order { font-size: 12px; line-height: 1.6; color: var(--text); margin-top: 10px; padding: 9px 11px;
+  background: color-mix(in srgb, var(--orange) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--orange) 38%, var(--line)); border-radius: 8px; }
+.imx-guide-link { margin-top: 12px; background: transparent; border: none; padding: 0; cursor: pointer;
+  color: var(--link, #5a96ff); font-size: 13px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; }
+.imx-guide-link:hover { text-decoration: underline; }

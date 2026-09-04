@@ -1,7 +1,7 @@
 """
-IM 侧 Bedrock API Key 注入测试（spec task 4.5 验收）。
+IM 侧 Bedrock API Key 注入测试（验收）。
 
-与 webchat（task 3.4，`scripts/test_webchat_load_model.py`）的分工：webchat 每请求新建
+与 webchat（`scripts/test_webchat_load_model.py`）的分工：webchat 每请求新建
 BedrockModel，只需「构造前 set/pop」。IM 完全不同，两条都得测：
 
   1. **缓存的客户端**：8 个模块级 `LazyClient("bedrock-runtime")` 单例构造一次后复用。

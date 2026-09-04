@@ -14,12 +14,17 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-import boto3
+from core.lazy_boto import LazyClient
 
 logger = logging.getLogger(__name__)
 
 OPENAPI_BASE = os.environ.get("FEISHU_OPENAPI_BASE", "https://open.feishu.cn/open-apis")
-_sm = boto3.client("secretsmanager")
+#: 惰性构造 —— 这个模块坐在 IM worker 的**模块级 import 路径**上（caps.py → 这里），
+#: 而 `boto3.client("secretsmanager")` 在 import 期就要加载 botocore 的服务模型、
+#: 跑一遍 endpoint/凭证解析。冷启动本来就贴着 Lambda 那条 10s INIT 硬上限
+#: （根因与修法见 `scripts/build_im_layer.sh` 的「预编译字节码」段），能从 init 里
+#: 挪出去的都挪走。行为不变：第一次 `.get_secret_value(...)` 时才真正构造。
+_sm = LazyClient("secretsmanager")
 
 _app_id: str | None = None
 _app_secret: str | None = None
@@ -149,6 +154,50 @@ def reply_text(message_id: str, text: str, *,
     if in_thread:
         payload["reply_in_thread"] = True
     return call_openapi("POST", f"/im/v1/messages/{message_id}/reply", payload=payload)
+
+
+def get_message(message_id: str) -> dict:
+    """读一条**已有消息**的正文（`GET /im/v1/messages/:id`）。
+
+    用途只有一个：用户对着一条历史消息点「回复」/「在话题中回复」再 @NotiOps 时，
+    把那条消息的正文取回来当背景（B8 第 7 项，见
+    `platforms/common/quoted_context.py`）。
+
+    ⚠️ 权限用的是现有的 `im:message` / `im:message:readonly`，**不需要客户加新 scope**
+    （前提是 bot 在那个会话里 —— 不在的话飞书返回非零码，我们按"取不到"处理并
+    **明确告诉用户**，不静默）。撤回的消息同样是非零码。
+    """
+    return call_openapi("GET", f"/im/v1/messages/{message_id}")
+
+
+def get_message_text(message_id: str) -> tuple[str, str]:
+    """`get_message` + 解析，返回 ``(正文, 发件人 id)``。取不到就 ``("", "")``。
+
+    解析在 `platforms/feishu/msg_text.py`（不依赖 lark_oapi，因此 CI 里能测）。
+    """
+    from platforms.feishu import msg_text
+    data = get_message(message_id)
+    if data.get("code") != 0:
+        return "", ""
+    items = ((data.get("data") or {}).get("items") or [])
+    if not items:
+        return "", ""
+    item = items[0]
+    return msg_text.parse_item(item), msg_text.sender_of(item)
+
+
+def add_reaction(message_id: str, emoji_type: str) -> dict:
+    """给一条消息加表情回复（`POST /im/v1/messages/:id/reactions`）。
+
+    用途只有一个：ingress 在「正在思考」卡片之前先给用户一个"收到了"的反馈
+    （理由与延迟分解见 `platforms/common/quick_ack.py` 文件头）。
+
+    ⚠️ 需要 `im:message.reaction:write` 权限，客户在开放平台加完权限要**重新发布版本**
+    才生效。没有权限时返回 `{"code": <非0>}` —— 调用方按"不影响答案"处理，只打一条
+    WARNING，绝不抛。`emoji_type` 是飞书的表情键（不是 Unicode 表情），填错同样是非零码。
+    """
+    return call_openapi("POST", f"/im/v1/messages/{message_id}/reactions",
+                        payload={"reaction_type": {"emoji_type": emoji_type}})
 
 
 def _send(receive_id_type: str, receive_id: str, msg_type: str,

@@ -54,7 +54,6 @@ interface Props {
   convKey?: string;
 }
 
-const EFFORTS = ["model.effort.fast", "model.effort.balanced", "model.effort.deep"] as const;
 
 export default function Composer({ model, onModelChange, onSend, busy, showSuggestions = true, webSearch = false, onToggleWebSearch, devopsAgent = false, onToggleDevopsAgent, devopsAgentDirect = false, onToggleDevopsAgentDirect, devopsChat = false, onToggleDevopsChat, onStop, topic = "general", prefill, onManageSkills, onOpenDashboard, convKey, accountId = "" }: Props) {
   const t = useT();
@@ -64,7 +63,6 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
   // 模型菜单弹出方向:默认向上(bottom:54px);但 composer 在页面靠上时(如成本/案例主题
   // 带仪表盘,输入框顶在上方),向上弹会被视口顶部裁掉。点开时测一下上方空间,不够就向下弹。
   const [menuDropUp, setMenuDropUp] = useState(true);
-  const [effortIdx, setEffortIdx] = useState(1);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const selRef = useRef<HTMLDivElement>(null);
   // 未发送草稿按会话隔离(见 convKey prop)：ref 存各会话草稿(不触发渲染) + 追踪上一个会话 key。
@@ -541,8 +539,9 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
             )}
             {/* 「DevOps 对话」：这轮直接由**客户自己的 DevOps Agent** 回答（BFF 直连控制面
                 CreateChat/SendMessage 并逐 delta 转发），NotiOps 侧 **0 token**。
-                位置固定在联网搜索之后（产品指定）；在**故障调查 + 通用会话**两个主题显示
-                （chatShown 显式列举，不跟 topicHasDevopsAgent 走）。同样依赖 Agent Space，故复用
+                位置固定在联网搜索之后（产品指定）；**只在故障调查主题**显示（chatShown 显式
+                列举 `["investigate"]`，不跟 topicHasDevopsAgent 走 —— 通用会话改由新对话主页的
+                「对话对象」两张卡来选，见上面 objMode 处的注释）。同样依赖 Agent Space，故复用
                 deepNa 的置灰与提示。与两个「深度调查」三方互斥（互斥在 ChatApp 侧）。
                 ⚠️ 关着时前端不传 devops_chat_direct，后端行为与从前逐字节一致。 */}
             {chatShown && (
@@ -646,7 +645,6 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
                 setMenuOpen((o) => !o);
               }}>
                 <span>{modelName}</span>
-                <span className="effort">{t(EFFORTS[effortIdx])}</span>
                 <span className="caret">▾</span>
               </div>
               )}
@@ -722,11 +720,6 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
                       <span className="mm-check">✓</span>
                     </div>
                   ))}
-                  <div style={{ height: 1, background: "var(--line)", margin: "5px 8px" }} />
-                  <div className="mm-item" onClick={(e) => { e.stopPropagation(); setEffortIdx((i) => (i + 1) % EFFORTS.length); }} style={{ justifyContent: "space-between" }}>
-                    <div className="mm-name" style={{ fontWeight: 500 }}>{t("model.effort.label")}</div>
-                    <span style={{ fontSize: 13, color: "var(--muted)" }}>{t(EFFORTS[effortIdx])} ›</span>
-                  </div>
                 </div>
               )}
             </div>

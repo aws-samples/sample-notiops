@@ -269,7 +269,7 @@
       },
       "Properties": {
         "Code": {
-          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Bucket": "cdk-hnb659fds-assets-444455556666-us-east-1",
           "S3Key": "<ASSET>"
         },
         "Handler": "index.handler",
@@ -420,7 +420,7 @@
       },
       "Properties": {
         "Code": {
-          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Bucket": "cdk-hnb659fds-assets-444455556666-us-east-1",
           "S3Key": "<ASSET>"
         },
         "Description": "AWS CDK resource provider framework - onEvent (WebChatStack/ChatConfigProvider)",
@@ -600,7 +600,7 @@
             }
           ]
         },
-        "BucketName": "notiops-chat-frontend-111122223333-us-east-1",
+        "BucketName": "notiops-chat-frontend-444455556666-us-east-1",
         "PublicAccessBlockConfiguration": {
           "BlockPublicAcls": true,
           "BlockPublicPolicy": true,
@@ -915,7 +915,7 @@
       },
       "Properties": {
         "Code": {
-          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Bucket": "cdk-hnb659fds-assets-444455556666-us-east-1",
           "S3Key": "<ASSET>"
         },
         "Environment": {
@@ -1017,7 +1017,7 @@
                       {
                         "Ref": "AWS::Partition"
                       },
-                      ":s3:::cdk-hnb659fds-assets-111122223333-us-east-1"
+                      ":s3:::cdk-hnb659fds-assets-444455556666-us-east-1"
                     ]
                   ]
                 },
@@ -1029,7 +1029,7 @@
                       {
                         "Ref": "AWS::Partition"
                       },
-                      ":s3:::cdk-hnb659fds-assets-111122223333-us-east-1/*"
+                      ":s3:::cdk-hnb659fds-assets-444455556666-us-east-1/*"
                     ]
                   ]
                 }
@@ -1103,7 +1103,7 @@
                       {
                         "Ref": "AWS::Partition"
                       },
-                      ":s3:::notiops-data-111122223333-us-east-1"
+                      ":s3:::notiops-data-444455556666-us-east-1"
                     ]
                   ]
                 },
@@ -1115,7 +1115,7 @@
                       {
                         "Ref": "AWS::Partition"
                       },
-                      ":s3:::notiops-data-111122223333-us-east-1/*"
+                      ":s3:::notiops-data-444455556666-us-east-1/*"
                     ]
                   ]
                 }
@@ -1142,7 +1142,7 @@
       },
       "Properties": {
         "Code": {
-          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Bucket": "cdk-hnb659fds-assets-444455556666-us-east-1",
           "S3Key": "<ASSET>"
         },
         "Description": {
@@ -1201,7 +1201,7 @@
       },
       "Properties": {
         "Content": {
-          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Bucket": "cdk-hnb659fds-assets-444455556666-us-east-1",
           "S3Key": "<ASSET>"
         },
         "Description": "/opt/awscli/aws"
@@ -1232,7 +1232,7 @@
           ]
         },
         "SourceBucketNames": [
-          "cdk-hnb659fds-assets-111122223333-us-east-1"
+          "cdk-hnb659fds-assets-444455556666-us-east-1"
         ],
         "SourceObjectKeys": [
           "<ASSET>"
@@ -1248,7 +1248,7 @@
       },
       "Properties": {
         "Content": {
-          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Bucket": "cdk-hnb659fds-assets-444455556666-us-east-1",
           "S3Key": "<ASSET>"
         },
         "Description": "/opt/awscli/aws"
@@ -1262,7 +1262,7 @@
       },
       "Properties": {
         "DestinationBucketKeyPrefix": "onboarding-templates",
-        "DestinationBucketName": "notiops-data-111122223333-us-east-1",
+        "DestinationBucketName": "notiops-data-444455556666-us-east-1",
         "OutputObjectKeys": true,
         "Prune": false,
         "ServiceToken": {
@@ -1272,7 +1272,7 @@
           ]
         },
         "SourceBucketNames": [
-          "cdk-hnb659fds-assets-111122223333-us-east-1"
+          "cdk-hnb659fds-assets-444455556666-us-east-1"
         ],
         "SourceMarkers": [
           {}
@@ -1295,7 +1295,7 @@
       },
       "Properties": {
         "Code": {
-          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Bucket": "cdk-hnb659fds-assets-444455556666-us-east-1",
           "S3Key": "<ASSET>"
         },
         "Handler": "index.handler",
@@ -1401,7 +1401,7 @@
             {
               "Action": "rum:PutRumEvents",
               "Effect": "Allow",
-              "Resource": "arn:aws:rum:us-east-1:111122223333:appmonitor/notiops-web-chat"
+              "Resource": "arn:aws:rum:us-east-1:444455556666:appmonitor/notiops-web-chat"
             }
           ],
           "Version": "2012-10-17"
@@ -1504,24 +1504,32 @@
       },
       "Properties": {
         "Code": {
-          "S3Bucket": "cdk-hnb659fds-assets-111122223333-us-east-1",
+          "S3Bucket": "cdk-hnb659fds-assets-444455556666-us-east-1",
           "S3Key": "<ASSET>"
         },
         "Environment": {
           "Variables": {
-            "AGENT_RUNTIME_ARN": "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/NotiOpsWebChat-fixture",
-            "ATHENA_RESULTS_BUCKET": "notiops-data-111122223333-us-east-1",
+            "AGENT_RUNTIME_ARN": "arn:aws:bedrock-agentcore:us-east-1:444455556666:runtime/NotiOpsWebChat-fixture",
+            "ATHENA_RESULTS_BUCKET": "notiops-data-444455556666-us-east-1",
             "COGNITO_USER_POOL_ID": "us-east-1_FIXTUREPOOL",
             "CONFIG_TABLE": "notiops-config",
+            "COST_AGENT_MCP_URL": "",
+            "DEPLOY_ACCOUNT_ID": "444455556666",
             "DEVOPS_AGENT_SPACE_ID": "fixture-agent-space",
-            "LOCKED_ACCOUNT_ID": "111122223333",
+            "IM_INGRESS_API_NAME_PREFIX": "notiops-im-ingress-",
+            "INSPECTION_EXECUTOR_FUNCTION": "notiops-inspection-executor",
+            "INSPECTION_SCHEDULER_FUNCTION": "notiops-inspection-scheduler",
+            "INSPECTION_TABLE": "notiops-inspection",
+            "INSPECT_AGENT_SPACE_ID": "",
+            "INSPECT_AGENT_SPACE_NAME": "",
+            "LOCKED_ACCOUNT_ID": "444455556666",
             "MEMBER_DA_STACKSET_NAME": "",
             "MEMBER_ONBOARDING_STACKSET_NAME": "",
             "NOTIOPS_CROSS_ACCOUNT_ROLE": "notiops-idle-detection-role",
             "NOTIOPS_MEMBER_ROLE_NAME": "",
             "ORGANIZATION_ID": "",
             "REPORTS_CDN_DOMAIN": "reports.example.invalid",
-            "SKILLS_BUCKET": "notiops-data-111122223333-us-east-1",
+            "SKILLS_BUCKET": "notiops-data-444455556666-us-east-1",
             "WEB_CHAT_TABLE": {
               "Ref": "WebChatTable02103F86"
             }
@@ -1715,7 +1723,7 @@
                 "cognito-idp:AdminRemoveUserFromGroup"
               ],
               "Effect": "Allow",
-              "Resource": "arn:aws:cognito-idp:us-east-1:111122223333:userpool/us-east-1_FIXTUREPOOL"
+              "Resource": "arn:aws:cognito-idp:us-east-1:444455556666:userpool/us-east-1_FIXTUREPOOL"
             },
             {
               "Action": [
@@ -1727,8 +1735,8 @@
               ],
               "Effect": "Allow",
               "Resource": [
-                "arn:aws:dynamodb:us-east-1:111122223333:table/notiops-config",
-                "arn:aws:dynamodb:us-east-1:111122223333:table/notiops-config/index/*"
+                "arn:aws:dynamodb:us-east-1:444455556666:table/notiops-config",
+                "arn:aws:dynamodb:us-east-1:444455556666:table/notiops-config/index/*"
               ]
             },
             {
@@ -1757,7 +1765,7 @@
             {
               "Action": "bedrock-agentcore:InvokeAgentRuntime",
               "Effect": "Allow",
-              "Resource": "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/*"
+              "Resource": "arn:aws:bedrock-agentcore:us-east-1:444455556666:runtime/*"
             },
             {
               "Action": [
@@ -1766,12 +1774,18 @@
                 "secretsmanager:UpdateSecret"
               ],
               "Effect": "Allow",
-              "Resource": "arn:aws:secretsmanager:us-east-1:111122223333:secret:notiops/im-bot-feishu*"
+              "Resource": "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-feishu*"
             },
             {
               "Action": "secretsmanager:CreateSecret",
               "Effect": "Allow",
-              "Resource": "arn:aws:secretsmanager:us-east-1:111122223333:secret:notiops/im-bot-feishu*"
+              "Resource": "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-feishu*"
+            },
+            {
+              "Action": "apigateway:GET",
+              "Effect": "Allow",
+              "Resource": "arn:aws:apigateway:us-east-1::/apis",
+              "Sid": "ImWebhookUrlLookupReadOnly"
             },
             {
               "Action": [
@@ -1836,7 +1850,7 @@
                 "aidevops:ListPendingMessages"
               ],
               "Effect": "Allow",
-              "Resource": "arn:aws:aidevops:us-east-1:111122223333:agentspace/*"
+              "Resource": "arn:aws:aidevops:us-east-1:444455556666:agentspace/*"
             },
             {
               "Action": "aidevops:ListAgentSpaces",
@@ -1851,7 +1865,7 @@
             {
               "Action": "dynamodb:GetItem",
               "Effect": "Allow",
-              "Resource": "arn:aws:dynamodb:us-east-1:111122223333:table/notiops-config"
+              "Resource": "arn:aws:dynamodb:us-east-1:444455556666:table/notiops-config"
             },
             {
               "Action": [
@@ -1864,7 +1878,7 @@
                 "athena:GetNamedQuery"
               ],
               "Effect": "Allow",
-              "Resource": "arn:aws:athena:us-east-1:111122223333:workgroup/primary"
+              "Resource": "arn:aws:athena:us-east-1:444455556666:workgroup/primary"
             },
             {
               "Action": [
@@ -1875,7 +1889,7 @@
               "Resource": [
                 "arn:aws:bedrock:*::foundation-model/*",
                 "arn:aws:bedrock:::foundation-model/*",
-                "arn:aws:bedrock:*:111122223333:inference-profile/*"
+                "arn:aws:bedrock:*:444455556666:inference-profile/*"
               ],
               "Sid": "BedrockInferenceAndConnectivityProbe"
             },
@@ -1903,7 +1917,7 @@
                 "secretsmanager:CreateSecret"
               ],
               "Effect": "Allow",
-              "Resource": "arn:aws:secretsmanager:us-east-1:111122223333:secret:notiops/bedrock-api-key*",
+              "Resource": "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/bedrock-api-key*",
               "Sid": "BedrockApiKeySecretAccess"
             },
             {
@@ -1915,9 +1929,9 @@
               ],
               "Effect": "Allow",
               "Resource": [
-                "arn:aws:glue:us-east-1:111122223333:catalog",
-                "arn:aws:glue:us-east-1:111122223333:database/*",
-                "arn:aws:glue:us-east-1:111122223333:table/*/*"
+                "arn:aws:glue:us-east-1:444455556666:catalog",
+                "arn:aws:glue:us-east-1:444455556666:database/*",
+                "arn:aws:glue:us-east-1:444455556666:table/*/*"
               ]
             },
             {
@@ -1929,8 +1943,8 @@
               ],
               "Effect": "Allow",
               "Resource": [
-                "arn:aws:s3:::notiops-data-111122223333-us-east-1",
-                "arn:aws:s3:::notiops-data-111122223333-us-east-1/athena-results/*"
+                "arn:aws:s3:::notiops-data-444455556666-us-east-1",
+                "arn:aws:s3:::notiops-data-444455556666-us-east-1/athena-results/*"
               ]
             },
             {
@@ -1948,7 +1962,7 @@
                 "s3:DeleteObject"
               ],
               "Effect": "Allow",
-              "Resource": "arn:aws:s3:::notiops-data-111122223333-us-east-1/skills/*"
+              "Resource": "arn:aws:s3:::notiops-data-444455556666-us-east-1/skills/*"
             },
             {
               "Action": "s3:ListBucket",
@@ -1961,12 +1975,12 @@
                 }
               },
               "Effect": "Allow",
-              "Resource": "arn:aws:s3:::notiops-data-111122223333-us-east-1"
+              "Resource": "arn:aws:s3:::notiops-data-444455556666-us-east-1"
             },
             {
               "Action": "s3:PutObject",
               "Effect": "Allow",
-              "Resource": "arn:aws:s3:::notiops-data-111122223333-us-east-1/reports/*"
+              "Resource": "arn:aws:s3:::notiops-data-444455556666-us-east-1/reports/*"
             },
             {
               "Action": [
@@ -1974,7 +1988,7 @@
                 "s3:PutObject"
               ],
               "Effect": "Allow",
-              "Resource": "arn:aws:s3:::notiops-data-111122223333-us-east-1/onboarding-templates/*"
+              "Resource": "arn:aws:s3:::notiops-data-444455556666-us-east-1/onboarding-templates/*"
             },
             {
               "Action": [
@@ -2025,6 +2039,75 @@
               ],
               "Effect": "Allow",
               "Resource": "*"
+            },
+            {
+              "Action": [
+                "dynamodb:Query",
+                "dynamodb:GetItem"
+              ],
+              "Effect": "Allow",
+              "Resource": [
+                "arn:aws:dynamodb:us-east-1:444455556666:table/notiops-inspection",
+                "arn:aws:dynamodb:us-east-1:444455556666:table/notiops-inspection/index/*"
+              ],
+              "Sid": "InspectionDashboardReadOnly"
+            },
+            {
+              "Action": [
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:DeleteItem"
+              ],
+              "Effect": "Allow",
+              "Resource": "arn:aws:dynamodb:us-east-1:444455556666:table/notiops-inspection",
+              "Sid": "InspectionScopeAndScheduleWrite"
+            },
+            {
+              "Action": "lambda:InvokeFunction",
+              "Effect": "Allow",
+              "Resource": [
+                "arn:aws:lambda:us-east-1:444455556666:function:notiops-inspection-scheduler",
+                "arn:aws:lambda:us-east-1:444455556666:function:notiops-inspection-executor"
+              ],
+              "Sid": "InspectionManualRunInvoke"
+            },
+            {
+              "Action": [
+                "rds:DescribeDBInstances",
+                "rds:DescribeDBClusters",
+                "elasticache:DescribeCacheClusters",
+                "elasticache:DescribeReplicationGroups"
+              ],
+              "Effect": "Allow",
+              "Resource": "*",
+              "Sid": "InspectionResourceInventoryReadOnly"
+            },
+            {
+              "Action": [
+                "aidevops:ListAssociations",
+                "aidevops:AssociateService",
+                "aidevops:ValidateAwsAssociations",
+                "aidevops:CreateAsset",
+                "aidevops:UpdateAsset",
+                "aidevops:DeleteAsset",
+                "aidevops:ListAssets",
+                "aidevops:CreateBacklogTask",
+                "aidevops:GetBacklogTask",
+                "aidevops:ListJournalRecords",
+                "aidevops:ListRecommendations"
+              ],
+              "Effect": "Allow",
+              "Resource": "arn:aws:aidevops:us-east-1:444455556666:agentspace/*"
+            },
+            {
+              "Action": "iam:PassRole",
+              "Condition": {
+                "StringEquals": {
+                  "iam:PassedToService": "aidevops.amazonaws.com"
+                }
+              },
+              "Effect": "Allow",
+              "Resource": "arn:aws:iam::444455556666:role/*"
             }
           ],
           "Version": "2012-10-17"

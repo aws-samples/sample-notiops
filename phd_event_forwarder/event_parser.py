@@ -5,8 +5,6 @@
 SNS 信封结构：
   Records[i].Sns.Message → JSON 字符串 → EventBridge 事件对象
   EventBridge 事件的 detail 字段包含 PHD 事件详情。
-
-Requirements: 4.1, 4.2, 4.3, 4.4, 4.5
 """
 
 import json

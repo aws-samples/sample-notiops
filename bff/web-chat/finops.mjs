@@ -482,15 +482,20 @@ Rows (top 40): ${JSON.stringify(rows.slice(0, 40))}
 Return ONLY the JSON object, no markdown, no prose.`;
     const resp = await bedrock.send(new ConverseCommand({
       // 注：这里的 model 是**硬编码**、不走 llmcfg 目录 —— 它是 dashboard 洞察生成，
-      // 不是用户可选的对话模型。已与目录口径对齐到 global.*（决策 2026-07）。
-      // 若要纳入 Admin 管理，应作为一类 backend_task 加进目录，而不是在这里各自写死。
-      modelId: "global.anthropic.claude-sonnet-5",
+      // 不是用户可选的对话模型。已与目录口径对齐到 global.*（决策 2026-07）；
+      // 2026-09-01 随产品默认模型一起改成 Grok 4.6（= 目录的 default_model）。
+      // 若要纳入 Admin 管理，应作为一类 backend_task 加进目录（现有的只有
+      // phd_translate / devops_report_summarize 两个），而不是在这里各自写死。
+      modelId: "global.xai.grok-4.6",
       messages: [{ role: "user", content: [{ text: prompt }] }],
-      // **不要传 temperature**。Sonnet 5 已弃用该参数（adaptive thinking 常驻），传了
-      // 整个请求 ValidationException:「`temperature` is deprecated for this model」——
-      // 而这一段的异常被兜进 aiError，界面表现只是"洞察是空的"，没有任何报错。
-      // 实测 2026-08-26 确认：带 temperature 必失败，去掉即正常。同一个坑在
-      // llm_config.mjs 的探测里踩过一次，那次至少有枚举态可查，这里连状态都没有。
+      // **不要传 temperature**（换成 Grok 之后这条依然成立，别"顺手加回来"）。
+      // 教训来自 Sonnet 5：它弃用了该参数（adaptive thinking 常驻），传了整个请求
+      // ValidationException:「`temperature` is deprecated for this model」—— 而这一段的
+      // 异常被兜进 aiError，界面表现只是"洞察是空的"，没有任何报错。实测 2026-08-26
+      // 确认：带 temperature 必失败，去掉即正常。这里的模型是可改的（见上），所以不能
+      // 依赖"当前这个模型接受 temperature"；确定性也不靠采样参数，靠提示词里的
+      // STRICT JSON 约束。同一个坑在 llm_config.mjs 的探测里踩过一次，那次至少有
+      // 枚举态可查，这里连状态都没有。
       inferenceConfig: { maxTokens: 1000 },
     }));
     const txt = resp.output?.message?.content?.[0]?.text || "";
@@ -573,15 +578,20 @@ Rows (top 40): ${JSON.stringify(rows.slice(0, 40))}
 Return ONLY the JSON object, no markdown, no prose.`;
     const resp = await bedrock.send(new ConverseCommand({
       // 注：这里的 model 是**硬编码**、不走 llmcfg 目录 —— 它是 dashboard 洞察生成，
-      // 不是用户可选的对话模型。已与目录口径对齐到 global.*（决策 2026-07）。
-      // 若要纳入 Admin 管理，应作为一类 backend_task 加进目录，而不是在这里各自写死。
-      modelId: "global.anthropic.claude-sonnet-5",
+      // 不是用户可选的对话模型。已与目录口径对齐到 global.*（决策 2026-07）；
+      // 2026-09-01 随产品默认模型一起改成 Grok 4.6（= 目录的 default_model）。
+      // 若要纳入 Admin 管理，应作为一类 backend_task 加进目录（现有的只有
+      // phd_translate / devops_report_summarize 两个），而不是在这里各自写死。
+      modelId: "global.xai.grok-4.6",
       messages: [{ role: "user", content: [{ text: prompt }] }],
-      // **不要传 temperature**。Sonnet 5 已弃用该参数（adaptive thinking 常驻），传了
-      // 整个请求 ValidationException:「`temperature` is deprecated for this model」——
-      // 而这一段的异常被兜进 aiError，界面表现只是"洞察是空的"，没有任何报错。
-      // 实测 2026-08-26 确认：带 temperature 必失败，去掉即正常。同一个坑在
-      // llm_config.mjs 的探测里踩过一次，那次至少有枚举态可查，这里连状态都没有。
+      // **不要传 temperature**（换成 Grok 之后这条依然成立，别"顺手加回来"）。
+      // 教训来自 Sonnet 5：它弃用了该参数（adaptive thinking 常驻），传了整个请求
+      // ValidationException:「`temperature` is deprecated for this model」—— 而这一段的
+      // 异常被兜进 aiError，界面表现只是"洞察是空的"，没有任何报错。实测 2026-08-26
+      // 确认：带 temperature 必失败，去掉即正常。这里的模型是可改的（见上），所以不能
+      // 依赖"当前这个模型接受 temperature"；确定性也不靠采样参数，靠提示词里的
+      // STRICT JSON 约束。同一个坑在 llm_config.mjs 的探测里踩过一次，那次至少有
+      // 枚举态可查，这里连状态都没有。
       inferenceConfig: { maxTokens: 700 },
     }));
     const txt = resp.output?.message?.content?.[0]?.text || "";

@@ -21,12 +21,26 @@
 #                         时传入）；空/未设 = 仅部署账号。**必须显式传空**而非省略，因为
 #                         §5 的回填是 merge-patch：不传就保留 runtime 上的旧值，会让
 #                         org→单账号回退时闸门一直留在开启态（fail-open）。
+#   COST_AGENT_MCP_URL    可选，客户自建 cost-agent MCP（CUR 行级明细）的 Lambda Function
+#                         URL。空/未设 = 本部署无客户 CUR 能力（core/cost_agent_mcp.py 不挂载
+#                         工具，agent 回答成本问题时走 CE / aws-api 兜底）。与上面同理**必须
+#                         显式传空**：§5 回填是 merge-patch，不传就留着 runtime 上的旧 URL。
 #
 # 退出码非 0 表示失败；setup.sh 据此决定是否回退 echo BFF。
 set -euo pipefail
 
 # 跨账号闸门取值：单独跑本脚本时可能未设（set -u 下需给默认值）。空串 = 默认关闭。
 ALLOW_CROSS_ACCOUNT="${NOTIOPS_ALLOW_CROSS_ACCOUNT:-}"
+# 客户 CUR 数据源（cost-agent MCP 的 Lambda Function URL）。空串 = 本部署没有这个能力，
+# 不是错误：agent 侧 get_tools() 返回空、web 侧能力节点被 requiresEnv 摘掉，成本问题
+# 由 CE / aws-api 兜底回答。末尾斜杠统一去掉（拼 /mcp 时不出现双斜杠）。
+COST_AGENT_MCP_URL="${COST_AGENT_MCP_URL:-}"
+COST_AGENT_MCP_URL="${COST_AGENT_MCP_URL%/}"
+# 同一个 Lambda 的**函数 ARN**。Function URL 里不含 ARN，而 `lambda:InvokeFunctionUrl`
+# 必须按资源授权 —— 所以 runtime 执行角色那条语句（cdk/lib/cdk-stack.ts 的
+# `InvokeCostAgentMcp`）只能从这里拿到目标。**export**：`agentcore deploy` 会 fork 出
+# cdk synth 子进程，不 export 就读不到，于是权限授到一个不存在的函数上、调用恒 403。
+export COST_AGENT_FN_ARN="${COST_AGENT_FN_ARN:-}"
 
 # ─── UI 语言（双语输出）───
 # 继承 setup.sh 导出的 UI_LANG（zh/en）；单独跑本脚本时默认英文，面向全球客户。
@@ -145,11 +159,12 @@ REPORTS_CDN_DOMAIN="$(aws cloudformation describe-stacks --region "$REGION" \
   --output text 2>/dev/null || echo '')"
 [ "$REPORTS_CDN_DOMAIN" = "None" ] && REPORTS_CDN_DOMAIN=""
 AGENTCORE_JSON="$AGENT_DIR/agentcore/agentcore.json"
-python3 - "$AGENTCORE_JSON" "$GATEWAY_URL" "$SKILLS_BUCKET" "$DEVOPS_AGENT_SPACE_ID" "$REPORTS_CDN_DOMAIN" "$ALLOW_CROSS_ACCOUNT" <<'PY'
+python3 - "$AGENTCORE_JSON" "$GATEWAY_URL" "$SKILLS_BUCKET" "$DEVOPS_AGENT_SPACE_ID" "$REPORTS_CDN_DOMAIN" "$ALLOW_CROSS_ACCOUNT" "$COST_AGENT_MCP_URL" <<'PY'
 import json, sys
 path, url, skills_bucket, da_space = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 reports_cdn = sys.argv[5] if len(sys.argv) > 5 else ""
 allow_cross = sys.argv[6] if len(sys.argv) > 6 else ""
+cost_mcp = sys.argv[7] if len(sys.argv) > 7 else ""
 d = json.load(open(path))
 for rt in d.get("runtimes", []):
     for ev in rt.get("envVars", []):
@@ -163,6 +178,8 @@ for rt in d.get("runtimes", []):
             ev["value"] = reports_cdn  # 空串=reports.py 回退 presigned(12h)
         elif ev.get("name") == "NOTIOPS_ALLOW_CROSS_ACCOUNT":
             ev["value"] = allow_cross  # org 模式传 1 = 放开跨账号闸门；空 = 仅部署账号
+        elif ev.get("name") == "COST_AGENT_MCP_URL":
+            ev["value"] = cost_mcp  # 空串=不挂 CUR 工具，成本问题走 CE / aws-api 兜底
 json.dump(d, open(path, "w"), indent=2, ensure_ascii=False)
 import os as _os
 _zh = _os.environ.get("UI_LANG") == "zh"
@@ -171,13 +188,15 @@ if _zh:
           f"SKILLS_BUCKET: {skills_bucket or '(空)'}; "
           f"DEVOPS_AGENT_SPACE_ID: {da_space or '(空，运行时自动发现)'}; "
           f"REPORTS_CDN_DOMAIN: {reports_cdn or '(空，回退 presigned)'}; "
-          f"跨账号闸门: {'开启（多账号模式）' if allow_cross else '关闭（仅部署账号）'}")
+          f"跨账号闸门: {'开启（多账号模式）' if allow_cross else '关闭（仅部署账号）'}; "
+          f"客户 CUR 数据源: {'已配置' if cost_mcp else '(空，成本问题走 CE / aws-api)'}")
 else:
     print(f"    agentcore.json written — gateway URL: {url or '(empty, no web search)'}; "
           f"SKILLS_BUCKET: {skills_bucket or '(empty)'}; "
           f"DEVOPS_AGENT_SPACE_ID: {da_space or '(empty, auto-discovered at runtime)'}; "
           f"REPORTS_CDN_DOMAIN: {reports_cdn or '(empty, presigned fallback)'}; "
-          f"cross-account gate: {'ON (multi-account mode)' if allow_cross else 'OFF (deploy account only)'}")
+          f"cross-account gate: {'ON (multi-account mode)' if allow_cross else 'OFF (deploy account only)'}; "
+          f"customer CUR source: {'configured' if cost_mcp else '(empty, cost questions fall back to CE / aws-api)'}")
 PY
 
 # ── 3. 部署 ──
@@ -261,6 +280,7 @@ FACTORY = {
     "DEVOPS_AGENT_SPACE_ID": "__DEVOPS_AGENT_SPACE_ID__",
     "REPORTS_CDN_DOMAIN": "__REPORTS_CDN_DOMAIN__",
     "NOTIOPS_ALLOW_CROSS_ACCOUNT": "",   # 出厂 = 关闭（安全默认）
+    "COST_AGENT_MCP_URL": "__COST_AGENT_MCP_URL__",
 }
 d = json.load(open(path))
 for rt in d.get("runtimes", []):
@@ -299,7 +319,7 @@ echo "  $(t "✓ Agent Runtime ARN:" "✓ Agent Runtime ARN:") $ARN"
 #
 # 回填/轮询/核验的实现统一收敛到 scripts/backfill_runtime_env.sh(单一权威,避免与
 # setup.sh 里"部署后补 AgentSpaceId/ReportsCdnDomain"那处各写一份而漂移)。
-# 这里传全部 5 个 env 真值 + idle=3600。注意:此刻 NotiOpsBackendStack 通常尚未部署
+# 这里传全部 6 个 env 真值 + idle=3600。注意:此刻 NotiOpsBackendStack 通常尚未部署
 # (setup.sh 里 CDK 部署在本脚本之后),故 DEVOPS_AGENT_SPACE_ID / REPORTS_CDN_DOMAIN
 # 此时多半为空 → 由 setup.sh 在 `cdk deploy --all` 之后再 merge-patch 补齐(不覆盖此处
 # 已设的 gateway/桶)。单独跑本脚本(栈已存在)时,这里就能一次拿到全部真值。
@@ -317,4 +337,5 @@ REGION="$REGION" RT_ARN="$ARN" SET_IDLE=3600 UI_LANG="$UI_LANG" \
     "DEVOPS_AGENT_SPACE_ID=$DEVOPS_AGENT_SPACE_ID" \
     "AGENTCORE_WEBSEARCH_GATEWAY_URL=$GATEWAY_URL" \
     "NOTIOPS_ALLOW_CROSS_ACCOUNT=$ALLOW_CROSS_ACCOUNT" \
+    "COST_AGENT_MCP_URL=$COST_AGENT_MCP_URL" \
   || echo "  $(t "⚠ env 回填/idle 设置未完成(不阻断);可稍后重跑。" "⚠ env backfill / idle setting did not complete (non-blocking); re-run later.")" >&2

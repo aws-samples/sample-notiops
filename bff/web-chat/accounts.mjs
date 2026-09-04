@@ -74,7 +74,16 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 /** 列出已启用账号：[{accountId, accountName}]。表不可用/查询失败 → []（前端回退到仅部署账号）。 */
 import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
 let _selfId = "";
-async function selfAccountId() {
+/**
+ * 部署账号 ID（本 Lambda 跑在哪个账号）。带进程内缓存。
+ *
+ * ⚠️ 导出给 `inspection.mjs` 用：巡检看板的账号选择器把**空字符串定义为
+ * 「部署账号」**（`<option value="">部署账号</option>`），而全新部署的
+ * 成员账号登记表是空的 → 选择器压根不渲染 → accountId 恒为空。
+ * 所以巡检那侧必须把空值解析成这个 ID，否则每个新部署第一次打开看板
+ * 都是 `account_required`。
+ */
+export async function selfAccountId() {
   if (_selfId) return _selfId;
   try { _selfId = (await new STSClient({}).send(new GetCallerIdentityCommand({}))).Account || ""; } catch { /* 空=不过滤 */ }
   return _selfId;

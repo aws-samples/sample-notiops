@@ -244,6 +244,36 @@ def send_report(chat_id: str, root_message_id: str, status: str,
     })
 
 
+def send_markdown(chat_id: str, markdown: str, *, locale: str = "zh",
+                  title: str = "NotiOps") -> bool:
+    """Post a standalone markdown body via the custom-bot webhook. True on ok.
+
+    Added for the inspection broadcast layer . `send_report` is
+    not reusable there: it prefixes a `[STATUS] detail_type — task_id[:8]`
+    heading that a cron digest has no values for, and it returns None so a
+    fan-out can't tell which groups failed.
+
+    🔴 `chat_id` is accepted for signature parity but **NOT used** — the
+    custom-bot webhook URL is bound to one specific group, so routing is
+    implicit (same caveat as `send_report`). That is exactly why
+    `inspection/domain/targets.py` rejects the whole platform when more than
+    one DingTalk target is configured: every target would land in the same
+    group, so a per-account digest would leak account A's findings into
+    account B's group. Do not "fix" that by looping here.
+    """
+    if not is_configured():
+        logger.warning(
+            "dingtalk_sender: not configured — skipping send_markdown")
+        return False
+    body = (markdown or "").strip() or "(empty)"
+    data = _post_webhook({
+        "msgtype": "markdown",
+        "markdown": {"title": title, "text": body},
+        "at": {"isAtAll": False},
+    })
+    return bool(data) and data.get("errcode", 0) == 0
+
+
 def send_live_console_link(chat_id: str, root_message_id: str,
                             console_url: str, locale: str = "zh",
                             **_kwargs) -> dict:

@@ -34,6 +34,7 @@
 - §11 [Full Parameter Reference](#11-full-parameter-reference)
 - **§12 [Web Chat Deployment](#12-web-chat-deployment)** — the browser-based agentic AI assistant, independent of the IM bot
 - **§13 [CUR + Athena FinOps Data Source](#13-cur--athena-finops-data-source)** — cost-detail data source for the FinOps dashboard (optional; two paths: reuse an existing CUR = ready in minutes / new CUR = ~24h first delivery)
+- §14 [Customer CUR Dashboard + cost-agent MCP](#14-customer-cur-dashboard--cost-agent-mcp-optional) (optional) — line-item CUR for **someone else's** accounts, via your own MCP Lambda
 
 ---
 
@@ -56,14 +57,20 @@
 
 The first run is **interactive**: confirm AWS account + region → (optional) PHD event forwarding → **pick which IM platforms to deploy (default `0` = skip, web UI only; pick Feishu / Slack only if you want IM)** → build frontends (admin console + chat-app) → deploy the Web Chat Agent (AgentCore Runtime) → CDK bootstrap → CDK synth → CDK deploy `--all`. **Web Chat + the backend agent deploy by default.** IM credentials are **not** collected here — CDK creates **empty** secrets, and you fill them in *after* deploy (see §4 / §5).
 
-> **About DingTalk**: `bot-stack.ts` still defines `DingtalkBotService` (adapter code retained), but v1 `setup.sh` doesn't surface the option → `enabledPlatforms` never includes `dingtalk` → DingTalk task `desiredCount=0`, doesn't run, no Fargate cost. v2 ships the dual-robot credential flow.
+> **About DingTalk**: the DingTalk adapter code (`platforms/dingtalk/`) is retained, but v1 `setup.sh` doesn't surface the option → `enabledPlatforms` never includes `dingtalk` → `ImStack` creates no DingTalk Lambda / webhook, no cost. v2 ships the dual-robot credential flow.
 
-Three stacks land (one shot via `cdk deploy --all`):
+Two stacks land (one shot via `cdk deploy --all`; three when you pick an IM platform — `ImStack` is added):
 - `NotiOpsBackendStack` — shared backend (DDB, 5 Lambdas, S3 report bucket, EventBridge rules)
 - `WebChatStack` — the browser-based agentic AI assistant (**deployed by default**; BFF Lambda + Function URL, single DDB table `notiops-web-chat`, static frontend, notification handler)
-- `BotStack` — IM bot platform stack (VPC, ECS Cluster at 512 CPU / 1024 MB per task, one Fargate Service per selected platform + ECR; **each task bundles pricing + cost MCP sidecars**). **If no IM is selected, this stack still deploys but every bot runs at `desiredCount=0` — no containers, no cost.**
+- `ImStack` (only when IM is selected) — **the only path for IM**: one API Gateway HTTP API plus one Lambda pair (ingress + worker) per platform, plus a progress Lambda, the dependency Layer and the de-duplication table. After deploy, paste the webhook URL it outputs into the IM platform console — see [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md)
 
-Re-running `./setup.sh` only patches deltas (existing stacks go through `cdk diff`; images rebuild only if changed).
+> ℹ️ **`BotStack` (ECS Fargate long connection) was retired on 2026-09-03** (IM refactor M2).
+> `infra/bin/app.ts` no longer instantiates it — so **no VPC is needed, and neither is finch / docker**.
+> `infra/lib/bot-stack.ts` and the three Dockerfiles stay in the repo as the long-connection rollback
+> path (referenced by no app); `teardown.sh` still deletes `BotStack` by name so accounts installed
+> before M2 clean up completely.
+
+Re-running `./setup.sh` only patches deltas (existing stacks go through `cdk diff`).
 
 ### 0.1.1 After deploy: what works out of the box vs what needs one more step
 
@@ -118,13 +125,14 @@ Expect a reply within seconds. If nothing → §6 Smoke Tests / §10 Troubleshoo
 
 ## 1. Deployment Architecture
 
-CDK deploys three stacks in one shot via `cdk deploy --all`. **Web Chat (the browser-based main entry) and the AgentCore agent that backs it deploy by default** — `setup.sh` first builds the chat-app frontend, runs `scripts/deploy_agent.sh` to deploy the agent, then runs `cdk deploy --all`:
+CDK deploys three stacks in one shot via `cdk deploy --all` (four when you pick an IM platform — `ImStack` is added). **Web Chat (the browser-based main entry) and the AgentCore agent that backs it deploy by default** — `setup.sh` first builds the chat-app frontend, runs `scripts/deploy_agent.sh` to deploy the agent, then runs `cdk deploy --all`:
 
 | Stack (CDK name) | Required | Contents |
 |---|---|---|
 | **`notiops-*`** | ✅ Required | 5 Lambdas (collector / analyzer / health-checker / notifier / cost-analyzer), shared DDB tables, S3 report bucket, EventBridge rules (5 IM push rules + 10 web notification rules + notiops schedules), agent-trigger Role (for STS AssumeRole) |
 | **`WebChatStack`** | ✅ Deployed by default | The browser-based agentic AI assistant (**the product's main entry**): BFF Lambda (`notiops-web-chat-bff`) + Function URL (`AWS_IAM`), single DDB table `notiops-web-chat` (sessions/messages + notification inbox), static frontend (chat-app), notification handler. The BFF gets the previous step's agent Runtime ARN injected via `-c agentRuntimeArn` |
-| **`BotStack`** | ✅ Deployed (IM optional) | VPC + public subnets, ECS Cluster (512 CPU / 1024 MB per task), ECR repo, one Fargate Service per selected IM platform (v1: Feishu / Slack), **each task bundles pricing + cost MCP sidecars**, Task Role, Security Group. **If no IM is selected the stack still deploys, but every bot runs at `desiredCount=0` — no containers, no cost** |
+| **`ImStack`** | Only when IM is selected | **The production path for IM**: one **API Gateway HTTP API** per platform (the public entry point, a `$default` catch-all route) plus one Lambda pair — ingress (validates the signature and hands off asynchronously, `reservedConcurrentExecutions=10`) + worker (does the real work, 900s) — plus the shared dependency Layer and a de-duplication table. Its `FeishuWebhookUrl` / `SlackWebhookUrl` outputs are the request URLs you paste into the IM platform console (see [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md)) |
+| ~~**`BotStack`**~~ | ❌ **Retired (2026-09-03)** | It used to be: VPC + public subnets, ECS Cluster (512 CPU / 1024 MB per task), ECR repo, one Fargate Service per selected platform, pricing + cost MCP sidecars per task, Task Role, Security Group. After IM refactor M2, `infra/bin/app.ts` **no longer instantiates it**, so fresh installs get no VPC / ECS / ECR and need no finch / docker. The source (`infra/lib/bot-stack.ts` + three Dockerfiles) is deliberately kept in the repo as the long-connection rollback path — rolling back means `new BotStack(...)` again, which is far cheaper than rebuilding VPC/ECS and the images from scratch. Accounts installed before M2 still have the stack: `teardown.sh` deletes it by name, or delete it on its own with `aws cloudformation delete-stack --stack-name BotStack` (it publishes **no CFN exports**, so no other stack can be importing it) |
 
 **Deployment order** (handled automatically by `./setup.sh`):
 ```
@@ -133,7 +141,7 @@ CDK deploys three stacks in one shot via `cdk deploy --all`. **Web Chat (the bro
 (optional) to enable IM: §3 Register an IM app first, then re-run setup.sh and pick the platform
 ```
 
-Credential flow: `setup.sh` **does not collect IM credentials** — it only sets the `enabledPlatforms` flag based on your selection. CDK creates **empty** secrets (`notiops/im-bot-feishu` / `notiops/slack-bot-token` / `notiops/slack-app-token`); after deploy you fill them in via the Web Chat admin console "Notifications" settings, or directly in Secrets Manager followed by a forced restart of the matching ECS service (see §4). CDK stacks always reference the secrets by ARN. **Nothing is persisted to disk locally.**
+Credential flow: `setup.sh` **does not collect IM credentials** — it only sets the `enabledPlatforms` flag based on your selection. CDK creates **empty** secrets (`notiops/im-bot-feishu` / `notiops/slack-bot-token` / `notiops/slack-signing-secret`); after deploy you fill them in under Web Chat admin console → "IM Integration" (all four Feishu credentials on one form), or directly in Secrets Manager (see §4.2 — webhook mode needs **no** service restart). CDK stacks always reference the secrets by ARN. **Nothing is persisted to disk locally.**
 
 ---
 
@@ -146,7 +154,7 @@ Credential flow: `setup.sh` **does not collect IM credentials** — it only sets
 | AWS CLI v2 | ≥ 2.13 (Bedrock support) | `aws --version` |
 | ~~AWS SAM CLI~~ | ~~≥ 1.100~~ | ~~`sam --version`~~ *(retired — CDK deploy doesn't need SAM CLI)* |
 | Node.js | ≥ 22 | `node --version` *(CDK runtime)* |
-| Container build tool | finch (recommended) / docker | `finch version` |
+| ~~Container build tool~~ | ~~finch (recommended) / docker~~ | — *(**no longer required** as of 2026-09-03 — see the note below)* |
 | jq | any version | `jq --version` |
 | Python 3.12+ (local builds) | — | `python3 --version` |
 | **uv** | any version | `uv --version` |
@@ -161,12 +169,23 @@ Credential flow: `setup.sh` **does not collect IM credentials** — it only sets
 > Note that uv's official installer puts the binary in `~/.local/bin`, which is often not on PATH in
 > non-interactive shells — open a new shell after installing.
 
+> ℹ️ **A container build tool (finch / docker) is no longer required as of 2026-09-03**, including for IM.
+> The only thing that ever needed one was the five `ContainerImage.fromAsset("../")` calls in the old
+> `BotStack` (ECS Fargate long-connection containers), and IM moved entirely to Webhook + Lambda
+> (`ImStack`) in refactor M2 — `infra/bin/app.ts` no longer instantiates `BotStack`. The IM Python
+> dependency Layer is cross-downloaded by `scripts/build_im_layer.sh` using
+> `pip --platform manylinux2014_x86_64 --only-binary=:all:`, which needs no container.
+> Side benefit: `cdk synth` no longer hashes the whole repo root as a Docker build context
+> (measured 594s → 12s).
+> ⚠️ If a Docker asset is ever reintroduced, this note, `setup.sh`'s preflight, and
+> `publish/README.public.{zh,en}.md` all have to change back together.
+
 ### 2.2 AWS account preparation
 
 - **AWS account**: admin or equivalent permissions
-- **VPC**: any VPC capable of running ECS Fargate + ≥ 2 AZs of public subnets (**only needed if you enable the IM bot** — Fargate tasks reach IM APIs over the public internet; ignore for web-only)
+- ~~**VPC**~~: **no longer needed** — IM runs on Webhook + Lambda (`ImStack`), so there is no ECS Fargate task and therefore no VPC / public subnet requirement (2026-09-03, IM refactor M2). Only the `infra/lib/bot-stack.ts` long-connection rollback path needs one
 - **AWS DevOps Agent**: enabled (required for deep investigation). **No need to bring your own Agent Space** — CDK auto-creates one named `notiops-devops-<account>` in your account (see §5.3.5); you don't pre-create one or supply a space id
-- **Bedrock**: the model behind the catalogue's **default_model** is enabled in your region (Bedrock console → Model access). Today that is **Claude Sonnet 5** (`global.anthropic.claude-sonnet-5`); enable the others too (Claude Opus 5 / Haiku 4.5, Nova Pro, DeepSeek, GLM 5, Grok 4.6, the GPT-5.6 family) if you want users to be able to switch
+- **Bedrock**: the model behind the catalogue's **default_model** is enabled in your region (Bedrock console → Model access). Today that is **xAI Grok 4.6** (`global.xai.grok-4.6`); enable the others too (Claude Sonnet 5 / Opus 5 / Haiku 4.5, Nova Pro, DeepSeek, GLM 5, the GPT-5.6 family) if you want users to be able to switch
 
 ### 2.3 Region selection
 
@@ -176,13 +195,13 @@ Different components have different region constraints — plan ahead:
 |---|---|---|
 | **AWS DevOps Agent service** | **`us-east-1` only** | AWS service constraint (single-region preview) |
 | **Shared backend Lambda stack** | **strongly recommended `us-east-1`** | Polls DevOps Agent journal API; cross-region adds latency and IAM complexity |
-| **Feishu / Slack ECS bot stack** | any AWS region | No hard constraint; pick what's nearest your users |
+| **Feishu / Slack IM stack (`ImStack`)** | any AWS region | No hard constraint; pick what's nearest your users. The webhook HTTP API lives in this region |
 | **Bedrock** | any region with `claude-sonnet-4-6` enabled | Override via `BedrockRegion` parameter; can differ from the runtime region |
-| **DDB / S3 / ECR** | follows Lambda / ECS region | Created in the same region as the stack |
+| **DDB / S3** | follows the Lambda region | Created in the same region as the stack |
 
 **Simplest deploy**: the `setup.sh` region menu defaults to `1) ap-northeast-1` (Tokyo); just press Enter to use it. DevOps Agent service capabilities still assume `us-east-1` (see the table above).
 
-**Multi-region**: ECS bot in (say) `ap-southeast-1` for proximity, Lambda + DevOps Agent stay in `us-east-1`. The `DevOpsAgentRegion` CFN parameter (default `us-east-1`) controls which region appears in the IAM Resource ARN for journal-read permissions.
+**Multi-region**: the IM stack in (say) `ap-southeast-1` for proximity, Lambda + DevOps Agent stay in `us-east-1`. The `DevOpsAgentRegion` CFN parameter (default `us-east-1`) controls which region appears in the IAM Resource ARN for journal-read permissions.
 
 ### 2.4 IAM deployment permissions
 
@@ -202,18 +221,72 @@ The deploying IAM user / role needs:
 
 ### 3.1 Feishu enterprise self-built app
 
+> **Mind the order**: the Request URL **can only be filled in after the deployment
+> finishes** — that URL is produced by `ImStack` and does not exist yet. So this section
+> only covers "create the app + set the scopes + collect the keys"; the two steps that
+> fill in the URL live in **[IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §1** (run
+> after deploy). Symptom of getting it backwards: Feishu sends a verification request the
+> instant you save the URL, and with the keys not yet in the secret it reports
+> "verification failed" — which looks like a wrong URL.
+
 1. Visit the [Feishu Open Platform](https://open.feishu.cn/) and sign in with an enterprise admin account
 2. **Developer Console → Create Enterprise Self-Built App** → fill in a name (e.g. NotiOps)
 3. **App Features → Bot → Enable**, set the bot display name
-4. **Events & Callbacks → Long Connection** → **Enable long-connection mode** (no public endpoint required)
-5. **Subscribe to events** (click + to add):
-   - `im.message.receive_v1` — receive user messages
-   - `card.action.trigger` — card button click callbacks
-6. **Permissions → Add permissions**:
-   - `im:message` / `im:message:send_as_bot` / `im:message:reply` / `im:chat` / `im:chat:readonly`
-7. **Versioning & Release → Create new version** → submit for release (self-built app admin can self-approve)
-8. **Save** the App ID + App Secret — `setup.sh` does **not** ask for credentials; after deploy, fill them in via the **Web Chat admin console "Notifications" settings** (or edit the `notiops/im-bot-feishu` secret directly and force-restart the ECS service). See §4 / §5
-9. **Add the bot to your channel.** If you want proactive push (Health / alerts, etc.) delivered to a group, grab that group's `chat_id` first:
+4. **Permissions → Batch import/export permissions** → import the JSON below. **The
+   first 11 are required** — the three `cardkit:*` ones drive the cards (progress cards,
+   case cards, buttons); miss them and messages arrive but no card can be sent. Miss
+   `im:message.group_at_msg:readonly` and `@bot` in a group arrives with no text. The
+   last one, `im:message.reaction:write`, is **optional** (see the note below):
+
+   ```json
+   {
+     "scopes": {
+       "tenant": [
+         "cardkit:card:read",
+         "cardkit:card:write",
+         "cardkit:template:read",
+         "im:chat",
+         "im:chat.access_event.bot_p2p_chat:read",
+         "im:message",
+         "im:message.group_at_msg:readonly",
+         "im:message.p2p_msg:readonly",
+         "im:message:readonly",
+         "im:message:send_as_bot",
+         "im:resource",
+         "im:message.reaction:write"
+       ],
+       "user": []
+     }
+   }
+   ```
+
+   ℹ️ `im:message.reaction:write` (added 2026-09-03) is used only to put a 👀 reaction on
+   the user's message **before** the "thinking" card, moving the "got it" acknowledgement
+   into the millisecond range. **It works without it** — the call returns a non-zero code,
+   the ingress log gets one WARNING, the answer is unaffected, you just lose the instant
+   acknowledgement. Scopes ship with the version: after adding it, go back to step 8 and
+   **publish a new version**.
+
+5. **Events & Callbacks → Encryption Strategy** → collect the two keys (in webhook mode
+   these are the **only** authentication mechanism, and both must be non-empty):
+   - **Encrypt Key**: supply your own random string, ≥32 chars recommended — `openssl rand -hex 24`
+   - **Verification Token**: shown right on that page — **copy it**
+6. **Events & Callbacks → Event Configuration** → set the delivery mode to **"Send events
+   to developer server"** and subscribe to `im.message.receive_v1` (receive user
+   messages). **Leave the Request URL empty for now** and fill it in after deploy (see the
+   ordering note above)
+7. **Events & Callbacks → Callback Configuration** → likewise set the delivery mode to
+   **"Send callbacks to developer server"** and subscribe to `card.action.trigger` (every
+   card button depends on it; miss it and buttons do nothing). The Request URL is again
+   filled in after deploy, and it is **the same URL as in step 6**
+8. **Versioning & Release → Create new version** → submit for release (self-built app admin can self-approve)
+9. **Save** the App ID + App Secret + the two keys from step 5 — `setup.sh` does **not**
+   ask for credentials; after deploy, fill them in under **Web Chat admin console →
+   "IM Integration"** — all four credentials (App ID / App Secret / Encrypt Key /
+   Verification Token) sit on one form and Save writes them into the
+   `notiops/im-bot-feishu` secret (you can also edit that secret directly, see §5). See
+   §4 / §5 and [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md)
+10. **Add the bot to your channel.** If you want proactive push (Health / alerts, etc.) delivered to a group, grab that group's `chat_id` first:
 
 ```bash
 # First fetch a tenant_access_token
@@ -225,20 +298,36 @@ curl -X POST 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/inter
 curl 'https://open.feishu.cn/open-apis/im/v1/chats' \
   -H 'Authorization: Bearer <tenant_access_token>' | jq '.data.items[]'
 ```
-Later put this `chat_id` into the Feishu secret's `notify_chat_ids` (or configure it in the Web Chat admin "Notifications" settings) — it is **not** a `setup.sh` prompt (optional; leave empty to disable push delivery).
+Later put this `chat_id` into the Feishu secret's `notify_chat_ids` (or configure it under Web Chat admin → "IM Integration") — it is **not** a `setup.sh` prompt (optional; leave empty to disable push delivery).
 
 ### 3.2 Slack App
 
+> Same as §3.1: the **Request URL is filled in only after the deployment finishes**. All
+> three places that need it are in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §2.
+
 1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App → From scratch**
-2. **Settings → Socket Mode** → enable, generate an App-Level Token (scope `connections:write`)
+2. ⚠️ **Do not enable Socket Mode** — it is **mutually exclusive** with webhooks; with it
+   on, Slack stops sending requests to the Request URL and the bot looks completely dead.
+   You also do **not** need an App-Level Token (`xapp-...`)
 3. **OAuth & Permissions → Bot Token Scopes** → add:
    - `app_mentions:read` / `channels:history` / `channels:read` / `chat:write` / `chat:write.public`
    - `groups:history` / `im:history` / `im:write` / `users:read`
-4. **Event Subscriptions → Enable Events: ON** → **Subscribe to bot events**:
+   - `commands` — slash commands (`/devops`, `/case`, …); miss it and you get `dispatch_failed`
+   - `reactions:write` — **optional**, puts a 👀 reaction on the question first (instant
+     ack). Miss it and you only lose the reaction; the log shows
+     `reactions.add error=missing_scope`
+4. **Basic Information → App Credentials → Signing Secret** → copy it. In webhook mode
+   this is the **only** request-authentication mechanism (it replaces the App Token of the
+   Socket Mode era)
+5. **Event Subscriptions → Enable Events: ON** → **Subscribe to bot events**:
    - `app_mention` / `message.channels` / `message.groups` / `message.im`
-5. **Install App → Install to Workspace**, grab the Bot Token (`xoxb-...`)
-6. **Save** the Bot Token + App Token — `setup.sh` does **not** ask for credentials; after deploy, fill them in via the **Web Chat admin console "Notifications" settings** (or edit the `notiops/slack-bot-token` / `notiops/slack-app-token` secrets directly and force-restart the ECS service). See §4 / §5
-7. In the target channel run `/invite @YourBot`, then open the channel settings panel to copy the **Channel ID** (`C...`). To enable proactive push, put this Channel ID in the notification settings (it is **not** a `setup.sh` prompt)
+   - Request URL is filled in after deploy
+6. **Install App → Install to Workspace**, grab the Bot Token (`xoxb-...`)
+7. **Save** the Bot Token + Signing Secret — `setup.sh` does **not** ask for credentials;
+   after deploy, put them into the `notiops/slack-bot-token` /
+   `notiops/slack-signing-secret` secrets. See §4 / §5 and
+   [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §2
+8. In the target channel run `/invite @YourBot`, then open the channel settings panel to copy the **Channel ID** (`C...`). To enable proactive push, put this Channel ID in the notification settings (it is **not** a `setup.sh` prompt)
 
 ### 3.3 DingTalk Internal H5 App — **v2 only**
 
@@ -261,7 +350,7 @@ Later put this `chat_id` into the Feishu secret's `notify_chat_ids` (or configur
    - **Skipping this step**: Phase 1 chat / dispatch still works, but **investigation reports won't auto-write back to the DingTalk group**; users must visit Operator Home directly.
    - Why TWO robots: DingTalk splits inbound vs outbound across two robot classes. The **H5-app Stream-Mode robot** receives + replies (using the per-message `session_webhook`); the **custom robot** receives the AWS Lambda push (using its own webhook URL). Both live in the same group; from the user's perspective it's one bot.
 
-> The DingTalk robot **needs no public ingress**, identical to Feishu / Slack: Stream Mode is an outbound long-poll initiated from the bot's ECS task. Friendly to your IT security review.
+> The DingTalk robot **needs no public ingress**: Stream Mode is an outbound long-poll initiated by the bot. ⚠️ But the thing that used to host that long poll (`BotStack`'s ECS task) was retired on 2026-09-03 — landing DingTalk now requires a webhook adapter first (M4, not done yet).
 
 ---
 
@@ -286,16 +375,21 @@ CDK deployment doesn't need `bootstrap.env` — `./setup.sh` walks you through t
 
 At deploy time CDK creates **empty** IM secrets; you fill the credentials in **after deploy**, two ways (the script's completion banner also points here):
 - **Option A (recommended)**: log in to Web Chat (admin) → left menu "More → Inspections & Reports" opens the console → "Settings → Notifications" → fill them in
-- **Option B**: update the secret below directly, then force-restart the matching ECS service to load the new credentials:
-  `aws ecs update-service --cluster <BotStack-cluster> --service <service> --force-new-deployment`
+- **Option B**: update the secret below directly. **Nothing needs restarting** — IM runs on
+  Lambda and reads credentials at cold start, so a secret change takes effect on the next
+  cold start (to force it now, wait a few minutes or touch a Lambda environment variable to
+  cycle the instances). ⚠️ The `aws ecs update-service --force-new-deployment` line from
+  older docs only matters for the **rollback-only** `BotStack` long-connection containers;
+  in webhook mode nothing you do to them has any effect.
 
 CDK stacks always reference the secrets by ARN. **No credential files on the local disk.**
 
 | Auto-created Secret (empty initially) | Purpose |
 |---|---|
-| `notiops/im-bot-feishu` | Feishu bot credentials (single secret, JSON: `app_id` / `app_secret` / `verification_token` / `encrypt_key` / `notify_chat_ids`) |
+| `notiops/im-bot-feishu` | Feishu bot credentials (single secret, JSON: `app_id` / `app_secret` / `verification_token` / `encrypt_key` / `notify_chat_ids`). ⚠️ In webhook mode `encrypt_key` **and** `verification_token` are **both required** — miss either and the ingress function crashes on cold start (see [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §1.2) |
 | `notiops/slack-bot-token` | Slack bot token (`xoxb-`) |
-| `notiops/slack-app-token` | Slack app-level token (`xapp-`, Socket Mode) |
+| `notiops/slack-signing-secret` | Slack signing secret — **the only request-authentication mechanism in webhook mode**; required |
+| `notiops/slack-app-token` | Slack app-level token (`xapp-`, Socket Mode). **Unused** in webhook mode; only needed if you roll back to the `BotStack` long connection |
 | `notiops/bedrock-api-key` | Bedrock API Key (cross-account model-invocation auth; populated manually post-deploy, leave empty to use IAM) |
 | `notiops/litellm-config` | LiteLLM credentials (JSON: `base_url` / `api_key` / `default_model`; only if you use LiteLLM) |
 
@@ -310,7 +404,7 @@ Edit `infra/cdk.json` directly, or pass `-c key=value` to `cdk deploy`:
 | `bedrockModelId` | `us.anthropic.claude-sonnet-4-6` | LLM inference profile |
 | `agenticChatMode` | `enabled` | `disabled` / `qa_only` / `enabled` |
 | `awsMcpMode` | `docs_only` | `disabled` / `docs_only` |
-| `enableMcpPricing` | `true` | Pricing MCP sidecar master switch |
+| `enableMcpPricing` | `true` | Pricing MCP sidecar main switch |
 | `defaultLocale` | `en` | `zh` / `en` |
 | `defaultLlmProvider` | `claude` | `claude` / `nova` / `gpt` |
 | `allowedOrigins` | (empty = all origins) | Comma-separated CORS allow-list, e.g. `https://d123.cloudfront.net` |
@@ -336,7 +430,7 @@ After §2 prerequisites (and §3 IM-app registration only if you want IM), this 
 
 ### 5.1 What setup.sh actually does
 
-1. Dependency check: `node` ≥ 22 / `npm` / `npx cdk` / `aws` / `jq` / `python3` / `uv` (**exits immediately if uv is missing** — otherwise a failed agent deployment silently degrades Web Chat to echo mode; not checked when `SKIP_AGENT=true`). **The container build tool (`finch` or `docker`) is optional** — required only if you chose to deploy an IM platform (the IM bot's ECS image builds locally); not needed for web-only
+1. Dependency check: `node` ≥ 22 / `npm` / `npx cdk` / `aws` / `jq` / `python3` / `uv` (**exits immediately if uv is missing** — otherwise a failed agent deployment silently degrades Web Chat to echo mode; not checked when `SKIP_AGENT=true`). **No container build tool is required at all** since 2026-09-03 (IM refactor M2) — see §2.1
 2. Lets you pick a deploy Profile from your local `~/.aws` profile list (or keep the current one)
 3. `aws sts get-caller-identity` to detect the account, prompts you to confirm
 4. Lets you pick a deploy region from 6 options (default `ap-northeast-1`; includes a "custom input" choice)
@@ -344,9 +438,9 @@ After §2 prerequisites (and §3 IM-app registration only if you want IM), this 
 6. Asks which IM platforms to deploy (**default `0` = skip, web UI only**; `1` Feishu / `2` Slack, multi-select). **Only sets the `enabledPlatforms` flag — does not collect credentials**
 7. **`[1/4]` Build frontends** — builds **both** the admin console (`frontend/frontend-app`) **and** the Web Chat frontend (`frontend/chat-app`)
 8. **Deploy the Web Chat Agent** — runs `scripts/deploy_agent.sh` to deploy the Strands agent onto AgentCore Runtime and get the Runtime ARN (injected into WebChatStack via `-c agentRuntimeArn`; `SKIP_AGENT=true` skips it and the BFF falls back to echo)
-9. **`[2/4]` Install Lambda deps** (boto3 / powertools / jinja2, `--platform manylinux2014_x86_64` for Linux binaries)
+9. **`[2/4]` Install Lambda deps** (boto3 / powertools / jinja2, `--platform manylinux2014_x86_64` for Linux binaries). **If you selected IM**, it also runs `scripts/build_im_layer.sh` to build the IM dependency layer (`lark-oapi` / `slack-sdk` / `boto3`, manylinux wheels too). A failure here **aborts on the spot** rather than skipping quietly — with packages missing from the layer, `ImStack` fails at synth time anyway
 10. CDK bootstrap (if the target account + region isn't bootstrapped yet; reused if already bootstrapped + healthy)
-11. **`[3/4]`** CDK synth → IAM consistency check → **CDK deploy `--all`** (`NotiOpsBackendStack` + `BotStack` + **`WebChatStack`**; the Docker build that pushes bot images to ECR fires only if you selected IM)
+11. **`[3/4]`** CDK synth → IAM consistency check → **CDK deploy `--all`** (`NotiOpsBackendStack` + **`WebChatStack`**; plus **`ImStack`** if you selected IM). **No image builds at all any more** — `BotStack` is retired (see §0.1)
 12. **CUR + Athena FinOps data source** guidance (detect / reuse / create new, see §13)
 13. **Create the Cognito `admin` user + temp password** (first deploy) and add it to the admin group
 14. **`[4/4]`** Writes outputs to `cdk-outputs.json` and prints a **Web-Chat-first** completion banner (Web Chat URL + `admin` login credentials at the top)
@@ -371,7 +465,7 @@ npx cdk deploy --all
 
 # Deploy a single stack
 npx cdk deploy NotiOpsBackendStack
-npx cdk deploy BotStack
+npx cdk deploy ImStack       # IM side (Feishu / Slack webhook + Lambda)
 
 # Diff to see what would change
 npx cdk diff --all
@@ -462,25 +556,49 @@ Run these immediately after deploying:
 
 For the fuller Web Chat smoke test, see §12.6.
 
-### 6.1 ECS task is up (only if you enabled IM)
+### 6.1 The webhook endpoint is alive (only if you enabled IM)
 
-> §6.1-6.3 **apply only if you enabled an IM platform (Feishu / Slack)**. For web-only deploys the BotStack bots run at `desiredCount=0`, so the commands below print `0 0` — that's expected.
+> §6.1-6.3 **apply only if you enabled an IM platform (Feishu / Slack)**. For web-only deploys you can skip all of them.
 
-```bash
-aws ecs describe-services --region $AWS_REGION \
-  --cluster <cluster> \
-  --services <service> \
-  --query 'services[0].deployments[0].[runningCount,desiredCount,rolloutState]' \
-  --output text
-# Expected: 1   1   COMPLETED
-```
-
-### 6.2 Long connection / Socket Mode established
+IM runs on an **API Gateway HTTP API + Lambda webhook** — there is no long-lived container to look
+at, so the criterion is "the URL exists + there are logs":
 
 ```bash
-aws logs tail <log-group> --region $AWS_REGION --since 5m | \
-  grep -E "Lark connected|Bolt app is running"
+# The URL (this is exactly what you paste into the Feishu / Slack console)
+aws cloudformation describe-stacks --stack-name ImStack --region $AWS_REGION \
+  --query 'Stacks[0].Outputs[?OutputKey==`FeishuWebhookUrl`||OutputKey==`SlackWebhookUrl`]' \
+  --output table
 ```
+
+> ℹ️ **There are no containers any more**: the `BotStack` ECS Fargate long-connection
+> containers were retired on 2026-09-03 (IM refactor M2), and fresh installs create no
+> VPC / ECS / ECR. Rolling back to the long connection now means adding `new BotStack(...)`
+> back into `infra/bin/app.ts`, running `cdk deploy BotStack`, and only then switching the IM
+> platform console back to long connection / Socket Mode. Accounts installed before M2 may
+> still have `BotStack` around at `desiredCount=1` (running and billing) — delete the whole
+> stack to stop paying, or scale it to 0 first:
+>
+> ```bash
+> aws ecs update-service --cluster <BotStack cluster> \
+>   --service <FeishuBotService> --desired-count 0 --region $AWS_REGION
+> ```
+
+### 6.2 A message was received and processed
+
+`@bot` something in a group, then read both Lambda log groups (Feishu shown; for Slack
+replace `feishu` with `slack`):
+
+```bash
+aws logs tail /aws/lambda/notiops-im-ingress-feishu --region $AWS_REGION --since 5m
+aws logs tail /aws/lambda/notiops-im-worker-feishu  --region $AWS_REGION --since 5m
+```
+
+| Symptom | What it means |
+|---|---|
+| both have logs | ✅ working |
+| ingress yes, worker no | signature check passed but the async handoff failed — read the ingress error |
+| `401 (signature/token)` in ingress | the two keys do not match the console; back to [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §1.2 |
+| neither has logs | Feishu / Slack never sent it — is the delivery mode still on long connection / Socket Mode? |
 
 ### 6.3 End-to-end
 
@@ -494,6 +612,19 @@ Expected:
 2. Click **🚀 Dispatch Investigation** → the card updates to **✅ Dispatched, ⏳ Investigation starting**
 3. A few seconds later, an **🔭 Investigation Started** card + progress updates
 4. After 1–3 minutes, a **📝 Report Summary** + **✅ Report** header card lands in the original channel
+
+Then try a plain question that is **not** an investigation (it goes to the DevOps chat path, e.g.
+`@NotiOps list every S3 bucket with its size`):
+
+5. Within **1–2 seconds**, a **🤔 Thinking · Ns elapsed** card appears (this is the criterion — a card, immediately)
+6. Body text and ⚙️ progress lines refresh on that same card, and the elapsed seconds in the title keep
+   climbing (roughly every 2s for the first 30s, slower after that — see
+   [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §6.2)
+7. When it finishes (possibly minutes later) the card settles into the answer plus two buttons
+
+⚠️ "It took several minutes to answer" is **not** a failure. There is exactly one criterion:
+**did the thinking card show up immediately after you sent the question?** The user-facing wording is in
+[IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §6 — don't file it as a regression.
 
 If it fails → §10 [Top 5 Deployment Errors](#10-top-5-deployment-errors).
 
@@ -522,7 +653,7 @@ $EDITOR infra/cdk.json
 cd infra && npx cdk deploy NotiOpsBackendStack
 ```
 
-> For Feishu you can also put the target group into the `notify_chat_ids` field of the `notiops/im-bot-feishu` secret, or configure it in the Web Chat admin "Notifications" settings.
+> For Feishu you can also put the target group into the `notify_chat_ids` field of the `notiops/im-bot-feishu` secret, or configure it under Web Chat admin → "IM Integration".
 
 ### 7.2 Tune push event sources
 
@@ -577,38 +708,50 @@ aws events put-events --region $AWS_REGION --entries '[{
 
 ## 8. Day-2 Operations
 
-### 8.1 Configuration changes (no image rebuild needed)
+### 8.1 Configuration changes
 
-Edit the corresponding context in `infra/cdk.json`, then `npx cdk deploy <stack>`. ~2 min via ECS rolling update (no image rebuild):
+Edit the corresponding context in `infra/cdk.json`, then `npx cdk deploy <stack>`. ~2 min:
 
 | Change | Edit which context | Deploy which stack |
 |---|---|---|
-| Toggle chitchat mode | `agenticChatMode` | `bot-stack` |
-| Toggle MCP mode | `awsMcpMode` | `bot-stack` |
-| Change default language | `defaultLocale` | `bot-stack` |
-| Edit chat_id allowlist | `allowedChatIds` (JSON array) | `bot-stack` |
-| Change default LLM | `defaultLlmProvider` | `bot-stack` |
-| Toggle a single push event source | `enable*Push` family | `notiops` |
+| Edit chat_id allowlist | `imAllowedChatIds` (comma-separated) | `ImStack` |
+| Add / remove IM platforms | `enabledPlatforms` (`none` = deploy no IM side at all) | `ImStack` |
+| Toggle a single push event source | `enable*Push` family | `NotiOpsBackendStack` |
+
+> ⚠️ **No longer context-driven** as of M2 (2026-09-03): chitchat mode, MCP mode, default language,
+> default LLM. Those keys (`agenticChatMode` / `awsMcpMode` / `defaultLocale` / `defaultLlmProvider`)
+> only ever fed the `BotStack` Fargate containers; with that stack retired, passing them **has no
+> effect** (silently ineffective). Today: the mode flags are hard-coded in
+> `infra/lib/constructs/im-core.ts`; **language** switches per conversation with `@bot 中文` /
+> `@bot english` (`core/locale_resolver.py`); **default LLM** is the `default_model` an admin sets in
+> the Web console's model catalogue, which any user can override for one conversation with
+> `@bot model <alias>` (`core/llm_pref_resolver.py`). Full detail in §11.1.
 
 ### 8.2 Deploy new code
 
 ```bash
 git pull
-./setup.sh            # rebuilds images + cdk deploy --all
+./setup.sh            # cdk deploy --all (no image builds any more)
 ```
 
 `setup.sh` skips unchanged resources on re-runs and only patches the diff.
 
-### 8.3 Force task restart (no config change)
+### 8.3 Force a fresh set of Lambda instances (no config change)
+
+IM runs on Lambda, so there is **no "restart the task"** — a changed Secret takes effect on the next
+cold start. To cycle every live instance right now (e.g. you just fixed a credential and want to
+verify), touch an environment variable (any value change replaces the instances):
 
 ```bash
-aws ecs update-service --region $AWS_REGION \
-  --cluster <cluster> \
-  --service <service> \
-  --force-new-deployment
+aws lambda update-function-configuration --region $AWS_REGION \
+  --function-name notiops-im-worker-feishu \
+  --environment "Variables={FORCE_ROLL=$(date +%s)}"
 ```
 
-See §6 top for how to find the actual resource names.
+⚠️ That command **replaces** the whole environment map — read the existing `Variables` with
+`get-function-configuration` first and pass them all back, don't send a single key. The safer move is
+just `cdk deploy ImStack`. (On pre-M2 installs that still have ECS, the equivalent was
+`aws ecs update-service --force-new-deployment`.)
 
 ### 8.4 Inspect logs
 
@@ -644,9 +787,9 @@ aws dynamodb delete-item --table-name <conv-table> \
 | Level | Action | Impact |
 |---|---|---|
 | **L1 disable a single feature** | Edit `infra/cdk.json` (e.g. `enableHealthPush: false`) → `cdk deploy NotiOpsBackendStack` | Single event source, ~2 min |
-| **L2 disable a whole conversation tier** | Edit `agenticChatMode: "disabled"` → `cdk deploy BotStack` | chitchat / general_qa paths |
-| **L3 roll back to previous image** | `cdk deploy BotStack` (CDK will roll the ECS service to the previous ECR digest) | Single platform, ~2 min |
-| **L4 turn the bot off entirely** | `aws ecs update-service --desired-count 0 ...` | Single platform, instant |
+| **L2 disable a whole conversation tier** | Edit `agenticChatMode: "disabled"` → `cdk deploy ImStack` | chitchat / general_qa paths |
+| **L3 take IM from webhook back to long connection** | ⚠️ **No longer "minutes" after M2 (2026-09-03)** — `BotStack` is not instantiated by `infra/bin/app.ts` any more, so you first add `new BotStack(...)` back, install finch/docker, and `cdk deploy BotStack` (which creates VPC/ECS/ECR and builds images), then set the Feishu / Slack console delivery mode back to long connection / Socket Mode. Pre-M2 installs (stack still present) stay minutes-level: switch the delivery mode + `aws ecs update-service --desired-count 1 ...` | Single platform; ~20 min on fresh installs, minutes on pre-M2 installs ([IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §1.6) |
+| **L4 turn the bot off entirely** | webhook mode: `aws lambda put-function-concurrency --reserved-concurrent-executions 0` (the ingress starts 429-ing everything at once); long-connection mode: `aws ecs update-service --desired-count 0 ...` | Single platform, instant |
 | **L5 delete the stack** | `cd infra && npx cdk destroy <stack-name>` | Entire stack |
 
 > ⚠️ Stack deletion removes ECR / IAM / SG / ECS. **The DDB tables and S3 report bucket are NOT deleted** (`removalPolicy: RETAIN`) — clean them up manually if needed. By design, every AWS resource created by this project carries the `auto-delete=no` tag to protect it from automated cleanup jobs.
@@ -666,9 +809,9 @@ aws dynamodb delete-item --table-name <conv-table> \
 | Symptom | Likely cause | Diagnose / fix |
 |---|---|---|
 | **Access denied on Secrets Manager** — during CDK deploy (creating the empty secrets) or later when you fill in IM credentials | Deploy user lacks Secrets Manager permission | `aws iam attach-user-policy --policy-arn arn:aws:iam::aws:policy/SecretsManagerReadWrite` |
-| **CDK deploy reports `CannotPullContainerError`** | Main app image build failed / ECR push incomplete | `cd infra && npx cdk deploy BotStack` (CDK Asset rebuilds + re-pushes) |
-| **Bot doesn't respond to @ — ECS logs show `auth failed`** | Wrong IM credentials / wrong Secret payload | `aws secretsmanager get-secret-value --secret-id <name>` and compare to the original credential; correct it and re-run `setup.sh` |
-| **Bot dispatch succeeds but the report doesn't return to the channel** | report-handler Lambda doesn't have IM credentials | Verify the Secret ARNs in the Lambda env match those in BotStack; re-run `cdk deploy NotiOpsBackendStack` |
+| **`ImStack` fails at synth complaining the Layer is missing packages** | `scripts/build_im_layer.sh` wasn't run, or it failed | Re-run `bash scripts/build_im_layer.sh` (it cross-downloads with `pip --platform manylinux2014_x86_64 --only-binary=:all:` — **no container needed**) |
+| **Bot doesn't respond to @ — worker logs show `auth failed`** | Wrong IM credentials / wrong Secret payload | `aws secretsmanager get-secret-value --secret-id <name>` and compare to the original credential; fix it and wait for the next cold start (no redeploy needed) |
+| **Bot dispatch succeeds but the report doesn't return to the channel** | report-handler Lambda doesn't have IM credentials | Verify the Secret ARNs in the Lambda env match those in `ImStack`; re-run `cdk deploy NotiOpsBackendStack` |
 | **`Bedrock InvokeModel` AccessDeniedException** | Task role lacks permission / model not enabled in region | Add `bedrock-runtime:InvokeModel` to IAM, or Bedrock console → Model access |
 
 ---
@@ -677,20 +820,28 @@ aws dynamodb delete-item --table-name <conv-table> \
 
 All tunable parameters live under the `context` block in `infra/cdk.json`. After editing, run `cd infra && npx cdk deploy <stack>`.
 
-### 11.1 BotStack (IM bot platform stack)
+### 11.1 ImStack (IM platform stack)
+
+`ImStack` reads exactly **three** context keys (`infra/lib/im-stack.ts`):
 
 | context key | Default | Description |
 |---|---|---|
-| `bedrockModelId` | `us.anthropic.claude-sonnet-4-6` | Bedrock inference profile |
-| `bedrockRegion` | (deploy region) | Bedrock invocation region (can differ from the runtime region) |
-| `agenticChatMode` | `enabled` | `disabled` / `qa_only` / `enabled` |
-| `defaultLlmProvider` | `claude` | Default LLM alias: `claude` / `nova` / `gpt`. Any user can override with `@bot model <alias>` in-chat (no admin gate). See [USER_GUIDE.en.md §7](USER_GUIDE.en.md#7-model-selection-bot-model) |
-| `gptRegion` | `us-east-2` | Region of the Bedrock Mantle Responses endpoint when `gpt` is in use. Allowed: `us-east-2` / `us-west-2` / `us-gov-west-1` |
-| `awsMcpMode` | `docs_only` | `disabled` / `docs_only` |
-| `enableMcpPricing` | `true` | Pricing MCP sidecar |
-| `defaultLocale` | `en` | `zh` / `en` resolver fallback |
-| `allowedChatIds` | `[]` | chat_id allowlist (empty array = no restriction) |
-| `enabledPlatforms` | `feishu` | IM platforms to enable (comma-separated, e.g. `feishu,slack`). Platforms not listed get ECS Service `desiredCount=0` and don't start |
+| `enabledPlatforms` | `feishu` | IM platforms to enable (comma-separated, e.g. `feishu,slack`). `none` = the whole `ImStack` is not instantiated (`infra/bin/app.ts`); platforms not listed get no Lambda / webhook at all |
+| `imAllowedChatIds` | (empty) | chat_id allowlist (comma-separated; empty = no restriction). Injected as `ALLOWED_CHAT_IDS` on the worker |
+| `organizationId` | (empty) | Non-empty = multi-account (Organizations) mode, same semantics as `NotiOpsBackendStack` |
+
+> ⚠️ **These keys stopped doing anything after M2 (2026-09-03)** — don't copy them from older docs:
+> `bedrockModelId` / `bedrockRegion` / `agenticChatMode` / `defaultLlmProvider` / `gptRegion` /
+> `awsMcpMode` / `enableMcpPricing` / `defaultLocale` / `allowedChatIds`.
+> They only ever fed the `BotStack` Fargate container environment, and that stack is retired. The IM
+> equivalents are now **hard-coded in `infra/lib/constructs/im-core.ts`** (`AGENTIC_CHAT_MODE=enabled`,
+> `AWS_MCP_MODE=docs_only`, `AWS_MCP_PRICING_ENABLED=false` / `AWS_MCP_COST_ENABLED=false` — there is no
+> sidecar for a Lambda to talk to). **Model** is resolved at runtime: per-chat / per-DM `@bot model <alias>`
+> → the DDB model catalogue's `default_model` (`core/llm_pref_resolver.py`, see
+> [USER_GUIDE.en.md §7](USER_GUIDE.en.md#7-model-selection-bot-model)); **locale** comes from
+> `core/locale_resolver.py`'s user / DM / thread / incident records, falling back to `en` when there is
+> none (`DEFAULT_LOCALE` is not injected). Passing these `-c` flags neither errors nor takes effect —
+> that is **silently ineffective**, which is exactly why they're listed here.
 
 ### 11.2 NotiOpsBackendStack (shared backend + push)
 
@@ -726,7 +877,7 @@ All tunable parameters live under the `context` block in `infra/cdk.json`. After
 | **Auth** | Cognito (reuses the notiops user pool) + Identity Pool; the frontend gets temporary credentials and **SigV4-signs** requests to the Function URL |
 | **Data** | CDK `WebChatStack` creates the single DDB table `notiops-web-chat` (sessions/messages + the persistent notification inbox in the `notif#` segment, 90-day TTL, account-shared) |
 
-The data plane inherits the backend's **strict read-only** constraints (three layers of defense) throughout — Web Chat does not relax them.
+The data plane is **strictly read-only** end to end: the hard boundary is a read-only IAM role, and on top of it sit tool-level read-only enforcement (`READ_OPERATIONS_ONLY` + a curated read-only MCP allow list), a command-level denylist, and a read-only system prompt (see [TECHNICAL_DESIGN.en.md](TECHNICAL_DESIGN.en.md) §5.3 for the full make-up of this defense in depth). Web Chat does not relax any of it.
 
 ### 12.2 Deployment order
 
@@ -926,3 +1077,74 @@ aws s3 ls s3://<CUR_BUCKET>/<report-prefix>/<report-name>/ --recursive | grep cr
 The IAM identity running `setup.sh` additionally needs: `cur:PutReportDefinition` / `cur:DescribeReportDefinitions`, `s3:CreateBucket`, `scheduler:CreateSchedule`, `iam:PassRole` (to pass `notiops-cur-finalizer-scheduler-role`); plus the permissions to set up the Athena FinOps saved queries: `athena:GetWorkGroup` / `athena:UpdateWorkGroup` (to set the result output location on the primary workgroup) + `athena:ListNamedQueries` / `athena:BatchGetNamedQuery` / `athena:CreateNamedQuery`. The CDK-deployed `notiops-cur-finalizer-role` (see §13.3) and the Web Chat BFF role (which holds the `athena:*Query*` + `athena:ListNamedQueries`/`BatchGetNamedQuery`/`GetNamedQuery` needed to query CUR (Cost Deep Dive fetches saved queries), `glue:Get*`, CUR-bucket read-only, and on the results bucket `s3:GetBucketLocation` + `s3:GetObject`/`s3:PutObject` (`GetObject` for re-signing Deep Dive CSV downloads); Cost Deep Dive's AI insight needs `bedrock:InvokeModel` (Claude Sonnet inference profile), and same-day result caching needs `dynamodb:PutItem` on the `notiops-config` table — without `GetBucketLocation`, Athena errors with "Unable to verify/create the output bucket") need no additional manual grants.
 
 Once the CUR is ready (within minutes when reusing an existing CUR), `setup.sh` automatically: ① sets the result output location on the primary workgroup (`s3://notiops-data-<account>-<region>/athena-results/`, not overwritten if already set) ② idempotently creates **6** Athena saved queries using the [dynamically-discovered db/table names] — `NotiOps - DevOps Agent Usage & Credit` (same measure as the dashboard's credit card), `NotiOps - EDP Commitment Attainment` (edit the annual commitment + contract start/end in `params` and run it directly), plus 4 **Cost Deep Dive** detail queries: `CloudWatch cost by usage type` / `Data Transfer by service` / `EC2 cost by instance type` / `S3 cost by storage class` (run on demand from the dashboard's "Cost Deep Dive" card). The dashboard's Commitments & Programs card "View SQL in Athena" link points here; each Cost Deep Dive scenario's SQL is also read from these saved queries (single source of truth, editable directly in the Athena console) — after the BFF runs it, it hands the real result rows to Bedrock for charts + insights and caches the day's result in the `notiops-config` table (clicking again the same day only re-signs the CSV download, without re-running SQL / re-calling AI).
+
+---
+
+## 14. Customer CUR Dashboard + cost-agent MCP (optional)
+
+> How this differs from §13: §13 queries **this deployment account's own** CUR (which NotiOps creates for you). This section connects **someone else's CUR table** — a customer's, or several payers' (the TAM scenario) — at line-item granularity, through a separate cost-agent MCP Lambda. Leave it unconfigured and the FinOps page simply doesn't show the 4 CUR sheets and chat doesn't mount the customer-CUR tools; nothing else changes (fail-closed).
+
+### 14.1 What it adds
+
+| Capability | Where | Notes |
+|---|---|---|
+| 4 CUR dashboard sheets | FinOps page: Cost trend (cross-filtering) / Credit / Extended Support / Savings Plans | BFF caches per day; instant after the daily warmup |
+| Ask about customer spend in chat | Just ask in the conversation ("customer's total spend in July") | The agent reaches the MCP's 45 CUR tools through 2 meta-tools (`list_cost_tools` / `call_cost_tool`) |
+| Inline charts | Any answer with >=3 data points gets a chart | The tool return carries `display_hint`; the frontend renders a ```chart fence |
+
+### 14.2 Deploy the cost-agent MCP Lambda (customer-specific, prerequisite)
+
+This Lambda's code lives in a **separate repository** (Python, streamable-http MCP over a Lambda Function URL, `AuthType=AWS_IAM`) — not in this repo; ask the maintainer for the address. One Lambda per customer; all the per-customer difference lives in environment variables:
+
+| Environment variable | Meaning | Example |
+|---|---|---|
+| `CUR_TABLE` | The customer's CUR table (db.table) | `customer_cur_data.customer_all` |
+| `PARTITION_STYLE` | Partition layout: `year-month` / `billing-period` / `flat` | `year-month` |
+| `ATHENA_WORKGROUP` / `ATHENA_OUTPUT` | Query workgroup / result location (empty = follow the workgroup) | `primary` |
+| `CUR_ACCESS_KEY_ID/SECRET/TOKEN` | Temporary credentials for cross-account queries; leave empty to use the execution role in-account | — |
+
+> ⚠️ Measure caveat: the 45 tools' SQL was tuned against a reference customer (multi-payer, EDP, heavy SP/ODCR use). The basic tools (totals / trend / dimension breakdowns / SP / RI / Extended Support) work as-is on a new table; a few derived measures (LOB tag mapping, the historical window in SP `per_vcpu_rate`) are worth reviewing against your customer's CUR structure before you hand them over.
+
+### 14.3 Wiring it into NotiOps (both deployment paths are IaC; you supply two values)
+
+You supply exactly **two values**, and they must come as a pair: a Function URL does not contain the function ARN, and `lambda:InvokeFunctionUrl` can only be granted per resource — so filling in only one half deploys a data source that *looks* installed and 403s on every call, where the 403 is visible only in CloudTrail. Both paths therefore block that half-configuration **before anything is created**.
+
+| | How you supply it | Where "only one half" is caught |
+|---|---|---|
+| Path A (one-click CFN) | Parameters page → *Optional: your own CUR data source* → `CostAgentMcpUrl` + `CostAgentFunctionArn` (you can also add them later via a stack update) | `CostAgentArnRequiredWithUrl` (a CfnRule — parameter-validation time, the stack is never created) |
+| Path B (setup.sh) | `COST_AGENT_MCP_URL=... COST_AGENT_FN_ARN=... ./setup.sh` | setup.sh's preflight check, **before** the ~20-minute agent deploy |
+
+Once supplied, both paths wire up all four pieces automatically (no manual steps remain):
+
+1. **Agent (chat)**: runtime env var `COST_AGENT_MCP_URL` + the execution role's `InvokeCostAgentMcp` (`lambda:InvokeFunctionUrl`).
+2. **BFF (dashboard data)**: the same env var + `InvokeCostAgentMcp` + S3 read/write on the cache prefix (`CurDashCache`).
+3. **Cache lifecycle**: 3-day expiry on the data bucket's `cur-dash-cache/` prefix.
+4. **Daily warmup**: EventBridge rule `CurDashWarmup`.
+
+> ⚠️ **Upgrade note**: these used to be manual (the old §14.3/§14.4 in v1.0.x). CDK now **owns** the BFF env var and that rule — the next deploy **overwrites** any `COST_AGENT_MCP_URL` you set by hand with the parameter value. So when you upgrade, pass the URL *and* the function ARN to setup.sh (or fill in the one-click parameters); otherwise your manual configuration is reset to empty and the 4 sheets silently disappear (their capability nodes are dropped by `requiresEnv`). Delete any EventBridge rule you created by hand, or the warmup runs twice a day.
+
+**IAM is two-sided**: the identity side (both roles) is now IaC. The **resource policy still lives on the cost-agent side** — that's your own separate deployment, not in this repo — and must allow those two roles to invoke its Function URL. Field-tested trap: the identity policy must **not** carry a `lambda:FunctionUrlAuthType` Condition; with it, every call 403s.
+
+### 14.4 What happens when the data source is down (the degradation chain never blocks the whole tool)
+
+This is an **external** dependency, so it is fail-soft at four layers, and every degradation is **stated out loud** (a silent degradation is worse than an error — CE's aggregated numbers passing themselves off as CUR line-item numbers would have the customer reconciling against the wrong figures):
+
+| Layer | Situation | What the customer sees |
+|---|---|---|
+| Deploy time | Parameters not supplied | The capability **does not exist, by design**: the 4 `nav:finops:cur-*` nodes are dropped by `requiresEnv` (no menu entry that does nothing when clicked); the agent mounts zero tools |
+| BFF | MCP unreachable / timing out | Only those 4 sheets say "temporarily unavailable" (HTTP 200 + `available:false`); the rest of the page is unaffected |
+| Agent | MCP unreachable / timing out | The answer still comes: **customer CUR (line-item) → CE MCP (aggregated, deploy account) → `call_aws` / `aws_readonly`**, and it says which source and which measure it fell back to |
+| Agent | 2 consecutive transport failures | A 10-minute circuit breaker fast-fails instead of waiting out 300s every turn — *that* wait is what actually blocks the whole tool |
+
+A single tool's **logical error** (bad arguments) does not trip the breaker: the data source is alive, so the model is left to fix its arguments and retry. Covered by `tests/test_cost_agent_mcp_failsoft.py` and `bff/web-chat/tests/cur_dashboard_failsoft.test.mjs`.
+
+What the warmup does: on `{"source":"notiops.curdash.warmup"}` the BFF queries all 4 panels concurrently for the default window (T-33 to T-3 — the last 3 days of CUR aren't complete, so the window is closed early) and writes the day's cache, so the first person to open it during the day gets it instantly. The cron is `cron(0 22 * * ? *)` (22:00 UTC = 06:00 Beijing) — **the cache key's date basis is UTC+8**, so if you change the timezone you must change both. To verify, send the same payload manually with `aws lambda invoke --invocation-type Event`; the log should show `curdash warmup: cube:fulfilled credit:fulfilled es:fulfilled sp:fulfilled`.
+
+### 14.5 Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| The 4 sheets say "data source not configured" | The BFF is missing `COST_AGENT_MCP_URL`, or IAM isn't through |
+| MCP calls keep returning 403 | The identity policy carries a `FunctionUrlAuthType` Condition (remove it); or the resource policy doesn't list the calling role |
+| First open of the day still takes 1-5 minutes | The warmup didn't run, or the timezone is misaligned — the cache key's date basis is UTC+8 and the EventBridge cron must match it; check the BFF log's warmup line |
+| Warmup reports all-rejected | Usually an Athena failure on the MCP side (expired cross-account credentials, etc.); the BFF log carries a per-panel reason |

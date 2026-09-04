@@ -111,22 +111,30 @@ def _client_and_space(account_id: str) -> tuple:
     """返回 (devops-agent client, agent_space_id)。
     - 目标==部署账号：本地凭证直连 + 自动发现/指定 Agent Space。
     - 否则且 config 有跨账号配置：AssumeRole trigger role + config 的 agent_space_id。
-    取不到 Agent Space → 返回 (None, None)（调用方走 not_onboarded）。"""
+    取不到 Agent Space → 返回 (None, None)（调用方走 not_onboarded）。
+
+    `account_id` 传空 = 部署账号。这一步必须在这里补，不能指望每个调用方先过
+    `_target_account()`：空串跟部署账号号永远不相等 → 一路走到跨账号分支 → 找不到
+    `da#` 配置行 → (None, None) → 客户看到「无法定位该账号的 Agent Space」。
+    2026-09-02 IM 侧现网实测命中（同一份逻辑，见 core/devops_agent.py 的长注释）。"""
     deploy = _deploy_account_id()
-    is_deploy = (deploy is not None and str(account_id) == str(deploy))
+    target = str(account_id or "").strip() or str(deploy or "")
+    if not target:
+        return (None, None)
+    is_deploy = bool(deploy) and target == str(deploy)
 
     if is_deploy:
         client = boto3.client("devops-agent", region_name=_REGION)
-        space = _discover_space(client, account_id)
+        space = _discover_space(client, target)
         return (client, space) if space else (None, None)
 
     # 跨账号：需要 config 行（trigger_role_arn + agent_space_id）
-    cfg = _get_da_config(account_id)
+    cfg = _get_da_config(target)
     if not cfg or not cfg.get("trigger_role_arn") or not cfg.get("agent_space_id"):
         return (None, None)
     if cfg.get("enabled") is not True and cfg.get("onboarding_status") not in (None, "active"):
         return (None, None)
-    client = _assume_client(account_id, cfg)
+    client = _assume_client(target, cfg)
     return (client, cfg["agent_space_id"])
 
 

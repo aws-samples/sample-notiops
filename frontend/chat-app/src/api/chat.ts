@@ -39,6 +39,22 @@ export interface Followup { label: string; prompt?: string; url?: string }
 /** 调查分析过程的一步（收进右侧「调查过程」面板；console_url 仅首条带，用于面板顶部后台链接）。 */
 export interface InvestigationStep { text: string; console_url?: string }
 
+/**
+ * 思考/处理过程的一步（收进右侧「思考过程」面板）。与 InvestigationStep 的区别：那个是
+ * DevOps Agent 深度调查专属的分析过程，这个是**任意长任务**都有的过程记录。
+ *
+ * kind 决定图标/样式：
+ *   thought = 模型思考（reasoning 增量攒成的一段）；tool = 正在调工具；
+ *   result  = 工具返回摘要；status = 其它状态行（含 BFF 的等待期提示，前端会滤掉）。
+ * ts = 前端收到该步的时间（epoch ms），用于面板上显示相对耗时。
+ */
+export interface ThinkingStep {
+  text: string;
+  kind?: "thought" | "tool" | "result" | "status";
+  detail?: string;
+  ts?: number;
+}
+
 export interface StreamCallbacks {
   onToken?: (delta: string) => void;
   onToolCall?: (tool: string, args: unknown) => void;
@@ -50,7 +66,12 @@ export interface StreamCallbacks {
   onActions?: (actions: ProposedAction[]) => void;
   onFollowups?: (followups: Followup[]) => void;
   onInvestigationStep?: (step: InvestigationStep) => void;
+  // 思考/处理过程的一步（agent 侧的工具调用与返回摘要）→ 右侧「思考过程」面板。
+  onThinkingStep?: (step: ThinkingStep) => void;
   onUsage?: (usage: TokenUsage) => void;
+  // 答案来源标记（目前只有 "builtin"：agent 的内置确定性回答，未调模型、0 token）。
+  // 收到即把该条消息的署名行从「AWS Bedrock (某模型)」换成 NotiOps，见 types.ts::ChatMessage.via。
+  onVia?: (via: string) => void;
   // 服务端把本轮模型换掉了（客户端点的那个已不在管理员启用集内）。
   // 静默替换会让用户以为自己还在用原来的模型，所以必须回传并纠正选择器。
   onModelSubstituted?: (info: { requested?: string; effective?: string; reason?: string }) => void;
@@ -196,6 +217,41 @@ export async function signedClient() {
   } catch {
     return null;
   }
+}
+
+/**
+ * 会话预热（**0 token**，发即忘）。
+ *
+ * 首字延迟的大头不是模型，是 agent runtime 这个容器还没准备好（平台冷启动 + import +
+ * 挂工具快照 + 起 MCP 子进程，实测 ~10s）。这段时间与"用户读完落地页、想好要问什么、
+ * 把问题打出来"完全可以重叠 —— 所以进入对话时先发这么一发。
+ *
+ * ⚠️ `conversationId` 必须与随后真正发消息用的**同一个** —— runtimeSessionId 由它派生，
+ * AgentCore 按 runtimeSessionId 路由到具体 microVM；换个 id 就是预热了另一个容器。
+ * ⚠️ model/topic/accountId/devopsAgent 也要与真正那一轮一致：runtime 的 agent 缓存键
+ * 含这四项，不一致会在真正那一轮再建一个 agent、白热一遍。
+ *
+ * 永不抛、永不影响 UI：预热失败的唯一后果是首字回到原来的延迟。
+ */
+export async function warmupChat(params: {
+  conversationId: string; model?: string; topic?: string; accountId?: string; devopsAgent?: boolean;
+}): Promise<void> {
+  if (!params.conversationId) return;
+  const s = await signedClient();
+  if (!s) return;
+  try {
+    await s.aws.fetch(`${s.base}/warmup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-notiops-id-token": s.idToken },
+      body: JSON.stringify({
+        conversation_id: params.conversationId,
+        model: params.model || "",
+        topic: params.topic || "general",
+        account_id: params.accountId || "",
+        devops_agent: params.devopsAgent === true,
+      }),
+    });
+  } catch { /* 预热失败无害，静默 */ }
 }
 
 /** 列出当前用户的所有会话（按 updatedAt 倒序，后端已排序）。 */
@@ -429,6 +485,9 @@ function routeEvent(event: string, data: any, cb: StreamCallbacks) {
     case "usage":
       if (data?.usage) cb.onUsage?.(data.usage);
       break;
+    case "via":
+      if (data?.via) cb.onVia?.(String(data.via));
+      break;
     case "model_substituted":
       cb.onModelSubstituted?.(data ?? {});
       break;
@@ -440,6 +499,9 @@ function routeEvent(event: string, data: any, cb: StreamCallbacks) {
       break;
     case "investigation_step":
       if (data?.step) cb.onInvestigationStep?.(data.step);
+      break;
+    case "thinking_step":
+      if (data?.step) cb.onThinkingStep?.(data.step);
       break;
     case "followups":
       cb.onFollowups?.(data?.followups ?? []);

@@ -102,7 +102,7 @@ def run(platform: str,
 
         while True:
             try:
-                # Bedrock API Key 热生效（task 4.5）：这个 daemon 线程独立于消息入口，
+                # Bedrock API Key 热生效：这个 daemon 线程独立于消息入口，
                 # 自己也调 Bedrock（进度叙述），所以必须自行收敛凭证变更。Key 未变时是
                 # 廉价 no-op；变了则重建缓存的 bedrock 客户端。
                 _bedrock_credentials.refresh()

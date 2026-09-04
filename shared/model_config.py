@@ -17,16 +17,20 @@ import boto3
 logger = logging.getLogger("shared.model_config")
 
 _SSM_PARAMETER = "/notiops/agent/model_id"
-# `global.*` —— 与 CDK 写入 SSM 的值（global.anthropic.claude-sonnet-5）一致。
+# `global.*` —— 与 CDK 写入 SSM 的值（global.xai.grok-4.6）一致。
 # 此前这里是 us.*，只有在 SSM 与 env 都缺失时才暴露，属于隐蔽的地理路由分叉。
 #
-# ⚠️ **必须是 Claude**，不能跟随模型目录的 default_model（现为 Claude Sonnet 5，恰好同值，但那是目录的自由）。本函数的
-# 返回值只喂给一批手搓 Anthropic 原生 body 的 `invoke_model` 调用（bedrock_intent /
-# next_steps / case_analyze / skill_dispatcher / case_classifier / progress_card ×2 /
-# skill_authoring），换非 Claude 模型 = ValidationException。要统一得先把那些调用点
-# 迁到 shared/llm_provider.py::invoke_llm。见 core/llm_pref_resolver.py 与
+# 历史约束已解除（留着，因为它解释了为什么这个默认值长期落后于模型目录）：本函数的
+# 返回值喂给 bedrock_intent / next_steps / case_analyze / skill_dispatcher /
+# case_classifier / progress_card ×2 / skill_authoring 这 8 处调用，它们原先各自手搓
+# Anthropic 原生 body，所以这里**必须**是 Claude，换非 Claude 模型 = ValidationException。
+# 2026-09-01 那 8 处已统一到 core/bot_llm.py → shared/llm_provider.py::invoke_llm
+# （Bedrock Converse），于是这个默认值跟随目录 default_model 改成 Grok 4.6。
+#
+# ⚠️ 仍不能填只在 bedrock-mantle 上架的模型（GPT-5.6 系列）：`core/bot_llm.py` 恒走
+# Converse，不按 model_id 猜协议。见 core/llm_pref_resolver.py 与
 # infra/lib/notiops-backend-stack.ts 的 AgentModelIdParam 注释（spec R8）。
-_ENV_DEFAULT = os.environ.get("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5")
+_ENV_DEFAULT = os.environ.get("BEDROCK_MODEL_ID", "global.xai.grok-4.6")
 _CACHE_TTL = 300  # 5 分钟
 
 _cached_model_id: str | None = None

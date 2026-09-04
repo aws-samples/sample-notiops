@@ -1,3 +1,5 @@
-boto3>=1.35.0
+# boto3 下限由 devops-agent 的 Asset API + Trigger API 决定（1.43.19 缺，1.43.30 有）。
+# Lambda 层里装的是精确版本，见 setup.sh 的 `pip install boto3==...`。
+boto3>=1.43.30
 aws-lambda-powertools[aws-sdk]>=3.0.0
 defusedxml>=0.7.1

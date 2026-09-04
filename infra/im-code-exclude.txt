@@ -1,0 +1,84 @@
+# IM Lambda 代码包（ingress / worker / progress）的**排除清单** —— 两条部署路径共用。
+#
+#   · 方式B（setup.sh / CDK）：infra/lib/im-stack.ts 读本文件，喂给
+#     `lambda.Code.fromAsset("../", { exclude })`。
+#   · 方式A（一键 CloudFormation）：scripts/build_im_zips.py 读本文件，按同一套语义
+#     打出 im-code.zip 挂到 GitHub Release，由 StagerFn 搬进客户账号。
+#
+# 为什么抽成一个文件而不是各写一份：漏一条 / 多一条的症状**只在方式A 暴露**，而且
+# 不是构建报错，是客户账号里的 `Runtime.ImportModuleError` 或者
+# `Unzipped size must be smaller than 262144000 bytes`。两份清单一定会漂。
+#
+# 语义（两边一致，方式A 侧在 build_im_zips.py 里实现）：
+#   · 相对仓库根的 posix 路径匹配；
+#   · 不含 `/` 的模式按 **basename** 匹配（任意深度）—— minimatch 的 matchBase；
+#   · `**` 匹配 0 个或多个路径段，`*` 只在段内匹配；
+#   · 命中的**目录**整棵剪掉（不再递归进去）。
+#
+# 格式：一行一个模式，`#` 开头是注释，空行忽略。
+# ⚠️ 加新模式时想清楚"漏掉它会怎么失败"，并把答案写成注释 —— 下面每一条都有。
+
+# 前端 / 基础设施 / 虚拟环境 / 依赖树：与 Lambda 运行时无关，且是体积大头。
+frontend/**
+infra/**
+.venv*/**
+**/node_modules/**
+agent-build/**
+promo/**
+agent/**
+bff/**
+**/.cache/**
+.git/**
+tests/**
+docs/**
+.kiro/**
+lambda_layer/**
+lambda_layer_im/**
+cdk.out/**
+
+# ⚠️ `.cdk-out` 必须写成**裸目录名**，不能只写 `.cdk-out/**`：
+# CDK 的 GLOB ignore 用 minimatch，且**没有** `{dot:true}`（aws-cdk-lib
+# core/lib/fs/ignore.js: `minimatch(rel, pattern, {matchBase:true, flipNegate:true})`）。
+# 于是 `**` 拒绝匹配以 `.` 开头的路径段 —— 一旦目录里已经有了递归产物
+# （`.cdk-out/asset.X/.cdk-out/asset.X/...`），相对路径中间那些 `.cdk-out` 段
+# 让 `.cdk-out/**` 整条失配 → 照抄一遍 → ENAMETOOLONG（2026-09-01 第三次部署实测：
+# 只加 `.cdk-out/**` 依然崩）。而 copy.js 是先对**目录**调 `completelyIgnores()`
+# 再决定要不要递归，裸名 + matchBase 能在第一层就剪掉整棵树。
+#
+# 这条本身是**兜底**：cdk synth/deploy 必须带 `--output` 指到仓库根**之外**
+# （setup.sh:1095 用 `${TMPDIR:-/tmp}/notiops-cdk-out`；**不是** `../.cdk-out`——
+# 那个路径就在仓库根里，fromAsset("../") 会自引用递归复制）。别删这条：它让
+# "路径给错了"退化成一次失败的构建，而不是污染之后每一次构建。
+.cdk-out
+.cdk-out/**
+
+**/__pycache__/**
+
+# ⚠️ dist/** 是一键部署（方式A）的产物目录（dist/oneclick + dist/verify，各 ~290MB
+# 的 zip）。漏掉它的症状不是构建报错，而是部署到一半 Lambda 报
+# `Unzipped size must be smaller than 262144000 bytes` —— 因为「代码资产 + 依赖层」
+# 解压后合计有 250MB 上限（2026-09-01 实测踩过：FeishuWorker / ImProgress
+# CREATE_FAILED 整栈回滚）。只在本地跑过 build_oneclick 的人才会中，
+# 所以很容易误判成"层太大"。
+dist/**
+
+*.md
+mcp_server/**
+
+# 三条裸名（matchBase，任意深度）。加它们的直接原因是**两条路径的产物要逐字节一致**：
+# CDK 的 minimatch 没 `dot:true`，所以 `.venv*/**` 这类模式的 `**` 匹配不到点开头的
+# basename —— 方式B 的资产里因此躺着 `.venv/.gitignore`、`frontend/.gitkeep`、
+# `promo/.DS_Store` 这几个漏网的（2026-09-01 拿现网 notiops-im-worker-feishu 的代码包
+# 与方式A 的 im-code.zip 对过，差集正好是这 6 个点文件）。裸名是字面量、不走 `**`，
+# 两边都能剪掉，于是差集归零、以后再对比就是干净的判据。
+.DS_Store
+.gitignore
+.gitkeep
+.hypothesis/**
+.pytest_cache/**
+phd_event_forwarder/**
+devops_agent_callback/**
+
+# 容器时代的产物，Lambda 路径用不到。
+platforms/*/Dockerfile
+sidecars/**

@@ -25,6 +25,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 
 from shared.report_delivery.html_template import generate_html_report
 from shared.report_delivery.trace_template import generate_trace_html
@@ -123,6 +124,9 @@ class ReportArtifacts:
     report_available: False when any critical step failed (degraded result).
     report_truncated: True when summary_card is a truncated long_report slice.
     model_id: Bedrock model used (None on degrade/no-summary).
+    journal_records: the sliced journal records this run already fetched for
+        trace.html. Exposed so downstream gates do not re-fetch — see the
+        attribute's own note.
     """
     summary_card: str = ""
     long_report: str | None = None
@@ -135,11 +139,181 @@ class ReportArtifacts:
     report_truncated: bool = False
     model_id: str | None = None
     incident_id: str = ""
+    journal_records: tuple[dict, ...] | None = None
+    """本次已拉到的 journal 记录（已按 `slice_after_ts` 切过）。
+
+    ⚠️ **不是**为了让调用方再解析一遍报告 —— 正文走 `long_report`。
+    它存在的唯一理由是 `inspection/domain/journal_gate.py` 那道 skill 加载门禁
+    需要原始记录，而 trace.html 那一步**已经拉过一次**。不暴露的话下游要
+    再发一次 `ListJournalRecords`（跨账号、逐页），而那次调用拿的是同一批数据。
+
+    ⚠️ 只在内存里传递，**SHALL NOT 落库**：实测单次调查 92 条记录、其中
+    `ui_investigation_summary` 单条 6.8KB —— 落 DDB 会直接撞 400KB 行上限。
+
+    `None` = 没拉到（trace 那步失败或权限不足）。与空元组是两回事：
+    前者是「不知道」，后者是「确实没有记录」，门禁对两者的判定相同
+    （都判 `NO_JOURNAL`）但日志要能区分。
+    """
 
 
-def _stable_keys(task_id: str) -> tuple[str, str, str]:
-    base = f"investigations/{task_id}"
+class CardMode(str, Enum):
+    """`summary_card` 怎么产出（R9.4）。
+
+    ⚠️ 枚举而不是布尔。布尔只能表达「要不要卡片」，而这里有**三种**语义，
+    其中两种在布尔下会被压成同一个值：
+
+    ```
+    BEDROCK   调 Bedrock 摘要，失败降级成截断片段   ← 排障链路，默认
+    SKIP      压根不调 Bedrock，卡片留一行占位文本   ← 巡检链路
+    ```
+
+    🔴 `SKIP` **不等于**「把 `long_report` 原样放进 `summary_card`」。
+    那是 明写要避免的错：`_summarize_with_degrade` 是函数体内
+    第 ② 步且原本无开关，直接跳过会让 DA 全文进 `summary_card`，
+    撞 `_DEGRADE_CARD_MAX_CHARS`(16000) 上界 —— 也就是重开 H7
+    （DDB 行被一段几万字符的正文撑爆）。
+
+    ⚠️ 巡检为什么不要卡片：`summary_card` 是给 IM 卡片显示用的短表示，
+    而巡检不投 IM 卡片（走 Phase 10 的广播层）。它要的是 `long_report`
+    —— 按 finding_id 分节的判读全文，回拼时要逐节解析。
+    多调一次 Bedrock 只是白花钱，还会把已经结构化的分节文本重新压成散文。
+    """
+
+    BEDROCK = "bedrock"
+    SKIP = "skip"
+
+
+_SKIP_CARD_PLACEHOLDER = "（巡检判读，详见完整报告）"
+"""`CardMode.SKIP` 时 `summary_card` 的内容。
+
+⚠️ 是一行占位文本而不是空串：`summary_card` 会进 DDB 行并被列表 UI 读，
+空串会让那一行在列表里显示成一片空白，看起来像「调查失败了」。
+"""
+
+
+class TextSource(str, Enum):
+    """`long_report` 从哪条 journal 记录取（2026-08-31 实测定的）。
+
+    ## 为什么需要这个开关
+
+    两个调用方要的**不是同一段文字**，而在此之前它们共用一条固定顺序的
+    fallback 链 —— 于是巡检永远取不到它要的那段。
+
+    ```
+    排障   要 DA 的成品报告      投 IM 卡片、给客户读、喂 Bedrock 摘要
+    巡检   要 agent 的自由输出   按 `## <finding_id>` 分节，逐节回拼到 finding 行
+    ```
+
+    🔴 `investigation_summary_md` 是 **DA 服务端按固定模板渲染的产物**，
+    不是 agent 的自由输出。两次独立实测都确认：
+
+    ```
+    2026-08-20  一次与巡检无关的排障调查，92 条 journal 逐类核对
+                → 内容恒为 `# Investigation Summary` + Symptoms/Findings/Root Cause
+                  （见 agent-build/.../core/devops_agent.py 的实测注释）
+    2026-08-20  一个**没有账号关联**的 space：DA 一条真实数据都读不到、
+                finding 记录 0 条，而 investigation_summary_md 照样产出
+                一份格式完好的报告（见 inspection/domain/journal_gate.py
+                的 NO_DATA_ACCESS 一档）
+    ```
+
+    ⇒ skill 要求的 `## <finding_id>` 信封**永远不会**出现在那个字段里，
+      与 skill 有没有加载无关。
+
+    ## 实测证据（2026-08-31，部署账号）
+
+    两次真实判读，`utilization.skills.bundles` 都是 `['inspection-cost-idle']`
+    —— skill 加载了、加载的是对的那份。agent 也确实按信封写了：
+
+    ```
+    ## 444455556666#us-east-1#elasticache#notiops-tb-redis-us-east-1-001#idle#-
+    **verdict**: `expected_behaviour`
+    **evidence**: …
+    ```
+
+    那段文字在 **assistant message** 记录里。拿同一批数据跑 `parse_sections`：
+
+    ```
+    investigation_summary_md（改动前实际取的）   892 字符 → parse_failed  0 节
+    末条 assistant message（agent 自由输出）    2046 字符 → ok          1 节 ✅
+    ```
+
+    判读一直都在、可解析，被取正文这一步扔掉了。
+
+    ⚠️ `AGENT_OUTPUT` 只是把 message 提到**第一位**，不是删掉其余三级。
+    agent 那条取不到时仍然退回成品报告 —— 那时 `parse_sections` 会如实标
+    `parse_failed` 并保留原文，而那是能看出问题的形态。
+
+    ⚠️ 顺序改了之后 `long_report` 也是写进 S3 的那一段，这是**要的** ——
+    `ParseResult.raw` 的契约是「分节解析的正确性只能靠事后对照原文验证」。
+    S3 里放一段与被解析文本不同的文字，等于把那个验证变成不可回答的问题。
+    """
+
+    PRODUCT_REPORT = "product_report"
+    """DA 成品报告优先（既有行为，排障链路）。"""
+
+    AGENT_OUTPUT = "agent_output"
+    """agent 自由输出优先（巡检链路）。"""
+
+
+def _text_source_of(value: "TextSource | str | None") -> "TextSource":
+    """把入参归一成 `TextSource`。认不出的值**回落到 PRODUCT_REPORT**。
+
+    ⚠️ 与 `_card_mode_of` 同一条理由：`build_investigation_report` 的契约是
+    「从不抛异常」。回落方向是既有行为，拼错时排障链路不变。
+    """
+    if isinstance(value, TextSource):
+        return value
+    try:
+        return TextSource(str(value or "").strip().lower())
+    except ValueError:
+        logger.warning("未知 text_source=%r，按 %s 处理", value,
+                       TextSource.PRODUCT_REPORT.value)
+        return TextSource.PRODUCT_REPORT
+
+
+def _stable_keys(
+    task_id: str, *, key_prefix: str = "investigations"
+) -> tuple[str, str, str]:
+    """S3 的三个固定 key。
+
+    ⚠️ `key_prefix` 可分流（R9.4b）：巡检报告与排障报告
+    落在同一个 `investigations/<task_id>/` 前缀下时，
+    「按前缀列出全部排障报告」会把巡检的也列出来，而两者的读者不同
+    （前者给客户看，后者给巡检看板拼装）。分前缀让 S3 侧的生命周期策略
+    也能分别设置 —— 巡检报告每天产出，保留期需要比排障短。
+
+    ⚠️ 前缀里的 `/` 由本函数拼，调用方 SHALL NOT 自带尾斜杠 ——
+    自带会拼出 `insp//<task_id>/report.md`，那是一个**合法但不同**的 key，
+    于是写进去的对象再也读不出来（读侧用的是规范化后的 key）。
+    """
+    p = (key_prefix or "investigations").strip().strip("/")
+    base = f"{p}/{task_id}"
     return f"{base}/report.md", f"{base}/report.html", f"{base}/trace.html"
+
+
+INSPECTION_KEY_PREFIX = "inspections"
+"""巡检报告的 S3 前缀。与排障的 `investigations` 分开，见 `_stable_keys`。"""
+
+
+def _card_mode_of(value: CardMode | str | None) -> CardMode:
+    """把入参归一成 `CardMode`。认不出的值**回落到 BEDROCK**。
+
+    ⚠️ 认不出时 SHALL NOT 抛 —— `build_investigation_report` 的整体契约是
+    「从不抛异常」（外层大 try/except，任何错误只降级成
+    `report_available=False`）。为一个拼错的字符串抛异常会让整条 callback
+    进 DLQ，而那是比「多调一次 Bedrock」严重得多的后果。
+
+    ⚠️ 回落方向是 BEDROCK 而不是 SKIP：前者是既有行为，
+    拼错时保持老路径不变；回落到 SKIP 会让排障卡片静默变成一行占位文本。
+    """
+    if isinstance(value, CardMode):
+        return value
+    try:
+        return CardMode(str(value or "").strip().lower())
+    except ValueError:
+        logger.warning("未知 card_mode=%r，按 %s 处理", value, CardMode.BEDROCK.value)
+        return CardMode.BEDROCK
 
 
 def _summarize_with_degrade(long_report: str | None) -> tuple[str, str | None, bool]:
@@ -180,7 +354,13 @@ def _summarize_with_degrade(long_report: str | None) -> tuple[str, str | None, b
 def build_investigation_report(*, execution_id: str, target_account_id: str,
                                task_id: str, detail: dict,
                                event_status: str,
-                               incident_id: str = "") -> ReportArtifacts:
+                               incident_id: str = "",
+                               card_mode: CardMode | str = CardMode.BEDROCK,
+                               key_prefix: str = "investigations",
+                               account_already_authorized: bool = False,
+                               text_source: TextSource | str = (
+                                   TextSource.PRODUCT_REPORT),
+                               ) -> ReportArtifacts:
     """Single-source-of-truth report pipeline (completed investigations).
 
     ① cross-account fetch long_report ONCE (4-level fallback + slice)
@@ -195,9 +375,31 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
     task_id empty → returns an empty (report_available=False) artifact WITHOUT
     writing any degenerate S3 key (Req 1.6 / Property 7).
 
+    `account_already_authorized`: 调用方已确认 `target_account_id` 是我们登记的
+    账号 → 跳过 `LOCKED_ACCOUNT_ID` 闸门（两个取正文的下游调用都会带上它）。
+    🔴 不传它时，成员账号的报告会**静默降级**：`long_report=None`、trace 为空，
+    而 `report_available` 仍为真、S3 对象与链接都正常 —— 巡检那侧收敛到
+    `parse_status="empty"`，看板上与「DA 说这些没问题」长得一样。
+    语义与正当性见 `shared.devops_agent.build_cross_account_devops_client`。
+
     `incident_id`: when empty, recovered from journal records (also yields the
     slice cutoff timestamp for multi-incident isolation); surfaced on the
     returned artifact for the delivery step to route on.
+
+    `card_mode` / `key_prefix` / `text_source`: all three default to the
+    existing behaviour so that callers written before they existed need no
+    change (R9.4). Inspection passes `CardMode.SKIP` +
+    `INSPECTION_KEY_PREFIX` + `TextSource.AGENT_OUTPUT`: it never shows an IM
+    card, its S3 objects live under their own prefix, and it needs the agent's
+    own `## <finding_id>`-sectioned output rather than DA's product report.
+    See `CardMode` for why SKIP is not "put long_report into summary_card",
+    and `TextSource` for the measured reason the product report can never
+    carry that envelope.
+
+    🔴 `text_source` 不由 `card_mode` 推导。两者恰好都在巡检那侧取非默认值，
+    但表达的是**无关**的两件事（要不要 IM 卡片 / 取哪段文字）。绑在一起之后，
+    任何一方将来需要单独调整都会连带改掉另一方的行为 —— 这正是
+    `account_already_authorized` 那段注释拒绝按 `is_inspection` 分岔的理由。
     """
     artifacts = ReportArtifacts(incident_id=incident_id)
     if not task_id:
@@ -212,7 +414,8 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
             list_journal_records_cross_account,
         )
         client, xa_space_id = build_cross_account_devops_client(
-            target_account_id, source="fetch-report")
+            target_account_id, source="fetch-report",
+            account_already_authorized=account_already_authorized)
         agent_space_id = metadata.get("agent_space_id", "") or xa_space_id or ""
 
         # Recover incident_id + slice cutoff when not supplied (DevOps Agent's
@@ -224,7 +427,8 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
                 agent_space_id, execution_id, client=client)
         artifacts.incident_id = incident_id
 
-        report_md_key, report_html_key, trace_html_key = _stable_keys(task_id)
+        report_md_key, report_html_key, trace_html_key = _stable_keys(
+            task_id, key_prefix=key_prefix)
         common = dict(
             status=data.get("status", "UNKNOWN"),
             priority=data.get("priority", "UNKNOWN"),
@@ -239,11 +443,19 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
         summary_record_id = data.get("summary_record_id", "")
         long_report = fetch_investigation_results(
             agent_space_id, execution_id, summary_record_id,
-            slice_after_ts=slice_after_ts, client=client)
+            slice_after_ts=slice_after_ts, client=client,
+            text_source=text_source)
         artifacts.long_report = long_report
 
         # ② Bedrock summarize → summary_card (degrade w/ truncation)
-        summary_card, model_id, truncated = _summarize_with_degrade(long_report)
+        #
+        # ⚠️ `CardMode.SKIP` 走的是「给一行占位文本」，**不是**「把 long_report
+        #    原样放进 summary_card」。后者会撞 _DEGRADE_CARD_MAX_CHARS 上界
+        #    并把 DDB 行撑爆 —— 也就是重开 H7（明写要避免）。
+        if _card_mode_of(card_mode) is CardMode.SKIP:
+            summary_card, model_id, truncated = _SKIP_CARD_PLACEHOLDER, None, False
+        else:
+            summary_card, model_id, truncated = _summarize_with_degrade(long_report)
         artifacts.summary_card = summary_card
         artifacts.model_id = model_id
         artifacts.report_truncated = truncated
@@ -262,8 +474,21 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
         # trace.html — cross-account full record listing (best-effort), sliced
         try:
             records = list_journal_records_cross_account(
-                execution_id=execution_id, target_account_id=target_account_id)
+                execution_id=execution_id, target_account_id=target_account_id,
+                account_already_authorized=account_already_authorized,
+                # 🔴 **必须传本函数已经解析出来的 space。** 那个函数默认去读
+                #    `da#<acct>.agent_space_id`（**排障** space），而巡检的
+                #    execution 活在 `inspect_agent_space_id` 里 —— 不传的表现是
+                #    巡检的 trace.html 恒空 + skill 门禁恒判 no_journal
+                #    （同一次回调里「正文取到了、trace 是空的」）。
+                #    这里的 `agent_space_id` 来自事件 metadata，是 DA 盖章的。
+                agent_space_id=agent_space_id)
             records = _filter_after_ts(records, slice_after_ts)
+            # ⚠️ 在 trace.html 之**前**挂上：下面几步（渲染 / 上传 / presign）
+            #    任一失败都会跳到 except，而门禁只要记录本身就够了 ——
+            #    把赋值放在后面会让「trace 上传失败」连带把 skill 门禁也关掉，
+            #    而那两件事完全无关。
+            artifacts.journal_records = tuple(records or ())
             trace_html = generate_trace_html(records=records, **common)
             upload_to_s3(trace_html, trace_html_key)
             artifacts.trace_html_key = trace_html_key
@@ -341,6 +566,8 @@ def deliver_report_card(*, artifacts: ReportArtifacts, incident_id: str,
             _mark_progress_row_completed(incident_id, "completed")
         return
 
+    incident_id = incident_id or _backfill_incident_id(target, task_id)
+
     _persist_support_context(
         incident_id=incident_id, task_id=task_id, agent_space_id=agent_space_id,
         execution_id=execution_id, summary_md=(artifacts.long_report or ""),
@@ -358,6 +585,12 @@ def deliver_report_card(*, artifacts: ReportArtifacts, incident_id: str,
                                   status=status, locale=locale)
     except Exception as e:
         logger.warning("next_steps.generate failed: %s", e)
+        # ⚠️ 空列表是**降级兜底**，不是「待收集的容器」。
+        #    `scripts/lint_seams.py` 的③会把它报成「传出去之后没人读」——
+        #    那条检查找的是「创建一个空列表收集痕迹，然后自己从不读它」
+        #    （`skipped` 那个缺陷的形态）。这里正好相反：值由上面
+        #    `_ns.generate()` 产出，空列表只是它失败时的替代，
+        #    而它的**用途就是传给 sender**。已钉进 .seams_baseline.json。
         ns_actions = []
 
     sender = _load_sender(target.get("platform", ""))
@@ -378,10 +611,30 @@ def deliver_report_card(*, artifacts: ReportArtifacts, incident_id: str,
         _mark_progress_row_completed(incident_id, "completed")
 
 
+def _failure_case_body(event_status: str, status: str, task_id: str,
+                       execution_id: str) -> str:
+    """调查失败/超时时塞进案例正文的那段说明（英文 —— 读者是 AWS Support 工程师）。
+
+    只有机器事实（状态 / task_id / execution_id），不含用户问题原文 —— 用户的问题本身
+    由 `raw_text` / `intent_summary` 走 `build_body` 的既有字段带进去。
+    """
+    what = ("timed out" if event_status == "timed_out" else "failed")
+    return (
+        "## Automated investigation did not complete\n\n"
+        f"NotiOps' automated investigation {what} before producing a report, "
+        "so no findings are attached below. The customer is escalating from "
+        "the failure notification card.\n\n"
+        f"- Investigation status: `{status}`\n"
+        f"- task_id: `{task_id or 'n/a'}`\n"
+        f"- execution_id: `{execution_id or 'n/a'}`\n"
+    )
+
+
 def deliver_failure_card(*, incident_id: str, task_id: str, detail: dict,
                          event_status: str, agent_space_id: str = "",
                          execution_id: str = "",
-                         target_account_id: str = "") -> None:
+                         target_account_id: str = "",
+                         account_already_authorized: bool = False) -> None:
     """Deliver a failure/timeout card WITHOUT fetching long_report or writing
     S3 (Req 5.5). Routes to chat (if any) and marks the progress row terminal.
 
@@ -394,7 +647,8 @@ def deliver_failure_card(*, incident_id: str, task_id: str, detail: dict,
         try:
             from shared.devops_agent import build_cross_account_devops_client
             client, xa_space_id = build_cross_account_devops_client(
-                target_account_id, source="fetch-failcard")
+                target_account_id, source="fetch-failcard",
+                account_already_authorized=account_already_authorized)
             eff_space_id = agent_space_id or xa_space_id or ""
             incident_id, _ = _extract_incident_id_from_records(
                 eff_space_id, execution_id, client=client)
@@ -407,6 +661,22 @@ def deliver_failure_card(*, incident_id: str, task_id: str, detail: dict,
                    else "Investigation Timed Out")
     target = _resolve_chat_target(incident_id, task_id)
     if target:
+        incident_id = incident_id or _backfill_incident_id(target, task_id)
+        # 失败卡上照样渲染 🆘「升级到 AWS Support」按钮 —— 调查失败恰恰是最需要找人的
+        # 时候。但这条路径以前**不写** `support#<incident_id>` 行，于是点 🆘 →
+        # `load_support_context()` 返回 None → 客户看到"报告已过期"，而报告从来就没存在
+        # 过。这里补一条：没有长报告可存（Req 5.5 明确不 fetch / 不写 S3），就存一句
+        # 说明失败的正文，让案例里写清"自动调查失败/超时"而不是空白。
+        _persist_support_context(
+            incident_id=incident_id, task_id=task_id,
+            agent_space_id=agent_space_id, execution_id=execution_id,
+            summary_md=_failure_case_body(event_status, status, task_id,
+                                          execution_id),
+            report_url="", trace_url="",
+            raw_text=target.get("raw_text", ""),
+            intent_summary=target.get("intent_summary", ""),
+            platform=target.get("platform", ""),
+        )
         sender = _load_sender(target.get("platform", ""))
         if sender:
             locale = _resolve_locale(target, incident_id)
@@ -513,7 +783,8 @@ def lambda_handler(event, context):
 # Step 1: Fetch investigation results
 # ===========================================================================
 def fetch_investigation_results(agent_space_id, execution_id, summary_record_id,
-                                slice_after_ts=None, client=None):
+                                slice_after_ts=None, client=None,
+                                text_source=TextSource.PRODUCT_REPORT):
     """Fetch investigation content with 4-level fallback.
 
     `slice_after_ts` (ISO timestamp str): when provided, only records created
@@ -524,25 +795,57 @@ def fetch_investigation_results(agent_space_id, execution_id, summary_record_id,
     `client` (optional): a cross-account devops-agent boto3 client injected by
     the report pipeline. When None, falls back to the module-level top-level
     client (本账户凭证) for backward compatibility.
+
+    `text_source`: which record the caller actually wants first. See
+    `TextSource` for the measured reason this is a knob and not a constant.
+    **两种模式的候选集合完全相同，只有顺序不同** —— 任一模式下四级都会试完，
+    所以没有哪一方会因为这个开关而拿不到内容。
     """
-    text = _try_record_type(agent_space_id, execution_id, "investigation_summary_md", slice_after_ts, client=client)
-    if text:
-        logger.info("Source: investigation_summary_md (%d chars)", len(text))
-        return text
+    order = _FETCH_ORDER[_text_source_of(text_source)]
+    for level in order:
+        text = _FETCH_LEVELS[level](
+            agent_space_id, execution_id, slice_after_ts, client)
+        if text:
+            logger.info("Source: %s (%d chars, text_source=%s)",
+                        level, len(text), _text_source_of(text_source).value)
+            return text
+    # 四级全空。返回空串而不是 None —— 调用方 (`_summarize_with_degrade` /
+    # `upload_to_s3` / `parse_sections`) 都按字符串处理，None 会在三处各炸一次。
+    logger.warning("取正文四级全空: execution_id=%s text_source=%s",
+                   execution_id, _text_source_of(text_source).value)
+    return ""
 
-    text = _try_record_type(agent_space_id, execution_id, "finding", slice_after_ts, client=client)
-    if text:
-        logger.info("Source: finding (%d chars)", len(text))
-        return text
 
-    text = _try_last_assistant_message(agent_space_id, execution_id, slice_after_ts, client=client)
-    if text:
-        logger.info("Source: last assistant message (%d chars)", len(text))
-        return text
+_FETCH_LEVELS = {
+    "investigation_summary_md": lambda sp, ex, ts, cl: _try_record_type(
+        sp, ex, "investigation_summary_md", ts, client=cl),
+    "finding": lambda sp, ex, ts, cl: _try_record_type(
+        sp, ex, "finding", ts, client=cl),
+    "assistant_message": lambda sp, ex, ts, cl: _try_last_assistant_message(
+        sp, ex, ts, client=cl),
+    "all_records": lambda sp, ex, ts, cl: _try_all_records(
+        sp, ex, ts, client=cl),
+}
+"""取正文的四个取数器。键名会进日志，改名要同步改 `_FETCH_ORDER`。"""
 
-    text = _try_all_records(agent_space_id, execution_id, slice_after_ts, client=client)
-    logger.info("Source: all records fallback (%d chars)", len(text))
-    return text
+_FETCH_ORDER = {
+    TextSource.PRODUCT_REPORT: (
+        "investigation_summary_md", "finding", "assistant_message",
+        "all_records"),
+    TextSource.AGENT_OUTPUT: (
+        # 🔴 `assistant_message` 在第一位是这个模式**唯一**的意义。
+        #    实测：巡检要的 `## <finding_id>` 信封只在这一级里，而
+        #    `investigation_summary_md` 是 DA 的模板报告、恒无信封 ——
+        #    它排在前面时巡检 100% 落到 parse_failed（见 `TextSource`）。
+        "assistant_message", "investigation_summary_md", "finding",
+        "all_records"),
+}
+"""两种模式的取数顺序。
+
+⚠️ 两个元组必须是**同一个集合的排列** —— 少一级会让那一档在该模式下
+永久取不到，而表现是「偶发空报告」（取决于 DA 那次产出了哪些 recordType）。
+`tests/test_report_text_source.py` 有一条元断言钉住这件事。
+"""
 
 
 def _try_record_type(agent_space_id, execution_id, record_type, slice_after_ts=None, client=None):
@@ -794,12 +1097,35 @@ def generate_presigned_url(s3_key):
 # ===========================================================================
 # Investigation Started → post execution-deep-link card
 # ===========================================================================
+#: Mirror of `core.ddb_state.LIVE_CARD_OWNER_IM_LAMBDA`. Kept as a literal so
+#: this module stays importable without `core` (Lambda layering — same reason
+#: `update_live_card` takes its IR duck-typed). `tests/test_im_double_card.py`
+#: asserts the two strings are equal so they can't drift apart silently.
+LIVE_CARD_OWNER_IM_LAMBDA = "im_lambda"
+
+
 def _handle_investigation_started(agent_space_id: str, execution_id: str,
                                   task_id: str, incident_id: str) -> dict:
     """Post the execution-level console deep link to the originating Feishu thread.
 
     incident_id is rarely echoed in the Started event metadata, so we mine
     journal records to recover it (same trick as Completed handling).
+
+    ⚠️ Skipped entirely when the routing row says the IM webhook path already
+    owns a live card (`live_card_owner == "im_lambda"`). Posting here too gives
+    the user TWO cards for one `/investigate` — measured on prod 2026-09-02.
+    This card is driven by a `progress#` row, and the only reader of those rows
+    was the Fargate-resident `core/progress_poller.py`
+    (`platforms/common/lambda_progress.py` scans `imtask#` only).
+
+    ⚠️ `BotStack` was retired on 2026-09-03 (IM refactor M2), so nothing reads
+    `progress#` rows any more: a card posted here would freeze on "investigation
+    started" forever. Every IM dispatch now goes through the webhook Lambda,
+    which stamps `live_card_owner = "im_lambda"`, so in practice this function
+    returns early for IM. The branch is kept — not deleted — because
+    `infra/lib/bot-stack.ts` is still in the repo as the long-connection
+    rollback path, and if it ever comes back this card is its only live
+    progress. See `core.ddb_state.link_im_investigation`.
     """
     if not incident_id:
         incident_id, _ = _extract_incident_id_from_records(agent_space_id, execution_id)
@@ -817,6 +1143,15 @@ def _handle_investigation_started(agent_space_id: str, execution_id: str,
         logger.info("InvestigationStarted: no chat thread for incident_id=%s, "
                     "task_id=%s — skipping live link post", incident_id, task_id)
         return {"statusCode": 200, "body": "no-thread"}
+
+    if target.get("live_card_owner") == LIVE_CARD_OWNER_IM_LAMBDA:
+        # The IM webhook path already posted its own dispatch card and owns an
+        # `imtask#` row that the progress Lambda patches every minute. A second
+        # card here is pure noise either way — see docstring.
+        logger.info("InvestigationStarted: live card owned by %s for task_id=%s "
+                    "— skipping duplicate live link post",
+                    LIVE_CARD_OWNER_IM_LAMBDA, task_id)
+        return {"statusCode": 200, "body": "live-card-owned-by-im"}
 
     sender = _load_sender(target.get("platform", ""))
     if not sender:
@@ -1024,6 +1359,40 @@ def _persist_support_context(incident_id: str, task_id: str, agent_space_id: str
 # ===========================================================================
 # Cross-platform chat routing lookup
 # ===========================================================================
+def _backfill_incident_id(target: dict, task_id: str) -> str:
+    """Recover the incident_id from the routing row when the callback lacks one.
+
+    Why this is needed: the Lambda-webhook IM path dispatches through
+    ``core.devops_agent.start_investigation()``, which does **not** embed the
+    ``<!--notiops:<incident_id>-->`` marker that the older Fargate path used
+    (``shared.devops_agent.create_investigation``). Callback events rarely echo
+    the incident_id either, so by the time we get here it is usually empty even
+    though ``ddb_state.link_im_investigation()`` wrote it into both the
+    ``incident#`` and ``task#`` rows.
+
+    Two things break on an empty incident_id, both silently:
+      * ``_persist_support_context`` writes to the literal key ``support#`` —
+        every IM investigation overwrites the same row, so the report card's
+        "sync to case" / "escalate to support" buttons look up a stranger's
+        report (or nothing at all);
+      * ``_extract_case_display_id`` returns "", so a report whose investigation
+        was kicked off from a case-create flow loses its link back to the case.
+
+    Falls back to ``task#<task_id>`` as a synthetic id so the support-context row
+    is at least unique per investigation. That synthetic form deliberately does
+    NOT match ``_CASE_LINKED_INCIDENT_RE`` — a made-up id must never be mistaken
+    for a real case link.
+    """
+    recovered = str((target or {}).get("incident_id") or "").strip()
+    if recovered:
+        return recovered
+    if task_id:
+        logger.info("incident_id absent from callback and routing row; "
+                    "falling back to task-derived id for task_id=%s", task_id)
+        return f"task-{task_id}"
+    return ""
+
+
 def _resolve_chat_target(incident_id: str, task_id: str) -> dict | None:
     """Look up the originating chat context from the shared Conversations
     table. Returns a dict including the `platform` slug on hit; None if no
@@ -1051,7 +1420,14 @@ def _resolve_chat_target(incident_id: str, task_id: str) -> dict | None:
                         "root_message_id": item.get("root_message_id", ""),
                         "raw_text": item.get("raw_text", ""),
                         "intent_summary": item.get("intent_summary", ""),
-                        "locale": item.get("locale", "")}
+                        "locale": item.get("locale", ""),
+                        # The row carries the incident_id even when the callback
+                        # event doesn't — see the backfill in
+                        # deliver_report_card / deliver_failure_card.
+                        "incident_id": item.get("incident_id", ""),
+                        # Who owns the live/progress card for this run — see
+                        # LIVE_CARD_OWNER_IM_LAMBDA below.
+                        "live_card_owner": item.get("live_card_owner", "")}
     except Exception as e:
         logger.warning("DDB lookup failed: %s", e)
     return None

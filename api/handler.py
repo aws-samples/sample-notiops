@@ -26,6 +26,7 @@ from api.routes.devops_agent import handle_devops_agent
 from api.routes.agent_config import handle_agent_config
 from api.routes.system_config import handle_system_config
 from api.routes.org_onboard import handle_org_onboard
+from api.errors import ApiError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -138,10 +139,35 @@ def handler(event: dict, context) -> dict:
         if isinstance(result, dict) and result.get("_status_code"):
             status_code = result.pop("_status_code")
         return _response(status_code, result)
+    # ── 领域错误（路由显式抛的）──
+    #
+    # ⚠️ 顺序要紧：`ApiError` 的子类要在 `ValueError` 之前，否则
+    #    `ValidationError`（如果将来继承 ValueError）会被前者吃掉。
+    except ApiError as e:
+        # 客户能看懂的错，但仍然记一行 —— 「404 变多了」是个有用的信号
+        # （通常意味着前端在拿一个已经被删掉的 id 反复请求）。
+        logger.info("%s: %s", e.code, e)
+        return _response(e.status, {"error": e.code, "message": str(e)})
     except ValueError as e:
+        # 118 处路由主动 `raise ValueError(...)` 当入参校验用 —— 这是既有约定。
+        # ⚠️ 但也**记一行 traceback**：内部解析错误（比如 int() 收到 None）
+        #    也是 ValueError，那时报给客户「你的入参有问题」是误导，
+        #    而没有 traceback 就永远查不出来。
+        logger.warning("ValidationError: %s\n%s", e, traceback.format_exc())
         return _response(400, {"error": "ValidationError", "message": str(e)})
     except KeyError as e:
-        return _response(404, {"error": "NotFound", "message": str(e)})
+        # 🔴 **裸 KeyError 是 bug，不是 404。**
+        #
+        #    原来这里返回 `404 {"error":"NotFound","message":"'threshold'"}` ——
+        #    前端读成「这个资源不存在」，而真相是后端某个字段改名/缺失。
+        #    而且它**不进日志**（只有 `except Exception` 记 traceback），
+        #    所以最需要追溯的那一类在 CloudWatch 里什么都没有。
+        #
+        #    真正的 404 现在走 `NotFoundError`（26 处已迁移）。
+        logger.error("Missing key (this is a bug, not a 404): %s\n%s",
+                     e, traceback.format_exc())
+        return _response(500, {"error": "InternalError",
+                               "message": "Internal server error"})
     except Exception as e:
         logger.error("Unhandled error: %s\n%s", e, traceback.format_exc())
         return _response(500, {"error": "InternalError", "message": "Internal server error"})

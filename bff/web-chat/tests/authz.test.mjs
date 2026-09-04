@@ -62,6 +62,19 @@ ok("chat stream alwaysOn allowed", chatStream.allow === true);
 const unknown = await authorize({ method: "GET", path: "/api/totally/unknown", query: null, body: null }, { grants: ["*"], denies: [] });
 ok("unknown route fail-closed", unknown.allow === false && unknown.status === 403);
 
+/* ── /warmup（会话预热，0 token）与 /stream 同一个能力节点 ──
+ *
+ * 为什么必须挂在 nav:chat 而不是丢进 LOGIN_ONLY：LOGIN_ONLY 是"登录即可"，会绕开
+ * 模块开关 —— 那样管理员关掉聊天模块之后，前端仍能每进一个会话就拉起一次 agent
+ * runtime（关掉的功能还在花钱）。挂在节点上，开关一关两条路一起停。
+ */
+const chatWarm = await authorize({ method: "POST", path: "/api/chat/warmup", query: null, body: null }, { grants: [], denies: [] });
+ok("chat warmup allowed on the same alwaysOn node as /stream", chatWarm.allow === true);
+const warmNear = await authorize({ method: "POST", path: "/api/chat/warmup/extra", query: null, body: null }, { grants: ["*"], denies: [] });
+ok("warmup pattern is anchored (no prefix match) → fail-closed", warmNear.allow === false && warmNear.status === 403);
+const warmGet = await authorize({ method: "GET", path: "/api/chat/warmup", query: null, body: null }, { grants: ["*"], denies: [] });
+ok("warmup is POST-only", warmGet.allow === false && warmGet.status === 403);
+
 /* ── authorize：/actions/execute 按 body.action.type（真实请求体形状）── */
 const resolveBody = { action: { type: "resolve_case", params: {} } };
 const canResolve = await authorize({ method: "POST", path: "/api/actions/execute", query: null, body: resolveBody },
@@ -79,7 +92,7 @@ const finopsClosed = await authorize(finopsDash, { grants: ["*"], denies: [] }, 
 ok("finops denied when module disabled even for admin", finopsClosed.allow === false);
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * 权限矩阵：adminOnly 节点（spec task 8.3）
+ * 权限矩阵：adminOnly 节点
  *
  * `/admin/llm-config*` 全部落在 `nav:admin`（adminOnly）这一个能力节点上，所以
  * 「非 Admin 拿不到模型目录与 API Key」这件事完全由 adminOnly 的判定承载。

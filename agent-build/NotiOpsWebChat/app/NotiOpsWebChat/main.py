@@ -28,13 +28,34 @@ try:
 except ImportError:  # pragma: no cover
     class ModelThrottledException(Exception):  # type: ignore[no-redef]
         """占位：老版本 strands 无此异常类型。"""
-_MODEL_CALL_ERRORS = (
-    ClientError, EventStreamError, ReadTimeoutError,
-    ConnectionClosedError, EndpointConnectionError, ModelThrottledException,
+# GPT 系（Bedrock Mantle）不走 botocore，走 openai-python —— 它超时抛的是
+# `openai.APITimeoutError`，不在上面那几个 botocore 异常里。漏掉的后果是实测过的最差
+# 形态：异常一路冒到 AgentCore，SSE 只剩一个 error 帧，前端显示「（无响应）」。
+# 守卫导入：openai 是 Mantle 那条路才用到的间接依赖，缺了不该让整个 runtime 起不来。
+try:
+    from openai import APIConnectionError as _OpenAIConnectionError
+    from openai import APITimeoutError as _OpenAITimeoutError
+except ImportError:  # pragma: no cover — 未装 openai（不启用 GPT 系时）
+    class _OpenAITimeoutError(Exception):  # type: ignore[no-redef]
+        """占位：未安装 openai 时永不匹配。"""
+    class _OpenAIConnectionError(Exception):  # type: ignore[no-redef]
+        """占位：未安装 openai 时永不匹配。"""
+# 「模型没在约定时间内给出下一段内容」这一类。单独成组是因为**给用户的话不一样**：
+# 5xx / 限流 该说「再发一次通常就好」，超时该说「问题太重或模型在长推理，拆小或换模型」。
+_MODEL_TIMEOUT_ERRORS = (
+    ReadTimeoutError, ConnectionClosedError, EndpointConnectionError,
+    _OpenAITimeoutError, _OpenAIConnectionError,
 )
+_MODEL_CALL_ERRORS = (
+    ClientError, EventStreamError, ModelThrottledException,
+) + _MODEL_TIMEOUT_ERRORS
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from model.load import load_model, resolve_model_id
-from memory.session import get_memory_session_manager, set_retrieval_query
+from model.load import BEDROCK_READ_TIMEOUT_SEC, load_model, resolve_model_id
+from memory.session import get_memory_session_manager
+# 能力/元问题的确定性 0-token 应答（判据 + 文案 + 理由都在那个模块里）。
+from capability import builtin_answer_source, capability_answer, is_capability_question
+# Strands message 事件 → 右侧「思考过程」面板的步骤（工具入参/返回摘要）。零依赖、纯函数。
+from thinking_steps import steps_from_message
 
 app = BedrockAgentCoreApp()
 log = app.logger
@@ -91,7 +112,7 @@ B) **当 Web search = OFF 时**，优先级 = **AWS 文档 MCP > 模型自身知
 **每次取证用过的工具/文档/网页都会自动记入 Sources 给用户看（信息透明），所以你要老实通过工具取证、不要走捷径凭记忆。**
 
 【多账号归因铁律】账号范围的数据问题（cases/资源/成本/告警）**必须本轮实时调用工具**，
-严禁凭会话记忆或长期记忆作答 —— 记忆里的数据可能属于其它账号或已过期（事故根因：
+严禁凭本会话前几轮的记忆作答 —— 记忆里的数据可能属于其它账号或已过期（事故根因：
 记忆里部署账号的 case 表被当成成员账号的答案复述）。工具结果里的 `account_queried` 是数据真正所属的账号。
 回答里提到账号时**必须与它一致**；用户点名某账号但工具报错（不可见/未接入）时，
 如实告知并停止 —— **绝不允许**把其它账号（含部署账号）的数据冒充成用户点名的账号。
@@ -105,6 +126,14 @@ B) **当 Web search = OFF 时**，优先级 = **AWS 文档 MCP > 模型自身知
   AWS 成本与定价工具**（来自 awslabs MCP，如 cost-explorer / cost-optimization /
   cost-anomaly / get_pricing 等）。**必须主动调用这些工具拿真实数据再作答**，
   不要声称"无法访问账单"或让用户自己去控制台查——你能查。拿到数据后给出分析与建议。
+- **成本数据源的降级链（不许把用户堵住）**：客户 CUR 行级明细（`list_cost_tools` /
+  `call_cost_tool`）是**可选数据源**——本部署可能没配（这两个工具就不存在）、也可能临时挂了
+  （返回带 `error` + `fallback` 的对象）。**任何一种情况都不要说"查不了"**，按顺序降级：
+  ①客户 CUR（行级、可对账） → ②CE 官方成本工具（聚合、部署账号） → ③`call_aws` /
+  `aws_readonly`（任意只读 AWS API）。用**拿得到的那一层**作答，并**明确说明口径变了**：
+  行级明细此刻不可用、这次用的是哪个数据源、因此是聚合/部署账号口径、可能与账单对不齐。
+  ⚠️ 绝不能把 CE 的数字当成 CUR 行级数字端上去，也绝不编数。反向同理：CE 能答的聚合问题
+  别绕去 CUR（更慢、更贵）。
 - **RDS / 数据库巡检**：你**有只读工具**实时读取用户账号的 RDS 现状——`rds_list_instances`
   （列实例）、`rds_describe_instance`（单实例健康明细：Multi-AZ/备份/存储自动扩展/加密/公开访问等）、
   `rds_recent_events`（近期故障切换/重启等事件）、`rds_metrics`（CPU/连接/存储/延迟等 CloudWatch 指标）。
@@ -780,6 +809,19 @@ for _t in (support_case_create, support_case_reply, support_case_resolve):
 # 全面覆盖官方 cost + pricing MCP 能力（只读白名单，18 个工具）。工具返回原始事实数据，
 # 分析交给 LLM。子进程随 runtime 容器常驻；起不来则返回空列表，agent 照常运行。
 from core import finops_mcp as _finops_mcp  # noqa: E402
+from core import cost_agent_mcp as _cost_agent_mcp  # noqa: E402  # 客户 CUR 行级明细（Lambda URL MCP）
+
+
+def _cost_agent_tools():
+    """cost-agent MCP（客户 CUR 行级明细）：仅 2 个元工具（list/call），token 税 ~600，
+    全主题挂载。COST_AGENT_MCP_URL 未配置 → 空列表（模块缺席不影响其它）。
+    注意：数据权限在 Lambda 侧（查它配置的客户 CUR 表），与本容器凭据无关——
+    不存在跨账号串号问题（它永远查同一张表，答案与 account_id 无关，工具描述已注明）。"""
+    try:
+        return list(_cost_agent_mcp.get_tools())
+    except Exception as _e:  # noqa: BLE001
+        log.warning("cost_agent_mcp.get_tools failed: %s", _e)
+        return []
 
 
 def _finops_tools_for(topic):
@@ -1485,13 +1527,14 @@ def _tools_for_topic(topic, account_id: str | None = None, devops_deep: bool = F
         # 结果按固定顺序拼接(顺序进 prompt,抖动会让 prompt 缓存失效)。首次启动后子进程常驻,
         # 后续走缓存秒回。
         import concurrent.futures as _cf
-        with _cf.ThreadPoolExecutor(max_workers=3) as _ex:
+        with _cf.ThreadPoolExecutor(max_workers=4) as _ex:
             _futs = {
                 "finops": _ex.submit(_finops_tools_for, topic),
                 "investigation": _ex.submit(_investigation_tools_for, topic),
                 "aws_api": _ex.submit(_aws_api_tools),
+                "cost_agent": _ex.submit(_cost_agent_tools),
             }
-            for _k in ("finops", "investigation", "aws_api"):
+            for _k in ("finops", "investigation", "aws_api", "cost_agent"):
                 try:
                     _t += _futs[_k].result()
                 except Exception as _e:  # noqa: BLE001 — 单个 MCP 起不来不阻断其它/整体
@@ -1552,6 +1595,10 @@ from core import llm_config  # noqa: E402 — 模型目录（DDB 单一真源）
 # 能被 scripts/test_webchat_agent_cache.py 直接测到 —— 内联在闭包里时测试只能手抄副本。
 from core import agent_cache as _agent_cache  # noqa: E402
 
+# 恢复历史里的跨模型不可回放块（Claude thinking / cachePoint）清理。同样抽成独立模块以便
+# scripts/test_webchat_history_scrub.py 直接压真实现。
+from core import history_scrub as _history_scrub  # noqa: E402
+
 
 def agent_factory():
     cache: "_OrderedDict[str, object]" = _OrderedDict()
@@ -1572,7 +1619,7 @@ def agent_factory():
         def _build(restore: bool):
             # restore=False：跳过 AgentCore Memory 的会话恢复（session_manager=None），
             # 用于旧会话持久化状态与新 conversation manager 不兼容时的兜底。
-            return Agent(
+            _agent = Agent(
                 model=load_model(model_key),
                 session_manager=get_memory_session_manager(session_id, _actor_id) if restore else None,
                 conversation_manager=_make_conversation_manager(),
@@ -1580,6 +1627,17 @@ def agent_factory():
                 tools=_tools_for_topic(_topic, account_id, devops_deep),
                 hooks=[],
             )
+            # 历史已经在 Agent.__init__ 末尾被 session manager 恢复进 _agent.messages
+            # （Strands 在那里 invoke AgentInitializedEvent）。这里趁它还没进任何一次
+            # 模型请求，把**跨模型不可回放**的块洗掉 —— 换模型时 model_key 进缓存键 =
+            # 新建 Agent + 恢复上一个模型的历史，Claude 的 reasoningContent 回放给
+            # grok 是 InternalServerException、给 glm 是 ValidationException（现网
+            # 2026-09-01 实测，见 core/history_scrub.py 的矩阵）。
+            if restore:
+                _n = _history_scrub.scrub_cross_model_history(_agent.messages)
+                if _n:
+                    log.info("scrubbed %d cross-model history block(s) for session %s", _n, session_id)
+            return _agent
         def _build_with_restore_fallback():
             try:
                 return _build(restore=True)
@@ -1801,6 +1859,27 @@ def _is_trivial_greeting(text: str) -> bool:
     # 允许 "hello there" / "你好啊" 这类：整句由问候词 + 少量语气词构成
     return any(s_clean == w or s_clean.startswith(w + " ") or s_clean.startswith(w) and len(s_clean) <= len(w) + 3
                for w in _GREETING_WORDS)
+
+
+# —— P2b：能力/元问题快路径（**真 0 token**：完全不调模型）────────────────────
+# 判据（哪些说法算能力问题）、文案（能力清单）、以及为什么不让模型现编 —— 全在
+# `capability.py`。放在那里是因为它没有 strands 依赖，可以被 pytest 直接加载
+# （见 tests/test_webchat_capability_fastpath.py）；本文件一进门就 import strands，
+# 在 CI / 本地根本 import 不了。
+#
+# 与寒暄快路径（_is_trivial_greeting）的关键区别：寒暄那条**仍然调模型**（无工具的
+# 临时 agent 答一句），这条**一个字都不过模型** —— 因此署名行必须走 `via="builtin"`，
+# 不能沿用「AWS Bedrock (某模型)」，那会把答案来源说错（与 via="devops-agent" 同一
+# 个道理，见 frontend/chat-app/src/components/Message.tsx 顶部注释）。
+#
+# 下面两个包装只做一件事：把「本轮语言」交给它。`_dv` 是本文件唯一的语言口径，
+# 复用它（而不是再读一次 _ui_locale）才不会出现两处语言判断慢慢漂开。
+def _capability_answer() -> str:
+    return capability_answer(_dv("zh", "en"))
+
+
+def _builtin_answer_source() -> dict:
+    return builtin_answer_source(_dv("zh", "en"))
 
 
 def _has_inline_function_call(messages) -> bool:
@@ -2026,8 +2105,18 @@ def _stream_events(event, scrubber):
     redactedContent 泄漏的成因 —— 主循环滤掉了 reasoning,快路径(寒暄/问候,如"你好")
     漏了,于是同一个模型在长问答里干净、一句"你好"就把原始事件糊到回答里。
     """
-    if not isinstance(event, dict) or "event" not in event:
-        return []  # Strands 自有事件(init_event_loop / message 等)不外发
+    if not isinstance(event, dict):
+        return []
+    if "event" not in event:
+        # Strands 自有事件（不带外层 event 包装）。其中 `message` 事件携带本轮的
+        # toolUse（工具名+入参）/ toolResult（返回状态+规模）块 → 转成「思考过程」步，
+        # 补上 progress 之外那层"调用 X（region=…）→ X 返回了"的密度（见 thinking_steps.py）。
+        # 其余自有事件（init_event_loop / result 等）仍不外发。
+        _msg = event.get("message")
+        if isinstance(_msg, dict):
+            _rt = "Tool finished" if _ui_locale.get() == "en" else "工具已返回"
+            return [{"thinking_step": _s} for _s in steps_from_message(_msg, _progress_for_tool, tool_result_text=_rt)]
+        return []
     _ev = event["event"]
     # 工具开始调用 → 只发一句进度行;contentBlockStart 本身不含正文,不转发。
     cbs = _ev.get("contentBlockStart")
@@ -2153,6 +2242,48 @@ async def invoke(payload, context):
     session_id = getattr(context, 'session_id', 'default-session')
     user_id = getattr(context, 'user_id', 'default-user')
 
+    # ── P0-B：会话预热（prewarm，**0 token**）────────────────────────────────
+    # 首字延迟的大头不是模型，是**这个容器还没准备好**：AgentCore 平台冷启动（拉镜像 +
+    # 起 microVM）+ Python import + 从 S3 挂工具快照 + 起 MCP 子进程，实测约 10s
+    # （scripts/measure_cold_start.py；优化前 23-24s）。这段时间与"用户读完首页、
+    # 想好要问什么、把问题打出来"完全**可以重叠** —— 所以前端一进对话就发这么一发
+    # 即忘的 warmup，把整段准备工作挪到用户打字的时候做完。
+    #
+    # 三条硬约束（改这里前先读）：
+    #   ① **不调模型**：这里只做"准备"，一个 token 都不花。所以不 yield 任何正文，
+    #      也不进 _extract_prompt / 不发 sources —— 它压根不是一轮对话。
+    #   ② **必须与真实那一轮同一个 runtimeSessionId**：AgentCore 按
+    #      runtimeSessionId 路由到具体 microVM，session id 不同就是预热了**另一个**
+    #      容器，白花 10s。前端因此必须用同一个 conversationId 发 warmup
+    #      （bff/web-chat/agentcore.mjs::toSessionId 由它派生），见该处注释。
+    #   ③ **agent 缓存键必须对齐**：get_or_create_agent 的键含 model/topic/
+    #      account_id/devops_deep，预热时传的这四个值要与用户真正发消息时一致，
+    #      否则真实那一轮会再建一个 agent、白热一遍。前端传的就是当前会话的选择。
+    # 兜底：预热失败**绝不影响**任何东西 —— 它顶多让首字回到原来的 10s。
+    if payload.get("warmup") is True:
+        log.info("warmup ping (0 token): session=%s topic=%s", session_id, payload.get("topic"))
+        try:
+            # 与真实那一轮同序：先刷模型目录（缓存键含 generation），再建 agent。
+            llm_config.get_config(payload.get("generation"))
+            get_or_create_agent(session_id, user_id, payload.get("model"), payload.get("topic"),
+                                account_id=payload.get("account_id"),
+                                devops_deep=bool(payload.get("devops_agent")))
+            # MCP 子进程（最慢的一段）也在这里起 —— 幂等、非阻塞，真调用来了在同一个
+            # Future 上等，不会起第二份。
+            _mcp_snapshot.warm_now()
+        except Exception as e:  # noqa: BLE001 — 预热失败无害，回到"用时现起"
+            log.warning("warmup failed (harmless): %s", _safe_err(e))
+        # 回一帧非文本 ack：BFF 只用它确认 runtime 活着（extract 取不到 text → 不会
+        # 有任何东西流到前端）。**不要**改成文本帧，否则会被当成正文吐进聊天窗口。
+        yield {"warmup": "ok"}
+        return
+
+    # 就绪信号（**非正文、0 token**）：容器已拉起、代码开始跑了。BFF 只把它当作把等待期
+    # 提示从"正在启动服务（冷启动）"切到"正在分析"的**真实依据**（见 bff/web-chat/wait_hint.mjs），
+    # extract 取不到 text → 一个字都不会流到聊天窗口。放在这里（warmup 之后、真正干活之前），
+    # 覆盖问候快路径与主循环两条路。
+    yield {"ready": True}
+
     # 模型配置热生效（spec R4）：BFF 在 payload 里带**服务端读出**的 generation。
     # 与本地缓存不同 → 绕过 TTL 立即强刷（限速内），使 Admin 保存后**下一条消息**即生效，
     # 不必等 60s TTL、更不必重启 runtime。非法值（负数/1e308/字符串…）由 llm_config
@@ -2185,11 +2316,6 @@ async def invoke(payload, context):
     # 中文提问也带偏）；无 CJK 即视为英文。这样框架文案与模型正文语言保持一致。
     _raw_q_for_locale = str(payload.get("prompt") or payload.get("text") or "")
     _ui_locale.set("en" if _is_probably_english(_raw_q_for_locale) else "zh")
-    # 长期记忆检索用的查询串 = 用户**原话**，而不是下面拼出来的那个大 prompt。
-    # AgentCore Memory 的 searchQuery 上限 10000 字符，大 prompt 动辄几十 KB ——
-    # 四个 namespace 会齐刷刷 ValidationException 被 SDK 吞掉、返回空，记忆等于没开。
-    # 见 memory/session.py 里的 _NotiOpsMemorySessionManager。
-    set_retrieval_query(_raw_q_for_locale)
     # 重置本轮"待确认写操作提议"收集器（逐请求隔离）。
     _proposed_actions.set([])
     # 重置本轮"快捷操作按钮"收集器（续查等非流式工具往里塞，收尾统一发出）。
@@ -2242,6 +2368,39 @@ async def invoke(payload, context):
             return
         except Exception as e:  # noqa: BLE001 — 快路径出问题就回退正常流程
             log.warning("greeting fast-path failed, falling back: %s", _safe_err(e))
+
+    # ── P2b：能力/元问题快路径（**0 token**，完全不调模型）──
+    # 判据与文案见 capability.py（那个模块的 docstring 写了为什么不让模型现编）。
+    # 排除条件（任一命中就走正常 agent，不能给内置文案）：
+    #   web_on / finops_deep / devops_deep —— 用户显式开了某个能力开关，这一轮有具体意图；
+    #   skill_id —— 选了某个 Skill，此时「你能做什么」问的是**那个 skill**，不是产品全貌。
+    if (not web_on and not finops_deep and not devops_deep
+            and not str(payload.get("skill_id") or "").strip()
+            and is_capability_question(_raw_q)):
+        _cap_text = ""
+        try:
+            _cap_text = _capability_answer()
+        except Exception as e:  # noqa: BLE001 — 拼文案都能出错就老实回落正常路径
+            log.warning("capability fast-path failed, falling back: %s", _safe_err(e))
+        if _cap_text:
+            # 与寒暄快路径**相反**：这里先踢一脚 MCP 预热。问「你能做什么」的人下一句
+            # 大概率就是真任务（比"你好"强得多的意图信号），而 warm_now() 幂等、非阻塞，
+            # 正好用"用户读这段能力说明"的几秒把子进程起好。
+            try:
+                _mcp_snapshot.warm_now()
+            except Exception as e:  # noqa: BLE001
+                log.warning("mcp warm kick failed: %s", _safe_err(e))
+            # 署名行：这条**不是模型答的** → via=builtin（前端显示 "NotiOps"）。
+            # 少了这一帧就会署成「AWS Bedrock (某模型)」，把答案来源说错。
+            yield {"via": "builtin"}
+            yield {"event": {"contentBlockDelta": {"delta": {"text": _cap_text},
+                                                   "contentBlockIndex": 0}}}
+            yield {"sources": [_builtin_answer_source()]}
+            # 显式 0 而不是省略：让 BFF 落库拿到确切用量（前端 totalTokens=0 不显示
+            # token 数，见 Message.tsx::modelSignature）。省略会让历史回显时"用量未知"
+            # 与"用量为 0"混成一回事。
+            yield {"usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0, "cycles": 0}}
+            return
 
     # ── 懒挂载的 MCP server 后台预热（P0-A）──
     # 工具是从 S3 快照挂上的，子进程还没起。放在这里而**不是** get_or_create_agent 里，
@@ -2509,19 +2668,43 @@ async def invoke(payload, context):
                   type(e).__name__, _code or "-", _model_id)
         _zh_err = not _is_probably_english(_raw_q)
         _what = _code or type(e).__name__
-        _msg = (
-            f"\n\n---\n⚠️ 模型调用失败（`{_what}`），本轮未能生成回答。\n\n"
-            "**下一步：**\n"
-            "1. 直接再发一次 —— 这类错误多为模型服务端的临时故障，重试通常就好；\n"
-            "2. 若连续失败，在输入框上方切换到**另一个模型**（如 Claude Sonnet 5）后重试。\n"
-            if _zh_err else
-            f"\n\n---\n⚠️ The model call failed (`{_what}`), so this turn produced no answer.\n\n"
-            "**Next steps:**\n"
-            "1. Send the message again — this class of error is usually a transient "
-            "model-service fault and a retry succeeds;\n"
-            "2. If it keeps failing, switch to a different model (e.g. Claude Sonnet 5) "
-            "above the input box and retry.\n"
-        )
+        if isinstance(e, _MODEL_TIMEOUT_ERRORS):
+            # 超时是**另一种病**，给「重试通常就好」是误导：同样的问题给同一个模型，
+            # 大概率再超一次。真正有用的下一步是「把问题拆小」或「换一个吐字更快的模型」。
+            # 把等待时长写进文案（不是写死的数字，跟着 BEDROCK_READ_TIMEOUT_SEC 走）——
+            # 客户才知道系统确实等过、等了多久，而不是以为点了没反应。
+            _mins = BEDROCK_READ_TIMEOUT_SEC // 60
+            _msg = (
+                f"\n\n---\n⏳ 模型在 {_mins} 分钟内没有返回内容，本轮已停止等待。\n\n"
+                "这通常是问题太重、模型在做很长的推理。**下一步：**\n"
+                "1. 把问题拆小一点（比如只问一个服务、缩小时间范围）再发；\n"
+                "2. 或在输入框上方换一个模型（Claude Sonnet 5 通常更快出字）后重试；\n"
+                "3. 若是要做长时间的排查，打开「深度调查」开关 —— 那条路本来就是为长任务设计的。\n"
+                if _zh_err else
+                f"\n\n---\n⏳ The model returned nothing within {_mins} minutes, so this turn "
+                "stopped waiting.\n\n"
+                "That usually means the question is heavy and the model is doing a long "
+                "reasoning pass. **Next steps:**\n"
+                "1. Narrow the question (one service, a shorter time range) and send it again;\n"
+                "2. Or switch models above the input box (Claude Sonnet 5 usually starts "
+                "streaming sooner) and retry;\n"
+                "3. For genuinely long investigations, turn on the Deep investigation toggle — "
+                "that path is built for long-running work.\n"
+            )
+        else:
+            _msg = (
+                f"\n\n---\n⚠️ 模型调用失败（`{_what}`），本轮未能生成回答。\n\n"
+                "**下一步：**\n"
+                "1. 直接再发一次 —— 这类错误多为模型服务端的临时故障，重试通常就好；\n"
+                "2. 若连续失败，在输入框上方切换到**另一个模型**（如 Claude Sonnet 5）后重试。\n"
+                if _zh_err else
+                f"\n\n---\n⚠️ The model call failed (`{_what}`), so this turn produced no answer.\n\n"
+                "**Next steps:**\n"
+                "1. Send the message again — this class of error is usually a transient "
+                "model-service fault and a retry succeeds;\n"
+                "2. If it keeps failing, switch to a different model (e.g. Claude Sonnet 5) "
+                "above the input box and retry.\n"
+            )
         yield {"event": {"contentBlockDelta": {"delta": {"text": _msg}, "contentBlockIndex": 0}}}
     # 流结束：把清洗器里暂存的尾巴（确认非标记的部分）补发出去
     _tail = _scrubber.flush()

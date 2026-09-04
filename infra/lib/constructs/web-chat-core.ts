@@ -25,6 +25,8 @@ import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as cr from "aws-cdk-lib/custom-resources";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as cognito from "aws-cdk-lib/aws-cognito";
+import * as events from "aws-cdk-lib/aws-events";
+import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as path from "path";
 import * as fs from "fs";
 
@@ -57,6 +59,25 @@ export interface WebChatCoreProps {
    * 「深度调查（直连）」把 HTML 报告落到 dataBucket 的 reports/ 前缀后，用它拼**不过期**的链接。
    * 缺省时直连路径只是少一个报告链接（摘要仍在聊天里），不报错。 */
   reportsCdnDomain?: string;
+
+  /**
+   * 客户 CUR 数据源 —— 客户自建 cost-agent MCP 的 Lambda Function URL（`AuthType=AWS_IAM`）。
+   * 缺省时读 `-c costAgentMcpUrl=...`。
+   *
+   * **可选数据源**：空 = 本部署没有这个能力，不是错误。此时 FinOps 页那 4 个 CUR sheet 由
+   * `config/capabilities.json` 的 `requiresEnv` 直接从 `/capabilities` 里摘掉（前端不渲染
+   * 死入口），聊天里成本问题走 CE → aws-api 兜底（见 core/cost_agent_mcp.py 的降级链）。
+   */
+  costAgentMcpUrl?: string;
+
+  /**
+   * 上面那个 Lambda 的**函数 ARN**。缺省时读 `-c costAgentFunctionArn=...`。
+   *
+   * 为什么要单独给：Function URL 里没有函数 ARN（URL 是 `https://<id>.lambda-url.<region>.on.aws`，
+   * 拼不出 `arn:aws:lambda:...:function:<name>`），而 `lambda:InvokeFunctionUrl` 必须按资源授权。
+   * 给了 URL 不给 ARN 会在 synth 期直接失败 —— 否则症状是部署成功、4 个 sheet 全 403。
+   */
+  costAgentFunctionArn?: string;
 
   /**
    * AgentCore Runtime ARN。缺省时读 `-c agentRuntimeArn=...`（CDK / setup.sh 路径：agent 由
@@ -106,6 +127,19 @@ export interface WebChatCoreProps {
    * 里 BFF 那一份「Lambda 自建 log group 会残留」（实测：一次完整删栈后账号里剩下的孤儿
    * 恰好全是 log group）。
    */
+  /**
+   * 巡检专用 Agent Space ID（NotiOpsBackendStack 的 inspectionAgentSpaceId）。
+   *
+   * 🔴 与 `agentSpaceId`（排障）是**两个不同的 space**，刻意拆开的
+   * （见 notiops-backend-stack.ts 的 InspectionAgentSpace 注释）。
+   *
+   * BFF 用它做一件事：告诉管理页「跨账号巡检要把成员账号加进**哪个** space
+   * 作为 monitor account」。前端 SHALL NOT 硬编码这个 id —— 每次重建栈它都会变，
+   * 而写死的后果是界面上引导客户去一个不存在的 space，且没有任何报错。
+   */
+  inspectionAgentSpaceId?: string;
+  /** 巡检 space 的**名字**（`notiops-inspection-<账号>`）。控制台里按名字找比按 id 快。 */
+  inspectionAgentSpaceName?: string;
   staticTemplate?: boolean;
 }
 
@@ -164,6 +198,25 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   // 部署后把 ARN 通过 -c agentRuntimeArn=... 传进来；为空则 BFF 回退到 echo。
   const agentRuntimeArn = props.agentRuntimeArn || (scope.node.tryGetContext("agentRuntimeArn") as string) || "";
 
+  // ─── 客户 CUR 数据源（可选）───
+  // 末尾斜杠统一去掉：BFF 侧拼 `${url}/mcp`，双斜杠会 404（与 cur_dashboard.mjs 同样处理，
+  // 两边都做是因为客户可能只改一边的值）。
+  const costAgentMcpUrl = (props.costAgentMcpUrl || (scope.node.tryGetContext("costAgentMcpUrl") as string) || "")
+    .trim().replace(/\/$/, "");
+  const costAgentFunctionArn = (props.costAgentFunctionArn
+    || (scope.node.tryGetContext("costAgentFunctionArn") as string) || "").trim();
+  // 给了 URL 却没给函数 ARN → synth 期就停。放过去的代价是"部署全绿、4 个 sheet 全 403"，
+  // 而 403 的根因（缺 lambda:InvokeFunctionUrl）在前端只表现为"数据源暂时不可用"。
+  // 静态模板里两个值都是部署期 token（成对由 CFN 参数传入），synth 期无从判断 → 跳过。
+  if (costAgentMcpUrl && !costAgentFunctionArn && !cdk.Token.isUnresolved(costAgentMcpUrl)) {
+    throw new Error(
+      "costAgentMcpUrl is set but costAgentFunctionArn is missing. The Function URL does not "
+      + "contain the function ARN, and lambda:InvokeFunctionUrl must be granted per resource. "
+      + "Pass -c costAgentFunctionArn=arn:aws:lambda:<region>:<account>:function:<name> as well "
+      + "(see docs/DEPLOYMENT.md section 14).",
+    );
+  }
+
   // ─── Web Chat BFF：streaming Lambda + Function URL ───
   // node_modules 随 asset 一起打包（含 bedrock-agentcore 客户端，不在 Lambda
   // 运行时预装集）。部署前需在 bff/web-chat 跑过 `npm install --omit=dev`
@@ -188,6 +241,33 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       // 多账号：config 表名（复用 notiops-config）+ 跨账号角色名 + 单账号锁定
       CONFIG_TABLE: "notiops-config",
       NOTIOPS_CROSS_ACCOUNT_ROLE: orgSwitch(`notiops-idle-detection-role-${stack.account}`, "notiops-idle-detection-role"),
+      /* 部署账号 ID —— **恒有值，与 orgMode 无关**。
+         与下面 `LOCKED_ACCOUNT_ID` 是两件事：那个是**闸门**（解锁时留空），
+         这个是**身份**（永远要知道「我是谁」）。
+
+         🔴 两个 BFF 模块直接读它，其中一个**没有兜底**：
+
+           member_accounts.mjs:988   `const SELF_ACCOUNT = (DEPLOY_ACCOUNT_ID
+                                      || LOCKED_ACCOUNT_ID || "")` —— 模块级
+                                      常量，没有 STS 兜底。org 模式下
+                                      LOCKED_ACCOUNT_ID **就是空串**，所以少了
+                                      这个键 SELF_ACCOUNT 直接恒空。
+           devops_agent_skills.mjs   `selfAccount()` 有 STS 兜底，退化成每个
+                                      冷启动多一次 GetCallerIdentity。
+
+         空掉的后果不是报错而是**走错分支**：`id === SELF_ACCOUNT` 恒不成立，
+         于是传部署账号自己的 ID 也被当成跨账号目标 —— 去 `da#<部署账号>` 取
+         `trigger_role_arn` 然后 assume 自己、还带 ExternalId，而那个角色的
+         信任策略里未必有 ExternalId 条件。表现是 org 模式下「从 UI 选『本账号』
+         发布 skill」直接失败。
+
+         ⚠️ 2026-09-03 合并 main 时**丢过一次**：这个键原来在
+            `web-chat-stack.ts:115`（`DEPLOY_ACCOUNT_ID: this.account`），是
+            我方分支加的、main 侧从来没有；把巡检那 5 个 env var 迁进这个文件
+            时漏了它，靠 `cdk diff` 的 `[-] Removed: .DEPLOY_ACCOUNT_ID` 才发现。
+            合成模板里两条路径都要有它（standalone 上 `stack.account` 落成
+            `AWS::AccountId` 伪参数，同样正确）。 */
+      DEPLOY_ACCOUNT_ID: stack.account,
       // 多账号：解锁，多账号选择器可切换到成员账号。
       // 单账号：锁定部署账号，跨账号 disabled（可在 onboard 后放开）。
       LOCKED_ACCOUNT_ID: orgSwitch("", stack.account),
@@ -209,7 +289,76 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       // 「深度调查（直连）」报告链接：报告落 SKILLS_BUCKET 的 reports/ 前缀，用此 CDN 域名拼
       // 直读链接（CloudFront + OAC，**不过期**）。空值 = 直连路径不给报告链接（不报错）。
       REPORTS_CDN_DOMAIN: props.reportsCdnDomain ?? "",
+      // 客户 CUR 数据源（cost-agent MCP 的 Function URL）。空 = 4 个 CUR sheet 被能力清单
+      // （requiresEnv）摘掉，其余 FinOps 仪表盘与聊天不受影响；挂了则只有这 4 个 sheet 显示
+      // 「暂时不可用」（bff/web-chat/cur_dashboard.mjs 的 soft 边界），绝不拖垮别的功能。
+      COST_AGENT_MCP_URL: costAgentMcpUrl,
+      // Admin「集成 IM」→ 抽屉里直接显示飞书 webhook 地址（省掉客户去翻 CloudFormation
+      // Outputs 那一趟）。这里给的是 **IM 入口 HTTP API 的名字前缀**，不是地址本身 ——
+      // 地址由 BFF 运行时按名字查（apigatewayv2:GetApis，见 bff/web-chat/feishu_config.mjs）。
+      //
+      // 为什么不直接把地址塞进 env：
+      //   · 方式 B 的那个 HTTP API 在**另一个栈**（ImStack）里。跨栈引用会给主栈加一条 CFN
+      //     Export，`--exclusively` 就再也隔离不了 WebChatStack（同一个坑见 bin/app.ts 里
+      //     reportsCdnDomain 那段注释）；将来撤掉 IM 时那条 Export 还会卡住栈更新。
+      //   · 方式 A 的那个 HTTP API 挂在部署期条件 InstallFeishu 上，把它的属性塞进**无条件**
+      //     的 BFF env 就成了"无条件资源引用条件资源"，还得再套一层 Fn::If 才合法。
+      // 按名字查两条路都成立，也与 feishu_config.mjs 按字面名读 secret 的做法一致
+      //（那里同样是刻意不做跨栈 import）。
+      //
+      // ⚠️ 这个前缀必须和 im-core.ts 建 HTTP API 时的 `props.fnName(...)` 拼出来的名字对得上
+      // （方式 B `notiops-im-ingress-feishu`、方式 A `<栈名>-im-ingress-feishu`）。对不上的
+      // 症状是**抽屉里不显示地址、退回"去 Outputs 里找"，不报错** —— 所以
+      // tests/test_im_webhook_url_prefix.py 直接拿两边合成出来的名字对齐，改名字那条会先挂。
+      IM_INGRESS_API_NAME_PREFIX: props.staticTemplate
+        ? `${cdk.Aws.STACK_NAME}-im-ingress-`
+        : "notiops-im-ingress-",
       // AWS_REGION 由 Lambda 运行时自动注入
+
+      /* ── 资源巡检（2026-09-03 从 web-chat-stack.ts 迁来）───────────────
+         main 的 `d7de88e` 把 Web Chat 的资源定义抽进了这个文件，而巡检那批
+         改动当时加在**旧位置**（web-chat-stack.ts），所以这里是搬过来的。
+
+         🔴 **standalone 单栈（一键部署）上，巡检后端整体不存在。**
+            实测 `cdk synth --app 'npx ts-node bin/standalone.ts'`：没有
+            `notiops-inspection` 表、没有 scheduler/executor Lambda、没有
+            executor 的 SQS 入口。那些资源全在 NotiOpsBackendStack 里，
+            而 standalone 刻意只装「chat UI + BFF + agent」。
+
+            于是下面这三个环境变量和后面那 4 条 IAM 在 standalone 上
+            **指向不存在的资源**。IAM 本身无害（授权一个不存在的 ARN 不
+            产生任何权限），但**别把它读成「standalone 支持巡检」**。
+
+         ⚠️ 已知缺口，不在这里修：`PRESET_ROLES` 的 `role:finops` /
+            `role:support` / `role:viewer` 都含 `nav:inspection:*`
+            （authz.mjs），而 capability 树的裁剪只看角色与
+            `getDisabledModules()`，**不看部署拓扑**（visibleTree 里没有
+            任何 env 判据）。所以 standalone 上这些角色的用户会看到
+            「资源巡检」tab，点进去是 `ddb_error` 加载失败面板 ——
+            HTTP 200、不是 403，也不会自动隐藏。
+            现成的收口手段是管理页的**模块开关**（`nav:inspection` 是
+            level=tab 且非 alwaysOn/adminOnly，admin.mjs 的
+            `apiGetModules` 已把它列为可关）—— 需要人手关一次。
+            要做成自动的，得给 visibleTree 引入可用性判据，且必须与
+            `authorize()` 同步改（authz.mjs 开头那条不漂移的不变量），
+            那是一个独立改动，不该混在这次 merge 里。 */
+      // 巡检 space —— 管理页用它引导「把成员账号加为 monitor account」。
+      INSPECT_AGENT_SPACE_ID: props.inspectionAgentSpaceId ?? "",
+      INSPECT_AGENT_SPACE_NAME: props.inspectionAgentSpaceName ?? "",
+      INSPECTION_TABLE: "notiops-inspection",
+      // 「立即巡检」按钮要 invoke 它。
+      // 🔴 原来 CDK **压根没注入**这一项，BFF 靠 `inspection.mjs` 里一个
+      //    硬编码字符串兜底（`process.env.INSPECTION_SCHEDULER_FUNCTION
+      //    || "notiops-inspection-scheduler"`）。而这个函数名有三处互不引用
+      //    的字面量：BFF 的兜底串、`notiops-backend-stack.ts` 的 functionName、
+      //    以及下面那条 IAM resource ARN。改任一处，「立即巡检」会返回
+      //    `invoke_failed`（AccessDenied 或 ResourceNotFoundException）。
+      // ⚠️ 与第 237 行那条 IAM ARN 里的名字**必须一致** —— 那条也写死了同一
+      //    个串。这里注入之后至少 BFF 侧只剩一个来源。
+      INSPECTION_SCHEDULER_FUNCTION: "notiops-inspection-scheduler",
+      // 按需判读（「深入分析」）直接 invoke 它。硬编码同上一行的惯例 ——
+      // 跨栈 Ref 会在两个栈间建立部署顺序依赖，改 BFF 不该被迫动后端栈。
+      INSPECTION_EXECUTOR_FUNCTION: "notiops-inspection-executor",
     },
     // 两种模式给的是**同一个保留期**，区别只在谁来设：CDK 路径用 logRetention（会带出一个
     // Custom::LogRetention Lambda），静态模板路径用显式 LogGroup 资源。名字交给 CFN 生成 ——
@@ -338,6 +487,20 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
     new iam.PolicyStatement({
       actions: ["secretsmanager:CreateSecret"],
       resources: [`arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:notiops/im-bot-feishu*`],
+    }),
+  );
+
+  // Admin「集成 IM」抽屉里显示飞书 webhook 地址：按名字查 IM 入口 HTTP API
+  //（IM_INGRESS_API_NAME_PREFIX，见上面 env 那段）。
+  // `apigateway:GET` 是 API Gateway 控制面的**只读**动作（对应 GetApis），改不了任何东西。
+  // ⚠️ 资源 ARN 的形状是 `arn:aws:apigateway:<region>::/apis` —— **账号段是空的**，
+  // 这是 API Gateway 规定的写法；照别处习惯填上账号会让这条永远匹配不上（症状是抽屉里
+  // 不显示地址，而不是报错）。列 API 这个动作本身不支持按单个 API 限定，只能到 /apis。
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      sid: "ImWebhookUrlLookupReadOnly",
+      actions: ["apigateway:GET"],
+      resources: [`arn:aws:apigateway:${stack.region}::/apis`],
     }),
   );
 
@@ -641,6 +804,53 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
     );
   }
 
+  // ─── 客户 CUR 仪表盘：MCP 调用授权 + 当天缓存 + 每日预热 ───────────────────────
+  // 三件事都只在**配了数据源**时才建（方式 B 不传 `-c costAgentMcpUrl` 时模板逐字节不变）。
+  // 静态模板里 URL 是部署期参数（token，恒真）→ 资源恒建；参数留空时预热每天空转一次
+  // （BFF 见 URL 为空立即返回 not-configured，不发任何 AWS 调用），代价可忽略，
+  // 换来的是"客户事后填上参数就能用，不必再动基础设施"。
+  if (costAgentMcpUrl) {
+    // ① 调 cost-agent MCP 的 Function URL。
+    // ⚠️ 实测坑：这条 identity policy **不能**带 `lambda:FunctionUrlAuthType` Condition ——
+    // 带上会被拒（403），而 403 在前端只表现为"数据源暂时不可用"。目标 Lambda 侧还需要
+    // 一条 resource policy 允许本角色（见 docs/DEPLOYMENT.md §14.3，那一步在客户自己的
+    // cost-agent 部署里，不属于本栈）。
+    bff.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "InvokeCostAgentMcp",
+        actions: ["lambda:InvokeFunctionUrl"],
+        resources: [costAgentFunctionArn],
+      }),
+    );
+    // ② 大 payload 的当天缓存落共享数据桶的 cur-dash-cache/ 前缀
+    //（cube/es/sp 单条超 DynamoDB 400KB 上限；credit 仍走 notiops-web-chat 表）。
+    if (props.skillsBucketName) {
+      bff.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: "CurDashCache",
+          actions: ["s3:GetObject", "s3:PutObject"],
+          resources: [`arn:aws:s3:::${props.skillsBucketName}/cur-dash-cache/*`],
+        }),
+      );
+    }
+    // ③ 每日预热：UTC 22:00 = 北京 6:00。缓存 key 的日期基准是 UTC+8（见
+    //    cur_dashboard.mjs 的 day()），两者必须配套 —— 按 UTC 算 key 的话北京 8:00 之后
+    //    用户请求会落到"新一天"，预热的缓存全 miss（症状：每天首开仍等 1-5 分钟）。
+    //    事件体里那个 source 是 BFF 在鉴权**之前**分流的固定字面量（index.mjs 开头），
+    //    外部 HTTP 请求带不进来。
+    new events.Rule(scope, "CurDashWarmup", {
+      // 方式 A 不给物理名：同账号里可能已有 setup.sh 部署的同名规则，撞名 = 整栈回滚。
+      ruleName: props.staticTemplate ? undefined : "notiops-curdash-warmup",
+      description: "NotiOps: pre-warm the customer CUR dashboard cache (daily, 06:00 UTC+8)",
+      schedule: events.Schedule.expression("cron(0 22 * * ? *)"),
+      targets: [
+        new targets.LambdaFunction(bff, {
+          event: events.RuleTargetInput.fromObject({ source: "notiops.curdash.warmup" }),
+        }),
+      ],
+    });
+  }
+
   // BFF 执行用户已确认的 Support 写操作（创建/回复/关闭 case）。Support API 是
   // 全局服务，resource 只能用 *。写操作仅在用户 UI 确认后由 /actions/execute 触发。
   // NOTE: AWS Support API actions do NOT support resource-level permissions — IAM
@@ -695,6 +905,371 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
     new iam.PolicyStatement({
       actions: ["securityhub:GetFindings", "securityhub:GetInsights"],
       resources: ["*"],
+    }),
+  );
+
+  /* ── 资源巡检的 4 条 IAM（2026-09-03 从 web-chat-stack.ts 迁来）──────
+     ⚠️ 在 standalone 单栈上这几条指向不存在的资源 —— 原因与影响见上面
+        `INSPECTION_TABLE` 那一段。别据此认为一键部署那条路支持巡检。
+
+     ⚠️ BFF 角色的内联策略贴着 IAM 的 **10240 字节**上限，CDK 会自动把装不下的
+        statement 挪进**溢出 managed policy**（`WebChatBffServiceRoleOverflowPolicy1`）。
+        哪几条落进溢出**不固定** —— 取决于 CDK 那一次的排布，加一条无关的
+        statement 就可能换一批。实测（`cdk synth WebChatStack`，org 模式）：
+
+          2026-09-03 第一轮合并后   内联 35 条 /  9153 字节，溢出 6 条
+          2026-09-03 第二轮合并后   内联 41 条 / 10023 字节，溢出 1 条
+                                    ← 余量只剩 217 字节
+
+        🔴 所以核对模板时**不能只 grep 内联那条策略**就断定某个 Sid 没进去
+           （第一轮已经这样误判过一次：4 条巡检 Sid 明明在溢出策略里，
+            却因为只看了 `...DefaultPolicy` 而以为丢了）。判据要么按角色的
+           `ManagedPolicyArns` 把两处并起来看，要么直接查实机
+           （`iam get-role-policy` + `iam get-policy-version`）。
+
+        ⚠️ 余量这么小意味着**下一条 statement 大概率触发重新排布** ——
+           golden fixture 会跟着变一大片，那属于预期，不是逻辑变化；
+           但要逐条确认差异只是位置移动、没有动作或资源被删。 */
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      sid: "InspectionDashboardReadOnly",
+      actions: ["dynamodb:Query", "dynamodb:GetItem"],
+      resources: [
+        `arn:aws:dynamodb:${stack.region}:${stack.account}:table/notiops-inspection`,
+        `arn:aws:dynamodb:${stack.region}:${stack.account}:table/notiops-inspection/index/*`,
+      ],
+    }),
+  );
+
+  // 巡检**写入**：只有排除清单与定时配置两类。
+  //
+  // 🔴 DDB 的 IAM 无法按 PK 前缀细分（`dynamodb:LeadingKeys` 条件只对
+  // 带主键的请求生效，且需要把每个前缀枚举出来），所以这里的资源粒度
+  // 就是整张表。真正的边界在 **capabilities 的 `action:inspection:*`** ——
+  // BFF 只暴露那三个写端点，没有「写任意 PK」的路径。
+  //
+  // ⚠️ 之所以单独一条 statement 而不是把动作并进上面那条：分开写让
+  // 「看板是只读的」这件事在 IAM 里仍然看得见 —— 上面那条被审计时
+  // 一眼就能确认它没有写权限，而不是在一个混合动作列表里逐个数。
+  //
+  // 🔴 **`DeleteItem` 是 2026-09-01 才加的，之前刻意不给。** 改的理由与
+  // 原来不给的理由要一起读，否则下一个人会把它删回去：
+  //
+  // ```
+  // 原来的理由   R1.4「到期条目保留记录但不生效」是防「白名单越积越多
+  //              没人敢删」的机制，靠的是让它们**可见**。给了删除权限，
+  //              UI 上迟早出现「清理已过期」按钮，把审计痕迹一起清掉。
+  //
+  // 为什么改     那个机制防的是「攒着不管」，而客户遇到的是**误操作**：
+  //              手滑排除一台生产库之后**没有任何位置能撤销**，只能等
+  //              30 天过期 —— 而那 30 天里「没有告警」会被读成
+  //              「一切正常」，同样没有运行时信号。
+  //              客户原话：「也没有任何位置让我取消移除。如果用户误操作，
+  //              岂不是要等待 30 天？」
+  //
+  // 怎么保住审计  `deleteExclusion` 用 `ReturnValues: "ALL_OLD"` 把被删的
+  //              整行（账号 / 资源 / 理由 / 创建人 / 到期日）打进
+  //              CloudWatch Logs。「谁在什么时候删了哪条」没丢。
+  //
+  // 仍然不做      **没有**批量删除、没有「清理已过期」按钮。UI 上只有
+  //              逐行的「挪出白名单」+ 二次确认 —— 那个按钮一次只能
+  //              撤销一条（整账号排除是两条，因为它本来就是一个动作
+  //              写出来的两条）。原来担心的正是批量那一步。
+  // ```
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      sid: "InspectionScopeAndScheduleWrite",
+      actions: [
+        "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem",
+      ],
+      resources: [
+        `arn:aws:dynamodb:${stack.region}:${stack.account}:table/notiops-inspection`,
+      ],
+    }),
+  );
+
+  // 手动触发一轮巡检（`action:inspection:run`）。BFF 只是**转发**：
+  // 额度检查、锁抢占、fan-out 全在 scheduler 里，BFF 不重实现任何一条。
+  //
+  // 🔴 单独一条 statement 且**只到 scheduler 这一个函数**。
+  // 巡检有四个 Lambda，给通配 `notiops-inspection-*` 会让 BFF 能直接
+  // 调 executor（绕过锁 → 同一天可以并发跑多轮 → DA 额度翻倍消耗，
+  // 而且不报错）。executor 的正当入口只有 SQS。
+  //
+  // ⚠️ 硬编码函数名，与上面表名同一惯例：跨栈 Ref 会在 WebChatStack 与
+  // NotiOpsBackendStack 之间建立部署顺序依赖，而改 BFF 时不该被迫动后端栈。
+  // 不给这条的后果：手动触发按钮点下去 AccessDeniedException，
+  // 前端只看到「触发失败」。
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      sid: "InspectionManualRunInvoke",
+      actions: ["lambda:InvokeFunction"],
+      resources: [
+        `arn:aws:lambda:${stack.region}:${stack.account}:function:notiops-inspection-scheduler`,
+        // 按需判读（详情面板的「深入分析」）：**直接 invoke executor**，
+        // 不经 scheduler 转发。
+        //
+        // 🔴 为什么直接调而不绕 scheduler：那条路是「给一条 finding 派一次
+        //    DA 判读」，与调度无关（不抢锁、不写 run 行、不占当天槽位）。
+        //    经 scheduler 转发只是为了省这一条 policy，代价是让一个纯粹的
+        //    调度组件多一个与调度无关的分支 —— 而下一个读它的人会以为
+        //    「手动判读也参与调度」。
+        //
+        // ⚠️ 这是**同步** invoke（`RequestResponse`）：整条是 1 次 GetItem
+        //    + 1 次 query + 1 次 describe + 1 次 CreateBacklogTask，远在
+        //    Function URL 的 30 秒上限之内。同步的价值是能把「已经派过了」
+        //    「缺巡检 space id」这类可操作的原因直接回给客户，
+        //    而异步只能回一句「已提交」然后让人自己去猜为什么没结果。
+        `arn:aws:lambda:${stack.region}:${stack.account}:function:notiops-inspection-executor`,
+      ],
+    }),
+  );
+
+  // 资源清单（`nav:inspection:resources`）：列举账号下的 RDS / ElastiCache /
+  // EC2，供排除清单**勾选**而不是手填 resource_id。
+  //
+  // ⚠️ 全部是 Describe/List，无写动作。这些 API 不支持资源级 ARN 限定
+  // （`rds:DescribeDBInstances` 等的 Resource 只能是 `*`），所以粒度就在
+  // 动作本身 —— 这也是为什么它与上面的写权限严格分开成一条。
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      sid: "InspectionResourceInventoryReadOnly",
+      actions: [
+        "rds:DescribeDBInstances",
+        "rds:DescribeDBClusters",
+        "elasticache:DescribeCacheClusters",
+        "elasticache:DescribeReplicationGroups",
+        // 🔴 **没有 ec2:DescribeInstances。** 巡检只覆盖 RDS 与
+        //    ElastiCache（见 inspection/pipeline.py::load_resources）。
+        //    列出 EC2 会让人勾出一条「语义合法但永不匹配」的排除记录：
+        //    UI 说已排除、巡检压根不看它 —— 比手填打错更难发现，
+        //    因为界面反馈是成功的。
+      ],
+      resources: ["*"],
+    }),
+  );
+
+  // org 模式：Admin「账户」页一键接入 —— StackSets 下发成员账号资源 + Organizations 账号列表
+  if (orgMode) {
+    const onboardingStackSetName = "notiops-member-onboarding";
+    bff.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "OrgOnboardStackSets",
+        actions: [
+          "cloudformation:CreateStackInstances",
+          "cloudformation:DeleteStackInstances",
+          "cloudformation:DescribeStackSet",
+          "cloudformation:DescribeStackSetOperation",
+          "cloudformation:ListStackInstances",
+        ],
+        resources: [
+          `arn:aws:cloudformation:${stack.region}:${stack.account}:stackset/${onboardingStackSetName}:*`,
+          `arn:aws:cloudformation:*:*:stackset-target/${onboardingStackSetName}:*`,
+          `arn:aws:cloudformation:${stack.region}:${stack.account}:stackset/notiops-member-devops-agent:*`,
+          `arn:aws:cloudformation:*:*:stackset-target/notiops-member-devops-agent:*`,
+          "arn:aws:cloudformation:*::type/resource/*",
+        ],
+      }),
+    );
+    bff.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "OrgOnboardListAccounts",
+        actions: ["organizations:ListAccounts", "organizations:ListRoots", "organizations:DescribeOrganization", "organizations:ListParents", "organizations:DescribeOrganizationalUnit"],
+        resources: ["*"],
+      }),
+    );
+  }
+
+  // ④ SecOps 仪表盘（部署账号自身视角；成员账号经 AssumeRole 走成员角色权限）
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      sid: "SecOpsDashboardsReadOnly",
+      actions: [
+        "guardduty:ListDetectors", "guardduty:GetFindingsStatistics",
+        "guardduty:ListFindings", "guardduty:GetFindings",
+        "backup:ListBackupJobs", "backup:ListBackupVaults", "backup:ListProtectedResources",
+      ],
+      resources: ["*"],
+    }),
+  );
+
+  // 多账号：BFF 可 AssumeRole 进目标账号的 notiops 跨账号角色（执行写操作）
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      actions: ["sts:AssumeRole"],
+      // 只匹配两种合法形态，避免 role* 松散通配误匹配 ...roleFOO：
+      resources: [
+        "arn:aws:iam::*:role/notiops-idle-detection-role", // 无后缀=部署账号自身/遗留手动接入
+        "arn:aws:iam::*:role/notiops-idle-detection-role-*", // 带账号后缀=org 模式成员账号
+        // 跨 payer DevOps Agent 接入：testDaConnection AssumeRole 进成员账号的触发角色
+        // （member-devops-agent.yaml 建的 notiops-agent-trigger-<acct>-m<sys>）。
+        "arn:aws:iam::*:role/notiops-agent-trigger-*",
+      ],
+    }),
+  );
+
+  // BFF 需要调 AgentCore Runtime
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      actions: ["bedrock-agentcore:InvokeAgentRuntime"],
+      // ARN 在部署后才有；用通配限定到本账户的 runtime（避免越权到别处）
+      resources: [`arn:aws:bedrock-agentcore:${stack.region}:${stack.account}:runtime/*`],
+    }),
+  );
+
+  // Admin「通知」板块：读写飞书机器人配置（Secrets Manager 单 secret）。
+  // 按**字面名**限定到 notiops/im-bot-feishu*（Secrets Manager ARN 带随机后缀故加 *），
+  // 不做跨栈 CFN import —— 老管理前端未来 sunset 时本栈零依赖、零影响。
+  // CreateSecret 用于 secret 尚不存在的首次配置场景（如未部署过 IM bot 栈）。
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      actions: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:UpdateSecret"],
+      resources: [`arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:notiops/im-bot-feishu*`],
+    }),
+  );
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      actions: ["secretsmanager:CreateSecret"],
+      resources: [`arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:notiops/im-bot-feishu*`],
+    }),
+  );
+
+  // BFF 读 AWS Health Dashboard（通知主题重点区块，实时查）。Health API 只读，
+  // 不支持资源级限定（只能 *）；需账号有 Business+/Enterprise Support 计划。
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      actions: ["health:DescribeEvents", "health:DescribeEventDetails", "health:DescribeAffectedEntities"],
+      resources: ["*"],
+    }),
+  );
+
+  // ─── FinOps 仪表盘（§13 CUR + Athena FinOps 数据源）───
+  // 1) AWS Budgets：预算 vs 实际支出 + AWS 侧预测超支，实时查，不落库
+  //    （budgets:ViewBudget 不支持资源级限定，只能 *；账号级只读）。
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      actions: ["budgets:ViewBudget", "budgets:DescribeBudgets"],
+      resources: ["*"],
+    }),
+  );
+  // 1b) Cost Explorer：Spend Overview / Marketplace / Support Fees / MoM Movers
+  //     四张卡片的数据源（固定查询模板，见 bff/web-chat/cost_explorer.mjs）。
+  //     ce:* 只读 API 不支持资源级限定。
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      actions: [
+        "ce:GetCostAndUsage", "ce:GetCostAndUsageComparisons", "ce:GetCostComparisonDrivers",
+        "ce:GetCostForecast", "ce:GetAnomalies", "ce:GetAnomalyMonitors", "ce:GetAnomalySubscriptions",
+        "ce:GetReservationCoverage", "ce:GetReservationUtilization",
+        "ce:GetSavingsPlansCoverage", "ce:GetSavingsPlansUtilization",
+        "ce:GetDimensionValues", "ce:GetTags", "ce:GetCostCategories",
+      ],
+      resources: ["*"],
+    }),
+  );
+  // Cost Optimization Hub（Potential Savings 卡）——只读。COH 是全局服务(us-east-1)，
+  // 需账号先开通（enrollment）；未开通时 API 返回空，前端优雅降级为"未开通"。
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      actions: [
+        "cost-optimization-hub:ListEnrollmentStatuses",
+        "cost-optimization-hub:GetRecommendation",
+        "cost-optimization-hub:ListRecommendations",
+        "cost-optimization-hub:ListRecommendationSummaries",
+      ],
+      resources: ["*"],
+    }),
+  );
+  // 1c) 跨账号成本查询：<member-account> 是 Organization 成员账号，真实历史成本/预算
+  //     大多记在 payer 账号上（Cost Explorer 默认只返回调用者所在账号自身的
+  //     视角，不会自动汇总到 payer 层级）。复用已有的
+  //     DevOpsAgentRole-AgentSpace-notiOps-<account> （DevOps Agent 业务账号
+  //     onboarding 时在 payer 账号创建，已挂 AIDevOpsAgentAccessPolicy，内含
+  //     budgets:*／ce:*／cur:* 只读权限）——不新建角色，只需让 BFF 能 AssumeRole
+  //     过去。Trust Policy 需在 payer 账号侧手动追加信任本 BFF Role（见
+  // 1c) 跨账号成本查询：<member-account> 是 Organization 成员账号，真实历史成本/预算
+  //     大多记在 payer 账号上（Cost Explorer 默认只返回调用者所在账号自身的
+  //     视角，不会自动汇总到 payer 层级）。不再硬编码目标角色 ARN——BFF 动态
+  //     调 devops-agent:ListAssociations 读 Agent Space 的关联账号列表，找到
+  //     其中的 Organization payer 账号，再 AssumeRole 过去查真实成本（见
+  //     bff/web-chat/devops_agent_accounts.mjs）。这两类权限缺一不可：
+  //       · devops-agent:ListAssociations —— 读本账号 Agent Space 的关联列表
+  //       · sts:AssumeRole —— 假设关联账号的 assumableRoleArn（各关联账号在
+  //         onboarding 时创建，例如 DevOpsAgentRole-AgentSpace-notiOps-<account>），
+  //         Resource 用 * 是因为角色 ARN 属于其它账号、CDK synth 时不可知；
+  //         真正的访问边界由对方账号 Trust Policy 决定（对方必须显式信任本
+  //         BFF Role 才能被 assume——见 docs/DEPLOYMENT.md §14 跨账号成本查询）。
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      // NOTE: SDK client-devops-agent 的 ListAssociations 在 IAM 里授权命名空间是
+      // aidevops:（与 resource ARN 的 arn:aws:aidevops:... 一致），不是 devops-agent:。
+      // 写成 devops-agent: 会 AccessDenied，拖垮 FinOps 仪表盘取数（500）。
+      //
+      // Asset API（skill 发布到本账号 Agent Space；见 bff/web-chat/devops_agent_skills.mjs）：
+      //   CreateAsset/UpdateAsset/DeleteAsset/ListAsset(s) —— 把「文档型 skill」zip 装进
+      //   Agent Space，激活由 DevOps Agent 自行判断（read-only 边界不受影响）。跨 payer
+      //   成员账号的上传走 AssumeRole 进 notiops-agent-trigger-* 触发角色，权限在成员
+      //   模板 member-devops-agent.yaml 里授予，不在此 BFF Role。
+      // 「深度调查（直连）」（bff/web-chat/devops_investigate.mjs）：BFF 不经 agent runtime
+      // 直接发起并跟踪 DevOps Agent 调查 —— CreateBacklogTask 建 INVESTIGATION 任务、
+      // GetBacklogTask 判终态、ListJournalRecords 拉分析过程与最终摘要、ListRecommendations
+      // 备缓解建议。这是老「深度调查」链路里 core/devops_agent.py 用的同一组 API（0 token），
+      // 只是搬到了 BFF 侧执行。跨 payer 成员账号仍走 AssumeRole（权限在成员模板里）。
+      // 巡检跨账号②（bff/web-chat/member_accounts.mjs::associateInspectionSource）：
+      //   AssociateService 把成员账号作为「辅助云来源」(sourceAws/source) 挂到
+      //   **本账号**的巡检 Agent Space 上；ValidateAwsAssociations 让服务端真去
+      //   assume 一次并把状态落成 valid/invalid。
+      //   🔴 这两个动作原来只能让客户进控制台走「添加辅助云来源」向导（7 步，
+      //      其中 6 步是手抄信任策略建 IAM 角色）。角色那半由成员模板
+      //      member-devops-agent.yaml 建，剩下这半是**本账号**的 API —— 所以
+      //      能由 BFF 代做，客户一个按钮。
+      //   ⚠️ 只作用于本账号的 space（resources 已限定 stack.account），
+      //      不能用来动别人账号的 space。
+      actions: [
+        "aidevops:ListAssociations",
+        "aidevops:AssociateService", "aidevops:ValidateAwsAssociations",
+        "aidevops:CreateAsset", "aidevops:UpdateAsset",
+        "aidevops:DeleteAsset", "aidevops:ListAssets",
+        "aidevops:CreateBacklogTask", "aidevops:GetBacklogTask",
+        "aidevops:ListJournalRecords", "aidevops:ListRecommendations",
+      ],
+      resources: [`arn:aws:aidevops:${stack.region}:${stack.account}:agentspace/*`],
+    }),
+  );
+  // ─── AssociateService 的配套权限：iam:PassRole ───
+  //
+  // 🔴 少了它 `AssociateService` 直接 AccessDenied（2026-08-27 线上实测）：
+  //
+  //   User: …/notiops-web-chat-bff is not authorized to perform:
+  //   iam:PassRole on resource: arn:aws:iam::111122223333:role/*
+  //   because no identity-based policy allows the iam:PassRole action
+  //
+  // API Reference 对 `SourceAwsConfiguration.assumableRoleArn` 的原话：
+  //
+  //   To set this role ARN on AssociateService or UpdateAssociation, the caller
+  //   must have at least the iam:PassRole permission on
+  //   arn:aws:iam::<account-id>:role/* **in the caller's own account**, with the
+  //   condition iam:PassedToService set to aidevops.amazonaws.com.
+  //
+  // ⚠️ 资源是**调用方自己账号**的通配（不是被传的那个成员账号角色）——
+  //    这一条反直觉：我们传进去的 ARN 是 698 账号的角色，而 PassRole 检查打在
+  //    677 自己身上。文档明写是这个形状，线上报错也是这个形状。
+  //
+  // ⚠️ `iam:PassedToService` 条件**必须带**。没有它就是「这个角色能把本账号
+  //    任意角色传给任意服务」—— 那是一张很宽的授权。带上之后作用面收到
+  //    「只能传给 aidevops」，而 aidevops 拿到角色能做什么由那个角色自己的
+  //    权限决定（成员账号侧是 AIDevOpsAgentAccessPolicy，只读）。
+  //
+  // ⚠️ SDK 里 `SourceAwsConfiguration` 的描述有一句「passRole check on
+  //    'assumableRoleArn' is not supported」—— 那句与 API Reference 及线上
+  //    行为都不一致。信文档与实测，不信 SDK 注释。
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      actions: ["iam:PassRole"],
+      resources: [`arn:aws:iam::${stack.account}:role/*`],
+      conditions: {
+        StringEquals: { "iam:PassedToService": "aidevops.amazonaws.com" },
+      },
     }),
   );
 
@@ -913,9 +1488,14 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   });
 
   if (props.staticTemplate) {
-    // ─── Outputs（与下面 CDK 路径那份保持一致）───
+    // ─── Outputs ───
+    // ⚠️ 这份**故意**比下面 CDK 路径那份少一个 `ChatBffUrl`。方式A（一键 CFN）的 Outputs
+    // 是客户在控制台上唯一会读的东西，而 BFF Function URL 对客户零用处：前端自己从
+    // `config.json` 的 `chatApiBase` 读它（就是上面同一个 `fnUrl.url`），客户手点这个
+    // URL 只会拿到 403（AWS_IAM 授权，要 SigV4 签名）。多一行客户看不懂的 URL，就是
+    // 多一次「这个要我配到哪里？」的支持问询。方式B（setup.sh）留着它是因为
+    // `setup.sh` 的排障小节会打印它给运维用，那是内部受众。
     new cdk.CfnOutput(scope, "ChatUrl", { value: `https://${distribution.distributionDomainName}`, description: "Web Chat frontend URL" });
-    new cdk.CfnOutput(scope, "ChatBffUrl", { value: fnUrl.url, description: "Web Chat BFF Function URL (streaming)" });
     new cdk.CfnOutput(scope, "WebChatTableName", { value: table.tableName });
     return { table, bff, fnUrl, siteBucket, distribution, identityPool, rumIdentityPool, rumGuestRole, appMonitor, configJson };
   }

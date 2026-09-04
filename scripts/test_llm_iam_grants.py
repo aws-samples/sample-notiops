@@ -193,14 +193,14 @@ def test_global_cris_regionless_arn_is_granted() -> None:
 
 
 def test_key_consumers_can_read_the_secret() -> None:
-    """每个消费 Bedrock API Key 的执行角色都必须能读那个 Secret（task 3.4 / 4.5 / 6.2）。
+    """每个消费 Bedrock API Key 的执行角色都必须能读那个 Secret。
 
     失败模式是**静默的**，这正是需要源码级断言的原因：`get_bedrock_api_key()` 读 Secret 被拒
     时会记一条 warning 然后返回 None → 回退 IAM 角色 → 对话照常。于是「Admin 配了 Key 但
     Key 从不生效」，UI 上没有任何异常，日志也只有一行 warning。少给一个角色授权，就少一个
     端生效，而三端的表现完全一样。
 
-    只断言**读**：Key 的唯一写入方是 BFF（web-chat-stack），见 task 7.1 的收敛。
+    只断言**读**：Key 的唯一写入方是 BFF（web-chat-stack），见 的收敛。
     """
     print("test_key_consumers_can_read_the_secret")
     SECRET = "secret:notiops/bedrock-api-key"
@@ -230,7 +230,7 @@ def test_key_consumers_can_read_the_secret() -> None:
                f"silently fall back to IAM and the key will never take effect")
         _check(f"{label}: uses GetSecretValue", GET in src)
 
-    # 反向：runtime 与 ECS 角色**不得**持写权限（写入方只有 BFF，task 7.1）。
+    # 反向：runtime 与 ECS 角色**不得**持写权限（写入方只有 BFF）。
     for label, path in (("AgentCore runtime", os.path.join(
                             ROOT, "agent-build", "NotiOpsWebChat", "agentcore",
                             "cdk", "lib", "cdk-stack.ts")),
@@ -245,7 +245,7 @@ def test_key_consumers_can_read_the_secret() -> None:
 
 
 def test_config_table_has_pitr() -> None:
-    """notiops-config 必须开 PITR（task 6.6）。
+    """notiops-config 必须开 PITR。
 
     这张表现在是五个独立部署单元的配置真源。`RemovalPolicy.RETAIN` 只防栈删除时丢表，
     防不住一次写坏 —— 而模型目录的写入路径包含整份 PUT 与回滚。llmcfg#audit 里的变更前

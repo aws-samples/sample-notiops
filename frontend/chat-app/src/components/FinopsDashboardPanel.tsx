@@ -8,7 +8,7 @@ const CloseIcon = () => (
 );
 
 /**
- * FinOps dashboard 右侧停靠面板。复用 SourcesPanel/InvestigationPanel 的 .src-panel
+ * FinOps dashboard 右侧停靠面板。复用 SourcesPanel/ThinkingPanel 的 .src-panel
  * 停靠 + 可拖宽 + 可关机制（团队一致）。内部直接复用 FinopsDashboard 组件的
  * 「单 dashboard 面板」模式（传 dashboardId），零卡片代码重复。关闭只关面板。
  */

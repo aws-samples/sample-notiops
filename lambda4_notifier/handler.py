@@ -291,31 +291,25 @@ def _preregister_investigation(
 ) -> None:
     """create_investigation 成功后预注册 pending 记录到 DDB.
 
-    upsert_investigation uses if_not_exists semantics on task_id/created_at,
-    so a retry or late callback won't overwrite the initial write (analogous
-    to the old ON CONFLICT DO NOTHING).
+    ⚠️ 实现已收敛到 `shared/investigations.py`（R5.5c） ——
+    此前本函数与 `api/routes/devops_agent.py::_preregister_investigation`
+    是两份独立实现，写同一行 `invst#<task_id>` 但字段清单分叉：
+    HTTP 那侧总写 `account_alias`，本侧在 alias 为 None 时不写该键，
+    于是同一张列表里有的行有别名有的没有，UI 上看起来像「有些账号没上车」。
+
+    保留这个薄封装是为了不改本模块既有调用点的签名。
+    错误策略不变：失败只记日志**不抛** —— 调查已经派出去了（额度已花），
+    让它因为一行占位记录失败而整轮回滚是更坏的结果。
 
     Requirements: R18.1
     """
-    try:
-        fields: dict = {
-            "status": "pending",
-            "title": title,
-            "source": source,
-        }
-        if execution_id:
-            fields["execution_id"] = execution_id
-        if account_alias:
-            fields["account_alias"] = account_alias
+    from shared.investigations import preregister_investigation
 
-        upsert_investigation(task_id, account_id=account_id, **fields)
-        logger.info(
-            "预注册 pending 记录成功: task_id=%s account=%s", task_id, account_id
-        )
-    except Exception as e:
-        logger.error(
-            "预注册 pending 记录失败（不中断）: task_id=%s error=%s", task_id, e
-        )
+    preregister_investigation(
+        task_id=task_id, account_id=account_id, title=title, source=source,
+        execution_id=execution_id or "", account_alias=account_alias,
+        raise_on_error=False,
+    )
 
 
 # ---------------------------------------------------------------------------

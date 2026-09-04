@@ -10,6 +10,7 @@ import json
 import logging
 
 from shared.queries.threshold import get_thresholds, list_thresholds, put_thresholds
+from api.errors import NotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ def _update_config(resource_type: str, body: dict | None) -> dict:
 
     existing = get_thresholds(resource_type)
     if not existing:
-        raise KeyError(f"Threshold config {resource_type} not found")
+        raise NotFoundError(f"Threshold config {resource_type} not found")
 
     thresholds = body.get("thresholds")
     if thresholds is not None:
@@ -90,7 +91,7 @@ def _delete_config(resource_type: str) -> dict:
 
     existing = get_thresholds(resource_type)
     if not existing:
-        raise KeyError(f"Threshold config {resource_type} not found")
+        raise NotFoundError(f"Threshold config {resource_type} not found")
 
     # Direct DeleteItem — threshold module only has put/get/list
     _table = config_table()

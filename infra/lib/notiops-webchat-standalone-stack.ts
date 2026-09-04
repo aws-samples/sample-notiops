@@ -24,6 +24,7 @@
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as cognito from "aws-cdk-lib/aws-cognito";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as events from "aws-cdk-lib/aws-events";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
@@ -31,6 +32,8 @@ import * as logs from "aws-cdk-lib/aws-logs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as fs from "fs";
 import * as path from "path";
+// IM（飞书 / Slack）三件套 —— 与 `im-stack.ts`（方式 B）**共用同一个 construct**。
+import { createImCore } from "./constructs/im-core";
 import { createMinimalBase } from "./constructs/minimal-base-core";
 import { createWebChatCore } from "./constructs/web-chat-core";
 // 「通知」生产端 —— 与 `notiops-backend-stack.ts`（方式 B）**共用同一份**事件源定义。
@@ -55,8 +58,9 @@ const RUNTIME_NAME = "notiops_web_chat";
  * `setup.sh` 那条路上是 AgentCore CLI 按 `agentcore.json` 里声明的 memory 名推导出
  * `MEMORY_<名字大写去掉非字母数字>_ID` 注入的，而消费方 `memory/session.py` 写死读
  * `MEMORY_NOTIOPSWEBCHATMEMORY_ID`。所以这里必须叫 `NotiOpsWebChatMemory` ——
- * 名字一改，env 键就对不上，长期记忆会**静默**失效（`get_memory_session_manager()`
- * 返回 None，对话照常，只是不再有服务端记忆）。判据在 scripts/test_oneclick_parity.py。
+ * 名字一改，env 键就对不上，会话记忆会**静默**失效（`get_memory_session_manager()`
+ * 返回 None，对话照常，只是同一个会话里换个模型 / 冷启动之后模型就不记得前面说过什么）。
+ * 判据在 scripts/test_oneclick_parity.py。
  *
  * 与方式 B 现网那个 Memory 的名字（`NotiOpsWebChat_NotiOpsWebChatMemory`，CLI 加了应用名
  * 前缀）**故意不同**：Memory 的 `Name` 是 createOnly 且账号内唯一，同名会让两条路径没法
@@ -143,6 +147,30 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       constraintDescription: "Must be a valid email address.",
     });
 
+    // ── 装什么：Web 永远装，IM 是加装项 ──
+    // 为什么是"web / web+飞书 / web+slack"这种**枚举**，而不是两个独立的 Yes/No：
+    //   1. Web 是底座 —— 管理控制台（填 IM 凭证的地方）、config 表、会话表、agent
+    //      运行时全在 web 那一侧。给成两个独立开关就意味着要支持「只装 IM」这个组合，
+    //      而那个组合根本跑不起来（客户没有地方填 app_id/app_secret）。枚举从结构上
+    //      消灭了这个非法状态，而不是靠文档提醒。
+    //   2. 参数页上一个下拉框比两个复选框更少歧义（客户不用推理"两个都选 No 会怎样"）。
+    // 目前不提供「web+飞书+slack」：两个平台同时装没有技术障碍（资源互相独立），但
+    // 现网没有任何客户这么用，加进来就得跟着维护第 4 种组合的回归路径。要加时只需
+    // 在 allowedValues 里多一项、并把下面 InstallFeishu/InstallSlack 两个条件改成
+    // Fn::Or —— 不需要改 im-core.ts。
+    const installOption = new cdk.CfnParameter(this, "InstallOption", {
+      type: "String",
+      default: "web",
+      allowedValues: ["web", "web+feishu", "web+slack"],
+      description:
+        "Which entry points to install. 'web' installs the NotiOps web chat and admin console " +
+        "only. 'web+feishu' also installs the Feishu/Lark bot; 'web+slack' also installs the " +
+        "Slack bot. The web chat is always installed -- the admin console is where you enter the " +
+        "bot credentials. Adding a bot creates two extra Lambda functions with a public webhook " +
+        "URL (request signature verified, throttled to 10 concurrent executions) plus a " +
+        "once-a-minute poller; you can switch this value on a later stack update.",
+    });
+
     // CORS 白名单。默认 "*" 的理由与 CDK 路径一致（端点已由 AWS_IAM/SigV4 鉴权，
     // 且前端 CloudFront 域名是部署期才生成的、模板里无从预置）。一键部署这条路上
     // 尤其无解：模板必须先算出 Function URL 的 CORS 配置，而 CloudFront 分配在它之后
@@ -154,7 +182,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       description:
         "CORS allowed origins for the chat API. Defaults to * (the endpoint is already " +
         "protected by AWS_IAM/SigV4). After the first deploy you can update the stack and " +
-        "set this to the ChatUrl output for defence in depth.",
+        "set this to the ChatUrl output for defense in depth.",
     });
 
     const teardownMode = new cdk.CfnParameter(this, "TeardownMode", {
@@ -251,18 +279,88 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         "inconvenient -- MultiAccount stays off without it.",
     });
 
+    // ── 客户自有 CUR 数据源（cost-agent MCP）——可选加装项 ──
+    // 这是**外部**依赖：客户自己在某个账号里部署了 cost-agent（Athena over CUR 的 MCP
+    // 服务器，Lambda Function URL + IAM 鉴权），NotiOps 只是去调它。所以它不能是必填，
+    // 也不能在它挂掉时把整个工具拖下水：
+    //   · 参数留空（默认）→ 这项能力**按设计不存在**：BFF 拿到空串，
+    //     config/capabilities.json 的 requiresEnv 会把 4 个 nav:finops:cur-* 节点摘掉
+    //     （客户看不到点了没反应的菜单），agent 侧一个工具都不挂；
+    //   · 填了但服务挂了 → 只有那 4 张表显示「暂时不可用」，对话仍然能答 ——
+    //     agent 走 CE（awslabs cost-explorer MCP）→ call_aws 兜底，并**明说**换了数据源
+    //     （口径从 CUR 行级变成 CE 聚合，不许拿 CE 的数字冒充 CUR 的）。
+    // 两个参数而不是一个：Function URL 里**不含**函数 ARN，而 lambda:InvokeFunctionUrl
+    // 必须按资源授权（见 docs/DEPLOYMENT.md §14）。下面用 CfnRule 钉住"要么都填，要么都不填"。
+    const costAgentMcpUrl = new cdk.CfnParameter(this, "CostAgentMcpUrl", {
+      type: "String",
+      default: "",
+      allowedPattern: "^(https://[a-z0-9-]+\\.lambda-url\\.[a-z0-9-]+\\.on\\.aws/?)?$",
+      constraintDescription:
+        "Must be a Lambda Function URL (https://<id>.lambda-url.<region>.on.aws) or empty.",
+      description:
+        "Optional. Lambda Function URL of your own cost-agent MCP server (Athena over your Cost " +
+        "and Usage Report). Fill this in to unlock the line-item CUR dashboards, which reconcile " +
+        "against your invoice. Leave empty and those four sheets are simply not offered -- cost " +
+        "questions are still answered from Cost Explorer. If the server is later unreachable, only " +
+        "those sheets go unavailable; the chat falls back to Cost Explorer and says so.",
+    });
+    const costAgentFunctionArn = new cdk.CfnParameter(this, "CostAgentFunctionArn", {
+      type: "String",
+      default: "",
+      allowedPattern: "^(arn:aws[a-z-]*:lambda:[a-z0-9-]+:\\d{12}:function:[a-zA-Z0-9-_]+)?$",
+      constraintDescription: "Must be a Lambda function ARN or empty.",
+      description:
+        "Required when the cost-agent MCP URL above is set, ignored otherwise: the ARN of that " +
+        "same Lambda function. A Function URL does not contain the function ARN, and " +
+        "lambda:InvokeFunctionUrl has to be granted per function -- so it cannot be derived.",
+    });
+
+    // 群 / 频道允许清单 —— IM 只读四道防线的第三道。
+    //
+    // 🔴 为什么必须有这个参数（原来这里是写死的 `allowedChatIds: ""`）：
+    //    「方式 A 与方式 B 的 web 功能必须对等」是铁律。方式 B 有 `-c imAllowedChatIds=…`
+    //    （im-stack.ts:67），方式 A 写死空串 = 这道防线在一键部署上**永久缺席**，
+    //    而且客户没有任何办法在 IaC 里打开它 —— 手改 Lambda 环境变量会被下一次栈更新
+    //    覆盖回空，属于"改了也会悄悄失效"，比一开始就没有更糟。
+    //
+    // 默认空 = 不限制（与方式 B 同口径，不改变现网行为）。客户拿到群 id 是在部署**之后**，
+    // 所以正常节奏是：先空着部署 → 建群 → 把 chat id 填进来更新栈。这也是为什么它归在
+    // 「Security」组而不是「Required」。
+    const imAllowedChatIds = new cdk.CfnParameter(this, "ImAllowedChatIds", {
+      type: "String",
+      default: "",
+      // 允许 oc_/C0.../cid 等各家 id 形态 + 逗号分隔；不做更严的校验，因为三家平台
+      // 的 id 前缀规则各不相同且会变，写死正则只会把合法值挡在外面。
+      allowedPattern: "^[A-Za-z0-9_,:@.-]*$",
+      constraintDescription:
+        "Comma-separated chat/channel ids, or empty. No spaces.",
+      description:
+        "Optional, IM only. Comma-separated list of the Feishu chat ids (oc_...) or Slack channel " +
+        "ids (C...) the bot is allowed to answer in. Empty means every chat the bot is invited to. " +
+        "This is defense in depth: even if request-signature verification were bypassed, a message " +
+        "from a chat outside this list is dropped before any model call. You normally deploy empty, " +
+        "create the group, then update the stack with its id.",
+    });
+
     // 控制台参数分组 —— 一键部署的门面就是那个参数页，顺序/分组直接决定客户观感。
     this.templateOptions.metadata = {
       "AWS::CloudFormation::Interface": {
         ParameterGroups: [
-          { Label: { default: "Required" }, Parameters: [adminEmail.logicalId] },
+          {
+            Label: { default: "Required" },
+            Parameters: [adminEmail.logicalId, installOption.logicalId],
+          },
           {
             Label: { default: "Scope" },
             Parameters: [deployMode.logicalId, organizationId.logicalId, enableDeepInvestigation.logicalId],
           },
           {
             Label: { default: "Security (safe defaults -- change only if you know why)" },
-            Parameters: [agentReadOnlyAccess.logicalId, allowedOrigins.logicalId],
+            Parameters: [agentReadOnlyAccess.logicalId, allowedOrigins.logicalId, imAllowedChatIds.logicalId],
+          },
+          {
+            Label: { default: "Optional: your own CUR data source" },
+            Parameters: [costAgentMcpUrl.logicalId, costAgentFunctionArn.logicalId],
           },
           {
             Label: { default: "Lifecycle & advanced" },
@@ -271,6 +369,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         ],
         ParameterLabels: {
           [adminEmail.logicalId]: { default: "Administrator email" },
+          [installOption.logicalId]: { default: "What to install" },
           [deployMode.logicalId]: { default: "Deployment mode" },
           [organizationId.logicalId]: { default: "AWS Organizations id (MultiAccount only)" },
           // 标签只影响控制台显示（不是改参数名，栈更新不会丢值）—— 写成「所有
@@ -280,9 +379,12 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           },
           [agentReadOnlyAccess.logicalId]: { default: "Give the agent account-wide read-only access?" },
           [allowedOrigins.logicalId]: { default: "CORS allowed origins" },
+          [imAllowedChatIds.logicalId]: { default: "IM chat/channel allow list (optional)" },
           [teardownMode.logicalId]: { default: "On stack delete" },
           [artifactBaseUrl.logicalId]: { default: "Artifact base URL override" },
           [artifactMirrorBucket.logicalId]: { default: "Artifact mirror bucket name (s3:// only)" },
+          [costAgentMcpUrl.logicalId]: { default: "cost-agent MCP Function URL (optional)" },
+          [costAgentFunctionArn.logicalId]: { default: "cost-agent Lambda function ARN" },
         },
       },
     };
@@ -338,6 +440,36 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       expression: cdk.Fn.conditionEquals(cdk.Aws.REGION, "us-east-1"),
     });
 
+    // IM 加装项。三个条件而不是两个：`InstallIm` 盖住**平台无关**的共用资源
+    // （IM 角色、依赖层、两张表、进度轮询函数 + 它的 1 分钟节拍）。少了它，只装 web 的
+    // 客户也会白拿一个每分钟跑一次的 Lambda（以及两张空表）。
+    const installFeishu = new cdk.CfnCondition(this, "InstallFeishu", {
+      expression: cdk.Fn.conditionEquals(installOption.valueAsString, "web+feishu"),
+    });
+    const installSlack = new cdk.CfnCondition(this, "InstallSlack", {
+      expression: cdk.Fn.conditionEquals(installOption.valueAsString, "web+slack"),
+    });
+    const installIm = new cdk.CfnCondition(this, "InstallIm", {
+      expression: cdk.Fn.conditionOr(installFeishu, installSlack),
+    });
+
+    // 客户自有 CUR 数据源装没装。留空 = 这项能力按设计不存在（不是"坏了"）。
+    const hasCostAgentMcp = new cdk.CfnCondition(this, "HasCostAgentMcp", {
+      expression: cdk.Fn.conditionNot(cdk.Fn.conditionEquals(costAgentMcpUrl.valueAsString, "")),
+    });
+    // 只填 URL 不填 ARN 会得到一个"看起来装好了、每次调用都 403"的部署（Function URL 的
+    // IAM 鉴权失败信息在 CloudTrail 里，客户看到的只是表格空着）。所以在**开栈之前**拦掉，
+    // 而不是让它跑起来再排查。CfnRule 在参数校验阶段执行，失败时栈根本不会创建。
+    new cdk.CfnRule(this, "CostAgentArnRequiredWithUrl", {
+      ruleCondition: cdk.Fn.conditionNot(cdk.Fn.conditionEquals(costAgentMcpUrl.valueAsString, "")),
+      assertions: [{
+        assert: cdk.Fn.conditionNot(cdk.Fn.conditionEquals(costAgentFunctionArn.valueAsString, "")),
+        assertDescription:
+          "CostAgentFunctionArn is required when CostAgentMcpUrl is set: a Function URL does not "
+          + "contain the function ARN, and lambda:InvokeFunctionUrl must be granted per function.",
+      }],
+    });
+
     // ══ Mappings：本模板绑定的 Release ═════════════════════════════════════════
     // 为什么用 Mappings 而不是 Parameter：客户**不该**能随便换版本 —— 模板结构与产物
     // 是一套发出去的（agent zip 里的 main.py 要对得上模板给的环境变量、前端要对得上 BFF
@@ -365,6 +497,13 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // 成 `Code.ZipFile` 省掉一次搬运 —— 但内联只能放**单文件**源码，而这个 handler
     // `from core import push_event`（679 行）。所以走和 BFF 一样的产物路径。
     const webNotifKey = `notif/${releaseTag}/${WEB_NOTIF_ARTIFACT}`;
+    // IM 加装项的两份产物（只在 InstallOption != web 时才会被 stager 下载，见下面
+    // StagerArtifacts 的 InstallOption 属性）。分成 code + layer 两个 zip 而不是一个：
+    // 依赖（lark-oapi + slack-sdk + botocore，解压后 ~60MB）与业务代码的变更频率差两个
+    // 数量级，合成一个 zip 会让每次改 Python 都重传 60MB；而且 Lambda 的
+    // 「代码 + 层」解压后合计上限 250MB，层是唯一能让三个函数共享这份依赖的机制。
+    const imCodeKey = `im/${releaseTag}/im-code.zip`;
+    const imLayerKey = `im/${releaseTag}/im-layer.zip`;
 
     // ══ Staging 桶：Release 产物在客户账号里的落脚点 ═══════════════════════════
     // Lambda 的 `Code.S3Bucket` 与 AgentCore 的 `Code.S3.Bucket` 都只接受**同区域**的
@@ -471,6 +610,12 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         // postprocess 改写这里；同时它天然是「版本变了就重搬」的触发器
         // （sha256 变 → 属性变 → CFN 发 Update）。
         Artifacts: "[]",
+        // 只装 web 时让 stager **跳过** `im-` 开头的产物（handler 里按名字前缀过滤）。
+        // 为什么不能靠"反正没人引用它"就照搬：im-layer.zip 有 ~25MB，白下白传一遍会给
+        // 每一次只装 web 的部署多花十几秒，而且客户会在 staging 桶里看到自己没装的东西。
+        // 值本身也是「切换安装选项就重搬」的触发器：web → web+feishu 的栈更新会改这个
+        // 属性 → CFN 发 Update → stager 这次把 IM 产物补下来。
+        InstallOption: installOption.valueAsString,
       },
     });
     stagerArtifacts.addDependency(stagerFn);
@@ -705,19 +850,25 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       deepInvestigationEnabled.logicalId, agentSpace.attrAgentSpaceId, "",
     ).toString();
 
-    // ══ AgentCore Memory（长期记忆）════════════════════════════════════════════
+    // ══ AgentCore Memory（**会话内**历史，不做跨会话记忆）══════════════════════
     // 这是**产品功能**，不是基础设施细节：BFF 每一轮只发 `prompt`（bff/web-chat/
     // agentcore.mjs 的 buildRuntimePayload 里没有任何历史），所以模型能接上上文全靠两件事
     // 之一 —— ① 容器里那个 Agent 对象还活在 LRU 缓存里（core/agent_cache.py），
-    // ② Memory 的 session manager 把历史读回来（memory/session.py）。
+    // ② Memory 的 session manager 把**本会话**的历史读回来（memory/session.py）。
     // 没有 ② 的时候，只要缓存那一格被顶掉，模型就**当场失忆**，而界面上历史还在
     // （历史存 DynamoDB，跟模型看得见什么无关）—— 换模型、换主题、换账号、开关深度调查、
     // 管理员存一次配置、凭证轮换、闲置 1 小时、8 小时最长寿命、重新部署，全都会顶掉那一格。
-    // 客户看到的症状是「它刚刚还知道，现在突然不认了」。
+    // 客户看到的症状是「它刚刚还知道，现在突然不认了」。所以这个资源**必须留着**。
+    //
+    // 2026-09-01 产品决策：**去掉跨会话记忆**（原先挂了 4 个 strategy：SEMANTIC /
+    // USER_PREFERENCE / SUMMARIZATION / EPISODIC，把用户的事实与偏好抽取到
+    // `/users/{actorId}/…` 这类**不带 sessionId** 的 namespace，下一个会话还能检索到）。
+    // 现在只保留「按 sessionId 存原始事件」这一层 —— 对应 SDK 的 create_event /
+    // list_events，与 strategy 抽取是两条独立的路（读取端见 memory/session.py 顶部）。
     //
     // 方式 B 的真源是 agent-build/NotiOpsWebChat/agentcore/agentcore.json 的 `memories` 块，
     // 由 AgentCore CLI 建资源、并把 memory id 注进 runtime 环境变量。这里逐条对齐它：
-    // 4 个 strategy、同样的 namespace 模板、同样的 30 天事件保留期。
+    // 同样 0 个 strategy、同样的 30 天事件保留期。
     // 判据在 scripts/test_oneclick_parity.py（第 ⑦ 个维度）。
     //
     // 刻意**不设** RemovalPolicy.RETAIN（跟 Runtime 一样随栈删）。两个理由：
@@ -727,10 +878,12 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     const memoryRole = new iam.Role(this, "AgentMemoryRole", {
       assumedBy: new iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
       description: "AgentCore Memory execution role",
-      // **故意没有任何权限**。4 个 strategy 都是 AgentCore 托管的抽取（没有自定义模型
-      // 覆盖），抽取用的是服务自己的身份；这个角色只是 CreateMemory 要求的一个句柄。
-      // 与方式 B 现网那个 CLI 建出来的角色逐条一致（实测：0 条内联策略、0 条托管策略，
-      // 而 /users/default-user/facts 下确实有抽取出来的 memory record）。
+      // **故意没有任何权限**，而且去掉 strategy 之后**更加**没有任何调用方 ——
+      // 抽取是 AgentCore 托管的、用服务自己的身份；这个角色只是 CreateMemory 的一个句柄。
+      // 那为什么不顺手删掉？`MemoryExecutionRoleArn` 不是 createOnly，删属性走的是
+      // UpdateMemory —— 「把它清空」是否真的生效取决于服务端实现，赌错的结果是
+      // CFN 把 IAM 角色删了、而 Memory 里还引用着一个不存在的 ARN。留一个 0 权限的角色
+      // 是这两者里代价小的那个（也让日后想恢复跨会话抽取时不用再动 IAM）。
       // 想给它加权限之前先问一句「哪个 API 会用这个身份去调什么」——答不出来就别加。
     });
 
@@ -738,36 +891,18 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       type: "AWS::BedrockAgentCore::Memory",
       properties: {
         Name: MEMORY_NAME,
-        Description: "NotiOps Web Chat long-term memory (one-click deployment)",
+        Description: "NotiOps Web Chat session memory (one-click deployment)",
         // 事件保留期（天）。与 agentcore.json 的 eventExpiryDuration 一致。
+        // 这是**会话内**历史的保留期，跟已经删掉的跨会话抽取无关 —— 别因为「不要长期
+        // 记忆」就来把它改小：同一个会话隔天接着聊也要能接上。
         EventExpiryDuration: 30,
         MemoryExecutionRoleArn: memoryRole.roleArn,
-        // 每个 wrapper 对象只能带**一个** strategy（schema 里 maxProperties=1）。
-        // 只写 `NamespaceTemplates`（不写 `Namespaces`）——与 agentcore.json 用的是同一个
-        // 输入字段，服务端会把它镜像到 Namespaces（现网那个 Memory 就是这么来的）。
-        // 这四个 namespace 必须与 memory/session.py 的 retrieval_config **逐字**对上：
-        // 写入端和读取端对不上时不报错，只是永远检索不到东西。
-        MemoryStrategies: [
-          { SemanticMemoryStrategy: {
-            Name: `${MEMORY_NAME}_Semantic`,
-            NamespaceTemplates: ["/users/{actorId}/facts"],
-          } },
-          { UserPreferenceMemoryStrategy: {
-            Name: `${MEMORY_NAME}_Userpreference`,
-            NamespaceTemplates: ["/users/{actorId}/preferences"],
-          } },
-          { SummaryMemoryStrategy: {
-            Name: `${MEMORY_NAME}_Summarization`,
-            NamespaceTemplates: ["/summaries/{actorId}/{sessionId}"],
-          } },
-          { EpisodicMemoryStrategy: {
-            Name: `${MEMORY_NAME}_Episodic`,
-            NamespaceTemplates: ["/episodes/{actorId}/{sessionId}"],
-            // 反思（把多个 episode 归纳成跨会话的经验）落在**去掉 sessionId** 的
-            // 上一层 namespace 上 —— 对应 agentcore.json 的 reflectionNamespaceTemplates。
-            ReflectionConfiguration: { NamespaceTemplates: ["/episodes/{actorId}"] },
-          } },
-        ],
+        // **故意是空的**，不是漏写（与 agentcore.json 的 `"strategies": []` 对齐）。
+        // 一旦这里出现任何 strategy，跨会话记忆就又打开了：抽取会往
+        // `/users/{actorId}/…`（不带 sessionId）写，A 会话说过的话在 B 会话就能被检索到。
+        // 真要恢复的话，写入端（这里）与读取端（memory/session.py 的 retrieval_config）
+        // 必须同时改、且 namespace **逐字**对上 —— 对不上时不报错，只是永远检索不到。
+        MemoryStrategies: [],
       },
     });
 
@@ -947,42 +1082,41 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       actions: ["bedrock-agentcore:InvokeGateway"],
       resources: [`arn:${this.partition}:bedrock-agentcore:${this.region}:${this.account}:gateway/*`],
     }));
-    // AgentCore Memory（上面那个资源）—— 长期记忆的读写面，与方式 B 现网那个 CLI 生成的
-    // 执行角色**逐条一致**（实测抄自方式 B 那条路径上 CLI 生成的 runtime 执行角色内联策略）。
-    // 分成三条不是洁癖：ListMemoryRecords 走 `namespacePath`（按前缀列），
-    // RetrieveMemoryRecords 走 `namespace`（精确检索），两个条件键不能写在一条里；
-    // 第三条那组 API 没有 namespace 条件键可用，只能落在 Memory 资源本身上。
-    // 条件里的四个前缀 = memory/session.py 那四个 namespace，收得比 `*` 紧。
+    // AgentCore Memory（上面那个资源）—— **只有事件读写这一组**。
+    // 2026-09-01 去掉跨会话记忆之后，`RetrieveMemoryRecords` / `ListMemoryRecords` /
+    // `*MemoryRecord` 这一整类「记忆记录」API 已经没有任何调用方：strands 那个 session
+    // manager 只在 `retrieve_customer_context()` 里调它们，而该函数在 `retrieval_config`
+    // 为空时**第一行就 return**（vendored SDK session_manager.py）。所以原先按 namespace
+    // 前缀收口的两条语句连同前缀表一起删了 —— 留着就是给一个不存在的调用面发权限。
+    // 恢复跨会话记忆时要把它们**一起**加回来（namespace / namespacePath 是两个条件键，
+    // 不能写在同一条语句里，这是当初拆成两条的原因）。
     //
-    // 注意 CreateEvent / DeleteEvent / DeleteMemoryRecord 是**写**动作，但**不违反只读承诺**：
-    // 写的对象是 agent 自己的会话记忆，不是客户的 AWS 资源。少了 CreateEvent 的失败模式最
-    // 隐蔽 —— 检索照常（历史读得回来），但这一轮的对话永远存不进去，于是"记忆只到某天为止"。
-    const memoryNamespacePrefixes = [
-      "/users/*/facts", "/users/*/preferences", "/summaries/*/*", "/episodes/*/*",
-    ];
+    // 注意 CreateEvent / DeleteEvent 是**写**动作，但**不违反只读承诺**：写的对象是 agent
+    // 自己的会话历史，不是客户的 AWS 资源。少了 CreateEvent 的失败模式最隐蔽 ——
+    // 读历史照常，但这一轮的对话永远存不进去，于是"记忆只到某天为止"。
     const memoryArn = memory.getAtt("MemoryArn").toString();
-    runtimeRole.addToPolicy(new iam.PolicyStatement({
-      sid: "NotiOpsMemoryRetrieve",
-      actions: ["bedrock-agentcore:ListMemoryRecords", "bedrock-agentcore:RetrieveMemoryRecords"],
-      resources: [memoryArn],
-      conditions: { StringLike: { "bedrock-agentcore:namespace": memoryNamespacePrefixes } },
-    }));
-    runtimeRole.addToPolicy(new iam.PolicyStatement({
-      sid: "NotiOpsMemoryRetrieveByPath",
-      actions: ["bedrock-agentcore:ListMemoryRecords", "bedrock-agentcore:RetrieveMemoryRecords"],
-      resources: [memoryArn],
-      conditions: { StringLike: { "bedrock-agentcore:namespacePath": memoryNamespacePrefixes } },
-    }));
     runtimeRole.addToPolicy(new iam.PolicyStatement({
       sid: "NotiOpsMemoryEvents",
       actions: [
         "bedrock-agentcore:CreateEvent", "bedrock-agentcore:DeleteEvent",
-        "bedrock-agentcore:DeleteMemoryRecord", "bedrock-agentcore:GetEvent",
-        "bedrock-agentcore:GetMemory", "bedrock-agentcore:GetMemoryRecord",
+        "bedrock-agentcore:GetEvent", "bedrock-agentcore:GetMemory",
         "bedrock-agentcore:ListActors", "bedrock-agentcore:ListEvents",
         "bedrock-agentcore:ListSessions",
       ],
       resources: [memoryArn],
+    }));
+    // 客户自建 cost-agent MCP（CUR 行级明细，docs/DEPLOYMENT.md §14）。与方式 B 的
+    // `agent-build/.../cdk/lib/cdk-stack.ts` 同 Sid 同动作（parity 断言按 Sid 比对）。
+    // ⚠️ 不能带 `lambda:FunctionUrlAuthType` Condition —— 实测那样恒 403（§14.5）。
+    // 没填参数时资源指向一个不存在的函数：语句照在但授不到东西，客户日后只改参数即可开通。
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      sid: "InvokeCostAgentMcp",
+      actions: ["lambda:InvokeFunctionUrl"],
+      resources: [cdk.Fn.conditionIf(
+        hasCostAgentMcp.logicalId,
+        costAgentFunctionArn.valueAsString,
+        `arn:${this.partition}:lambda:${this.region}:${this.account}:function:notiops-cost-agent-not-configured`,
+      ).toString()],
     }));
     // 模型目录 / RBAC 等配置（agent 侧也要读，例如按角色裁剪工具）。
     runtimeRole.addToPolicy(new iam.PolicyStatement({
@@ -1046,10 +1180,10 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           // 只给 M1 真的有的那几个。空串在部分 AgentCore 校验下会被拒，
           // 缺省项一律**不写**（agent 侧都是 os.environ.get(..., "")）。
           SKILLS_BUCKET: base.dataBucket.bucketName,
-          // 长期记忆。键名不是随便起的：它是 AgentCore CLI 从 memory 名推导出来的形式
+          // 会话记忆。键名不是随便起的：它是 AgentCore CLI 从 memory 名推导出来的形式
           // （`MEMORY_` + 名字大写去掉非字母数字 + `_ID`），而 memory/session.py 写死读它。
-          // 键错/缺 → `get_memory_session_manager()` 返回 None → 对话照常但**没有记忆**，
-          // 不报错、不写日志。所以这里**不加任何条件**：长期记忆不是可选功能。
+          // 键错/缺 → `get_memory_session_manager()` 返回 None → 对话照常但**会话历史不落库**，
+          // 不报错、不写日志。所以这里**不加任何条件**：它不是可选功能。
           MEMORY_NOTIOPSWEBCHATMEMORY_ID: memory.getAtt("MemoryId").toString(),
           // 报告分发 CDN。缺这个键 core/reports.py 退回 12h presigned URL，与「7 天有效」
           // 的产品承诺和桶生命周期都不符（见 minimal-base-core.ts 的 ReportsCDN）。
@@ -1071,6 +1205,12 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           // 中途、没法再把这个键整个删掉），agent 侧只认 https:// 开头的值。
           AGENTCORE_WEBSEARCH_GATEWAY_URL: cdk.Fn.conditionIf(
             webSearchSupported.logicalId, stagerWebSearch.getAtt("GatewayUrl").toString(), cdk.Aws.NO_VALUE,
+          ),
+          // 客户自有 CUR 数据源（core/cost_agent_mcp.py）。没填参数时整个键消失 →
+          // 一个工具都不挂（不是挂两个每次必失败的工具），成本问题走 CE / call_aws。
+          // 与 agentcore.json 的 envVars 一一对应（scripts/test_oneclick_parity.py 钉住）。
+          COST_AGENT_MCP_URL: cdk.Fn.conditionIf(
+            hasCostAgentMcp.logicalId, costAgentMcpUrl.valueAsString, cdk.Aws.NO_VALUE,
           ),
         },
       },
@@ -1096,6 +1236,17 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       // 报告分发 CDN（同栈资源，见 minimal-base-core.ts）。BFF 的「深度调查（直连）」
       // 没有 presign 分支，域名为空就不产出报告链接。
       reportsCdnDomain: base.reportsCdnDomain,
+      // 客户自有 CUR 数据源。URL 是 Token（永远"真"），所以 web-chat-core.ts 在静态模板
+      // 模式下无条件建 IAM/缓存桶授权与那条每日预热规则 —— 参数为空时预热调用是个 no-op，
+      // 客户日后只改参数就能开这项能力，不用动基础设施。
+      // ARN 走 Fn::If：没填时给一个本账号不存在的函数 ARN，使 Resource 语法合法但**授不到**
+      // 任何东西（IAM 不允许空 Resource，也不能只在某条件下删掉一条语句里的一个字段）。
+      costAgentMcpUrl: costAgentMcpUrl.valueAsString,
+      costAgentFunctionArn: cdk.Fn.conditionIf(
+        hasCostAgentMcp.logicalId,
+        costAgentFunctionArn.valueAsString,
+        `arn:${cdk.Aws.PARTITION}:lambda:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:function:notiops-cost-agent-not-configured`,
+      ).toString(),
       // 不带的只有 `idleConsoleUrl`：它指向完整部署才有的管理仪表盘，而侧边栏那个入口
       // 本来就被 `SHOW_INSPECTIONS = false` 隐藏（Sidebar.tsx），AdminPanel 里也只是一个
       // 可选的 ↗ 外链 —— 空串是正确取值，不是缺口。
@@ -1184,13 +1335,19 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       actions: ["s3:ListBucket", "s3:ListBucketVersions", "s3:DeleteBucket"],
       resources: [base.dataBucket.bucketArn],
     }));
-    // Bedrock API Key 的 secret 是 BFF 按需建的、不在栈里（见 web-chat-core.ts 的
-    // `BedrockApiKeySecretAccess`），CFN 不会删它 —— DeleteEverything 时由 StagerFn 收尾。
-    // 精确到这一个名字：不给「删本账号任意 secret」。
+    // 这几个 secret 都不在栈里（Bedrock API Key 由 BFF 按需建，见 web-chat-core.ts 的
+    // `BedrockApiKeySecretAccess`；IM 凭证由管理控制台建或客户手建），CFN 不会删它们
+    // —— DeleteEverything 时由 StagerFn 收尾。**逐个点名**：不给「删本账号任意 secret」，
+    // 也不写成 `notiops/*`（那会把客户自己起名带 notiops/ 前缀的 secret 一起纳入）。
     stagerRole.addToPolicy(new iam.PolicyStatement({
-      sid: "TeardownDeleteBedrockApiKeySecret",
+      sid: "TeardownDeleteOwnSecrets",
       actions: ["secretsmanager:DeleteSecret"],
-      resources: [`arn:${this.partition}:secretsmanager:${this.region}:${this.account}:secret:notiops/bedrock-api-key-*`],
+      resources: [
+        "notiops/bedrock-api-key",
+        "notiops/im-bot-feishu",
+        "notiops/slack-bot-token",
+        "notiops/slack-signing-secret",
+      ].map((n) => `arn:${this.partition}:secretsmanager:${this.region}:${this.account}:secret:${n}-*`),
     }));
 
     // 出厂模型目录的种子（`PK=llmcfg / SK=meta`）。`setup.sh` 用
@@ -1229,9 +1386,24 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         TeardownMode: teardownMode.valueAsString,
         DataBucket: base.dataBucket.bucketName,
         TableNames: cdk.Stack.of(this).toJsonString([base.configTable.tableName, webchat.table.tableName]),
-        // BFF 按需创建的 secret（栈外资源）。名字与 bff/web-chat/llm_config.mjs::SECRET_ID
-        // 和 core/llm_config.py::_BEDROCK_KEY_SECRET 的默认值一致。
-        SecretNames: cdk.Stack.of(this).toJsonString(["notiops/bedrock-api-key"]),
+        // 按需创建的 secret（都是**栈外**资源，所以 CFN 不会替我们删）。
+        //   · notiops/bedrock-api-key —— BFF 在客户切到 API Key 模式时建；名字与
+        //     bff/web-chat/llm_config.mjs::SECRET_ID 和
+        //     core/llm_config.py::_BEDROCK_KEY_SECRET 的默认值一致。
+        //   · notiops/im-bot-feishu —— 管理控制台「集成 IM」页保存凭证时建（BFF 有
+        //     CreateSecret 权限，见 web-chat-core.ts）。
+        //   · notiops/slack-* —— 客户按文档手建（Slack 侧没有"在控制台里填"的入口）。
+        // 三个 IM secret **无条件**列出，不跟着 InstallIm 走：客户可能先装 web+feishu、
+        // 后来改回 web 再删栈，那时属性里若没有它，凭证就永久留在账号里
+        // （自定义资源的 Delete 事件只带**上一次成功部署**的属性）。名字不存在时
+        // handler 会忽略 ResourceNotFoundException（见 index.py `_ignore_missing`），
+        // 所以多列几个不会让删栈失败。
+        SecretNames: cdk.Stack.of(this).toJsonString([
+          "notiops/bedrock-api-key",
+          "notiops/im-bot-feishu",
+          "notiops/slack-bot-token",
+          "notiops/slack-signing-secret",
+        ]),
         // 只精确点名本次部署自己那个 AgentCore 运行时日志组 —— **绝不**按前缀扫描后批量删。
         // BFF 与 StagerFn 的日志组都是栈内资源（DESTROY），CFN 自己会删，不用列在这里。
         LogGroupNames: cdk.Stack.of(this).toJsonString([
@@ -1332,6 +1504,104 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       });
     }
 
+    // ══ IM 加装项（飞书 / Slack）════════════════════════════════════════════════
+    // 三个函数的**定义**在 `constructs/im-core.ts`，与方式 B（`im-stack.ts`）逐字同源；
+    // 允许的差异只有那 4 条（代码来源 / 物理名 / 日志组名 / 合成期布尔 vs 部署期条件），
+    // 见该文件头。这里只负责喂给它方式 A 特有的那 4 样东西。
+    //
+    // 整块都挂在 `InstallIm` / `InstallFeishu` / `InstallSlack` 上：只装 web 的客户
+    // 模板里虽然有这些资源，但一个都不会创建（CFN 对 Condition 为 false 的资源是
+    // 完全跳过，不是建了再删）。
+
+    // ── IM 专属的两张表 ──
+    // 为什么方式 A 不能复用 `notiops-web-chat` 那张表：
+    //   · `CONVERSATIONS_TABLE` 只被 `core/ddb_state.py` 读，而它的表是**单主键**
+    //     `lookup_key`；web chat 那张是 `PK`/`SK` 复合主键。塞进去每次写都
+    //     ValidationException，而症状是"飞书里机器人不回话"。
+    //   · `METRICS_TABLE` **确实**会被读到（`shared/queries/_client.py` ←
+    //     `platforms/*/app/…query_handler`，`query` 命令那条路径惰性 import）。缺这个
+    //     环境变量是硬 `KeyError`，所以哪怕一行数据都不会有，表也得存在 —— 让查询路径
+    //     退化成"没有数据"再落到 investigate，而不是崩。
+    //
+    // 两张表都：**不指定物理名** + `DESTROY` + 不进 `StagerSite.TableNames`。
+    //   · 不指定名字：账号里可能已经有 setup.sh 建的同名 `notiops-conversations`
+    //     （方式 B 是 RETAIN，删栈也不消失），写死名字就是 already-exists 整栈回滚。
+    //     Python 侧一律从环境变量读表名，没有任何地方按字面名找表。
+    //   · DESTROY 而不是 RETAIN：这两张表里**没有**需要保护的数据 —— 全是带 `ttl`
+    //     (~24h) 的去重键 / 在飞的调查行 / 会话短期记忆（见 core/ddb_state.py 文件头），
+    //     metrics 那张更是纯缓存。所以它们不属于 `TeardownMode=KeepData` 要保的东西；
+    //     反过来，RETAIN 会让「先选 web+feishu、再改回 web」留下一张孤儿表。
+    const imConversationsTable = new dynamodb.Table(this, "ImConversationsTable", {
+      partitionKey: { name: "lookup_key", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: "ttl",
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    (imConversationsTable.node.defaultChild as cdk.CfnResource).cfnOptions.condition = installIm;
+
+    // 形状必须与方式 B 的 MetricsTable 一致（PK/SK + GSI1）—— `shared/queries` 会按
+    // GSI1 查询，缺索引的失败模式是 ValidationException 而不是"查不到"。
+    const imMetricsTable = new dynamodb.Table(this, "ImMetricsTable", {
+      partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "SK", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: "ttl",
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    imMetricsTable.addGlobalSecondaryIndex({
+      indexName: "GSI1",
+      partitionKey: { name: "GSI1PK", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "GSI1SK", type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+    (imMetricsTable.node.defaultChild as cdk.CfnResource).cfnOptions.condition = installIm;
+
+    // ── 依赖层 ──
+    // 方式 B 从 `lambda_layer_im/` 打资产；这里从 staging 桶取 Release 里的 im-layer.zip。
+    // description 里写死版本号是运维在控制台唯一看得见"层里装了什么"的地方 —— 与
+    // `scripts/build_im_layer.sh` 的三个 *_VERSION 及 im-stack.ts 那句保持一致。
+    const imLayer = new lambda.LayerVersion(this, "ImDepsLayer", {
+      code: lambda.Code.fromBucket(stagingBucket, imLayerKey),
+      compatibleRuntimes: [lambda.Runtime.PYTHON_3_14],
+      description: "IM deps: lark-oapi 1.6.5 + slack-sdk 3.33.5 + boto3/botocore 1.43.65",
+    });
+    const imLayerCfn = imLayer.node.defaultChild as cdk.CfnResource;
+    imLayerCfn.cfnOptions.condition = installIm;
+    imLayerCfn.addDependency(stagerArtifacts);
+
+    const im = createImCore(this, {
+      metricsTableName: imMetricsTable.tableName,
+      configTableName: base.configTable.tableName,
+      conversationsTableName: imConversationsTable.tableName,
+      skillsBucketName: base.dataBucket.bucketName,
+      // 与方式B 同一个值来源：本栈自己建的报告 CDN（同一个域名也喂给 BFF，见 :1090）。
+      // 一键部署里它**永远非空**（同栈内 GetAtt，没有跨栈 Export 的问题）。
+      reportsCdnDomain: base.reportsCdnDomain,
+      // 单账号模式锁死本账号；多账号模式留空（跨账号闸门交给 core/aws_session.py）。
+      lockedAccountId: cdk.Fn.conditionIf(isMultiAccount.logicalId, "", cdk.Aws.ACCOUNT_ID).toString(),
+      // 群/频道允许清单：与方式 B 的 `-c imAllowedChatIds=…` 对等（铁律：两条路径
+      // 的功能必须一致）。默认空 = 不限制；客户拿到群 id 后更新栈即可收窄。
+      // 不能写死空串 —— 那样客户只能手改 Lambda 环境变量，下一次栈更新又会覆盖回去。
+      allowedChatIds: imAllowedChatIds.valueAsString,
+      code: lambda.Code.fromBucket(stagingBucket, imCodeKey),
+      layer: imLayer,
+      // 带 StackName 前缀：一键模板可能与 setup.sh 部署共存于同一账号（后者写死
+      // `notiops-im-*`），撞名会 already-exists。
+      fnName: (role) => `${cdk.Aws.STACK_NAME}-im-${role}`,
+      // 日志组交给 CFN 命名 —— 写死 `/aws/lambda/<fn>` 会撞上 Lambda 服务自建的同名组，
+      // NAME_CONFLICT_VALIDATION 让整栈 9 秒内失败（同 WebNotifLogs 那段的实测）。
+      explicitLogGroupNames: false,
+      // 两个平台的资源都**合成**出来，装不装由部署期条件决定。
+      platforms: { feishu: true, slack: true },
+      conditions: { feishu: installFeishu, slack: installSlack, anyPlatform: installIm },
+      // 不给 EventBridge 规则物理名（同上，避免与 setup.sh 的 notiops-im-progress-tick /
+      // notiops-im-keepalive-* 撞名）—— progressRuleName 与 keepAliveRuleName 都不传。
+    });
+    // 代码在 staging 桶里 → 每个函数都要等 StagerFn 搬完。
+    for (const fn of im.functions) {
+      (fn.node.defaultChild as lambda.CfnFunction).addDependency(stagerArtifacts);
+    }
+
     // ══ 多账号落地（Phase=OrgSetup，仅 MultiAccount）═══════════════════════════
     // 两个成员账号 StackSet 的模板在**合成期**读进来、当字符串内联 —— 不是 CDK 资产
     // （客户账号没有资产桶，见文件头第 1 条）。`setup.sh` 那条路径用的是同两份文件，
@@ -1404,7 +1674,35 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     if (stagerPolicy) stagerOrgSetup.addDependency(stagerPolicy as cdk.CfnResource);
 
     // ══ Outputs ══════════════════════════════════════════════════════════════
-    // `ChatUrl` / `ChatBffUrl` / `WebChatTableName` 已由 createWebChatCore 输出。
+    // `ChatUrl` / `WebChatTableName` 已由 createWebChatCore 输出（`ChatBffUrl` 只在
+    // 方式B 那份 Outputs 里 —— 对客户零用处，理由见 web-chat-core.ts 的 staticTemplate 分支）。
+
+    // 登录用的账号名。硬编码 "admin" 与 infra/lambda/stager/index.py 的 `_ADMIN_USERNAME`
+    // 是同一个值（两处都不能单独改；那边还解释了为什么不能用邮箱当 username）。
+    // 单独成一个 Output 而不只写在下面 `NextSteps` 那段话里：客户在控制台 Outputs 表里
+    // 是**按行找**的，一段散文里的 'admin' 会被漏掉。
+    new cdk.CfnOutput(this, "LoginUsername", {
+      description: "Username for the first sign-in",
+      value: "admin",
+    });
+    // ⚠️ 这里给的是**密码在哪**，不是密码本身，这是有意的、也不要"顺手改成更方便"：
+    //   1. 本栈从来就没有这个密码。`_create_admin` 不传 TemporaryPassword，由 Cognito
+    //      自己生成并邮件下发（`DesiredDeliveryMediums=["EMAIL"]`），栈里无处可取。
+    //   2. 即使能取到也不能放：CFN Output 是**明文**的，任何拿到
+    //      `cloudformation:DescribeStacks` 的人（ReadOnlyAccess 就含这条）都能读，
+    //      而且会长期留在 CFN 的 API / 控制台历史里，改了密码也删不掉那份记录。
+    // 方式B（setup.sh）在终端里打印初始密码是另一回事：那是本地一次性输出，不落任何
+    // 可被他人查询的 AWS API。
+    new cdk.CfnOutput(this, "LoginPassword", {
+      description: "Where to find the initial password (not shown here by design)",
+      value: cdk.Fn.join("", [
+        "Cognito emailed a one-time temporary password to ",
+        adminEmail.valueAsString,
+        " (check spam). It is deliberately NOT in these Outputs, which are plaintext ",
+        "and readable by anyone with read-only access to this stack. ",
+        "Lost it? Cognito console > this user pool > Users > admin > Reset password.",
+      ]),
+    });
     new cdk.CfnOutput(this, "NextSteps", {
       description: "How to log in",
       value: cdk.Fn.join("", [
@@ -1414,6 +1712,45 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         "then set a new password.",
       ]),
     });
+
+    // ── IM 加装项的 Outputs ──
+    // Webhook 地址是**部署后必做的一步**（要粘到飞书/Slack 的后台），所以它必须是
+    // Outputs 里的一行，而不是"去 API Gateway 控制台找那个 HTTP API 的调用地址"。
+    if (im.feishuWebhookUrl) {
+      const o = new cdk.CfnOutput(this, "FeishuWebhookUrl", {
+        description:
+          "Paste this into the Feishu/Lark developer console as the request URL for BOTH " +
+          "'Events' and 'Card callbacks'",
+        value: im.feishuWebhookUrl,
+      });
+      o.condition = installFeishu;
+    }
+    if (im.slackWebhookUrl) {
+      const o = new cdk.CfnOutput(this, "SlackWebhookUrl", {
+        description:
+          "Paste this into your Slack app for all three of Event Subscriptions, Interactivity " +
+          "and Slash Commands",
+        value: im.slackWebhookUrl,
+      });
+      o.condition = installSlack;
+    }
+    // 为什么单独一行「凭证放哪」：webhook 地址填好了但 secret 是空的时候，ingress 在
+    // 冷启动就失败（fail-fast，见 lambda_ingress.py 文件头），而客户在 IM 里看到的
+    // 只是"机器人不回话" —— 完全看不出缺的是凭证。
+    const imFeishuNextSteps =
+      "Open the admin console (ChatUrl > Admin > IM integration) and enter the Feishu app id, " +
+      "app secret, Encrypt Key and Verification Token. Then paste FeishuWebhookUrl into the " +
+      "Feishu console under Events and Card callbacks. The bot stays silent until both are done.";
+    const imSlackNextSteps =
+      "Create two secrets in AWS Secrets Manager -- 'notiops/slack-bot-token' (your xoxb- bot " +
+      "token) and 'notiops/slack-signing-secret' (the app signing secret), each a plain string " +
+      "-- then paste SlackWebhookUrl into your Slack app. The bot stays silent until both are done.";
+    const imNextSteps = new cdk.CfnOutput(this, "ImNextSteps", {
+      description: "Finish wiring up the chat bot you chose to install",
+      value: cdk.Fn.conditionIf(installFeishu.logicalId, imFeishuNextSteps, imSlackNextSteps).toString(),
+    });
+    imNextSteps.condition = installIm;
+
     new cdk.CfnOutput(this, "InstalledRelease", { description: "NotiOps release deployed by this stack", value: releaseTag });
     new cdk.CfnOutput(this, "DataRetentionOnDelete", {
       description: "What deleting this stack does to your data",
@@ -1447,12 +1784,12 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         ).toString(),
       ).toString(),
     });
-    // 长期记忆：这个 Output 的价值不是让客户去用这个 id，而是给发布回归一个**能核对的判据**。
-    // 历史教训是「长期记忆没生效」完全是静默的 ——
+    // 会话记忆：这个 Output 的价值不是让客户去用这个 id，而是给发布回归一个**能核对的判据**。
+    // 历史教训是「记忆没生效」完全是静默的 ——
     // 界面上历史照常显示，只有模型不记得了。把 id 摊出来，就能一条命令核对：
     // 这个 id 和 runtime 环境变量 MEMORY_NOTIOPSWEBCHATMEMORY_ID 的值必须相同。
     new cdk.CfnOutput(this, "MemoryId", {
-      description: "AgentCore Memory backing long-term memory (must match the runtime's MEMORY_NOTIOPSWEBCHATMEMORY_ID)",
+      description: "AgentCore Memory backing within-session conversation memory (must match the runtime's MEMORY_NOTIOPSWEBCHATMEMORY_ID)",
       value: memory.getAtt("MemoryId").toString(),
     });
     // 联网搜索同理：不写清楚的话，「开关点了没结果」这种情况客户只能猜。

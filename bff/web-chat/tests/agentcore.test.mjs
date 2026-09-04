@@ -77,6 +77,38 @@ t("session id meets the 33-char runtime minimum", () => {
   assert.ok(toSessionId("").length >= 33);
 });
 
+/* ── 会话预热（warmup）──
+ *
+ * 两条判据，理由都是"别把真实那一轮弄坏"：
+ *   ① 不预热时 payload 必须与改动前**逐字节一致**（warmup 字段缺席，不是 false）——
+ *      runtime 的分支写的是 `payload.get("warmup") is True`，多一个 false 字段虽不改
+ *      行为，却会让"预热改动没有碰到正常路径"这句话不再成立（也影响 payload 快照对比）。
+ *   ② 预热与真实那一轮必须落到**同一个 runtimeSessionId**：AgentCore 按它路由到具体
+ *      microVM，id 不同就是热了另一个容器、白等 10s。所以 toSessionId 必须是纯函数。
+ */
+t("warmup flag is absent unless asked for", () => {
+  assert.equal("warmup" in wire({}), false);
+  assert.equal("warmup" in wire({ warmup: false }), false);
+  assert.equal("warmup" in wire({ warmup: 0 }), false);
+});
+
+t("warmup:true is carried as a real boolean true", () => {
+  assert.equal(wire({ warmup: true }).warmup, true);
+});
+
+t("warmup payload keeps the agent-cache-key fields (or the real turn rebuilds the agent)", () => {
+  const p = wire({ warmup: true, model: "gpt-5-6", topic: "finops", accountId: "123456789012", devopsAgent: true });
+  assert.equal(p.model, "gpt-5-6");
+  assert.equal(p.topic, "finops");
+  assert.equal(p.account_id, "123456789012");
+  assert.equal(p.devops_agent, true);
+});
+
+t("same conversation id always maps to the same runtime session id", () => {
+  assert.equal(toSessionId("c-abc"), toSessionId("c-abc"));
+  assert.notEqual(toSessionId("c-abc"), toSessionId("c-abd"));
+});
+
 /* ── extract()：序列化失败的退化产物绝不能当正文 ──
  *
  * 实测事故（Grok 一句"你好"）：回答里出现一坨
@@ -152,6 +184,63 @@ t("业务/工具返回里的 error 字段不误判成 runtime 崩了", () => {
 
 t("正常事件不带 error", () => {
   assert.equal(extract({ event: { contentBlockDelta: { delta: { text: "hi" } } } }).error, undefined);
+});
+
+/* ── extract()：via（答案来源）──
+ *
+ * agent 的内置确定性回答（「你能做什么」，见 capability.py）**一个 token 都不过模型**。
+ * 若这一帧丢了，前端会按缺省把它署名成「AWS Bedrock (某模型)」—— 把一段产品文案说成
+ * 模型生成的能力自述，等于把来源说错（与 via="devops-agent" 同一个道理）。
+ * 所以这里既要认得 via，也要保证它**不进正文**、不被别的字段误触发。
+ */
+console.log("\nagentcore — extract(): via（答案来源）");
+
+t("认得 via 帧且不当正文", () => {
+  const e = extract({ via: "builtin" });
+  assert.equal(e.via, "builtin");
+  assert.equal(e.text, "");
+});
+
+t("没有 via 的事件不凭空产生 via", () => {
+  assert.equal(extract({ event: { contentBlockDelta: { delta: { text: "hi" } } } }).via, undefined);
+  assert.equal(extract("plain text").via, undefined);
+});
+
+t("空/非字符串 via 一律忽略（宁可回落缺省署名，也不写一个空来源）", () => {
+  for (const bad of ["", null, 0, false, {}, [], 1]) {
+    assert.equal(extract({ via: bad }).via, undefined, `via=${JSON.stringify(bad)} leaked`);
+  }
+});
+
+t("warmup ack 帧不产生任何正文（否则会被吐进聊天窗口）", () => {
+  const e = extract({ warmup: "ok" });
+  assert.equal(e.text, "");
+  assert.equal(e.via, undefined);
+  assert.equal(e.error, undefined);
+});
+
+t("thinking_step 帧被提取出来（右侧「思考过程」面板的数据源）", () => {
+  const e = extract({ thinking_step: { text: "调用 get_cost_and_usage", kind: "tool" } });
+  assert.equal(e.thinkingStep.text, "调用 get_cost_and_usage");
+  assert.equal(e.thinkingStep.kind, "tool");
+  assert.equal(e.text, "", "过程记录不许混进答案正文");
+});
+
+t("非对象的 thinking_step 一律忽略（宁可没有过程，也不给面板喂脏数据）", () => {
+  for (const bad of ["x", 1, true, null]) {
+    assert.equal(extract({ thinking_step: bad }).thinkingStep, null, `thinking_step=${JSON.stringify(bad)} leaked`);
+  }
+});
+
+t("ready 帧只在 ready===true 时为真，且不产生正文（它只切等待期提示的阶段）", () => {
+  const e = extract({ ready: true });
+  assert.equal(e.ready, true);
+  assert.equal(e.text, "");
+  for (const bad of ["true", 1, {}, undefined]) {
+    assert.equal(extract({ ready: bad }).ready, false, `ready=${JSON.stringify(bad)} 被当成就绪`);
+  }
+  // 普通正文帧不许被误判成 ready —— 否则等待期提示会在冷启动时提前切到"已连接"。
+  assert.equal(extract({ event: { contentBlockDelta: { delta: { text: "hi" } } } }).ready, false);
 });
 
 console.log(`\n${fail === 0 ? "PASSED" : "FAILED"}: ${pass} ok, ${fail} failed`);

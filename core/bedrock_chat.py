@@ -39,6 +39,8 @@ import os
 import re
 
 import boto3
+from botocore.config import Config as _BotocoreConfig
+from contextvars import ContextVar as _ContextVar
 from .lazy_boto import LazyClient
 
 from datetime import datetime, timezone
@@ -48,7 +50,7 @@ from . import aws_pricing_mcp as _aws_pricing_mcp
 from . import aws_cost_mcp as _aws_cost_mcp
 from . import llm_pref_resolver as _llm_pref_resolver
 from . import model_catalog as _model_catalog
-# 导入即注册 bedrock 客户端的「构造前钩子」（Bedrock API Key 注入，spec task 4.5）。
+# 导入即注册 bedrock 客户端的「构造前钩子」（Bedrock API Key 注入）。
 # 必须在任何 bedrock-runtime 客户端首次构造之前完成 —— botocore 构造时快照 token provider。
 from . import bedrock_credentials as _bedrock_credentials
 from . import openai_responses_client as _openai_responses
@@ -69,14 +71,19 @@ from . import openai_responses_client as _openai_responses
 logger = logging.getLogger(__name__)
 
 # `global.*` inference profile, matching core/model_catalog.py and web chat.
-# This fallback is not theoretical: the IM ECS task does not set
-# BEDROCK_MODEL_ID (only lambda3 gets it from the CDK stack), so whatever is
-# written here is what IM actually routes through. It used to say `us.*`,
-# which meant IM traffic was US-routed while web chat was globally routed for
-# the very same alias. Unified on `global.*` (decision 2026-07).
-BEDROCK_MODEL_ID = os.environ.get(
-    "BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5"
-)
+# It used to say `us.*`, which meant IM traffic was US-routed while web chat was
+# globally routed for the very same alias. Unified on `global.*` (decision 2026-07).
+#
+# 2026-09-01: follows the catalogue default from Claude Sonnet 5 to Grok 4.6.
+# ⚠️ **Never read this constant directly** — use `_default_model_pair()` below.
+# `_invoke` / `_invoke_with_tools` dispatch on `model_kind`, and a model id
+# without its matching kind is a torn pair: a Grok id reaching the
+# `bedrock_anthropic` branch sends a hand-rolled `anthropic_version` body to a
+# model that does not speak it, and every chitchat/general_qa reply dies on
+# ValidationException. That is precisely the class of bug this env var used to
+# invite, which is why the raw value is no longer usable on its own.
+_BEDROCK_MODEL_ID_ENV = os.environ.get("BEDROCK_MODEL_ID", "").strip()
+BEDROCK_MODEL_ID = _BEDROCK_MODEL_ID_ENV or "global.xai.grok-4.6"
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
 
 # Hard input cap so a malicious / very long prompt can't blow up cost or
@@ -112,10 +119,96 @@ def _max_output_tokens_for(model_id: str | None) -> int:
         return _MAX_OUTPUT_TOKENS_FALLBACK
     return entry.max_output_tokens
 
+
+def _default_model_pair() -> tuple[str, str]:
+    """``(model_id, model_kind)`` for the "caller resolved nothing" path.
+
+    Always a **matched pair**, which is the whole point. `respond()` resolves a
+    full triple from the catalogue, so in production this is unreachable; it
+    exists for the defensive `model_id=None` default arg on `_invoke` /
+    `_invoke_with_tools`. Before 2026-09-01 that path took the bare
+    `BEDROCK_MODEL_ID` string and left `model_kind` at its
+    ``"bedrock_anthropic"`` default — fine while the constant was a Claude id,
+    a guaranteed ValidationException the moment it wasn't.
+    """
+    if _BEDROCK_MODEL_ID_ENV:
+        entry = _model_catalog.find_by_model_id(_BEDROCK_MODEL_ID_ENV)
+        if entry is not None:
+            return entry.model_id, entry.kind
+        # An id we can't find in the catalogue: its wire protocol is genuinely
+        # unknown. Anthropic Messages is the historical assumption, so keep it —
+        # but say so, because if it's wrong the symptom ("model identifier is
+        # invalid") reads like the model doesn't exist rather than like a
+        # protocol mismatch.
+        logger.warning(
+            "bedrock_chat: BEDROCK_MODEL_ID is not in the catalogue; assuming "
+            "the Anthropic Messages protocol for it")
+        return _BEDROCK_MODEL_ID_ENV, "bedrock_anthropic"
+    entry = _model_catalog.get(_model_catalog.DEFAULT_ALIAS)
+    return entry.model_id, entry.kind
+
+
+# ── 超时 ────────────────────────────────────────────────────────────────────
+# **Bedrock 服务端没有客户可配的推理超时**，这条线的超时全部在客户端（botocore）。
+# 而这里此前一个字都没配，吃的是 botocore 的默认 `read_timeout=60`。
+#
+# ⚠️ 60s 在这条路上比 web 那条更致命：本模块的调用**全是非流式**
+# （`invoke_model` / `converse`，无 `*_stream`），所以 60s 卡的不是「下一个 chunk」，
+# 而是**整个回答生成完的总时长**。Grok / GLM 这类先长推理再一次性吐字的模型，
+# 在 IM 里问一个稍复杂的问题就会直接 ReadTimeoutError。
+#
+# 300s 与 web 侧 `model/load.py` 的 `BEDROCK_READ_TIMEOUT_SEC` 取同一个数（两处
+# 改动要一起做）。上界依据：worker Lambda
+# 是 900s（infra/lib/im-stack.ts），`max_attempts=2` 的最坏值 600s 仍在其内。
+# 重试次数必须收紧 —— botocore 默认 legacy 模式 5 次，300×5=1500s > 900s，
+# 结果是客户端还在重试、Lambda 先被杀，用户在 IM 里等到的是**什么都没有**。
+_BEDROCK_TIMEOUT_CONFIG = _BotocoreConfig(
+    read_timeout=300,
+    connect_timeout=10,
+    retries={"max_attempts": 2, "mode": "standard"},
+)
+
 # 惰性构造（core/lazy_boto.py）：botocore 在**构造时**快照凭证，import 期建好的
 # client 会让后续 setenv AWS_BEARER_TOKEN_BEDROCK 完全失效（Bedrock API Key 模式
 # 因此无法生效）。代理转发属性访问，所有调用点写法不变。
-_bedrock = LazyClient("bedrock-runtime", region=BEDROCK_REGION)
+# `config=` 经 LazyClient 的 `**kwargs` 原样转给 boto3.client（见 core/lazy_boto.py）。
+_bedrock = LazyClient(
+    "bedrock-runtime", region=BEDROCK_REGION, config=_BEDROCK_TIMEOUT_CONFIG)
+
+
+# ── 失败原因回传（只为「超时说超时」）────────────────────────────────────────
+# 本模块所有模型调用都是「出错就 return ""」，`respond()` 于是只知道「没拿到回答」，
+# 一律回 `chitchat.downgraded` —— 那是一段「你好，我能帮你…」的能力介绍。用户问了个
+# 真问题、等了几分钟、收到一段自我介绍，这是实测过的最差体验之一：他不知道系统等过、
+# 也不知道该拆小问题还是换模型，只会以为 bot 坏了。
+#
+# 又不能把异常一路 raise 上来：那些 `except` 是有意的「模型故障不得炸掉 IM 回复」纵深，
+# 改成透传会牵动 8 个调用点的语义。所以只回传**一个分类字符串**，够 `respond()` 挑文案。
+# 用 ContextVar 而非全局变量：Fargate router 是多会话共享进程（web 那条不是），
+# 全局变量会让 A 会话的超时污染 B 会话的回复。
+_last_model_failure: _ContextVar[str] = _ContextVar(
+    "notiops_bedrock_chat_last_failure", default="")
+
+# 「模型没在约定时间内给出内容」这一类。ConnectionClosedError / EndpointConnectionError
+# 也归进来：连接被中途掐断，对用户而言与超时无从区分，给同一句话比给「未知错误」有用。
+_TIMEOUT_EXC_NAMES = frozenset({
+    "ReadTimeoutError", "ConnectTimeoutError", "ConnectionClosedError",
+    "EndpointConnectionError", "APITimeoutError", "APIConnectionError",
+})
+
+
+def _note_model_failure(e: BaseException) -> None:
+    """记一笔模型调用失败的分类，供 `respond()` 选文案。自身绝不抛。
+
+    按**异常类名**判断，不 import botocore/openai 的异常类：这两套异常分散在
+    `botocore.exceptions` 与 `openai` 两个包，后者在 IM 这条路上是可选依赖
+    （只有 GPT 系用到），import 它就等于给整个 IM 加一个硬依赖。
+    """
+    try:
+        kind = "timeout" if type(e).__name__ in _TIMEOUT_EXC_NAMES else "other"
+        _last_model_failure.set(kind)
+    except Exception:  # noqa: BLE001 — 诊断信息不得成为故障源
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +667,7 @@ def respond(user_text: str, *, command: str,
     if command not in {"chitchat", "general_qa"}:
         return ""
 
-    # Bedrock API Key 热生效（spec R5.2 / task 4.5）。Admin 改了 Key / 切了凭证模式后，
+    # Bedrock API Key 热生效（spec R5.2）。Admin 改了 Key / 切了凭证模式后，
     # 缓存的 bedrock 客户端仍持旧凭证 —— refresh() 在 Key 变化时重建它们（未变则廉价 no-op）。
     # 放在这里而不是模块导入处：IM 是长驻 ECS 进程，必须每条消息都有机会收敛。
     _bedrock_credentials.refresh()
@@ -602,6 +695,10 @@ def respond(user_text: str, *, command: str,
         return ""
     if len(text) > _MAX_USER_TEXT_CHARS:
         text = text[:_MAX_USER_TEXT_CHARS]
+
+    # 清掉上一条消息留下的失败分类。Fargate router 复用进程，不清就会把上一轮的超时
+    # 结论安在这一轮身上（这一轮可能只是解析失败）。
+    _last_model_failure.set("")
 
     # Layer 1: inbound prefilter. Any change-request keyword → canned
     # refusal, no Bedrock call. Cheapest, strongest defense.
@@ -677,14 +774,50 @@ def respond(user_text: str, *, command: str,
 
     # ---- Final fallback: plain Bedrock invoke (no MCP at all) ----
     if not reply:
+        # 🔴 走到这里而 citations / tool_calls **非空**,意思是工具循环真的调过工具、
+        #    却没给出文本。已知三条触发路径,而且只有第一条被上面那次强制收尾轮兜住:
+        #
+        #      Converse 撞迭代上限           → _invoke_with_tools_converse 收尾轮
+        #      收尾轮自己失败(ValidationException / Throttling)
+        #      循环中途单次调用失败(ThrottlingException / 超时)后 return
+        #
+        #    下面这次 `_invoke` **不带任何工具结果**,是模型凭自身知识答的。把攒下来的
+        #    来源与工具清单原样盖上去 = 一段什么都没读的回答,盖着 AWS 官方文档的章 ——
+        #    读者拿「来源」当可信度,这比不回答坏得多。
+        #
+        #    还有第二重代价:下面那条出站审计写的是 `if not tool_calls and …`,非空的
+        #    tool_calls 会让这段**裸 invoke** 的回答绕过审计 —— 而按那段注释自己的说法,
+        #    裸 invoke 恰恰是提示注入风险最高、最需要审计的那条路径。旁路的前提
+        #    (「回答是 MCP 落地的」)在这里根本不成立。
+        #
+        #    所以两个清单一起清掉,并**如实说一句**没核对过文档(`mcp.ungrounded_notice`)。
+        #    ⚠️ 别改成静默清掉:「没有来源」与「有来源但没显示」对读者是两件事。
+        ungrounded = bool(citations or tool_calls)
+        if ungrounded:
+            logger.warning(
+                "bedrock_chat: tool loop returned provenance but no text "
+                "(citations=%d, tool_calls=%d) — dropping both; the plain "
+                "invoke below reads no tool output",
+                len(citations), len(tool_calls))
+            citations, tool_calls = [], []
         reply = _invoke(text, locale=locale,
                         model_id=model_id, model_kind=model_kind)
+        if reply and ungrounded:
+            from . import i18n as _i18n
+            reply = reply.rstrip() + "\n\n" + _i18n.t(
+                "mcp.ungrounded_notice", locale)
 
     if not reply:
         # Bedrock unavailable / parse failed — fall back to canned
         # phrasing. Never leak any kind of "service is down" message
         # that suggests the user retry into a real action path.
         from . import i18n as _i18n
+        if _last_model_failure.get() == "timeout":
+            # 超时单独说。回 `chitchat.downgraded`（一段能力介绍）等于让用户以为
+            # 自己的问题被无视了；这里如实说「等了 5 分钟没等到」并给可执行的下一步。
+            # 不追加 `_maybe_append_guidance` 的引导语 —— 那是给「聊天太多」用的。
+            logger.warning("bedrock_chat: model call timed out (model=%s)", model_id)
+            return _i18n.t("chitchat.model_timeout", locale)
         return _maybe_append_guidance(
             _i18n.t("chitchat.downgraded", locale), chitchat_count, locale)
 
@@ -728,8 +861,8 @@ def respond(user_text: str, *, command: str,
     # model + provider produced it, so users always know they're
     # reading model output (not curated content). Uses the per-call
     # model_label resolved at the top so a chat that has switched
-    # to Nova or GPT shows the right name even though the global
-    # `BEDROCK_MODEL_ID` env still points at Claude.
+    # to Nova or GPT shows the right name regardless of what the
+    # deployment-wide default happens to be.
     # 归因须含访问路径 Amazon Bedrock（第三方模型 Claude/GPT/Nova 均经 Bedrock 访问，
     # 非直连厂商 API），与 Web 端落款 "AWS Bedrock (...)" 一致（GenAI 合规归因要求）。
     reply = reply.rstrip() + "\n\nBy " + model_label + " (via Amazon Bedrock)"
@@ -737,7 +870,7 @@ def respond(user_text: str, *, command: str,
     return _maybe_append_guidance(reply, chitchat_count, locale)
 
 
-# Removed 2026-08 (spec task 4.4): `_MODEL_FRIENDLY_NAMES` / `_friendly_model_name()`
+# Removed 2026-08: `_MODEL_FRIENDLY_NAMES` / `_friendly_model_name()`
 # / `_model_footer()`. That trio was a second, hardcoded model-id → label map that
 # had no callers left — the live byline is built in `respond()` from the catalogue's
 # own label (`model_entry.label`), which now comes from DynamoDB. Keeping a parallel
@@ -1064,6 +1197,17 @@ _MAX_TOOL_ITERATIONS = 8
 # their own per-tool caps, so this is the OUTER bound only.
 _MAX_TOOL_RESULT_CHARS = 8000
 
+# 迭代预算用尽时塞给模型的最后一句话(「强制收尾轮」的 user turn)。
+#
+# 提成常量而不是在两条循环里各写一遍:Anthropic 与 Converse 两条工具循环
+# 必须在这件事上完全同步,而「两份同义的长字面量」正是它们上次走散的原因 ——
+# Converse 那条压根没有收尾轮(见 `_invoke_with_tools_converse` 末尾的注释)。
+_FORCED_SUMMARY_NUDGE = (
+    "基于以上工具结果直接回答用户的问题。如果数据足够,给出"
+    "答案;如果不足,告知客户哪些维度还需要他补充(region / "
+    "instance type / time window 等)。不要再请求新的工具。"
+)
+
 
 def _build_tools_for_call() -> list[dict]:
     """Tools sent to Bedrock with each invoke.
@@ -1098,6 +1242,15 @@ def _sidecar_enabled(name: str) -> bool:
       - cost    : DEFAULT ON  (same)
       - wa      : DEFAULT OFF (well-architected-security sidecar was
                   retired 2026-05-30, kept here for back-compat)
+
+    ⚠️ Those sidecars only ever existed as Fargate sidecar containers in
+    `BotStack`, which was retired on 2026-09-03 (IM refactor M2). The IM
+    Lambda path pins `AWS_MCP_PRICING_ENABLED=false` /
+    `AWS_MCP_COST_ENABLED=false` explicitly (`infra/lib/constructs/im-core.ts`)
+    because there is no sidecar to talk to — so in production these two
+    defaults are never the value in effect. They stay ON here for the
+    long-connection rollback path (`infra/lib/bot-stack.ts` is still in the
+    repo) and for local runs that start the sidecars by hand.
 
     Override semantics: setting `AWS_MCP_<NAME>_ENABLED=false` (or
     `0` / `no` / `off`) explicitly disables that sidecar's tools
@@ -1157,6 +1310,14 @@ def _invoke_with_tools(user_text: str, locale: str = "en",
         Responses API protocol, with stateful previous_response_id
         chaining). Lives in core/openai_responses_client.py.
     """
+    # Resolve **before** dispatching on kind: the fallback carries its own kind,
+    # and picking the branch first would strand a Converse-only model on the
+    # Anthropic body. See `_default_model_pair()`.
+    if model_id is None:
+        model_id, model_kind = _default_model_pair()
+        logger.info("bedrock_chat: no model resolved by caller, using %s (%s)",
+                    model_id, model_kind)
+
     if model_kind == "bedrock_mantle_responses":
         return _invoke_with_tools_responses(user_text, locale, model_id=model_id)
 
@@ -1164,8 +1325,6 @@ def _invoke_with_tools(user_text: str, locale: str = "en",
         return _invoke_with_tools_converse(user_text, locale, model_id=model_id)
 
     # Default: bedrock_anthropic — the original implementation.
-    if model_id is None:
-        model_id = BEDROCK_MODEL_ID
     messages: list[dict] = [{"role": "user", "content": user_text}]
     citations: list[dict] = []
     seen_urls: set[str] = set()
@@ -1233,6 +1392,7 @@ def _invoke_with_tools(user_text: str, locale: str = "en",
         except Exception as e:
             logger.warning("bedrock_chat: tool-use invoke iter %d failed: %s",
                            it, e)
+            _note_model_failure(e)
             return "", citations, tool_calls
 
         stop_reason = data.get("stop_reason")
@@ -1317,12 +1477,7 @@ def _invoke_with_tools(user_text: str, locale: str = "en",
     # tool_calls for the `🔧 调用的 MCP 工具` block.
     logger.warning("bedrock_chat: tool-use loop exhausted %d iterations — "
                    "forcing summary turn", _MAX_TOOL_ITERATIONS)
-    messages.append({
-        "role": "user",
-        "content": ("基于以上工具结果直接回答用户的问题。如果数据足够,给出"
-                    "答案;如果不足,告知客户哪些维度还需要他补充(region / "
-                    "instance type / time window 等)。不要再请求新的工具。"),
-    })
+    messages.append({"role": "user", "content": _FORCED_SUMMARY_NUDGE})
     try:
         body = {
             "anthropic_version": "bedrock-2023-05-31",
@@ -1346,6 +1501,7 @@ def _invoke_with_tools(user_text: str, locale: str = "en",
         return text_out, citations, tool_calls
     except Exception as e:
         logger.warning("bedrock_chat: forced-summary invoke failed: %s", e)
+        _note_model_failure(e)
         return "", citations, tool_calls
 
 
@@ -1543,10 +1699,13 @@ def _invoke(user_text: str, locale: str = "en",
       - ``bedrock_mantle_responses``: OpenAI Responses API on
         bedrock-mantle endpoint (GPT-5.x family)
     """
+    # Resolve **before** dispatching on kind — see `_invoke_with_tools`.
+    if model_id is None:
+        model_id, model_kind = _default_model_pair()
+        logger.info("bedrock_chat: no model resolved by caller, using %s (%s)",
+                    model_id, model_kind)
+
     if model_kind == "bedrock_mantle_responses":
-        if model_id is None:
-            logger.warning("bedrock_chat: _invoke responses missing model_id")
-            return ""
         try:
             resp = _openai_responses.call_responses(
                 model_id=model_id,
@@ -1555,11 +1714,9 @@ def _invoke(user_text: str, locale: str = "en",
             )
         except Exception as e:
             logger.warning("bedrock_chat: openai responses invoke failed: %s", e)
+            _note_model_failure(e)
             return ""
         return _openai_responses.extract_text(resp)
-
-    if model_id is None:
-        model_id = BEDROCK_MODEL_ID
 
     if model_kind == "bedrock_converse":
         return _invoke_converse(user_text, locale, model_id=model_id)
@@ -1585,6 +1742,7 @@ def _invoke(user_text: str, locale: str = "en",
         return ""
     except Exception as e:
         logger.warning("bedrock_chat: invoke failed: %s", e)
+        _note_model_failure(e)
         return ""
 
 
@@ -1612,6 +1770,7 @@ def _invoke_converse(user_text: str, locale: str,
         )
     except Exception as e:
         logger.warning("bedrock_chat: converse failed: %s", e)
+        _note_model_failure(e)
         return ""
     # Diagnostic: surface stopReason + token usage for the single-shot
     # converse path the same way we now do for the tool-use loop. Lets
@@ -1654,9 +1813,10 @@ def _invoke_with_tools_converse(user_text: str, locale: str,
     are echoed as ``content[*].toolResult`` user messages. Otherwise
     the iteration logic is identical to the Anthropic loop."""
     if model_id is None:
-        # Caller should always pass a model_id when kind=bedrock_converse;
-        # falling back to BEDROCK_MODEL_ID would silently route Nova traffic
-        # to a Claude model id and 400 at the API layer.
+        # Caller should always pass a model_id when kind=bedrock_converse.
+        # Aborting is deliberate: substituting some other default here would
+        # route this chat's traffic to a model the user did not pick, and if the
+        # substitute's protocol differs it 400s at the API layer anyway.
         logger.warning("bedrock_chat: converse loop missing model_id, aborting")
         return ("", [], [])
 
@@ -1699,6 +1859,7 @@ def _invoke_with_tools_converse(user_text: str, locale: str,
             logger.warning(
                 "bedrock_chat: converse tool-use iter %d failed: %s", it, e,
             )
+            _note_model_failure(e)
             return ("", citations, tool_calls)
 
         stop_reason = resp.get("stopReason", "")
@@ -1767,12 +1928,76 @@ def _invoke_with_tools_converse(user_text: str, locale: str,
 
         messages.append({"role": "user", "content": result_blocks})
 
-    # Hit iteration cap — return whatever we accumulated.
-    logger.info(
-        "bedrock_chat: converse tool-use hit iteration cap (%d)",
-        _MAX_TOOL_ITERATIONS,
-    )
-    return ("", citations, tool_calls)
+    # 迭代预算用尽:模型还想再调工具,但额度没了。**不能**直接 return ""。
+    #
+    # 静默失败的形态(实测):`respond()` 看到 reply 空但 tool_calls 非空,于是
+    # 跳过 P1、掉到「最后兜底 plain `_invoke`」—— 那一次调用**不带任何工具结果**,
+    # 这 8 轮真实取回的文档全被丢掉;可 `citations` / `tool_calls` 还在,末尾照样
+    # 拼上 `📚 来源` 和 `🔧 调用的 MCP 工具`。用户读到的是一段没看过任何文档的
+    # 回答,盖着权威 AWS 文档引用的章 —— 归因错误,比答不出来更坏。
+    #
+    # Anthropic 那条循环早就为此加了「强制收尾轮」,Converse 这条一直漏着。
+    # 2026-09-01 默认模型换成 Grok 4.6(kind=bedrock_converse)之后,漏的这条
+    # 从「只有手动切 Nova 的人会碰到」变成了**默认路径**。
+    #
+    # 收尾轮的请求形状**不能照抄** Anthropic 那条,Converse 有两条硬规则:
+    #
+    #   1) 角色必须严格 user / assistant 交替。循环退出时 `messages[-1]` 已经是
+    #      一条 user(装着 toolResult),再 append 一条 user 就是两条相邻 user,
+    #      Converse 判 ValidationException。所以 nudge **并进**那条已有的 user
+    #      消息,当作它的最后一个 text block,而不是新开一轮。
+    #      (Anthropic Messages API 明确允许相邻同角色消息并自动合并,所以
+    #       `_invoke_with_tools` 那条 append 是对的 —— 两条协议在这件事上的
+    #       差别,正是这段不能与它共用一份代码的原因。)
+    #   2) messages 里只要还带着 toolUse / toolResult block,就必须同时给
+    #      toolConfig,否则同样 ValidationException。所以收尾轮**照旧挂工具**,
+    #      靠 nudge 文案让模型收手 —— 与 Anthropic 那条「刻意不带 tools」相反。
+    #      模型真不收手(又只回 toolUse、没有文本)时,下面会打 WARNING 并退回
+    #      「返回空串」的旧行为:不比修复前更坏,而且在日志里留得下痕迹。
+    #
+    # 这两条都是「请求被 API 拒掉」类失败:一旦踩中,except 会把收尾轮悄悄吞成
+    # 空串,归因缺陷原样复现,而单测里的 fake 客户端不做形状校验、照样是绿的。
+    logger.warning("bedrock_chat: converse tool-use loop exhausted %d "
+                   "iterations — forcing summary turn", _MAX_TOOL_ITERATIONS)
+    if messages and messages[-1].get("role") == "user":
+        messages[-1] = {
+            "role": "user",
+            "content": list(messages[-1].get("content") or [])
+                       + [{"text": _FORCED_SUMMARY_NUDGE}],
+        }
+    else:
+        # 走不到:上面每轮都以一条 user(toolResult)结尾。留着是因为「拼错角色
+        # 顺序」的代价是整轮被 API 拒掉,而不是少一句提示。
+        messages.append({"role": "user",
+                         "content": [{"text": _FORCED_SUMMARY_NUDGE}]})
+    try:
+        resp = _bedrock.converse(
+            modelId=model_id,
+            system=[{"text": system_text}],
+            messages=messages,
+            toolConfig={"tools": converse_tools} if converse_tools else None,
+            inferenceConfig={"maxTokens": _max_output_tokens_for(model_id)},
+        )
+        content = (resp.get("output", {}).get("message", {}) or {}
+                   ).get("content", []) or []
+        final_text = "\n".join(
+            (b.get("text") or "").strip()
+            for b in content if b.get("text")
+        ).strip()
+        if not final_text:
+            # 收尾轮又要工具 / 只回空文本。归因块(来源 + 工具列表)会被
+            # respond() 连同空 reply 一起丢掉,所以这条必须能在日志里查到。
+            logger.warning(
+                "bedrock_chat: converse forced-summary turn returned no text "
+                "(stop=%s) — falling back to empty reply", resp.get("stopReason"))
+        return (final_text, citations, tool_calls)
+    except Exception as e:
+        # 与循环体内同一套语义:模型调用出错不得炸掉 IM 回复,只回传失败分类,
+        # 由 `respond()` 决定文案(超时说超时)。
+        logger.warning(
+            "bedrock_chat: converse forced-summary invoke failed: %s", e)
+        _note_model_failure(e)
+        return ("", citations, tool_calls)
 
 
 # ---------------------------------------------------------------------------

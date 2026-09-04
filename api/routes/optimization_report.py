@@ -16,6 +16,7 @@ from shared.queries.optimization import (
 )
 from shared.queries.metrics import get_monitoring_history
 from api.routes._export_util import csv_safe_row
+from api.errors import NotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -82,11 +83,11 @@ def _get_detail(account_id: str, instance_id: str, query_params: dict) -> dict:
     """优化报告详情。按全键点查。"""
     report_date = query_params.get("report_date") or get_latest_optimization_date()
     if not report_date:
-        raise KeyError(f"Optimization report for {account_id}/{instance_id} not found")
+        raise NotFoundError(f"Optimization report for {account_id}/{instance_id} not found")
 
     report = get_optimization_report(account_id, report_date, instance_id)
     if not report:
-        raise KeyError(f"Optimization report for {account_id}/{instance_id} not found")
+        raise NotFoundError(f"Optimization report for {account_id}/{instance_id} not found")
 
     # 查询关联的监控数据（最近 7 天）
     rt = report.get("resource_type", "rds")

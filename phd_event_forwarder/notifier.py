@@ -1,8 +1,6 @@
 """IM notification module (PHD Event Forwarder).
 
 Uses shared.feishu_sender to push PHD event messages to Feishu.
-
-Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6
 """
 
 import logging

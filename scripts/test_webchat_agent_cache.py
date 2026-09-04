@@ -1,5 +1,5 @@
 """
-webchat Agent 实例缓存测试（spec task 3.2 / 3.3 验收）。
+webchat Agent 实例缓存测试（验收）。
 
 钉住两件事：
 
@@ -171,7 +171,7 @@ def test_account_key_normalisation():
     k_none = ac.build_key(generation=gen, session_id="s1", user_id="u1",
                           cross_account=False, account_id=None)
     k_self = ac.build_key(generation=gen, session_id="s1", user_id="u1",
-                          cross_account=False, account_id="111122223333")
+                          cross_account=False, account_id="444455556666")
     _check("non-cross-account collapses to the same key regardless of account_id",
            k_none == k_self, f"{k_none} != {k_self}")
     # 用「包含该段」而不是「以该段结尾」：键尾会追加新维度（cred_epoch 就是这么加的），
@@ -180,8 +180,8 @@ def test_account_key_normalisation():
            "/self/" in k_none, k_none)
 
     k_x = ac.build_key(generation=gen, session_id="s1", user_id="u1",
-                       cross_account=True, account_id=" 444455556666 ")
-    _check("cross-account uses the stripped account id", "/444455556666/" in k_x, k_x)
+                       cross_account=True, account_id=" 111122223333 ")
+    _check("cross-account uses the stripped account id", "/111122223333/" in k_x, k_x)
     _check("cross-account key differs from self key", k_x != k_none)
 
     # 空账号 + cross_account=True 不得抛异常（上游判定异常时的兜底）

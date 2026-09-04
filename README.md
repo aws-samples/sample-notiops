@@ -26,10 +26,16 @@ switchable.
 
 All models are served through **Amazon Bedrock** (managed security, compliance,
 and cost controls), with per-session model switching and automatic
-English/Chinese localization. A **zero-change promise** is enforced by a
-three-layer guardrail (inbound filter → system prompt → outbound audit): the
-assistant reads and reasons, but never mutates your cloud — safe to hand to
-on-call engineers without granting write access.
+English/Chinese localization. The **zero-change promise** rests on a read-only
+IAM role as its hard boundary — both entry points reach your account through it,
+and no write permission on your infrastructure is ever granted — with defense in depth layered on top,
+differently per entry point: on the web, tool-level read-only enforcement plus a
+command-level denylist (for actions that are technically reads but shouldn't be,
+such as `get-secret-value`) plus a strictly read-only system prompt; on IM, a
+direct call to the read-only AWS DevOps Agent with a strong-mutation-wording
+regex as a second gate on the NotiOps side. The assistant reads and reasons, but
+never mutates your cloud — safe to hand to on-call engineers without granting
+write access.
 
 ---
 
@@ -37,10 +43,10 @@ on-call engineers without granting write access.
 
 | Doc | Purpose |
 |---|---|
-| 🚀 [One-click Deploy](docs/DEPLOYMENT_ONECLICK.en.md) | Browser only: upload one CloudFormation template, about 5 minutes to a running Web Chat (Web Chat only) |
+| 🚀 [One-click Deploy](docs/DEPLOYMENT_ONECLICK.en.md) | Browser only: upload one CloudFormation template, about 5 minutes to a running Web Chat (optionally plus one IM bot — Feishu/Lark or Slack) |
 | 🛠 [Deployment Guide](docs/DEPLOYMENT.en.md) | Full install: step-by-step from `./setup.sh` to first smoke test (web console + optional IM) |
 | 👤 [User Guide](docs/USER_GUIDE.en.md) | End-user manual + conversation samples + FAQ |
-| 🏗 [Technical Design](docs/TECHNICAL_DESIGN.en.md) | Module boundaries / data flow / security / 3-layer defense |
+| 🏗 [Technical Design](docs/TECHNICAL_DESIGN.en.md) | Module boundaries / data flow / security / read-only defense in depth |
 | 🧑‍💻 [CONTRIBUTING](CONTRIBUTING.md) | Conventions (i18n / security / PR process) |
 
 ---
@@ -76,9 +82,14 @@ on-call engineers without granting write access.
   (managed security, compliance, and cost controls), on either IAM or a Bedrock
   API key
 - 🌍 **Bilingual**: Chinese / English auto-detect + explicit switching
-- 🛡 **Zero-Change Promise**: 3-layer defense (inbound regex / system prompt /
-  outbound audit) — the assistant never mutates your cloud
-- 💬 **IM channels**: Slack / Feishu full-feature
+- 🛡 **Zero-Change Promise**: a read-only IAM role as the hard boundary, then
+  defense in depth per entry point — web: tool-level read-only + command denylist
+  + read-only system prompt; IM: the read-only DevOps Agent + a mutation-wording
+  regex second gate — the assistant never mutates your cloud
+- 💬 **IM channels**: Slack / Feishu full-feature — a card comes back **immediately** after you
+  ask, and progress / thinking / the answer all refresh **in that same card** (the seconds in
+  its title are the "still running" signal); when a deep investigation finishes, its report
+  card is posted back to the conversation that started it
 
 ---
 
@@ -89,8 +100,8 @@ Two ways to deploy — pick one.
 ### Option A: one-click deploy — a browser is all you need
 
 For environments where long-lived access keys aren't available, or where you
-can't install CDK and a container runtime locally: everything happens in the AWS
-Console, nothing is installed on your machine.
+can't install the CDK locally: everything happens in the AWS Console, nothing is
+installed on your machine.
 
 1. Download `notiops-webchat.template.json` from
    [Releases](https://github.com/aws-samples/sample-notiops/releases/latest);
@@ -99,20 +110,27 @@ Console, nothing is installed on your machine.
    the IAM capabilities acknowledgement, and create — measured at about 5 minutes.
    The stack outputs include the Web Chat URL.
 
-Two optional parameters are worth knowing about: **deep investigation** (AWS
-DevOps Agent — on by default, free while idle, and silently skipped instead of
-failing the stack in Regions that don't have it) and **deployment mode** (single
-account by default; pick multi-account and supply your organization id to run
-read-only investigations across other accounts in the organization — requires
-deploying from the organization management account or a StackSets delegated
-administrator).
+Three optional parameters are worth knowing about:
 
-⚠️ One-click deploys **Web Chat only** (frontend + BFF + agent). It does **not**
-include the IM bots, scheduled inspections, the admin dashboard, or CUR/Athena
-FinOps — use Option B for those. Prerequisites (region and Bedrock model access),
-a parameter-by-parameter walkthrough, the resource and cost breakdown,
+- **What to install** (`InstallOption`, default `web`) — a three-way dropdown: `web` /
+  `web+feishu` / `web+slack`. **All three install Web Chat**; the latter two add **one** IM
+  bot (@-mention it in a group, or DM it — after deploying you still fill in a request URL on
+  the IM platform and put the credentials into Secrets Manager). You can update the stack to
+  a different value later.
+- **Deep investigation** (AWS DevOps Agent — on by default, free while idle, and silently
+  skipped instead of failing the stack in Regions that don't have it).
+- **Deployment mode** (single account by default; pick multi-account and supply your
+  organization id to run read-only investigations across other accounts in the organization —
+  requires deploying from the organization management account or a StackSets delegated
+  administrator).
+
+⚠️ One-click deploys **Web Chat plus at most one IM bot**. It does **not** include scheduled
+inspections and proactive push, the admin dashboard, or CUR/Athena FinOps, and one stack can
+only carry one IM platform — use Option B for those. Prerequisites (region and Bedrock model
+access), a parameter-by-parameter walkthrough, the resource and cost breakdown,
 upgrade/rollback, and one-click teardown are in
-[docs/DEPLOYMENT_ONECLICK.en.md](docs/DEPLOYMENT_ONECLICK.en.md).
+[docs/DEPLOYMENT_ONECLICK.en.md](docs/DEPLOYMENT_ONECLICK.en.md); the two IM setup steps are in
+[docs/IM_WEBHOOK_SETUP.en.md](docs/IM_WEBHOOK_SETUP.en.md).
 
 ### Option B: `setup.sh` — the full install
 
@@ -126,11 +144,12 @@ cd sample-notiops
 # First run: confirm AWS account → pick region → pick IM platforms
 # (Slack / Feishu, multi-select) → paste credentials for each (written
 # straight to Secrets Manager, never to disk) → CDK bootstrap → synth →
-# container build → cdk deploy --all. Re-runs only patch deltas.
+# dependency Layer build (pip, no container) → cdk deploy --all. Re-runs
+# only patch deltas.
 ```
 
-Requires git, Node.js, Python, the AWS CDK, and a container runtime locally,
-plus credentials that can deploy.
+Requires git, Node.js, Python, uv and the AWS CDK locally, plus credentials that
+can deploy — **no container runtime needed**.
 
 #### Deploy modes: single-account (default) vs multi-account
 
@@ -156,7 +175,7 @@ mode comparison and how to switch — see
 | Capability | Option A (one-click) | Option B (`setup.sh`) |
 |---|:---:|:---:|
 | **Prerequisites and timing** | | |
-| Installed locally | nothing (browser only) | git / Node / Python / **uv** / CDK / container runtime (IM bot only) |
+| Installed locally | nothing (browser only) | git / Node / Python / **uv** / CDK (**no container runtime**) |
 | Long-lived access key required | no | yes, credentials that can deploy |
 | Deploy time | about 5 minutes | 10–20 minutes (includes local builds) |
 | One-click teardown | ✅ pick `KeepData` / `DeleteEverything` on delete | ✅ `./teardown.sh` (keeps data by default, `--delete-everything` for a full wipe) |
@@ -169,10 +188,12 @@ mode comparison and how to switch — see
 | Deep investigation (Direct — token-free) | ✅ see note ¹ | ✅ |
 | DevOps Chat (your own DevOps Agent answers a general chat directly) | ✅ see note ¹ | ✅ |
 | Web search (AgentCore Web Search) | ✅ see note ² | ✅ see note ² |
-| Long-term memory (remembers your preferences and facts across sessions) | ✅ see note ³ | ✅ see note ³ |
+| Session memory (keeps context within one conversation) | ✅ see note ³ | ✅ see note ³ |
+| Cross-session memory (carries preferences and facts into the next conversation) | ❌ see note ³ | ❌ see note ³ |
 | **Cost / FinOps** | | |
 | FinOps dashboard (Cost Explorer data) | ✅ deploy account only | ✅ cross-account |
 | CUR + Athena billing-detail drill-down | ❌ | ✅ |
+| Bring your own CUR data source (4 dashboard sheets + ask about that bill in chat) | ✅ optional, see note ⁵ | ✅ optional, see note ⁵ |
 | **Cases and Skills** | | |
 | Full AWS Support case management | ✅ | ✅ |
 | 11 bundled Skills + your own | ✅ | ✅ |
@@ -181,7 +202,7 @@ mode comparison and how to switch — see
 | Multi-LLM switching + model catalogue | ✅ | ✅ |
 | Bedrock API key as the credential | ✅ | ✅ |
 | **Proactive / IM** | | |
-| IM channels (Slack / Feishu) | ❌ | ✅ |
+| IM channels (Slack / Feishu) | ✅ one platform per stack, see note ⁴ | ✅ both at once |
 | Proactive push **to IM** (10 EventBridge sources) | ❌ | ✅ |
 | Daily scheduled inspection (idle resources / cost anomalies) | ❌ | ✅ |
 | Notification inbox (the same 10 sources, into the web inbox) | ✅ | ✅ |
@@ -209,19 +230,54 @@ mode comparison and how to switch — see
 > deploy log. Note the toggle is **not** greyed out (the UI does no Region check):
 > clicking it doesn't error, you just get no results.
 
-> ³ **Long-term memory needs v1.0.19 or later on both paths.** It uses four AgentCore
-> Memory namespaces: facts extracted from your conversations, preferences you state
-> explicitly, a summary per session, and episodes. Extraction is **asynchronous** — after
-> you state a preference, give it a minute or two before starting a new session to see it
-> honoured. ⚠️ The memory actor is currently **one identity shared by the whole
-> deployment**: facts and preferences extracted from any user's conversations are visible
-> to every signed-in user of that deployment (session summaries and episodes stay within
-> their own session, and chat history remains per user). If that is not acceptable, deploy
-> separate stacks. The memory resource carries **no retention policy**: deleting the stack
-> deletes it and everything accumulated in it. Before v1.0.19 Option A never created the
-> resource at all, and Option B had it but discarded every retrieval behind a relevance
-> threshold — both paths need this release for the feature to actually work. See the
-> release notes for details.
+> ³ **Memory is per conversation, not across conversations.** Within one conversation it
+> remembers what you discussed (AgentCore Memory stores the raw messages per session,
+> events expire after 30 days). **A new conversation starts from a clean page** — nothing
+> you said in an earlier one is carried over. That is deliberate: less data retained, and
+> more predictable behaviour ("why did it answer that?" never traces back to something you
+> said days ago and forgot). Anything it should always know belongs in the current
+> conversation, or in **explicit** configuration such as a Skill or the system prompt.
+>
+> Why the within-session layer cannot be dropped: each request carries only your latest
+> message, and the model-side session object is rebuilt whenever you switch models, switch
+> topics, or the container cold-starts — without it, switching models mid-conversation and
+> asking a follow-up would lose all context. The memory resource carries **no retention
+> policy**: deleting the stack deletes it and the session messages in it.
+> ⚠️ Releases before 2026-09 (v1.0.18 / v1.0.19) did have **cross-session** memory, and its
+> actor was one identity shared by the whole deployment (preferences extracted from any
+> user were visible to every signed-in user). Upgrading to this release removes that layer;
+> already-extracted records are deleted along with the strategies.
+
+> ⁴ **On Option A the IM bot is a dropdown on the parameters page** (`InstallOption`: `web` /
+> `web+feishu` / `web+slack`; the default installs web only). The bot and the web UI share the
+> **same read-only backend**, so you can @-mention it in a group or DM it; anything that
+> matches "look at resources / start an investigation / check progress / switch model / switch
+> language" is deterministic routing and costs **no tokens**. Two differences: (1) one stack
+> carries **one** platform (use Option B if you want both); (2) two steps stay with you after
+> deploying — put the credentials into Secrets Manager and paste the request URL back into the
+> IM platform, in that order (the `ImNextSteps` stack output reminds you), as described in
+> [docs/IM_WEBHOOK_SETUP.en.md](docs/IM_WEBHOOK_SETUP.en.md). Note this is **request/response
+> only**; pushing daily inspection reports and alerts into a group is still Option B.
+
+> ⁵ **Bringing your own CUR data source is optional, and identical on both paths.** The
+> "CUR + Athena billing-detail drill-down" row above is about **this deploy account's own**
+> bill (Option B provisions it). This row is about **a different CUR table** — a customer
+> you look after, or several payer accounts — reached through **a cost-agent MCP Lambda that
+> you deploy yourself**; that Lambda is not in this repository. Once connected, the FinOps
+> page gains 4 sheets (spend trend / credits / extended support / Savings Plans) and you can
+> ask about that bill in chat. **How you supply it**: Option A takes the parameters
+> `CostAgentMcpUrl` + `CostAgentFunctionArn`; Option B takes the environment variables
+> `COST_AGENT_MCP_URL` + `COST_AGENT_FN_ARN`. **Both values must be supplied together**: a
+> Function URL does not contain the function ARN, and invoke permission can only be granted
+> per resource, so filling in just one gives you a data source that looks installed and 403s
+> on every call — both paths therefore reject a half-configuration **before doing any work**
+> (on Option A the stack is never created). **Leave them empty** and the entry points for
+> those 4 sheets simply don't appear; nothing else is affected. **If it goes down after you
+> connect it, the tool keeps working**: only those 4 sheets say "temporarily unavailable",
+> and chat falls back to Cost Explorer, then to the read-only AWS APIs, **telling you it
+> switched data source** (different basis of measurement — don't reconcile the numbers
+> blindly). Steps for deploying that Lambda are in
+> [docs/DEPLOYMENT.en.md §14](docs/DEPLOYMENT.en.md#14-customer-cur-dashboard--cost-agent-mcp-optional).
 
 > 📋 **The AWS Support features (create / view / reply / resolve) require the
 > account to be on a Business, Enterprise On-Ramp, or Enterprise support plan** —
@@ -255,8 +311,8 @@ run the same update again with the **older** template.
 
 | | What survives |
 |---|---|
-| `KeepData` (default) | The config table, the chat-history table, and the data bucket (your Skills and reports) |
-| `DeleteEverything` | Nothing — everything goes |
+| `KeepData` (default) | The config table, the chat-history table, and the data bucket (your Skills and reports); if you installed IM, its credential secrets too |
+| `DeleteEverything` | Nothing — everything goes (**including the IM credential secrets, unrecoverably**) |
 
 ⚠️ **Two things to know:**
 
@@ -318,7 +374,7 @@ Web console (browser)        Customer IM (Slack / Feishu)
         ┌──────────────────────────────────────┐
         │   NotiOps (this repo)                 │
         │   · intent classification             │
-        │   · 3-layer read-only defense         │
+        │   · read-only defense in depth        │
         │   · case management · bilingual i18n  │
         │   · MCP doc retrieval · Bedrock routing│
         │                 │                      │

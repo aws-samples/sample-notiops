@@ -21,24 +21,25 @@
 
 | | **`setup.sh`**（完整版，见 [DEPLOYMENT.md](DEPLOYMENT.md)） | **本篇：一键部署** |
 |---|---|---|
-| 你要准备什么 | git、Node、Python、AWS CDK、Docker/finch + 一份能部署的 AWS 凭证 | **只要一个能登进 AWS 控制台的浏览器** |
+| 你要准备什么 | git、Node、Python、uv、AWS CDK + 一份能部署的 AWS 凭证(**不需要 Docker/finch** —— IM 侧 2026-09-03 / M2 之后走 Lambda Layer,不再构建镜像) | **只要一个能登进 AWS 控制台的浏览器** |
 | 怎么开始 | clone 仓库 → `./setup.sh` | 从 Release 下一个模板文件 → 在 CloudFormation 控制台上传 |
-| 部署内容 | Web Chat + IM bot（飞书/Slack）+ 每日巡检 + 管理仪表盘 + CUR/Athena FinOps 数据源 | **只有 Web Chat**（聊天界面 + BFF + agent + DevOps Agent Agent Space；可选多账号） |
-| 适合 | 长期使用、要 IM 推送和自动巡检 | 先试用 / 演示 / 只要浏览器里那个只读运维助手 |
+| 部署内容 | Web Chat + IM bot（飞书/Slack）+ 每日巡检 + 管理仪表盘 + CUR/Athena FinOps 数据源 | **Web Chat**（聊天界面 + BFF + agent + DevOps Agent Agent Space；可选多账号）**+ 可选一个 IM 机器人**（飞书/Lark 或 Slack，见 [§2.11](#211-加装-im-机器人飞书lark-或-slack)） |
+| 适合 | 长期使用、要 IM 推送和自动巡检 | 先试用 / 演示 / 只要浏览器里那个只读运维助手（想在群里 @ 它也可以） |
 
-**两条路径可以先后走**：先一键部署试用，之后想要 IM 和巡检，再按 [DEPLOYMENT.md](DEPLOYMENT.md) 跑 `setup.sh`（两边建的管理员用户名都是 `admin`，不会打架）。
+**两条路径可以先后走**：先一键部署试用（需要 IM 机器人的话直接在参数页选上，见 [§2.11](#211-加装-im-机器人飞书lark-或-slack)），之后想要自动巡检、主动推送、管理仪表盘，再按 [DEPLOYMENT.md](DEPLOYMENT.md) 跑 `setup.sh`（两边建的管理员用户名都是 `admin`，不会打架）。
 
 ### 0.1 一键部署**不包含**什么
 
 说清楚比事后惊讶好。下面这些**这条路径不部署**，需要 `setup.sh`：
 
-- **IM bot**（飞书 / Slack / 钉钉）——包括往 IM 推送告警。（同样这 10 类信号源**会**进浏览器里的「通知」收件箱，见 [§2.9](#29-通知收件箱)；不进的只是 IM。）
+- **往 IM 主动推送**：每日巡检报告、告警推到飞书/Slack 群。IM 机器人本身**可以装**（见 [§2.11](#211-加装-im-机器人飞书lark-或-slack)：你在群里 @ 它、它回你），但那是**被动应答**；主动推送要 `setup.sh` 那条路径的报告流水线。（同样这 10 类信号源**会**进浏览器里的「通知」收件箱，见 [§2.9](#29-通知收件箱)；不进的只是 IM 群。）
+- **钉钉**机器人（飞书/Lark 和 Slack 都支持）。
 - **每日自动巡检**（闲置资源检测、成本异常扫描）与它的 5 个 Lambda。
 - **管理仪表盘**（阈值配置、目标账户管理、Skills 管理界面）——一键部署只有聊天界面。
 - **CUR + Athena 成本明细数据源**：FinOps 提问仍可用 Cost Explorer 口径，但没有账单明细级下钻。
 - **跨账号的自动巡检与事件推送**：一键部署可以做**跨账号只读排查/调查/开案例**（`DeployMode=MultiAccount`，见 [§2.6](#26-可选多账号组织内跨账号)），但成员账号侧的 **CloudWatch OAM Sink** 与 **跨账号事件转发**（Health / DevOps Agent 调查事件回流）不在这条路径里 —— 那两样要 `setup.sh`。
 
-（**DevOps Agent 深度调查**、**联网搜索**、**「通知」收件箱**都**不**在此列 —— 这三样都由这个栈自动建好，分别见 [§2.7](#27-深度调查aws-devops-agent)、[§2.8](#28-联网搜索agentcore-web-search)、[§2.9](#29-通知收件箱)。）
+（**DevOps Agent 深度调查**、**联网搜索**、**「通知」收件箱**都**不**在此列 —— 这三样都由这个栈自动建好，分别见 [§2.7](#27-深度调查aws-devops-agent)、[§2.8](#28-联网搜索agentcore-web-search)、[§2.9](#29-通知收件箱)。**IM 机器人**也不在此列，它是参数页上的一个选项，见 [§2.11](#211-加装-im-机器人飞书lark-或-slack)。）
 
 ---
 
@@ -55,14 +56,14 @@
 
 agent 跑在 **Amazon Bedrock** 上。**先去 Bedrock 控制台 → Model access，确认你要用的模型在这个区域是「Access granted」**，再来开栈。
 
-- **默认模型是 Anthropic 的 Claude Sonnet 5**（`global.anthropic.claude-sonnet-5`）—— 这一个必须开通，否则装完不能用。
-- 想用别的模型（Claude Opus 5 / Haiku 4.5、Amazon Nova Pro、DeepSeek、GLM 5、xAI Grok 4.6、GPT-5.6 系列）就把对应的也一起开通；用户在聊天页右上角可以按会话切换。
+- **默认模型是 xAI 的 Grok 4.6**（`global.xai.grok-4.6`）—— 这一个必须开通，否则装完不能用。
+- 想用别的模型（Claude Sonnet 5 / Opus 5 / Haiku 4.5、Amazon Nova Pro、DeepSeek、GLM 5、GPT-5.6 系列）就把对应的也一起开通；用户在聊天页右上角可以按会话切换。
 - 推荐 **us-east-1** 或 **us-west-2**（Bedrock AgentCore 与模型覆盖最全）。
 - 没开通模型访问时，栈会**开成功**、页面能打开、登录也没问题，但一提问就报 `AccessDeniedException`。这是最常见的"部署完了不能用"。
 
 ### 1.3 这个账号要能访问 GitHub（或者准备一个私有镜像）
 
-部署过程中，栈里的一个 Lambda 会去 **GitHub Release** 下四个产物（前端、BFF、「通知」生产端、agent 代码）搬进你自己的 S3 桶。Lambda 默认不在 VPC 里、走 AWS 托管的公网出口，**绝大多数账号天然满足**。
+部署过程中，栈里的一个 Lambda 会去 **GitHub Release** 下产物（前端、BFF、「通知」生产端、agent 代码，共 4 个；选装了 IM 机器人再多 2 个）搬进你自己的 S3 桶。Lambda 默认不在 VPC 里、走 AWS 托管的公网出口，**绝大多数账号天然满足**。
 
 企业环境如果**出口白名单不含 github.com**，不必放弃这条路径 —— 见 [§7 无公网出口：用私有 S3 镜像](#7-无公网出口用私有-s3-镜像)。
 
@@ -78,7 +79,9 @@ agent 跑在 **Amazon Bedrock** 上。**先去 Bedrock 控制台 → Model acces
 notiops-webchat.template.json
 ```
 
-同一个 release 里还有四个产物（`bff.zip` / `chat-dist.zip` / `web-notif.zip` / `agent-code.zip`）——**不用下**，模板会让你的账号自己去取。模板里写死了这四个文件的 SHA256，下载后当场校验，不匹配就让开栈失败。
+同一个 release 里还有六个产物（`bff.zip` / `chat-dist.zip` / `web-notif.zip` / `im-code.zip` / `im-layer.zip` / `agent-code.zip`）——**不用下**，模板会让你的账号自己去取。模板里写死了这六个文件的 SHA256，下载后当场校验，不匹配就让开栈失败。
+
+> 两个 `im-*.zip` 只有你在参数页选了带 IM 的安装选项时才会被下载（[§2.11](#211-加装-im-机器人飞书lark-或-slack)）；默认的「只装 web」会跳过它们，不为这 ~28 MB 付流量和存储。
 
 > **为什么不是"点一下就开栈"的 Launch Stack 链接？** CloudFormation 的 `TemplateURL` 只接受
 > S3 上的对象，不接受 GitHub 的 URL。所以这里多两步点击（下载 + 上传），换来的是我们
@@ -105,8 +108,10 @@ notiops-webchat.template.json
 
 | 参数 | 默认 | 什么时候才需要改 |
 |---|---|---|
+| **What to install** | `web` | 下拉三选一：`web`（只装浏览器里的聊天界面）/ `web+feishu`（再加一个飞书/Lark 机器人）/ `web+slack`（再加一个 Slack 机器人）。**三个选项都装 web** —— IM 是加装项，不是替代项。选了带 IM 的还要在 IM 平台侧配几步，见 [§2.11](#211-加装-im-机器人飞书lark-或-slack)。**部署完也能改**（update 栈换个值即可，见 §2.11）。 |
 | **Give the agent account-wide read-only access?** | `Yes` | 选 `Yes` 会给 agent 挂上 AWS 托管的 `ReadOnlyAccess`，于是它能回答这个账号里任何资源的问题。选 `No` 则只保留精选的只读授权（成本、日志、指标、RDS/EC2 describe），有些问题会答不了并明确告诉你缺哪条 action。**两种选择都不给任何写权限。** |
 | **CORS allowed origins** | `*` | 接口本身已经是 `AWS_IAM`（SigV4）鉴权，`*` 不构成越权。想再收一层，可以在第一次部署完之后 update 栈、把它设成 `ChatUrl` 那个地址。 |
+| **IM chat/channel allow list (optional)** | 空 | 只有装了 IM 才有意义（[§2.11](#211-加装-im-机器人飞书lark-或-slack)），只装 web 可以完全不管。填逗号分隔的飞书 chat id（`oc_...`）或 Slack channel id（`C...`），**不能有空格**；留空 = 不限制，机器人被拉进的任何群都答。它是 IM 入口的一道纵深防御（[§8](#8-安全说明值得知道的几条) 里的第 ③ 道）：即使验签被绕过，来自清单外会话的消息也会在**任何模型调用之前**被丢弃。**正常节奏是先留空部署 → 建群拿到 chat id → 再 update 栈填进去**，所以它归在 `Security` 组、不在必填项里。与 `setup.sh` 路径的 `-c imAllowedChatIds=…` 等价。 |
 | **On stack delete** | `KeepData` | 决定删栈时你的数据怎么办。见 [§6 删除](#6-删除这个栈)——**改这个值有个坑，删栈前先读那一节**。 |
 | **Deployment mode** | `SingleAccount` | 想让它同时看组织里**其它**账号，就选 `MultiAccount` 并填下面的 org id。有前置条件，见 [§2.6](#26-可选多账号组织内跨账号)。 |
 | **AWS Organizations id (MultiAccount only)** | 空 | 只有选了 `MultiAccount` 才填（`o-` 开头）。**只填一半不生效**（选了 MultiAccount 但 org id 留空 = 仍是单账号），Outputs 的 `DeployModeStatus` 会告诉你。 |
@@ -117,9 +122,9 @@ notiops-webchat.template.json
 
 **Next** → 到最后一页勾上 **"I acknowledge that AWS CloudFormation might create IAM resources"** → **Submit**。
 
-**实测耗时约 4.5 分钟**（两次独立测量：4m16s / 4m25s，us-east-1）。中途你会看到栈在等两个
+**实测耗时约 4.5 分钟**（两次独立测量：4m16s / 4m25s，us-east-1，默认的「只装 web」）。中途你会看到栈在等两个
 `Custom::NotiOpsStager…` 资源 —— 那是它在把 ~165 MB 产物从 GitHub 搬进你的 S3 桶、
-解压前端、写运行时配置、建管理员用户。
+解压前端、写运行时配置、建管理员用户。选了带 IM 的安装选项会再多搬 ~28 MB、多建 3 个 Lambda（半分钟量级）。
 
 ### 2.5 登录
 
@@ -128,7 +133,8 @@ notiops-webchat.template.json
 | Output | 是什么 |
 |---|---|
 | **ChatUrl** | 聊天界面地址（CloudFront）。**打开这个。** |
-| **ChatBffUrl** | 后端接口地址（前端自己会用，你不用管） |
+| **LoginUsername** | 登录用的账号名，固定是 `admin` |
+| **LoginPassword** | 初始密码**在哪**（不是密码本身，见下面的说明） |
 | **NextSteps** | 一句话的登录指引 |
 | **InstalledRelease** | 这个栈当前装的是哪个 release |
 | **DataRetentionOnDelete** | 当前 `TeardownMode` 下，删栈会对数据做什么 |
@@ -138,11 +144,26 @@ notiops-webchat.template.json
 | **DevOpsAgentSpaceId** | 深度调查开着时才有：栈给你建的 Agent Space id。 |
 | **WebSearchStatus** | 这个区域**支持不支持**联网搜索（不是 us-east-1 就整块跳过，见 [§2.8](#28-联网搜索agentcore-web-search)）。 |
 | **WebSearchProvisioning** | 区域支持时才有：Gateway **到底建成了没有**。`enabled` = 开关可用；`unavailable (<错误码>)` = 建失败，开关点了没结果（栈本身照样成功，见 [§2.8](#28-联网搜索agentcore-web-search)）。 |
+| **FeishuWebhookUrl** | 只有选了 `web+feishu` 才有：要粘到飞书开放平台的请求地址（[§2.11](#211-加装-im-机器人飞书lark-或-slack)）。 |
+| **SlackWebhookUrl** | 只有选了 `web+slack` 才有：要粘到 Slack App 的三处 Request URL（[§2.11](#211-加装-im-机器人飞书lark-或-slack)）。 |
+| **ImNextSteps** | 只有装了 IM 才有：一句话说明你还差哪几步（凭证 + 请求地址）。**两步都做完机器人才会说话。** |
 
 邮件里那个链接就是 `ChatUrl`（和上面这张表里的 `ChatUrl` 是同一个地址，不用两边对），用：
 
-- **用户名：`admin`**（不是邮箱；邮箱也能登，它被配成了别名）
+- **用户名：`admin`**（不是邮箱；邮箱也能登，它被配成了别名）—— 也就是 Outputs 里的 `LoginUsername`
 - **密码**：邮件里的临时密码，首次登录会要求你改成新密码
+
+> 🔒 **为什么 Outputs 里没有初始密码？** 两个原因，都不是"忘了做"：
+> 1. **这个栈根本没有这个密码。** 建管理员时它不传 `TemporaryPassword`，密码由 Cognito
+>    自己生成并直接邮件下发（`infra/lambda/stager/index.py` 的 `_create_admin`），
+>    栈里无处可取。
+> 2. **就算取得到也不能放。** CFN 的 Output 是**明文**的：任何拿到
+>    `cloudformation:DescribeStacks` 的人（`ReadOnlyAccess` 就含这一条）都能读到，
+>    而且会长期留在 CloudFormation 的 API / 控制台历史里 —— 你后来改了密码，那份记录也删不掉。
+>
+> 所以 `LoginPassword` 这个 Output 给的是**去哪拿**，不是密码本身。
+> （`setup.sh` 那条路径在终端里直接打印初始密码是另一回事：那是本地一次性输出，
+> 不落任何能被别人查询的 AWS API。）
 
 > 📧 **收不到邮件？** 发件人是 `no-reply@verificationemail.com`（Cognito 默认发信），
 > 主题 `Your NotiOps sign-in details`。**企业邮箱常常给它打上 `[EXTERNAL]` 标记或直接丢进垃圾邮件**
@@ -223,34 +244,86 @@ notiops-webchat.template.json
 
 **跨账号**：这 10 条规则只收**部署账号自己**的事件。成员账号的事件要回流到这里需要跨账号事件转发，那个不在这条路径里（见 [§0.1](#01-一键部署不包含什么)）。
 
-### 2.10 长期记忆（AgentCore Memory）
+### 2.10 会话记忆（AgentCore Memory）
 
-**没有参数，栈自动建好。** 栈里有一个 **Bedrock AgentCore Memory**，agent 靠它记住跨会话的上下文：你说过的偏好（比如"回答短一点""我更关心成本"）、关于你环境的事实、以及每个会话的摘要。四类抽取各写各的命名空间：
+**没有参数，栈自动建好。** 栈里有一个 **Bedrock AgentCore Memory**，作用只有一个：把**当前这个会话**的消息按 `sessionId` 存下来、下一轮再读回去。**不跨会话** —— 新开一个会话就是干净的一页。
 
-| 抽取 | 写到哪 | 记的是什么 |
-|---|---|---|
-| 语义 | `/users/<actor>/facts` | 关于你和你环境的事实 |
-| 用户偏好 | `/users/<actor>/preferences` | 你希望它怎么回答 |
-| 摘要 | `/summaries/<actor>/<会话>` | 单个会话讲了什么 |
-| 情节 | `/episodes/<actor>/<会话>` | 一次完整的排查/分析过程 |
+- **它不是"对话历史"**：历史在 DynamoDB 里、界面上一直看得见；Memory 决定的是**模型还记不记得**。没有它，你在同一个会话里切模型 / 切主题 / 隔一小时再回来，界面上历史还在，但模型是"新人"。所以这一层不是可选项，栈里**无条件**建。
+- **不做跨会话记忆**（2026-09-01 产品决策）。以前这里挂着四个抽取 strategy，把"你说过的偏好""关于你环境的事实"写到不带会话号的命名空间（`/users/<actor>/…`），下一个会话还能检索到。现在 **strategy 数为 0**，那条路整块关闭：抽取不跑、检索不发。
+  - 少一份跨会话的数据留存，行为也更可预期（"它为什么突然这么答"不会来自你早就忘了的某句话）。想让它一直知道的事，写进 Skill / 系统提示这类**显式**配置。
+  - ⚠️ **从 v1.0.18 / v1.0.19 升上来的部署**：栈更新会删掉那四个 strategy，**已经抽取出来的记录随之删除**（原先那个 `<actor>` 还是整个部署共用的一个身份，即 A 说过的偏好会影响 B 得到的回答 —— 这也是取消它的原因之一）。
+- **事件 30 天后自动过期**（同一个会话隔天接着聊仍能接上；聊天记录本身另存在 `notiops-web-chat` 表里）。
+- **删栈时随栈删除**，会话消息一起消失。
+- 计费按用量（写入/读取的事件），量级远小于提问本身的 Bedrock token；去掉抽取之后这一项还会更小。
 
-- ⚠️ **当前版本的 `<actor>` 是整个部署共用的一个身份**（`default-user`），**不是**每个登录用户一个。也就是说：同一个部署里多人使用时，"偏好"和"事实"是**共享**的 —— A 说过的偏好会影响 B 得到的回答。会话级的摘要/情节按会话隔离，不会串。介意这一点就一人一个部署，或者暂时只给单人用。
-- **事件 30 天后自动过期**（对话原文不会无限留在这里；聊天记录本身另存在 `notiops-web-chat` 表里）。
-- **它不是"对话历史"**：历史在 DynamoDB 里、界面上一直看得见；Memory 决定的是**模型还记不记得**。没有它，你切模型 / 切主题 / 隔一小时再回来，界面上历史还在，但模型是"新人"。
-- **删栈时随栈删除**，事件与抽取结果一起消失。
-- 计费按用量（写入的事件 + 抽取出的记录），量级远小于提问本身的 Bedrock token。
+### 2.11 加装 IM 机器人（飞书/Lark 或 Slack）
+
+参数页第一组里那个 **What to install** 下拉框：
+
+| 选项 | 装出来是什么 |
+|---|---|
+| `web`（默认） | 只有浏览器里的聊天界面。 |
+| `web+feishu` | Web Chat **加**一个飞书/Lark 机器人：群里 @ 它、或者私聊它。 |
+| `web+slack` | Web Chat **加**一个 Slack 机器人：`/notiops` 斜杠命令、@ 提及、私聊。 |
+
+**三个选项都装 web** —— IM 是加装项，不是替代项。栈只装**一个** IM 平台；两个都要就走 [DEPLOYMENT.md](DEPLOYMENT.md) 的 `setup.sh`（`-c enabledPlatforms=feishu,slack`）。
+
+**IM 侧和网页侧是同一个后端**：同一个只读的 AWS DevOps Agent、同一套 Skills、同一份配置表。所以你在网页里问的那些（成本、故障调查、Support 案例）在群里问是同一个答案。
+
+**它不烧 token**：进来的每条消息先走确定性路由（正则 + 关键词，中英文都认），命中「查资源 / 发起调查 / 看进度 / 切模型 / 切语言」这些直接调 API，**一个 token 都不花**。只有**案例流程**（要把你的描述写成案例正文）才真的走大模型。
+
+**部署后还差两步**，两步都做完机器人才会说话（Outputs 里的 `ImNextSteps` 也会提醒你）：
+
+1. **凭证进 Secrets Manager** —— 机器人要有钥匙才能验签和回消息。
+   - **飞书/Lark**：`notiops/im-bot-feishu`，四个键：`app_id` / `app_secret` / `encrypt_key` / `verification_token`。
+     **推荐直接在网页里填**：登录后 **管理控制台 → 集成 IM**，四个凭证在同一张表单上，点保存即写进这个 secret —— 不用装 CLI、不用另开凭证。那一页还带飞书那一半的四步速览和「查看详细配置步骤」侧边栏。
+   - **Slack**：两个 secret，`notiops/slack-bot-token`（`xoxb-` 开头）和 `notiops/slack-signing-secret`，各存一个纯字符串。⚠️ Slack 这两个目前**只能**在 Secrets Manager 控制台建（管理控制台那一页现在只管飞书）。
+2. **请求地址填回 IM 平台** —— 就是 Outputs 里的 `FeishuWebhookUrl` / `SlackWebhookUrl`。
+
+> ⚠️ **顺序不能反**：先写凭证，再填请求地址。飞书/Slack 在你保存请求地址时会**立刻**发一次校验请求，那时凭证还没有的话入口函数会直接失败，而 IM 平台上显示的是「校验失败」—— 看起来像地址填错了。
+
+**每一步点哪里、填什么，见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md)**（飞书 §1、Slack §2；那份文档两条部署路径通用，secret 名字和请求地址的用法完全一样）。
+
+**装完之后想改**：update 栈、把 **What to install** 换成另一个值即可。
+
+- `web` → `web+feishu`：新建 IM 那套资源（~30 秒），然后照上面两步配。
+- `web+feishu` → `web`：删掉 IM 那套。⚠️ **两张 IM 的 DynamoDB 表（会话与用量）也会被删** —— 里面是群会话的上下文和调查任务状态，删了就没了。
+- `web+feishu` → `web+slack`：删飞书那套、建 Slack 那套。飞书那个 HTTP API 的地址**不会**保留，改回去时是一个新地址，得重新填一遍飞书后台。
+- **凭证不随栈走**：那三个 secret 是栈外资源，换选项、删栈（`KeepData`）都留着。只有 `TeardownMode=DeleteEverything` 的删栈才会连它们一起删（见 [§6](#6-删除这个栈)）。
+
+---
+
+### 2.12 （可选）接自己的 CUR 数据源
+
+参数页 **Optional: your own CUR data source** 那一组，两个参数，**默认都空 = 不启用**：
+
+| 参数 | 填什么 |
+|---|---|
+| `CostAgentMcpUrl` | 你自己那个 cost-agent MCP Lambda 的 **Function URL**（`https://<id>.lambda-url.<region>.on.aws`） |
+| `CostAgentFunctionArn` | **同一个 Lambda 的函数 ARN** |
+
+这一项接的是**别的账号/多 payer 的 CUR 表**（行级明细，TAM 场景），不是本账号自己的成本数据 —— 本账号那份是 FinOps 页默认就有的，不需要这两个参数。启用后多出：FinOps 页 4 个 CUR sheet（费用趋势 / Credit / 扩展支持 / Savings Plans）+ 聊天里直接问客户费用。
+
+⚠️ **两个必须一起填**。Function URL 里**不含**函数 ARN，而调用授权（`lambda:InvokeFunctionUrl`）只能按资源给 —— 只填 URL 会部署出一个「看起来装好了、每次调用 403」的数据源。所以模板里有一条参数校验规则（`CostAgentArnRequiredWithUrl`）：只填一半会在**开栈之前**就被拒掉，不会先建出半个东西来。
+
+- **不填**：这项能力按设计不存在 —— 那 4 个 sheet 的导航节点直接不出现（不会有点了没反应的菜单），聊天里也不挂对应工具。其余功能不受影响。
+- **先部署后再加**：update 栈、填上这两个参数即可，不用重建。
+- **还差一步在你那侧**：那个 Lambda 的 **resource policy** 要允许本栈的两个角色（BFF 与 agent runtime）调它的 Function URL —— 那是你自己的部署，模板碰不到。
+- **MCP 挂了不会拖垮整个工具**：仪表盘只有那 4 张表显示「暂时不可用」；聊天会自动降级到 Cost Explorer、再到 AWS 只读 API，并**明确告诉你换了数据源**（口径不同，别拿去直接对账）。
+
+**这个 Lambda 怎么部署、45 个工具的口径注意事项、以及降级链的完整说明，见 [DEPLOYMENT.md §14](DEPLOYMENT.md#14-客户-cur-仪表盘--cost-agent-mcp可选)**（那一节两条部署路径通用）。
 
 ---
 
 ## 3. 这个栈建了什么
 
-默认参数下 **68 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 5 个；选上多账号多 3 个）：
+默认参数下 **68 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 5 个；选上多账号多 3 个；**选带 IM 的安装选项多 16 个**）：
 
 | 类别 | 资源 |
 |---|---|
 | 前端 | S3 网站桶 + CloudFront distribution + CloudWatch RUM；报告下载走另一个 CloudFront distribution（带一个只放行报告路径的 CloudFront Function） |
 | 接口 | 1 个 Lambda（BFF）+ Function URL（`AWS_IAM` 鉴权，流式返回） |
-| Agent | 1 个 Bedrock AgentCore Runtime + 1 个 AgentCore Memory（长期记忆，见 [§2.10](#210-长期记忆agentcore-memory)） |
+| Agent | 1 个 Bedrock AgentCore Runtime + 1 个 AgentCore Memory（会话记忆，见 [§2.10](#210-会话记忆agentcore-memory)） |
 | 登录 | Cognito User Pool + Client + Identity Pool + 8 个用户组（角色） |
 | 数据 | DynamoDB `notiops-config`、`notiops-web-chat`；1 个数据桶（报告等） |
 | 部署辅助 | 1 个 staging 桶（放搬进来的产物）+ 1 个内联的部署 Lambda + 2 个自定义资源 |
@@ -259,8 +332,9 @@ notiops-webchat.template.json
 | 深度调查（默认开） | 1 个 DevOps Agent Agent Space（**含自动开好的 Operator App**）+ 1 个只读关联 + 1 个被 DevOps Agent 假设的角色（+ 它的策略）+ 1 个 Operator App 角色 = 5 个 |
 | 联网搜索（仅 us-east-1） | 1 个自定义资源（去建 AgentCore Gateway）+ 1 个 Gateway 服务角色 + 1 个内联策略 |
 | 多账号（可选） | 1 个自定义资源（去建两个成员账号 StackSet）+ 2 个内联策略 |
+| IM 机器人（可选，见 [§2.11](#211-加装-im-机器人飞书lark-或-slack)） | 3 个 Lambda（入口 / 干活 / 进度刷新）+ 3 个日志组 + 1 个 **API Gateway HTTP API**（公网入口，见下；连它的路由 / 集成 / 阶段一共 4 个资源）+ 3 条调用许可（HTTP API→入口、保活规则→入口、进度规则→进度刷新）+ 1 个依赖层 + 2 张 DynamoDB 表（群会话、用量）+ 2 条 EventBridge 规则（每分钟刷调查进度、每 4 分钟保活入口）+ 1 个角色（+ 策略）= 20 个 |
 
-**成本量级**（空闲时）：CloudFront + S3 + DynamoDB 按量、Lambda 不调用不计费、AgentCore Runtime 空闲不计费 —— 不用的时候基本只有几毛钱的存储。真正花钱的是**提问时的 Bedrock token**。staging 桶里每个 release 约 **165 MB**（S3 标准存储 ≈ $0.004/月），升级不会自动清掉旧版本，见 [§5](#5-升级到新版本)。
+**成本量级**（空闲时）：CloudFront + S3 + DynamoDB 按量、Lambda 不调用不计费、AgentCore Runtime 空闲不计费 —— 不用的时候基本只有几毛钱的存储。真正花钱的是**提问时的 Bedrock token**。staging 桶里每个 release 约 **165 MB**（装了 IM 再多 ~28 MB；S3 标准存储 ≈ $0.004/月），升级不会自动清掉旧版本，见 [§5](#5-升级到新版本)。IM 那套同理**空闲零成本**（三个 Lambda 不调用不计费，两张表按量，每分钟那条进度规则只在有调查在跑时才真的做事）。
 
 **只读设计**：agent 拿到的全是只读授权，产品层面也没有任何"改你资源"的工具。它能做的最大动作是**开一个 AWS Support 案例**（且需要你在对话里确认）。
 
@@ -309,7 +383,19 @@ CloudFront 分发要几分钟才在全球生效。先等 2–3 分钟、强刷�
 - `AccessDeniedException` 提到 `bedrock` → §1.2 的模型访问没开。
 - 报错提到某个具体 action（比如 `rds:DescribeDBInstances`）→ 你把 **Give the agent account-wide read-only access** 选成了 `No`。要么按提示补授权，要么 update 栈改回 `Yes`。
 
-### 4.5 想用命令行而不是控制台
+### 4.5 装了 IM，但机器人在群里不说话
+
+这是**静默失败**，几乎总是 [§2.11](#211-加装-im-机器人飞书lark-或-slack) 那两步里漏了一步：
+
+| 先查什么 | 怎么判断 |
+|---|---|
+| 凭证有没有写全 | Secrets Manager 里那个 secret 存在吗、键齐吗（飞书要四个键）。入口函数是**故意**在缺钥匙时冷启动就失败的 —— 宁可起不来，也不开一个谁都能伪造请求的公网入口。 |
+| 请求地址填了吗 | 飞书要填**两处**（事件配置 + 回调配置），Slack 要填**三处**（Events / Interactivity / Slash Commands），都是同一个 URL。 |
+| 日志 | CloudWatch 日志组 `/aws/lambda/<栈名>-im-*`（`feishu-ingress` / `feishu-worker` / `progress`）。入口函数里能看到验签失败、或者干脆没有任何日志（= IM 平台根本没打过来，说明地址没填对）。 |
+
+排查步骤和每个报错的含义在 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) 里。
+
+### 4.6 想用命令行而不是控制台
 
 可以，但有两个坑：
 
@@ -323,6 +409,8 @@ aws cloudformation create-stack --stack-name notiops \
 # 多账号：再加两个参数（缺一不生效，见 §2.6）
 #   ParameterKey=DeployMode,ParameterValue=MultiAccount \
 #   ParameterKey=OrganizationId,ParameterValue=o-xxxxxxxxxx
+# 加装 IM 机器人（见 §2.11）：web / web+feishu / web+slack
+#   ParameterKey=InstallOption,ParameterValue=web+feishu
 ```
 
 漏了 `--capabilities CAPABILITY_IAM` 会被直接拒（栈里有 IAM 角色）。
@@ -344,8 +432,8 @@ aws cloudformation create-stack --stack-name notiops \
 
 **回滚**：用**旧版本的模板**再 update 一次即可（产物按 tag 存在 staging 桶里，旧对象还在）。
 
-> **staging 桶会累积**：每个装过的 release 留 ~165 MB。想清理就手工删 staging 桶里
-> `agent/<旧tag>/` 和 `frontend/<旧tag>/` 前缀下的对象 —— **别删当前 release 的**，
+> **staging 桶会累积**：每个装过的 release 留 ~165 MB（装了 IM 再多 ~28 MB）。想清理就手工删 staging 桶里
+> `agent/<旧tag>/`、`frontend/<旧tag>/`、`im/<旧tag>/` 前缀下的对象 —— **别删当前 release 的**，
 > 那会让下一次栈更新找不到代码。
 
 ---
@@ -361,7 +449,8 @@ aws cloudformation create-stack --stack-name notiops \
 | `notiops-config` 表（配置） | **保留** | 删除 |
 | `notiops-web-chat` 表（聊天历史、通知） | **保留** | 删除 |
 | 数据桶 `notiops-data-…`（导出的报告等） | **保留** | 删除 |
-| 其他一切（前端、CloudFront、Lambda、agent、**Cognito 用户池**） | 删除 | 删除 |
+| 其他一切（前端、CloudFront、Lambda、agent、**Cognito 用户池**，以及装了 IM 的话那 16 个资源含两张 IM 表） | 删除 | 删除 |
+| IM 凭证（`notiops/im-bot-feishu` 等 Secrets Manager secret，栈外资源） | **保留** | 删除（不可恢复） |
 
 > ⚠️ **两种模式下 Cognito 用户池都会被删除** —— 也就是用户和密码都没了。`KeepData` 保的是
 > **数据**，不是账号。
@@ -403,24 +492,28 @@ CloudFormation → 选中栈 → **Delete**。**实测**：`KeepData` ~**3 分 1
 | `/aws/vendedlogs/RUMService_<栈名>-web-chat<hash>` 日志组 | CloudWatch RUM 自己建的，不属于这个栈 | **可以不管**：实测 0 字节，30 天后自动过期。想清就在 CloudWatch 里按这个**完整名字**删（别按前缀批量删） |
 | `KeepData` 下的两张表 + 数据桶 | 这是 `KeepData` 的**本意** | 不再用了就手工删（桶要先清空）。**想在这个账号里重新部署就必须先删** —— 见 §6.1 的第二条警告 |
 | CloudFront 的访问日志（如果你自己开过） | 不由这个栈管理 | 按需 |
+| **装过 IM 的话**：`notiops/im-bot-feishu` / `notiops/slack-bot-token` / `notiops/slack-signing-secret` 这几个 Secrets Manager secret | 它们不是栈内资源（飞书那个由管理控制台按需创建、Slack 那两个你手建），所以 `KeepData` 不会动它们 | `DeleteEverything` 会**连它们一起删**（不可恢复）。`KeepData` 下想清就自己删；留着的话下次重装同名 secret 会被直接复用 |
 | **多账号模式下**：`notiops-member-onboarding` / `notiops-member-devops-agent` 两个 StackSet，以及 Organizations 对 StackSets 的信任访问 | **故意留的。** ① StackSet 要先删掉全部 stack instance 才删得掉，而那等于抹掉各成员账号里的跨账号角色 —— 这种跨账号的破坏性动作不该由"删一个栈"隐式触发；② 信任访问是**组织级**开关，删我们的栈就把它关掉会打断组织里别人的 StackSets 部署。 | 确实不要了：先在 CloudFormation → StackSets 里 **Delete stacks from StackSet**（删实例），再删 StackSet 本身。信任访问除非你确认没别人在用，否则别关。 |
 
-**没有**其他孤儿：agent 的日志组、BFF 的日志组、「通知」函数的日志组、部署 Lambda 的日志组、IAM 角色、Cognito 用户池、RUM app monitor、AgentCore Runtime、网站桶、staging 桶 —— 实测全部随栈删除。深度调查建的 Agent Space 与关联也随栈删除（它是栈里的普通资源）。长期记忆的 AgentCore Memory（[§2.10](#210-长期记忆agentcore-memory)）同理 —— 它是栈里的普通资源、**没有**保留策略，随栈删除，里面攒的 facts / preferences / 摘要一起消失（这条是按模板声明说的，还没像上面那串一样删栈实测过）。联网搜索的 AgentCore Gateway 分两种：**这个栈建出来的**随栈删除；**它复用的别人的**（同账号里已经存在的 `notiops-websearch-gw`，比如 `setup.sh` 建的）留着不动 —— 删一个栈不该顺手拆掉另一条部署路径还在用的东西。
+**没有**其他孤儿：agent 的日志组、BFF 的日志组、「通知」函数的日志组、部署 Lambda 的日志组、IAM 角色、Cognito 用户池、RUM app monitor、AgentCore Runtime、网站桶、staging 桶 —— 实测全部随栈删除。深度调查建的 Agent Space 与关联也随栈删除（它是栈里的普通资源）。会话记忆的 AgentCore Memory（[§2.10](#210-会话记忆agentcore-memory)）同理 —— 它是栈里的普通资源、**没有**保留策略，随栈删除，里面存的会话消息一起消失（这条是按模板声明说的，还没像上面那串一样删栈实测过）。联网搜索的 AgentCore Gateway 分两种：**这个栈建出来的**随栈删除；**它复用的别人的**（同账号里已经存在的 `notiops-websearch-gw`，比如 `setup.sh` 建的）留着不动 —— 删一个栈不该顺手拆掉另一条部署路径还在用的东西。
 
 ---
 
 ## 7. 无公网出口：用私有 S3 镜像
 
-如果你的账号出不了公网（或企业策略不允许从 github.com 拉可执行代码），可以把四个产物**先镜像到一个 S3 桶**，让栈从那里取。桶**可以完全私有**（Block Public Access 全开）——部署 Lambda 用它自己的角色签名去读，走的是 S3 API，不需要公网。
+如果你的账号出不了公网（或企业策略不允许从 github.com 拉可执行代码），可以把产物**先镜像到一个 S3 桶**，让栈从那里取。桶**可以完全私有**（Block Public Access 全开）——部署 Lambda 用它自己的角色签名去读，走的是 S3 API，不需要公网。
 
 **一次性准备**（由一个有凭证的人做，之后所有账号/团队都能复用这一份镜像）：
 
 ```bash
-# 从 release 下四个产物，放进一个桶（桶要和你开栈的区域同区）
+# 从 release 下产物，放进一个桶（桶要和你开栈的区域同区）
 aws s3 cp bff.zip        s3://my-mirror/notiops/v1.2.3/
 aws s3 cp chat-dist.zip  s3://my-mirror/notiops/v1.2.3/
 aws s3 cp web-notif.zip  s3://my-mirror/notiops/v1.2.3/
 aws s3 cp agent-code.zip s3://my-mirror/notiops/v1.2.3/
+# 只有要装 IM 机器人（§2.11）时才需要这两个；只装 web 的话栈不会来取
+aws s3 cp im-code.zip    s3://my-mirror/notiops/v1.2.3/
+aws s3 cp im-layer.zip   s3://my-mirror/notiops/v1.2.3/
 ```
 
 **开栈时填两个参数**：
@@ -432,7 +525,7 @@ aws s3 cp agent-code.zip s3://my-mirror/notiops/v1.2.3/
 
 跨账号也行：桶策略允许部署账号读即可（`Code.S3Bucket` 允许跨账号，但**必须同区域**）。
 
-镜像的完整性照样有保障：模板里那三个 SHA256 是按 release 里的原始产物算的，镜像内容被换过会当场校验失败、栈 CREATE_FAILED。
+镜像的完整性照样有保障：模板里每个产物的 SHA256 都是按 release 里的原始文件算的，镜像内容被换过会当场校验失败、栈 CREATE_FAILED。
 
 `https://` 形式也支持（`https://host/path`），但那是**不带任何凭证**的普通 GET —— 对象必须匿名可读。私有场景请用 `s3://`。
 
@@ -447,11 +540,13 @@ aws s3 cp agent-code.zip s3://my-mirror/notiops/v1.2.3/
    不匹配就删掉已上传的对象并让栈失败。不接受这个前提的话，请走 [§7](#7-无公网出口用私有-s3-镜像) 的私有镜像，或走 `setup.sh`。
 4. **管理员密码我们碰不到**：临时密码由 Cognito 生成并直接发给你。部署流程不传、不读、不打印、不放进 Outputs。
 5. **你自己的凭证做的所有动作**：整条链路上没有我们的账号、我们的桶、我们的角色。
+6. **装了 IM 就多一个公网入口**（[§2.11](#211-加装-im-机器人飞书lark-或-slack)）——那个 **API Gateway HTTP API** 必须是**未鉴权**的，因为飞书/Slack 不会给你签 SigV4（2026-09-01 之前这里是 Lambda Function URL，为什么换、以及被否掉的两个替代方案，见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §4.1）。五道边界：① **验签**（飞书用 Encrypt Key + Verification Token，Slack 用 signing secret，缺钥匙就冷启动失败，不存在"没配好也能进"）；② **两层限流** —— HTTP API 阶段级 50 req/s、突发 100（超出的请求由 API Gateway 直接 429，**不进 Lambda**），入口函数上再叠**并发上限 10**，这是公网未鉴权入口的花费天花板；③ 可选的**群允许清单**（只让指定群里的消息生效，见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §3）；④ **幂等去重**（同一个事件重复投递只处理一次）；⑤ 到了后端仍然是**同一个只读 agent**，没有任何写权限 —— 即使有人伪造了一条消息，最坏结果也是读到只读信息。凭证一律放 Secrets Manager，不进环境变量、不打印在日志里。还剩下的风险如实列在 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §4.3。
 
 ---
 
 ## 9. 接下来
 
 - [USER_GUIDE.md](USER_GUIDE.md) — 界面怎么用、有哪些主题（成本、故障调查、Support 案例、Skills…）
-- [DEPLOYMENT.md](DEPLOYMENT.md) — 想要 IM bot、自动巡检、管理仪表盘时，走完整版部署
+- [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) — 装了 IM 机器人（[§2.11](#211-加装-im-机器人飞书lark-或-slack)）之后，在飞书/Slack 那边要点什么
+- [DEPLOYMENT.md](DEPLOYMENT.md) — 想要自动巡检、往 IM 主动推送、管理仪表盘时，走完整版部署
 - [TECHNICAL_DESIGN.md](TECHNICAL_DESIGN.md) — 架构与设计取舍

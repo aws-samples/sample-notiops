@@ -14,8 +14,9 @@ import { readFileSync } from "node:fs";
 import { makeSink, consumeEvents, parseAsk, renderUserPrompt } from "../devops_chat.mjs";
 
 let fails = 0;
+let ok = 0;
 async function t(name, fn) {
-  try { await fn(); console.log(`  ok   ${name}`); }
+  try { await fn(); ok++; console.log(`  ok   ${name}`); }
   catch (e) { fails++; console.log(`  FAIL ${name}\n       ${e?.message || e}`); }
 }
 
@@ -342,8 +343,15 @@ await t("BFF 三条 DevOps 路径互斥，且老客户端不传字段时永不�
   // 答案来源要落库，否则刷新后历史回复被错误署名成本地模型，且通用会话的「对话对象」锁
   // 失去唯一依据。「转人工」那轮真由我们的 agent 答，
   // 就该署我们的模型名。
-  assert.match(idx, /via: objDevops && !escalateFallback \? "devops-agent" : undefined/);
+  //
+  // 回落分支是 `agentVia`（agent 自己报的来源，目前只有 "builtin" —— 内置确定性回答，
+  // 0 token、未调模型）。写成两条断言而不是逐字匹配整行，是因为这一行会随新的来源类型
+  // 增长，而**必须不变**的只有这两点：devops-agent 这个署名仍然只由
+  // `objDevops && !escalateFallback` 决定；其余情况下的署名来自流里报的 via，不许在
+  // 这里硬编码任何模型名/来源名。
+  assert.match(idx, /via: objDevops && !escalateFallback \? "devops-agent" :/);
+  assert.match(idx, /via: objDevops && !escalateFallback \? "devops-agent" : \(agentVia \|\| undefined\)/);
 });
 
-console.log(fails ? `\nFAILED: ${fails}` : "\nPASSED: all ok");
+console.log(fails ? `\nFAILED: ${fails}` : `\nPASSED: ${ok} ok, 0 failed`);
 process.exit(fails ? 1 : 0);

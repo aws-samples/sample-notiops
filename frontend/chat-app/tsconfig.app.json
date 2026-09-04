@@ -5,7 +5,11 @@
     "useDefineForClassFields": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
-    "types": ["vite/client"],
+    // ⚠️ `node` 是给**测试**用的：`src/inspection.test.ts` 读
+    // `capabilities.json` 与几个源文件做接线断言（那类漏配 tsc 查不出来）。
+    // `include: ["src"]` 把测试也纳入 `tsc -b`，所以缺了这一项
+    // `npm run build` 直接失败 —— 而 `npm test`（vitest 不做类型检查）照过。
+    "types": ["vite/client", "node"],
     "skipLibCheck": true,
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,

@@ -37,13 +37,19 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 from core import ddb_state
 from core import i18n
 from core import support_logic
+from core.feishu_card import card_config
 from core.support_logic import (
-    DEFAULT_LANGUAGE, DEFAULT_SEVERITY,
+    DEFAULT_ISSUE_TYPE, DEFAULT_LANGUAGE, DEFAULT_SEVERITY,
+    ISSUE_TYPE_CODES,
     LANGUAGE_CODES, LANGUAGE_LABELS,
     SEVERITY_CODES,
     severity_label, severity_labels,
 )
 
+# 「服务名称 / 案例类型」这一组控件由 case_flow 提供 —— 两个开案例面板共用一份，
+# 避免同一个操作从两个入口进去开出不同的案例。case_flow 不 import support_flow，
+# 无循环依赖。
+from platforms.feishu.app import case_flow
 from platforms.feishu.app import feishu_utils
 
 logger = logging.getLogger(__name__)
@@ -154,6 +160,14 @@ def handle(action_tag: str, action_value: dict, event,
             extra = (f"{extra}\n\nContact: {contact}".strip()
                      if extra else f"Contact: {contact}")
         subject_override = (form.get("subject_override") or "").strip()
+        # 服务名称 / 类别 / 案例类型 —— 与 `/案例` 面板同一套取值规则（选择器优先、
+        # 自由文本兜底、两个都空就交给分类器；类别在最终服务名下反查）。三项都**不拦提交**。
+        service_text = case_flow.picked_service_code(
+            form.get("service_select") or "", form.get("service_text") or "")
+        category_text = (form.get("category_text") or "").strip()
+        issue_type = form.get("issue_type_select") or DEFAULT_ISSUE_TYPE
+        if issue_type not in ISSUE_TYPE_CODES:
+            issue_type = DEFAULT_ISSUE_TYPE
         message_id = ""
         try:
             message_id = (event.event.context.open_message_id or "")
@@ -169,6 +183,8 @@ def handle(action_tag: str, action_value: dict, event,
         return _confirm(incident_id, severity, language, extra,
                         operator_name, card_message_id=message_id,
                         subject_override=subject_override,
+                        service_text=service_text, issue_type=issue_type,
+                        category_text=category_text,
                         locale=locale)
 
     return _toast(i18n.t("case.toast.unknown_action", locale))
@@ -181,6 +197,8 @@ def _confirm(incident_id: str, severity: str, language: str, extra: str,
              operator_name: str,
              card_message_id: str,
              subject_override: str = "",
+             service_text: str = "", issue_type: str = "",
+             category_text: str = "",
              locale: str = "zh") -> P2CardActionTriggerResponse:
     locale = _normalize_locale(locale)
     if severity not in SEVERITY_CODES:
@@ -216,6 +234,8 @@ def _confirm(incident_id: str, severity: str, language: str, extra: str,
             target=_create_case_worker,
             args=(card_message_id, ctx, incident_id, severity, language,
                   extra, operator_name, locale),
+            kwargs={"service_text": service_text, "issue_type": issue_type,
+                    "category_text": category_text},
             daemon=True,
         ).start()
     else:
@@ -224,6 +244,8 @@ def _confirm(incident_id: str, severity: str, language: str, extra: str,
         result = support_logic.create_case(
             ctx, platform=PLATFORM, severity=severity, language=language,
             extra=extra, operator_name=operator_name,
+            service_text=service_text, issue_type=issue_type,
+            category_text=category_text,
         )
         subject_for_display = support_logic.build_subject(ctx, PLATFORM)
         return _build_card_response(
@@ -240,13 +262,17 @@ def _confirm(incident_id: str, severity: str, language: str, extra: str,
 def _create_case_worker(card_message_id: str, ctx: dict, incident_id: str,
                         severity: str, language: str, extra: str,
                         operator_name: str,
-                        locale: str = "zh") -> None:
+                        locale: str = "zh",
+                        service_text: str = "", issue_type: str = "",
+                        category_text: str = "") -> None:
     """Background thread: call CreateCase, then patch the original card."""
     locale = _normalize_locale(locale)
     try:
         result = support_logic.create_case(
             ctx, platform=PLATFORM, severity=severity, language=language,
             extra=extra, operator_name=operator_name,
+            service_text=service_text, issue_type=issue_type,
+            category_text=category_text,
         )
         # Show the same subject we used on the API call back to the user
         # so the success card matches what was sent to AWS Support.
@@ -344,7 +370,7 @@ def _form_card(incident_id: str,
     ]
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {
             "title": {"tag": "plain_text",
                       "content": i18n.t("support.form.title", locale)},
@@ -395,6 +421,11 @@ def _form_card(incident_id: str,
                       "type": "default",
                       "width": "fill",
                       "required": True},
+                     # 服务名称 + 案例类型 —— 与 `/案例` 面板**共用**同一份控件
+                     # (`case_flow.service_and_type_elements`)。这个面板当初漏了这两
+                     # 项，客户从报告卡升级时只能靠分类器猜；共用一份也保证以后两个
+                     # 入口不会长歪（选项 / 默认值 / 目录挂了的退化行为都同一份）。
+                     *case_flow.service_and_type_elements(locale),
                      {"tag": "markdown",
                       "content": i18n.t("support.form.notes_label", locale)},
                      {"tag": "input",
@@ -483,7 +514,7 @@ def _pending_card(severity: str, language: str,
     lang_label = LANGUAGE_LABELS.get(language, language)
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {
             "title": {"tag": "plain_text",
                       "content": i18n.t("support.pending.title", locale)},
@@ -535,8 +566,24 @@ def _success_card(case_id: str, case_url: str, severity: str, language: str,
     if service or category:
         classification_block = i18n.t("case.create.classification_block", locale,
                                       service=service,
-                                      category=category,
+                                      # 类别后面跟一句"你指定"还是"自动挑选"，四张结果卡
+                                      # 同口径（`support_logic.category_display`）。
+                                      category=support_logic.category_display(
+                                          cls, locale),
                                       issue_type=issue_type)
+    # 不静默降级：用户在面板里填的服务名没匹配上目录时，明说"改用了自动判断的服务"，
+    # 而不是让他以为开在了自己填的那个服务下（与 `/案例` 面板的结果卡同一条口径）。
+    if cls.get("serviceUnmatched"):
+        classification_block += i18n.t("case.create.service_unmatched_block",
+                                       locale,
+                                       text=str(cls["serviceUnmatched"]))
+    # 类别同理：填了但这个服务名下没有 → 说清用的是哪个，别让人以为按自己填的走了。
+    if cls.get("categoryUnmatched"):
+        classification_block += i18n.t("case.create.category_unmatched_block",
+                                       locale,
+                                       text=str(cls["categoryUnmatched"]),
+                                       service=service,
+                                       category=cls.get("categoryCode", ""))
     # ID first so the user can copy it without scrolling, subject second
     # for context, link last as the primary action target.
     subject_block = (i18n.t("support.success.subject_block", locale,
@@ -546,7 +593,7 @@ def _success_card(case_id: str, case_url: str, severity: str, language: str,
     lang_label = LANGUAGE_LABELS.get(language, language)
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {
             "title": {"tag": "plain_text",
                       "content": i18n.t("support.success.title", locale)},
@@ -596,7 +643,7 @@ def _success_card(case_id: str, case_url: str, severity: str, language: str,
 def _info_card(title: str, body: str, color: str = "blue") -> dict:
     return {
         "schema": "2.0",
-        "config": {"streaming_mode": False},
+        "config": card_config(streaming_mode=False),
         "header": {"title": {"tag": "plain_text", "content": title},
                    "template": color},
         "body": {

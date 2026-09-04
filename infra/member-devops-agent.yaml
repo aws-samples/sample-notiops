@@ -1,31 +1,143 @@
 AWSTemplateFormatVersion: "2010-09-09"
+
+# 🔴 **所有 `Description:` 字段必须是纯 ASCII 英文。**
+#
+# 2026-08-26 实测：CloudFormation 把 Description 里的非 ASCII 字符全部渲染成
+# `?`，于是客户在「快速创建堆栈」页上看到的是：
+#
+#   堆栈描述  NotiOps member account DevOps Agent onboarding … ????????? Agent Space
+#   参数      OrganizationId  (???????) AWS Organizations ID (o-xxxx)?????
+#
+# 完全看不出这个模板要建什么、参数该填什么，而且不报错。
+# （先怀疑是 S3 的 content-type 少了 charset=utf-8，加上之后仍然是问号 ——
+#  所以是 CFN 服务端的行为，不是传输编码。）
+#
+# ⚠️ 这个模板是**给客户看的**（跨 payer 接入时客户在自己账号里点开部署），
+#    所以英文也是对的：客户可能是任何语言环境。
+#    中文判据保留在 `#` 注释里 —— 那些不进 CFN，客户看不到。
+#
+# 中文原文（本模板做什么）：
+#   在成员账号创建独立 Agent Space + Primary/Trigger Role + Association
+#   （per-member-space 架构；对齐 notiops-backend-stack.ts 部署账号自建逻辑）。
+#   资源命名带 SystemAccountId 后缀 —— 与成员账号内可能存在的【独立 NotiOps 部署】
+#   （拥有无后缀的 notiops-agent-primary/trigger-<acct> 与同名 space）解耦共存。
+#   Outputs 暴露 AgentSpaceId/Arn + TriggerRoleArn，管理侧跨账号读回自动完成
+#   payload 登记（da#<account>）→ 测试 → 启用。
 Description: >
-  NotiOps member account DevOps Agent onboarding (StackSet payload, Phase 2).
-  在成员账号创建独立 Agent Space + Primary/Trigger Role + Association
-  （per-member-space 架构；对齐 notiops-backend-stack.ts 部署账号自建逻辑）。
-  资源命名带 SystemAccountId 后缀 —— 与成员账号内可能存在的【独立 NotiOps 部署】
-  （拥有无后缀的 notiops-agent-primary/trigger-<acct> 与同名 space）解耦共存。
-  Outputs 暴露 AgentSpaceId/Arn + TriggerRoleArn，管理侧跨账号读回自动完成
-  payload 登记（da#<account>）→ 测试 → 启用，实现一键到底。
+  NotiOps member-account onboarding for AWS DevOps Agent (Phase 2).
+  Creates a dedicated Agent Space in this account, the primary role the DevOps
+  Agent service assumes to read this account, an association between them, and a
+  trigger role the NotiOps management account assumes to start investigations.
+  Resource names carry the management account id as a suffix so this stack can
+  coexist with an independent NotiOps deployment in the same account.
+  When the inspection parameters are set (NotiOps prefills them), it also creates
+  the read-only collection role and the role the inspection agent space assumes,
+  so no second stack is needed.
+  After creation, copy AgentSpaceId and TriggerRoleArn from the Outputs tab back
+  into the NotiOps admin page to finish onboarding.
 
 Parameters:
   SystemAccountId:
     Type: String
     AllowedPattern: "[0-9]{12}"
-    Description: NotiOps 系统部署账号 ID（trigger 角色信任它来触发调查）
+    # 中文：NotiOps 系统部署账号 ID（trigger 角色信任它来触发调查）
+    Description: >
+      Account id of the NotiOps deployment (the management account). The trigger
+      role created here will trust this account so it can start investigations.
 
   OrganizationId:
     Type: String
     Default: ""
+    # 中文：(可选但强烈建议) AWS Organizations ID (o-xxxx)。非空时给 TriggerRole
+    #       信任策略加 aws:PrincipalOrgID 条件做纵深防御：即便信任系统账号 root，
+    #       也只有本组织内 principal 能 AssumeRole，杜绝跨组织混淆代理。
+    # ⚠️ 跨 Org 接入（本账号与部署账号不在同一个 Organization）时**必须留空** ——
+    #    填了会让 aws:PrincipalOrgID 条件永远不成立，AssumeRole 全部被拒。
     Description: >
-      (可选但强烈建议) AWS Organizations ID (o-xxxx)。非空时给 TriggerRole 信任策略加
-      aws:PrincipalOrgID 条件做纵深防御：即便信任系统账号 root，也只有本组织内 principal
-      能 AssumeRole，杜绝跨组织混淆代理。
+      Optional but recommended when this account is in the SAME AWS Organization
+      as the NotiOps deployment: the organization id (o-xxxx). It adds an
+      aws:PrincipalOrgID condition to the trust policy as defense in depth.
+      LEAVE EMPTY if this account is in a different organization - otherwise the
+      condition can never be satisfied and every AssumeRole will be denied.
     AllowedPattern: "^(o-[a-z0-9]{10,32})?$"
     ConstraintDescription: Must be an AWS Organizations ID (o-xxxx) or empty
 
+  InspectionAgentSpaceArn:
+    Type: String
+    Default: ""
+    # 中文：**系统账号**里那个巡检 Agent Space 的完整 ARN。由 NotiOps 预填，
+    #       客户不用管。非空 → 建 InspectionMonitorRole，把本账号变成该 space
+    #       的「辅助云来源」（控制台那个向导第 1~6 步做的事）。
+    # 🔴 用完整 ARN 而不是 space id：ARN 里带 region，而客户可能把本栈部署在
+    #    与系统账号不同的 region —— 那时 `${AWS::Region}` 拼出来的信任条件
+    #    永远不成立，DA assume 不进来，且**不报错**（只是判读拿不到数据）。
+    Description: >
+      Prefilled by NotiOps - the ARN of the inspection agent space in the NotiOps
+      deployment account. When set, this stack also creates the role that the
+      DevOps Agent service assumes to read this account on behalf of that space
+      (the "add secondary cloud source" wizard does this by hand otherwise).
+      Clear it if you only want root-cause investigation and not inspection.
+    AllowedPattern: "^(arn:aws:aidevops:[a-z0-9-]+:[0-9]{12}:agentspace/[A-Za-z0-9-]+)?$"
+    ConstraintDescription: Must be an aidevops agentspace ARN or empty
+
+  CreateCollectionRole:
+    Type: String
+    Default: "yes"
+    AllowedValues: ["yes", "no"]
+    # 中文：建不建巡检的跨账号只读采集角色 notiops-idle-detection-role-<系统账号>。
+    # ⚠️ 同 Org 的账号如果已经被一键接入（StackSets）下发过同名角色，这里要选
+    #    `no` —— 否则 CreateRole 报 EntityAlreadyExists，整栈 rollback。
+    Description: >
+      Create the read-only role that NotiOps inspection assumes to collect
+      RDS / ElastiCache / CloudWatch data from this account. Choose "no" only if
+      this account was already onboarded through one-click (CloudFormation
+      StackSets), which creates a role with the same name.
+
+  InspectionLocale:
+    Type: String
+    Default: "zh"
+    AllowedValues: ["zh", "en"]
+    # 中文：巡检判读的输出语言。
+    # ⚠️ 必须与系统账号 executor 的 `INSPECTION_REPORT_LOCALE` 一致
+    #    （CDK 的 `-c inspectionReportLocale`，默认同样是 zh）。两边漂了会出现
+    #    「space 说英文、payload 说中文」，而判读听哪个不确定。
+    # ⚠️ 排障那个 space **刻意不设** Locale：排障是交互式的，语言按当次请求的
+    #    `body.locale` 走；给 space 钉死一个语言可能覆盖那个 per-request 行为。
+    #    巡检相反 —— 批处理，一条判读推给多个人，语言必须是全局的。
+    Description: >
+      Language for inspection judgment output. Must match the management
+      account's INSPECTION_REPORT_LOCALE.
+
+  DevOpsEventBusArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^(arn:aws:events:[a-z0-9-]+:[0-9]{12}:event-bus/.+)?$"
+    ConstraintDescription: Must be an EventBridge event bus ARN, or empty
+    # 中文：系统账号那条 custom event bus 的 ARN。填了就在本账号建一条转发规则，
+    # 把本账号 DevOps Agent 的调查/判读事件推回系统账号。
+    #
+    # 🔴 **Default 必须是空串。** 这个模板同时被两条路用：
+    #    手动接入（BFF 的 generateLaunchStackUrl，会预填这个值）与
+    #    org 一键接入的 StackSet（setup.sh 只传 SystemAccountId + OrganizationId）。
+    #    做成必填会让 `update-stack-set` 直接失败
+    #    （Parameters: [DevOpsEventBusArn] must have values），既有实例更新不了。
+    #
+    # 🔴 **org 那条路要留空**，不是忘了传。org 账号的转发由
+    #    `member-account-onboarding.yaml`（StackSets 下发那份）建，两份都建会让
+    #    同一批事件被投**两次** —— callback 跑两遍，多花一次 Bedrock 摘要、
+    #    多写一条 progress 行，而且不报错。
+    Description: >
+      ARN of the NotiOps custom event bus in the management account. When set,
+      this stack creates an EventBridge rule that forwards this account's
+      DevOps Agent investigation events to it. Leave empty if this account is
+      already onboarded through one-click (StackSets), which creates the
+      forwarding rule from the other template.
+
 Conditions:
   HasOrgId: !Not [!Equals [!Ref OrganizationId, ""]]
+  EnableCollectionRole: !Equals [!Ref CreateCollectionRole, "yes"]
+  EnableInspectionMonitor: !Not [!Equals [!Ref InspectionAgentSpaceArn, ""]]
+  EnableEventForwarding: !Not [!Equals [!Ref DevOpsEventBusArn, ""]]
 
 Resources:
   AgentSpace:
@@ -33,27 +145,128 @@ Resources:
     Properties:
       Name: !Sub "notiops-devops-${AWS::AccountId}-m${SystemAccountId}"
       Description: !Sub "NotiOps managed member agent space (management account ${SystemAccountId})"
-      # 建 space 时一并开好 Operator App(web app)。这一条对多账号客户尤其要紧：
-      # 没有它，管理侧对本成员账号发起的 CreateBacklogTask / CreateChat 会一律报
-      # `Invalid or unregistered domain`，而补救动作是**登进这个成员账号的控制台**
-      # 点 Agent Space → Access → Configure web app —— 接 N 个账号就要点 N 次。
-      # CFN 的 create handler 替我们调 aidevops:EnableOperatorApp，delete handler 调
-      # DisableOperatorApp（StackSet 摘实例时自动收尾）。
+      # 🔴 **开 Operator App（Web App）**。
+      #
+      # 不开的后果（2026-08-27 实测）：`https://<spaceId>.aidevops.global.app.aws/
+      # investigation/<taskId>` 这条深链返回 **Invalid or unregistered domain**。
+      # 那个子域名只有在 space 配了 `OperatorApp` 之后才被注册。
+      #
+      # 而我们在四个地方往客户面前放这条链接：
+      #   core/devops_agent.py（聊天回复里的「查看进度」）
+      #   shared/report_delivery/{feishu,slack}_sender.py（IM 推送正文）
+      #   core/support_logic.py（support case 里的 operator_url）
+      # 也就是说不开 Web App 等于**在每一条推送里放一个死链**，
+      # 而客户点了才发现 —— 那时他已经在等一个看不到的进度。
+      #
+      # 🔴 多账号客户还多一层（main 侧记录）：没有它，管理侧对本成员账号发起的
+      #    CreateBacklogTask / CreateChat 会一律报 `Invalid or unregistered
+      #    domain`，补救动作是**登进这个成员账号的控制台**点 Agent Space →
+      #    Access → Configure web app —— 接 N 个账号就要点 N 次。
+      #    CFN 的 create handler 替我们调 aidevops:EnableOperatorApp，
+      #    delete handler 调 DisableOperatorApp（StackSet 摘实例时自动收尾）。
+      #
+      # ⚠️ 用 `Iam` 而不是 `Idc`：`IdcAuthConfiguration` 必填 `IdcInstanceArn`，
+      #    而成员账号大多没有 Identity Center 实例。IAM 模式下客户用自己的
+      #    AWS 凭证/控制台会话登录那个 web app。
       OperatorApp:
         Iam:
           OperatorAppRoleArn: !GetAtt OperatorAppRole.Arn
 
-  # DevOps Agent 服务跑它自己那个 per-space web app 用的角色。
-  # 两个细节（都是实测反推控制台建出来的角色得到的）：
-  #   · sts:TagSession 不能省 —— AIDevOpsOperatorAppAccessPolicy 把资源写成
-  #     agentspace/${aws:PrincipalTag/AgentSpaceId}，session tag 就是授权依据。
-  #   · aws:SourceArn 用 ArnLike + agentspace/* 而非精确 ARN —— 精确 ARN 会让本角色
-  #     引用 AgentSpace、AgentSpace 又 !GetAtt 本角色，CFN 直接判循环依赖。
+  # ─── 巡检判读专用的第二个 space（per-account agent space 设计，改动①）───
+  #
+  # 🔴 与排障那个 space **必须分开**。合用一个的后果不是报错：巡检的判读 skill
+  #    是 per agent space 的（Asset API 全部必填 agentSpaceId），装进排障 space
+  #    会让排障调查也按判读格式输出；反过来把巡检 task 派进排障 space，那里没有
+  #    判读 skill，DA 会用通用提示词自由发挥，输出格式对不上解析器
+  #    （da_parse_status: parse_failed）。
+  #
+  # ⚠️ 形状照 `notiops-backend-stack.ts` 里部署账号那个巡检 space 抄
+  #    （名字前缀 notiops-inspection、复用 OperatorAppRole、带 Association）。
+  #    两边不一致会造出「部署账号的巡检能主动查证、成员账号的不能」这种
+  #    按账号分裂的行为 —— 那正是本模板顶上那段注释要防的东西。
+  #
+  # ⚠️ 名字带 -m${SystemAccountId} 后缀（本模板的统一约定，见文件头）：
+  #    同一个成员账号可能被两套 NotiOps 部署接管，不带后缀会撞名。
+  #    ⚠️ 部署账号那个叫 notiops-inspection-<账号>（没有后缀）—— 那是 CDK 建的、
+  #      一个账号只可能有一套，不需要区分。
+  InspectionAgentSpace:
+    Type: AWS::DevOpsAgent::AgentSpace
+    Properties:
+      Name: !Sub "notiops-inspection-${AWS::AccountId}-m${SystemAccountId}"
+      Description: !Sub "NotiOps resource inspection - isolated from incident RCA space (management account ${SystemAccountId})"
+      # 判读语言。⚠️ 必须与 executor 的 `INSPECTION_REPORT_LOCALE` 一致 ——
+      # 两边漂了会出现「space 说英文、payload 说中文」，而判读听哪个不确定。
+      Locale: !Ref InspectionLocale
+      # 复用排障那个 OperatorAppRole：托管策略 AIDevOpsOperatorAppAccessPolicy
+      # 按 aws:PrincipalTag/AgentSpaceId 限权、信任策略的 SourceArn 是
+      # agentspace/* 通配 —— 两侧都不绑单个 space，所以一个角色能服务 N 个。
+      # （2026-08-29 实测该托管策略 v9 确认。）
+      OperatorApp:
+        Iam:
+          OperatorAppRoleArn: !GetAtt OperatorAppRole.Arn
+
+  # 复用同一个 PrimaryRole：巡检与排障读的是同一个账号的同一批资源，
+  # 权限需求完全相同（AIDevOpsAgentAccessPolicy 只读）。
+  InspectionAssociation:
+    Type: AWS::DevOpsAgent::Association
+    DependsOn: [InspectionAgentSpace, PrimaryRole]
+    Properties:
+      AgentSpaceId: !GetAtt InspectionAgentSpace.AgentSpaceId
+      ServiceId: aws
+      Configuration:
+        Aws:
+          AccountId: !Ref "AWS::AccountId"
+          AccountType: monitor
+          AssumableRoleArn: !GetAtt PrimaryRole.Arn
+
+  # 客户在 Web App 里的身份（不是 DA 服务读资源的那个角色）。
+  #
+  # 两个角色分工（官方文档的说法）：
+  #   PrimaryRole      DA 服务 AssumeRole 进来**读资源**（AIDevOpsAgentAccessPolicy）
+  #   OperatorAppRole  **人**在 web app 里能做什么（发起调查、看结果、开 support case）
+  #
+  # ⚠️ 信任策略里必须有 `sts:TagSession`，不只 `sts:AssumeRole` ——
+  #    `AIDevOpsOperatorAppAccessPolicy` 用 `aws:PrincipalTag/AgentSpaceId`
+  #    把权限收到具体那个 space 上，而那个 tag 靠 TagSession 打进会话。
+  #    少了它 web app 会以 AccessDenied 收场，而报错发生在浏览器里、
+  #    不在我们的日志里。
+  #
+  # ⚠️ `aws:SourceArn` 用 `agentspace/*` 通配而不是具体那个 id ——
+  #    具体 id 会与 AgentSpace 形成**循环依赖**（space 引用角色 ARN，
+  #    角色引用 space ARN），CFN 直接拒绝部署。
+  #    同一个理由见上面 PrimaryRole 的写法。
+  #
+  # ⚠️ 上面两条都是**实测反推控制台建出来的角色**得到的（main 侧记录）：
+  #    · sts:TagSession 不能省 —— AIDevOpsOperatorAppAccessPolicy 把资源写成
+  #      agentspace/${aws:PrincipalTag/AgentSpaceId}，session tag 就是授权依据。
+  #    · aws:SourceArn 用 ArnLike + agentspace/* 而非精确 ARN —— 精确 ARN 会让
+  #      本角色引用 AgentSpace、AgentSpace 又 !GetAtt 本角色，CFN 判循环依赖。
+  #
+  # 🔴 角色名跟随 main：`notiops-agent-webapp-…`。
+  #
+  #    本分支曾把它改成 `notiops-agent-operator-…`，理由记的是「线上
+  #    两个成员账号实际就是这个名字」—— 那是**循环证据**：
+  #    这个角色是 main 引入的，两个成员账号跑的就是本分支改完下发的结果。
+  #    改名不带来任何功能。
+  #
+  #    2026-09-03 第二轮合并时收敛回 main，与 `notiops-backend-stack.ts` 里
+  #    部署账号那个角色同步（那边同一天同一理由收敛）。不收敛的后果是**并回
+  #    main 时把 main 系所有成员账号一起改名** —— 而改名意味着 CFN 删旧建新，
+  #    同时要改 `OperatorApp.Iam.OperatorAppRoleArn`，那是一次有停机窗口的
+  #    替换，换来的只是一个不同的名字。
+  #
+  # ⚠️ 已经装了本分支旧版本的成员账号（677 / 088 带 `operator` 那份）更新到
+  #    这一版时**会经历这次替换**。那是一次性的，且只影响用过本分支的账号。
+  #
+  # ⚠️ `-m${SystemAccountId}` 后缀与基名是**两件事**：后缀是「与成员账号内
+  #    自建的 NotiOps 部署共存」的前提，改基名时别顺手把它一起去掉
+  #    （`scripts/test_oneclick_parity.py` 有断言钉着 —— 判据只看后缀、
+  #     不看基名，正是为了让这类收敛不必同时改测试）。
   OperatorAppRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "notiops-agent-webapp-${AWS::AccountId}-m${SystemAccountId}"
-      Description: "Assumed by AWS DevOps Agent for its per-Agent-Space operator web app"
+      Description: "Assumed by humans in the DevOps Agent web app for this member account"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -194,12 +407,344 @@ Resources:
                   - aidevops:UpdateAsset
                   - aidevops:DeleteAsset
                   - aidevops:ListAssets
-                Resource: !GetAtt AgentSpace.Arn
+                  # 🔴 上传后的**回验**。部署账号的 Lambda 角色早就有这两个
+                  #    （notiops-backend-stack.ts 那段注释写着「拿到 asset_id
+                  #    不等于 space 里真有这份 skill」），成员账号这侧一直没有
+                  #    —— 两边不对称，而不对称的那一半是静默的：
+                  #
+                  #    ```
+                  #    GetAsset 被拒       → skill_upload._verify_asset_exists
+                  #                          返回 None → 只记一条 WARNING
+                  #                          → 上传照样报成功，回验这道防线是空的
+                  #    GetAssetContent 被拒 → upload_inspection_skills.py --verify
+                  #                          在成员账号上压根做不了逐字比对
+                  #    ```
+                  #
+                  #    后果：传上去一份被截断的、或版本对不上的 skill 看不出来，
+                  #    然后判读静默退化成通用发挥 —— 而那正是 2026-08-24
+                  #    「传错 space」那次事故唯一没被及时发现的原因。
+                  #
+                  # ⚠️ 纯只读，不扩大写权限面。
+                  - aidevops:GetAsset
+                  - aidevops:GetAssetContent
+                # 🔴 **两个 space 都要列。** 只写排障那个的后果按动作不同：
+                #    CreateBacklogTask   → 巡检判读一条都派不出去（AccessDenied
+                #                          藏在 executor 日志里，看板只显示
+                #                          「N 条未做根因分析」）
+                #    GetBacklogTask      → 对账兜底整条变 no-op
+                #    ListJournalRecords  → callback 拉不到判读全文，
+                #                          每条 finding 旁边是空的
+                #    CreateAsset 等      → 判读 skill 装不进去，DA 自由发挥、
+                #                          输出格式对不上解析器
+                Resource:
+                  - !GetAtt AgentSpace.Arn
+                  - !GetAtt InspectionAgentSpace.Arn
+
+  # ─── 巡检①：跨账号只读采集角色 ───
+  #
+  # 🔴 **与 `infra/member-account-onboarding.yaml` 里的 `IdleDetectionRole`
+  #    必须逐字一致**（角色名 / 信任策略 / 托管策略 / 内联 action 清单）。
+  #    同 Org 的账号由 StackSets 下发那一份，非 Org 的账号由本模板下发这一份，
+  #    而系统侧只有一套 `collectionRoleArn()` 推导逻辑 —— 两边漂了就会出现
+  #    「一键接入的账号能采，手动接入的账号采不到」这种按接入方式分裂的行为。
+  #    `tests/test_inspection_cross_account.py` 有一条测试逐字比对两个模板。
+  #
+  # ⚠️ 搬到这里的原因：手动接入这条路原来只下发本模板（agent space + trigger
+  #    role），采集角色在**另一个**模板里且只有 StackSets 会下发 —— 于是非 Org
+  #    客户被迫部署两个栈，而 UI 上要专门开一个区块教他部署第二个。
+  #    `CreateCollectionRole=no` 留给已经被 StackSets 下发过的账号（否则角色
+  #    撞名，整栈 rollback）。
+  IdleDetectionRole:
+    Type: AWS::IAM::Role
+    Condition: EnableCollectionRole
+    Properties:
+      RoleName: !Sub "notiops-idle-detection-role-${SystemAccountId}"
+      Description: "Allows NotiOps system account read-only access to this member account (RDS/EC2/CloudWatch/Cost/Support/Security etc.)"
+      # 挂 AWS 托管 ReadOnlyAccess：与部署账号自身 agent 的广只读范围对齐，
+      # 让跨账号调查(EC2/成本/任意只读 API)与单账号体验一致。纯只读、无任何写权限。
+      # 下方 inline notiops-readonly 保留：明确列出核心用到的 action(文档用途 + 兜底)。
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              # 信任管理账号 root：由管理账号侧 IAM 精确控制哪些角色能 AssumeRole
+              # （lambda 执行角色 + Web Chat BFF 角色均有显式 sts:AssumeRole 授权）。
+              # 只信任单一角色名会漏掉 BFF（其 roleName 由 CDK 自动生成）。
+              AWS: !Sub "arn:aws:iam::${SystemAccountId}:root"
+            Action: sts:AssumeRole
+            # 纵深防御：传入 OrganizationId 时，附加 aws:PrincipalOrgID 条件——
+            # 即便信任 root，也只有本组织内的 principal 能 assume，杜绝跨组织混淆代理。
+            Condition: !If
+              - HasOrgId
+              - StringEquals:
+                  aws:PrincipalOrgID: !Ref OrganizationId
+              - !Ref "AWS::NoValue"
+      Policies:
+        - PolicyName: notiops-readonly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:ListTagsForResource
+                  # 资源巡检的变更事件抑制（R2.5）：刚扩容/刚重启的实例本轮不报。
+                  # 缺它巡检不会失败，但抑制条件恒不成立 —— 客户在维护窗口后
+                  # 第一天会收到一批本该被压掉的告警。
+                  # 注：rds:DescribeDBClusters 已在下方 EOS 那段声明（Aurora 巡检也用它）。
+                  - rds:DescribeEvents
+                  # 引擎 EOL 判定（结构性风险页）。缺它那一整类 finding
+                  # 永远为空，而页面上与「没有 EOL 风险」无法区分。
+                  - rds:DescribeDBMajorEngineVersions
+                  # CA 证书到期规则。缺它那条规则永远不命中，而与「没有证书
+                  # 风险」无法区分。RDS CA 到期是硬期限（到点连不上）。
+                  - rds:DescribeCertificates
+                  - elasticache:DescribeCacheClusters
+                  - elasticache:DescribeReplicationGroups
+                  - elasticache:DescribeEvents
+                  - elasticache:ListTagsForResource
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - support:DescribeTrustedAdvisorCheckResult
+                  - support:DescribeTrustedAdvisorChecks
+                  # 仪表盘跨账号视角（Security / Cases / Health / Investigate）——
+                  # 新增仪表盘需要的只读动作统一加在这里，StackSet 更新自动滚到全部成员账号
+                  - securityhub:GetFindings
+                  - securityhub:DescribeHub
+                  - support:DescribeCases
+                  - support:DescribeCommunications
+                  - support:DescribeServices
+                  - health:Describe*
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:DescribeAlarmHistory
+                  # ④ GuardDuty / Backup 仪表盘（只读）
+                  - guardduty:ListDetectors
+                  - guardduty:GetFindingsStatistics
+                  - guardduty:ListFindings
+                  - guardduty:GetFindings
+                  - backup:ListBackupJobs
+                  - backup:ListBackupVaults
+                  - backup:ListProtectedResources
+                  # Phase 2: 管理侧自动回填 DevOps Agent payload —— 读成员账号内
+                  # notiops-member-devops-agent StackSet 实例的 outputs
+                  - cloudformation:DescribeStacks
+                  # Lifecycle/EOS 仪表盘跨账号扫描（版本生命周期盘点，全部只读）
+                  - ec2:DescribeRegions
+                  # 🔴 **内存类判定的分母。** `freeable_memory_pct` /
+                  # `database_memory_usage_pct` 都是「占实例规格的百分比」
+                  # （R2.1.2），分母来自 `ec2:DescribeInstanceTypes` 的
+                  # `MemoryInfo.SizeInMiB`（RDS/EC 的规格名去掉 db./cache.
+                  # 前缀就是 EC2 机型）。
+                  #
+                  # 缺它的表现：`resolved memory for 0/N instance types` →
+                  # 全部 attrs 的 memory_bytes 留 None → **内存类规则一条都
+                  # 不命中**，而看板上与「内存都很健康」完全无法区分。
+                  # 整轮 status=success / completeness=100%，零错误码。
+                  # 这一条是在真实账号上实测出来的（缺它 = 内存类规则全静默）。
+                  #
+                  # ⚠️ 这两份模板此前**都漏了它**（部署账号侧的 lambdaRole 有）。
+                  # 多 region 之后那条 AccessDenied 会每轮重复 17 次 ——
+                  # 后果没变，只是日志噪声乘上去了。
+                  # ⚠️ 不支持资源级限定（API 要求 `*`）。只读、静态公共目录。
+                  - ec2:DescribeInstanceTypes
+                  - rds:DescribeDBClusters
+                  - rds:DescribeDBEngineVersions
+                  - eks:ListClusters
+                  - eks:DescribeCluster
+                  - eks:DescribeClusterVersions
+                  - lambda:ListFunctions
+                  - es:ListDomainNames
+                  - es:DescribeDomains
+                  - elasticmapreduce:ListClusters
+                  - elasticmapreduce:DescribeCluster
+                  - ce:Get*
+                  - ce:List*
+                  - ce:Describe*
+                  - cost-optimization-hub:ListRecommendations
+                  - cost-optimization-hub:GetRecommendation
+                  - cost-optimization-hub:ListEnrollmentStatuses
+                  - cost-optimization-hub:GetPreferences
+                  - compute-optimizer:Get*
+                  - compute-optimizer:Describe*
+                  - budgets:ViewBudget
+                  - budgets:DescribeBudgets
+                  - pricing:GetProducts
+                  - pricing:DescribeServices
+                  - pricing:GetAttributeValues
+                  - pricing:ListPriceLists
+                  - pricing:GetPriceListFileUrl
+                  - freetier:GetFreeTierUsage
+                  - storagelens:Get*
+                  - storagelens:List*
+                  - s3:GetStorageLensConfiguration
+                  - s3:ListStorageLensConfigurations
+                  - cur:DescribeReportDefinitions
+                Resource: "*"
+
+  # ─── 巡检②：DA 判读本账号资源的角色（辅助云来源）───
+  #
+  # 控制台「代理空间 → 添加辅助云来源」那个向导的第 1~6 步就是让客户手建这个
+  # 角色：命名 → 贴自定义信任策略 → 挂托管策略 → 建 → 再贴一条内联策略。
+  # 那两个关键值（系统账号 ID、巡检 space ARN）**系统自己全知道**，让客户手抄
+  # 只会抄错，所以直接在模板里建好，客户只剩向导最后一步「连接到代理」。
+  #
+  # 与上面 PrimaryRole 的区别只在信任条件指向谁：
+  #   PrimaryRole            SourceAccount = 本账号，SourceArn = 本账号的 space
+  #                          → 本账号自己的**根因调查**
+  #   InspectionMonitorRole  SourceAccount = 系统账号，SourceArn = 巡检 space
+  #                          → 系统账号的巡检 space 读本账号
+  # 所以 PrimaryRole 顶不了这个用 —— 条件不匹配，assume 会被拒。
+  #
+  # ⚠️ 托管策略用 AIDevOpsAgentAccessPolicy（2026-03，914 actions，含 aidevops /
+  #    pi / support），与本模板 PrimaryRole 一致、已验证跑通。控制台文案让贴的
+  #    AIOpsAssistantPolicy 是 2024-12 的 CloudWatch AIOps 那个，早于 DevOps
+  #    Agent 15 个月，看着是控制台没跟上。
+  # ─── 判读结果回传：把本账号的 DA 事件推到系统账号的 custom bus（改动①）───
+  #
+  # 🔴 本模板此前 **AWS::Events:: 资源数 = 0** —— 转发只在
+  #    `member-account-onboarding.yaml` 里，而那份走 StackSets，
+  #    partner-resold 客户（没有管理账号权限）用不了。于是手动接入的账号
+  #    判读结果**永远回不到系统账号**。
+  #
+  # ⚠️ 名字带 `-m${SystemAccountId}` 后缀，与另一份模板里的
+  #    `notiops-devops-forwarder-role-<账号>` / `notiops-devops-events-forward`
+  #    **刻意不同**。逐字照抄那份的名字会在「org 账号又手动部署了本模板」时
+  #    撞名（EntityAlreadyExists + 规则撞名）→ 整栈 rollback。
+  #    ⚠️ 系统账号那条总线策略用 `ArnLike ...forwarder-role-*` 通配，
+  #      同时覆盖两种形态 —— 加后缀不会让它匹配不上。
+  #
+  # ⚠️ 两份模板都建转发规则时会**投两次**（callback 跑两遍、多一次 Bedrock
+  #    摘要、多一条 progress 行，且不报错）。靠 `DevOpsEventBusArn` 留空来避免：
+  #    org 那条路不传这个参数。
+  DevOpsEventsForwardRole:
+    Type: AWS::IAM::Role
+    Condition: EnableEventForwarding
+    Properties:
+      RoleName: !Sub "notiops-devops-forwarder-role-${AWS::AccountId}-m${SystemAccountId}"
+      Description: "Allow EventBridge to forward aws.aidevops events to NotiOps system account custom bus"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: put-events
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Ref DevOpsEventBusArn
+
+  DevOpsEventsForwardRule:
+    Type: AWS::Events::Rule
+    Condition: EnableEventForwarding
+    Properties:
+      Name: !Sub "notiops-devops-events-forward-m${SystemAccountId}"
+      Description: "Forward DevOps Agent investigation events to NotiOps system account"
+      # ⚠️ 这里**不按 space 收窄** —— 事件里没有可用于 EventPattern 的 space 维度
+      #    （space id 在 detail.metadata 里，而它是我们要转的那个 payload 本身）。
+      #    分流在系统账号侧做：callback 用 detail.metadata.agent_space_id 判归属
+      #    （`inspection/domain/callback_route.py`）。
+      # 🔴 后果要知道：本账号**排障** space 的事件也会被转过去。那是新增行为
+      #    （本模板此前零转发）—— 排障链路在系统账号侧要能接住它们。
+      EventPattern:
+        source:
+          - aws.aidevops
+        detail-type:
+          - "Investigation Created"
+          - "Investigation Completed"
+          - "Investigation Failed"
+          - "Investigation Timed Out"
+          - "Investigation Cancelled"
+          - "Investigation Linked"
+          # SKIPPED 是终态且**不该重投**（重投必然同样结果）。
+          # 判据取自官方文档的 detail-type 清单 —— EventBridge schema registry
+          # 里没有 InvestigationSkipped（registry 滞后于文档）。
+          # ⚠️ 这 7 个必须与 member-account-onboarding.yaml 里那条一致，
+          #    否则会出现「一键接入的账号收得到某类事件、手动接入的收不到」。
+          - "Investigation Skipped"
+      Targets:
+        - Arn: !Ref DevOpsEventBusArn
+          Id: notiops-devops-bus-target
+          RoleArn: !GetAtt DevOpsEventsForwardRole.Arn
+
+  InspectionMonitorRole:
+    Type: AWS::IAM::Role
+    Condition: EnableInspectionMonitor
+    Properties:
+      RoleName: !Sub "notiops-inspection-monitor-${AWS::AccountId}-m${SystemAccountId}"
+      Description: "Assumed by the DevOps Agent service so the NotiOps inspection agent space can read this account"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref SystemAccountId
+                aws:SourceArn: !Ref InspectionAgentSpaceArn
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsAgentAccessPolicy
+      Policies:
+        # 控制台向导第 6 步那条内联策略：DA 要能建 Resource Explorer 的服务关联
+        # 角色才能盘点本账号资源。缺它判读时资源发现是瞎的。
+        - PolicyName: resource-explorer-slr
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/resource-explorer-2.amazonaws.com/AWSServiceRoleForResourceExplorer"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: resource-explorer-2.amazonaws.com
+
 
 Outputs:
   AgentSpaceId:
     Value: !GetAtt AgentSpace.AgentSpaceId
   AgentSpaceArn:
     Value: !GetAtt AgentSpace.Arn
+  IdleDetectionRoleArn:
+    Condition: EnableCollectionRole
+    # 中文：巡检采集角色 ARN。管理侧「验证并登记」会真 AssumeRole 一次再入库。
+    Description: Read-only role NotiOps inspection assumes to collect data from this account
+    Value: !GetAtt IdleDetectionRole.Arn
+  InspectionMonitorRoleArn:
+    Condition: EnableInspectionMonitor
+    # 中文：贴进控制台「添加辅助云来源 → 连接到代理」那一步的角色 ARN。
+    Description: Paste this into the inspection agent space "add secondary cloud source" wizard
+    Value: !GetAtt InspectionMonitorRole.Arn
+  InspectionAgentSpaceId:
+    # 中文：巡检判读用的 Agent Space ID，回填进管理页（写 da#<账号>.inspect_agent_space_id）。
+    # ⚠️ Description 必须纯 ASCII（见文件头）—— 客户在 Outputs 页照着这句做回填，
+    #    渲染成问号等于把最关键的一步说明弄没了。
+    Description: "Inspection Agent Space ID. Paste this into the NotiOps admin page (the Inspection Agent Space ID field) to enable AI judgment for this account."
+    Value: !GetAtt InspectionAgentSpace.AgentSpaceId
+
+  InspectionOperatorAppUrl:
+    # 中文：巡检 space 的 Web App 地址，需要本账号的登录权限。
+    Description: "Web app URL for the inspection agent space. Requires sign-in to THIS account."
+    Value: !Sub "https://${InspectionAgentSpace.AgentSpaceId}.aidevops.global.app.aws"
+
+  DevOpsEventsForwardRoleArn:
+    Condition: EnableEventForwarding
+    # 中文：EventBridge 转发角色 ARN。系统账号那条总线策略按
+    # notiops-devops-forwarder-role-* 通配放行它。
+    Description: "ARN of the EventBridge role that forwards DevOps Agent events to the NotiOps management account."
+    Value: !GetAtt DevOpsEventsForwardRole.Arn
+
+  OperatorAppUrl:
+    # 中文：Web App 地址。⚠️ 只有 `OperatorApp` 配了才存在这个域名。
+    Description: DevOps Agent web app for this account (open it to watch investigations)
+    Value: !Sub "https://${AgentSpace.AgentSpaceId}.aidevops.global.app.aws/"
   TriggerRoleArn:
     Value: !GetAtt TriggerRole.Arn

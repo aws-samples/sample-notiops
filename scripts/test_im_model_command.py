@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""`@bot model` now follows the admin-enabled set (spec task 4.1 / 4.3).
+"""`@bot model` now follows the admin-enabled set .
 
 The three `platforms/{feishu,slack,dingtalk}/app/main.py` copies were deliberately
 left untouched: they already ask `model_catalog` for the candidate list

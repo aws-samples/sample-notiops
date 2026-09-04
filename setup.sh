@@ -189,21 +189,15 @@ if [ "${SKIP_AGENT:-false}" != "true" ] && [ -d "$(cd "$(dirname "$0")" && pwd)/
   fi
 fi
 
-# 容器构建工具仅在部署 IM Bot 时必需(BotStack 的 ECS 容器用 CDK fromAsset 本地构建镜像)。
-# 若客户只部署 web 端、暂不部署 IM,则不需要容器工具。这里只探测,不强制退出;
-# 真正的强制检查移到 IM 平台选择之后(选了 IM 才要求容器工具)。
-# 支持 docker 或 finch(CDK 通过 CDK_DOCKER 环境变量支持替代容器工具,
-# 参考 https://docs.aws.amazon.com/cdk/v2/guide/build-containers.html)。
-HAS_DOCKER=false
-CONTAINER_TOOL=""
-if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-  HAS_DOCKER=true
-  CONTAINER_TOOL="docker"
-elif command -v finch >/dev/null 2>&1 && finch vm status >/dev/null 2>&1; then
-  HAS_DOCKER=true
-  CONTAINER_TOOL="finch"
-  export CDK_DOCKER=finch
-fi
+# 容器构建工具:**已不再需要**(2026-09-03,IM 重构 M2)。
+# 唯一需要 docker/finch 的地方是老 BotStack 那 5 处 `ContainerImage.fromAsset("../")`
+# ——ECS 长连接容器。IM 现在走 Webhook + Lambda(ImStack),依赖打成普通 zip 层
+# (scripts/build_im_layer.sh 用 pip --platform manylinux2014_x86_64,不用容器)。
+# 所以这里不再探测、也不再有"选了 IM 就必须装 Docker"的硬闸门。
+#
+# ⚠️ 别顺手把 finch 支持加回来:若将来又引入 Docker 资产,同时要改
+#   docs/DEPLOYMENT.md{,.en.md} 的前置条件表 + publish/README.public.{zh,en}.md,
+#   否则客户按文档准备好环境、到跑的时候才炸(见「不许静默降级」)。
 
 # 检查 CDK CLI
 if ! command -v cdk >/dev/null 2>&1; then
@@ -386,6 +380,38 @@ fi
 ORG_MODE=false
 ORG_ID=""
 ORG_FLAG=""
+
+# 🔴 **没带 `--multi-account` 时，成员账号接入整条路是死的 —— 而脚本会正常结束。**
+#
+#    `MULTI_ACCOUNT_MODE` 默认 false（只有 CLI 传 `--multi-account` 才为真），
+#    而下面整段 Organizations 检测挂在它上面 ⇒ `ORG_MODE=false` ⇒
+#    两个 StackSet（notiops-member-onboarding / notiops-member-devops-agent）
+#    压根不创建。
+#
+#    表现：`cdk deploy` 成功、看板能打开、Web Chat 能聊，**只有接入功能是死的**
+#    —— 管理页照常显示、「一键接入」按钮照常存在（`oneClickOnboardAvailable()`
+#    只看 env 有没有注入），点了才拿到 StackSetNotFound。
+#
+#    而 README 把 `./setup.sh` 写成「一键部署（唯一入口）」。
+#
+# ⇒ 当前账号明明是组织管理账号却没带 flag 时，明确说出来。**不自动开启** ——
+#   开多账号模式会动 Organizations 的可信访问与 StackSets，那是用户该决定的。
+if [ "$MULTI_ACCOUNT_MODE" != true ]; then
+  _org_probe=$(aws organizations describe-organization \
+    --query 'Organization.[Id,MasterAccountId]' --output text 2>/dev/null || echo "")
+  if [ -n "$_org_probe" ]; then
+    _org_mgmt=$(echo "$_org_probe" | awk '{print $2}')
+    _me=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
+    if [ -n "$_me" ] && [ "$_me" = "$_org_mgmt" ]; then
+      echo ""
+      echo "  $(t "⚠ 当前账号是组织管理账号(Org: $(echo "$_org_probe" | awk '{print $1}'))，但**没有**带 --multi-account。" "⚠ This account is the Organization management account (Org: $(echo "$_org_probe" | awk '{print $1}')), but --multi-account was NOT passed.")"
+      echo "    $(t "⇒ 两个成员账号 StackSet 不会创建，「一键接入」与「一键关联」都会报 StackSetNotFound。" "⇒ The two member-account StackSets will not be created; both one-click onboarding steps will fail with StackSetNotFound.")"
+      echo "    $(t "要接入成员账号请改用: ./setup.sh --multi-account" "To onboard member accounts, run: ./setup.sh --multi-account")"
+      echo ""
+    fi
+  fi
+fi
+
 if [ "$MULTI_ACCOUNT_MODE" = true ]; then
   echo ""
   echo "$(t "─── 多账号模式: Organizations 检测 ───" "─── Multi-Account Mode: Organizations Detection ───")"
@@ -485,7 +511,7 @@ except Exception: pass
     echo ""
     echo "  $(t "是否需要接收其他 AWS 账号的 Health 事件？" "Receive Health events from other AWS accounts?")"
     echo "  $(t "如果只监控当前账号, 直接回车跳过. " "To monitor only the current account, press Enter to skip.")"
-    echo "  $(t "如果需要, 请输入 Linked Account ID(逗号分隔, 如: 111122223333,444455556666)" "If needed, enter Linked Account IDs (comma-separated, e.g. 111122223333,444455556666)")"
+    echo "  $(t "如果需要, 请输入 Linked Account ID(逗号分隔, 如: 444455556666,111122223333)" "If needed, enter Linked Account IDs (comma-separated, e.g. 444455556666,111122223333)")"
     echo "  $(t "(填入后, 还需在对应账号中运行 ./setup.sh --phd 完成转发配置)" "(After entering, also run ./setup.sh --phd in each account to complete forwarding setup)")"
     if [ -n "$CURRENT_PHD_ACCOUNTS" ]; then
       echo ""
@@ -528,209 +554,59 @@ except Exception: pass
   fi  # end MULTI_ACCOUNT_MODE else (PHD linked accounts)
 fi
 
-# ─── DevOps Agent 多账户白名单(Custom Event Bus Resource Policy)───
-# 本期只 focus 系统部署账号,跨账号功能暂禁用(LOCKED_ACCOUNT_ID 硬锁)。
-# 如需启用多账户,运行: ./setup.sh --multi-account
+# ─── Custom Event Bus 的跨账号判据（改动② 之后不再需要白名单交互）───
+#
+# 🔴 **原来这里有约 190 行交互**：读现有资源策略里的 `aws:PrincipalAccount` 列表 →
+#    提示运维输入新白名单 → diff + 确认 → 用 `-c devopsAgentBusinessAccounts=`
+#    传给 CDK。整块已删，因为策略的判据换成了与账号无关的形状：
+#
+#      ArnLike aws:PrincipalArn arn:<partition>:iam::*:role/notiops-devops-forwarder-role-*
+#      AND events:source = "aws.aidevops"
+#
+#    加一个子账号**零部署** —— 客户的栈建出那个名字的转发角色就能投递。
+#
+# 🔴 **不删的后果是静默毁掉策略**：那段回读认的 key 是
+#    `Condition.StringEquals["aws:PrincipalAccount"]`，新策略里没有这个 key →
+#    读出空 → 提示变成「留空(首次部署 / 暂无业务账户接入)」→ 运维回车 →
+#    `DEVOPS_AGENT_ACCOUNTS_FLAG=""` → 旧 CDK 那个 `length > 0` 门控不成立 →
+#    **CfnEventBusPolicy 被删** → 全部成员账号 PutEvents AccessDenied。
+#    而 setup.sh 打出来的是一条看起来完全正常的提示。
+#
+# ⚠️ 这个 flag 仍然保留成空串传给 cdk synth（第 1109 行那条命令行里有它）——
+#    留着是为了不动那条命令行的形状；CDK 侧已经不读这个 context 了。
 DEVOPS_AGENT_ACCOUNTS_FLAG=""
 
-if [ "$ORG_MODE" = true ]; then
-  echo ""
-  echo "  $(t "ℹ Organizations 模式: DevOps Agent 白名单交互跳过 —" "ℹ Organizations mode: DevOps Agent allowlist prompt skipped —")"
-  echo "    $(t "Custom Event Bus 由 aws:PrincipalOrgID + events:source 双条件整组放行(CDK orgMode 分支)" "The Custom Event Bus allows the whole org via aws:PrincipalOrgID + events:source dual conditions (CDK orgMode branch)")"
-  echo ""
-elif [ "$MULTI_ACCOUNT_MODE" = false ]; then
-  echo ""
-  echo "  $(t "ℹ 跨账号功能本期 disabled(只 focus 部署账号)。如需启用: ./setup.sh --multi-account" "ℹ Cross-account features are disabled by default (focus on the deploy account). To enable: ./setup.sh --multi-account")"
-  echo ""
-else
+echo ""
+echo "  $(t "ℹ Custom Event Bus 跨账号判据: 转发角色名 + events:source" "ℹ Custom Event Bus cross-account judgement: forwarder role name + events:source")"
+echo "    $(t "  ArnLike aws:PrincipalArn .../notiops-devops-forwarder-role-*" "  ArnLike aws:PrincipalArn .../notiops-devops-forwarder-role-*")"
+echo "    $(t "  AND events:source = aws.aidevops" "  AND events:source = aws.aidevops")"
+echo "    $(t "新增业务账户无需重新部署本栈(不再维护账号白名单)" "Onboarding a business account no longer requires redeploying this stack (no account allowlist to maintain)")"
 
-# 先检测当前是否已部署 Bus 以及白名单
-EXISTING_BUS_WHITELIST=""
-EXISTING_BUS_POLICY_PRECHECK=$(aws events describe-event-bus \
+# 存量部署上如果还挂着老的白名单语句，说明一句它会被替换掉（本次部署的正常结果）
+LEGACY_BUS_POLICY=$(aws events describe-event-bus \
   --name notiops-devops-events --region "$DEPLOY_REGION" \
   --query 'Policy' --output text 2>/dev/null || echo "")
-if [ -n "$EXISTING_BUS_POLICY_PRECHECK" ] && [ "$EXISTING_BUS_POLICY_PRECHECK" != "None" ]; then
-  EXISTING_BUS_WHITELIST=$(echo "$EXISTING_BUS_POLICY_PRECHECK" | python3 -c "
-import sys, json
-try:
-    p = json.loads(sys.stdin.read())
-    accts = []
-    for s in p.get('Statement', []):
-        if s.get('Sid') == 'AllowWhitelistedBusinessAccountsForwardAidevopsEvents':
-            cond = s.get('Condition', {}).get('StringEquals', {})
-            v = cond.get('aws:PrincipalAccount', [])
-            if isinstance(v, str):
-                v = [v]
-            accts.extend(v)
-    print(','.join(sorted(set(accts))))
-except Exception:
-    pass
-" 2>/dev/null || echo "")
-fi
-
-echo ""
-echo "$(t "是否启用 DevOps Agent 多账户集成(跨账户调查触发 + 结果回传)？" "Enable DevOps Agent multi-account integration (cross-account investigation trigger + result callback)?")"
-echo "  $(t "说明: 该功能允许系统账户通过 Custom Event Bus 接收业务账户的 DevOps Agent 调查结果事件. " "Note: this lets the system account receive DevOps Agent investigation-result events from business accounts via a Custom Event Bus.")"
-echo "  $(t "若已有或计划接入业务账户, 请输入账号白名单; 否则直接回车跳过. " "If you have or plan to onboard business accounts, enter the allowlist; otherwise press Enter to skip.")"
-if [ -n "$EXISTING_BUS_WHITELIST" ]; then
+if [ -n "$LEGACY_BUS_POLICY" ] && [ "$LEGACY_BUS_POLICY" != "None" ] \
+   && echo "$LEGACY_BUS_POLICY" | grep -q "aws:PrincipalAccount"; then
   echo ""
-  echo "  $(t "当前已有白名单: " "Current allowlist: ")$EXISTING_BUS_WHITELIST"
-  echo "  $(t "选 N 将清空白名单(相当于删除所有业务账户的访问权限)" "Choosing N clears the allowlist (revokes all business accounts access)")"
+  echo "  $(t "⚠️ 检测到旧的账号白名单语句，本次部署会用上面那条判据替换它。" "⚠️ A legacy account-allowlist statement was found; this deploy replaces it with the judgement above.")"
+  echo "     $(t "影响: 白名单里的账号仍然能投递(它们用的就是那个角色名)；" "Effect: accounts in the allowlist keep working (they use that same role name);")"
+  echo "     $(t "      不在白名单但部署过我们模板的账号，从此也能投递。" "      accounts not in the allowlist but running our template can now also forward.")"
 fi
-read -p "  [Y/n]: " DEVOPS_AGENT_CHOICE
-case "${DEVOPS_AGENT_CHOICE:-Y}" in
-  [nN]*) ENABLE_DEVOPS_AGENT="false" ;;
-  *) ENABLE_DEVOPS_AGENT="true" ;;
-esac
-
-if [ "$ENABLE_DEVOPS_AGENT" = "true" ]; then
-  # 从已部署的 Custom Event Bus Resource Policy 读取当前白名单
-  CURRENT_DEVOPS_ACCOUNTS=""
-  DEVOPS_BUS_NAME="notiops-devops-events"
-  CURRENT_BUS_POLICY=$(aws events describe-event-bus \
-    --name "$DEVOPS_BUS_NAME" --region "$DEPLOY_REGION" \
-    --query 'Policy' --output text 2>/dev/null || echo "")
-
-  if [ -n "$CURRENT_BUS_POLICY" ] && [ "$CURRENT_BUS_POLICY" != "None" ]; then
-    CURRENT_DEVOPS_ACCOUNTS=$(echo "$CURRENT_BUS_POLICY" | python3 -c "
-import sys, json
-try:
-    p = json.loads(sys.stdin.read())
-    accts = []
-    for s in p.get('Statement', []):
-        if s.get('Sid') == 'AllowWhitelistedBusinessAccountsForwardAidevopsEvents':
-            cond = s.get('Condition', {}).get('StringEquals', {})
-            v = cond.get('aws:PrincipalAccount', [])
-            if isinstance(v, str):
-                v = [v]
-            accts.extend(v)
-    print(','.join(sorted(set(accts))))
-except Exception:
-    pass
-" 2>/dev/null || echo "")
-  fi
-
-  DEVOPS_AGENT_BUSINESS_ACCOUNTS="${DEVOPS_AGENT_BUSINESS_ACCOUNTS:-}"
-  if [ -z "$DEVOPS_AGENT_BUSINESS_ACCOUNTS" ]; then
-    echo ""
-    echo "  $(t "请输入业务账户白名单(12 位数字, 逗号分隔, 如: 111122223333,444455556666)" "Enter business account allowlist (12-digit IDs, comma-separated, e.g. 111122223333,444455556666)")"
-    echo "  $(t "直接回车 = " "Press Enter = ")"
-    if [ -n "$CURRENT_DEVOPS_ACCOUNTS" ]; then
-      echo "    $(t "保留当前白名单: " "keep current allowlist: ")$CURRENT_DEVOPS_ACCOUNTS"
-    else
-      echo "    $(t "留空(首次部署 / 暂无业务账户接入)" "leave empty (first deploy / no business accounts yet)")"
-    fi
-    echo ""
-    read -p "  Business Account IDs: " DEVOPS_AGENT_BUSINESS_ACCOUNTS
-
-    # 直接回车 → 保留当前
-    if [ -z "$DEVOPS_AGENT_BUSINESS_ACCOUNTS" ] && [ -n "$CURRENT_DEVOPS_ACCOUNTS" ]; then
-      DEVOPS_AGENT_BUSINESS_ACCOUNTS="$CURRENT_DEVOPS_ACCOUNTS"
-    fi
-  fi
-
-  if [ -n "$DEVOPS_AGENT_BUSINESS_ACCOUNTS" ]; then
-    # 统一分隔符(支持逗号、分号、空格)+ 去除多余分隔符
-    DEVOPS_AGENT_BUSINESS_ACCOUNTS=$(echo "$DEVOPS_AGENT_BUSINESS_ACCOUNTS" \
-      | tr ';' ',' | tr ' ' ',' | tr -s ',' | sed 's/^,//;s/,$//')
-
-    # 格式校验(R5.11): 每个账号必须是 12 位数字
-    DEVOPS_VALID=true
-    IFS=',' read -ra DEVOPS_ACCT_ARRAY <<< "$DEVOPS_AGENT_BUSINESS_ACCOUNTS"
-    for acct in "${DEVOPS_ACCT_ARRAY[@]}"; do
-      if ! [[ "$acct" =~ ^[0-9]{12}$ ]]; then
-        echo "  $(t "❌ 无效的业务账户 ID: " "❌ Invalid business account ID: ")$acct$(t "(必须为 12 位数字)" " (must be 12 digits)")"
-        DEVOPS_VALID=false
-      fi
-    done
-    if [ "$DEVOPS_VALID" = false ]; then
-      echo "  $(t "请检查输入后重新运行 setup.sh" "Please check your input and re-run setup.sh")"
-      exit 1
-    fi
-
-    # 去重校验(R5.11)
-    DEVOPS_UNIQUE_ACCOUNTS=$(echo "$DEVOPS_AGENT_BUSINESS_ACCOUNTS" \
-      | tr ',' '\n' | sort -u | paste -sd ',' -)
-    DEVOPS_INPUT_COUNT=$(echo "$DEVOPS_AGENT_BUSINESS_ACCOUNTS" | tr ',' '\n' | wc -l | tr -d ' ')
-    DEVOPS_UNIQUE_COUNT=$(echo "$DEVOPS_UNIQUE_ACCOUNTS" | tr ',' '\n' | wc -l | tr -d ' ')
-    if [ "$DEVOPS_INPUT_COUNT" != "$DEVOPS_UNIQUE_COUNT" ]; then
-      echo "  $(t "❌ 输入包含重复账户, 请去重后重新运行 setup.sh" "❌ Duplicate accounts in input; please de-duplicate and re-run setup.sh")"
-      echo "     $(t "原始: " "Original: ")$DEVOPS_AGENT_BUSINESS_ACCOUNTS"
-      echo "     $(t "去重: " "Deduped: ")$DEVOPS_UNIQUE_ACCOUNTS"
-      exit 1
-    fi
-    DEVOPS_AGENT_BUSINESS_ACCOUNTS="$DEVOPS_UNIQUE_ACCOUNTS"
-
-    # Diff 展示 + 显式确认(R5.12)
-    DEVOPS_ADDED=$(comm -13 \
-      <(echo "$CURRENT_DEVOPS_ACCOUNTS" | tr ',' '\n' | sort -u) \
-      <(echo "$DEVOPS_AGENT_BUSINESS_ACCOUNTS" | tr ',' '\n' | sort -u) \
-      | grep -v '^$' | paste -sd ',' - || echo "")
-    DEVOPS_REMOVED=$(comm -23 \
-      <(echo "$CURRENT_DEVOPS_ACCOUNTS" | tr ',' '\n' | sort -u) \
-      <(echo "$DEVOPS_AGENT_BUSINESS_ACCOUNTS" | tr ',' '\n' | sort -u) \
-      | grep -v '^$' | paste -sd ',' - || echo "")
-
-    if [ -n "$DEVOPS_ADDED" ] || [ -n "$DEVOPS_REMOVED" ]; then
-      echo ""
-      echo "  $(t "DevOps Agent 白名单变更: " "DevOps Agent allowlist changes:")"
-      [ -n "$DEVOPS_ADDED" ]   && echo "    $(t "+ 新增: " "+ Added: ")$DEVOPS_ADDED"
-      [ -n "$DEVOPS_REMOVED" ] && echo "    $(t "- 删除: " "- Removed: ")$DEVOPS_REMOVED"
-      echo "    $(t "最终白名单: " "Final allowlist: ")$DEVOPS_AGENT_BUSINESS_ACCOUNTS"
-      echo ""
-      echo "  $(t "⚠️ 删除账户的影响: 移除后该账户向 Custom Event Bus 发事件会被拒绝(AccessDenied). " "⚠️ Effect of removal: that account can no longer send events to the Custom Event Bus (AccessDenied).")"
-      echo "     $(t "请确认客户侧 delete-stack 或 Dashboard 禁用已完成后再移除白名单. " "Confirm the customer-side delete-stack or Dashboard disable is done before removing from the allowlist.")"
-      echo ""
-      read -p "  $(t "输入 yes 确认执行 cdk deploy: " "Type yes to confirm cdk deploy: ")" DEVOPS_CONFIRM
-      if [ "$DEVOPS_CONFIRM" != "yes" ]; then
-        echo "  $(t "已取消部署(未输入 yes)" "Deployment cancelled (yes not entered)")"
-        exit 1
-      fi
-    else
-      echo "  $(t "✓ 白名单无变化: " "✓ Allowlist unchanged: ")$DEVOPS_AGENT_BUSINESS_ACCOUNTS"
-    fi
-
-    echo "  $(t "✓ DevOps Agent 白名单: " "✓ DevOps Agent allowlist: ")$DEVOPS_AGENT_BUSINESS_ACCOUNTS"
-    DEVOPS_AGENT_ACCOUNTS_FLAG="-c devopsAgentBusinessAccounts=$DEVOPS_AGENT_BUSINESS_ACCOUNTS"
-  else
-    echo "  $(t "DevOps Agent 白名单为空(Custom Event Bus 不创建 resource policy)" "DevOps Agent allowlist is empty (Custom Event Bus resource policy not created)")"
-    DEVOPS_AGENT_ACCOUNTS_FLAG=""
-  fi
-else
-  # 选 N 时, 如果当前已有白名单, 警告会清空
-  if [ -n "$EXISTING_BUS_WHITELIST" ]; then
-    echo ""
-    echo "  $(t "⚠️ 警告: 当前 Custom Event Bus 有白名单 [" "⚠️ Warning: the Custom Event Bus currently has an allowlist [")$EXISTING_BUS_WHITELIST]"
-    echo "     $(t "选 N 将导致 CDK 删除 resource policy, 这些账户的事件将被拒绝(AccessDenied)" "Choosing N will make CDK delete the resource policy; these accounts events will be denied (AccessDenied)")"
-    echo "     $(t "请确认客户侧 delete-stack 或 Dashboard 禁用已完成后再移除白名单. " "Confirm the customer-side delete-stack or Dashboard disable is done before removing from the allowlist.")"
-    echo ""
-    read -p "     $(t "输入 yes 确认清空白名单: " "Type yes to confirm clearing the allowlist: ")" CLEAR_CONFIRM
-    if [ "$CLEAR_CONFIRM" != "yes" ]; then
-      echo "     $(t "已取消清空(仍启用 DevOps Agent, 保留现有白名单)" "Clear cancelled (DevOps Agent stays enabled, existing allowlist kept)")"
-      DEVOPS_AGENT_ACCOUNTS_FLAG="-c devopsAgentBusinessAccounts=$EXISTING_BUS_WHITELIST"
-    else
-      echo "  $(t "跳过 DevOps Agent 多账户白名单(Custom Event Bus 将删除 resource policy)" "Skipping DevOps Agent multi-account allowlist (Custom Event Bus resource policy will be deleted)")"
-      DEVOPS_AGENT_ACCOUNTS_FLAG=""
-    fi
-  else
-    echo "  $(t "跳过 DevOps Agent 多账户白名单交互(Custom Event Bus 将不创建 resource policy)" "Skipping DevOps Agent multi-account allowlist prompt (Custom Event Bus resource policy will not be created)")"
-    DEVOPS_AGENT_ACCOUNTS_FLAG=""
-  fi
-fi
-fi  # end MULTI_ACCOUNT_MODE guard
+echo ""
 
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # ─── IM 平台选择 ───
 # v1 release: dingtalk 暂不开放给客户(凭据流程 + push 自定义机器人
-# 双 robot 配置链路在 Phase 2c 才稳定)。bot-stack.ts 仍然定义了
-# DingtalkBotService 但 desiredCount=0,task 不起,不计费。
+# 双 robot 配置链路在 Phase 2c 才稳定)。M2 之后 ImStack 只按 enabledPlatforms
+# 建对应平台的 Webhook 路由,没选的平台连 Lambda 都不建。
 # 第二版要恢复:把 "3) 钉钉 (DingTalk)" 选项加回菜单 + 在解析里加
 # IM_PLATFORM_CHOICE 含 "3" 时 append "dingtalk,"。
 echo ""
 echo "$(t "── IM 平台选择（可选）──" "── IM Platform Selection (optional) ──")"
 echo "  $(t "web 端默认部署。IM Bot 是可选的：你可以现在部署、或暂时不部署、" "The web UI is always deployed. IM bots are optional: deploy now, or skip and")"
-echo "  $(t "以后想起来再随时重跑本脚本启用（未选中的平台 ECS desiredCount=0，不启动不计费）。" "re-run this script anytime later (unselected platforms run at ECS desiredCount=0 — no cost).")"
+echo "  $(t "以后想起来再随时重跑本脚本启用（未选中的平台整个 ImStack 不实例化，零成本）。" "re-run this script anytime later (unselected platforms: the whole ImStack is not created — zero cost).")"
 echo "  0) $(t "暂不部署 IM（只部署 web 端，以后可随时再加）" "Skip IM for now (web UI only, can add later)")"
 echo "  1) $(t "飞书 (Feishu)" "Feishu")"
 echo "  2) Slack"
@@ -748,21 +624,14 @@ fi
 ENABLED_PLATFORMS="${ENABLED_PLATFORMS%,}"  # 去尾逗号(空 = 不启用任何 IM)
 
 if [ -z "$ENABLED_PLATFORMS" ]; then
-  # 不部署 IM：BotStack 仍部署但所有 bot desiredCount=0（不起容器、不计费）。
+  # 不部署 IM：整个 ImStack 都不实例化（见 infra/bin/app.ts 的 enabledPlatforms 分支）。
   # 以后想启用：重跑本脚本选 1/2 即可，无需重建。
   echo "  $(t "✓ 暂不部署 IM（web 端照常部署；以后重跑本脚本可随时启用 IM）" "✓ Skipping IM (web UI deploys as usual; re-run this script anytime to enable IM)")"
   PLATFORM_FLAG="-c enabledPlatforms=none"
 else
-  # 选了 IM → 需要 Docker 本地构建 ECS 容器镜像
-  if [ "$HAS_DOCKER" != "true" ]; then
-    echo ""
-    echo "  $(t "❌ 你选择了部署 IM Bot（" "❌ You chose to deploy IM bots (")$ENABLED_PLATFORMS$(t "），但未检测到可用的容器构建工具。" "), but no container build tool was detected.")"
-    echo "     $(t "IM Bot 需要本地 Docker 或 Finch 构建 ECS 容器镜像。" "IM bots need local Docker or Finch to build ECS container images.")"
-    echo "     $(t "请安装并启动 Docker Desktop，或运行 'finch vm start' 启动 Finch 后重试；" "Install and start Docker Desktop, or run 'finch vm start', then retry;")"
-    echo "     $(t "或选 0) 暂不部署 IM。" "or choose 0) skip IM.")"
-    exit 1
-  fi
-  echo "  $(t "✓ 启用平台: " "✓ Enabled platforms: ")$ENABLED_PLATFORMS$(t "（容器工具: " " (container tool: ")$CONTAINER_TOOL)"
+  # 选了 IM 不再要求 Docker/Finch：M2 之后 IM 只有 Webhook + Lambda 一条路径，
+  # 依赖打成 zip 层（scripts/build_im_layer.sh），没有任何容器镜像要构建。
+  echo "  $(t "✓ 启用平台: " "✓ Enabled platforms: ")$ENABLED_PLATFORMS"
   PLATFORM_FLAG="-c enabledPlatforms=$ENABLED_PLATFORMS"
 fi
 
@@ -791,6 +660,32 @@ echo "  $(t "✓ EOL 兜底表 eol-dates.json 已复制进 BFF" "✓ eol-dates.j
 npm ci --omit=dev --silent --no-audit --no-fund   # ci: 严格按 lockfile（安全要求）
 echo "  $(t "✓ web chat BFF 依赖安装完成" "✓ Web Chat BFF dependencies installed")"
 
+# ── 客户自有 CUR 数据源（cost-agent MCP，可选加装项）──
+# 这是**外部**依赖：客户自己部署的一个 Athena-over-CUR 的 MCP 服务器（Lambda Function URL，
+# AuthType=AWS_IAM），NotiOps 只是去调它。所以两件事都必须成立：
+#   · 不填 = 这项能力**按设计不存在**（不是"坏了"）：BFF 拿到空串 → capabilities.json 的
+#     requiresEnv 把 4 个 nav:finops:cur-* 节点摘掉；agent 侧一个工具都不挂。费用问题照答
+#     （走 CE / call_aws），只是口径是聚合而非行级。
+#   · 填了但服务挂了 = 只有那 4 张表「暂时不可用」，对话仍然能答并**明说**换了数据源。
+# 为什么要两个变量：Function URL 里不含函数 ARN，而 lambda:InvokeFunctionUrl 必须按资源
+# 授权（docs/DEPLOYMENT.md §14）。只填一半会得到"看起来装好了、每次调用 403"的部署，
+# 而 403 的根因只在 CloudTrail 里 —— 所以在这里就拦掉，别让它跑到最后。
+COST_AGENT_MCP_URL="${COST_AGENT_MCP_URL:-}"
+COST_AGENT_MCP_URL="${COST_AGENT_MCP_URL%/}"
+COST_AGENT_FN_ARN="${COST_AGENT_FN_ARN:-}"
+COST_AGENT_FLAG=""
+if [ -n "$COST_AGENT_MCP_URL" ]; then
+  if [ -z "$COST_AGENT_FN_ARN" ]; then
+    echo ""
+    echo "  $(t "❌ 设了 COST_AGENT_MCP_URL 却没设 COST_AGENT_FN_ARN。" "❌ COST_AGENT_MCP_URL is set but COST_AGENT_FN_ARN is not.")" >&2
+    echo "     $(t "Function URL 里不含函数 ARN，而 lambda:InvokeFunctionUrl 必须按资源授权 ——" "A Function URL does not contain the function ARN, and lambda:InvokeFunctionUrl must be granted per function --")" >&2
+    echo "     $(t "只填一半会部署出一个每次调用都 403 的数据源。见 docs/DEPLOYMENT.md §14。" "filling in only half deploys a data source that 403s on every call. See docs/DEPLOYMENT.md section 14.")" >&2
+    exit 1
+  fi
+  COST_AGENT_FLAG="-c costAgentMcpUrl=$COST_AGENT_MCP_URL -c costAgentFunctionArn=$COST_AGENT_FN_ARN"
+  echo "  $(t "✓ 将接入客户自有 CUR 数据源（cost-agent MCP）" "✓ Will wire in your own CUR data source (cost-agent MCP)")"
+fi
+
 # ── Web Chat Agent（AgentCore Runtime）部署 ──
 # 部署 Strands agent 到 AgentCore Runtime，并 provision web-search Gateway（仅 us-east-1）。
 # 拿到 Runtime ARN 后，下面 CDK 部署 WebChatStack 时通过 -c agentRuntimeArn 注入，
@@ -815,6 +710,7 @@ if [ "${SKIP_AGENT:-false}" != "true" ] && [ -d "$PROJECT_ROOT/agent-build/NotiO
   if DEPLOY_REGION="$DEPLOY_REGION" PROJECT_ROOT="$PROJECT_ROOT" \
      ENABLE_WEBSEARCH="${ENABLE_WEBSEARCH:-true}" AGENT_ARN_OUT="$AGENT_ARN_FILE" \
      NOTIOPS_ALLOW_CROSS_ACCOUNT="$([ "$ORG_MODE" = true ] && echo 1 || echo "")" \
+     COST_AGENT_MCP_URL="$COST_AGENT_MCP_URL" COST_AGENT_FN_ARN="$COST_AGENT_FN_ARN" \
      bash "$PROJECT_ROOT/scripts/deploy_agent.sh"; then
     AGENT_RUNTIME_ARN=$(cat "$AGENT_ARN_FILE" 2>/dev/null || echo "")
     if [ -n "$AGENT_RUNTIME_ARN" ]; then
@@ -853,11 +749,61 @@ source .venv/bin/activate
 pip install --upgrade pip --quiet
 # --platform 确保安装 Linux x86_64 二进制(Lambda 运行环境)；用单行命令, 避免 \ 续行被编辑器/换行/尾随空格破坏(更 robust)
 PLAT_ARGS="--platform manylinux2014_x86_64 --implementation cp --only-binary=:all:"
-pip install boto3==1.42.69 botocore==1.42.69 -t lambda_layer/python/ --quiet --upgrade $PLAT_ARGS
+# boto3/botocore 钉 1.43.65 —— **不许往下调**。Lambda 运行时自带的版本不可控，
+# 层里的版本才是实际生效的。
+#
+# 下限有**两个独立来源**，都是运行时才炸、构建与部署全绿：
+#
+#   ① 服务模型存不存在。后端 Lambda（BFF 的「深度调查直连」）和 IM worker 都走
+#      core/devops_agent.py，它 `boto3.client("devops-agent")`，靠 botocore 自带的
+#      `botocore/data/devops-agent/` 目录。旧 botocore 里没有 → 构造客户端就
+#      UnknownServiceError。
+#   ② 模型里的 operation 够不够。Asset API（CreateAsset/UpdateAsset/ListAssets，
+#      管 skill / custom_agent）与 Trigger API（CreateTrigger/ListTriggers，DA 原生
+#      定时触发）是 1.43.2x 才进 service model 的。实测 1.43.19 只有 44 个
+#      operation、这两组全缺，1.43.30 起是 62 个。缺了不报错，只在调用时抛
+#      `object has no attribute 'create_trigger'`。
+#
+# 🔴 1.43.65 同时满足①②，2026-09-03 实测：62 个 operation，CreateAsset /
+#    UpdateAsset / ListAssets / CreateTrigger / ListTriggers / CreateChat /
+#    SendMessage / CreateBacklogTask / ListPendingMessages / ListAgentSpaces 全含。
+#    （此前本分支钉的是 1.43.73，那只是"当时最新"、不是需求下限；合并时统一到 65
+#     让下面那五处钉版本的地方一致。）
+#
+# 为什么必须钉、不能写 >=：CLI 漂版本会改写入库的 harness（见「依赖必钉版本」）。
+#
+# ⚠️ 一共**五处**钉同一个版本，改一处要全改，否则同一份 core/devops_agent.py
+#    在一端能跑、另一端 UnknownServiceError，看起来像"某一端的 bug"：
+#      setup.sh（本行）
+#      scripts/build_im_layer.sh 的 BOTO_VERSION
+#      platforms/{feishu,slack,dingtalk}/requirements.txt
+pip install boto3==1.43.65 botocore==1.43.65 -t lambda_layer/python/ --quiet --upgrade $PLAT_ARGS
 pip install "aws-lambda-powertools[aws-sdk]>=3.0.0" -t lambda_layer/python/ --quiet --upgrade $PLAT_ARGS
 pip install "jinja2>=3.1.6" -t lambda_layer/python/ --quiet --upgrade $PLAT_ARGS
 deactivate
 echo "  $(t "✓ Lambda 依赖安装完成" "✓ Lambda dependencies installed")"
+
+# 2.2 IM 依赖层（lambda_layer_im/）—— 只在选了 IM 平台时构建。
+# ⚠️ 这一步**不是可选的**：ImStack 在 infra/bin/app.ts 的
+# `enabledPlatforms !== "none"` 分支里实例化，而 im-stack.ts 在 synth 期就会检查层里
+# 有没有 lark_oapi/slack_sdk/botocore。层没建 → 下面的 `cdk synth --all` 直接失败，
+# 而不是"少部一个栈"（有意如此，见「不许静默降级」：宁可 synth 期停，也不要部上去
+# 一个 import 就崩的 Lambda）。
+# 为什么单独一层、为什么必须 manylinux2014_x86_64：见 scripts/build_im_layer.sh 文件头。
+if [ -n "$ENABLED_PLATFORMS" ]; then
+  echo ""
+  echo "  $(t "构建 IM 依赖层 (lark-oapi + slack-sdk + boto3)..." "Building IM dependency layer (lark-oapi + slack-sdk + boto3)...")"
+  if bash scripts/build_im_layer.sh; then
+    echo "  $(t "✓ IM 依赖层构建完成" "✓ IM dependency layer built")"
+  else
+    echo ""
+    echo "  $(t "❌ IM 依赖层构建失败（通常是访问 PyPI 失败）。" "❌ Failed to build the IM dependency layer (usually a PyPI connectivity failure).")"
+    echo "     $(t "IM 的 Webhook Lambda 依赖这一层，缺了它 cdk synth 会直接失败。" "The IM webhook Lambdas need this layer; without it cdk synth fails outright.")"
+    echo "     $(t "修好网络后重跑本脚本，或先单独跑: bash scripts/build_im_layer.sh" "Fix connectivity and re-run this script, or run it standalone: bash scripts/build_im_layer.sh")"
+    echo "     $(t "如果只想先部署 web 端：重跑本脚本、IM 平台那一步选 0) 暂不部署 IM。" "To deploy the web side only: re-run this script and choose 0) skip IM at the platform step.")"
+    exit 1
+  fi
+fi
 
 # 2.5. 检查遗留旧 Secret(spec: devops-agent-per-account-architecture 已废弃)
 # 旧架构用 notiops/devops-agent-config Secret 存 agent_space_id, 
@@ -1050,6 +996,60 @@ check_orphan_role() {
 check_orphan_role "notiops-idle-detection-role" "IdleDetectionRole"
 check_orphan_role "notiops-lambda-execution-role" "LambdaExecutionRole"
 
+# ─── 资源巡检的四个部署参数（R11c.3 / R11c.7 / R11b.7 / R11b.10）───
+#
+# 🔴 这四个不传的后果**全部是静默的** —— 巡检照跑、看板有数据、run 记录
+#    success，只是：告警没人收到 / 预算护栏关着 / 推送没有深链。
+#    所以这里自动探测 + 显式打印，而不是让它们默默吃兜底值。
+echo ""
+echo "$(t "─── 资源巡检部署参数 ───" "─── Resource Inspection deployment parameters ───")"
+INSPECTION_FLAGS=""
+
+# ① 运维告警收件人。**独立于客户推送通道**（R11c.2：混进去客户会收到
+#    我们的内部故障）。不填也会建 topic —— Alarm 必须有 action，否则它只在
+#    控制台变红，而「没人看控制台」正是 R11c.3 存在的原因。
+if [ -n "${OPS_ALERT_EMAIL:-}" ]; then
+  INSPECTION_FLAGS="$INSPECTION_FLAGS -c opsAlertEmail=$OPS_ALERT_EMAIL"
+  echo "  $(t "✓ 运维告警邮箱: " "✓ Ops alert email: ")$OPS_ALERT_EMAIL"
+else
+  echo "  $(t "ℹ 未设 OPS_ALERT_EMAIL —— 6 条巡检告警只会在 CloudWatch 控制台变红。" "ℹ OPS_ALERT_EMAIL not set -- the 6 inspection alarms will only turn red in the console.")"
+  echo "    $(t "补法: OPS_ALERT_EMAIL=sre@example.com ./setup.sh（或事后订阅 notiops-inspection-ops-alerts）" "Fix: OPS_ALERT_EMAIL=sre@example.com ./setup.sh (or subscribe to notiops-inspection-ops-alerts later)")"
+fi
+
+# ② DevOps Agent 月度额度上限（秒）。🔴 不设的话预算护栏**静默关闭**：
+#    `_env(..., "-1")` 恒取兜底 → used_ratio 恒 0 → tier 恒 NORMAL。
+#    按容量模型估算，满负荷月消耗
+#    远超 Enterprise Support Basic 的额度，护栏关着等于第一个月烧光全年。
+if [ -n "${INSPECTION_MONTHLY_LIMIT_SECONDS:-}" ]; then
+  INSPECTION_FLAGS="$INSPECTION_FLAGS -c monthlyLimitSeconds=$INSPECTION_MONTHLY_LIMIT_SECONDS"
+  echo "  $(t "✓ DA 月度额度上限: " "✓ DA monthly limit: ")${INSPECTION_MONTHLY_LIMIT_SECONDS}s"
+else
+  echo "  $(t "⚠ 未设 INSPECTION_MONTHLY_LIMIT_SECONDS —— 预算护栏关闭（P3 告警会停在 INSUFFICIENT_DATA 提示这一点）。" "⚠ INSPECTION_MONTHLY_LIMIT_SECONDS not set -- the budget guardrail is OFF (the P3 alarm stays INSUFFICIENT_DATA to surface this).")"
+fi
+
+# ③ 看板 base URL（推送正文里的「查看详情 / 查看全部」深链，R11b.7）。
+#    ⚠️ 它是 **WebChatStack** 的 CloudFront 域名，而那个栈在本次部署里
+#    可能还不存在（首次部署）。所以从**已有部署**的 CFN 输出里读 ——
+#    首次部署拿不到（推送就没深链），重跑一次即补上。这正是
+#    「用 setup.sh 更新现有资源」的场景。
+EXISTING_CHAT_URL=$(aws cloudformation describe-stacks \
+  --stack-name WebChatStack --region "$DEPLOY_REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='ChatUrl'].OutputValue | [0]" \
+  --output text 2>/dev/null || echo "")
+if [ -n "$EXISTING_CHAT_URL" ] && [ "$EXISTING_CHAT_URL" != "None" ]; then
+  INSPECTION_FLAGS="$INSPECTION_FLAGS -c webBaseUrl=$EXISTING_CHAT_URL"
+  echo "  $(t "✓ 推送深链 base URL: " "✓ Push deep-link base URL: ")$EXISTING_CHAT_URL"
+else
+  echo "  $(t "ℹ WebChatStack 尚未部署 —— 本轮推送正文没有深链，部署完重跑一次即补上。" "ℹ WebChatStack not deployed yet -- push bodies will have no deep links this round; re-run setup.sh once it exists.")"
+fi
+
+# ④ 判读正文语言（R11b.10）。默认 zh —— ⚠️ 不复用 DEFAULT_LOCALE，
+#    那个在 report_delivery 里兜底 "en"，共用会把巡检报告拖成英文。
+if [ -n "${INSPECTION_REPORT_LOCALE:-}" ]; then
+  INSPECTION_FLAGS="$INSPECTION_FLAGS -c inspectionReportLocale=$INSPECTION_REPORT_LOCALE"
+  echo "  $(t "✓ 判读正文语言: " "✓ Judgment body locale: ")$INSPECTION_REPORT_LOCALE"
+fi
+
 # 3. CDK 部署
 echo ""
 cd "$PROJECT_ROOT/infra"
@@ -1061,9 +1061,47 @@ SYNTH_OK=true
 # repo root, so the CDK output dir must NOT live inside it (infra/cdk.out would
 # self-reference recursively → ENAMETOOLONG). $CDK_OUT_DIR is under the system
 # temp dir, fully outside ../.
-CDK_OUT_DIR="${TMPDIR:-/tmp}/notiops-cdk-out"
+# ⚠️ 目录名带上 repo 名。三个 clone（devops-assistant / NotiOps /
+# sample-notiops）的 setup.sh 此前都写死 "notiops-cdk-out" —— 同一台机器上
+# 并发部署两个 repo 会互相踩：一边正在被 asset 拷贝读，另一边的
+# `rm -rf` 把它删了，表现是 ENOENT 或半个 asset 被打包上传。
+CDK_OUT_DIR="${TMPDIR:-/tmp}/notiops-cdk-out-$(basename "$PROJECT_ROOT")"
 rm -rf "$CDK_OUT_DIR"; mkdir -p "$CDK_OUT_DIR"
-npx cdk synth --quiet --all --output "$CDK_OUT_DIR" $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG $PLATFORM_FLAG $AGENT_ARN_FLAG $ORG_FLAG 2>cdk-synth-stderr.log || SYNTH_OK=false
+
+
+# ── 跑完就把 assembly 删掉（否则它一直占着盘，直到下次部署的 rm -rf）──
+#
+# 体积来源：`fromAsset("../")` 把 repo root 拷进每个 asset 目录，一次 synth
+# 有 20~60 个 asset。`infra/bin/app.ts` 里那条「594s → 12s」的注释是同一个
+# 根因的另一面 —— 那次治的是 hash 计算耗时，这里治的是留下来的拷贝。
+#
+# ⚠️ 只在**部署成功**时删。被 Ctrl-C 打断或部署失败时栈可能是半部署状态，
+#    assembly 留着才能对照模板排查。
+CDK_DEPLOY_DONE=0
+_cdk_out_cleanup() {
+  local rc=$?                     # 必须是第一句：下面任何命令都会覆盖 $?
+  trap - EXIT INT TERM            # 自己别再触发自己
+  if [ "$CDK_DEPLOY_DONE" = "1" ] && [ -d "$CDK_OUT_DIR" ]; then
+    # ⚠️ 用 df 差值报体积，**不要** du -sh：这个目录有百万级文件，
+    #    du 要跑好几分钟，会把部署的收尾卡住；df 是瞬时的。
+    local before_k after_k freed_mb
+    before_k=$(df -Pk "$CDK_OUT_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+    rm -rf "$CDK_OUT_DIR"
+    after_k=$(df -Pk "$(dirname "$CDK_OUT_DIR")" 2>/dev/null | awk 'NR==2{print $4}')
+    if [ -n "$before_k" ] && [ -n "$after_k" ] && [ "$after_k" -gt "$before_k" ]; then
+      freed_mb=$(( (after_k - before_k) / 1024 ))
+      echo "  $(t "已清理 CDK 构建产物，释放 ${freed_mb} MB" \
+                  "Cleaned CDK assembly, freed ${freed_mb} MB")"
+    else
+      echo "  $(t "已清理 CDK 构建产物" "Cleaned CDK assembly")"
+    fi
+  elif [ -d "$CDK_OUT_DIR" ]; then
+    echo "  $(t "保留 CDK 构建产物用于排查：" "Kept CDK assembly for debugging: ")$CDK_OUT_DIR"
+  fi
+  exit "$rc"                      # 原样传出，不改 set -e 的 fail-fast 语义
+}
+trap _cdk_out_cleanup EXIT INT TERM
+npx cdk synth --quiet --all --output "$CDK_OUT_DIR" $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG $PLATFORM_FLAG $AGENT_ARN_FLAG $ORG_FLAG $INSPECTION_FLAGS $COST_AGENT_FLAG 2>cdk-synth-stderr.log || SYNTH_OK=false
 
 if [ "$SYNTH_OK" = false ]; then
   echo ""
@@ -1096,8 +1134,88 @@ echo "  $(t "执行完整部署..." "Running full deployment...")"
 # Same --output outside repo root as synth above (avoids fromAsset recursion).
 # $AGENT_ARN_FLAG（若 agent 部署成功）= "-c agentRuntimeArn=<ARN>"，让 WebChatStack 的 BFF
 # 调真 agent；为空则 BFF 回退 echo。
-npx cdk deploy --all --require-approval never --output "$CDK_OUT_DIR" --outputs-file cdk-outputs.json $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG $PLATFORM_FLAG $AGENT_ARN_FLAG $ORG_FLAG
+# $COST_AGENT_FLAG（可选）= "-c costAgentMcpUrl=<url> -c costAgentFunctionArn=<arn>"：BFF 的
+# 环境变量 + lambda:InvokeFunctionUrl + 缓存前缀授权 + 每日预热规则都由它决定（web-chat-core.ts）。
+npx cdk deploy --all --require-approval never --output "$CDK_OUT_DIR" --outputs-file cdk-outputs.json $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG $PLATFORM_FLAG $AGENT_ARN_FLAG $ORG_FLAG $INSPECTION_FLAGS $COST_AGENT_FLAG
+# 部署成功 → 收尾时可以删 assembly（见上面的 _cdk_out_cleanup）。
+# 放在 deploy 之后：set -e 保证 deploy 非零就到不了这里。
+CDK_DEPLOY_DONE=1
 echo "  $(t "✓ CDK 部署完成" "✓ CDK deployment complete")"
+
+# ── 部署后:把巡检判读 skill 同步到 Agent Space ────────────────────────────
+#
+# 🔴 **这一步此前不存在**,后果是静默的:改了仓库里的 GUARDRAILS 不等于改了
+#    DA 手里那份。2026-08-24 实测巡检 space 里的判读 skill 是 8/22 的版本,
+#    而 8/23 新加的三段(PI 方法论 / 内存双条件 / burstable)一直没生效 ——
+#    DA 照样返回判读,只是用的是旧方法论,没有任何信号。
+#
+#    没有自动同步的原因:UI 的 Skills 页管的是 S3 里那 12 个预置
+#    skill(有「发布到 DevOps Agent」按钮),而巡检这两份在仓库
+#    inspection/skills/ 里,既没有 UI 入口,setup.sh 与 CDK 里也没有上传步骤。
+#    scripts/sync_inspection_skills.py 只保证**仓库里**两份 SKILL.md 与共享段
+#    逐字一致,管不到「有没有传上去」—— 所以那套 CI 检查一直是绿的。
+#
+# ⚠️ **best-effort,不阻断部署。** 传不上去的表现是判读不受约束(退化,不是
+#    崩溃),而部署失败会让整套系统都用不上。失败时打一行醒目的提示 +
+#    给出手动重跑的命令。
+# ⚠️ 幂等:内容没变时 client_token 不变,服务端不产生新版本,asset_id 也稳定。
+# 🔴 **`InspectionAgentSpaceId`，不是 `AgentSpaceId`。** 这套部署有两个
+#    Agent Space（刻意拆开,见 notiops-backend-stack.ts 的 InspectionAgentSpace
+#    那段）:AgentSpaceId 是排障/web chat 用的,InspectionAgentSpaceId 才是巡检。
+#    skill 是 per agent space 的,而 executor 派发用 INSPECT_AGENT_SPACE_ID
+#    (= 巡检那个)。传错 space 会两头都错:巡检侧仍加载不到 GUARDRAILS,
+#    排障侧被判读 skill 污染。2026-08-24 第一版这里写的就是 AgentSpaceId。
+DA_SPACE_FOR_SKILLS=$(jq -r '.NotiOpsBackendStack.InspectionAgentSpaceId // empty' \
+  cdk-outputs.json 2>/dev/null || echo "")
+if [ -n "$DA_SPACE_FOR_SKILLS" ]; then
+  echo ""
+  echo "$(t "[3.5/4] 同步巡检判读 skill 到 Agent Space..." "[3.5/4] Syncing inspection judgement skills to the Agent Space...")"
+  # .venv 优先(项目自己的 boto3);没有就用系统 python3。
+  SKILL_PY="$PROJECT_ROOT/.venv/bin/python"
+  [ -x "$SKILL_PY" ] || SKILL_PY="python3"
+  # 🔴 `--all-accounts`：传给**每个**已启用账号自己的巡检 space（per-account
+  #    agent space 之后必须这样）。不加这个参数只会传部署账号那一个 ——
+  #    成员账号的 space 里没有判读 skill → DA 用通用提示词自由发挥 →
+  #    切不出 `## <finding_id>` → 全部 da_parse_status: parse_failed。
+  #    判读的钱花了、结果全是废的。
+  #
+  # ⚠️ 仍然传 `--space`：它作为**部署账号那一个**的 env 兜底
+  #    （多账号模式下部署账号自己也在列表里，走的是 env/CFN 那条路）。
+  #
+  # ⚠️ 部分失败**不阻断部署**（下面的 else 分支）—— 部署不该因为一个成员账号的
+  #    assume 失败而停。但脚本会逐账号列出来并非零退出，那是运维唯一的信号。
+  if AWS_REGION="$DEPLOY_REGION" PYTHONPATH="$PROJECT_ROOT" \
+     "$SKILL_PY" "$PROJECT_ROOT/scripts/upload_inspection_skills.py" \
+       --all-accounts --space "$DA_SPACE_FOR_SKILLS" --region "$DEPLOY_REGION"; then
+    # 🔴 上传成功 ≠ DA 手里那份是仓库当前版本。三种情况都会让判读依据是旧的
+    #    而**判读结果看起来完全正常**（它照样输出结论，只是基于旧阈值）:
+    #      · 传进了错的 space(2026-08-24 真的发生过)
+    #      · 仓库里两份 SKILL.md 的共享段没同步
+    #      · 有人在控制台手改过
+    #    所以传完立刻把内容拉回来逐字比一次。
+    if AWS_REGION="$DEPLOY_REGION" PYTHONPATH="$PROJECT_ROOT" \
+       "$SKILL_PY" "$PROJECT_ROOT/scripts/upload_inspection_skills.py" \
+         --all-accounts --verify --space "$DA_SPACE_FOR_SKILLS" --region "$DEPLOY_REGION"; then
+      :
+    else
+      echo "  $(t "⚠ 校验发现 space 里的 skill 与仓库不一致 —— DA 的判读依据不是当前规则(不阻断部署)。" "⚠ Verification found the space's skills differ from the repo — DA judgements are not using current rules (non-blocking).")"
+    fi
+  else
+    # 🔴 这行文案必须点明「静默 / SILENT」这三个字。
+    #    原文只写了 parse_failed + 不阻断,而那读起来像「会有个失败状态等着我」——
+    #    实际不会:lambda_inspection_executor/handler.py:2109-2130 记着实测结论,
+    #    space 里没判读 skill 时 DA **不报错**,它用通用提示词自由发挥 → 切不出
+    #    `## <finding_id>` → 每条 finding 的 da_parse_status 都是 parse_failed,
+    #    而**巡检照跑、报告照出、run 仍是 success、判读额度照花**。也就是说除了
+    #    此刻这一行,后面再没有任何一处会提醒运维。所以「静默」本身是这行要传达
+    #    的第一信息,而不是脚注 —— 中英两侧都要说,只写一侧的那半个客户看不到。
+    echo "  $(t "⚠ 有账号的判读 skill 没传上去 —— 这是静默降级:巡检照跑、报告照出、run 仍是 success,只有那些账号的每条 finding 都会 parse_failed(判读额度照花,不阻断部署)。此刻这一行是唯一的信号。" "⚠ Some accounts did not get the judgement skills — this degrades SILENTLY: inspections still run, reports are still generated and the run still reports success; only those accounts' findings all come back parse_failed (judgement quota still spent, non-blocking). This line is the only signal you will get.")"
+    echo "    $(t "上面那份逐账号清单指出了是哪些账号；常见原因是该账号还没回填巡检 space(管理页显示「待更新栈」)。" "The per-account list above shows which ones; the usual cause is a missing inspection space id (the admin page shows \"Stack update needed\").")"
+    echo "    $(t "手动重跑: " "Retry manually: ")AWS_REGION=$DEPLOY_REGION PYTHONPATH=\$PWD .venv/bin/python scripts/upload_inspection_skills.py --all-accounts"
+  fi
+else
+  echo "  $(t "ℹ 拿不到 AgentSpaceId,跳过判读 skill 同步(可事后跑 scripts/upload_inspection_skills.py)。" "ℹ No AgentSpaceId available; skipping judgement-skill sync (run scripts/upload_inspection_skills.py later).")"
+fi
 
 # ── 部署后回填:补齐【只有 NotiOpsBackendStack 部署完才拿得到】的两个 runtime env ──
 # deploy_agent.sh 跑在本脚本早处(agent 必须先建,WebChatStack 才能注入其 ARN),那时
@@ -1118,14 +1236,57 @@ if [ -n "$AGENT_RUNTIME_ARN" ]; then
   fi
 fi
 
+# ── 巡检判读 skill 的上传在上面【已经做过了】──
+#
+# 🔴 这里原本有**第二个**上传块，而它从来没成功过：传的参数是
+#    `--space-id` / `--account-id`，而 `upload_inspection_skills.py` 的 argparse
+#    只认 `--space` / `--region` / `--dry-run` / `--verify`。
+#
+#    ```
+#    $ python3 scripts/upload_inspection_skills.py --space-id abc --account-id 1234...
+#    error: unrecognized arguments: --space-id abc --account-id 123456789012
+#    exit 2
+#    ```
+#
+#    exit 2 → 走 else 分支 → 打一行 ⚠ 警告（不阻断），而那行警告给出的
+#    「请手动重跑」命令**用的还是同一套错参数**。所以它是一个必然失败、
+#    且失败提示会把人引到同一个错误上的块。
+#
+# ⚠️ 而且它取的 space 与上面那块**完全一样**（都是
+#    `.NotiOpsBackendStack.InspectionAgentSpaceId`）—— 也就是说即使参数改对，
+#    它也只是把同一份 skill 往同一个 space 传第二遍。上面那块参数正确、
+#    还带 `--verify` 回读校验，所以这里直接删掉，不是修参数。
+#
+#    （2026-08-29 三方交叉 review 发现。实跑复现过。）
+
+# ── 部署后:给存量 finding 补 GSI1 索引键(跨账号统一视图) ──
+# 2026-08-27 起巡检看板是【跨全部可见账号的统一视图】,数据层走 notiops-inspection
+# 表新加的 GSI1。而 DynamoDB 的 GSI 只收带索引键的行:加索引那一刻起新写入的进索引,
+# 【存量行不会】—— 它们在主表里好好的,只是统一视图查不到。
+#
+# 🔴 不做这一步的后果是【静默的】:查询成功、返回 200、只是少了行。客户看到的是
+#    「升级之后昨天那些风险不见了」,而 CloudWatch 里什么都没有。所以放进部署流程,
+#    不指望人记住。
+#
+# 幂等:条件写 attribute_not_exists(GSI1PK),已经有的不动 —— 重复部署是空跑。
+# 只 SET 两个索引属性,不碰任何业务字段。
+# 不阻断:失败只影响统一视图的存量部分,新 finding 照常进索引。
+echo "  $(t "回填存量 finding 的跨账号索引键…" "Backfilling cross-account index keys on existing findings…")"
+if AWS_REGION="$DEPLOY_REGION" python3 "$PROJECT_ROOT/scripts/backfill_finding_gsi.py" --apply; then
+  :
+else
+  echo "  $(t "⚠ 索引键回填未完成(不阻断)。后果:巡检页看不到【升级前】的 finding(新的不受影响)。手动重跑:" "⚠ Index-key backfill did not complete (non-blocking). Impact: findings created BEFORE this upgrade will not show on the inspection page (new ones are fine). Re-run manually:")"
+  echo "      AWS_REGION=$DEPLOY_REGION python3 scripts/backfill_finding_gsi.py --apply"
+fi
+
 # 4. 部署摘要
 echo ""
 echo "$(t "[4/4] 提取部署信息..." "[4/4] Extracting deployment info...")"
 
 cd "$PROJECT_ROOT/infra"
-# Two stacks are now deployed (NotiOpsBackendStack + BotStack), so `keys[0]`
-# is no longer deterministic. All outputs below come from NotiOpsBackendStack;
-# hardcode it.
+# Several stacks are deployed (NotiOpsBackendStack + ImStack + WebChatStack),
+# so `keys[0]` is not deterministic. All outputs below come from
+# NotiOpsBackendStack; hardcode it.
 STACK_NAME="NotiOpsBackendStack"
 
 CLOUDFRONT_URL=$(jq -r ".[\"$STACK_NAME\"].CloudFrontUrl" cdk-outputs.json)
@@ -1147,6 +1308,14 @@ CHAT_URL=$(jq -r ".WebChatStack.ChatUrl" cdk-outputs.json 2>/dev/null || echo "N
 CHAT_BFF_URL=$(jq -r ".WebChatStack.ChatBffUrl" cdk-outputs.json 2>/dev/null || echo "N/A")
 [ "$CHAT_URL" = "null" ] && CHAT_URL="N/A"
 [ "$CHAT_BFF_URL" = "null" ] && CHAT_BFF_URL="N/A"
+
+# ImStack 输出（M2 之后 IM 走 Webhook + Lambda）。这两个 URL 是**客户必须拿到的东西**：
+# 要粘进飞书开放平台的「请求地址」/ Slack 的 Request URL，不打印出来客户就得自己去
+# CloudFormation 控制台翻 —— 那一步一卡住，IM 这条链路等于没交付。
+FEISHU_WEBHOOK_URL=$(jq -r ".ImStack.FeishuWebhookUrl" cdk-outputs.json 2>/dev/null || echo "N/A")
+SLACK_WEBHOOK_URL=$(jq -r ".ImStack.SlackWebhookUrl" cdk-outputs.json 2>/dev/null || echo "N/A")
+[ "$FEISHU_WEBHOOK_URL" = "null" ] && FEISHU_WEBHOOK_URL="N/A"
+[ "$SLACK_WEBHOOK_URL" = "null" ] && SLACK_WEBHOOK_URL="N/A"
 CUR_FINALIZER_FN_ARN=$(jq -r ".[\"$STACK_NAME\"].CurFinalizerFunctionArn" cdk-outputs.json 2>/dev/null || echo "")
 CUR_FINALIZER_SCHEDULER_ROLE_ARN=$(jq -r ".[\"$STACK_NAME\"].CurFinalizerSchedulerRoleArn" cdk-outputs.json 2>/dev/null || echo "")
 
@@ -1418,10 +1587,13 @@ echo "  · IdleDetectionRole:  $IDLE_ROLE_ARN"
 echo "  · LambdaExecutionRole: $LAMBDA_ROLE_ARN  $(t "← 跨账户信任策略填这个" "← use this in cross-account trust policy")"
 echo ""
 if [ -n "$ENABLED_PLATFORMS" ]; then
-  echo "$(t "── IM Bot(ECS 长连接,无需 Webhook）── 本次启用: " "── IM Bot (ECS long-connection, no webhook) ── enabled: ")$ENABLED_PLATFORMS"
+  echo "$(t "── IM Bot(Webhook + Lambda）── 本次启用: " "── IM Bot (webhook + Lambda) ── enabled: ")$ENABLED_PLATFORMS"
   echo "$(t "飞书 Secret:       " "Feishu Secret:     ")$FEISHU_SECRET"
   echo "Slack Bot Token:   $SLACK_BOT_TOKEN_SECRET"
-  echo "Slack App Token:   $SLACK_APP_TOKEN_SECRET"
+  # Slack App Token(xapp-)只有 socket mode 用得上。M2 之后正常路径是 Webhook +
+  # 签名校验(notiops/slack-signing-secret),这个 Secret 平时留空即可 —— 把它跟
+  # 必填项并排打印会让客户以为不填 bot 就不工作,白等一场。
+  echo "$(t "Slack App Token:   " "Slack App Token:   ")$SLACK_APP_TOKEN_SECRET  $(t "← 仅回滚到长连接(socket mode)时才需要填,正常留空" "← only needed if you roll back to socket mode; leave empty otherwise")"
 else
   echo "$(t "── IM Bot ── 本次未部署（web 端已就绪）" "── IM Bot ── not deployed this run (web UI is ready)")"
   echo "  $(t "以后想启用：重跑 ./setup.sh 选 1) 飞书 或 2) Slack 即可，无需重建其余资源。" "To enable later: re-run ./setup.sh and pick 1) Feishu or 2) Slack — no need to rebuild anything else.")"
@@ -1486,6 +1658,16 @@ else
   echo "  $(t "⚠ 上面的 Agent 问题修好之前,聊天只会回显,不要按下面的流程验收。" "⚠ Until the agent issue above is fixed, chat only echoes — do not sign off on the steps below yet.")"
 fi
 echo ""
+# ⚠️ 站内「资源巡检」看板与上面那个「巡检 & 报告」是**两个不同的东西**：
+#    后者外链到老控制台（CloudFront），前者是站内看板。这里必须单独说一句 ——
+#    不说的话客户跑完 setup.sh 压根不知道有这个页面（侧栏入口是 fail-CLOSED 的，
+#    只有拿到 nav:inspection 能力才显示），于是整个 feature 交付了等于没交付。
+echo "  $(t "  📋 资源巡检看板(站内,与上面的「巡检 & 报告」外链不是同一个页面):" "  📋 Resource Inspection dashboard (in-app; NOT the \"Inspections & Reports\" external link above):")"
+echo "     $(t "左侧「资源巡检」→ 总览 / 高负载 / 闲置与成本 / 结构性风险 / 巡检范围 / 阈值与定时。" "Left menu \"Resource Inspection\" → Overview / High Load / Idle & Cost / Structural Risk / Scope / Schedule.")"
+echo "     $(t "两类巡检默认都在每天 UTC 02:00(= 北京时间 10:00)跑,首轮结果在那之后可见;时刻可在「阈值与定时」页改。" "Both run types default to 02:00 UTC daily; first results appear after that. Change it on the \"Thresholds & Schedule\" page.")"
+echo "     $(t "改排除清单 / 改执行时刻需要 action:inspection:scope / :schedule 权限(默认只有 admin 有)。" "Editing exclusions / schedule needs action:inspection:scope / :schedule (admin only by default).")"
+echo "     $(t "出问题要立刻停:见 inspection/adapters/switches.py 顶部的 kill switch 命令(改 DDB 一行,不用重新部署)。" "To stop it immediately: see the kill switch commands atop inspection/adapters/switches.py (one DDB write, no redeploy).")"
+echo ""
 echo "  $(t "2️⃣  (可选)填 Bedrock API Key —— 跨账号调模型才需要:" "2️⃣  (Optional) Set a Bedrock API Key — only needed for cross-account model calls:")"
 echo "      $(t "Web Chat 左侧「更多 → 巡检 & 报告」打开控制台 →「设置 → AI 配置」填入并保存。" "Open the console via Web Chat \"More → Inspections & Reports\" → \"Settings → AI Config\", enter and save.")"
 echo "      $(t "留空则 Agent 用本地 AWS 凭证调当前账号 Bedrock 模型,不影响使用。" "If left empty, the Agent uses local AWS credentials to call the current account\x27s Bedrock models — works fine.")"
@@ -1498,22 +1680,37 @@ if [ -n "$ENABLED_PLATFORMS" ]; then
   echo "  $(t "  刚创建的凭证 Secret 是空的,必须填入你的机器人凭证,bot 才能连接。" "  The credential Secrets just created are EMPTY — you must fill in your bot credentials before the bot can connect.")"
   echo ""
   echo "  $(t "  【填法一】Web Chat 左侧「更多 → 巡检 & 报告」打开控制台 →「设置 → 通知设置」填入。" "  [Option A] Web Chat left menu \"More → Inspections & Reports\" → console → \"Settings → Notifications\".")"
-  echo "  $(t "  【填法二】直接更新 Secrets Manager(下方 Secret 名),然后重启对应 ECS 服务。" "  [Option B] Update Secrets Manager directly (secret names below), then restart the matching ECS service.")"
+  # M2 之后没有可重启的 ECS 服务了:Webhook Lambda 每次冷启动都重新读 Secret,
+  # 热容器最多带一个短 TTL 的缓存 —— 所以「填完等下一次调用」就是全部操作,
+  # 不存在也不需要「重启服务」这一步。旧文案让客户去找一个不存在的 ECS 服务。
+  echo "  $(t "  【填法二】直接更新 Secrets Manager(下方 Secret 名);Webhook Lambda 下次调用即生效,无需重启任何服务。" "  [Option B] Update Secrets Manager directly (secret names below); the webhook Lambda picks it up on its next invocation — nothing to restart.")"
+  echo ""
+  # 请求地址必须打印:客户下一步就是把它粘到飞书/Slack 控制台里。
+  echo "  $(t "  ▸ 要粘进平台控制台的【请求地址 / Request URL】:" "  ▸ The Request URL to paste into the platform console:")"
+  case "$ENABLED_PLATFORMS" in
+    *feishu*) echo "  $(t "    · 飞书: " "    · Feishu: ")$FEISHU_WEBHOOK_URL" ;;
+  esac
+  case "$ENABLED_PLATFORMS" in
+    *slack*)  echo "  $(t "    · Slack: " "    · Slack:  ")$SLACK_WEBHOOK_URL" ;;
+  esac
   echo ""
   case "$ENABLED_PLATFORMS" in
     *feishu*)
       echo "  $(t "  · 飞书 —— Secret: " "  · Feishu —— Secret: ")notiops/im-bot-feishu"
       echo "  $(t "      需填字段: app_id / app_secret(从飞书开放平台「凭证与基础信息」获取)。" "      Fields: app_id / app_secret (from Feishu Open Platform \"Credentials & Basic Info\").")"
-      echo "  $(t "      飞书开放平台 → 事件订阅 → 选「长连接」模式(非 Webhook)。" "      Feishu Open Platform → Event Subscription → choose \"Long Connection\" mode (NOT Webhook).")" ;;
+      echo "  $(t "      Webhook 模式还要填 encrypt_key / verification_token(见下面的配置指南)。" "      Webhook mode also needs encrypt_key / verification_token (see the setup guide below).")" ;;
   esac
   case "$ENABLED_PLATFORMS" in
     *slack*)
-      echo "  $(t "  · Slack —— Secret: " "  · Slack —— Secret: ")notiops/slack-bot-token $(t "和" "and") notiops/slack-app-token"
-      echo "  $(t "      需填: Bot Token(xoxb-)和 App Token(xapp-);Slack 用 Socket Mode,无需公网 webhook。" "      Fill: Bot Token (xoxb-) and App Token (xapp-); Slack uses Socket Mode, no public webhook needed.")" ;;
+      echo "  $(t "  · Slack —— Secret: " "  · Slack —— Secret: ")notiops/slack-bot-token $(t "和" "and") notiops/slack-signing-secret"
+      echo "  $(t "      需填: Bot Token(OAuth & Permissions 页)和 Signing Secret(Basic Information 页)。" "      Fill: the Bot Token (OAuth & Permissions page) and the Signing Secret (Basic Information page).")"
+      echo "  $(t "      ⚠️ 这两个 Secret 现在装的是 CDK 随机生成的值,不是空串 —— 忘了填不会报「为空」,而是报「密钥不对」。" "      ⚠️ Both secrets currently hold a CDK-generated random value, not an empty string — forgetting to fill them shows up as a wrong credential, not as an empty one.")" ;;
   esac
   echo ""
-  echo "  $(t "  填完凭证后,强制重启 bot 加载新凭证(或等下次部署):" "  After filling credentials, force-restart the bot to load them (or wait for next deploy):")"
-  echo "      aws ecs update-service --cluster <BotStack-cluster> --service <service> --force-new-deployment --region $DEPLOY_REGION"
+  echo "  $(t "  ▸ 两个平台在控制台具体点哪几个开关、顺序为什么不能反、怎么回滚:" "  ▸ Which switches to flip in each platform's console, why the order matters, and how to roll back:")"
+  echo "      docs/IM_WEBHOOK_SETUP.md"
+  echo "  $(t "    (飞书是「原地切换现有 App」,权限一条都不用加;Slack 是新建 App。" "    (Feishu is an in-place cutover of your existing app — no new scopes needed; Slack is a new app.")"
+  echo "  $(t "     必须先把 Secret 填好,再去平台上保存请求地址 —— 反了 URL 校验必失败。)" "     Fill the secrets BEFORE saving the Request URL in the console — the URL challenge fails otherwise.)")"
 else
   echo "  $(t "3️⃣  (可选)IM 机器人 —— 本次未部署。" "3️⃣  (Optional) IM bots — not deployed this run.")"
   echo "      $(t "以后想加飞书/Slack:重跑 ./setup.sh 选对应平台即可,无需重建其余资源。" "To add Feishu/Slack later: re-run ./setup.sh and pick the platform — no need to rebuild anything else.")"
@@ -1558,14 +1755,14 @@ echo "        https://console.aws.amazon.com/aidevops/home#/agent-spaces"
 echo ""
 echo "  $(t "── DevOps Agent 多账户集成 ──" "── DevOps Agent Multi-Account Integration ──")"
 DEVOPS_EVENT_BUS_ARN=$(jq -r ".[\"$STACK_NAME\"].DevOpsAgentEventBusArn" cdk-outputs.json 2>/dev/null || echo "N/A")
-DEVOPS_WHITELIST=$(jq -r ".[\"$STACK_NAME\"].DevOpsAgentBusinessAccountsWhitelist" cdk-outputs.json 2>/dev/null || echo "N/A")
+DEVOPS_BUS_JUDGEMENT=$(jq -r ".[\"$STACK_NAME\"].DevOpsAgentBusPolicyJudgement" cdk-outputs.json 2>/dev/null || echo "N/A")
 ONBOARDING_BUCKET=$(jq -r ".[\"$STACK_NAME\"].DataBucketName" cdk-outputs.json 2>/dev/null || echo "N/A")
 echo "  Custom Event Bus ARN:            $DEVOPS_EVENT_BUS_ARN"
-echo "  $(t "当前白名单业务账户:              " "Current allowlisted business accounts: ")$DEVOPS_WHITELIST"
+echo "  $(t "总线跨账号判据:                  " "Bus cross-account judgement:           ")$DEVOPS_BUS_JUDGEMENT"
 echo "  $(t "Onboarding 模板 S3 Bucket:       " "Onboarding template S3 Bucket:         ")$ONBOARDING_BUCKET"
 echo ""
 echo "  $(t "新增业务账户流程: " "To onboard a new business account:")"
-echo "    $(t "1. 本脚本重跑或执行: " "1. Re-run this script, or: ")cd infra && npx cdk deploy -c devopsAgentBusinessAccounts=\"$(t "<新白名单>" "<new-allowlist>")\""
+echo "    $(t "1. (不需要重新部署本栈 —— 判据与账号无关)" "1. (No redeploy of this stack needed - the judgement is account-agnostic)")"
 echo "    $(t "2. 在 Dashboard「DevOps Agent 账户配置」页生成 Launch Stack URL 发给客户" "2. In the Dashboard \"DevOps Agent Account Config\" page, generate a Launch Stack URL and send it to the customer")"
 echo "    $(t "3. 客户部署 CFN → 回填 OnboardingPayload → 测试连接 → 启用" "3. Customer deploys the CFN → fills back the OnboardingPayload → tests connection → enables")"
 echo "  $(t "详见 docs/USER_GUIDE.md 的 DevOps Agent 接入章节" "See the DevOps Agent onboarding section in docs/USER_GUIDE.md")"
@@ -1579,16 +1776,107 @@ if [ "$ORG_MODE" = true ]; then
   echo "$(t "─── Organizations 模式: 成员账号资源下发(StackSets) ───" "─── Organizations Mode: Member-Account Rollout (StackSets) ───")"
   MEMBER_TEMPLATE="$PROJECT_ROOT/infra/member-account-onboarding.yaml"
   STACKSET_NAME="notiops-member-onboarding"
+
+  # 🔴 **这两行赋值必须在参数数组之前。** bash 数组在赋值那一刻就展开 ——
+  #    引用一个还没赋值的变量**不报错**（本脚本有 `set -e` 但没有 `set -u`），
+  #    静默变空串。
+  #
+  #    2026-08-30 就是这么错过一次：参数数组按 `STACKSET_NAME=` 这个锚点插在
+  #    它下面，而这两行赋值在**更下面** ⇒ `DevOpsEventBusArn` 传空串。
+  #    而模板里那个参数**无 Default 且有 AllowedPattern**（空串不匹配）⇒
+  #      · CFN 在 `create-stack-set` 就拒 → `set -e` 让脚本**停在这里**，
+  #        后面 DA 的 StackSet 与 OU 下发全都不跑 ⇒「一键接入」与
+  #        「一键关联」两步都失败（各报找不到 StackSet）
+  #      · 或 CFN 推迟到 `create-stack-instances` 才校验 → StackSet 建成、
+  #        脚本打印「✓ 已创建」，而每个成员账号的实例异步失败，
+  #        脚本那时打的是「✓ 已提交(异步执行)」
+  #
+  #    ⚠️ `bash -n` 抓不到（语法合法）。真正钉住它的是
+  #      `tests/test_member_template_inspection_space.py::
+  #       test_StackSet_参数展开后不能有空值` —— 它把这一段**真跑一遍**
+  #      再查展开后的值。
   MEMBER_BUS_ARN="arn:aws:events:${DEPLOY_REGION}:${CDK_ACCOUNT}:event-bus/notiops-devops-events"
   MEMBER_PHD_ARN=""
   if [ "$ENABLE_PHD" != "false" ]; then
     MEMBER_PHD_ARN="arn:aws:sns:${DEPLOY_REGION}:${CDK_ACCOUNT}:phd-events"
   fi
 
-  # 1. 开启 StackSets 与 Organizations 的可信访问(幂等; 仅管理账号可执行,
-  #    委派管理员场景该调用会失败——但可信访问应已在管理账号开启, 忽略即可)
+  # ⚠️ 这道守卫**抓不到上面那个顺序问题**（它跑的时候变量已经赋值了，空串
+  #    早就烙进数组）—— 我实测确认过。它管的是另一类：变量真的算出来是空的
+  #    （比如 `CDK_ACCOUNT` 没解析出来）。留着是因为那种情况的失败位置
+  #    （第 2 步的 stack instance）离原因很远。
+  for _v in DEPLOY_REGION CDK_ACCOUNT ORG_ID MEMBER_BUS_ARN; do
+    eval "_val=\$$_v"
+    [ -n "$_val" ] || { echo "  BUG: $_v 为空，拒绝创建 StackSet（空参数会让成员账号接入静默失败）" >&2; exit 1; }
+  done
+
+  # ─── 这个 StackSet 的参数 ───
+  #
+  # 🔴 **PrimaryRegion 此前从不传**（2026-08-30 补）。
+  #
+  #    模板的 Default 是 `us-east-1`，而 `IsPrimaryRegion` 控制两件事：
+  #      · IAM 角色只在主区建一次（IAM 是全局资源）
+  #      · `DevOpsEventsForwardRole`（转发角色）
+  #    而转发**规则** `DevOpsEventsForwardRule` **没有**这个条件。
+  #
+  #    ⇒ 客户的 regions 不含 us-east-1 时：角色不建、规则照建、
+  #      规则的 RoleArn 是手拼字符串、指向一个不存在的角色
+  #      ⇒ 转发静默失败。只有 EventBridge 的 FailedInvocations 指标，
+  #        我们这侧零信号 —— 表现是「那个账号的判读一直空着」。
+  #
+  # ⚠️ 手动接入那条路（`member_accounts.mjs` 的 `generateCollectionStackUrl`）
+  #    一直是传 `param_PrimaryRegion` 的 —— **只有 StackSet 这条漏了**。
+  ONBOARD_SS_PARAMS=(
+    "ParameterKey=SystemAccountId,ParameterValue=$CDK_ACCOUNT"
+    "ParameterKey=DevOpsEventBusArn,ParameterValue=$MEMBER_BUS_ARN"
+    "ParameterKey=PhdSnsTopicArn,ParameterValue=$MEMBER_PHD_ARN"
+    "ParameterKey=OrganizationId,ParameterValue=$ORG_ID"
+    "ParameterKey=PrimaryRegion,ParameterValue=$DEPLOY_REGION"
+  )
+
+  # 1. 开启 StackSets 与 Organizations 的可信访问。
+  #
+  # 🔴 **这里有两个独立的开关，只开一个不够**（2026-08-31 实测踩到）：
+  #
+  #    ```
+  #    Organizations 侧   enable-aws-service-access
+  #                       --service-principal member.org.stacksets.cloudformation.amazonaws.com
+  #    CloudFormation 侧  cloudformation activate-organizations-access   ← 此前漏了
+  #    ```
+  #
+  #    只开第一个时 `describe-organizations-access` 仍然是 **DISABLED**，
+  #    而 `create-stack-set --permission-model SERVICE_MANAGED` 报
+  #      ValidationError: You must enable organizations access to operate
+  #                       a service managed stack set
+  #    ⇒ `set -e` 让脚本**停在这里**，后面 DA 的 StackSet 与 OU 下发都不跑。
+  #
+  #    实测现场最误导的一点：Organizations 侧的列表里
+  #    member.org.stacksets… **已经在了**（第一条调用成功了），而 CFN 侧是
+  #    DISABLED —— 所以只看第一条会以为没问题。
+  #
+  # ⚠️ 两条都**只有管理账号能调**。委派管理员场景会失败，那时可信访问应该已经
+  #    在管理账号开过了，所以照旧忽略错误 —— 但**不能静默**：真的没开时
+  #    下面 create-stack-set 会报上面那个 ValidationError，而那句话**不提**
+  #    该调 activate-organizations-access。所以这里把状态与补救命令打出来。
+  #
+  # ⚠️ API 形状已查官方文档核实：`activate-organizations-access` **无参数**
+  #    （boto3 `activate_organizations_access()`）。
   aws organizations enable-aws-service-access \
     --service-principal member.org.stacksets.cloudformation.amazonaws.com 2>/dev/null || true
+  aws cloudformation activate-organizations-access --region "$DEPLOY_REGION" 2>/dev/null || true
+
+  _ORG_ACCESS=$(aws cloudformation describe-organizations-access \
+    --region "$DEPLOY_REGION" --query Status --output text 2>/dev/null || echo UNKNOWN)
+  if [ "$_ORG_ACCESS" = "ENABLED" ]; then
+    echo "  $(t "✓ StackSets 与 Organizations 的可信访问已激活" "✓ Trusted access between StackSets and Organizations is active")"
+  else
+    echo "  $(t "⚠ StackSets 的 Organizations 可信访问状态: " "⚠ StackSets Organizations access status: ")$_ORG_ACCESS"
+    echo "    $(t "下一步 create-stack-set 大概率会报 'You must enable organizations access'。" "The next create-stack-set will likely fail with 'You must enable organizations access'.")"
+    echo "    $(t "请用**组织管理账号**执行下面两条，然后重跑本脚本:" "Run these from the **organization management account**, then re-run this script:")"
+    echo "      aws cloudformation activate-organizations-access --region $DEPLOY_REGION"
+    echo "      aws organizations enable-aws-service-access \\"
+    echo "        --service-principal member.org.stacksets.cloudformation.amazonaws.com"
+  fi
 
   # 2. 创建或更新 StackSet(SERVICE_MANAGED + auto-deployment)
   if aws cloudformation describe-stack-set --stack-set-name "$STACKSET_NAME" \
@@ -1597,10 +1885,7 @@ if [ "$ORG_MODE" = true ]; then
     aws cloudformation update-stack-set \
       --stack-set-name "$STACKSET_NAME" \
       --template-body "file://$MEMBER_TEMPLATE" \
-      --parameters "ParameterKey=SystemAccountId,ParameterValue=$CDK_ACCOUNT" \
-                   "ParameterKey=DevOpsEventBusArn,ParameterValue=$MEMBER_BUS_ARN" \
-                   "ParameterKey=PhdSnsTopicArn,ParameterValue=$MEMBER_PHD_ARN" \
-                   "ParameterKey=OrganizationId,ParameterValue=$ORG_ID" \
+      --parameters "${ONBOARD_SS_PARAMS[@]}" \
       --capabilities CAPABILITY_NAMED_IAM \
       --region "$DEPLOY_REGION" >/dev/null \
       && echo "  $(t "✓ StackSet 已更新(既有实例将随 operation 滚动更新)" "✓ StackSet updated (existing instances roll out with the operation)")" \
@@ -1611,10 +1896,7 @@ if [ "$ORG_MODE" = true ]; then
       --stack-set-name "$STACKSET_NAME" \
       --description "NotiOps member account onboarding (readonly role + event forwarding)" \
       --template-body "file://$MEMBER_TEMPLATE" \
-      --parameters "ParameterKey=SystemAccountId,ParameterValue=$CDK_ACCOUNT" \
-                   "ParameterKey=DevOpsEventBusArn,ParameterValue=$MEMBER_BUS_ARN" \
-                   "ParameterKey=PhdSnsTopicArn,ParameterValue=$MEMBER_PHD_ARN" \
-                   "ParameterKey=OrganizationId,ParameterValue=$ORG_ID" \
+      --parameters "${ONBOARD_SS_PARAMS[@]}" \
       --capabilities CAPABILITY_NAMED_IAM \
       --permission-model SERVICE_MANAGED \
       --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
@@ -1627,13 +1909,40 @@ if [ "$ORG_MODE" = true ]; then
   #     「账户接入」页第二步一键关联时才创建实例。
   DA_TEMPLATE="$PROJECT_ROOT/infra/member-devops-agent.yaml"
   DA_STACKSET_NAME="notiops-member-devops-agent"
+
+  # ─── 这个 StackSet 的参数 ───
+  #
+  # 🔴 **CreateCollectionRole 必须显式传 no**（2026-08-30 补）。
+  #
+  #    模板的 Default 是 `"yes"`，而 org 这条路上采集角色
+  #    `notiops-idle-detection-role-<系统账号>` 由**另一份**模板
+  #    （上面那个 `notiops-member-onboarding` StackSet）负责建。
+  #
+  #    两份都建 → `EntityAlreadyExists`（IAM 角色是全局资源，而那个名字里只有
+  #    **系统**账号、不含成员账号）→ 第二步「一键关联」**整栈 rollback**
+  #      ⇒ `devopsAgentAssocStatus` 写 `onboarding_status="failed"`
+  #      ⇒ `accounts._is_active` 把 failed 排除 ⇒ 那个账号**永不进**
+  #        `enabled_accounts()` ⇒ 巡检侧零信号
+  #      ⇒ 唯一的线索是管理页第二步显示 failed
+  #
+  # ⚠️ `member-devops-agent.yaml` 的注释把责任推给「客户在控制台选 no」——
+  #    而 StackSet 这条路**没有人去选**，走的是模板 Default。
+  #
+  # ⚠️ `DevOpsEventBusArn` 刻意**不传**（模板 Default 是空串）：org 账号的
+  #    转发规则由 onboarding 那份建，两份都建会让同一批事件被投两次
+  #    （callback 跑两遍、双份 Bedrock 摘要，且不报错）。
+  DA_SS_PARAMS=(
+    "ParameterKey=SystemAccountId,ParameterValue=$CDK_ACCOUNT"
+    "ParameterKey=OrganizationId,ParameterValue=$ORG_ID"
+    "ParameterKey=CreateCollectionRole,ParameterValue=no"
+  )
+
   if aws cloudformation describe-stack-set --stack-set-name "$DA_STACKSET_NAME" \
        --region "$DEPLOY_REGION" >/dev/null 2>&1; then
     aws cloudformation update-stack-set \
       --stack-set-name "$DA_STACKSET_NAME" \
       --template-body "file://$DA_TEMPLATE" \
-      --parameters "ParameterKey=SystemAccountId,ParameterValue=$CDK_ACCOUNT" \
-                   "ParameterKey=OrganizationId,ParameterValue=$ORG_ID" \
+      --parameters "${DA_SS_PARAMS[@]}" \
       --capabilities CAPABILITY_NAMED_IAM \
       --region "$DEPLOY_REGION" >/dev/null \
       && echo "  $(t "✓ DevOps Agent StackSet 已更新" "✓ DevOps Agent StackSet updated")" \
@@ -1643,8 +1952,7 @@ if [ "$ORG_MODE" = true ]; then
       --stack-set-name "$DA_STACKSET_NAME" \
       --description "NotiOps member DevOps Agent onboarding (agent space + trigger role)" \
       --template-body "file://$DA_TEMPLATE" \
-      --parameters "ParameterKey=SystemAccountId,ParameterValue=$CDK_ACCOUNT" \
-                   "ParameterKey=OrganizationId,ParameterValue=$ORG_ID" \
+      --parameters "${DA_SS_PARAMS[@]}" \
       --capabilities CAPABILITY_NAMED_IAM \
       --permission-model SERVICE_MANAGED \
       --auto-deployment Enabled=false \
@@ -1705,6 +2013,38 @@ if [ "$ORG_MODE" = true ]; then
       ;;
     *) echo "  $(t "跳过 Security Hub 组织聚合(Security tab 走逐账号 ?account= 视角)" "Skipping Security Hub org aggregation (the Security tab uses per-account ?account= views)")" ;;
   esac
+fi
+
+# ─── 两个接入模板同步到数据桶（**不在 ORG_MODE 块里**）────────────────────
+#
+# 🔴 2026-08-30 把这段从 `if [ "$ORG_MODE" = true ]` 块里**挪了出来**。
+#
+#    它原本在块内，而它自己的注释写着：「那条路径恰恰是 partner-resold /
+#    **非 org** 客户唯一的接入方式」—— 也就是说它**修在了自己点名的那个场景
+#    永远进不去的地方**。非 org 部署（或忘了 `--multi-account`）时模板压根不
+#    同步，点「生成部署链接」报 `config_error: template not found`。
+#
+#    BFF 的「手动接入账号」流程（`generateLaunchStackUrl` /
+#    `generateCollectionStackUrl`）会先试从 Lambda 包里读模板，读不到就从这里
+#    拿 —— 而 Lambda 包只打 `bff/web-chat`，**不含 `infra/`**，所以 S3 这份是
+#    唯一来源。手动接入与 org 模式无关，同步也不该有关。
+#
+# ⚠️ 此前没有任何自动化：DA 模板是 2026-08-21 手工传上去的，采集模板压根
+#    没传过。
+#
+# ⚠️ 桶的生命周期规则删的是 `onboarding/` 前缀（规则名虽然叫
+#    expire-onboarding-templates-7d），`onboarding-templates/` 不受影响。
+if [ -n "${DATA_BUCKET:-}" ] || DATA_BUCKET="notiops-data-${CDK_ACCOUNT}-${DEPLOY_REGION}"; then
+  for _tmpl in member-devops-agent.yaml member-account-onboarding.yaml; do
+    if aws s3 cp "$PROJECT_ROOT/infra/$_tmpl" \
+         "s3://$DATA_BUCKET/onboarding-templates/$_tmpl" \
+         --content-type "text/yaml; charset=utf-8" \
+         --region "$DEPLOY_REGION" >/dev/null 2>&1; then
+      echo "  $(t "✓ 接入模板已同步: $_tmpl" "✓ Onboarding template synced: $_tmpl")"
+    else
+      echo "  $(t "⚠ 接入模板同步失败: $_tmpl —— 「手动接入账号」的生成链接会报 template not found" "⚠ Failed to sync onboarding template: $_tmpl — Manual onboarding's link generation will report template not found")"
+    fi
+  done
 fi
 
 if [ "$ENABLE_PHD" != "false" ]; then

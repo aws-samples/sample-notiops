@@ -310,11 +310,14 @@ RUNTIME_REQUIRED_ACTIONS = [
     # bedrock:InvokeModelWithResponseStream 同时覆盖 ConverseStream API
     "bedrock:InvokeModel",
     "bedrock:InvokeModelWithResponseStream",
-    # AgentCore Memory
+    # AgentCore Memory（**会话内**历史：CreateEvent 写、ListEvents 读回来）
+    # 2026-09-01 去掉跨会话记忆后，RetrieveMemoryRecords 从这张表里删了 ——
+    # 它只服务「记忆记录」检索，而那条路已经没有调用方（见
+    # notiops-webchat-standalone-stack.ts 里 NotiOpsMemoryEvents 那段注释）。
+    # 恢复跨会话记忆时要连这一行一起加回来。
     "bedrock-agentcore:CreateEvent",
     "bedrock-agentcore:ListEvents",
     "bedrock-agentcore:GetMemory",
-    "bedrock-agentcore:RetrieveMemoryRecords",
     # Workload Identity
     "bedrock-agentcore:GetWorkloadAccessToken",
     # STS 跨账户

@@ -19,9 +19,12 @@
 EC2 Spot 中断预警、Auto Scaling 启动失败、RDS、Config),每类可独立开关。
 
 所有模型都通过 **Amazon Bedrock** 接入(托管的安全、合规与成本管控),可按会话切换
-模型,并自动做中英文本地化。**只读承诺**由三层防线(入站过滤 → 系统提示 → 出站审计)
-强制保障:助手只读取、只推理,绝不改动你的云环境 —— 因此可放心交给 on-call 工程师
-使用,而无需授予写权限。
+模型,并自动做中英文本地化。**只读承诺**的硬边界是**只读 IAM 角色**(两条入口访问
+你账号用的都是它,对你的基础设施从不授予写权限),之上再按入口做纵深防御:网页端是工具层只读
++ 命令级 denylist(拦 `get-secret-value` 这类「是只读但不该读」的动作)+ 严格只读的
+system prompt;IM 端直连 AWS DevOps Agent 的只读 agent,NotiOps 侧再加一条强变更
+措辞正则作二道门。助手只读取、只推理,绝不改动你的云环境 —— 因此可放心交给
+on-call 工程师使用,而无需授予写权限。
 
 ---
 
@@ -29,10 +32,10 @@ EC2 Spot 中断预警、Auto Scaling 启动失败、RDS、Config),每类可独�
 
 | 文档 | 用途 |
 |---|---|
-| 🚀 [一键部署](docs/DEPLOYMENT_ONECLICK.md) | 只要一个浏览器:上传一份 CloudFormation 模板,大约 5 分钟拿到 Web Chat(只含 Web Chat) |
+| 🚀 [一键部署](docs/DEPLOYMENT_ONECLICK.md) | 只要一个浏览器:上传一份 CloudFormation 模板,大约 5 分钟拿到 Web Chat(可选加装一个 IM 机器人:飞书/Lark 或 Slack) |
 | 🛠 [部署指南](docs/DEPLOYMENT.md) | 完整版:从 `./setup.sh` 到首次冒烟测试的分步指南(Web 控制台 + 可选 IM) |
 | 👤 [用户指南](docs/USER_GUIDE.md) | 终端用户手册 + 对话示例 + FAQ |
-| 🏗 [技术设计](docs/TECHNICAL_DESIGN.md) | 模块边界 / 数据流 / 安全 / 三层防线 |
+| 🏗 [技术设计](docs/TECHNICAL_DESIGN.md) | 模块边界 / 数据流 / 安全 / 只读纵深防线 |
 | 🧑‍💻 [贡献指南](CONTRIBUTING.md) | 约定(i18n / 安全 / PR 流程) |
 
 ---
@@ -59,8 +62,8 @@ EC2 Spot 中断预警、Auto Scaling 启动失败、RDS、Config),每类可独�
   仍按会话保存自己的模型偏好。所有模型均通过 **Amazon Bedrock** 接入(托管的安全、
   合规与成本管控),凭证可用 IAM 或 Bedrock API Key
 - 🌍 **双语**:中 / 英自动识别 + 显式切换
-- 🛡 **只读承诺**:三层防线(入站正则 / 系统提示 / 出站审计)—— 助手绝不改动你的云
-- 💬 **IM 渠道**:Slack / 飞书 全功能
+- 🛡 **只读承诺**:硬边界是只读 IAM 角色;之上按入口纵深防御 —— 网页端工具层只读 + 命令级 denylist + 只读 system prompt,IM 端 DevOps Agent 只读 agent + 强变更措辞正则二道门 —— 助手绝不改动你的云
+- 💬 **IM 渠道**:Slack / 飞书 全功能 —— 提问后**立刻**回一张卡片,过程 / 思考 / 答案都刷在**同一张卡**上(标题里的秒数就是"还在跑"的信号);深度调查跑完后报告卡自动回贴到发起它的那个会话
 
 ---
 
@@ -70,7 +73,7 @@ EC2 Spot 中断预警、Auto Scaling 启动失败、RDS、Config),每类可独�
 
 ### 方式 A:一键部署 —— 只要一个浏览器
 
-适合拿不到长期 access key,或不允许在本地装 CDK / 容器运行时的环境:全程在 AWS
+适合拿不到长期 access key,或不允许在本地装 CDK 的环境:全程在 AWS
 控制台里完成,你自己的机器上什么都不用装。
 
 1. 从 [Releases](https://github.com/aws-samples/sample-notiops/releases/latest)
@@ -79,14 +82,21 @@ EC2 Spot 中断预警、Auto Scaling 启动失败、RDS、Config),每类可独�
 3. 填管理员邮箱(临时密码会发到这个邮箱)、勾选 IAM 能力确认框、创建 —— 实测大约
    5 分钟完成,栈输出里就是 Web Chat 的访问地址。
 
-开栈时有两个可选参数值得知道:**深度调查**(AWS DevOps Agent,默认开,闲置不计费,
-区域不支持时自动跳过而不是让栈失败)与**部署模式**(默认单账号;选多账号并填组织 id,
-就能跨组织内其它账号做只读排查 —— 需要从组织管理账号或 StackSets 委派管理员账号部署)。
+开栈时有三个可选参数值得知道:
 
-⚠️ 一键部署**只部署 Web Chat**(前端 + BFF + agent),**不含** IM 机器人、定时巡检、
-管理仪表盘与 CUR/Athena FinOps —— 要这些请用下面的方式 B。前提条件(区域与 Bedrock
-模型开通)、参数逐条说明、资源与成本构成、升级 / 回滚、一键删除,见
-[docs/DEPLOYMENT_ONECLICK.md](docs/DEPLOYMENT_ONECLICK.md)。
+- **安装选项**(`InstallOption`,默认 `web`)—— 下拉三选一:`web` / `web+feishu` /
+  `web+slack`。**三个都装 Web Chat**,后两个再加**一个** IM 机器人(群里 @ 它或私聊它;
+  部署完还要在 IM 平台侧填一次请求地址、把凭证写进 Secrets Manager)。部署完也能 update
+  栈换成另一个值。
+- **深度调查**(AWS DevOps Agent,默认开,闲置不计费,区域不支持时自动跳过而不是让栈失败)。
+- **部署模式**(默认单账号;选多账号并填组织 id,就能跨组织内其它账号做只读排查 ——
+  需要从组织管理账号或 StackSets 委派管理员账号部署)。
+
+⚠️ 一键部署装的是 **Web Chat + 可选一个 IM 机器人**,**不含**定时巡检与主动推送、
+管理仪表盘、CUR/Athena FinOps,一个栈也只能装一个 IM 平台 —— 要这些请用下面的方式 B。
+前提条件(区域与 Bedrock 模型开通)、参数逐条说明、资源与成本构成、升级 / 回滚、
+一键删除,见 [docs/DEPLOYMENT_ONECLICK.md](docs/DEPLOYMENT_ONECLICK.md);IM 那两步配置见
+[docs/IM_WEBHOOK_SETUP.md](docs/IM_WEBHOOK_SETUP.md)。
 
 ### 方式 B:`setup.sh` —— 完整版
 
@@ -99,10 +109,10 @@ cd sample-notiops
 ./setup.sh
 # 首次运行:确认 AWS 账号 → 选区域 → 选 IM 平台(Slack / 飞书,可多选)→
 # 逐个粘贴凭证(直接写入 Secrets Manager,绝不落盘)→ CDK bootstrap → synth →
-# 容器构建 → cdk deploy --all。重复运行只增量更新。
+# 构建依赖 Layer(pip,无需容器)→ cdk deploy --all。重复运行只增量更新。
 ```
 
-需要本地有 git / Node.js / Python / AWS CDK / 一个容器运行时,以及一份能部署的 AWS 凭证。
+需要本地有 git / Node.js / Python / uv / AWS CDK,以及一份能部署的 AWS 凭证 —— **不需要容器运行时**。
 
 #### 部署模式:单账号(默认) vs 多账号
 
@@ -123,7 +133,7 @@ cd sample-notiops
 | 能力 | 方式 A(一键部署) | 方式 B(`setup.sh`) |
 |---|:---:|:---:|
 | **前提与耗时** | | |
-| 本地要装的东西 | 无(只要浏览器) | git / Node / Python / **uv** / CDK / 容器运行时(仅 IM bot 需要) |
+| 本地要装的东西 | 无(只要浏览器) | git / Node / Python / **uv** / CDK(**不需要容器运行时**) |
 | 需要长期 access key | 不需要 | 需要一份能部署的凭证 |
 | 部署耗时 | 大约 5 分钟 | 十几分钟(含本地构建) |
 | 一键删除整个环境 | ✅ 删栈时选 `KeepData` / `DeleteEverything` | ✅ `./teardown.sh`(默认保数据 / `--delete-everything` 全删) |
@@ -136,10 +146,12 @@ cd sample-notiops
 | 深度调查(直连,不耗 token) | ✅ 见下方注 ¹ | ✅ |
 | DevOps 对话(通用聊天里让你自己的 DevOps Agent 直答) | ✅ 见下方注 ¹ | ✅ |
 | 联网搜索(AgentCore Web Search) | ✅ 见下方注 ² | ✅ 见下方注 ² |
-| 长期记忆(跨会话记住你说过的偏好与事实) | ✅ 见下方注 ³ | ✅ 见下方注 ³ |
+| 会话记忆(同一会话内接得上上文) | ✅ 见下方注 ³ | ✅ 见下方注 ³ |
+| 跨会话记忆(把偏好与事实带到下一个会话) | ❌ 见下方注 ³ | ❌ 见下方注 ³ |
 | **成本 / FinOps** | | |
 | FinOps 仪表盘(Cost Explorer 口径) | ✅ 仅部署账号 | ✅ 可跨账号 |
 | CUR + Athena 账单明细下钻 | ❌ | ✅ |
+| 接自己的 CUR 数据源(4 个仪表盘 sheet + 聊天里问那份账单) | ✅ 可选,见下方注 ⁵ | ✅ 可选,见下方注 ⁵ |
 | **工单与 Skills** | | |
 | AWS Support 工单全生命周期 | ✅ | ✅ |
 | 11 个预置 Skill + 客户自建 | ✅ | ✅ |
@@ -148,7 +160,7 @@ cd sample-notiops
 | 多模型切换 + 模型目录管理 | ✅ | ✅ |
 | 用 Bedrock API Key 作为凭证 | ✅ | ✅ |
 | **主动化 / IM** | | |
-| IM 渠道(Slack / 飞书) | ❌ | ✅ |
+| IM 渠道(Slack / 飞书) | ✅ 一个栈一个平台,见下方注 ⁴ | ✅ 两个可同时开 |
 | 主动推送**到 IM**(10 类 EventBridge 信号源) | ❌ | ✅ |
 | 每日自动巡检(闲置资源 / 成本异常) | ❌ | ✅ |
 | 通知收件箱(同样这 10 类信号源,进 Web 收件箱) | ✅ | ✅ |
@@ -172,14 +184,39 @@ cd sample-notiops
 > 输出 `WebSearchStatus` 会写明原因,方式 B 的 `./setup.sh` 会在部署日志里说一句。
 > 注意这个开关**不会置灰**(界面不做区域判断),点了不报错,只是搜不到东西。
 
-> ³ **长期记忆:两条路径都要 v1.0.19 及以上。** 用 AgentCore Memory 的四个
-> namespace(从对话里抽取的事实、你明确说过的偏好、每个会话的摘要、episode),抽取是
-> **异步**的 —— 说完一句偏好,等一两分钟再开新会话才看得到效果。⚠️ 当前记忆的
-> **actor 是整个部署共用的一个身份**:任何用户对话里抽出的事实与偏好,同一个部署下所有
-> 登录用户都看得到(会话摘要与 episode 只在本会话内,聊天记录仍按用户隔离)。不接受这一点
-> 就分开部署两套栈。记忆资源**没有保留策略**:删栈会把它和里面积累的一切一起删掉。
-> 方式 A 在 v1.0.19 之前**根本没建这个资源**,方式 B 虽然一直有、但检索被一个相关度门槛
-> 滤光了 —— 两边都要升到 v1.0.19 才真正可用,细节见发布说明。
+> ³ **记忆只在会话内,不跨会话。** 同一个会话里它记得前面聊过什么(用 AgentCore Memory
+> 按会话存原始消息,事件保留 30 天);**换一个新会话就是干净的一页** —— 你上个会话说过的
+> 偏好和事实不会被带过来。这是有意的设计:少一份跨会话的数据留存,行为也更可预期
+> (「它为什么突然这么答」不会来自你早就忘了的某句话)。想让它记住的,请在当前会话里说,
+> 或者写进 Skill / 系统提示这类**显式**配置里。
+>
+> 为什么会话内这一层不能省:每一轮请求只带你这一句话,而模型侧的会话对象会因为换模型、
+> 换主题、容器冷启动而重建 —— 少了它,你在同一个会话里换个模型再追问一句,上文就没了。
+> 记忆资源**没有保留策略**:删栈会把它和里面的会话消息一起删掉。
+> ⚠️ 早于 2026-09 的版本(v1.0.18 / v1.0.19)带**跨会话**记忆,而且当时的 actor 是整个部署
+> 共用的一个身份(任何用户抽出的偏好所有登录用户都看得到)。升级到本版之后这层就没有了;
+> 已经抽取出来的记录会随 strategy 一起删除。
+
+> ⁴ **方式 A 的 IM 是开栈时的一个下拉选项**(`InstallOption`:`web` / `web+feishu` /
+> `web+slack`,默认只装 web)。装出来的机器人和网页用的是**同一个只读后端**,群里 @ 它、
+> 或者私聊它就能问;命中「查资源 / 发起调查 / 看进度 / 切模型 / 切语言」这些是确定性路由,
+> **不花 token**。两处差别:① 一个栈只能装**一个**平台(两个都要走方式 B);② 部署完还有
+> 两步在你手上 —— 凭证写进 Secrets Manager、请求地址填回 IM 平台(顺序不能反,栈输出
+> `ImNextSteps` 会提醒你),步骤见 [docs/IM_WEBHOOK_SETUP.md](docs/IM_WEBHOOK_SETUP.md)。
+> 注意这只是**问答**;把每日巡检报告和告警**主动推**到群里那一路仍然只有方式 B 有。
+
+> ⁵ **接自己的 CUR 数据源是可选的,两条路径一样。** 上面那行「CUR + Athena 账单明细下钻」
+> 说的是**本部署账号自己的**账单(方式 B 自动建);这一行说的是**另一份 CUR 表**(比如你负责的
+> 客户、或多个付款账号),数据经**你自己部署的一个 cost-agent MCP Lambda** 来 —— 它不在这个
+> 仓库里。接上之后 FinOps 页多出 4 张表(费用趋势 / Credit / 扩展支持 / Savings Plans),
+> 聊天里也能直接问那份账单。**怎么给**:方式 A 填参数 `CostAgentMcpUrl` + `CostAgentFunctionArn`,
+> 方式 B 传环境变量 `COST_AGENT_MCP_URL` + `COST_AGENT_FN_ARN`。**两个值必须一起给**:Function URL
+> 里不含函数 ARN,而调用授权只能按资源给,只填一半会得到一个"看起来装好了、每次调用 403"的
+> 数据源 —— 所以两条路径都会在**动手之前**拒掉半配置(方式 A 的栈根本不会创建)。**不填**:那 4 张
+> 表的入口直接不出现,其余功能不受影响。**填了之后它挂掉也不会拖垮工具**:仪表盘只有那 4 张表
+> 写「暂时不可用」,聊天会自动退到 Cost Explorer、再退到 AWS 只读 API,并**明确告诉你换了数据源**
+> (口径不同,别直接拿去对账)。部署那个 Lambda 的步骤见
+> [docs/DEPLOYMENT.md §14](docs/DEPLOYMENT.md#14-客户-cur-仪表盘--cost-agent-mcp可选)。
 
 > 📋 **AWS Support 相关功能(建案 / 查案 / 回复 / 解决)需要账号开通 Business、
 > Enterprise On-Ramp 或 Enterprise 支持计划** —— 这是 AWS Support API 本身的要求,
@@ -209,8 +246,8 @@ cd sample-notiops
 
 | | 保留什么 |
 |---|---|
-| `KeepData`(默认) | 保留配置表、聊天记录表、数据桶(里面有你的 Skill 和报告) |
-| `DeleteEverything` | 全删,不留东西 |
+| `KeepData`(默认) | 保留配置表、聊天记录表、数据桶(里面有你的 Skill 和报告);装过 IM 的话,IM 凭证 secret 也留着 |
+| `DeleteEverything` | 全删,不留东西(**含 IM 凭证 secret,不可恢复**) |
 
 ⚠️ **两个必须注意的点:**
 
@@ -261,7 +298,7 @@ cd sample-notiops
         ┌──────────────────────────────────────┐
         │   NotiOps(本仓库)                    │
         │   · 意图分类                           │
-        │   · 三层只读防线                       │
+        │   · 只读纵深防线                       │
         │   · 工单管理 · 双语 i18n               │
         │   · MCP 文档检索 · Bedrock 路由        │
         │                 │                      │

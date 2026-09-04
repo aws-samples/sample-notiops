@@ -1,5 +1,6 @@
 import { useState, useEffect, useId } from "react";
 import ReactMarkdown from "react-markdown";
+import ChartBlock, { tryParseChartSpec } from "./ChartBlock";
 import remarkGfm from "remark-gfm";
 import { useT, useLocale } from "../i18n";
 import { type ChatMessage, type ProposedAction } from "../types";
@@ -18,8 +19,12 @@ import { modelDisplayName } from "../models";
 // DevOps Agent** 答的（NotiOps 侧 0 token）。此时署名必须写 "AWS DevOps Agent" —— 沿用
 // "AWS Bedrock (某模型)" 会把答案的来源说错，客户会以为这是我们的模型在答、并按我们的
 // 模型能力去理解结果。也不带 token：DevOps Agent 侧用量计在客户自己的额度里，不在这里显示。
+// via="builtin"：agent 的**内置确定性回答**（如「你能做什么」），一个字都没过模型、0 token。
+// 同一个道理 —— 署成 "AWS Bedrock (某模型)" 就是把来源说错（还会让客户以为这段能力清单是
+// 模型"觉得"自己能做什么）。故署 "NotiOps"（产品自己答的），也不带 token。
 function modelSignature(model: string | undefined, usage: ChatMessage["usage"], via?: string): string {
   if (via === "devops-agent") return "AWS DevOps Agent";
+  if (via === "builtin") return "NotiOps";
   const name = modelDisplayName(model);
   if (!name) return "";
   let base = `AWS Bedrock (${name})`;
@@ -525,10 +530,10 @@ function ActionCard({ action, onConfirm, onCancel, locale }: {
   );
 }
 
-export default function Message({ m, onOpenSources, onOpenInvestigation, onConfirmAction, onCancelAction, onFollowup, accountLabel, accountIsMember }: {
+export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAction, onCancelAction, onFollowup, accountLabel, accountIsMember }: {
   m: ChatMessage;
   onOpenSources: (m: ChatMessage) => void;
-  onOpenInvestigation?: (m: ChatMessage) => void;
+  onOpenThinking?: (m: ChatMessage) => void;
   onConfirmAction?: (idx: number, editedParams?: Record<string, unknown>) => void;
   onCancelAction?: (idx: number) => void;
   onFollowup?: (prompt: string) => void;
@@ -564,6 +569,35 @@ export default function Message({ m, onOpenSources, onOpenInvestigation, onConfi
   }
 
   // assistant
+  // 「查看思考过程」入口 —— **两条 agent 路径共用这一个入口**（2026-09-04 需求：DevOps Agent 与
+  // 普通对话的过程展示，样式和行为尽量一致）。差别只在点开哪份数据：
+  // DevOps Agent 的 investigationSteps 与通用的 thinkingSteps 都进**同一个** ThinkingPanel
+  // （见 ChatApp），所以面板里的图标、「进行中」脉冲、自动滚底、自动弹出也天然一致。
+  // 计数取两者的最大值：新消息两者都有（DevOps 的调查步骤也写进了思考时间线），改版前存下来的
+  // 老消息只有 investigationSteps —— 那时刷新后这条回复的过程入口就靠它。
+  // 四条规矩，都是踩过的，别改回去：
+  //   1) **自己独占一行**（外面套 .think-entry-row）—— .thinking 与 .think-entry 都是 inline-flex，
+  //      不套块级容器就会和「… 正在思考 · 3s」挤到同一行。
+  //   2) 位置在正文**上方**（处理中与出答案后都可见，长任务进行时就能点进去看过程），但要跟
+  //      正文/思考态**留够间距**（见 .think-entry-row 的 margin），贴太近很难看。
+  //   3) 一条回复**只出一个**入口 —— 两个同名按钮客户分不清该点哪个（曾经是「查看调查过程」+
+  //      「查看思考过程」两个，一个在正文下一个在正文上，样式还不一样）。
+  //   4) 样式要**低调**（.think-entry 纯文字灰链），不用带边框的卡片气泡 —— 客户反馈太抢眼。
+  const entryCount = Math.max(m.thinkingSteps?.length ?? 0, m.investigationSteps?.length ?? 0);
+  const thinkEntry = entryCount > 0 ? (
+    <div className="think-entry-row">
+      <button type="button" className="think-entry" onClick={() => onOpenThinking?.(m)}>
+        <span className="think-entry-ic">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+          </svg>
+        </span>
+        {t("think.entry")}
+        <span className="think-entry-count">{t("think.entry.count").replace("{n}", String(entryCount))}</span>
+      </button>
+    </div>
+  ) : null;
+
   return (
     <div className="row bot">
       <div className="msg">
@@ -584,6 +618,8 @@ export default function Message({ m, onOpenSources, onOpenInvestigation, onConfi
           </div>
         )}
 
+        {thinkEntry}
+
         {m.thinking ? (
           <div className="thinking">
             <PulseWave />
@@ -601,21 +637,23 @@ export default function Message({ m, onOpenSources, onOpenInvestigation, onConfi
                 components={{
                   // 所有链接新标签打开，避免在 SPA 内导航丢失会话
                   a: ({ ...props }) => <a target="_blank" rel="noopener noreferrer" {...props} />,
+                  // ```chart 围栏 → 内联图表（解析失败原样显示代码，fail-open）。
+                  // 流式输出中不渲染图（半截 JSON 每 token 重 parse 会闪），显示占位，输出完成后一次成图。
+                  code: ({ className, children, ...props }) => {
+                    if (/language-chart/.test(className || "")) {
+                      if (m.streaming) {
+                        return <div style={{ padding: "12px", opacity: 0.6, fontSize: 12 }}>📊 图表生成中…</div>;
+                      }
+                      const spec = tryParseChartSpec(String(children));
+                      if (spec) return <ChartBlock spec={spec} />;
+                    }
+                    return <code className={className} {...props}>{children}</code>;
+                  },
                 }}
               >{linkifyCaseIds(stripThinking(m.text))}</ReactMarkdown>
             </div>
-            {/* 调查过程入口：有分析步骤时给一个按钮，点开右侧「调查过程」面板（不自动弹，主聊天干净）。 */}
-            {m.investigationSteps && m.investigationSteps.length > 0 && (
-              <button type="button" className="inv-entry" onClick={() => onOpenInvestigation?.(m)}>
-                <span className="inv-entry-ic">
-                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                    <circle cx="11" cy="11" r="7" /><path d="m21 21-4.3-4.3" />
-                  </svg>
-                </span>
-                {t("inv.entry")}
-                <span className="inv-entry-count">{t("inv.entry.count").replace("{n}", String(m.investigationSteps.length))}</span>
-              </button>
-            )}
+            {/* 调查过程入口不在这里 —— 已与「查看思考过程」合并成正文**上方**的唯一入口（见上面
+                thinkEntry）。别再在正文下面加第二个过程入口。 */}
             {/* 待确认写操作（创建/回复/关闭 case）确认卡 */}
             {!m.streaming && m.actions && m.actions.length > 0 && (
               <div className="action-cards">

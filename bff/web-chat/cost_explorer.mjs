@@ -7,8 +7,8 @@
  * 每次刷新的口径完全一致（不会因为 prompt 不同产生不同的过滤条件），也方便未来
  * 排查"这个数字是怎么算出来的"——直接看函数体就是唯一口径。
  *
- * 全部使用 UnblendedCost（实际发生费率），与 CMC 控制台默认口径一致（见
- * tam-steering.md §Cost Metric Selection 的默认建议）。
+ * 全部使用 UnblendedCost（实际发生费率），与账单控制台的默认口径一致
+ * ——「实际发生额」是成本指标选型的通行默认值。
  */
 import { CostExplorerClient, GetCostAndUsageCommand, GetCostAndUsageComparisonsCommand, GetCostForecastCommand, GetAnomaliesCommand, GetSavingsPlansCoverageCommand, GetReservationCoverageCommand, GetTagsCommand } from "@aws-sdk/client-cost-explorer";
 import { findPayerAccount, getAssumedCredentialsForAccount } from "./devops_agent_accounts.mjs";
@@ -206,7 +206,7 @@ export async function getSupportFees() {
 /**
  * 4. MoM Movers —— 本月 vs 上月，按 SERVICE 维度找涨幅最大 / 降幅最大的服务。
  *    走 getCostAndUsageComparisons（专为月度对比设计的 API，官方推荐用于这个场景，
- *    见 tam-steering.md 对该 API 的说明：仅支持整月对比，起止必须是月初）。
+ *    该 API 仅支持整月对比，起止必须是月初）。
  */
 export async function getTopMovers() {
   // MoM 对比必须用两个「完整」月：GetCostAndUsageComparisons 不接受未结束的当前月

@@ -22,7 +22,7 @@
    - 4.1 [意图分类器 `bedrock_intent`](#41-意图分类器-bedrock_intent)
    - 4.2 [通用对话 + 三层防御 `bedrock_chat`](#42-通用对话--三层防御-bedrock_chat)
    - 4.3 [Webhook 派发 `webhook_dispatch`](#43-webhook-派发-webhook_dispatch)
-   - 4.4 [实时进度卡 `progress_poller` + `progress_card`](#44-实时进度卡-progress_poller--progress_card)
+   - 4.4 [实时进度卡 `progress_poller` + `progress_card`(⚠️ 已退役,回滚路径)](#44-实时进度卡-progress_poller--progress_card)
    - 4.5 [next-step 建议 `next_steps`](#45-next-step-建议-next_steps)
    - 4.6 [Push 模式 `push_event` + `push_handler`](#46-push-模式-push_event--push_handler)
    - 4.7 [Case 管理 `case_management`](#47-case-管理-case_management)
@@ -103,25 +103,29 @@ NotiOps 的目标:**让 SRE 随时随地掌控云环境**。主入口是一个 *
 │  │  飞书   │  │  Slack  │  │  钉钉    │  │  Teams  │   ← 待接入   │
 │  └────┬────┘  └────┬────┘  └─────────┘  └─────────┘              │
 └───────┼────────────┼───────────────────────────────────────────────┘
-        │ 长连 WS    │ Socket Mode
+        │ webhook     │ webhook
+        │ (HTTPS)     │ (Events / Interactivity / Slash)
         ▼            ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │                    NotiOps (本项目)                        │
 │                                                                    │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐         │
-│  │  Feishu Bot  │    │  Slack Bot   │    │  其他平台    │         │
-│  │  ECS Fargate │    │  ECS Fargate │    │  (按需扩展)  │         │
-│  │  (lark-oapi) │    │  (slack_bolt)│    │              │         │
+│  │  Feishu      │    │  Slack       │    │  其他平台    │         │
+│  │  ingress λ   │    │  ingress λ   │    │  (按需扩展)  │         │
+│  │  + worker λ  │    │  + worker λ  │    │              │         │
+│  │  (ImStack)   │    │  (ImStack)   │    │              │         │
 │  └──────┬───────┘    └──────┬───────┘    └──────────────┘         │
+│   ingress: API GW HTTP API 触发，只验签 + 异步 invoke worker         │
+│   (旧的 ECS Fargate 长连接已于 2026-09-03 / M2 退役，只留源码回滚)  │
 │         │                   │                                       │
 │         └─────────┬─────────┘                                       │
 │                   ▼                                                 │
 │  ┌─────────────────────────────────────────────────────┐           │
 │  │            core/ 平台无关公共代码                    │           │
 │  │  • bedrock_intent (意图分类)                         │           │
-│  │  • bedrock_chat (通用对话 + 三层防御)                │           │
-│  │  • progress_poller (进度卡轮询 daemon)               │           │
-│  │  • progress_card (进度卡 IR + Bedrock 摘要)          │           │
+│  │  • bedrock_chat (通用对话 + 三层防御,仅回滚路径)     │           │
+│  │  • nl_router (0-token 双语意图路由)                  │           │
+│  │  • devops_agent (调查派发 + 无状态进度轮询)          │           │
 │  │  • next_steps (报告后建议生成)                       │           │
 │  │  • case_management (Support case 管理)               │           │
 │  │  • push_event (告警事件归一化)                       │           │
@@ -150,11 +154,11 @@ NotiOps 的目标:**让 SRE 随时随地掌控云环境**。主入口是一个 *
 
 | 层 | 物理位置 | 职责 | 代码 |
 |---|---|---|---|
-| **L1 平台适配层** | ECS Fargate(每个平台 1 task) | 接收 IM 事件、卡片回调路由、长连接维护 | `platforms/feishu/app/`、`platforms/slack/app/` |
-| **L2 公共业务逻辑** | 跟 L1 同进程或 Lambda 内 | 意图分类、对话、进度轮询、case、push、签名派发 | `core/` |
+| **L1 平台适配层** | Lambda(每个平台一对:ingress + worker,`ImStack`) | ingress:验签 + 幂等去重 + 异步投递;worker:消息 / 卡片回调路由与处理 | `platforms/{feishu,slack}/lambda_ingress.py` + `lambda_worker.py`(回滚用的长连接入口在 `platforms/*/app/`) |
+| **L2 公共业务逻辑** | 跟 L1 同进程或 Lambda 内 | 确定性意图路由(`core/nl_router`,0 token)、对话、进度轮询、case、push、签名派发 | `core/` |
 | **L3 后台任务** | AWS Lambda(无状态) | 接 EventBridge 事件,渲染报告,投递到 IM | `shared/report_delivery/report_handler.py`、`shared/report_delivery/push_handler.py`、`shared/report_delivery/feishu_sender.py`、`shared/report_delivery/slack_sender.py` |
 
-L2 被两类调用方共用 —— ECS task(同进程 import)和 Lambda(CDK 打包时 `core/` + `shared/` 被包含在 Lambda 部署包中)。
+L2 被两类调用方共用 —— IM worker Lambda / 后台 Lambda(CDK 打包时 `core/` + `shared/` 被包含在部署包中);M2 之前还有回滚路径上的 ECS task(同进程 import),那条路径已退役。
 
 ### 2.3 部署拓扑
 
@@ -162,16 +166,16 @@ L2 被两类调用方共用 —— ECS task(同进程 import)和 Lambda(CDK 打�
                     ┌─────────────────────────────────┐
                     │       AWS Account               │
                     │                                 │
-   IM ──长连 WS──→  │  ┌──────────────┐              │
-                    │  │  ECS Fargate │  飞书 bot    │
-                    │  │  Cluster     │  (1 task,    │
-                    │  │              │   512/1024MB) │
+  飞书 ──webhook──→ │  ┌──────────────┐              │
+                    │  │ API GW HTTP  │  飞书        │
+                    │  │ API + ingress│  (128MB /    │
+                    │  │ λ + worker λ │   900MB×900s)│
                     │  └──────┬───────┘              │
                     │         │                      │
                     │  ┌──────▼───────┐              │
-   IM ──Socket──→   │  │  ECS Fargate │  Slack bot   │
-                    │  │  Cluster     │  (1 task,    │
-                    │  │              │   512/1024MB) │
+ Slack ──webhook──→ │  │ API GW HTTP  │  Slack       │
+                    │  │ API + ingress│  (同上)      │
+                    │  │ λ + worker λ │              │
                     │  └──────┬───────┘              │
                     │         │                      │
                     │   ┌─────▼────────────────────┐ │
@@ -186,13 +190,15 @@ L2 被两类调用方共用 —— ECS task(同进程 import)和 Lambda(CDK 打�
                     └─────────────────────────────────┘
 ```
 
-**关键设计:** 每个 IM 平台独立 ECS cluster + 独立 CFN stack,但**所有平台共享同一份 `core/` 代码 + 共享 DDB / Lambda / S3**。客户可以只部署飞书,或只部署 Slack,或两个都部署。
+**关键设计:** 每个 IM 平台独立 HTTP API + 独立 ingress/worker Lambda + 独立执行角色(同一个 `ImStack`),但**所有平台共享同一份 `core/` 代码 + 共享 DDB / Lambda / S3 + 同一个进度轮询 Lambda**。客户可以只部署飞书,或只部署 Slack,或两个都部署。
+
+> ⚠️ 2026-09-03(M2)之前这里是每平台一个 ECS Fargate Service(512 CPU / 1024 MB,长连接 / Socket Mode),由 `BotStack` 部署 —— 已退役,`infra/lib/bot-stack.ts` 只作源码级回滚路径保留。
 
 ---
 
 ### 2.4 Web Chat 架构(agentic AI 助手)
 
-> **定位**:Web Chat 是 NotiOps 的**主入口** —— 浏览器里直接和 AWS 运维 agent 对话的 agentic 助手,IM 侧(飞书 / Slack / 钉钉)是面向告警群响应的必要补充。它有自己的 agent 运行时、BFF、前端与鉴权链路,和 IM 侧共享部分后端约束与存储(如 Skills 的 S3 前缀、只读防线理念),但**不复用 IM 侧的 `core/` / ECS bot / EventBridge 派发链路**。
+> **定位**:Web Chat 是 NotiOps 的**主入口** —— 浏览器里直接和 AWS 运维 agent 对话的 agentic 助手,IM 侧(飞书 / Slack / 钉钉)是面向告警群响应的必要补充。它有自己的 agent 运行时、BFF、前端与鉴权链路,和 IM 侧共享部分后端约束与存储(如 Skills 的 S3 前缀、只读防线理念),但**不复用 IM 侧的 `core/` / IM worker Lambda / EventBridge 派发链路**。
 
 #### 2.4.1 四层组件
 
@@ -220,7 +226,7 @@ L2 被两类调用方共用 —— ECS task(同进程 import)和 Lambda(CDK 打�
 │  • 单 agent + 工具集 + 主题聚焦层                             │
 │  • investigate_live(DevOps Agent 深度调查,async-gen 流式)   │
 │  • create_case_from_template(真实目录确定性解析建案)         │
-│  • 严格只读(沿用后端三层防御约束)                           │
+│  • 严格只读(纵深防御见 §5.3)                                  │
 └───────────────────────────────────────────────────────────────┘
 
 旁路:EventBridge 事件源 → notiops-web-notif-handler(Lambda)
@@ -285,39 +291,39 @@ BFF 把 AgentCore Runtime 的产出转成一条 SSE 事件流,前端按类型分
 ```mermaid
 sequenceDiagram
     participant U as 用户(飞书)
-    participant Bot as Feishu Bot (ECS)
-    participant H as Bedrock Haiku
+    participant GW as API GW HTTP API
+    participant IN as ingress λ
+    participant W as worker λ
     participant Agent as AWS DevOps Agent
+    participant P as notiops-im-progress λ
+    participant H as Bedrock Haiku
     participant L as Lambda<br/>(report-handler)
     participant S3 as S3
     participant DDB as DynamoDB
 
-    U->>Bot: @bot 查 i-0123 的 CPU
-    Bot->>DDB: put_new_event (conditional 幂等去重)
-    Bot->>U: 🤔 正在理解你的指令…
-    Bot->>Bot: _is_change_request(text) → False
-    Bot->>H: analyze_intent(text)
-    H-->>Bot: {command:"investigate", intent, suggestions}
-    Bot->>U: 确认卡片 [✅ 派发] [❌ 取消]
+    U->>GW: @bot 深度调查 i-0123 的 CPU
+    GW->>IN: $default catch-all(未鉴权,验签在请求体层)
+    IN->>IN: lark_oapi 解密 + 验签
+    IN->>W: 异步 invoke(InvocationType=Event)
+    IN->>U: 👀 表情(**必须在 invoke 之后**)
+    IN-->>GW: 200(秒回 —— 飞书 ~3s 硬超时)
 
-    U->>Bot: 点击 ✅ 派发
-    Bot->>DDB: 读取 event row,验证状态
-    Bot->>Agent: generic webhook 派发<br/>(HMAC 签名 + incident_id 嵌入 description)
-    Agent-->>Bot: task_id
-    Bot->>DDB: link_incident (incident#xxx → chat_id)
-    Bot->>DDB: put progress#xxx (启动轮询)
-    Bot->>U: ✅ 已派发 + 调查启动中
+    W->>DDB: put_new_event(event_id 幂等去重)
+    W->>W: nl_router.route(text) → investigate<br/>(正则,**0 token**)+ 强改写闸门放行
+    W->>Agent: CreateBacklogTask(title, description)
+    Agent-->>W: task_id + execution_id
+    W->>U: 「已发起」卡片 → message_id
+    W->>DDB: put imtask#(execution_id / task_id / message_id / seen_ids)
+    W->>DDB: link_incident(incident#xxx / task#xxx → chat_id)
 
-    Note over Bot,DDB: progress_poller daemon 每 10s 扫 DDB
+    Note over P,DDB: EventBridge rate(1 minute) 触发 → 扫 imtask#
 
-    Bot->>Agent: ListJournalRecords (轮询)
-    Agent-->>Bot: thinking + tool_use 记录
-    Bot->>Bot: extract_recent_tools<br/>extract_latest_thinking
-    Bot->>H: translate_thinking_zh<br/>summarize_progress (每 4 tick)
-    H-->>Bot: 中文摘要 + 思路
-    Bot->>U: chat_update 同一卡片(进度更新)
+    P->>Agent: ListJournalRecords + GetBacklogTask
+    Agent-->>P: 新 journal 记录 + status
+    P->>P: 按游标 seen_ids 算增量 new_lines(**0 token**)
+    P->>U: update_card 同一张卡(追加进度行)
 
-    Note over Agent: 调查完成
+    Note over Agent: 调查完成 → P 写「已完成」卡并删掉 imtask# 行
 
     Agent->>L: EventBridge "Investigation Completed"
     L->>Agent: ListJournalRecords (拉完整 journal)
@@ -326,9 +332,15 @@ sequenceDiagram
     L->>H: next_steps.generate(summary_md)
     H-->>L: [{type, label, query/url}, ...]
     L->>DDB: 查 incident#xxx → 路由信息
-    L->>Bot: 通过 sender 发回原群
-    Bot->>U: 📝 Report Summary + ✅ NotiOps Report<br/>(查看报告 / Trace / 🤖 next-step / 🆘 升级 Support)
+    L->>U: 通过 sender 发回原群:📝 Report Summary + ✅ NotiOps Report<br/>(查看报告 / Trace / 🤖 next-step / 🆘 升级 Support)
 ```
+
+> ⚠️ **M2 / M3 之前这条链路不一样**,老部署的排查按老图走:入口是 ECS Fargate 上的长连接
+> 进程(没有 API GW / ingress / worker 之分),意图靠 `bedrock_intent.analyze_intent()`
+> 过一次 Haiku 并弹「确认派发」卡片(**烧 token**),派发走 `webhook_dispatch` 的 HMAC
+> generic webhook,进度靠 ECS 常驻 daemon `progress_poller` 每 10s 扫 `progress#` 行 +
+> 每 4 tick 调一次 Haiku 生成中文叙事(§4.4)。现在这四处**全换了**:
+> 确定性正则路由、`CreateBacklogTask`、`imtask#` + 每分钟一次的 Lambda、进度正文原样透传。
 
 ### 3.2 关键标识符贯穿链路
 
@@ -566,6 +578,11 @@ CFN parameter,通过 task definition env 透传,**改不需要 rebuild**:
 
 ### 4.2 通用对话 + 三层防御 `bedrock_chat`
 
+> ⚠️ **口径范围(2026-09-03 更新)**:本节描述的是 `core/bedrock_chat.py`。它的唯一
+> 调用方是 `platforms/{feishu,slack,dingtalk}/app/main.py` —— M2 之后这些 ECS 长连接
+> app 已随 `BotStack` 退役(`infra/bin/app.ts:66`),源码保留只为能回滚。
+> **现网两条入口(网页控制台 / IM Webhook)都不跑这三层**,它们各自的实际防线见 §5.3。
+
 #### 4.2.1 零变更承诺(Zero-Change Promise)
 
 bot 是 **read-only**,绝不替客户改云环境。这是产品级硬边界,**不是档位的可调项** —— 即使 `AGENTIC_CHAT_MODE=disabled`,变更类请求也走拒绝。
@@ -692,7 +709,7 @@ By Claude Sonnet 5 (via Amazon Bedrock)
 ```
 
 - 实现:`core/bedrock_chat.py::respond()` 直接用本轮解析出的目录条目 label(`model_entry.label`)拼 `By <label> (via Amazon Bedrock)`
-- **只有一张模型名表 —— 模型目录本身**(DynamoDB,Admin「模型」页可改)。早期还有一张硬编码的 `_MODEL_FRIENDLY_NAMES` / `_friendly_model_name()` / `_model_footer()`,2026-08 已删(spec task 4.4):它没有调用方了,而且子串匹配不严谨(needle `claude-sonnet-5` 也会命中未来的 `claude-sonnet-5x`)。目录里查不到的 alias 由 `core/model_catalog.py` 兜底
+- **只有一张模型名表 —— 模型目录本身**(DynamoDB,Admin「模型」页可改)。早期还有一张硬编码的 `_MODEL_FRIENDLY_NAMES` / `_friendly_model_name()` / `_model_footer()`,2026-08 已删:它没有调用方了,而且子串匹配不严谨(needle `claude-sonnet-5` 也会命中未来的 `claude-sonnet-5x`)。目录里查不到的 alias 由 `core/model_catalog.py` 兜底
 - 署名跟随本群 / 本 DM 当前选的模型(默认 Claude Sonnet 5),不是写死某一个模型
 - 纯文本格式(不用 markdown italic),原因:飞书 `reply_text` 路径不渲染 markdown,`_..._` 字面会显示出来
 
@@ -808,6 +825,18 @@ Lambda report-handler 在 EventBridge 事件回来后,调 `aidevops:ListJournalR
 ---
 
 ### 4.4 实时进度卡 `progress_poller` + `progress_card`
+
+> ⚠️ **2026-09-03(M2)起,整节描述的是回滚路径,不是现网。** `core/progress_poller.py`
+> (ECS 常驻 daemon,扫 `progress#` 行)、`core/progress_card.py`(journal 抽取 + Bedrock 叙事)
+> 和 `platforms/*/app/progress_sender.py` 三者只由 `platforms/*/app/main.py` 装配,
+> 已随 `BotStack` 一起退役 —— 4.4.2 那批环境变量因此在现网**不生效**。
+>
+> 现网走 `notiops-im-progress` Lambda
+> ([`platforms/common/lambda_progress.py`](../platforms/common/lambda_progress.py)):
+> EventBridge 每 1 分钟触发,扫 `imtask#` 行,对每行调
+> `core.devops_agent.poll_investigation()`(无状态增量,游标 `seen_ids`),
+> 卡片刷新节奏由 `platforms/common/live_card.py` 的退避决定(见 §10.3)。
+> 本节保留是因为它记录了长连接时代的完整设计,回滚时要按它走。
 
 #### 4.4.1 为什么要有这一层
 
@@ -1087,7 +1116,9 @@ core.webhook_dispatch.dispatch(query=investigate_query, ...)
 | `incident#<incident_id>` | 跨链路路由(IM ↔ DevOps Agent ↔ Lambda)。incident_id 格式:`<platform>-<event_id>` | 7 天 |
 | `task#<task_id>` | DevOps Agent task fallback 路由(当 incident_id 抽取失败) | 7 天 |
 | `support#<incident_id>` | case 创建上下文(把 case_display_id 与 incident_id 关联) | 7 天 |
-| `progress#<incident_id>` | 进度卡轮询状态(tick_count / last_polled_at / last_summary_md) | 报告完成后自动删 |
+| `imtask#<incident_id>` | **现网(M2 起)**:一次已派发深度调查的全部上下文 + 进度游标(`message_id` / `execution_id` / `task_id` / `seen_ids` / `console_url`),`notiops-im-progress` 每分钟扫它 | 30 分钟(终态立刻删行) |
+| `imchat#<platform>:<chat_id>` | 一个会话的 DevOps Agent `execution_id`(IM 多轮上下文靠它,不靠模型记忆) | 12 小时 |
+| `progress#<incident_id>` | ⚠️ **已退役(M2)**:ECS daemon 的进度卡轮询状态(tick_count / last_polled_at / last_summary_md) | 报告完成后自动删 |
 | `push_dedup#<resource>:<event_type>` | push 事件 5 分钟去重 | 5 分钟 |
 | `locale#user#<user_id>` | 用户显式语言偏好(由 §4.9 `set_user_pref` 写入) | 90 天 |
 | `locale#dm#<platform>:<user_id>` | DM 自动锁定(首条消息 auto-detect 后写入,后续 follow-up 沿用) | 30 天 |
@@ -1236,13 +1267,22 @@ Body 文本 + 📚 来源块(列出每个引用的 URL)
 | `core/aws_docs_mcp.py` | 把 AWS Knowledge MCP 暴露给 Bedrock 的 `tool_use` 协议:`get_tool_definitions()` / `dispatch_tool_call(name, args)` |
 | `core/mcp_http_client.py` | 通用 streamable-HTTP MCP client(JSON-RPC 2.0 over POST + SSE),给 `aws_docs_mcp` / 三个 sidecar wrapper 共用 |
 | `core/aws_pricing_mcp.py` | (可选)Pricing 相关 tool 定义,通过 sidecar 接到客户账号本地的 `awslabs/aws-pricing-mcp-server` |
-| `sidecars/aws-pricing-mcp/` | 把 awslabs 的官方 MCP server 封装成 streamable-http,跑在 ECS task 里作为 sidecar(127.0.0.1:8001) |
+| `sidecars/aws-pricing-mcp/` | ⚠️ **已退役**(随 `BotStack` / M2,2026-09-03):把 awslabs 的官方 MCP server 封装成 streamable-http,跑在 ECS task 里作为 sidecar(127.0.0.1:8001) |
 
-> **关于 cost / pricing / WA MCP 现状**(2026-06-10):
+> **关于 cost / pricing / WA MCP 现状**:
 >
-> - **Pricing MCP**(`sidecars/aws-pricing-mcp/`):**默认随 BotStack 部署**,bot 用真实 AWS Pricing API 数据回答价格问题。
-> - **Cost MCP**(`sidecars/aws-cost-mcp/`):2026-05-30 短暂撤销过(因 cost preview snapshots + service alias 不稳定),2026-06-10 **重新默认启用**,bot 用 Cost Explorer 真实数据回答费用 / 用量 / 预算 / 优化建议类问题。
-> - **WA MCP**(`sidecars/aws-wa-mcp/`):仍**默认禁用**,代码保留供后续启用。
+> ⚠️ **2026-09-03(M2)起,三个 sidecar 在 IM 侧全部不可用** —— 它们只以 Fargate sidecar
+> 容器的形式存在于 `BotStack` 里,而 `BotStack` 已退役。IM Lambda 侧显式钉死
+> `AWS_MCP_PRICING_ENABLED=false` / `AWS_MCP_COST_ENABLED=false`
+> (`infra/lib/constructs/im-core.ts`),因为**没有 sidecar 可连**。
+> `core/bedrock_chat._sidecar_enabled()` 里那两个"默认开"因此在现网永远不生效 ——
+> 保留它们是为了长连接回滚路径和本地手动起 sidecar 的场景。
+>
+> 历史(2026-06-10 的口径):Pricing MCP 默认随 `BotStack` 部署;Cost MCP 2026-05-30 短暂
+> 撤销过、06-10 重新默认启用;WA MCP(`sidecars/aws-wa-mcp/`)一直默认禁用。
+>
+> Web Chat 侧的价格 / 成本能力**不受影响** —— 它走的是进程内 stdio 的官方 awslabs
+> cost+pricing MCP,与 sidecar 无关(见 §2.4)。
 >
 > 详见 §4.10 + `core/aws_pricing_mcp.py` / `core/aws_cost_mcp.py` / `core/bedrock_chat._sidecar_enabled()`。
 
@@ -1281,7 +1321,7 @@ CFN parameter,通过 task definition env 透传:
 
 ### 5.1 IAM 最小权限
 
-**bot ECS task role** 只能调:
+**IM worker Lambda 执行角色**(M2 之前是 bot ECS task role,权限集相同)只能调:
 
 ```
 ✅ bedrock-runtime:InvokeModel              (Haiku 调用)
@@ -1305,9 +1345,33 @@ CFN parameter,通过 task definition env 透传:
 - Headers:`x-amzn-event-timestamp` + `x-amzn-event-signature`(AWS standard)
 - DevOps Agent 端验签拒绝伪造
 
-### 5.3 三层零变更防御(详见 §4.2)
+### 5.3 零变更防御:硬边界 + 按入口的纵深防御
 
-L1 入站正则 + L2 system prompt + L3 出站审计,即使 prompt 注入也不破防。**38 个综合 case 单测全过**。
+硬边界是 **只读 IAM 角色**(§5.1):无论哪条入口,访问客户账号用的都是只读角色,写操作
+拿不到权限。这一层之上是纵深防御,而**两条入口的纵深层不一样** —— 别当同一套看:
+
+| 层 | 网页控制台 | IM(M2 之后 = Webhook + Lambda) |
+|---|---|---|
+| 工具 / 模型层只读 | `READ_OPERATIONS_ONLY=true`(官方 aws-api-mcp)+ 精选只读 MCP 允许清单(FinOps / Investigation / RDS·CloudWatch 巡检 / Cases) | 直连 DevOps Agent 的**只读 agent**,NotiOps 自己不过模型(0 token) |
+| 命令级 denylist | ✅ `is_denied_command()` —— 拦 `secretsmanager get-secret-value` / `ssm get-parameter --with-decryption` / `kms decrypt` 这类「本身只读、但不该读」的动作 | — |
+| system prompt 只读约束 | ✅ | 由 DevOps Agent 侧负责 |
+| 入站正则 | — | ✅ `platforms/common/router.py::_STRONG_CHANGE_RE`,只认强变更措辞(绝不扩到「改一下 / 调整」) |
+| 出站审计 | — | — |
+| 写类动作 | 工单的建 / 回 / 关只产出**预览**,用户确认后才执行 | 同左(走 `case_flow` 卡片确认) |
+
+⚠️ **§4.2 的「三层防御」(L1 入站正则 → L2 system prompt → L3 出站审计)不是现网口径。**
+它是 `core/bedrock_chat.py` 的实现,`bedrock_chat.respond()` 的唯一调用方是已随 `BotStack`
+退役的 ECS 长连接 app,M2 之后只在回滚路径上跑。历史上「38 个综合 case 单测全过」说的
+就是那三层,单测仍在,覆盖的是回滚路径。
+
+⚠️ **已知缺口(未做):** `core/case_analyze.py` 是 IM Webhook 路径上**唯一还调 LLM** 的
+能力(`platforms/feishu/caps.py` → `case_flow.start_analyze` → `case_analyze.analyze`)。
+它走 `core/bot_llm.py`,而 `bot_llm` 里**没有**出站审计 —— `case_analyze.py` 自己的
+docstring 曾声称「L3 outbound audit still runs (see `_audit_response`)」,那是陈旧说法
+(全仓库没有 `_audit_response`;唯一的审计函数 `bedrock_chat._audit_response_for_change`
+只在 `bedrock_chat.respond()` 里调用),该 docstring 已于 2026-09-03 就地更正。
+要补这条审计,得把它接到 `bot_llm` 上。风险有限:这条路径的输出是案例摘要,不含可执行
+命令,且硬边界(只读角色)照旧;但「文档说有、代码里没有」本身必须消掉,故在此记明。
 
 ### 5.4 数据保留与隐私
 
@@ -1332,7 +1396,7 @@ DDB 行带 `platform` 字段,所有查询必须按 `platform` 过滤(防止飞�
 简要要点:
 
 - **唯一部署入口**:`./setup.sh`(交互式 CDK 部署)。原 `deploy.sh` / SAM 流程已下线
-- **三个 CDK 栈**:`WebChatStack`(主入口:AgentCore Runtime agent + BFF Lambda + Function URL SSE + `notiops-web-chat` 表 + notif handler + Cognito Identity Pool,详见 §6.1)+ `NotiOpsBackendStack`(共享后端 Lambda + DDB + S3 + EventBridge)+ `BotStack`(IM bot 平台栈,VPC + ECS + ECR)
+- **两个 CDK 栈 + 选了 IM 再多一个**:`WebChatStack`(主入口:AgentCore Runtime agent + BFF Lambda + Function URL SSE + `notiops-web-chat` 表 + notif handler + Cognito Identity Pool,详见 §6.1)+ `NotiOpsBackendStack`(共享后端 Lambda + DDB + S3 + EventBridge)+ `ImStack`(选了 IM 平台才建:每平台一个 API Gateway HTTP API + ingress/worker Lambda)。~~`BotStack`~~(VPC + ECS + ECR)**2026-09-03 / M2 已退役,不再部署**
 - **凭据流**:`setup.sh` 直接调 `secretsmanager:CreateSecret`,IM 凭据写到 Secrets Manager,本地不落盘;CDK 栈通过 ARN 引用
 - **多平台**:Feishu / Slack / DingTalk 在 setup.sh 交互式选择,可多选
 
@@ -1370,9 +1434,13 @@ Web Chat 有自己的部署链路(见 §2.4):
 
 | 组件 | CloudWatch Log Group(命名规则) | 备注 |
 |---|---|---|
-| Feishu bot | `/ecs/<bot-stack>-feishu-bot-*` | 长连接 + 卡片回调 |
-| Slack bot | `/ecs/<bot-stack>-slack-bot-*` | Socket Mode |
-| DingTalk bot | `/ecs/<bot-stack>-dingtalk-bot-*` | Stream Mode + 自定义机器人回写 |
+| Feishu ingress | `/aws/lambda/notiops-im-ingress-feishu` | 验签 + 幂等去重 + 异步投递(**收不到消息先看这里**) |
+| Feishu worker | `/aws/lambda/notiops-im-worker-feishu` | 真正处理消息 / 卡片回调 |
+| Slack ingress | `/aws/lambda/notiops-im-ingress-slack` | 同上(Events / Interactivity / Slash 三类都走这里) |
+| Slack worker | `/aws/lambda/notiops-im-worker-slack` | 真正处理消息 / 交互 |
+| IM 进度轮询 | `/aws/lambda/notiops-im-progress` | 调查进度卡刷新 |
+| Feishu / Slack bot(回滚路径)| `/ecs/<bot-stack>-{feishu,slack}-bot-*` | 长连接 / Socket Mode 容器,只在回滚时有流量 |
+| DingTalk bot | `/ecs/<bot-stack>-dingtalk-bot-*` | Stream Mode + 自定义机器人回写(⏳ Phase 2) |
 | DevOps Callback | `/aws/lambda/notiops-devops-callback` | 调查结果回调 |
 | Lambda4 Notifier | `/aws/lambda/notiops-notifier` | 定时推送(含 6 事件源) |
 | Health Checker | `/aws/lambda/notiops-health-checker` | AWS Health 巡检 |
@@ -1430,7 +1498,7 @@ push_handler: dispatched feishu-push-<dedupe_key>
 
 新增 IM 平台(钉钉 / Teams / 微信企业号 / 任何支持 bot 的平台)只需做三件事,**`core/` 完全不动**。
 
-> **本节只讲如何新增 IM 补充平台;主入口 Web Chat 是另一条独立的接入面**(见 §2.4):它不是 IM 平台适配层,而是浏览器端的 agentic 助手,自带 AgentCore Runtime + BFF Function URL SSE + React 前端 + Cognito/SigV4 鉴权。它与 IM 侧共享部分后端约束与存储(如 Skills 的 S3 `skills/` 前缀、只读防线理念),但不复用本节的 `core/` + ECS bot 适配层与 sender 契约。
+> **本节只讲如何新增 IM 补充平台;主入口 Web Chat 是另一条独立的接入面**(见 §2.4):它不是 IM 平台适配层,而是浏览器端的 agentic 助手,自带 AgentCore Runtime + BFF Function URL SSE + React 前端 + Cognito/SigV4 鉴权。它与 IM 侧共享部分后端约束与存储(如 Skills 的 S3 `skills/` 前缀、只读防线理念),但不复用本节的 `core/` + IM 适配层(ingress/worker Lambda)与 sender 契约。
 
 ### 8.1 三步指南
 
@@ -1456,7 +1524,7 @@ def is_configured() -> bool: ...                         # 检查 env 是否配�
 def send_live_console_link(chat_id, root_message_id,
                             agent_space_id, execution_id,
                             incident_id, task_id, intent_summary) -> dict: ...
-def update_live_card(message_ref: dict, ir) -> None: ... # 用于 progress_poller
+def update_live_card(message_ref: dict, ir) -> None: ... # ⚠️ 仅回滚路径(progress_poller)
 def send_report(chat_id, root_message_id, status, priority,
                 detail_type, task_id, report_url, trace_url,
                 summary_md, incident_id, linked_case_display_id, next_steps) -> None: ...
@@ -1467,18 +1535,27 @@ def send_push_headsup(chat_id: str, event: dict) -> None: ...
 
 #### Step 3: 添加 CDK Service 定义
 
-不再有 CFN 模板,所有平台栈统一在 CDK 里。在 [`infra/lib/bot-stack.ts`](../infra/lib/bot-stack.ts) 里仿照 Feishu / Slack / DingTalk 的模式加一个 ECS Fargate service:
+不再有 CFN 模板,所有平台栈统一在 CDK 里。⚠️ **2026-09-03(M2)之后新平台走 webhook + Lambda,不要再照 Fargate 那套写**。在 [`infra/lib/constructs/im-core.ts`](../infra/lib/constructs/im-core.ts) 里仿照 Feishu / Slack 的模式加一套:
 
-- `new ecs.FargateTaskDefinition`(Fargate, 512 CPU / 1024 MB, X86_64)
-- `taskDef.addContainer(...)` 配置 `image: ecs.ContainerImage.fromAsset("../", { file: "platforms/<name>/Dockerfile" })`
-- CloudWatch Logs driver,`streamPrefix: "<name>-bot"`
-- `taskDef.taskRole.addToPrincipalPolicy(...)` 加 DDB / Bedrock / sts:AssumeRole / aidevops 权限(参考已有 feishu/slack 的声明)
-- `new ecs.FargateService(...)` 跑在 stack 已 provisioned 的 public-subnet VPC,`desiredCount: enabledPlatforms.includes("<name>") ? 1 : 0`
-- 新增一个 `notiops/im-bot-<name>` Secret(`setup.sh` 写入,CDK 通过 ARN 注入到 env var)
+- 一个 `createIngressHttpApi(...)`(`$default` catch-all,未鉴权 —— 鉴权靠平台签名)
+- `ingress` Lambda(128MB / 短超时,`reservedConcurrentExecutions=10`):验签 + 幂等 + `InvocationType='Event'` 投 worker + 表情 ack
+- `worker` Lambda(900s):规范化成 `ImMessage` → `platforms.common.router.dispatch` → 新平台的 `Caps` 实现
+- 两个函数共用 `scripts/build_im_layer.sh` 产出的依赖 Layer(**不需要容器构建**)
+- 执行角色加 DDB / Bedrock / sts:AssumeRole / aidevops 权限(参考已有 feishu/slack 的声明)
+- 新增一个 `notiops/im-bot-<name>` Secret(由 `NotiOpsBackendStack` 建空壳,部署后再填)
+- ⚠️ 别给 Lambda 设 `AWS_REGION` 环境变量(保留名,CFN 直接拒;Fargate 时代没这个限制)
 
 CDK 自动 synth 出 CloudFormation,你不需要写任何 template.yaml。
 
+历史写法(长连接 / 回滚路径)在 [`infra/lib/bot-stack.ts`](../infra/lib/bot-stack.ts) 里仍然可读:`new ecs.FargateTaskDefinition`(512 CPU / 1024 MB)+ `ContainerImage.fromAsset("../", { file: "platforms/<name>/Dockerfile" })`+ `new ecs.FargateService(...)`,`desiredCount: enabledPlatforms.includes("<name>") ? 1 : 0`。
+
 ### 8.2 接口契约
+
+> ⚠️ **`ProgressCardIR` 只在回滚路径上活着。** 现网(M2 之后)的进度卡由
+> [`platforms/common/lambda_progress.py`](../platforms/common/lambda_progress.py) 直接渲染 ——
+> 它自带 `_RENDERERS` / `_UPDATERS` 两张平台分发表,不经过 `ProgressCardIR`。
+> 新平台**必须**在这两张表里各加一行(漏了会被日志显式记为 `unknown platform` 并丢行,不静默跳过);
+> `update_live_card` + `ProgressCardIR` 只在你要走 Fargate 回滚路径时才需要实现。
 
 `core/` 暴露给 sender 的契约(在 [core/progress_card.py](../core/progress_card.py) `ProgressCardIR`):
 
@@ -1519,10 +1596,10 @@ class ProgressCardIR:
 | 5 | 定时巡检 cron | ⏳ 未开始 | 每天扫 IAM / SG / 费用异常 |
 | 6 | 多 LLM 切换(Claude / Nova / GPT)| ✅ 已实现 (2026-06-05) | `core/model_catalog.py` 别名表 + `core/llm_pref_resolver.py` per-chat 偏好 + per-model `max_output_tokens`;`@bot model nova` 任意切换 |
 | 7 | 跨调查记忆 / FAQ 库 | ⏳ 长期 | OpenSearch / S3 Vectors |
-| 8 | 通用对话能力 | ✅ 已实现 (2026-05-27) | 三层防御 + 三档开关 + 17 / 23 / 38 case 单测 |
+| 8 | 通用对话能力 | ✅ 已实现 (2026-05-27) | 三层防御(⚠️ 仅回滚路径,见 §5.3)+ 三档开关 + 17 / 23 / 38 case 单测 |
 | 9 | Skill 编排 | ✅ 飞书 / Slack 已实现 / ⏳ 钉钉 Phase 2c | DevOps Agent skill 选择 + 自助上传(authoring) |
 | 10 | 双语支持 (zh / en) | ✅ 已实现 (2026-05-31) | 自动检测 + 4 层锁定 + `language` 命令 + 自然语切换;详见 §4.9 |
-| 11 | AWS MCP(docs / pricing / cost) | ✅ 全部默认启用 (2026-06-10) | Tier-1 hosted Knowledge MCP + Pricing/Cost sidecar(BotStack 默认部署);WA sidecar 保留代码但默认禁用 |
+| 11 | AWS MCP(docs / pricing / cost) | ⚠️ IM 侧只剩 docs (2026-09-03 / M2) | Tier-1 hosted Knowledge MCP 仍在;Pricing/Cost/WA **sidecar 随 `BotStack` 退役**,IM Lambda 显式关掉(Web Chat 侧走进程内 stdio MCP,不受影响) |
 | 12 | 钉钉(DingTalk)平台支持 | ⚠️ Phase 1/1.5/1.6/2a/2b 已实现 (2026-06-05) | 对话 / 调查 / case CRUD(对话式)/ push 投递 / 报告 markdown 回贴。Phase 2c(实时进度卡 / Skill / Next-step 按钮)阻塞于客户在 DingTalk Open Platform 注册 cardTemplateId |
 
 ### 9.1 短期(本季度)
@@ -1554,10 +1631,12 @@ class ProgressCardIR:
 ```
 notiops/
 ├── core/                              # 平台无关共享代码
+│   ├── nl_router.py                   # ★ 双语正则意图路由(六条路,0 token)
+│   ├── devops_agent.py                # ★ 调查派发(CreateBacklogTask)+ 无状态进度轮询
 │   ├── bedrock_intent.py              # 意图分类(8 类 command + 模式开关)
-│   ├── bedrock_chat.py                # 通用对话 + 三层防御 + 模型 footer
-│   ├── progress_card.py               # 进度卡 IR + Bedrock 摘要 + 翻译
-│   ├── progress_poller.py             # daemon 轮询调度
+│   ├── bedrock_chat.py                # 通用对话 + 三层防御 + 模型 footer(仅回滚路径)
+│   ├── progress_card.py               # ⚠️ 已退役(M2):进度卡 IR + Bedrock 摘要 + 翻译
+│   ├── progress_poller.py             # ⚠️ 已退役(M2):ECS daemon 轮询调度
 │   ├── next_steps.py                  # 报告后建议生成(URL 白名单)
 │   ├── case_management.py             # AWS Support case 增删改查
 │   ├── case_classifier.py             # 服务 code 分类(~324 候选)
@@ -1567,7 +1646,7 @@ notiops/
 │   ├── i18n.py                        # 中央翻译表 + locale 检测 + NL 切换正则
 │   ├── locale_resolver.py             # 7 层优先级解析 + 4 类锁定 row
 │   ├── aws_docs_mcp.py                # AWS Knowledge MCP tool 定义(Bedrock tool_use)
-│   ├── aws_pricing_mcp.py             # 可选:Pricing MCP wrapper(经 sidecar)
+│   ├── aws_pricing_mcp.py             # 可选:Pricing MCP wrapper(经 sidecar,IM 侧已随 M2 关闭)
 │   ├── mcp_http_client.py             # 通用 streamable-HTTP MCP client
 │   ├── dispatch_compose.py            # 编辑模式拼装 user_text(details + 起点 + 日志)
 │   ├── chat_history.py                # (保留向后兼容,功能已撤销)
@@ -1596,18 +1675,30 @@ notiops/
 ├── api/                               # API Lambda(路由分发)
 ├── mcp_server/                        # MCP Server(21 个工具)
 ├── platforms/
+│   ├── common/                        # 三平台共用的适配层
+│   │   ├── router.py                  # 确定性分发(0 token)+ prompt-injection 二道门
+│   │   ├── quick_ack.py               # 提问后的 👀 表情(永不抛)
+│   │   ├── live_card.py               # 自刷新进度卡抽象
+│   │   ├── lambda_progress.py         # ★ notiops-im-progress 入口(扫 imtask# 行)
+│   │   └── long_answer.py             # 超长答案落 HTML 报告(不截断)
 │   ├── feishu/
-│   │   ├── app/                       # bot 进程(运行在 ECS Fargate)
+│   │   ├── lambda_ingress.py          # ★ webhook 入口:验签 + 去重 + 异步投递
+│   │   ├── lambda_worker.py           # ★ 真正处理消息 / 卡片回调
+│   │   ├── webhook_adapter.py         # 事件体 → 平台无关的处理入参
+│   │   ├── im_cards.py                # 卡片构造
+│   │   ├── app/                       # ⚠️ 已退役(M2):长连接 bot 进程,留作源码回滚
 │   │   │   ├── main.py                # lark-oapi 长连接 + 卡片路由
 │   │   │   ├── feishu_utils.py        # tenant_access_token 缓存
 │   │   │   ├── progress_sender.py     # progress IR → 飞书 v2 卡
 │   │   │   ├── case_flow.py           # case 飞书 UI 层
 │   │   │   └── support_flow.py        # 升级 Support 表单卡
 │   │   ├── Dockerfile
-│   ├── Dockerfile
-│   └── requirements.txt
+│   │   └── requirements.txt
 │   └── slack/                         # 对称结构
-│       ├── app/
+│       ├── lambda_ingress.py          # ★ Events / Interactivity / Slash 同一入口
+│       ├── lambda_worker.py           # ★
+│       ├── im_blocks.py
+│       ├── app/                       # 回滚路径:Socket Mode bot 进程
 │       │   ├── main.py                # slack_bolt Socket Mode + 路由
 │       │   ├── blocks.py              # Block Kit 工厂方法
 │       │   ├── progress_sender.py
@@ -1615,7 +1706,7 @@ notiops/
 │       │   └── support_flow.py
 │       ├── Dockerfile
 │       └── requirements.txt
-├── sidecars/                          # ECS sidecar 镜像(MCP server 包装)
+├── sidecars/                          # ⚠️ 已退役(M2):ECS sidecar 镜像(MCP server 包装)
 │   ├── aws-pricing-mcp/               # awslabs/aws-pricing-mcp-server (生产启用)
 │   ├── aws-cost-mcp/                  # 默认启用 (2026-06-10 重新启用)
 │   └── aws-wa-mcp/                    # 默认禁用,代码保留
@@ -1667,9 +1758,11 @@ notiops/
 
 ### 10.3 配置参数全集
 
-CDK context 完整列表(BotStack + NotiOpsBackendStack)请见 [DEPLOYMENT.md §11](DEPLOYMENT.md#11-完整-cdk-context-参考)。本文不重复。
+CDK context 完整列表(`ImStack` + `NotiOpsBackendStack`)请见 [DEPLOYMENT.md §11](DEPLOYMENT.md#11-完整-cdk-context-参考)。本文不重复。
 
-ECS Task 进度轮询调优环境变量(在 `bot-stack.ts` 里以 `environment:` 注入,改了之后跑 `cdk deploy BotStack`):
+⚠️ 进度轮询在 M2(2026-09-03)之后是 `notiops-im-progress` **Lambda**(EventBridge 1 分钟一跳,扫 `imtask#` 行),**没有**可调环境变量 —— 节奏由 `im-core.ts` 里的 rule + 函数内常量决定。
+
+下面这三个是**已退役**的 ECS 常驻 daemon(`core/progress_poller.py`,扫 `progress#` 行)的调优变量,只在长连接回滚路径上有意义(在 `bot-stack.ts` 里以 `environment:` 注入):
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
@@ -1691,26 +1784,31 @@ ECS Task 进度轮询调优环境变量(在 `bot-stack.ts` 里以 `environment:`
 
 ### 10.5 常用运维命令
 
-> 占位符 `<bot-log>` / `<lambda-log>` / `<cluster>` / `<service>` / `<conv-table>` 替换成 `cdk-outputs.json` / `aws ecs list-clusters` 查到的真名(见 [DEPLOYMENT.md §6](DEPLOYMENT.md#6-冒烟测试))。
+> 占位符 `<platform>`(`feishu` / `slack`)/ `<conv-table>` 替换成真名(见
+> [DEPLOYMENT.md §6](DEPLOYMENT.md#6-冒烟测试))。M2(2026-09-03)之后**没有 ECS 集群 /
+> service 了**,IM 侧全是 Lambda,日志组名字是固定的 `/aws/lambda/notiops-im-*`。
 
 ```bash
 # === 实时观察 ===
-aws logs tail <bot-log> --since 5m --follow                       # bot ECS task
+aws logs tail /aws/lambda/notiops-im-ingress-<platform> --since 5m --follow  # 收不到 / 验签失败先看这个
+aws logs tail /aws/lambda/notiops-im-worker-<platform> --since 5m --follow   # 收到了但答得不对
+aws logs tail /aws/lambda/notiops-im-progress --since 5m --follow            # 卡片停在「正在思考」
 aws logs tail /aws/lambda/notiops-devops-callback --since 5m --follow
 aws logs tail /aws/lambda/notiops-notifier --since 5m --follow
 
 # === 定向查询(关键日志关键字)===
-aws logs tail <bot-log> --since 1h --filter-pattern "intent_classify"   # 意图分类
-aws logs tail <bot-log> --since 1h --filter-pattern "change-request"    # 变更拦截
-aws logs tail <bot-log> --since 1h --filter-pattern "progress tick"     # 进度轮询
+aws logs tail /aws/lambda/notiops-im-worker-<platform> --since 1h --filter-pattern "nl_router"       # 确定性路由结果
+aws logs tail /aws/lambda/notiops-im-worker-<platform> --since 1h --filter-pattern "change-request"  # 变更拦截
+aws logs tail /aws/lambda/notiops-im-progress --since 1h --filter-pattern "progress"                 # 进度轮询
 
 # === 配置变更(改 infra/cdk.json 后)===
-cd infra && npx cdk deploy BotStack       # bot 配置项(agenticChatMode / locale / llmProvider 等)
+cd infra && npx cdk deploy ImStack               # IM 配置项(ImStack 只读 3 个 context key,见 DEPLOYMENT.md §11.1)
 cd infra && npx cdk deploy NotiOpsBackendStack   # push / 后端配置项
 
-# === 强制重启 ECS task(不改任何配置)===
-aws ecs update-service --cluster <cluster> --service <service> \
-  --force-new-deployment
+# === 让 IM Lambda 换一批执行环境(重读 Secret)===
+# Lambda 冷启动时才读 Secret;改任意一个环境变量即可强制换环境。
+# ⚠️ update-function-configuration --environment 会**整体替换** env map,
+#    先 get-function-configuration 拿全量再改,别只传一个键。做法见 DEPLOYMENT.md §8.2
 
 # === 部署整个项目 ===
 ./setup.sh                  # 全量(bootstrap → build → CDK deploy --all)
@@ -1721,7 +1819,7 @@ aws dynamodb get-item --table-name <conv-table> \
   --key '{"lookup_key":{"S":"event#<event_id>"}}'
 aws dynamodb scan --table-name <conv-table> \
   --filter-expression "begins_with(lookup_key, :p)" \
-  --expression-attribute-values '{":p":{"S":"progress#"}}'
+  --expression-attribute-values '{":p":{"S":"imtask#"}}'   # M2 之后的在跑调查(旧的是 progress#)
 ```
 
 ---

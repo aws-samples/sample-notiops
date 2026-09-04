@@ -630,7 +630,7 @@ function titleFromSummary(md) {
  *
  * ⚠️ 为什么必须在**服务端**识别：followup 是 prompt 型，点击 = 在同一会话里再发一轮，
  * 而会话的「直连」开关仍然开着 → 请求又落回 `runDirectInvestigation`；更糟的是该 prompt 里带
- * `execution_id=`，会被 `extractExecutionId()` 判成"续查"，于是把同一份报告再贴一遍就结束了
+ * `execution_id=`，会被 `extractInvestigationRef()` 判成"续查"，于是把同一份报告再贴一遍就结束了
  * （用户看到的现象：闪一下文字、然后没反应）。所以由 `index.mjs` 在分流前拦下来改走老路径。
  *
  * 判据取工具名 `escalate_to_support` —— 它只出现在我们自己生成的这个 prompt 里（与
@@ -640,14 +640,59 @@ export function isEscalateRequest(text) {
   return /escalate_to_support/i.test(String(text || ""));
 }
 
-/** 续查识别：消息里带 execution_id → 不发起新调查，直接续拉已有调查的结果（同样 0 token）。
- * 支持两种写法：`execution_id=xxx`（我们自己的 followup 按钮生成的）和裸 `exe-...` id。 */
-export function extractExecutionId(text) {
+/** 调查编号**给人看的唯一形式**：`[[investigation:<taskId>]]`。
+ *
+ * 为什么不再显示 `execution_id`（2026-09-03，客户实测）：拿着我们打出来的 `exe-ops1-…`
+ * 去问 DevOps Agent，**查不到** —— 那串是执行编号；DevOps Agent 侧能被引用/检索的是
+ * backlog task 的 uuid（后台深链 `investigation/<taskId>` 用的也是它），而且它认
+ * `[[investigation:<uuid>]]` 这种引用写法。显示一个"看着像编号、拿去问却查不到"的串，
+ * 是最难自救的一类坑，所以可见文案一律换成 taskId 的引用形式。
+ *
+ * executionId 仍是我们内部所有只读接口（ListJournalRecords）的 key，只是不再当"给人看的编号"；
+ * 报告 meta 里两个都留（排查用）。拿不到 taskId（极少见：续查时 journal 里没带）就退回旧写法，
+ * 保证「查看调查结果」按钮和用户复制回来的串仍然认得出。 */
+export function investigationRef(taskId, executionId) {
+  const tid = String(taskId || "").trim();
+  if (tid) return `[[investigation:${tid}]]`;
+  const eid = String(executionId || "").trim();
+  return eid ? `execution_id=${eid}` : "";
+}
+
+/** 续查识别：消息里带调查引用 → 不发起新调查，直接续拉已有调查的结果（同样 0 token）。
+ *
+ * 认四种写法，返回 `{ id, explicit }`（都不中 → null）：
+ *   · `[[investigation:<uuid>]]` —— 现在的可见形式（按钮 prompt、以及用户复制回来的）
+ *   · `execution_id=<id>`        —— 历史形式。**必须继续认**：老会话的气泡里还贴着它
+ *   · 裸 `exe-…`
+ *   · 裸 uuid                    —— `explicit:false`
+ *
+ * `explicit:false` 的那种**必须先解析成功才算续查**：uuid 也可能只是用户问题里的某个资源 id，
+ * 解析不出对应任务就当普通新调查处理（见 runDirectInvestigation 的续查分支）。 */
+export function extractInvestigationRef(text) {
   const s = String(text || "");
-  let m = /execution[_\s-]?id\s*[=:：]\s*`?([A-Za-z0-9][A-Za-z0-9._-]{7,})`?/i.exec(s);
-  if (m) return m[1];
+  let m = /\[\[\s*investigation\s*:\s*([A-Za-z0-9][A-Za-z0-9._-]{7,})\s*\]\]/i.exec(s);
+  if (m) return { id: m[1], explicit: true };
+  m = /execution[_\s-]?id\s*[=:：]\s*`?([A-Za-z0-9][A-Za-z0-9._-]{7,})`?/i.exec(s);
+  if (m) return { id: m[1], explicit: true };
   m = /\b(exe-[A-Za-z0-9-]{8,})\b/.exec(s);
-  return m ? m[1] : "";
+  if (m) return { id: m[1], explicit: true };
+  m = /\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i.exec(s);
+  return m ? { id: m[1], explicit: false } : null;
+}
+
+/** 把引用解析成 `{ executionId, taskId }`（解析不出 → null）。
+ *
+ * `exe-…` 本身就是 executionId，直接用（老形式，不多花一次 API 调用）。uuid 形状的是
+ * **taskId**，必须 GetBacklogTask 换出 executionId —— journal 只能按 executionId 拉，
+ * 少了这一步，新的可见形式贴回来会被当成"不是引用"从而**发起一场新调查**。 */
+async function resolveInvestigationRef({ client, space, id }) {
+  const ref = String(id || "").trim();
+  if (!ref) return null;
+  if (/^exe-/i.test(ref)) return { executionId: ref, taskId: "" };
+  const { GetBacklogTaskCommand } = await import("@aws-sdk/client-devops-agent");
+  const t = await client.send(new GetBacklogTaskCommand({ agentSpaceId: space, taskId: ref }));
+  const executionId = t?.task?.executionId || "";
+  return executionId ? { executionId, taskId: ref } : null;
 }
 
 /* ───────────────────────── 能力探测（前端据此决定开关能不能点）─────────────────────────
@@ -727,19 +772,38 @@ export async function runDirectInvestigation({ text, locale, accountId, skillId,
   }
   const space = target.agentSpaceId;
 
-  // —— 续查分支：消息里带 execution_id → 接着上次那场调查拉结果，不新建任务 ——
+  // —— 续查分支：消息里带调查引用 → 接着上次那场调查拉结果，不新建任务 ——
   // 复用同一条 /stream + 同一个开关，因此**不需要**新增 BFF 路由（也就不用动 authz/capabilities
-  // 白名单）：只要开关还开着，「查看调查结果」按钮天然仍走直连 → 依旧 0 token。
-  const resumeId = extractExecutionId(text);
-  if (resumeId) {
-    // 这一轮只是去拉上一场调查的结果，没有新任务可以承载 skill —— 说一句，别让它静默消失。
-    if (skillId) {
-      say(dv(`_（本轮是查看上一场调查的结果，\`/${skillId}\` 未参与。）_\n`,
-             `_(This turn just fetches the previous investigation's result, so \`/${skillId}\` was not applied.)_\n`));
+  // 允许清单）：只要开关还开着，「查看调查结果」按钮天然仍走直连 → 依旧 0 token。
+  const ref = extractInvestigationRef(text);
+  if (ref) {
+    let resolved = null;
+    try {
+      resolved = await resolveInvestigationRef({ client, space, id: ref.id });
+    } catch (e) {
+      console.warn("[direct-investigate] resume_ref_unresolved", safeErr(e));
     }
-    await resumeInvestigation({ client, space, executionId: resumeId, locale, emit, say });
-    finishUsage();
-    return reply;
+    if (resolved) {
+      // 这一轮只是去拉上一场调查的结果，没有新任务可以承载 skill —— 说一句，别让它静默消失。
+      if (skillId) {
+        say(dv(`_（本轮是查看上一场调查的结果，\`/${skillId}\` 未参与。）_\n`,
+               `_(This turn just fetches the previous investigation's result, so \`/${skillId}\` was not applied.)_\n`));
+      }
+      await resumeInvestigation({ client, space, executionId: resolved.executionId,
+                                 taskId: resolved.taskId, locale, emit, say });
+      finishUsage();
+      return reply;
+    }
+    // 明确写了引用却解析不出来 → **说出来就停**。这里绝不能"顺手发起一场新调查"：
+    // 用户要的是那一场的结论，悄悄换成新调查等于既没回答、又在客户账号上真跑了一轮。
+    if (ref.explicit) {
+      say(dv(`\n⚠️ 读不到这个调查（\`${ref.id}\`）。它可能不在当前账号 / Agent Space 里，或者编号有误。\n`,
+             `\n⚠️ Could not read that investigation (\`${ref.id}\`). It may not belong to the current account / Agent Space, or the id is wrong.\n`));
+      finishUsage();
+      return reply;
+    }
+    // 裸 uuid 没解析出对应任务 → 它压根不是调查引用（多半是用户问题里的某个资源 id），
+    // 按普通新调查继续，什么也不用提示。
   }
 
   // —— 发起新调查 ——
@@ -787,7 +851,9 @@ export async function runDirectInvestigation({ text, locale, accountId, skillId,
   // 分析过程走 investigation_step → 右侧「调查过程」面板（与老路径一致）。
   let open = dv(`\n\n🚀 **深度调查已发起**（直连，0 token）\n\n**${title}**\n\n${userText}${skillLine}\n\n`,
                 `\n\n🚀 **Deep investigation started** (direct, 0 tokens)\n\n**${title}**\n\n${userText}${skillLine}\n\n`);
-  open += dv(`（execution_id: \`${executionId}\`）`, `(execution_id: \`${executionId}\`)`);
+  // 编号用 taskId 的引用形式：这串**复制去问 DevOps Agent 是查得到的**（execution_id 查不到）。
+  open += dv(`（调查编号：\`${investigationRef(taskId, executionId)}\`）`,
+             `(Investigation id: \`${investigationRef(taskId, executionId)}\`)`);
   if (consoleUrl) {
     open += dv(`\n\n🔗 可点开 DevOps Agent 后台实时查看进度：[${consoleUrl}](${consoleUrl})`,
                `\n\n🔗 Watch live progress in the DevOps Agent console: [${consoleUrl}](${consoleUrl})`);
@@ -839,13 +905,13 @@ export async function runDirectInvestigation({ text, locale, accountId, skillId,
     say(dv(
       `\n\n⏳ **调查仍在进行中**（已实时跟踪 ${mins} 分钟）。深度调查有时需要更长时间，为避免长时间占用会话，先在这里暂告一段落——\n\n` +
       `> **调查并没有停止，它仍在 AWS 侧继续运行。**\n` +
-      `> 调查编号（execution_id）：\`${executionId}\`\n\n` +
+      `> 调查编号：\`${investigationRef(taskId, executionId)}\`\n\n` +
       `过几分钟后点下方「查看调查结果」，我就会拉回完整结论并生成可下载的报告（同样 0 token）。\n`,
       `\n\n⏳ **Investigation still in progress** (tracked live for ${mins} min). Deep investigations sometimes take longer, so let's pause here to avoid holding the session open —\n\n` +
       `> **The investigation has NOT stopped; it keeps running on the AWS side.**\n` +
-      `> Investigation id (execution_id): \`${executionId}\`\n\n` +
+      `> Investigation id: \`${investigationRef(taskId, executionId)}\`\n\n` +
       `In a few minutes, click “Check investigation result” below and I'll pull back the full conclusion and generate a downloadable report (also 0 tokens).\n`));
-    emitFollowups({ emit, locale, consoleUrl, executionId, title, description, resumable: true });
+    emitFollowups({ emit, locale, consoleUrl, executionId, taskId, title, description, resumable: true });
     finishUsage();
     return reply;
   }
@@ -857,7 +923,7 @@ export async function runDirectInvestigation({ text, locale, accountId, skillId,
 }
 
 /** 续查：只读拉取已有调查的进度/结论（0 token），形状与首查完全一致。 */
-async function resumeInvestigation({ client, space, executionId, locale, emit, say }) {
+async function resumeInvestigation({ client, space, executionId, taskId: taskIdHint = "", locale, emit, say }) {
   const en = locale === "en";
   const dv = (zh, enStr) => (en ? enStr : zh);
 
@@ -869,7 +935,8 @@ async function resumeInvestigation({ client, space, executionId, locale, emit, s
     say(dv(`\n⚠️ 读取调查结果失败：${safeErr(e)}\n`, `\n⚠️ Failed to read the investigation result: ${safeErr(e)}\n`));
     return;
   }
-  const taskId = summary.taskId;
+  // taskId：journal 里反推出来的优先（最权威），否则用调用方解析引用时拿到的那个。
+  const taskId = summary.taskId || taskIdHint;
   const consoleUrl = operatorUrls(space, taskId).deepLink;
 
   // 判终态（拿不到 taskId 就只按有无摘要判断）。
@@ -886,9 +953,9 @@ async function resumeInvestigation({ client, space, executionId, locale, emit, s
 
   if (!TERMINAL.has(status) && !summary.markdown) {
     say(dv(
-      `\n\n⏳ 调查仍在进行中（execution_id: \`${executionId}\`），暂无摘要。请稍后再点一次「查看调查结果」。\n`,
-      `\n\n⏳ The investigation is still running (execution_id: \`${executionId}\`) and no summary is available yet. Please click “Check investigation result” again shortly.\n`));
-    emitFollowups({ emit, locale, consoleUrl, executionId, title: "", description: "", resumable: true });
+      `\n\n⏳ 调查仍在进行中（\`${investigationRef(taskId, executionId)}\`），暂无摘要。请稍后再点一次「查看调查结果」。\n`,
+      `\n\n⏳ The investigation is still running (\`${investigationRef(taskId, executionId)}\`) and no summary is available yet. Please click “Check investigation result” again shortly.\n`));
+    emitFollowups({ emit, locale, consoleUrl, executionId, taskId, title: "", description: "", resumable: true });
     return;
   }
 
@@ -932,7 +999,8 @@ async function finishAndReport({ client, space, executionId, taskId, status, tit
     say(dv("\n\n调查结束，但暂未取到摘要内容。可稍后再查。\n",
            "\n\nThe investigation finished, but no summary was available yet. You can check again shortly.\n"));
     // 摘要还没落地 → 续查按钮**有意义**（过一会儿再点能拉到内容）。
-    emitFollowups({ emit, locale, consoleUrl, executionId, title: escTitle, description, resumable: true });
+    emitFollowups({ emit, locale, consoleUrl, executionId, taskId: taskId || summary.taskId || "",
+                    title: escTitle, description, resumable: true });
     return;
   }
 
@@ -960,7 +1028,8 @@ async function finishAndReport({ client, space, executionId, taskId, status, tit
   }
   // 已出结论 → **不给**续查按钮（点了只是把同一份报告再刷一遍）；与老路径完成时一致：只有
   // ①去后台生成缓解方案 + ③转人工支持。
-  emitFollowups({ emit, locale, consoleUrl, executionId, title: escTitle, description,
+  emitFollowups({ emit, locale, consoleUrl, executionId, taskId: taskId || summary.taskId || "",
+                  title: escTitle, description,
                   hasMitigation: Boolean(summary.hasMitigation) });
 }
 
@@ -974,7 +1043,7 @@ const SHOW_ESCALATE_FOLLOWUP = false;
 
 /** 末尾快捷操作。
  * ① 生成缓解方案 → 跳 DevOps Agent 后台（url 型，新标签打开；与老路径一致）。
- * ② 查看调查结果 → prompt 带 execution_id，仍走**直连**路径的续查分支 → 0 token。
+ * ② 查看调查结果 → prompt 带调查引用（`[[investigation:…]]`），仍走**直连**路径的续查分支 → 0 token。
  *    ⚠️ **只在还查得到新东西时才给**（`resumable`）：调查已完成、摘要都贴出来了还挂这个按钮，
  *    点下去只是把同一份报告再瞬间刷一遍（表现为"闪一下、什么也没发生"），且老路径完成时
  *    也只有 ①③ 两个按钮——保持一致。
@@ -982,14 +1051,18 @@ const SHOW_ESCALATE_FOLLOWUP = false;
  *    直连路径没有模型，无法自己判断 service_code/severity_code；这是用户主动点击才发生的
  *    一次计费，且行为与今天完全一致（设计文档 §5 方案 a）。
  *    ⚠️ 回退是由 `index.mjs` 的 `isEscalateRequest()` 在**服务端**识别并分流的（见那里的注释）——
- *    prompt 里带 `execution_id=` 会被 `extractExecutionId()` 误判成"续查"，那样永远到不了模型。
+ *    prompt 里带 `execution_id=` 会被 `extractInvestigationRef()` 误判成"续查"，那样永远到不了模型。
+ *    ⚠️ 这个 prompt 里**保留** `execution_id=`（不换成 `[[investigation:…]]`）：它是给 agent 侧
+ *    `get_investigation_result` / `escalate_to_support` 用的，那两个工具的入参就是 execution_id。
  *
  * @param {boolean} p.resumable  本次调查还没出结论（超时/仍在跑/暂无摘要）→ 才给 ② 续查按钮
+ * @param {string}  p.taskId     backlog task uuid：② 的 prompt 用它拼 `[[investigation:…]]`
+ *                               （见 `investigationRef`）。为空才退回 `execution_id=`。
  * @param {string}  p.title      建案主题用的问题描述：用户原话，或从摘要里推出来的（titleFromSummary）。
  *                               为空 = 连摘要都还没有 → ③ 的 prompt 改成"先取结论再建案"。
  */
-function emitFollowups({ emit, locale, consoleUrl, executionId, title, description, resumable = false,
-                        hasMitigation = false }) {
+function emitFollowups({ emit, locale, consoleUrl, executionId, taskId = "", title, description,
+                        resumable = false, hasMitigation = false }) {
   const en = locale === "en";
   const dv = (zh, enStr) => (en ? enStr : zh);
   const fups = [];
@@ -1008,8 +1081,9 @@ function emitFollowups({ emit, locale, consoleUrl, executionId, title, descripti
   if (resumable && executionId) {
     fups.push({
       label: dv("🔄 查看调查结果（0 token）", "🔄 Check investigation result (0 tokens)"),
-      prompt: dv(`查一下这次调查的结果，execution_id=${executionId}`,
-                 `Check the result of this investigation, execution_id=${executionId}`),
+      // 引用形式与气泡里显示的那串**一致**：用户手打/复制回来的走的是同一条识别分支。
+      prompt: dv(`查一下这次调查的结果，${investigationRef(taskId, executionId)}`,
+                 `Check the result of this investigation, ${investigationRef(taskId, executionId)}`),
     });
   }
   if (executionId && SHOW_ESCALATE_FOLLOWUP) {

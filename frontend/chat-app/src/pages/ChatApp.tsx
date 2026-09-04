@@ -4,7 +4,8 @@ import Sidebar from "../components/Sidebar";
 import Message from "../components/Message";
 import Composer from "../components/Composer";
 import SourcesPanel from "../components/SourcesPanel";
-import InvestigationPanel from "../components/InvestigationPanel";
+import ThinkingPanel from "../components/ThinkingPanel";
+import { appendStep, appendReasoning, type TimelineStep } from "../thinking";
 import CustomizePanel from "../components/CustomizePanel";
 import NotificationsPanel from "../components/NotificationsPanel";
 import AdminPanel from "../components/AdminPanel";
@@ -16,12 +17,13 @@ import { getCasesDashboard, type CasesDashboardData } from "../api/cases";
 import SecurityDashboardBrowser from "../components/SecurityDashboardBrowser";
 import { getSecurityDashboard, type SecurityDashboardData } from "../api/security";
 import InvestigationDashboardBrowser from "../components/InvestigationDashboardBrowser";
+import InspectionDashboardBrowser from "../components/InspectionDashboardBrowser";
 import { getAlarmDashboard, type AlarmDashboardData } from "../api/alarms";
 import ErrorBoundary from "../components/ErrorBoundary";
 import ChatObjectPicker from "../components/ChatObjectPicker";
 import Logo from "../components/Logo";
 import { unreadCount } from "../api/notifications";
-import { streamChat, listConversations, getMessages, deleteConversationApi, renameConversationApi, setPinnedApi, executeActionApi, getAccountsFull, type SourceItem, type AccountInfo } from "../api/chat";
+import { streamChat, warmupChat, listConversations, getMessages, deleteConversationApi, renameConversationApi, setPinnedApi, executeActionApi, getAccountsFull, type SourceItem, type AccountInfo } from "../api/chat";
 import { useLocale, useT } from "../i18n";
 import { topicDef, deepDiveTogglesFor, type ChatMessage, type Conversation, type TopicKey } from "../types";
 import { defaultModelId, modelDisplayName, refreshModelCatalog, isSelectableModel, useModelCatalog } from "../models";
@@ -160,7 +162,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   const [activeId, setActiveId] = useState<string>(conversations[0].id);
   // 主区视图：chat（默认）| skills（独立 Skills 页）| customize（定制页：连接器/插件）
   // | notifications（通知收件箱）。非对话页切到它时主区换渲染。
-  const [view, setView] = useState<"chat" | "skills" | "customize" | "notifications" | "finops" | "cases" | "admin" | "security" | "investigate">("chat");
+  const [view, setView] = useState<"chat" | "skills" | "customize" | "notifications" | "finops" | "cases" | "admin" | "security" | "investigate" | "inspection">("chat");
   // 「Skills」一级入口点击信号：每次点都自增。已在 skills 视图内（可能停在某个 skill 详情/编辑器）
   // 时，CustomizePanel 据此重置回列表首页——无修改直接回、有未保存修改先确认。见 skillsHome 透传。
   const [skillsHome, setSkillsHome] = useState(0);
@@ -173,6 +175,11 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   // 即便 /me/capabilities 异常或 token group claim 传播延迟（与后端 admin-group 兜底同源）。
   const [isAdmin, setIsAdmin] = useState(false);
   const can = (key: string) => isAdmin || (capKeys || []).includes(key);
+  // hasCapNode: 服务端能力树里**确实下发了**这个节点。与 can() 的区别是不 fail-open
+  // （admin 也不例外）—— 用于「可选外部数据源」类能力：服务端在数据源未配置时会把节点
+  // 整个摘掉（authz.mjs 的 requiresEnv），此时任何人都不该看到入口，否则就是一个点进去
+  // 只会显示"数据源未配置"的死 tab。权限不足与数据源缺失在这里被合成同一个信号：不可用。
+  const hasCapNode = (key: string) => (capKeys || []).includes(key);
   // 加载完成 = 拿到非空能力集 且 无错误；否则视为"未就绪"→ 门禁 fail-open（默认显示，后端把关）。
   const capsLoaded = capKeys !== null && !capsError;
   useEffect(() => {
@@ -203,7 +210,9 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   // 能力加载后：若当前停在无权访问的 tab，回退到 chat（防止直链/降权后停留）
   useEffect(() => {
     if (!capsLoaded) return;
-    const gate: Record<string, string> = { finops: "nav:finops", cases: "nav:cases", admin: "nav:admin", notifications: "nav:notifications", skills: "nav:skills", customize: "nav:customize", security: "nav:security", investigate: "nav:investigate" };
+    // ⚠️ **view union 加了新值就必须在这里加一条**，否则那个视图不受权限保护：
+    //    降权或直链进来的用户会停在页面上，靠后端 403 才被挡（白屏 + 报错）。
+    const gate: Record<string, string> = { finops: "nav:finops", cases: "nav:cases", admin: "nav:admin", notifications: "nav:notifications", skills: "nav:skills", customize: "nav:customize", security: "nav:security", investigate: "nav:investigate", inspection: "nav:inspection" };
     const need = gate[view];
     if (need && !can(need)) setView("chat");
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -252,9 +261,16 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   const [homePrefill, setHomePrefill] = useState<Record<string, { text: string; seq: number }>>({});
   const fillHomePrefill = (convId: string, text: string) =>
     setHomePrefill((p) => ({ ...p, [convId]: { text, seq: (p[convId]?.seq ?? 0) + 1 } }));
-  // 右侧「调查过程」面板（复用 src 停靠栏样式）：记住**是哪条消息**（存 msgId），
-  // 渲染时从当前会话实时取该消息的 steps —— 这样流式新步骤会实时进面板（不是打开那刻的快照）。
-  const [invOpen, setInvOpen] = useState(false);
+  // 右侧「思考过程」面板（复用 src 停靠栏样式）：记住**是哪条消息**（存 msgId），渲染时从当前
+  // 会话实时取该消息的 steps —— 这样流式新步骤会实时进面板（不是打开那刻的快照）。
+  // **只有这一个过程面板**：DevOps Agent 与普通对话的过程展示共用它（2026-09-04 客户要求一致）。
+  const [thinkOpen, setThinkOpen] = useState(false);
+  const [thinkMsgId, setThinkMsgId] = useState<string>("");
+  // 自动弹面板的用户偏好：默认开；用户手动关一次就记住"别再自动弹了"（持久化）。
+  // 用 ref 是因为它在流式回调里被读，state 会造成回调闭包读到旧值。
+  const thinkAutoRef = useRef<boolean>((() => {
+    try { return localStorage.getItem("notiops-thinkpanel-auto") !== "off"; } catch { return true; }
+  })());
   const [finopsDash, setFinopsDash] = useState<string | null>(null);
   const [finopsData, setFinopsData] = useState<FinopsData | null>(null);
   const [casesDash, setCasesDash] = useState<string | null>(null);
@@ -264,6 +280,18 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   const [securityData, setSecurityData] = useState<SecurityDashboardData | null>(null);
   const [investigateDash, setInvestigateDash] = useState<string | null>(null);
   const [alarmData, setAlarmData] = useState<AlarmDashboardData | null>(null);
+  // 资源巡检看板：当前打开的子页 key（null = 停在缩略卡主页）。
+  //
+  // ⚠️ 侧栏入口用 `isAdmin || (capsLoaded && can(...))` 而**不是**
+  //    `!capsLoaded || can(...)` —— 与 Security 同档、与 Finops 不同。
+  //    后者是 fail-open（能力加载期先显示），而巡检看板会显示客户的
+  //    排除清单与阈值配置，那是运维决策不是公开信息。
+  //    fail-open 会在加载完成前的那一瞬间对所有人闪出这个入口。
+  // ⚠️ 数据**不在这里预取**。巡检的六个端点各自服务不同子页，而缩略卡主页
+  // 一个都不需要 —— 在这里预取等于每次点开侧栏就打六次 DDB。
+  // 各子页组件自己按需拉（见 InspectionDashboard）。
+  const [inspectionDash, setInspectionDash] = useState<string | null>(null);
+  const showInspectionNav = isAdmin || (capsLoaded && can("nav:inspection"));
   // dashboard **浏览账号**（finops/cases/security/investigate 仪表盘共用的全局浏览维度，与 chat
   // 会话账号解耦；见下方 acctPickerFor）。声明在此处——须在下面各 dashboard fetch effect 之前。
   const [dashAccountId, setDashAccountId] = useState("");
@@ -281,7 +309,6 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     getCasesDashboard(dashAccountId).then((d) => { if (!cancelled) setCasesData(d); });
     return () => { cancelled = true; };
   }, [view, casesData, dashAccountId]);
-  const [invMsgId, setInvMsgId] = useState<string>("");
   // 对话流滚动容器：用 **callback ref + state** 而不是纯 useRef —— 滚动监听必须以真实节点
   // 为依赖重绑（`.stream` 会随 <ErrorBoundary key={view}> 重挂载），见下方滚动跟随 effect。
   const streamRef = useRef<HTMLDivElement | null>(null);
@@ -355,11 +382,18 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   const [themePrefill, setThemePrefill] = useState<Record<string, { text: string; seq: number }>>({});
   const fillThemePrefill = (topicKey: string, text: string) =>
     setThemePrefill((p) => ({ ...p, [topicKey]: { text, seq: (p[topicKey]?.seq ?? 0) + 1 } }));
-  // 「调查过程」面板实时数据：按 invMsgId 从当前会话取该消息（每次渲染都取最新）——
-  // 流式新步骤写进消息后，这里自动反映到面板，无需重新打开。
-  const invMsg = invMsgId ? active.messages.find((m) => m.id === invMsgId) : undefined;
-  const invSteps = invMsg?.investigationSteps ?? [];
-  const invConsoleUrl = invMsg?.investigationConsoleUrl ?? "";
+  // 「思考过程」面板实时数据：按 msgId 从当前会话取该消息（每次渲染都取最新）——流式新步骤写进
+  // 消息后这里自动反映到面板，无需重新打开。**两个 agent 共用这一个面板**（2026-09-04）。
+  const thinkMsg = thinkMsgId ? active.messages.find((m) => m.id === thinkMsgId) : undefined;
+  // 兼容**改版前**存下来的老消息：那时 DevOps 的过程只写进 investigationSteps、没进 thinkingSteps，
+  // 刷新后若只看 thinkingSteps 会是空面板。故 thinkingSteps 为空时回落到 investigationSteps
+  // （只有 text，没有 kind → 统一按 status 那一档渲染）。新消息两者都有，走前者。
+  const thinkSteps: TimelineStep[] = thinkMsg?.thinkingSteps?.length
+    ? thinkMsg.thinkingSteps
+    : (thinkMsg?.investigationSteps ?? []).map((s) => ({ text: s.text, kind: "status" as const }));
+  const thinkLive = Boolean(thinkMsg?.streaming || thinkMsg?.thinking); // 仍在跑 → 面板显示脉冲/自动滚底
+  // DevOps Agent 后台深链（只有 DevOps 那条有）——两条路径唯一的差异，属能力差异不是样式差异。
+  const thinkConsoleUrl = thinkMsg?.investigationConsoleUrl ?? "";
   // 模型改为**每会话**：改了只影响该会话、切走再回保持。
   // 存量会话记的模型可能已被管理员下架 —— 此时回落到当前默认值，让下拉框显示的就是真正会用的
   // 那个（服务端也会做同样的替换并回一条 model_substituted，两侧结论一致）。
@@ -606,6 +640,32 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
       .finally(settleHydration);
   }, [activeId, conversations]);
 
+  // 已预热过的会话（每个 tab 生命周期内每会话最多一次）。
+  const warmedRef = useRef<Set<string>>(new Set());
+
+  // 会话预热：**空会话摆到用户面前**时，先把 agent runtime 那个容器叫起来（0 token）。
+  //
+  // 首字延迟的大头不是模型，是容器还没准备好（平台冷启动 + import + 挂工具快照 + 起 MCP
+  // 子进程，实测 ~10s）。这段时间与"用户读落地页、想好要问什么、把问题打出来"完全重叠 ——
+  // 白等的那 10s 就是这么省掉的。
+  //
+  // 口径（有意为之，别顺手放宽）：
+  //   · **只预热空会话**。有历史的会话被点开时不热 —— 用户在侧栏翻会话是常态，每点一下
+  //     热一发就是白起 N 个 microVM（真金白银），而"接着追问"这一路的 runtimeSessionId
+  //     通常还是热的。代价：刷新页面后打开旧会话追问，仍是原来的延迟。
+  //   · 每会话至多一次（warmedRef），且不看 hydratingIds —— 水合中的会话必然非空，进不来。
+  //   · 站在输入框前才热：管理/技能/通知/定制这些页面没有 Composer，热了没人用。
+  //   · model/topic/accountId/devopsAgent 与 handleSend 同源。预热后用户又改了模型 →
+  //     真正那一轮会另建一个 agent（多花约 1s 建 agent），但容器/import/MCP 的预热仍然有效。
+  useEffect(() => {
+    if (view === "skills" || view === "customize" || view === "admin" || view === "notifications") return;
+    if (!active || active.messages.length > 0) return;
+    if (warmedRef.current.has(active.id)) return;
+    warmedRef.current.add(active.id);
+    // 发即忘：warmupChat 自己吞掉所有异常，失败的唯一后果是首字回到原来的延迟。
+    void warmupChat({ conversationId: active.id, model, topic: active.topic ?? "general", accountId, devopsAgent });
+  }, [view, active, model, accountId, devopsAgent]);
+
   // 监听滚动：判断用户是否还贴着底部；一旦上滚就停止自动跟随。
   //
   // ⚠️ 依赖必须是**真实 DOM 节点**（streamEl），不能用 isEmpty 之类的近似信号 —— 这是
@@ -725,6 +785,21 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     let acc = "";
     let reasoningAcc = ""; // 思考过程累积（可折叠灰字）
     const invSteps: import("../api/chat").InvestigationStep[] = []; // 调查过程累积（走右侧面板）
+    // 「思考过程」时间线累积（走右侧面板；合并连续思考、去重重复行、滤掉 BFF 等待期提示）。
+    let thinkTimeline: TimelineStep[] = [];
+    // 收到第一步时：若用户没关过自动弹，且面板没在看别的消息 → 自动把面板打开到本条。只做一次。
+    let thinkAutoDone = false;
+    const pushThinking = (next: TimelineStep[]) => {
+      if (next === thinkTimeline) return;             // 纯函数原样返回（被过滤/到顶）→ 不必重渲染
+      thinkTimeline = next;
+      patchMsgIn(convId, botId, { thinkingSteps: next });
+      if (!thinkAutoDone && thinkAutoRef.current && convId === activeIdRef.current && viewRef.current === "chat") {
+        thinkAutoDone = true;
+        setThinkMsgId(botId);
+        setSrcOpen(false); // 与 Sources 互斥，共用停靠位
+        setThinkOpen(true);
+      }
+    };
 
     try {
       await streamChat(
@@ -738,19 +813,40 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
           },
           // 处理中临时状态行（工具调用等）：只在**还没有正文**时显示（复用思考态区域），
           // 一旦正文开始就由 onToken 清空。文案已由 agent 端按本轮语言给好，前端直接显示。
-          onProgress: (p) => { if (!acc && p?.text) patchMsgIn(convId, botId, { progress: p.text }); },
-          // 思考过程增量：累积成可折叠灰字（默认折叠）。语言由 agent 端锁定跟随本轮。
-          onReasoning: (r) => { if (r?.text) { reasoningAcc += r.text; patchMsgIn(convId, botId, { reasoning: reasoningAcc }); } },
+          onProgress: (p) => {
+            if (!acc && p?.text) patchMsgIn(convId, botId, { progress: p.text });
+            // 工具调用等进度行也进「思考过程」时间线（appendStep 会按 kind 滤掉 coldstart/working
+            // 这类 BFF 等待期提示——那不是模型/工具做的事）。
+            if (p?.text) pushThinking(appendStep(thinkTimeline, { text: p.text, kind: p.kind }, Date.now()));
+          },
+          // 思考过程增量：累积成可折叠灰字（默认折叠）+ 并进右侧面板的思考段。语言由 agent 端锁定跟随本轮。
+          onReasoning: (r) => {
+            if (r?.text) {
+              reasoningAcc += r.text;
+              patchMsgIn(convId, botId, { reasoning: reasoningAcc });
+              pushThinking(appendReasoning(thinkTimeline, r.text, Date.now()));
+            }
+          },
+          // 思考/处理过程的一步（工具调用及入参摘要、工具返回摘要）→ 右侧「思考过程」面板。
+          onThinkingStep: (step) => { if (step?.text) pushThinking(appendStep(thinkTimeline, step, Date.now())); },
           onSources: (sources) => patchMsgIn(convId, botId, { sources }),
           onActions: (actions) => patchMsgIn(convId, botId, { actions }),
           onFollowups: (followups) => patchMsgIn(convId, botId, { followups }),
+          // DevOps Agent 的调查步骤。除了原样存进 investigationSteps（面板的 console 深链、历史兼容
+          // 都靠它），**还要进同一条思考时间线** —— 两个 agent 的过程展示要一致：同一个面板、同样的
+          // 图标/「进行中」脉冲/自动滚底/自动弹出。只写 investigationSteps 的话 DevOps 那条不会自动弹。
           onInvestigationStep: (step) => {
             invSteps.push(step);
             const patch: Partial<ChatMessage> = { investigationSteps: [...invSteps] };
             if (step.console_url) patch.investigationConsoleUrl = step.console_url;
             patchMsgIn(convId, botId, patch);
+            if (step.text) pushThinking(appendStep(thinkTimeline, { text: step.text }, Date.now()));
           },
           onUsage: (usage) => patchMsgIn(convId, botId, { usage }),
+          // 答案来源标记（"builtin" = agent 的内置确定性回答，未调模型、0 token）：
+          // 把这条的署名行从「AWS Bedrock (某模型)」换成 NotiOps。agent 在正文之前发这一帧，
+          // 所以署名不会先按模型渲染再跳变。
+          onVia: (via) => patchMsgIn(convId, botId, { via }),
           // 服务端换了模型（本会话记的那个已被管理员下架）：把会话选择和本条署名都纠正过来，
           // 并重拉一次候选集 —— 说明本地目录已过期。不纠正的话用户会一直看到一个再也用不了的名字。
           onModelSubstituted: (info) => {
@@ -836,12 +932,18 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   };
 
   const openSources = (m: ChatMessage) => { setSrcItems(m.sources ?? []); setSrcOpen(true); };
-  // 打开右侧「调查过程」面板（点主聊天里的入口按钮触发；不自动弹）。与 Sources 互斥。
-  // 只记 msgId，步骤在渲染时实时取（见下方 invMsg/invSteps 派生）——流式新步骤会自动进面板。
-  const openInvestigation = (m: ChatMessage) => {
-    setInvMsgId(m.id);
+  // 打开右侧「思考过程」面板（点入口按钮触发）。与 Sources 互斥（共用停靠位）。
+  // 只记 msgId，步骤在渲染时实时取（见上方 thinkMsg/thinkSteps 派生）——流式新步骤会自动进面板。
+  const openThinking = (m: ChatMessage) => {
+    setThinkMsgId(m.id);
     setSrcOpen(false);
-    setInvOpen(true);
+    setThinkOpen(true);
+  };
+  // 用户**手动**关闭思考面板 → 记住"以后别自动弹了"（持久化）。自动弹只是便利，用户关掉即尊重。
+  const closeThinking = () => {
+    setThinkOpen(false);
+    thinkAutoRef.current = false;
+    try { localStorage.setItem("notiops-thinkpanel-auto", "off"); } catch { /* ignore */ }
   };
 
   // 用户在确认卡上点"确认" → 执行写操作（创建/回复/关闭 case），结果回填到该 action。
@@ -1066,6 +1168,8 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
         showSecurity={isAdmin || (capsLoaded && can("nav:security"))}
         onInvestigate={() => { setInvestigateDash(null); setView("investigate"); collapseIfMobile(); }}
         investigateActive={view === "investigate"}
+        onInspection={() => { setInspectionDash(null); setView("inspection"); collapseIfMobile(); }}
+        inspectionActive={view === "inspection"}
         onAdmin={() => { setView("admin"); collapseIfMobile(); }}
         adminActive={view === "admin"}
         showFinops={!capsLoaded || can("nav:finops")}
@@ -1073,6 +1177,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
         showAdmin={isAdmin || (capsLoaded && can("nav:admin"))}
         showNotifications={!capsLoaded || can("nav:notifications")}
         showInvestigation={!capsLoaded || can("nav:investigate")}
+        showInspection={showInspectionNav}
         showSkills={!capsLoaded || can("nav:skills")}
         showCustomize={!capsLoaded || can("nav:customize")}
       />
@@ -1116,6 +1221,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               <div className="title">{t("topic.cost")} · {locale === "en" ? "Dashboards" : "仪表盘"}</div>{dashAcctPickerRight}{finopsBadge}
             </div>
             <FinopsDashboardBrowser data={finopsData ?? undefined} initial={finopsDash}
+              can={can} hasCapNode={hasCapNode}
               onAsk={(q) => { setFinopsDash(null); startFromNotification(q, "finops"); }} />
           </>
         ) : view === "finops" ? (
@@ -1126,7 +1232,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               )}
               <div className="title">{t("topic.cost")}</div>{dashAcctPickerRight}{finopsBadge}
             </div>
-            {renderThemeLanding("finops", () => { setFinopsDash("spend"); setSrcOpen(false); setInvOpen(false); })}
+            {renderThemeLanding("finops", () => { setFinopsDash("spend"); setSrcOpen(false); setThinkOpen(false); })}
           </>
         ) : view === "cases" && casesDash ? (
           /* 案例仪表盘两栏浏览器(仿通知/成本主题) */
@@ -1149,7 +1255,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               )}
               <div className="title">{t("topic.cases")}</div>{dashAcctPickerRight}
             </div>
-            {renderThemeLanding("cases", () => { setCasesDash("overview"); setSrcOpen(false); setInvOpen(false); })}
+            {renderThemeLanding("cases", () => { setCasesDash("overview"); setSrcOpen(false); setThinkOpen(false); })}
           </>
         ) : view === "security" && securityDash ? (
           /* 安全仪表盘两栏浏览器(仿通知/成本/案例主题:左列表+右内容) */
@@ -1173,7 +1279,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               )}
               <div className="title">{t("topic.security")}</div>{dashAcctPickerRight}
             </div>
-            {renderThemeLanding("security", () => { setSecurityDash("ta-security"); setSrcOpen(false); setInvOpen(false); })}
+            {renderThemeLanding("security", () => { setSecurityDash("ta-security"); setSrcOpen(false); setThinkOpen(false); })}
           </>
         ) : view === "investigate" && investigateDash ? (
           /* 调查仪表盘两栏浏览器(仿通知/成本/案例主题:左列表+右内容) */
@@ -1199,7 +1305,38 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               )}
               <div className="title">{t("topic.investigate")}</div>{dashAcctPickerRight}
             </div>
-            {renderThemeLanding("investigate", () => { setInvestigateDash("alarm-overview"); setSrcOpen(false); setInvOpen(false); })}
+            {renderThemeLanding("investigate", () => { setInvestigateDash("alarm-overview"); setSrcOpen(false); setThinkOpen(false); })}
+          </>
+        ) : view === "inspection" ? (
+          /* 巡检看板：两栏浏览器（左目录 + 右内容），**没有主题落地页**。
+             ⚠️ 其他仪表盘（finops / cases / security / investigate）走
+             `renderThemeLanding` 是因为它们同时是**聊天主题** ——
+             落地页的作用是「发起该主题的新会话」。巡检不是聊天主题：
+             硬塞一个会让它出现在侧栏的会话分组里，而那里永远是空的
+             （`TopicKey` 与会话分组同源，见 types.ts 的 TOPICS）。
+             所以直接进目录，`initial` 缺省落总览。 */
+          <>
+            <div className="topbar">
+              {collapsed && (
+                <button className="panel-btn topbar-expand" onClick={() => setCollapsed(false)}><ExpandIcon /></button>
+              )}
+              <div className="title">{t("insp.title")}</div>{dashAcctPickerRight}
+            </div>
+            <InspectionDashboardBrowser initial={inspectionDash ?? "overview"} can={can}
+              accountId={dashAccountId} accounts={accounts} onAccountChange={setDashAccountId}
+              onNavigate={setInspectionDash}
+              /* 🔴 **这里原来有 `onInvestigate`，2026-08-31 删掉。**
+
+                 巡检的「深入分析」改成了「派一次真的 DA 判读」——
+                 结果绑在那条 finding 上（`put_dispatch` 是回拼锚点），
+                 不落在任何一个聊天会话里。所以它不需要宿主给回调，
+                 实现留在 `InspectionDashboard` 内的 `doJudge`。
+
+                 ⚠️ 顺带解决了这一行原本的缺陷：它以前不给账号 ⇒
+                    `startFromNotification` 继承**聊天页选择器**的账号 ⇒
+                    点 677 的 finding、DA 在 698 里分析 698 的同名资源，
+                    给出一份看起来完全正常的报告。零错误码、零提示。
+                    现在判读走 executor，每个账号自己 assume。 */ />
           </>
         ) : view === "skills" || view === "customize" ? (
           <>
@@ -1291,7 +1428,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               <div className="thread">
                 {active.messages.map((m) => (
                   <Message key={m.id} m={m} onOpenSources={openSources}
-                    onOpenInvestigation={openInvestigation}
+                    onOpenThinking={openThinking}
                     onConfirmAction={(idx, editedParams) => confirmAction(m.id, idx, editedParams)}
                     onCancelAction={(idx) => cancelAction(m.id, idx)}
                     onFollowup={(prompt) => handleSend(prompt)}
@@ -1437,9 +1574,12 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
           桌面用可拖拽分割线；移动端 CSS 里退回覆盖式抽屉。 */}
       {srcOpen && <div className="src-resize" onMouseDown={startSrcResize} title="拖动调整宽度" />}
       <SourcesPanel open={srcOpen} sources={srcItems} width={srcWidth} onClose={() => setSrcOpen(false)} />
-      {/* 「调查过程」面板：与 Sources 同一停靠位（互斥）。分析过程走这里，主聊天保持干净。 */}
-      {invOpen && <div className="src-resize" onMouseDown={startSrcResize} title="拖动调整宽度" />}
-      <InvestigationPanel open={invOpen} steps={invSteps} consoleUrl={invConsoleUrl} width={srcWidth} onClose={() => setInvOpen(false)} />
+      {/* 「思考过程」面板：**所有路径共用这一个**（DevOps Agent 与普通对话的过程展示必须一致 ——
+          2026-09-04 客户要求；原来 DevOps 走独立的 InvestigationPanel，标题/图标/脉冲都不一样）。
+          与 Sources 同一停靠位（互斥）。手动关会记住"别再自动弹"。 */}
+      {thinkOpen && <div className="src-resize" onMouseDown={startSrcResize} title="拖动调整宽度" />}
+      <ThinkingPanel open={thinkOpen} steps={thinkSteps} live={thinkLive} consoleUrl={thinkConsoleUrl}
+                     width={srcWidth} onClose={closeThinking} />
       {/* FinOps / Cases 仪表盘均改为主区两栏浏览器(见 view==="finops"/"cases" && *Dash 分支),不再用右停靠面板 */}
     </div>
   );

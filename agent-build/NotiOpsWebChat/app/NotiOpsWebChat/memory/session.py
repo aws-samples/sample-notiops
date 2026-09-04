@@ -1,10 +1,42 @@
-import contextvars
+"""AgentCore Memory session manager — **会话内**恢复，不做跨会话记忆。
+
+── 现在保留什么、去掉什么（2026-09-01 产品决策）─────────────────────────────────
+保留：**按 `sessionId` 持久化原始消息**。这不是"记忆功能"，而是这套架构的必需件 ——
+BFF 每轮只发单轮 `prompt` + `runtimeSessionId`（`bff/web-chat/agentcore.mjs`），**客户端
+不回放历史**；而 runtime 侧的 `Agent` 是进程内缓存的，缓存键里带 `model_key`/`topic`/
+`account_id`/`devops_deep`，所以换模型、换主题、容器冷启动都会重建 `Agent`。少了这一层，
+用户在同一个会话里换个模型再追问一句，上文就没了。对应的 SDK 调用是 `create_event` /
+`list_events`（`initialize` 时按 session 拉回来），与下面说的抽取完全是两条路。
+
+去掉：**跨会话的记忆抽取与检索**。原先 Memory 上挂了四个 strategy
+（SEMANTIC `/users/{actorId}/facts`、USER_PREFERENCE `/users/{actorId}/preferences`、
+SUMMARIZATION、EPISODIC），这里再配一份 `retrieval_config` 每轮去检索。现在不配
+`retrieval_config` —— SDK 的 `retrieve_customer_context()` 在它为空时**直接 return**，
+一次检索都不发（见 `session_manager.py` 的 `if not self.config.retrieval_config`）。
+Memory 资源本身的 strategy 也一并删了（`agentcore/agentcore.json` 与
+`infra/lib/notiops-webchat-standalone-stack.ts` 两条部署路径同时改）。
+
+── 两条不要重新踩的教训（真要恢复跨会话记忆时先读这段）───────────────────────
+1. **检索查询不能用"最后一条 user 消息"。** SDK 基类就是这么取的，而到
+   `stream_async()` 那一刻这条消息已经是拼装完的大 prompt（账号隔离规则 + 主题指令 +
+   skill 正文 + 强制联网结果 + 语言锁），动辄几十 KB。服务端对 `searchQuery` 超过
+   10000 字符报 `ValidationException`，**SDK 把这个异常吞掉、返回空列表** —— 于是每个
+   namespace 永远检索不到东西，还每轮白付四次往返。当时的解法是子类
+   `_NotiOpsMemorySessionManager`：临时把这个 content block 换成用户原话、调完再换回去。
+2. **`relevance_score` 不能设门槛。** 实测（us-east-1，拿真实部署自己的记录）：一条已存
+   偏好对"几乎逐字重述"打 0.72，对自然问法「我偏好什么回答格式？」只打 0.41–0.49，
+   对无关问题 0.33–0.39。0.5 的门槛把该命中的全滤掉，而基类既不注入也不记日志。把数字
+   调低也不解决设计问题：「回答简短点」这条偏好本来就要作用在「怎么降 EC2 成本」上，
+   两者语义零重叠，而相关(0.41–0.49)与无关(0.33–0.39)在边界只差 ~0.02。所以当时是
+   `relevance_score=0.0` + 靠 `top_k` 收口，并且**显式写出来**（SDK 默认是 0.2，不写等于
+   留一个会被 SDK 升级悄悄抬高的隐式门槛）。
+"""
 import logging
 import os
 import uuid
 from typing import Optional
 
-from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig, RetrievalConfig
+from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig
 from bedrock_agentcore.memory.integrations.strands.session_manager import AgentCoreMemorySessionManager
 
 logger = logging.getLogger(__name__)
@@ -12,87 +44,15 @@ logger = logging.getLogger(__name__)
 MEMORY_ID = os.getenv("MEMORY_NOTIOPSWEBCHATMEMORY_ID")
 REGION = os.getenv("AWS_REGION")
 
-# AgentCore Memory rejects searchCriteria.searchQuery over 10000 chars. Stay
-# well under it — a retrieval query longer than a question is noise anyway.
-_MAX_RETRIEVAL_QUERY = 4000
-
-# The turn's raw user question. The entrypoint records it before invoking the
-# agent; retrieve_customer_context() below reads it back. A ContextVar (not a
-# module global) so concurrent turns in one container cannot cross over. Read
-# in the hook's own frame, which runs synchronously in the caller's context
-# (async_mode defaults to False), so no thread-propagation issue arises.
-_retrieval_query: "contextvars.ContextVar[str]" = contextvars.ContextVar(
-    "notiops_memory_retrieval_query", default=""
-)
-
-
-def set_retrieval_query(text: Optional[str]) -> None:
-    """Record the turn's raw user question for memory retrieval."""
-    _retrieval_query.set(str(text or ""))
-
-
-def _short_query(prompt_text: str) -> str:
-    q = _retrieval_query.get() or ""
-    if not q:
-        # No question recorded for this turn (unexpected). Degraded but safe:
-        # a truncated prompt retrieves poorly, yet still beats a request the
-        # service refuses outright.
-        q = str(prompt_text or "")
-    return q[:_MAX_RETRIEVAL_QUERY]
-
-
-class _NotiOpsMemorySessionManager(AgentCoreMemorySessionManager):
-    """Retrieve memories with the user's question, not the assembled prompt.
-
-    The base class uses the last user message verbatim as the retrieval query.
-    By the time a turn reaches stream_async() that message is the fully
-    assembled prompt — account-isolation rules, topic directive, skill body,
-    forced web-search results, language lock — routinely tens of KB. The
-    service rejects a searchQuery over 10000 chars with ValidationException,
-    which the SDK swallows into an empty list, so every namespace silently
-    retrieved nothing: long-term memory was effectively off, and we paid four
-    round trips per turn to learn that.
-
-    Swap the short query in for the duration of the base call, then put the
-    original text back so the model still sees the full prompt. The content
-    block is mutated in place (same dict object), so the base class inserting
-    its <user_context> block at index 0 does not disturb the restore.
-    """
-
-    def retrieve_customer_context(self, event) -> None:
-        block = None
-        original = None
-        content = None
-        before = 0
-        try:
-            messages = event.agent.messages
-            if messages and messages[-1].get("role") == "user":
-                content = messages[-1].get("content") or []
-                before = len(content)
-                # Same shape check the base makes; tool-result turns carry no
-                # "text" block and are skipped there too.
-                if content and isinstance(content[0], dict) and "text" in content[0]:
-                    block = content[0]
-                    original = block["text"]
-                    block["text"] = _short_query(original)
-        except Exception:  # noqa: BLE001 - retrieval must never break the turn
-            block = None
-        try:
-            return super().retrieve_customer_context(event)
-        finally:
-            if block is not None:
-                block["text"] = original
-            # Say out loud whether this turn actually got any long-term memory.
-            # The base class logs only the non-empty case, which is why a
-            # relevance floor that rejected everything went unnoticed for two
-            # releases: no error, no warning, no line at all. One line per turn
-            # is a cheap price for never debugging that blind again.
-            if block is not None:
-                injected = len(content) - before
-                logger.info("long-term memory injected into this turn: %d block(s)", injected)
-
 
 def get_memory_session_manager(session_id: Optional[str], actor_id: str) -> Optional[AgentCoreMemorySessionManager]:
+    """按 `session_id` 持久化 / 恢复本会话消息；**不检索**跨会话记忆。
+
+    `MEMORY_ID` 为空时返回 `None`（调用方据此退化成纯进程内会话）。⚠️ 这条退化路径是
+    **静默**的 —— 环境变量键名对不上就等于会话历史整块不落库，没有报错也没有日志，
+    所以 `MEMORY_NOTIOPSWEBCHATMEMORY_ID` 这个键名在 CDK 与这里必须逐字一致
+    （见 `notiops-webchat-standalone-stack.ts` 的注释与 `test_oneclick_parity.py` 维度 ⑦）。
+    """
     if not MEMORY_ID:
         return None
 
@@ -100,41 +60,13 @@ def get_memory_session_manager(session_id: Optional[str], actor_id: str) -> Opti
     # without a runtime session header, so synthesize one when absent.
     session_id = session_id or uuid.uuid4().hex
 
-    # relevance_score=0.0 on purpose: top_k is the only bound.
-    #
-    # It is spelled out rather than omitted because the SDK's default is 0.2, not
-    # "off" — leaving it out would leave an implicit floor that a future SDK bump
-    # could raise under us. The base class skips the filter entirely when this is
-    # falsy, so 0.0 means "off" no matter what the SDK defaults to.
-    #
-    # We used to pass relevance_score=0.5, which made long-term memory retrieve
-    # nothing, ever — silently. Measured in us-east-1 against a real deployment's
-    # own records, the service's similarity scores land far below that: a stored
-    # preference scored 0.72 against a near-verbatim restatement
-    # of itself, 0.41–0.49 against the natural question "what response format do I
-    # prefer?", and 0.33–0.39 against unrelated questions. A 0.5 floor rejects every
-    # one of those; the base class then injects nothing and logs nothing.
-    #
-    # Tuning the number down would not fix the design error. A stable preference like
-    # "always answer briefly" has to apply to "how do I cut my EC2 bill?" — a question
-    # with no semantic overlap with the preference text at all. The band that separates
-    # relevant (0.41–0.49) from irrelevant (0.33–0.39) is ~0.02 wide at the boundary,
-    # so any threshold that filters noise also filters exactly the case this feature
-    # exists for. top_k already caps what a turn can pull in (3+3+5+3 short items),
-    # and the service ranks by score, so the top few are the best available context.
-    retrieval_config = {
-        f"/users/{actor_id}/facts": RetrievalConfig(top_k=3, relevance_score=0.0),
-        f"/users/{actor_id}/preferences": RetrievalConfig(top_k=3, relevance_score=0.0),
-        f"/episodes/{actor_id}/{session_id}": RetrievalConfig(top_k=5, relevance_score=0.0),
-        f"/summaries/{actor_id}/{session_id}": RetrievalConfig(top_k=3, relevance_score=0.0),
-    }
-
-    return _NotiOpsMemorySessionManager(
+    # 不传 retrieval_config = 不做任何跨会话检索（顶部说明）。别"顺手补上默认值"：
+    # 传空字典与不传等价，传了内容就是把跨会话记忆重新打开。
+    return AgentCoreMemorySessionManager(
         AgentCoreMemoryConfig(
             memory_id=MEMORY_ID,
             session_id=session_id,
             actor_id=actor_id,
-            retrieval_config=retrieval_config,
         ),
         REGION
     )

@@ -39,9 +39,14 @@ agentcore dev --stream "ALB 和 NLB 的区别"   # 流式测一句
 ## 部署到 AgentCore Runtime（手动 / 开发）
 ```bash
 cd agent
-# 首次：创建 agentcore 工程配置（Strands + Bedrock + 短期&长期记忆）
+# 首次：创建 agentcore 工程配置（Strands + Bedrock + 会话记忆）
 agentcore create --name NotiOpsWebChat --framework Strands \
   --protocol HTTP --model-provider Bedrock --memory longAndShortTerm
+# ⚠️ `--memory longAndShortTerm` 是脚手架唯一给 Memory 资源的档位，它会顺手写进
+#    4 个 strategy（SEMANTIC / USER_PREFERENCE / SUMMARIZATION / EPISODIC）。
+#    **生成完必须把 agentcore.json 里的 `strategies` 清成 `[]`** —— 2026-09-01 产品
+#    决策：只保留会话内记忆，不做跨会话（判据在 scripts/test_oneclick_parity.py 维度 ⑦，
+#    留着 strategy 会让它 fail）。Memory 资源本身要留着：会话内恢复靠它。
 # 把本目录的 main.py / prompt.py / tools/ 覆盖进生成的 app/ 入口，
 # 并确保打包包含仓库根 core/（CodeZip：在 pyproject/打包脚本里加 core/ 路径；
 # 或用 --build Container 写 Dockerfile COPY ../core ./core）。

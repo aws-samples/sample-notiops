@@ -15,6 +15,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from core.lazy_boto import LazyClient
+from platforms.common import lambda_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,34 @@ _app_secret: str | None = None
 _token: str | None = None
 _token_expiry: float = 0.0
 _lock = threading.Lock()
+
+
+#: HTTP 等待的地板：预算再紧也留一次机会。**不能是 0** —— `urlopen(timeout=0)` 不是
+#: "不等"，而是立刻 `timed out`，等于把这条路径直接关掉。
+_MIN_HTTP_TIMEOUT = 2.0
+#: 给"把响应写回去"留的余量。urlopen 一直等到被 Lambda 杀掉，对外就是 5xx + 平台重试，
+#: 而日志里只有一行 `Task timed out` —— 什么都看不出来。
+_HTTP_RESERVE = 5.0
+
+
+def _http_timeout(default: float) -> float:
+    """这一次 HTTP 最多等多久 —— 不许超过本次调用剩下的时间。
+
+    为什么需要这一层：ingress 的 timeout 是 **20s**（`infra/lib/constructs/im-core.ts`），
+    而"取 token（10s）+ 一次 OpenAPI（15s）"两次都撞上限就是 **25s** —— 函数先被平台
+    杀掉，API Gateway 对飞书回 5xx，飞书重试（答案不会重复，worker 用 `event_id` 去重，
+    但 ingress 白烧一轮、且 CloudWatch 里只留下一行 `Task timed out`）。ingress 上跑的
+    是「收到了」表情那条**纯体验**路径（`platforms/common/quick_ack.py` 约束 2/3），
+    为它把 webhook 拖成非 2xx 是反的。
+
+    ⚠️ 只会**变短，不会变长**（`min(default, ...)`）：worker（timeout 900s）与本地 /
+    Fargate / 单测（没设过 context → `remaining_seconds()` 返回 900）都拿回原值，
+    行为逐字不变。
+    """
+    room = lambda_deadline.remaining_seconds() - _HTTP_RESERVE
+    if room >= default:
+        return default
+    return max(_MIN_HTTP_TIMEOUT, room)
 
 
 def _load_credentials() -> tuple[str, str]:
@@ -63,7 +92,7 @@ def get_tenant_access_token() -> str:
         req.add_header("Content-Type", "application/json; charset=utf-8")
         if not (req.full_url if hasattr(req, "full_url") else str(req)).lower().startswith(("https://","http://")):
             raise ValueError("refusing non-http(s) URL")  # B310 mitigation
-        with urlopen(req, timeout=10) as resp:  # nosec B310 - scheme validated above
+        with urlopen(req, timeout=_http_timeout(10)) as resp:  # nosec B310 - scheme validated above
             data = json.loads(resp.read().decode("utf-8"))
         if data.get("code") != 0:
             raise RuntimeError(f"Feishu token fetch failed: {data}")
@@ -90,7 +119,7 @@ def call_openapi(method: str, path: str, payload: dict | None = None,
     try:
         if not (req.full_url if hasattr(req, "full_url") else str(req)).lower().startswith(("https://","http://")):
             raise ValueError("refusing non-http(s) URL")  # B310 mitigation
-        with urlopen(req, timeout=15) as resp:  # nosec B310 - scheme validated above
+        with urlopen(req, timeout=_http_timeout(15)) as resp:  # nosec B310 - scheme validated above
             data = json.loads(resp.read().decode("utf-8"))
     except HTTPError as e:
         body_txt = e.read().decode("utf-8") if e.fp else ""

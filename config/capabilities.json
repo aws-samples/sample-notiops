@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "_note": "能力清单单一真源。BFF(authz/渲染) 与前端共同消费。新增 dashboard 只需在此加节点 + 在对应 BFF 模块加数据路由 + 前端加卡片渲染，三处自动生效。routes 的 pattern 为 path 后缀正则（对齐 index.mjs 的 endsWith/exec 匹配习惯）。queryMatch/bodyMatch 用于同路由按参数区分能力。responseKey 用于 dashboard 单次返回时按权限过滤顶层字段（response-side 强制）。requiresEnv 声明该能力依赖的 BFF 环境变量：未配置时该节点从 /capabilities 树里消失（前端不渲染入口），已授权的角色也看不到——用于「可选外部数据源」类能力（如客户 CUR）。注意：本文件是唯一真源，setup.sh 会把它 cp 到 bff/web-chat/capabilities.json，两份必须逐字节一致（tests/test_capabilities_parity.py 守）。",
+  "_note": "能力清单单一真源。BFF(authz/渲染) 与前端共同消费。新增 dashboard 只需在此加节点 + 在对应 BFF 模块加数据路由 + 前端加卡片渲染，三处自动生效。routes 的 pattern 为 path 后缀正则（对齐 index.mjs 的 endsWith/exec 匹配习惯）。queryMatch/bodyMatch 用于同路由按参数区分能力。responseKey 用于 dashboard 单次返回时按权限过滤顶层字段（response-side 强制）。requiresEnv 声明该能力依赖的 BFF 环境变量：未配置时该节点从 /capabilities 树里消失（前端不渲染入口），已授权的角色也看不到（visibleTree 里这道判据压在 alwaysOn 之前；filterDashboard 用同一判据剥响应字段）。它挡两种事，加新节点前先想清是哪一种：①「可选外部数据源没配」——客户配上就有了，可以引导客户去配（如客户 CUR 的 4 个 sheet，COST_AGENT_MCP_URL）；②「这条部署路径上压根没有写侧」——引导不了，只能不显示（如 nav:finops:daily-anomaly 的 COST_ANALYZER_FUNCTION：产数的 lambda5 只在方式 B，web-chat-core.ts 因此在 staticTemplate 下把它置空）。两者共用一个机制是有意的（判据都是「这个 env 有没有值」），但两者的产品含义相反，别混着写。注意：本文件是唯一真源，setup.sh 会把它 cp 到 bff/web-chat/capabilities.json，两份必须逐字节一致（tests/test_capabilities_parity.py 守）。",
   "nodes": [
     { "key": "nav:chat", "level": "tab", "viewState": "chat", "alwaysOn": true,
       "title_zh": "对话", "title_en": "Chat",
@@ -62,6 +62,11 @@
     { "key": "nav:finops:anomalies", "level": "subtab", "parent": "nav:finops:optimization",
       "responseKey": "costExplorer.anomalies",
       "title_zh": "成本异常", "title_en": "Cost Anomalies" },
+    { "key": "nav:finops:daily-anomaly", "level": "subtab", "parent": "nav:finops:optimization",
+      "responseKey": "dailyAnomaly",
+      "requiresEnv": "COST_ANALYZER_FUNCTION",
+      "_note": "每日多因子成本异常扫描（lambda5，01:15 UTC 自建基线）。requiresEnv 挡的不是「客户没配数据源」而是「这条部署路径上没有写侧」：一键部署（方式 A）的最小底座不装 lambda5 与它的定时规则，web-chat-core.ts 因此把 COST_ANALYZER_FUNCTION 置空，这张卡整个不下发 —— 否则它会恒显示「近 3 天没有扫描记录（每日 01:15 UTC 跑）」，而那边没有任何东西在 01:15 UTC 跑（不许静默降级）。它是 subtab，admin 模块开关只收 tab，人手关不掉单张卡。与 nav:finops:anomalies（AWS Cost Anomaly Detection，要配 monitor）是两套引擎，两张卡并排、各自标注来源 —— 合并会让两套口径的数字对不上任何一边的控制台。老 idle 控制台退役（2026-09-04）后这是 lambda5 唯一的界面读侧。",
+      "title_zh": "每日异常扫描", "title_en": "Daily Anomaly Scan" },
     { "key": "nav:finops:ri-sp", "level": "subtab", "parent": "nav:finops:optimization",
       "responseKey": "costExplorer.coverage",
       "title_zh": "RI/SP 覆盖", "title_en": "RI/SP Coverage" },
@@ -187,7 +192,7 @@
       ] },
 
     { "key": "nav:inspection", "level": "tab", "viewState": "inspection",
-      "title_zh": "资源巡检", "title_en": "Resource Inspection",
+      "title_zh": "巡检", "title_en": "Inspection",
       "_note": "tab 只挂「总览 + 明细 + 序列」三条：它们是任何子页都要用的公共读取。列表按 kind 分权到子页（见下），SHALL NOT 把 /inspection/findings$ 放回这里 —— tab 级 route 会遮蔽子页的 queryMatch（matchRoute 按节点顺序取首个命中），从而绕过按页分权。",
       "routes": [
         { "method": "GET", "pattern": "/inspection/overview$" },

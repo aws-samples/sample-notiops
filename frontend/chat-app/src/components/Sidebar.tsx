@@ -1,12 +1,11 @@
 import { useState } from "react";
-import { getConfig } from "../config";
 import Logo from "./Logo";
 import { useT, useLocale } from "../i18n";
 import type { Conversation, TopicKey } from "../types";
 import { TOPICS } from "../types";
 import {
   IconNewChat, IconInvestigate, IconFinOps, IconCases, IconSecurity,
-  IconReports, IconInspection, IconMore, IconExternal, IconSkill, IconCustomize, IconWhatsNew, IconChevronRight, IconBell,
+  IconInspection, IconMore, IconSkill, IconCustomize, IconWhatsNew, IconChevronRight, IconBell,
   IconCollapseAll, IconExpandAll,
 } from "./icons";
 import ConvItem from "./ConvItem";
@@ -72,16 +71,10 @@ const PanelIcon = () => (
   </svg>
 );
 
-/**
- * 「巡检 & 报告」入口的显示开关。
- *
- * 当前置 false = **只隐藏，不删代码**：按钮、图标、openConsole()、i18n 的
- * nav.inspections 文案全部原样保留，要恢复只需把这里改回 true，无需重写任何东西。
- *
- * 这一项本质是外链到 idle 控制台（config.json 里的 idleConsoleUrl），不是站内页面，
- * 所以隐藏它不影响任何站内路由或状态。
- */
-const SHOW_INSPECTIONS = false;
+/* 「巡检 & 报告」外链已随老 idle 控制台退役（2026-09-04）——
+   原先由 SHOW_INSPECTIONS=false 隐藏、代码保留；控制台整体删除后
+   openConsole()/按钮/idleConsoleUrl 一并移除。站内巡检看板不受影响
+   （nav:inspection 那套是独立入口）。 */
 
 export default function Sidebar({ conversations, activeId, busyIds, unreadIds, onSelect, onNew, onRename, onTogglePin, onDelete, collapsed, onToggle, username, onSignOut, width = 264, onSkills, skillsActive, onCustomize, customizeActive, onWhatsNew, onNotifications, notificationsActive, notifUnread = 0, onFinops, finopsActive, onCases, casesActive, onAdmin, adminActive, showFinops = true, showCases = true, showAdmin = false, showNotifications = true, showInvestigation = true, showSkills = true, showCustomize = true, onSecurity, securityActive, showSecurity = false, onInvestigate, investigateActive, onInspection, inspectionActive, showInspection = false }: Props) {
   const t = useT();
@@ -89,7 +82,7 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
   // "更多"子菜单展开态（收纳 安全 / 巡检&报告 等非高频入口）
   const [moreOpen, setMoreOpen] = useState(false);
   // 子菜单里到底还剩没剩东西：都没了就连「更多」按钮一起藏，别让用户点开一个空菜单
-  const hasMoreItems = SHOW_INSPECTIONS || showAdmin || showCustomize;
+  const hasMoreItems = showAdmin || showCustomize;
 
   // 主题会话分组的收起态：记录**已收起**的组 key（默认全部展开）。持久化到 localStorage，跨刷新保留。
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
@@ -146,13 +139,6 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
       return persistCollapsed(next);
     });
 
-  // idle 控制台：扩展区第一个链接（同一套登录，深链到现有控制台）
-  const openConsole = () => {
-    // config.json 注入的 idle 控制台 CloudFront 地址（web-chat-stack 从 NotiOpsBackendStack.consoleUrl 透传）
-    let url = "";
-    try { url = getConfig().idleConsoleUrl || ""; } catch { /* config 未加载 */ }
-    if (url) window.open(url, "_blank", "noopener");
-  };
 
   // 点主题入口 = 新建一个带该主题 tag 的会话（通用能力 + 主题上下文/分类）。
   // 后续每个主题可在 agent 侧按 topic 做特定微调；当前共享同一通用 agent。
@@ -181,12 +167,11 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
         {/* 主题入口（②）：点击将在右侧打开该主题的定制 chat 页。 */}
         {showInvestigation && <button className={"navitem" + (investigateActive ? " active" : "")} onClick={() => onInvestigate?.()}><span className="ni-ic"><IconInvestigate /></span>{t("topic.investigate")}</button>}
         {showFinops && <button className={"navitem" + (finopsActive ? " active" : "")} onClick={onFinops}><span className="ni-ic"><IconFinOps /></span>{t("topic.cost")}</button>}
-        {/* 资源巡检：站内看板（**不是**「更多」里那个外链到 idle 控制台的旧入口）。
-            放在成本之后 —— 它的两个主力页面是高负载（可靠性）与闲置（成本），
-            与上下两个邻居各有一半重合，位置上贴着它们最好找。 */}
-        {showInspection && <button className={"navitem" + (inspectionActive ? " active" : "")} onClick={() => onInspection?.()}><span className="ni-ic"><IconInspection /></span>{t("insp.title")}</button>}
         {showSecurity && <button className={"navitem" + (securityActive ? " active" : "")} onClick={() => onSecurity?.()}><span className="ni-ic"><IconSecurity /></span>{t("topic.security")}</button>}
         {showCases && <button className={"navitem" + (casesActive ? " active" : "")} onClick={onCases}><span className="ni-ic"><IconCases /></span>{t("topic.cases")}</button>}
+        {/* 巡检：站内看板（2026-09-04 从「资源巡检」改名并挪到 案例/Skills
+            之间 —— 用户指定的位置；老外链入口已随 idle 控制台退役）。 */}
+        {showInspection && <button className={"navitem" + (inspectionActive ? " active" : "")} onClick={() => onInspection?.()}><span className="ni-ic"><IconInspection /></span>{t("insp.title")}</button>}
         {/* Skills：独立一级入口。点开进独立 Skills 管理页（非「定制」外壳）。 */}
         {showSkills && (
           <button className={"navitem" + (skillsActive ? " active" : "")} onClick={() => onSkills?.()}>
@@ -204,13 +189,6 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
         )}
         {hasMoreItems && moreOpen && (
           <div className="sb-submenu">
-            {/* 外链：idle 控制台，新标签打开。当前由 SHOW_INSPECTIONS 关掉显示（代码保留）。 */}
-            {SHOW_INSPECTIONS && (
-              <button className="navitem subitem" onClick={openConsole}>
-                <span className="ni-ic"><IconReports /></span>{t("nav.inspections")}
-                <span className="ni-tag">{locale === "zh" ? "控制台" : "Console"} <IconExternal /></span>
-              </button>
-            )}
             {/* 管理：仅 admin 可见（后端 nav:admin 门禁 + 前端能力过滤）。角色/用户/模块。从一级收进「更多」。 */}
             {showAdmin && (
               <button className={"navitem subitem" + (adminActive ? " active" : "")} onClick={() => onAdmin?.()}>

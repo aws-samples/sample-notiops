@@ -52,9 +52,7 @@ export interface WebChatCoreProps {
    * 查询用它动态发现关联账号（devops-agent:ListAssociations），不再硬编码 payer
    * 账号 ID/角色 ARN（见 bff/web-chat/devops_agent_accounts.mjs）。 */
   agentSpaceId?: string;
-  /** idle 控制台前端 CloudFront 地址（NotiOpsBackendStack.consoleUrl）——写入 config.json，
-   * 供 chat-app 侧栏「巡检 & 报告」外链跳转。 */
-  idleConsoleUrl?: string;
+  // （`idleConsoleUrl` 已随老控制台退役，2026-09-04 —— 见 app.ts 的说明。）
   /** 报告 CDN 域名（NotiOpsBackendStack.reportsCdnDomain，CloudFront + OAC，只暴露 reports/*）。
    * 「深度调查（直连）」把 HTML 报告落到 dataBucket 的 reports/ 前缀后，用它拼**不过期**的链接。
    * 缺省时直连路径只是少一个报告链接（摘要仍在聊天里），不报错。 */
@@ -331,17 +329,29 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
 
          ⚠️ 已知缺口，不在这里修：`PRESET_ROLES` 的 `role:finops` /
             `role:support` / `role:viewer` 都含 `nav:inspection:*`
-            （authz.mjs），而 capability 树的裁剪只看角色与
-            `getDisabledModules()`，**不看部署拓扑**（visibleTree 里没有
-            任何 env 判据）。所以 standalone 上这些角色的用户会看到
-            「资源巡检」tab，点进去是 `ddb_error` 加载失败面板 ——
+            （authz.mjs），所以 standalone 上这些角色的用户会看到
+            「巡检」tab，点进去是 `ddb_error` 加载失败面板 ——
             HTTP 200、不是 403，也不会自动隐藏。
-            现成的收口手段是管理页的**模块开关**（`nav:inspection` 是
+            ⚠️ **这里原来写着「visibleTree 里没有任何 env 判据」，那已经
+               不成立**：`visibleTree` 现在压在 `alwaysOn` 之前跑一道
+               `envConfigured(node.requiresEnv)`（authz.mjs），
+               `filterDashboard` 也用同一判据剥响应字段 —— 下面第 381 行的
+               `COST_ANALYZER_FUNCTION` 正是靠它把方式 A 的
+               `nav:finops:daily-anomaly` 整张卡收掉的。
+            **机制有了，巡检这条却仍然收不掉**，原因不在机制而在下面那一行：
+               `INSPECTION_TABLE` 两条路径都**无条件**注入
+               `"notiops-inspection"`，于是 `requiresEnv: "INSPECTION_TABLE"`
+               在方式 A 上照样判「已配置」，闸门空转。真要自动收口，得先让
+               那一行也带 `props.staticTemplate` 条件（空串 = 这条路上没有
+               写侧），再给 `nav:inspection` 加 `requiresEnv` —— 那会动两条
+               路径的模板与 golden fixture，且**必须连带改掉
+               `bff/web-chat/inspection.mjs:51` 的
+               `process.env.INSPECTION_TABLE || "notiops-inspection"`**：
+               那个 `||` 兜底会把空串又填回成表名，闸门照样空转。
+               属独立改动，不该混在这次 merge 里。
+            眼下现成的收口手段仍是管理页的**模块开关**（`nav:inspection` 是
             level=tab 且非 alwaysOn/adminOnly，admin.mjs 的
-            `apiGetModules` 已把它列为可关）—— 需要人手关一次。
-            要做成自动的，得给 visibleTree 引入可用性判据，且必须与
-            `authorize()` 同步改（authz.mjs 开头那条不漂移的不变量），
-            那是一个独立改动，不该混在这次 merge 里。 */
+            `apiGetModules` 已把它列为可关）—— 需要人手关一次。 */
       // 巡检 space —— 管理页用它引导「把成员账号加为 monitor account」。
       INSPECT_AGENT_SPACE_ID: props.inspectionAgentSpaceId ?? "",
       INSPECT_AGENT_SPACE_NAME: props.inspectionAgentSpaceName ?? "",
@@ -359,6 +369,28 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       // 按需判读（「深入分析」）直接 invoke 它。硬编码同上一行的惯例 ——
       // 跨栈 Ref 会在两个栈间建立部署顺序依赖，改 BFF 不该被迫动后端栈。
       INSPECTION_EXECUTOR_FUNCTION: "notiops-inspection-executor",
+      /* 每日成本异常扫描（lambda5 = `notiops-cost-analyzer`）**在这条部署路径上是否存在**。
+         🔴 空串不是「客户没配」，是「这条路上压根没有这个后端」：`notiops-cost-analyzer`
+            和它那条 01:15 UTC 的 EventBridge 规则都只在 `notiops-backend-stack.ts` 里，
+            一键部署（方式 A）的最小底座刻意只装 Web Chat，不带这一族定时 Lambda
+            （见 minimal-base-core.ts 文件头）。写侧不存在 → 永远不会有扫描结果。
+         没有这个标记时，`nav:finops:daily-anomaly` 在方式 A 上恒可见、恒无数据，卡里
+         还写着「每日 01:15 UTC 跑」—— 而那边没有任何东西在 01:15 UTC 跑。它是
+         level=subtab，admin 的模块开关只收 level=tab，人手关不掉单张卡（只能连带
+         关掉整块 nav:finops）。所以这道 env 闸门是唯一的自动收口手段。
+         ⚠️ 单独加这一行**不改变任何行为**，三处必须同批落地：
+            · `config/capabilities.json` 给该节点加 `"requiresEnv": "COST_ANALYZER_FUNCTION"`
+            · `bff/web-chat/capabilities.json` 同步（复制型真源，两份逐字节一致，
+              tests/test_capabilities_parity.py 守）
+            · 本行的 `props.staticTemplate` 条件 —— 这个 construct 两条路径共用，
+              不给条件就等于两边都配上，闸门永不触发。
+         ⚠️ 这是把一处已知拓扑缺口收口成「功能不出现」（不许静默降级），**不是**补齐
+            对等；真正对等要把 lambda5 装进一键底座，那是独立改动。
+         ⚠️ 值必须与 notiops-backend-stack.ts 里 Lambda5CostAnalyzer 的 functionName 一致。
+         ⚠️ 改这一行会动 WebChatStack 模板：需要
+            `cd infra && UPDATE_GOLDEN=1 npx jest test/web-chat-golden.test.ts` 重生成
+            infra/test/fixtures/web-chat-stack.golden.json。 */
+      COST_ANALYZER_FUNCTION: props.staticTemplate ? "" : "notiops-cost-analyzer",
     },
     // 两种模式给的是**同一个保留期**，区别只在谁来设：CDK 路径用 logRetention（会带出一个
     // Custom::LogRetention Lambda），静态模板路径用显式 LogGroup 资源。名字交给 CFN 生成 ——
@@ -1480,7 +1512,6 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
     cognitoClientId: props.userPoolClientId,
     cognitoIdentityPoolId: identityPool.ref,
     region: stack.region,
-    idleConsoleUrl: props.idleConsoleUrl ?? "",
     rumAppMonitorId: appMonitor.attrId,
     rumIdentityPoolId: rumIdentityPool.ref,
     rumGuestRoleArn: rumGuestRole.roleArn,

@@ -185,6 +185,30 @@ aws logs tail /aws/lambda/notiops-im-ingress-feishu --region <REGION> --since 5m
 aws logs tail /aws/lambda/notiops-im-worker-feishu  --region <REGION> --since 5m
 ```
 
+> ⚠️ **上面这两个名字只对方式 B(`./setup.sh`)成立。方式 A(一键部署)必须先解析。**
+> 本文件后面所有 `/aws/lambda/notiops-im-*` 都同理。
+>
+> 原因:方式 A 的函数名带栈名前缀(`<栈名>-im-ingress-feishu`,防止与 `setup.sh` 的部署
+> 撞名),而**日志组名是 CloudFormation 生成的随机名**(`<栈名>-FeishuIngressLogs<hash>-<随机>`)
+> —— 它连 `/aws/lambda/` 前缀都没有,拿栈名拼不出来。方式 A 刻意不写死日志组名:写死
+> `/aws/lambda/<函数名>` 会撞上 Lambda 服务自建的同名组,`NAME_CONFLICT_VALIDATION`
+> 让整栈在 9 秒内失败(理由见 `infra/lib/constructs/im-core.ts` 的 `explicitLogGroupNames`)。
+>
+> 从栈里查(逻辑 ID 前缀是稳定的,别去猜后面的 hash):
+>
+> ```bash
+> STACK=<你开栈时填的栈名>   # 例如 notiops
+> REGION=<REGION>
+> lg() { aws cloudformation describe-stack-resources --stack-name "$STACK" --region "$REGION" \
+>   --query "StackResources[?starts_with(LogicalResourceId,'$1')].PhysicalResourceId" --output text; }
+>
+> aws logs tail "$(lg FeishuIngressLogs)" --region "$REGION" --since 5m
+> aws logs tail "$(lg FeishuWorkerLogs)"  --region "$REGION" --since 5m
+> # Slack 换成 SlackIngressLogs / SlackWorkerLogs;进度刷新是 ImProgressLogs
+> ```
+>
+> 唯一的例外是部署 Lambda:它的日志组**是**写死的 `/aws/lambda/<栈名>-stager`。
+
 - ingress 有日志、worker 没有 → 验签过了但投递失败（看 ingress 的报错）
 - ingress 里有 `401 (signature/token)` → 两把钥匙和控制台不一致，回到 §1.2
 - 两个都没日志 → 飞书没发出来，检查订阅方式是否真的切走了长连接
@@ -354,6 +378,27 @@ cd infra && npx cdk deploy ImStack --output ../.cdk-out --region <REGION> \
 
 飞书填 `oc_` 开头的 chat id，Slack 填 `C`/`D` 开头的 channel id，逗号分隔。
 留空 = 不限制（与长连接时代行为一致）。
+
+### 3.1 同一个群里装两个 bot（测试环境 + 生产环境）
+
+**可以**，而且它们不会互相抢答：@ 谁谁回，另一个完全静默 —— 连「思考中」的表情都不打。
+
+判据是 bot 自己的 `open_id`：飞书**没有** Slack 那种独立的 `app_mention` 事件，
+bot 在群里是成员时，群里的每一句话都会作为 `im.message.receive_v1` 投过来，
+事件里只有一个 `mentions` 数组装着这条消息 @ 到的**所有**人/bot。所以「@ 的是谁」
+由 bot 自己比对：启动后查一次 `GET /bot/v3/info` 拿到自己的 `open_id`，
+只有 `mentions` 里出现这个 id 才响应。
+
+因此：
+
+- **不带 @ 的群内闲聊两个 bot 都不响应** —— 群消息必须 @ 才触发（私聊不需要）。
+- **`@产品 @NotiOps 看下这个` 这种混合 @ 会触发** —— 只要被 @ 的人里有它。
+- **万一 bot 查不到自己的 `open_id`**（凭证过期、网络抖动），它在群里**装死**而不是
+  见到 @ 就抢答 —— 宁可让你立刻发现「它不理我了」，也不要在装了两个 bot 的群里
+  多答一次而你分不清是谁答的。这时候**私聊仍然可用**，去看 ingress 日志里的
+  `bot identity: GET /bot/v3/info` 那行 ERROR（抖动会在一分钟内自愈）。
+
+> Slack 侧不需要这一层：它有独立的 `app_mention` 事件，平台已经替我们分好了。
 
 ---
 

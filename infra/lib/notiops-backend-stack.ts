@@ -46,6 +46,21 @@ import {
   webNotifRuleDescription,
   webNotifRuleName,
 } from "./constructs/web-notif-sources";
+// DevOps Agent 调查回调的唯一真源 —— 同样两条路径共用，别把常量抄回本文件。
+import {
+  DEVOPS_CALLBACK_DLQ_NAME,
+  DEVOPS_CALLBACK_DLQ_RETENTION_DAYS,
+  DEVOPS_CALLBACK_FUNCTION_DESCRIPTION,
+  DEVOPS_CALLBACK_FUNCTION_NAME,
+  DEVOPS_CALLBACK_HANDLER,
+  DEVOPS_CALLBACK_MEMORY_MB,
+  DEVOPS_CALLBACK_RETRY_ATTEMPTS,
+  DEVOPS_CALLBACK_TIMEOUT_SECONDS,
+  DEVOPS_EVENT_SOURCE,
+  DEVOPS_INVESTIGATION_DETAIL_TYPES,
+  devopsCallbackRuleDescription,
+  devopsCallbackRuleName,
+} from "./constructs/devops-callback";
 
 export class NotiOpsBackendStack extends cdk.Stack {
   public readonly dataBucketName: string;
@@ -66,8 +81,6 @@ export class NotiOpsBackendStack extends cdk.Stack {
   // 标量读取点（shared/devops_agent.py · core/ · devops_agent_callback/ ·
   // shared/report_delivery/ · 前端），改多值等于重写整条排障链路。
   public readonly inspectionAgentSpaceId: string;
-  // 暴露给 WebChatStack：idle 控制台前端 CloudFront 地址，供 web chat 侧栏「巡检&报告」外链跳转。
-  public readonly consoleUrl: string;
 
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
@@ -596,10 +609,6 @@ export class NotiOpsBackendStack extends cdk.Stack {
         removalPolicy: cdk.RemovalPolicy.DESTROY,
       });
 
-    const logGroupCollector = createLogGroup("LogGroupCollector", "notiops-collector");
-    const logGroupAnalyzer = createLogGroup("LogGroupAnalyzer", "notiops-analyzer");
-    const logGroupApi = createLogGroup("LogGroupApi", "notiops-api");
-    const logGroupHealthChecker = createLogGroup("LogGroupHealthChecker", "notiops-health-checker");
     const logGroupNotifier = createLogGroup("LogGroupNotifier", "notiops-notifier");
     const logGroupCostAnalyzer = createLogGroup("LogGroupCostAnalyzer", "notiops-cost-analyzer");
     const logGroupCurFinalizer = createLogGroup("LogGroupCurFinalizer", "notiops-cur-finalizer");
@@ -664,82 +673,11 @@ export class NotiOpsBackendStack extends cdk.Stack {
       ],
     });
 
-    // Lambda1 - Collector
-    const lambda1 = new lambda.Function(this, "Lambda1Collector", {
-      ...commonLambdaProps,
-      functionName: "notiops-collector",
-      handler: "lambda1_collector.handler.handler",
-      code: lambdaCode,
-      logGroup: logGroupCollector,
-      description: "资源发现、白名单过滤、CloudWatch 指标采集和数据入库（阶段一至三）",
-    } as lambda.FunctionProps);
-
-    // Lambda2 - Analyzer
-    const lambda2 = new lambda.Function(this, "Lambda2Analyzer", {
-      ...commonLambdaProps,
-      functionName: "notiops-analyzer",
-      handler: "lambda2_analyzer.handler.handler",
-      code: lambdaCode,
-      logGroup: logGroupAnalyzer,
-      description: "深度分析判定、评分和报告生成（阶段四）",
-    } as lambda.FunctionProps);
-
-    lambda1.addEnvironment("LAMBDA2_FUNCTION_NAME", lambda2.functionName);
-
-    // API Lambda
-    const apiLambda = new lambda.Function(this, "ApiLambda", {
-      ...commonLambdaProps,
-      functionName: "notiops-api",
-      handler: "api.handler.handler",
-      logGroup: logGroupApi,
-      timeout: cdk.Duration.seconds(30),
-      memorySize: 256,
-      code: lambdaCode,
-      description: "REST API — Dashboard、报告、白名単、阈值、账户管理",
-    } as lambda.FunctionProps);
-
-    // Lambda3 - HealthChecker (AI 智能巡检)
-    const lambda3 = new lambda.Function(this, "Lambda3HealthChecker", {
-      ...commonLambdaProps,
-      functionName: "notiops-health-checker",
-      handler: "lambda3_health_checker.handler.handler",
-      code: lambdaCode,
-      logGroup: logGroupHealthChecker,
-      timeout: cdk.Duration.seconds(600),
-      memorySize: 512,
-      description: "RDS/ElastiCache AI 智能巡检 — Bedrock 分析与报告生成（路径 C）",
-    } as lambda.FunctionProps);
-
-    // 与 config/llm-model-catalog.json 的 default_model 一致（2026-09-01 起为 Grok 4.6）。
-    // lambda3 走 `client.converse()`（见 lambda3_health_checker/bedrock_invoker.py），
-    // 而 Grok 的目录 kind 就是 `bedrock_converse` —— 协议原生对得上（换成任何
-    // Converse 可调的模型都行；**不要**换成只走 Mantle Responses 的 GPT-5.6 系列）。
-    lambda3.addEnvironment("BEDROCK_MODEL_ID", "global.xai.grok-4.6");
-    apiLambda.addEnvironment("HEALTH_CHECKER_FUNCTION_NAME", lambda3.functionName);
-    apiLambda.addEnvironment("COLLECTOR_FUNCTION_NAME", "notiops-collector");
 
     // ─── 多账号一键接入（控制台「账户接入」Tab，orgMode 专属）───
     // API Lambda 通过 StackSets 向成员账号下发 member-account-onboarding.yaml，
     // 并用 Organizations ListAccounts 填充账号下拉列表。
     if (orgMode) {
-      const onboardingStackSetName = "notiops-member-onboarding";
-      apiLambda.addEnvironment("MEMBER_ONBOARDING_STACKSET_NAME", onboardingStackSetName);
-      apiLambda.addEnvironment("NOTIOPS_MEMBER_ROLE_NAME", `notiops-idle-detection-role-${this.account}`);
-      apiLambda.addEnvironment("ORGANIZATION_ID", organizationId);
-      lambdaRole.addToPolicy(new iam.PolicyStatement({
-        sid: "OrgOnboardStackSets",
-        actions: [
-          "cloudformation:CreateStackInstances",
-          "cloudformation:DescribeStackSet",
-          "cloudformation:DescribeStackSetOperation",
-          "cloudformation:ListStackInstances",
-        ],
-        resources: [
-          `arn:aws:cloudformation:${this.region}:${this.account}:stackset/${onboardingStackSetName}:*`,
-          `arn:aws:cloudformation:*:*:stackset-target/${onboardingStackSetName}:*`,
-          "arn:aws:cloudformation:*::type/resource/*",
-        ],
-      }));
       // CloudWatch OAM Sink（跨账号 observability 管理侧入口）：成员账号经 member
       // 模板的 oam:Link 把 metrics/logs/traces 共享进来（调查/告警关联分析用）。
       // ⚠ OAM 限制：每账号每 Region 只允许 1 个 Sink。已有 Sink（如客户自配的
@@ -773,14 +711,6 @@ export class NotiOpsBackendStack extends cdk.Stack {
       new cdk.CfnOutput(this, "ObservabilitySinkArn", { value: oamSink.getAtt("Arn").toString() });
       }
 
-      lambdaRole.addToPolicy(new iam.PolicyStatement({
-        sid: "OrgOnboardListAccounts",
-        actions: [
-          "organizations:ListAccounts",
-          "organizations:DescribeOrganization",
-        ],
-        resources: ["*"],
-      }));
     }
 
     // Lambda4 - Notifier（定时推送巡检报告和闲置资源通知到飞书）
@@ -928,84 +858,7 @@ export class NotiOpsBackendStack extends cdk.Stack {
       description: "setup.sh 创建 EventBridge Scheduler 一次性 schedule 时作为 RoleArn",
     });
 
-    // ─── API Gateway ───
-    const api = new apigateway.RestApi(this, "IdleDetectorApi", {
-      restApiName: "notiops-api",
-      description: "AWS 资源闲置检测系统 REST API",
-      deployOptions: { stageName: "prod" },
-      // CORS：优先用部署方通过 `-c allowedOrigins=https://a.com,https://b.com` 指定的可信域名白名单。
-      // 未指定时回退到 ALL_ORIGINS —— 说明：① 该 API 的每个数据类端点都要求 Cognito User Pool
-      // 授权（下方 authorizer + IAM/SigV4），浏览器 CORS 不是这里的主要信任边界;② 前端 CloudFront
-      // 域名是每次部署动态生成的、部署期未知,示例仓库无法预置固定白名单。生产部署应显式传
-      // allowedOrigins 收窄到自己的前端域名。
-      defaultCorsPreflightOptions: {
-        allowOrigins: (() => {
-          const raw = (this.node.tryGetContext("allowedOrigins") as string) || "";
-          const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
-          if (!list.length) {
-            cdk.Annotations.of(this).addWarning(
-              "CORS allowOrigins 回退到 '*'（所有来源）。生产部署请传 " +
-              "`-c allowedOrigins=https://<你的前端域名>` 收窄到可信域名。" +
-              "接口仍由 Cognito 授权，但收窄 CORS 是纵深防御的推荐做法。",
-            );
-            return apigateway.Cors.ALL_ORIGINS;
-          }
-          return list;
-        })(),
-        allowMethods: apigateway.Cors.ALL_METHODS,
-        allowHeaders: ["Content-Type", "Authorization"],
-      },
-    });
-
-    const authorizer = new apigateway.CognitoUserPoolsAuthorizer(this, "CognitoAuth", {
-      cognitoUserPools: [userPool],
-      authorizerName: "notiops-cognito-auth",
-    });
-
-    const authOpts: apigateway.MethodOptions = {
-      authorizer,
-      authorizationType: apigateway.AuthorizationType.COGNITO,
-    };
-
-    const integration = new apigateway.LambdaIntegration(apiLambda);
-    const apiRes = api.root.addResource("api");
-
-    // 使用 {proxy+} 代理模式，避免 Lambda 资源策略超过 20KB 限制
-    // 所有 /api/* 请求统一转发到 API Lambda，由 Python handler 内部路由
-    apiRes.addProxy({
-      defaultIntegration: integration,
-      defaultMethodOptions: authOpts,
-      anyMethod: true,
-    });
-
     // ─── EventBridge 定时规则 ───
-    new events.Rule(this, "DailyCollectionRule", {
-      ruleName: "notiops-daily-collection",
-      description: "每天 00:00 UTC 触发 Lambda1-Collector",
-      schedule: events.Schedule.cron({ minute: "0", hour: "0" }),
-      targets: [new targets.LambdaFunction(lambda1)],
-    });
-
-    // Lambda3 每天定时 RDS 巡检（在 Lambda1 采集完成后执行，00:30 UTC）
-    new events.Rule(this, "DailyHealthCheckRule", {
-      ruleName: "notiops-daily-health-check",
-      description: "每天 00:30 UTC 触发 Lambda3-HealthChecker 执行 RDS AI 巡检",
-      schedule: events.Schedule.cron({ minute: "30", hour: "0" }),
-      targets: [new targets.LambdaFunction(lambda3)],
-    });
-
-    // Lambda3 每天定时 ElastiCache 巡检（在 RDS 巡检之后，01:00 UTC）
-    new events.Rule(this, "DailyElastiCacheHealthCheckRule", {
-      ruleName: "notiops-daily-elasticache-health-check",
-      description: "每天 01:00 UTC 触发 ElastiCache AI 巡检",
-      schedule: events.Schedule.cron({ minute: "0", hour: "1" }),
-      targets: [new targets.LambdaFunction(lambda3, {
-        event: events.RuleTargetInput.fromObject({
-          resource_type: "elasticache",
-        }),
-      })],
-    });
-
     // Lambda5 每天定时成本异常分析（在 Lambda3 之后、Lambda4 之前，01:15 UTC）
     new events.Rule(this, "DailyCostAnalysisRule", {
       ruleName: "notiops-daily-cost-analysis",
@@ -1022,75 +875,6 @@ export class NotiOpsBackendStack extends cdk.Stack {
       targets: [new targets.LambdaFunction(lambda4)],
     });
 
-    // ─── S3 + CloudFront 前端托管 ───
-    const siteBucket = new s3.Bucket(this, "FrontendBucket", {
-      bucketName: `notiops-frontend-${this.account}-${this.region}`,
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-      encryption: s3.BucketEncryption.S3_MANAGED,  // Security: 显式 SSE(与 dataBucket 一致)
-      enforceSSL: true,                            // Security: 拒绝非 TLS 请求
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-      autoDeleteObjects: true,
-    });
-
-    const oai = new cloudfront.OriginAccessIdentity(this, "OAI");
-    siteBucket.grantRead(oai);
-
-    const distribution = new cloudfront.Distribution(this, "FrontendCDN", {
-      defaultBehavior: {
-        origin: origins.S3BucketOrigin.withOriginAccessIdentity(siteBucket, { originAccessIdentity: oai }),
-        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-      },
-      defaultRootObject: "index.html",
-      errorResponses: [
-        { httpStatus: 403, responseHttpStatus: 200, responsePagePath: "/index.html", ttl: cdk.Duration.minutes(5) },
-        { httpStatus: 404, responseHttpStatus: 200, responsePagePath: "/index.html", ttl: cdk.Duration.minutes(5) },
-      ],
-    });
-    this.consoleUrl = `https://${distribution.distributionDomainName}`;
-
-    // ─── 前端配置注入 + 构建 + 部署 ───
-    // 创建 runtime config JSON，前端在运行时加载
-    const configInitFn = new lambda.Function(this, "FrontendConfigFunction", {
-      runtime: lambda.Runtime.PYTHON_3_14,
-      handler: "index.handler",
-      code: lambda.Code.fromAsset(path.join(__dirname, "..", "lambda", "frontend-config")),
-      timeout: cdk.Duration.minutes(2),
-      memorySize: 256,
-      environment: {
-        BUCKET_NAME: siteBucket.bucketName,
-        API_BASE: api.url + "api",
-        COGNITO_USER_POOL_ID: userPool.userPoolId,
-        COGNITO_CLIENT_ID: userPoolClient.userPoolClientId,
-      },
-    });
-
-    siteBucket.grantWrite(configInitFn);
-
-    const configProvider = new cr.Provider(this, "FrontendConfigProvider", {
-      onEventHandler: configInitFn,
-      logRetention: logs.RetentionDays.ONE_WEEK,
-    });
-
-    // 先部署前端静态文件
-    const frontendDeployment = new s3deploy.BucketDeployment(this, "DeployFrontend", {
-      sources: [s3deploy.Source.asset("../frontend/frontend-app/dist")],
-      destinationBucket: siteBucket,
-      distribution,
-      distributionPaths: ["/*"],
-    });
-
-    // 再写入 runtime config（覆盖 .env 中的占位值）
-    const configResource = new cdk.CustomResource(this, "FrontendConfig", {
-      serviceToken: configProvider.serviceToken,
-      properties: {
-        apiBase: api.url + "api",
-        userPoolId: userPool.userPoolId,
-        clientId: userPoolClient.userPoolClientId,
-        timestamp: Date.now().toString(),
-      },
-    });
-
-    configResource.node.addDependency(frontendDeployment);
 
     // ─── Secrets Manager (IM Bot credentials) ───
     const feishuSecret = new secretsmanager.Secret(this, "FeishuBotSecret", {
@@ -1241,13 +1025,12 @@ export class NotiOpsBackendStack extends cdk.Stack {
     }));
 
     // Lambda env vars for secrets
-    lambda3.addEnvironment("BEDROCK_API_KEY_SECRET_ARN", bedrockApiKeySecret.secretArn);
-    lambda4.addEnvironment("BEDROCK_API_KEY_SECRET_ARN", bedrockApiKeySecret.secretArn);
-    apiLambda.addEnvironment("BEDROCK_API_KEY_SECRET_ARN", bedrockApiKeySecret.secretArn);
-    lambda3.addEnvironment("LITELLM_CONFIG_SECRET_ARN", liteLlmConfigSecret.secretName);
-    lambda4.addEnvironment("LITELLM_CONFIG_SECRET_ARN", liteLlmConfigSecret.secretName);
-    apiLambda.addEnvironment("LITELLM_CONFIG_SECRET_ARN", liteLlmConfigSecret.secretName);
+    // （BEDROCK_API_KEY / LITELLM 两个 env 随健康报告 AI 解析一起退役，
+    //   2026-09-04 —— lambda4 不再调任何模型。）
     lambda4.addEnvironment("FEISHU_SECRET_ARN", feishuSecret.secretArn);
+    // 每日消息的巡检段读新巡检表（2026-09-04 改造，老 RDS/EC/闲置段退役）
+    lambda4.addEnvironment("INSPECTION_TABLE", inspectionTable.tableName);
+    inspectionTable.grantReadData(lambda4);
     // Same Slack token wiring as the callback Lambda (see comment above)
     // — without this lambda4's idle/cost-report push to Slack channels
     // silently no-ops via slack_sender.is_configured() == False.
@@ -2116,6 +1899,8 @@ def handler(event, context):
         "部署完 WebChatStack 后用 -c webBaseUrl=<ChatUrl 输出值> 重新部署即可补上。",
       );
     }
+    // 每日通知（lambda4）的尾注深链同一来源（声明顺序所限，env 加在这里）。
+    lambda4.addEnvironment("WEB_BASE_URL", inspectionWebBaseUrl);
     const inspectionPushLambda = new lambda.Function(
       this,
       "InspectionPushLambda",
@@ -2394,8 +2179,8 @@ def handler(event, context):
 
     // ─── SQS DLQ：Custom Bus Rule → Callback Lambda 投递失败落到此队列 ───
     const callbackDlq = new sqs.Queue(this, "DevOpsAgentCallbackDlq", {
-      queueName: "notiops-devops-callback-dlq",
-      retentionPeriod: cdk.Duration.days(14),
+      queueName: DEVOPS_CALLBACK_DLQ_NAME,
+      retentionPeriod: cdk.Duration.days(DEVOPS_CALLBACK_DLQ_RETENTION_DAYS),
     });
 
     // ─── Callback Lambda 独立代码包 ───
@@ -2419,16 +2204,16 @@ def handler(event, context):
     });
 
     // ─── Callback Lambda ───
-    const logGroupCallback = createLogGroup("LogGroupCallback", "notiops-devops-callback");
+    const logGroupCallback = createLogGroup("LogGroupCallback", DEVOPS_CALLBACK_FUNCTION_NAME);
     const devopsCallbackLambda = new lambda.Function(this, "DevOpsCallbackLambda", {
-      functionName: "notiops-devops-callback",
+      functionName: DEVOPS_CALLBACK_FUNCTION_NAME,
       runtime: lambda.Runtime.PYTHON_3_14,
-      handler: "devops_agent_callback.handler.handler",
+      handler: DEVOPS_CALLBACK_HANDLER,
       code: devopsCallbackCode,
       logGroup: logGroupCallback,
       role: lambdaRole,
-      timeout: cdk.Duration.seconds(120),
-      memorySize: 256,
+      timeout: cdk.Duration.seconds(DEVOPS_CALLBACK_TIMEOUT_SECONDS),
+      memorySize: DEVOPS_CALLBACK_MEMORY_MB,
       // 🔴 **函数级 DLQ**（2026-08-29 实测补上）。
       //
       //    实测：`AsyncEventsReceived (76) == Invocations (76)` ——
@@ -2475,8 +2260,7 @@ def handler(event, context):
         // 「巡检 callback 从来没触发过」。domain 侧对空值记 ERROR 兜住这点。
         INSPECT_AGENT_SPACE_ID: inspectionAgentSpace.attrAgentSpaceId,
       },
-      description:
-        "DevOps Agent 调查结果回调 — Custom Event Bus 触发，AssumeRole 拉摘要 → Bedrock 精简 → 入 DDB",
+      description: DEVOPS_CALLBACK_FUNCTION_DESCRIPTION,
     });
 
     // LITELLM Secret env
@@ -2503,7 +2287,7 @@ def handler(event, context):
       metric: new cloudwatch.Metric({
         namespace: "AWS/Lambda",
         metricName: "AsyncEventsDropped",
-        dimensionsMap: { FunctionName: "notiops-devops-callback" },
+        dimensionsMap: { FunctionName: DEVOPS_CALLBACK_FUNCTION_NAME },
         statistic: "Sum",
         period: cdk.Duration.minutes(5),
       }),
@@ -2530,78 +2314,36 @@ def handler(event, context):
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
 
-    // ─── EventBridge Rule on Custom Bus → Callback Lambda（带 DLQ + 2 次重试）───
-    new events.Rule(this, "DevOpsAgentCallbackCustomRule", {
-      ruleName: "devops-agent-callback-custom",
-      eventBus: devopsEventBus,
-      description:
-        "DevOps Agent 调查结果回调 — Investigation Completed/Failed/Timed Out（Custom Bus）",
-      eventPattern: {
-        source: ["aws.aidevops"],
-        detailType: [
-          "Investigation Created",
-          "Investigation Completed",
-          "Investigation Failed",
-          "Investigation Timed Out",
-          "Investigation Cancelled",
-          "Investigation Linked",
-          // R13.13b：官方语义是「matched skip criteria defined in
-          // a skill」，而巡检自己上传两份判读 skill → 这条路径**真实可达**。
-          // 少了它，SKIPPED 只能等对账 Lambda 每小时一次去 GetBacklogTask 才
-          // 发现 —— 在那之前 finding 上一直显示「判读缺失（原因未知）」。
-          //
-          // ⚠️ 判据取自官方文档的 10 个 detail-type，**不是** EventBridge
-          // schema registry。实测 registry 里**没有** InvestigationSkipped
-          // （2026-07 查 ap-northeast-1 与 us-east-1 都只有 9 个 Investigation
-          // schema）—— registry 滞后于文档。本文件上方那句「判据:schema
-          // registry 里存在该 schema」对新事件类型不可靠。
-          "Investigation Skipped",
-        ],
-      },
-      targets: [
-        new targets.LambdaFunction(devopsCallbackLambda, {
-          deadLetterQueue: callbackDlq,
-          retryAttempts: 2,
-        }),
-      ],
+    // ─── EventBridge Rules → Callback Lambda（带 DLQ + 2 次重试）───
+    // source / detail-type / 规则名 / 描述全部 import 自
+    // `constructs/devops-callback.ts` —— **一键部署（方式 A）import 的是同一份**，
+    // 别把那张 7 条清单抄回这里（这两条规则原先各写了一遍，加第 8 个 detail-type 时
+    // 只改一处就是静默漏消费）。
+    //
+    // 两条总线都要：本账号的 DevOps Agent 把事件发到 **default** bus，Custom Bus 是
+    // 给跨账号转发用的落点。方式 A 不建 Custom Bus，所以那边只有 default 那条。
+    const callbackEventPattern: events.EventPattern = {
+      source: [DEVOPS_EVENT_SOURCE],
+      detailType: [...DEVOPS_INVESTIGATION_DETAIL_TYPES],
+    };
+    const callbackTarget = () => new targets.LambdaFunction(devopsCallbackLambda, {
+      deadLetterQueue: callbackDlq,
+      retryAttempts: DEVOPS_CALLBACK_RETRY_ATTEMPTS,
     });
 
-    // ─── EventBridge Rule on DEFAULT Bus → Callback Lambda ───
-    // 本账号的 DevOps Agent 把事件发到 default bus(不是 Custom Bus)。
-    // Custom Bus 是给跨账号转发用的;本账号需要在 default bus 也有 rule。
-    // 原 notiops-devops SAM 就是在 default bus 上建的 EventBridgeRule。
+    new events.Rule(this, "DevOpsAgentCallbackCustomRule", {
+      ruleName: devopsCallbackRuleName("custom"),
+      eventBus: devopsEventBus,
+      description: devopsCallbackRuleDescription("custom"),
+      eventPattern: callbackEventPattern,
+      targets: [callbackTarget()],
+    });
+
     new events.Rule(this, "DevOpsAgentCallbackDefaultRule", {
-      ruleName: "devops-agent-callback-default",
-      description:
-        "DevOps Agent 调查事件(本账号 default bus) → Callback Lambda",
-      eventPattern: {
-        source: ["aws.aidevops"],
-        detailType: [
-          "Investigation Created",
-          "Investigation Completed",
-          "Investigation Failed",
-          "Investigation Timed Out",
-          "Investigation Cancelled",
-          "Investigation Linked",
-          // R13.13b：官方语义是「matched skip criteria defined in
-          // a skill」，而巡检自己上传两份判读 skill → 这条路径**真实可达**。
-          // 少了它，SKIPPED 只能等对账 Lambda 每小时一次去 GetBacklogTask 才
-          // 发现 —— 在那之前 finding 上一直显示「判读缺失（原因未知）」。
-          //
-          // ⚠️ 判据取自官方文档的 10 个 detail-type，**不是** EventBridge
-          // schema registry。实测 registry 里**没有** InvestigationSkipped
-          // （2026-07 查 ap-northeast-1 与 us-east-1 都只有 9 个 Investigation
-          // schema）—— registry 滞后于文档。本文件上方那句「判据:schema
-          // registry 里存在该 schema」对新事件类型不可靠。
-          "Investigation Skipped",
-        ],
-      },
-      targets: [
-        new targets.LambdaFunction(devopsCallbackLambda, {
-          deadLetterQueue: callbackDlq,
-          retryAttempts: 2,
-        }),
-      ],
+      ruleName: devopsCallbackRuleName("default"),
+      description: devopsCallbackRuleDescription("default"),
+      eventPattern: callbackEventPattern,
+      targets: [callbackTarget()],
     });
 
     // ─── S3 Bucket：共用业务桶(前缀分区:onboarding/ + skills/ + 将来 reports/)───
@@ -2664,13 +2406,9 @@ def handler(event, context):
     new cdk.CfnOutput(this, "ReportsCdnDomain", { value: reportsCdn.distributionDomainName });
 
     // Dashboard API Lambda 读写 onboarding 模板 + skill(管理端)
-    dataBucket.grantReadWrite(apiLambda);
-    apiLambda.addEnvironment("ONBOARDING_TEMPLATES_BUCKET", dataBucket.bucketName);
-    apiLambda.addEnvironment("SKILLS_BUCKET", dataBucket.bucketName);
     // DATA_BUCKET：调查详情按需从 S3 读 investigations/<task_id>/report.md
     // （report pipeline refactor）。代码侧解析顺序 S3_BUCKET → DATA_BUCKET →
     // SKILLS_BUCKET，三者均指向同一数据桶。
-    apiLambda.addEnvironment("DATA_BUCKET", dataBucket.bucketName);
 
     // 注:seedDataFn 不再写 S3 skill(预置 skill 改由 BFF 运行时 seedPresetSkills 统一 seed),
     // 故此处不再给它注入 SKILLS_BUCKET / 授予 dataBucket 读写 / 加 dataBucket 依赖(最小权限)。
@@ -3000,14 +2738,6 @@ def handler(event, context):
     } // end if (!skipPhd)
 
     // ─── Outputs ───
-    new cdk.CfnOutput(this, "CloudFrontUrl", {
-      value: `https://${distribution.distributionDomainName}`,
-      description: "前端访问地址",
-    });
-    new cdk.CfnOutput(this, "ApiUrl", {
-      value: api.url,
-      description: "API Gateway URL",
-    });
     new cdk.CfnOutput(this, "UserPoolId", {
       value: userPool.userPoolId,
       description: "Cognito User Pool ID",
@@ -3023,14 +2753,6 @@ def handler(event, context):
     new cdk.CfnOutput(this, "IdleDetectionRoleArn", {
       value: idleDetectionRole.roleArn,
       description: "管理账户 IdleDetectionRole ARN — 在 Dashboard 目标账户管理中添加",
-    });
-    new cdk.CfnOutput(this, "FrontendBucketName", {
-      value: siteBucket.bucketName,
-      description: "前端 S3 Bucket",
-    });
-    new cdk.CfnOutput(this, "DistributionId", {
-      value: distribution.distributionId,
-      description: "CloudFront Distribution ID",
     });
     new cdk.CfnOutput(this, "DevOpsAgentEventBusArn", {
       value: devopsEventBus.eventBusArn,

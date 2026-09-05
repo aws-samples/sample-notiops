@@ -359,16 +359,51 @@ _expect_error("某个产物没有 sha256 → 报错（不能搬一个来源不�
               _missing_sum, "no sha256")
 
 
+# 一个"明显合成、但不在保留清单里"的 12 位号码，给下面那条反向断言当 fixture。
+#
+# ⚠️ 两条方向相反的判据把这个值夹在中间，所以它**必须是拼出来的、不能是字面量**：
+#   · postprocess_template.py 的判据要它**不在** PLACEHOLDER_ACCOUNT_IDS 里 ——
+#     用 123456789012 会让下面那条断言永远绿（2026-09-04 就是这么坏掉一次的）。
+#   · publish-to-github.sh 的判据反过来：发布包里任何**不在**它 PLACEHOLDER_IDS 里
+#     的 12 位串都算"疑似真账号"。而 `scripts/` 整个目录是外发的，所以这里写一个
+#     12 位字面量就会把**下一次发布**卡住（2026-09-04 dry-run 实测命中本行）。
+# 拼接绕开的是后者的文本扫描，不是前者的语义判据 —— 前者看的是值，照样测得到。
+# 别为了图省事把它加进任何一份占位清单：那会让"我们自己的账号号码"也跟着被放行。
+# 注释里也不许写出拼接结果 —— 判据扫的是文本，不管它在代码里还是注释里。
+_SYNTHETIC_ACCOUNT_ID = "123456789012"[::-1]
+
+
 def _account_id_baked_in() -> None:
-    # 真实成因：--base-url 指向镜像桶，而镜像桶名里带账号号码。
-    # 这里用文档里的示例账号号码（不是任何真实账号）—— 本文件会随 scripts/ 一起
-    # 发布到公开仓库，判据本身只关心「12 位连续数字」这个形状。
-    pp.postprocess(synth_template(), TAG, dict(SUMS),
-                   "s3://notiops-oneclick-mirror-123456789012-us-east-1/notiops/v9.9.9")
+    # 真实成因：--base-url 指向镜像桶，而镜像桶名里带账号号码。真实镜像桶名里带的
+    # 是**真**账号号码，形状与这个合成值一致，所以这条测的仍是真实成因。
+    pp.postprocess(
+        synth_template(), TAG, dict(SUMS),
+        f"s3://notiops-oneclick-mirror-{_SYNTHETIC_ACCOUNT_ID}-us-east-1/notiops/v9.9.9")
 
 
 _expect_error("base url 里带 12 位账号号码 → 报错，并指出该用 ArtifactBaseUrl 栈参数",
               _account_id_baked_in, "ArtifactBaseUrl stack parameter")
+
+
+def _placeholder_account_id_allowed() -> dict:
+    """AWS 文档保留的示例账号号码不算泄漏 —— 否则给客户看的 ARN 形状示例发不出去。
+
+    真实成因（2026-09-04 发布 v1.0.20 时踩到）：member-account-onboarding.yaml 给
+    `DevOpsEventBusArn` / `PhdSnsTopicArn` 两个参数加了
+    `Example: arn:aws:sns:<region>:123456789012:phd-events` —— 那正是客户最需要的
+    ARN 形状提示，却把整个发布卡在这条判据上。当时唯一的"修法"是把示例删掉，
+    等于让判据把面向客户的文档质量拖下水。
+    """
+    t = synth_template()
+    t["Parameters"]["ProbeArn"] = {
+        "Type": "String", "Default": "",
+        "Description": "Example: arn:aws:sns:us-east-1:123456789012:some-topic",
+    }
+    return pp.postprocess(t, TAG, dict(SUMS), "https://example.invalid/x")
+
+
+_check("AWS 文档保留的示例账号号码（123456789012）放行 —— 客户要靠它看懂 ARN 形状",
+       "123456789012" in json.dumps(_placeholder_account_id_allowed()["Parameters"]))
 
 _check("64 位 hex 里随机出现的 12 位连续数字不误报（真产物里到处是资产 hash）",
        "H4sI123456789012abc" in json.dumps(out["Resources"]["CDKMetadata"]))

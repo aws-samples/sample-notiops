@@ -321,9 +321,12 @@ def test_tops_up_models_added_after_the_first_deploy() -> None:
     showing the old list, with no error anywhere. That is exactly how `zai-glm-5`
     was missing from production a day after being added (2026-08-27).
 
-    The top-up is additive and gated on `generation == 0`: an administrator who
-    has saved that page may have dropped a model deliberately, and a deploy
-    resurrecting it would be the same defect as overwriting their config.
+    The top-up is gated on `generation == 0`: an administrator who has saved that
+    page may have dropped a model deliberately, and a deploy resurrecting it
+    would be the same defect as overwriting their config.
+
+    Field-level changes to entries that already exist are the sibling case, in
+    `test_retiring_a_model_reaches_seeded_environments`.
     """
     print("test_tops_up_models_added_after_the_first_deploy")
     mod = _load_seeder()
@@ -364,20 +367,94 @@ def test_tops_up_models_added_after_the_first_deploy() -> None:
            rc == 0 and edited.updates == 0
            and len(edited.item["models"]) == len(cfg["models"]) - 1, f"rc={rc}")
 
-    # 只增不改：库里已有的条目（哪怕被关掉了）逐字段保留，目录里没有的留在末尾
+    # 目录里没有的 alias 保留在末尾：目录退休模型走 enabled:false 而不是删除，就是为了
+    # 让历史消息还能查到标签 —— 这里顺手删掉，会把以前版本发过的模型的这个性质一起丢掉。
     kept = [dict(m) for m in cfg["models"][:-1]]
-    kept[0] = {**kept[0], "enabled": False, "label": "renamed by admin"}
     kept.append({"alias": "custom-model", "enabled": True})
-    additive = _FakeTable(existing={"PK": "llmcfg", "SK": "meta", "generation": 0,
+    survives = _FakeTable(existing={"PK": "llmcfg", "SK": "meta", "generation": 0,
                                     "default_model": cfg["default_model"],
                                     "models": kept})
-    _run_seeder(mod, additive, ["--table", "t", "--region", "us-east-1"])
-    merged = additive.item["models"]
-    first = next(m for m in merged if m["alias"] == aliases[0])
-    _check("existing entries are copied verbatim (a disabled model stays disabled)",
-           first["enabled"] is False and first["label"] == "renamed by admin")
+    _run_seeder(mod, survives, ["--table", "t", "--region", "us-east-1"])
+    merged = survives.item["models"]
     _check("entries absent from the catalogue survive at the end",
            merged[-1]["alias"] == "custom-model", str([m["alias"] for m in merged]))
+    _check("the catalogue's own entries keep the catalogue's order",
+           [m["alias"] for m in merged[:-1]] == aliases,
+           str([m["alias"] for m in merged]))
+
+
+def test_retiring_a_model_reaches_seeded_environments() -> None:
+    """Editing an entry the environment already has must reach it too.
+
+    2026-09-04 in production: `claude-haiku-4-5` had been retired
+    (`enabled: false`) and `openai-gpt-5-6-luna` narrowed to `surfaces: ["im"]`
+    the day before, and the web model picker still offered both. Same root cause
+    as the missing-model case above -- the top-up only ever *added* entries and
+    copied the ones that already existed byte-for-byte, so every edit to an
+    existing entry was silently first-deploy-only. Retiring a model is the one
+    catalogue edit that is *meant* to be visible to users, which is exactly why
+    it must not require a rebuilt environment.
+
+    The invariant this pins: while `generation == 0`, the stored model list *is*
+    the shipped catalogue (plus any alias the catalogue no longer carries).
+    """
+    print("test_retiring_a_model_reaches_seeded_environments")
+    mod = _load_seeder()
+    cfg = mod._load(SEED_FILE)                      # noqa: SLF001
+
+    # 老环境：装的时候这两次改动还没发生
+    stored = [dict(m) for m in cfg["models"]]
+    touched: list[str] = []
+    retired = next((m for m in stored if not m.get("enabled")), None)
+    if retired is not None:
+        retired["enabled"] = True
+        touched.append(retired["alias"])
+    narrowed = next((m for m in stored
+                     if "webchat" not in (m.get("surfaces") or [])), None)
+    if narrowed is not None:
+        narrowed["surfaces"] = ["webchat", "im"]
+        touched.append(narrowed["alias"])
+    if not touched:
+        # 目录里暂时没有"已退休"或"已收窄"的条目时也要有东西可测:任何字段漂了都该拉回来。
+        stored[0]["label"] = "stale label"
+        touched.append(stored[0]["alias"])
+
+    def _shipped(alias):
+        return next(m for m in cfg["models"] if m["alias"] == alias)
+
+    table = _FakeTable(existing={"PK": "llmcfg", "SK": "meta", "generation": 0,
+                                 "default_model": cfg["default_model"],
+                                 "models": [dict(m) for m in stored]})
+    rc = _run_seeder(mod, table, ["--table", "t", "--region", "us-east-1"])
+    _check("stale entries: exits 0", rc == 0, f"rc={rc}")
+    for alias in touched:
+        got = next(m for m in table.item["models"] if m["alias"] == alias)
+        _check(f"stale entry realigned to the catalogue: {alias}",
+               got == _shipped(alias), f"{got} != {_shipped(alias)}")
+    _check("stale entries: the write is conditional on generation",
+           any("generation = :zero" in (c or "") for c in table.conditions),
+           str(table.conditions))
+    _check("stale entries: generation stays 0 (still seed-managed)",
+           table.item.get("generation") == 0, str(table.item.get("generation")))
+
+    # 管理员改过（generation>0）→ 一个字段都不许动。他可能是**故意**留着那个模型。
+    edited = _FakeTable(existing={"PK": "llmcfg", "SK": "meta",
+                                 "generation": 1760000000000,
+                                 "default_model": cfg["default_model"],
+                                 "models": [dict(m) for m in stored]})
+    rc = _run_seeder(mod, edited, ["--table", "t", "--region", "us-east-1"])
+    _check("admin-edited catalogue: entries are never realigned",
+           rc == 0 and edited.updates == 0
+           and edited.item["models"] == stored, f"rc={rc} updates={edited.updates}")
+
+    # --dry-run: 说清楚会改什么，但一个字节都不写（现网跑之前先看一眼用的就是它）
+    dry = _FakeTable(existing={"PK": "llmcfg", "SK": "meta", "generation": 0,
+                               "default_model": cfg["default_model"],
+                               "models": [dict(m) for m in stored]})
+    rc = _run_seeder(mod, dry, ["--table", "t", "--region", "us-east-1", "--dry-run"])
+    _check("--dry-run: exits 0 and writes nothing",
+           rc == 0 and dry.updates == 0 and dry.puts == 0
+           and dry.item["models"] == stored, f"rc={rc} updates={dry.updates} puts={dry.puts}")
 
 
 def test_follows_default_model_changes_in_the_catalogue() -> None:
@@ -464,6 +541,7 @@ def main() -> int:
     test_sanity_check_catches_a_broken_seed()
     test_idempotent_and_force()
     test_tops_up_models_added_after_the_first_deploy()
+    test_retiring_a_model_reaches_seeded_environments()
     test_follows_default_model_changes_in_the_catalogue()
     test_setup_sh_wires_it_up()
     if _failed:

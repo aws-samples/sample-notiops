@@ -519,7 +519,7 @@ The `locale` parameter (`"zh"` / `"en"`) lets the LLM produce the `intent` parap
 | `case_reply` | ✅ | Reply to a case | "reply to case 12345: restarted" |
 | `case_resolve` | ✅ | Close a case | "close case 12345" |
 | `case_analyze` | ✅ | LLM post-mortem of a case (root cause + next steps + missing info) | "analyze case 12345" / "summarize case 12345" |
-| `query` | ✅ | Read existing inspection reports / idle / optimization results (instant, launches no new investigation) | "today's inspection report" / "idle resources" |
+| `query` | ⚠️ folded into `investigate` | Intent classification can still return `query` (e.g. "show me the inspection report"), but the legacy DynamoDB report lookups it relied on went away with the **legacy** backend that was retired on 2026-09-04 (NotiOps' own backend is very much still there). On the production Feishu / Slack webhook path routing is done by `core/nl_router`, which has no `query` lane at all; where the LLM classifier is still used (`platforms/{feishu,slack}/app/main.py`) a `query` result is rewritten to `investigate` rather than being silently dropped. Inspection reports themselves are now read in the Web Chat "Inspection" dashboard | "today's inspection report" → handled as investigate |
 | `chitchat` | ⚠️ only on `enabled` tier | Small talk | "hi" / "what can you do" |
 | `general_qa` | ⚠️ only on `qa_only` / `enabled` tier | AWS conceptual Q&A | "what's the difference between ALB and NLB" |
 
@@ -1456,6 +1456,16 @@ Key env vars (BFF / Agent):
 
 ### 7.1 Log Locations
 
+> ⚠️ **The table below gives the Option B (`./setup.sh`) names. Under Option A (one-click),
+> only the stager's log group name matches** — every other group is CloudFormation-generated
+> (`<stack-name>-FeishuIngressLogs<hash>-<random>`, without even the `/aws/lambda/` prefix).
+> Option A leaves them unnamed on purpose: hard-coding `/aws/lambda/<function>` collides with
+> the group the Lambda service creates itself, and `NAME_CONFLICT_VALIDATION` fails the whole
+> stack within 9 seconds (see `explicitLogGroupNames` in `infra/lib/constructs/im-core.ts`).
+> How to resolve the real names under Option A:
+> [IM_WEBHOOK_SETUP.en.md §1.5](IM_WEBHOOK_SETUP.en.md#15-verify). The **function** names are
+> derivable on both paths (Option A just adds a `<stack-name>-` prefix).
+
 | Component | CloudWatch Log Group (naming pattern) | Notes |
 |---|---|---|
 | Feishu ingress | `/aws/lambda/notiops-im-ingress-feishu` | signature check + idempotent de-dup + async hand-off (**start here when messages don't arrive**) |
@@ -1693,13 +1703,25 @@ notiops/
 │   └── account_scope.py               # single-account guardrail
 ├── devops_agent_callback/             # DevOps Agent investigation callback Lambda
 ├── phd_event_forwarder/               # AWS Health event translator/forwarder Lambda
-├── lambda1_collector/                 # 4-stage collection + EC2 Trusted Advisor
-├── lambda2_analyzer/                  # deep analysis + verdict
-├── lambda3_health_checker/            # RDS / ElastiCache AI sweep
-├── lambda4_notifier/                  # scheduled push delivery
+├── lambda4_notifier/                  # daily ops digest (Feishu; sourced from the new inspection system)
 ├── lambda5_cost_analyzer/             # daily cost-anomaly analysis
-├── api/                               # API Lambda (route dispatch)
-├── mcp_server/                        # MCP server (21 tools)
+├── lambda6_cur_finalizer/             # CUR/Athena integration finalizer (one-shot Scheduler)
+├── lambda_inspection_scheduler/       # inspection scheduling (15-min tick → lock + SQS fan-out)
+├── lambda_inspection_executor/        # inspection execution (SQS consumer + batched GetMetricData)
+├── lambda_inspection_reconciler/      # inspection reconciliation (hourly: verdict terminal state + coverage gaps)
+├── lambda_inspection_push/            # inspection result push (Rule every 15 min, window decided in code)
+├── inspection/                        # inspection domain logic (pipeline / domain / adapters / skills)
+├── agent/                             # hand-written reference skeleton (Strands), **not deployed**;
+│                                      #   it has diverged from the one below (405 vs 2819 lines) —
+│                                      #   read agent-build/ for what production actually runs
+├── agent-build/                       # ★ source of the Web Chat agent that runs in production, plus
+│   └── NotiOpsWebChat/                #   the AgentCore CLI scaffold: agentcore.json's codeLocation
+│                                      #   points at app/NotiOpsWebChat/, and scripts/deploy_agent.sh
+│                                      #   only ever cd's here to run `agentcore deploy`
+├── bff/web-chat/                      # ★ Web Chat BFF (Node.js; Lambda Function URL, AWS_IAM + SSE)
+│   └── preset-skills/                 # ★ 11 bundled preset skills (author = notiops-system)
+├── frontend/chat-app/                 # ★ Web Chat frontend (React 19 + Vite, hand-written components)
+├── config/                            # single source of truth for config (capabilities / LLM model catalog seed / EOL fallback table)
 ├── platforms/
 │   ├── common/                        # adapter layer shared by all three platforms
 │   │   ├── router.py                  # deterministic dispatch (0 token) + injection 2nd gate

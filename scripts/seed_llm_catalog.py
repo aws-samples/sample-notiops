@@ -5,14 +5,23 @@ Called by `setup.sh`. Idempotent: the write is conditional on the item not
 existing, so re-running a deploy never overwrites what an administrator has
 configured in the console.
 
-When the item already exists the catalogue is **topped up**: entries that this
-file has and the stored item does not are appended (see `_top_up`). Without that
-step "already present" -- the normal path on every re-deploy -- silently means
-*models added to the catalogue after the first deploy never reach the
-environment*. That really happened: `zai-glm-5` was added on 2026-08-26 and was
-still missing from the production admin console (and therefore from the model
-picker) a day later, which reads as "the feature was never built". The top-up is
-additive only, and only while nobody has edited the catalogue in the console.
+When the item already exists the catalogue is **reconciled** (see `_top_up`):
+entries this file has and the stored item does not are appended, and entries
+both have are brought back in line with this file. Without that step "already
+present" -- the normal path on every re-deploy -- silently means *catalogue
+changes made after the first deploy never reach the environment*. Both halves
+have bitten production:
+
+  * `zai-glm-5` was added on 2026-08-26 and was still missing from the admin
+    console (and therefore from the model picker) a day later, which reads as
+    "the feature was never built";
+  * on 2026-09-03 two models were retired from the web picker
+    (`claude-haiku-4-5` disabled, `openai-gpt-5-6-luna` narrowed to `im`) and
+    production was still offering both the next day, because the old top-up
+    copied stored entries byte-for-byte.
+
+Reconciliation only runs while nobody has edited the catalogue in the console,
+and it never drops an alias the stored item has and this file does not.
 
 Why a Python helper instead of `aws dynamodb put-item` in the shell: the
 catalogue is nested (a list of maps, with maps inside those), and the CLI's
@@ -98,33 +107,50 @@ def _sanity_check(cfg: dict) -> str | None:
     return None
 
 
-def merge_missing_models(existing: list, catalog: list) -> tuple[list, list[str]]:
-    """Return (merged models, aliases added). **Additive only.**
+def reconcile_models(existing: list, catalog: list) -> tuple[list, list[str], list[str]]:
+    """Return (merged models, aliases added, aliases realigned).
 
-    Kept deliberately dumb: an entry already in the stored item is copied over
-    byte-for-byte (never re-enabled, re-labelled or re-pointed at another
-    model_id), and entries the stored item has but this file does not are kept at
-    the end. The only edit is appending the missing ones, positioned where the
-    catalogue puts them so the admin console's ordering stays intentional.
+    The invariant while `generation == 0` ("seeded, nobody has edited it") is
+    *stored models == shipped catalogue*, so an alias present in both is replaced
+    by the shipped entry **wholesale**. That is what makes a field-level change
+    (`enabled`, `surfaces`, `label`, `model_id`, `max_tokens`) reach an
+    environment that was installed before the change; the previous version copied
+    stored entries byte-for-byte, which quietly made every such edit
+    first-deploy-only. Missing entries are appended where the catalogue puts them
+    so the admin console's ordering stays intentional.
 
-    Mirrored in `infra/lambda/stager/index.py::_merge_missing_models` (the
-    one-click path cannot import from this repo); kept honest by
+    Aliases the stored item has and the catalogue does not are kept, at the end.
+    The catalogue retires a model by setting `enabled: false`, never by deleting
+    it, precisely so old messages keep resolving their model's label -- dropping
+    an unknown alias here would undo that for anything an earlier release
+    shipped.
+
+    Mirrored in `infra/lambda/stager/index.py::_reconcile_models` (the one-click
+    path cannot import from this repo); kept honest by
     `scripts/test_oneclick_parity.py`.
     """
     by_alias = {m.get("alias"): m for m in existing if isinstance(m, dict)}
     merged: list = []
     added: list[str] = []
+    realigned: list[str] = []
     for entry in catalog:
         alias = entry.get("alias")
-        if alias in by_alias:
-            merged.append(by_alias[alias])
-        else:
+        if alias not in by_alias:
             merged.append(entry)
             added.append(alias)
+            continue
+        merged.append(entry)
+        stored = by_alias[alias]
+        # Field names only -- the values can be long (model_id) and this string
+        # goes into the deploy log.
+        drifted = sorted(k for k in set(stored) | set(entry)
+                         if stored.get(k) != entry.get(k))
+        if drifted:
+            realigned.append(f"{alias} ({', '.join(drifted)})")
     known = {e.get("alias") for e in catalog}
     merged.extend(m for m in existing
                   if isinstance(m, dict) and m.get("alias") not in known)
-    return merged, added
+    return merged, added, realigned
 
 
 def default_model_drift(item: dict, cfg: dict) -> str | None:
@@ -147,15 +173,23 @@ def default_model_drift(item: dict, cfg: dict) -> str | None:
     return seed_default
 
 
-def _top_up(table, cfg: dict) -> int:
+def _top_up(table, cfg: dict, dry_run: bool = False) -> int:
     """Sync what a re-deploy is allowed to sync. Returns an exit code.
 
-    Two kinds of drift, both invisible until someone goes looking:
+    Three kinds of drift, all invisible until someone goes looking:
 
     1. **Models the stored item is missing** -- entries added to the catalogue
        after the first deploy. 2026-08-27 in production: `zai-glm-5` had entered
        the catalogue the day before and simply was not in the list.
-    2. **`default_model`** -- 2026-09-02 in production: the catalogue's default
+    2. **Fields of models both sides have** -- 2026-09-04 in production: the web
+       model picker still offered `claude-haiku-4-5` (retired via
+       `enabled: false`) and `openai-gpt-5-6-luna` (narrowed to `surfaces:
+       ["im"]`) a day after both landed in the catalogue. Same shape as (1) and
+       the same root cause -- the top-up only ever *added* entries, so every
+       edit to an entry that already existed was silently first-deploy-only.
+       Retiring a model is the one catalogue edit that is *supposed* to be
+       visible to users, which is exactly why it must not need a rebuild.
+    3. **`default_model`** -- 2026-09-02 in production: the catalogue's default
        moved from `claude-sonnet-5` to `xai-grok-4-6`, `xai-grok-4-6` *was*
        topped up into the model list, and the default stayed on Sonnet 5. The
        old code only ever wrote `models`, with the reasoning "a new model must
@@ -167,24 +201,25 @@ def _top_up(table, cfg: dict) -> int:
        change -- so the fleet looked consistent from the CLI while the web chat
        still opened on Sonnet 5.
 
-    Both are gated on `generation == 0` ("seeded, never edited by an admin").
-    Once an administrator has saved the page it is theirs: they may have removed
-    a model -- or chosen a default -- on purpose, and a deploy overriding that is
-    the same class of bug as overwriting the whole item. In that case say what
-    would have changed and leave the decision to them; a silent no-op here is
-    what made both of the problems above so hard to spot.
+    All three are gated on `generation == 0` ("seeded, never edited by an
+    admin"). Once an administrator has saved the page it is theirs: they may have
+    disabled a model -- or chosen a default -- on purpose, and a deploy
+    overriding that is the same class of bug as overwriting the whole item. In
+    that case say what would have changed and leave the decision to them; a
+    silent no-op here is what made all of the problems above so hard to spot.
     """
     from botocore.exceptions import ClientError
 
     item = table.get_item(Key={"PK": _PK, "SK": _SK}).get("Item") or {}
-    merged, added = merge_missing_models(item.get("models") or [],
-                                        cfg.get("models") or [])
+    merged, added, realigned = reconcile_models(item.get("models") or [],
+                                               cfg.get("models") or [])
     new_default = default_model_drift(item, cfg)
-    if not added and not new_default:
+    if not added and not realigned and not new_default:
         print("seed_llm_catalog: catalogue already present and complete, left untouched")
         return 0
 
-    pending = list(added) + ([f"default_model -> {new_default}"] if new_default else [])
+    pending = (list(added) + list(realigned)
+               + ([f"default_model -> {new_default}"] if new_default else []))
     gen = item.get("generation")
     if gen is not None and int(gen) != 0:
         print(f"seed_llm_catalog: catalogue was edited in the console "
@@ -192,10 +227,15 @@ def _top_up(table, cfg: dict) -> int:
               f"from the admin console if you want them.")
         return 0
 
+    if dry_run:
+        print(f"seed_llm_catalog: --dry-run, would apply {pending}")
+        return 0
+
     # Only the drifted attributes are written: credential_mode / backend_tasks
-    # and every stored model entry stay byte-for-byte as they are.
+    # stay untouched, as do stored model entries whose alias this file no longer
+    # carries.
     sets, names, values = [], {}, {":zero": 0}
-    if added:
+    if added or realigned:
         sets.append("#m = :m")
         names["#m"] = "models"
         values[":m"] = merged
@@ -234,6 +274,9 @@ def main() -> int:
     ap.add_argument("--force", action="store_true",
                     help="overwrite an existing catalogue (DESTRUCTIVE: discards "
                          "whatever the administrator configured in the console)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print what would be written and exit without writing "
+                         "(reads the stored item; ignores --force)")
     args = ap.parse_args()
 
     try:
@@ -259,6 +302,13 @@ def main() -> int:
 
     kwargs = {"region_name": args.region} if args.region else {}
     table = boto3.resource("dynamodb", **kwargs).Table(args.table)
+
+    if args.dry_run:
+        if table.get_item(Key={"PK": _PK, "SK": _SK}).get("Item"):
+            return _top_up(table, cfg, dry_run=True)
+        print(f"seed_llm_catalog: --dry-run, would seed {len(cfg['models'])} models "
+              f"(default={cfg.get('default_model')}) into {args.table}")
+        return 0
 
     put = {"Item": item}
     if not args.force:

@@ -240,7 +240,9 @@ console.log("\nGET — webhook url lookup");
 // CloudFormation Outputs 里翻。查不到的四种情形对客户是同一件事：界面退回文字说明 ——
 // 所以这一组用例的重点不是「查得到」，而是**查不到时不许抛**。
 const API = (name, ep) => ({ Name: name, ApiId: name, ApiEndpoint: ep });
-const EP = "https://e5er287z3e.execute-api.us-east-1.amazonaws.com";
+// API id 是**占位**。别贴真实部署的 webhook 地址进来：这个仓要外发，而 IM webhook
+// 是公网未鉴权入口，贴真值等于把某个部署的入口发到公网上。
+const EP = "https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com";
 
 await t("按名字命中 → 回 ApiEndpoint 且补上结尾的 /", async () => {
   // 结尾那个 `/` 是契约：与 CfnOutput FeishuWebhookUrl 一字不差（$default stage 不出现在

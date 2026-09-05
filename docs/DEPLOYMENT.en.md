@@ -46,7 +46,9 @@
 > [DEPLOYMENT_ONECLICK.en.md](DEPLOYMENT_ONECLICK.en.md) is a path that needs **nothing installed
 > locally and no access keys**: download one CloudFormation template from the Release, upload it in
 > the console, stack done in ~4.5 minutes. The trade-off is that it deploys **Web Chat only** — no IM
-> bots, no daily inspection, no admin dashboard. Want those, come back here and run `setup.sh`
+> bots, no daily inspection, and no inspection backend (the inspection dashboard entry is still
+> there in Web Chat, but nothing writes to it on that path, so opening it fails to load).
+> Want those, come back here and run `setup.sh`
 > (both paths create the same admin username, `admin`, so doing one then the other is fine).
 
 ### 0.1 One-command deploy
@@ -55,12 +57,12 @@
 ./setup.sh
 ```
 
-The first run is **interactive**: confirm AWS account + region → (optional) PHD event forwarding → **pick which IM platforms to deploy (default `0` = skip, web UI only; pick Feishu / Slack only if you want IM)** → build frontends (admin console + chat-app) → deploy the Web Chat Agent (AgentCore Runtime) → CDK bootstrap → CDK synth → CDK deploy `--all`. **Web Chat + the backend agent deploy by default.** IM credentials are **not** collected here — CDK creates **empty** secrets, and you fill them in *after* deploy (see §4 / §5).
+The first run is **interactive**: confirm AWS account + region → (optional) PHD event forwarding → **pick which IM platforms to deploy (default `0` = skip, web UI only; pick Feishu / Slack only if you want IM)** → build the frontend (there is only one: Web Chat's `frontend/chat-app`) → deploy the Web Chat Agent (AgentCore Runtime) → CDK bootstrap → CDK synth → CDK deploy `--all`. **Web Chat + the backend agent deploy by default.** IM credentials are **not** collected here — CDK creates **empty** secrets, and you fill them in *after* deploy (see §4 / §5).
 
 > **About DingTalk**: the DingTalk adapter code (`platforms/dingtalk/`) is retained, but v1 `setup.sh` doesn't surface the option → `enabledPlatforms` never includes `dingtalk` → `ImStack` creates no DingTalk Lambda / webhook, no cost. v2 ships the dual-robot credential flow.
 
 Two stacks land (one shot via `cdk deploy --all`; three when you pick an IM platform — `ImStack` is added):
-- `NotiOpsBackendStack` — shared backend (DDB, 5 Lambdas, S3 report bucket, EventBridge rules)
+- `NotiOpsBackendStack` — shared backend (DDB, 8 Lambdas, S3 report bucket, EventBridge rules)
 - `WebChatStack` — the browser-based agentic AI assistant (**deployed by default**; BFF Lambda + Function URL, single DDB table `notiops-web-chat`, static frontend, notification handler)
 - `ImStack` (only when IM is selected) — **the only path for IM**: one API Gateway HTTP API plus one Lambda pair (ingress + worker) per platform, plus a progress Lambda, the dependency Layer and the de-duplication table. After deploy, paste the webhook URL it outputs into the IM platform console — see [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md)
 
@@ -129,7 +131,7 @@ CDK deploys three stacks in one shot via `cdk deploy --all` (four when you pick 
 
 | Stack (CDK name) | Required | Contents |
 |---|---|---|
-| **`notiops-*`** | ✅ Required | 5 Lambdas (collector / analyzer / health-checker / notifier / cost-analyzer), shared DDB tables, S3 report bucket, EventBridge rules (5 IM push rules + 10 web notification rules + notiops schedules), agent-trigger Role (for STS AssumeRole) |
+| **`notiops-*`** | ✅ Required | 8 Lambdas (`notiops-inspection-scheduler` / `-executor` / `-reconciler` / `-push`, `notiops-cost-analyzer`, `notiops-notifier`, `notiops-push-handler`, `notiops-phd-forwarder`), shared DDB tables, S3 report bucket, EventBridge rules (5 IM push rules + 10 web notification rules + notiops schedules), agent-trigger Role (for STS AssumeRole) |
 | **`WebChatStack`** | ✅ Deployed by default | The browser-based agentic AI assistant (**the product's main entry**): BFF Lambda (`notiops-web-chat-bff`) + Function URL (`AWS_IAM`), single DDB table `notiops-web-chat` (sessions/messages + notification inbox), static frontend (chat-app), notification handler. The BFF gets the previous step's agent Runtime ARN injected via `-c agentRuntimeArn` |
 | **`ImStack`** | Only when IM is selected | **The production path for IM**: one **API Gateway HTTP API** per platform (the public entry point, a `$default` catch-all route) plus one Lambda pair — ingress (validates the signature and hands off asynchronously, `reservedConcurrentExecutions=10`) + worker (does the real work, 900s) — plus the shared dependency Layer and a de-duplication table. Its `FeishuWebhookUrl` / `SlackWebhookUrl` outputs are the request URLs you paste into the IM platform console (see [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md)) |
 | ~~**`BotStack`**~~ | ❌ **Retired (2026-09-03)** | It used to be: VPC + public subnets, ECS Cluster (512 CPU / 1024 MB per task), ECR repo, one Fargate Service per selected platform, pricing + cost MCP sidecars per task, Task Role, Security Group. After IM refactor M2, `infra/bin/app.ts` **no longer instantiates it**, so fresh installs get no VPC / ECS / ECR and need no finch / docker. The source (`infra/lib/bot-stack.ts` + three Dockerfiles) is deliberately kept in the repo as the long-connection rollback path — rolling back means `new BotStack(...)` again, which is far cheaper than rebuilding VPC/ECS and the images from scratch. Accounts installed before M2 still have the stack: `teardown.sh` deletes it by name, or delete it on its own with `aws cloudformation delete-stack --stack-name BotStack` (it publishes **no CFN exports**, so no other stack can be importing it) |
@@ -137,7 +139,7 @@ CDK deploys three stacks in one shot via `cdk deploy --all` (four when you pick 
 **Deployment order** (handled automatically by `./setup.sh`):
 ```
 ./setup.sh (interactive: region / optional PHD / [IM skipped by default])
-   → build frontends (admin console + chat-app) → deploy Web Chat Agent → cdk deploy --all
+   → build the frontend (only one: `frontend/chat-app`) → deploy Web Chat Agent → cdk deploy --all
 (optional) to enable IM: §3 Register an IM app first, then re-run setup.sh and pick the platform
 ```
 
@@ -401,13 +403,34 @@ Edit `infra/cdk.json` directly, or pass `-c key=value` to `cdk deploy`:
 
 | Context | Default | Notes |
 |---|---|---|
-| `bedrockModelId` | `us.anthropic.claude-sonnet-4-6` | LLM inference profile |
-| `agenticChatMode` | `enabled` | `disabled` / `qa_only` / `enabled` |
-| `awsMcpMode` | `docs_only` | `disabled` / `docs_only` |
-| `enableMcpPricing` | `true` | Pricing MCP sidecar main switch |
-| `defaultLocale` | `en` | `zh` / `en` |
-| `defaultLlmProvider` | `claude` | `claude` / `nova` / `gpt` |
 | `allowedOrigins` | (empty = all origins) | Comma-separated CORS allow-list, e.g. `https://d123.cloudfront.net` |
+| `organizationId` | (empty) | Non-empty = multi-account (Organizations) mode |
+| `inspectionReportLocale` | (empty = follow `DEFAULT_LOCALE`) | Language of the inspection **findings text**; one global value (`setup.sh` derives it from `$INSPECTION_REPORT_LOCALE`) |
+| `monthlyLimitSeconds` | `-1` (= unlimited) | Monthly seconds budget guard for the inspection executor |
+| `opsAlertEmail` | (empty) | Ops alert email (SNS subscription) |
+| `webBaseUrl` | (empty) | Site root for the "view details / view all" deep links in inspection pushes; empty = no deep links |
+| `reportsCdnDomain` | (empty) | Serve report downloads from your own CDN domain; empty = fall back to presigned URLs (dead after 12h) |
+| `skipPhd` | `false` | `true` = do not create the PHD forwarder |
+| `phdLinkedAccounts` | (empty) | Member accounts PHD should watch (comma-separated) |
+| `oamSinkArn` | (empty) | Reuse an existing OAM sink instead of creating one |
+| `costAgentMcpUrl` / `costAgentFunctionArn` | (empty) | Your self-hosted cost-agent MCP — the data source behind the four CUR sheets under FinOps; leave it unset and those four entries do not appear at all (see `requiresEnv`) |
+| `agentRuntimeArn` | (empty) | ARN of an already-deployed Web Chat AgentCore Runtime |
+| `operatorAppAlreadyEnabled` | `false` | ⚠️ **Never pass this by hand** — passing `true` makes the stack assume the Operator App is already enabled and skip enabling it |
+
+For the IM side (`enabledPlatforms` / `imAllowedChatIds`) see the `ImStack` context
+table in §14. `infra/cdk.json`'s `context` block contains **no** entries for any of
+these keys — pass them with `-c` on the command line, or add them to `cdk.json`
+yourself.
+
+> 🔴 **Six of the seven keys this table used to list do not exist at all**
+> (`bedrockModelId` / `agenticChatMode` / `awsMcpMode` / `enableMcpPricing` /
+> `defaultLocale` / `defaultLlmProvider`), and the default `bedrockModelId` value it
+> printed (`us.anthropic.claude-sonnet-4-6`) has not been the default model for a
+> while either (it is `global.xai.grok-4.6` now, and the effective value comes from
+> the DDB model catalogue rather than a deploy-time parameter). They were pre-M2 keys
+> feeding the `BotStack` Fargate container, and that stack is retired — criterion:
+> `git grep -n <key> -- infra/` returns zero hits for every one of them. See the
+> matching warning in §14.
 
 > **⚠️ Tighten CORS (recommended for production)**: every endpoint on both the REST API
 > and the Web Chat Function URL is already authenticated (Cognito / AWS_IAM SigV4), so the
@@ -436,7 +459,7 @@ After §2 prerequisites (and §3 IM-app registration only if you want IM), this 
 4. Lets you pick a deploy region from 6 options (default `ap-northeast-1`; includes a "custom input" choice)
 5. (Optional) asks whether to deploy PHD event forwarding (default `Y`)
 6. Asks which IM platforms to deploy (**default `0` = skip, web UI only**; `1` Feishu / `2` Slack, multi-select). **Only sets the `enabledPlatforms` flag — does not collect credentials**
-7. **`[1/4]` Build frontends** — builds **both** the admin console (`frontend/frontend-app`) **and** the Web Chat frontend (`frontend/chat-app`)
+7. **`[1/4]` Build the frontend** — builds only the Web Chat frontend (`frontend/chat-app`). The old admin console (`frontend/frontend-app`) and the old REST API behind it were retired on 2026-09-04 in this release; the directory no longer exists in the repo and `setup.sh` no longer builds it. This step also copies `config/capabilities.json` / `config/eol-dates.json` into `bff/web-chat/` (the capability manifest's single source of truth lives in `config/`, but the Lambda only packages `bff/web-chat/`) and installs the BFF dependencies (`npm ci --omit=dev`)
 8. **Deploy the Web Chat Agent** — runs `scripts/deploy_agent.sh` to deploy the Strands agent onto AgentCore Runtime and get the Runtime ARN (injected into WebChatStack via `-c agentRuntimeArn`; `SKIP_AGENT=true` skips it and the BFF falls back to echo)
 9. **`[2/4]` Install Lambda deps** (boto3 / powertools / jinja2, `--platform manylinux2014_x86_64` for Linux binaries). **If you selected IM**, it also runs `scripts/build_im_layer.sh` to build the IM dependency layer (`lark-oapi` / `slack-sdk` / `boto3`, manylinux wheels too). A failure here **aborts on the spot** rather than skipping quietly — with packages missing from the layer, `ImStack` fails at synth time anyway
 10. CDK bootstrap (if the target account + region isn't bootstrapped yet; reused if already bootstrapped + healthy)
@@ -445,7 +468,7 @@ After §2 prerequisites (and §3 IM-app registration only if you want IM), this 
 13. **Create the Cognito `admin` user + temp password** (first deploy) and add it to the admin group
 14. **`[4/4]`** Writes outputs to `cdk-outputs.json` and prints a **Web-Chat-first** completion banner (Web Chat URL + `admin` login credentials at the top)
 
-Total time: ~10-15 min on first run (mostly CDK deploy + agent deploy; add image build if you selected IM). Re-runs only patch deltas, ~3-5 min.
+Total time: ~10-15 min on first run (mostly CDK deploy + agent deploy; add the step-9 IM dependency-layer build if you selected IM — a `pip --platform manylinux2014_x86_64 --only-binary=:all:` cross-download of wheels, **no container image build**). Re-runs only patch deltas, ~3-5 min.
 
 ### 5.2 Specialized flows (when you don't need a full deploy)
 
@@ -523,6 +546,48 @@ The CDK template uses `CfnAgentSpace` to **create a new one**, by design:
 - ❌ **Side effect**: customers with existing spaces have to re-do that space's configuration in the new one (this section)
 
 A future capability ("support reusing an existing Agent Space") would have `setup.sh` ask "do you have an existing Agent Space to reuse?" interactively. **Not supported today.**
+
+### 5.4 Upgrading an installed environment: cross-stack Export retirement preflight (setup.sh does it for you)
+
+**Upgrades only — a fresh install never hits this.** If you installed an older version and re-run `./setup.sh` to upgrade, you may hit:
+
+```
+Export NotiOpsBackendStack:ExportsOutputFnGetAttFrontendCDNF4E135DEDomainNameBF02A209
+cannot be deleted as it is in use by WebChatStack
+```
+
+`NotiOpsBackendStack` then goes to `UPDATE_ROLLBACK_COMPLETE` and `WebChatStack` / `ImStack` are SKIPPED.
+
+**Why**: Method B is three stacks (main + WebChatStack + ImStack), and every value passed between them (Cognito pool id, reports CDN domain, …) becomes a CDK-generated **CFN Export**. When a version drops a cross-stack parameter (this one drops `idleConsoleUrl`, retired together with the old console), the new main stack has to **delete** that export — but the **old** WebChatStack still installed on your account still holds an `Fn::ImportValue`, and CloudFormation refuses. `cdk deploy --all` updates main first, so that's the wall you hit first.
+
+**⚠️ Key point: plainly re-running does NOT self-heal.** CloudFormation treats `UPDATE_ROLLBACK_COMPLETE` as a normal settled state and CDK will not delete-and-recreate, so ten more `--all` runs produce the same error.
+
+**What you have to do: nothing — just re-run `./setup.sh`.** As of this version, `setup.sh` runs a preflight before `cdk deploy --all` ([scripts/export_retire_plan.py](../scripts/export_retire_plan.py) — read-only `describe-stacks` plus the local cloud assembly; it changes no resources) with four possible verdicts:
+
+| Verdict | Meaning | What setup.sh does |
+|---|---|---|
+| `SKIP` | Fresh install, or this version deletes no deployed export (**the vast majority of upgrades**) | Proceeds straight to `--all`, byte-for-byte the old behaviour |
+| `REORDER <stack>…` | This version retires an export | Deploys the consumer stack(s) **first** with `cdk deploy <stack> --exclusively` to release the reference, **then** `--all` |
+| `WAIT <status>` | Main stack is mid-change (`UPDATE_IN_PROGRESS`, …) | Aborts and asks you to re-run once it settles — any decision made now would be stale |
+| `FALLTHROUGH …` | The same version both retires **and** adds an export, and a consumer needs the added one | Warns loudly, then continues in the normal order (see below) |
+
+**Already stuck in `UPDATE_ROLLBACK_COMPLETE`?** Just re-run `./setup.sh` — the preflight detects it and reorders automatically. To do it by hand:
+
+```bash
+cd infra
+# 1. Update the consumer stack alone so it stops importing the export being deleted.
+#    ⚠️ --exclusively is mandatory: without it CDK deploys the dependency (main) first,
+#       i.e. exactly the order that fails.
+#    ⚠️ Pass the full set of -c flags (copy them from the setup.sh line) — one missing
+#       flag synthesizes a different template.
+npx cdk deploy WebChatStack --exclusively --require-approval never -c enabledPlatforms=feishu
+# 2. Then the full deploy
+npx cdk deploy --all
+```
+
+**What about `FALLTHROUGH`?** Reordering cannot save that version (consumer-first fails with `No export named … found`; main-first fails on the export deletion). The correct answer is to **split it into two releases**: ship the retirement first, then the addition. A CI gate in this repo (`cfn-export-gate` plus [infra/exports.golden.json](../infra/exports.golden.json)) blocks such a version before it reaches `main`, so as a deployer you should essentially never see it.
+
+> 📌 **Method A (one-click deploy) is unaffected**: it is a **single stack** (`NotiOps`) with no cross-stack references and therefore no CFN Exports — the failure mode does not exist structurally, so Method A needs no equivalent preflight step. This is not a feature gap (the **web functionality** of both paths remains identical).
 
 ---
 

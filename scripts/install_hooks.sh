@@ -30,18 +30,32 @@ cat > "$HOOK" <<'BODY'
 
 set -euo pipefail
 
-# Find staged Python files. If none staged, skip — nothing to lint.
-mapfile -t FILES < <(git diff --cached --name-only --diff-filter=ACMR \
-  | grep -E '\.py$' || true)
+# Staged files this lint can have an opinion about. **Not just .py**:
+# lint_i18n.py also checks the frontend (every t("a.b.c") exists in
+# i18n.ts, and every key is still referenced), so a pure .ts/.tsx change
+# is exactly the kind that needs it.
+#
+# Plain string, not an array: `mapfile` is bash 4+ and macOS ships bash
+# 3.2, and under `set -u` bash 3.2 also treats `${#ARR[@]}` on an empty
+# array as unbound. Either one exits 127/1 **before** the "nothing
+# staged" check, i.e. every commit on a Mac fails and this gate never
+# actually runs. Same class of trap as the 12 fixed in `5dcb9fc`.
+STAGED="$(git diff --cached --name-only --diff-filter=ACMR \
+  | grep -E '\.(py|ts|tsx)$' || true)"
 
-if [ "${#FILES[@]}" -eq 0 ]; then
+if [ -z "$STAGED" ]; then
   exit 0
 fi
+
+# `python3`, not `python`: modern macOS has no bare `python`, and a dev
+# shell without the repo .venv activated would fail on it.
+PY=python3
+command -v "$PY" >/dev/null 2>&1 || PY=python
 
 # Run the i18n lint on the whole repo (baseline-aware), but if it
 # fails we'll show the user only the new violations they introduced.
 # Cheap enough — the script walks ~40 files in <100 ms.
-python scripts/lint_i18n.py
+"$PY" scripts/lint_i18n.py
 BODY
 
 chmod +x "$HOOK"

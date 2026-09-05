@@ -93,7 +93,8 @@ on-call 工程师使用,而无需授予写权限。
   需要从组织管理账号或 StackSets 委派管理员账号部署)。
 
 ⚠️ 一键部署装的是 **Web Chat + 可选一个 IM 机器人**,**不含**定时巡检与主动推送、
-管理仪表盘、CUR/Athena FinOps,一个栈也只能装一个 IM 平台 —— 要这些请用下面的方式 B。
+巡检看板里的数据与阈值配置、CUR/Athena FinOps,一个栈也只能装一个 IM 平台 ——
+要这些请用下面的方式 B。
 前提条件(区域与 Bedrock 模型开通)、参数逐条说明、资源与成本构成、升级 / 回滚、
 一键删除,见 [docs/DEPLOYMENT_ONECLICK.md](docs/DEPLOYMENT_ONECLICK.md);IM 那两步配置见
 [docs/IM_WEBHOOK_SETUP.md](docs/IM_WEBHOOK_SETUP.md)。
@@ -151,6 +152,7 @@ cd sample-notiops
 | **成本 / FinOps** | | |
 | FinOps 仪表盘(Cost Explorer 口径) | ✅ 仅部署账号 | ✅ 可跨账号 |
 | CUR + Athena 账单明细下钻 | ❌ | ✅ |
+| 每日成本异常扫描(自建基线,每天 01:15 UTC 跑) | ❌ FinOps 页那张「每日异常扫描」卡整个不出现,不是一张空卡 | ✅ |
 | 接自己的 CUR 数据源(4 个仪表盘 sheet + 聊天里问那份账单) | ✅ 可选,见下方注 ⁵ | ✅ 可选,见下方注 ⁵ |
 | **工单与 Skills** | | |
 | AWS Support 工单全生命周期 | ✅ | ✅ |
@@ -162,9 +164,9 @@ cd sample-notiops
 | **主动化 / IM** | | |
 | IM 渠道(Slack / 飞书) | ✅ 一个栈一个平台,见下方注 ⁴ | ✅ 两个可同时开 |
 | 主动推送**到 IM**(10 类 EventBridge 信号源) | ❌ | ✅ |
-| 每日自动巡检(闲置资源 / 成本异常) | ❌ | ✅ |
+| 定时自动巡检(高负载 / 闲置与成本 / 结构性风险) | ❌ | ✅ |
 | 通知收件箱(同样这 10 类信号源,进 Web 收件箱) | ✅ | ✅ |
-| 管理仪表盘(阈值 / 目标账户 / Skills 管理) | ❌ | ✅ |
+| 巡检看板(巡检总览 / 高负载 / 闲置与成本 / 结构性风险 / 巡检范围 / 阈值与定时) | ❌ 入口还在,但方式 A 没有巡检后端,点进去是加载失败 | ✅ |
 | **范围** | | |
 | 多账号(AWS Organizations 跨账号) | ✅ 开栈时选 `DeployMode=MultiAccount` + 填组织 id | ✅ `--multi-account` |
 | 升级 | 换新版模板 update 栈(~1 分钟) | 重跑 `./setup.sh` |
@@ -295,16 +297,17 @@ cd sample-notiops
         │                            │
         └──────────────┬─────────────┘
                        ▼
-        ┌──────────────────────────────────────┐
-        │   NotiOps(本仓库)                    │
+        ┌────────────────────────────────────────┐
+        │   NotiOps(本仓库)                      │
         │   · 意图分类                           │
         │   · 只读纵深防线                       │
         │   · 工单管理 · 双语 i18n               │
         │   · MCP 文档检索 · Bedrock 路由        │
         │                 │                      │
         │                 ▼                      │
-        │   Lambdas(collector / analyzer /      │
-        │   health / notifier / cost)+ handlers │
+        │   Lambdas(inspection × 4 / notifier /  │
+        │   cost / cur-finalizer)+ report /      │
+        │   push / PHD handlers                  │
         └──────┬────────────────────┬────────────┘
                ▼                    ▼
         AWS 调查              EventBridge × 10

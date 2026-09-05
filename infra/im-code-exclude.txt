@@ -77,7 +77,16 @@ mcp_server/**
 .hypothesis/**
 .pytest_cache/**
 phd_event_forwarder/**
-devops_agent_callback/**
+
+# ⚠️ `devops_agent_callback/**` **曾经在这里，2026-09-04 刻意去掉了**。别加回来。
+# 方式B 给回调函数单独打了一个资产（notiops-backend-stack.ts 的 devopsCallbackCode），
+# 所以那边剪掉它不痛；方式A 的单栈没有资产，回调函数与 IM 三个函数共用这同一个
+# im-code.zip（`devops_agent_callback/` 只有 116KB，它 import 的 shared/** 与 core/**
+# 本来就在包里）。漏掉它的失败方式：客户账号里的回调函数一调就
+# `Runtime.ImportModuleError: No module named 'devops_agent_callback'` —— 而那条链路
+# 本身是异步的（EventBridge → Lambda），所以客户看到的只是「深度调查跑完了、
+# 报告和公网 URL 永远不来」，与「压根没建这个函数」长得一模一样。
+# 判据在 scripts/package_artifacts.sh（打包时断言这个包里有 handler.py）。
 
 # 容器时代的产物，Lambda 路径用不到。
 platforms/*/Dockerfile

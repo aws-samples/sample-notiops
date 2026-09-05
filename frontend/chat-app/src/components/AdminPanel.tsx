@@ -8,7 +8,6 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { useT, useLocale } from "../i18n";
-import { loadConfig } from "../config";
 import FeishuGuideDrawer from "./FeishuGuideDrawer";
 import {
   fetchAllCapabilities, fetchRoles, saveRole, deleteRole,
@@ -1877,8 +1876,7 @@ export function AccountsView() {
   const [regionsInput, setRegionsInput] = useState("us-east-1");
   const [submitting, setSubmitting] = useState(false);
   const [polling, setPolling] = useState<Record<string, string>>({}); // opId -> accountId
-  const [consoleUrl, setConsoleUrl] = useState("");
-  useEffect(() => { loadConfig().then((c) => setConsoleUrl(c.idleConsoleUrl || "")).catch(() => {}); }, []);
+  // （老 idle 控制台的「手动向导」外链已随控制台退役，2026-09-04）
   const [daPolling, setDaPolling] = useState<Record<string, string>>({}); // opId -> accountId
 
   /**
@@ -2107,10 +2105,6 @@ export function AccountsView() {
             style={{ fontSize: 11, fontWeight: 700, color: "var(--orange)", background: "transparent", border: "1px solid var(--orange)", borderRadius: 100, padding: "1px 10px", cursor: "pointer" }}>
             {t("admin.accounts.daGuideBtn")}
           </button>
-        )}
-        {showGuide && consoleUrl && (
-          <a href={`${consoleUrl}/settings/devops-agent-accounts`} target="_blank" rel="noreferrer"
-            title="手动向导（逃生通道）" style={{ fontSize: 11, color: "var(--muted)", textDecoration: "none" }}>↗</a>
         )}
       </span>
     );

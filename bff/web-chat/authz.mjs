@@ -258,7 +258,13 @@ export function filterDashboard(tabKey, payload, eff) {
     if (cur && typeof cur === "object") delete cur[parts[parts.length - 1]];
   };
   for (const node of subtabsOf(tabKey)) {
-    if (satisfies(eff, node.key)) continue;
+    // 与 visibleTree 的 requiresEnv 门控同源：外部依赖没配 → 节点已从 /capabilities 树里
+    // 摘掉，响应里也不该再带它的数据（否则不读 /capabilities 的客户端会画出一张死卡）。
+    // 今天真实生效在 nav:finops:daily-anomaly（requiresEnv=COST_ANALYZER_FUNCTION 且带
+    // responseKey）：一键部署没有 lambda5，dailyAnomaly 这一段就不进 payload。
+    // 带 requiresEnv 的 4 个 CUR sheet 没有 responseKey（走各自 /cur-dash/* 路由，由
+    // cur_dashboard.mjs 同一判据挡），所以这一条对它们是空转 —— 那是对的。
+    if (envConfigured(node.requiresEnv) && satisfies(eff, node.key)) continue;
     const keys = Array.isArray(node.responseKey) ? node.responseKey : [node.responseKey];
     for (const k of keys) if (k) deletePath(payload, k); // 支持嵌套(costExplorer.anomalies)按卡剥离
   }

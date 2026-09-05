@@ -135,7 +135,7 @@ d=json.load(sys.stdin); env=d.get('environmentVariables') or {}
 bad=[k for k,v in env.items() if isinstance(v,str) and v.startswith('__') and v.endswith('__')]
 print(','.join(sorted(bad)))" 2>/dev/null || echo "")
   if [ -n "$LEFT" ]; then
-    echo "  $(t "⚠ 核验:runtime env 仍有占位符未替换 → $LEFT。" "⚠ Check: runtime env still has unreplaced placeholders → $LEFT.")" >&2
+    echo "  $(t "⚠ 核验:runtime env 仍有占位符未替换 → ${LEFT}。" "⚠ Check: runtime env still has unreplaced placeholders → $LEFT.")" >&2
   else
     echo "  $(t "✓ env 回填完成,无残留占位符" "✓ env backfilled; no leftover placeholders")"
   fi

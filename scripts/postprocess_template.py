@@ -66,6 +66,22 @@ AGENT_ARTIFACT = "agent-code.zip"
 # CDK 默认 bootstrap 限定词（qualifier）。出现在资产桶名里。
 BOOTSTRAP_MARKERS = ("cdk-hnb659fds", "cdk-bootstrap")
 
+# AWS 官方文档保留的示例账号 ID。下面那条「模板里不许有 12 位字面量」的判据要
+# 排掉它们，否则给客户看的 `Example: arn:aws:sns:<region>:123456789012:...`
+# 这类**正确内容**会把发布卡住。
+#
+# ⚠️ 这不是给判据开后门：它要抓的是我们自己的账号号码（或某个客户的）被写死进
+# 模板，而这些号段 AWS 保留给文档、不可能是真账号。少了这层排除，唯一的"修法"
+# 是把 ARN 形状示例从客户看得见的 Description 里删掉 —— 让判据把文档质量拖下水。
+#
+# 与 scripts/publish-to-github.sh 的 PLACEHOLDER_IDS 同口径。两处都改，别只改一处。
+PLACEHOLDER_ACCOUNT_IDS = frozenset({
+    "123456789012", "012345678901", "012345678910", "123456789101",
+    "444455556666", "111122223333", "000000000000",
+    # 全同位数字（111111111111 … 999999999999）：也是常见占位写法
+    *(str(d) * 12 for d in range(1, 10)),
+})
+
 # CFN 限制：`--template-body` / 控制台直接粘贴上限 51,200 字节；
 # 传 S3（`--template-url` / 控制台 "Upload a template file"）上限 1 MB。
 INLINE_TEMPLATE_LIMIT = 51_200
@@ -324,7 +340,7 @@ def assert_clean(template: dict, tag: str) -> None:
     scannable = {k: v for k, v in template.items() if k != "Resources"}
     scannable["Resources"] = {k: v for k, v in template["Resources"].items() if k != "CDKMetadata"}
     for token in re.findall(r"[0-9A-Za-z]+", json.dumps(scannable)):
-        if len(token) == 12 and token.isdigit():
+        if len(token) == 12 and token.isdigit() and token not in PLACEHOLDER_ACCOUNT_IDS:
             raise PostprocessError(
                 f"template contains a literal 12-digit account id {token!r} — "
                 "the one-click template must be account-agnostic (use AWS::AccountId). "

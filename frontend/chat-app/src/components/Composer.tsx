@@ -9,7 +9,10 @@ import { getCasesSummary, getDeepInvestigationAvailability } from "../api/chat";
 import { listSkills, skillDisplay, isPresetSkill, type Skill } from "../api/skills";
 // IconSkill 随「/命令菜单」的两层结构一起去掉了：现在根层直接就是 skill 列表，
 // 不再有那条「技能 ▸」父项，所以这个图标已无处使用（留着 tsc 会报未使用导入）。
-import { IconInvestigate, IconCases, IconFinOps, IconReports, IconGlobe, IconSecurity, IconWhatsNew, IconChevronRight, IconPlus, IconCustomize, IconGauge, IconChatBubble, skillIcon } from "./icons";
+// IconChatBubble 随「DevOps 对话」那个平铺 pill 一起搬进了 ModePicker（工具条瘦身），
+// 本文件已无引用 —— 留着 tsc 会报未使用导入。
+import { IconInvestigate, IconCases, IconFinOps, IconReports, IconGlobe, IconSecurity, IconWhatsNew, IconChevronRight, IconPlus, IconCustomize, IconGauge, skillIcon } from "./icons";
+import ModePicker from "./ModePicker";
 
 interface Props {
   model: string;
@@ -537,75 +540,46 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
                 <IconGlobe size={15} /> {t("composer.websearch.short")}
               </button>
             )}
-            {/* 「DevOps 对话」：这轮直接由**客户自己的 DevOps Agent** 回答（BFF 直连控制面
-                CreateChat/SendMessage 并逐 delta 转发），NotiOps 侧 **0 token**。
-                位置固定在联网搜索之后（产品指定）；**只在故障调查主题**显示（chatShown 显式
-                列举 `["investigate"]`，不跟 topicHasDevopsAgent 走 —— 通用会话改由新对话主页的
-                「对话对象」两张卡来选，见上面 objMode 处的注释）。同样依赖 Agent Space，故复用
-                deepNa 的置灰与提示。与两个「深度调查」三方互斥（互斥在 ChatApp 侧）。
-                ⚠️ 关着时前端不传 devops_chat_direct，后端行为与从前逐字节一致。 */}
-            {chatShown && (
-              <button
-                type="button"
-                className={"websearch-toggle" + (devopsChat ? " on" : "") + (deepNa ? " disabled" : "")}
-                onClick={deepNa ? undefined : onToggleDevopsChat}
-                disabled={!!deepNa}
-                title={deepNa ? deepNaHint : t("composer.devopschat") + " — " + t("composer.devopschat.hint")}
-                aria-pressed={devopsChat}
-                aria-disabled={deepNa ? "true" : undefined}
-              >
-                <IconChatBubble size={15} /> {t("composer.devopschat.short")}
-                {deepNa && <span className="toggle-soon">{t("composer.devops.na")}</span>}
-              </button>
-            )}
-            {/* FinOps Agent 深度模式开关：仅 FinOps 主题显示。**暂不可用**(功能未完善)——
-                置灰禁用,提示"即将上线"。客户可改用下面的 DevOps Agent 分析成本/用量。 */}
-            {topic === "finops" && (
-              <button
-                type="button"
-                className="websearch-toggle disabled"
-                disabled
-                title={t("composer.finops") + " — " + t("composer.finops.soon")}
-                aria-disabled="true"
-              >
-                <IconFinOps size={15} /> {t("composer.finops.short")}
-                <span className="toggle-soon">{t("composer.soon")}</span>
-              </button>
-            )}
-            {/* DevOps Agent 深度调查开关：**默认所有主题都显示**，只排除少数不适用的
-                (见 types.ts `topicHasDevopsAgent` —— 与后端 `_DEVOPS_TOPICS_EXCLUDED` 同一口径)。
-                这样以后新增主题自动继承该能力，不需要回来改这里。
-                默认开/关状态由会话初始值决定(见 ChatApp;当前一律默认关，用户按需手动开)。 */}
-            {deepShown && (
-              <button
-                type="button"
-                className={"websearch-toggle" + (devopsAgent ? " on" : "") + (deepNa ? " disabled" : "")}
-                onClick={deepNa ? undefined : onToggleDevopsAgent}
-                disabled={!!deepNa}
-                title={deepNa ? deepNaHint : t("composer.devops") + " — " + t("composer.devops.hint")}
-                aria-pressed={devopsAgent}
-                aria-disabled={deepNa ? "true" : undefined}
-              >
-                <IconInvestigate size={15} /> {t("composer.devops.short")}
-                {deepNa && <span className="toggle-soon">{t("composer.devops.na")}</span>}
-              </button>
-            )}
-            {/* 「深度调查（直连）」：与上面同一能力的 **0 token** 版本（BFF 直连 DevOps Agent
-                API，不经大模型）。与上面的开关**互斥**（互斥在 ChatApp 的 toggle 里实现），
-                主题门控沿用同一个 topicHasDevopsAgent。老开关一行未改。 */}
-            {deepShown && (
-              <button
-                type="button"
-                className={"websearch-toggle" + (devopsAgentDirect ? " on" : "") + (deepNa ? " disabled" : "")}
-                onClick={deepNa ? undefined : onToggleDevopsAgentDirect}
-                disabled={!!deepNa}
-                title={deepNa ? deepNaHint : t("composer.devops.direct") + " — " + t("composer.devops.direct.hint")}
-                aria-pressed={devopsAgentDirect}
-                aria-disabled={deepNa ? "true" : undefined}
-              >
-                <IconInvestigate size={15} /> {t("composer.devops.direct.short")}
-                {deepNa && <span className="toggle-soon">{t("composer.devops.na")}</span>}
-              </button>
+            {/* 回答模式：**平铺后工具条上带文字的按钮 >2 个就收成下拉，≤2 个保持原样** ——
+                产品要求（2026-09-04：「聊天框只有 ≤2 个按钮的（比如：联网+深度），可以保持不变」）。
+                ⚠️ 数的是**工具条上带文字的按钮总数（含「联网」这一枚）**，不是模式项数 ——
+                用户给的例子「联网+深度」就把联网算进去了。`/` 和发送是图标按钮，不占这个预算。
+                各主题（barCount = 联网 1 + 模式项数）：
+                  · investigate = 1+3 = 4（DevOps 对话 + 深度调查 + 深度调查（直连）） → 下拉
+                  · finops      = 1+3 = 4（深度调查 + 深度调查（直连）+ FinOps 置灰） → 下拉
+                  · security 等 deepShown-only = 1+2 = 3（深度调查 + 深度调查（直连）） → 下拉
+                  · general / cases / whats-new = 1+0 = 1 → 一个模式都没有，什么都不渲染
+                所以在**当前**主题集合里，"保持平铺"这条只是一道**未来的保险**：将来某主题只提供
+                **一个**模式（联网+它 = 2 枚）时它才生效 —— 而不是把「深度调查 / 深度调查（直连）」
+                这一对留在外面。那一对恰恰是最该收的：两个标签只差四个字、真正的区别只藏在
+                tooltip 里、而且它们互斥（同时亮起来的语义不是"更强"，是同一个问题被送上两条路）。
+                ⚠️ 阈值判据**落在 ModePicker 里**（`items.length === 2`，即"不启用 + 唯一一个
+                模式" → 画成平铺 pill），
+                不在这里 —— 项清单、置灰、图标都在那边，在这边再列一份必然漂。这里只负责
+                "联网那一枚在不在"这个前提：!objMode 时它总在，所以 ModePicker 侧的
+                "1 项 = 总共 2 枚" 恒成立。
+                收成下拉的原因（原来这里是**四个并列 pill**）：它们在状态上本来就是单选
+                （ChatApp 的 `setDevopsMode` 一次写三个字段），画成四个并列复选既占一整行、
+                又看起来能同时开。收成下拉后每一项有名称 + 说明两行，那句说明才是这个控件真正
+                要给的信息。详见 ModePicker 的文件头注释。
+                主题门控、置灰（deepNa）、互斥（ChatApp 的三个 onToggle*）在两条路径上都原样
+                保留 —— 关着时前端仍然一个字段都不传，后端行为与从前逐字节一致。
+                ⚠️ objMode（通用会话选了 DevOps Agent）不走这两条路径：那里剩下的「深度调查」
+                是**这一轮的修饰**而不是选模式，仍是下面单独那个开关。 */}
+            {!objMode && (
+              <ModePicker
+                topic={topic}
+                deepShown={deepShown}
+                chatShown={chatShown}
+                deepNa={deepNa}
+                deepNaHint={deepNaHint}
+                devopsAgent={devopsAgent}
+                devopsAgentDirect={devopsAgentDirect}
+                devopsChat={devopsChat}
+                onToggleDevopsAgent={onToggleDevopsAgent}
+                onToggleDevopsAgentDirect={onToggleDevopsAgentDirect}
+                onToggleDevopsChat={onToggleDevopsChat}
+              />
             )}
             {/* objMode（通用会话，对话对象已是客户自己的 DevOps Agent）下**唯一保留**的开关：
                 「深度调查」。对象不变，它只决定**这一轮**走哪一条：不勾 = 直接问答（秒级回话）；

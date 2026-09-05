@@ -172,6 +172,27 @@ export interface EdpCommitment {
   remainingMarketplaceUsd: number;
 }
 
+/**
+ * 每日多因子成本异常扫描（lambda5 产数，01:15 UTC）。
+ *
+ * ⚠️ 与 `costExplorer.anomalies`（AWS Cost Anomaly Detection）是**两套
+ * 引擎**：那套要配 monitor，这套自建基线每天全账号跑。两张卡并排展示，
+ * 合并会让两套口径的数字对不上任何一边的控制台。
+ *
+ * 🔴 `available:false` = 没跑/读失败（**不是**「无异常」）；
+ *    `available:true, totalAnomalies:0` 才是「跑了且干净」。
+ */
+export interface DailyAnomalyRow {
+  accountId: string; service: string; score: number; confidence: string;
+  type: string; baselineDailyUsd: number | null;
+  recent3dDailyUsd: number | null; projected7dExtraUsd: number; trend: string;
+}
+export interface DailyAnomaly {
+  available: boolean; reason?: string; date?: string;
+  totalAnomalies?: number; projected7dExtraUsd?: number; accounts?: number;
+  details?: DailyAnomalyRow[];
+}
+
 export interface FinopsDashboard {
   budgetAlerts: BudgetAlertsResponse;
   curStatus: CurAthenaStatus;
@@ -179,6 +200,8 @@ export interface FinopsDashboard {
   costExplorer: CostExplorerDashboard;
   edpCommitment: EdpCommitment;
   potentialSavings?: PotentialSavings;
+  /** 可选：存量 BFF 不返回 → 整卡不渲染（不显示一排 0）。 */
+  dailyAnomaly?: DailyAnomaly;
 }
 
 const EMPTY: FinopsDashboard = {
@@ -196,6 +219,7 @@ const EMPTY: FinopsDashboard = {
     coverage: { available: false },
   },
   potentialSavings: { available: false },
+  dailyAnomaly: { available: false },
   edpCommitment: {
     annualCommitmentUsd: 0, discountRate: 0, marketplaceCapRatio: 0, contractPeriod: "",
     attainmentPct: 0, expectedPct: 0, remainingUsd: 0, remainingMarketplaceUsd: 0,

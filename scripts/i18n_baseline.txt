@@ -83,7 +83,6 @@ frontend/chat-app/src/i18n.ts: 'admin.users.create' 定义了但没有任何 t()
 frontend/chat-app/src/i18n.ts: 'cmd.typeToFilter' 定义了但没有任何 t() 引用 —— 改它不会生效，留着会让人以为那个功能还在
 frontend/chat-app/src/i18n.ts: 'composer.account.default' 定义了但没有任何 t() 引用 —— 改它不会生效，留着会让人以为那个功能还在
 frontend/chat-app/src/i18n.ts: 'composer.account.hint' 定义了但没有任何 t() 引用 —— 改它不会生效，留着会让人以为那个功能还在
-frontend/chat-app/src/i18n.ts: 'composer.finops.hint' 定义了但没有任何 t() 引用 —— 改它不会生效，留着会让人以为那个功能还在
 frontend/chat-app/src/i18n.ts: 'cz.skill.importOk' 定义了但没有任何 t() 引用 —— 改它不会生效，留着会让人以为那个功能还在
 frontend/chat-app/src/i18n.ts: 'cz.skill.upload' 定义了但没有任何 t() 引用 —— 改它不会生效，留着会让人以为那个功能还在
 frontend/chat-app/src/i18n.ts: 'cz.skill.uploadHint' 定义了但没有任何 t() 引用 —— 改它不会生效，留着会让人以为那个功能还在
@@ -153,12 +152,6 @@ platforms/feishu/app/case_flow.py:CJK literal '新建case' — move to core/i18n
 platforms/feishu/app/case_flow.py:CJK literal '新建案例' — move to core/i18n.py and call i18n.t(...) with both zh and en values
 platforms/feishu/app/main.py:CJK literal 'DEFAULT_INVESTIGATION_ACCOUNT_ID 未配置,无法发起调查 incident_id=%s' — move to core/i18n.py and call i18n.t(...) with both zh and en values
 platforms/feishu/app/main.py:CJK literal '\\b(delete|remove|stop|terminate|destroy|drop|kill|reboot|restart|shutdown)\\s+(?:' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/query_handler.py:CJK literal '**EC2 低利用率**' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/query_handler.py:CJK literal '**RDS 巡检报告** (' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/query_handler.py:CJK literal '**优化建议 Top 5**' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/query_handler.py:CJK literal '**采集状态**:' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/query_handler.py:CJK literal '**闲置资源 Top 5**' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/query_handler.py:CJK literal '/月' — move to core/i18n.py and call i18n.t(...) with both zh and en values
 platforms/slack/app/case_flow.py:CJK literal '创建 case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
 platforms/slack/app/case_flow.py:CJK literal '创建case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
 platforms/slack/app/case_flow.py:CJK literal '创建案例' — move to core/i18n.py and call i18n.t(...) with both zh and en values

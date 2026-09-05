@@ -1,0 +1,41 @@
+{
+  "__doc__": [
+    "本文件由 scripts/check_cfn_exports.py --update 生成，不要手改。",
+    "它钉住的是 CDK 为跨栈引用自动生成的 CFN Export/Import 集合。",
+    "CI 上 diff 变红不代表你写错了 —— 但**删除**任何一条已发布的 export 都会让",
+    "升级路径进入 `Export … cannot be deleted as it is in use by <栈>`，主栈整栈",
+    "回滚且重跑不自愈。setup.sh 的预检（scripts/export_retire_plan.py）能救",
+    "「只退役」的版本；「同一版又退役又新增」必须拆成两次发布。",
+    "确认过升级路径后再跑 --update：golden diff 里只有新增 → 直接发；一旦出现",
+    "删除，先单独部署消费者栈放开引用，再发主栈。"
+  ],
+  "ImStack": {
+    "exports": [],
+    "imports": [
+      "NotiOpsBackendStack:ExportsOutputFnGetAttReportsCDN7ADC2FBEDomainNameE62F8798",
+      "NotiOpsBackendStack:ExportsOutputRefDataBucketE3889A50250F5285"
+    ]
+  },
+  "NotiOpsBackendStack": {
+    "exports": [
+      "NotiOpsBackendStack:ExportsOutputFnGetAttDevOpsAgentSpaceAgentSpaceId56302D38",
+      "NotiOpsBackendStack:ExportsOutputFnGetAttInspectionAgentSpaceAgentSpaceIdD00DD9D7",
+      "NotiOpsBackendStack:ExportsOutputFnGetAttReportsCDN7ADC2FBEDomainNameE62F8798",
+      "NotiOpsBackendStack:ExportsOutputRefDataBucketE3889A50250F5285",
+      "NotiOpsBackendStack:ExportsOutputRefIdleDetectorUserPool48FD3565791250E1",
+      "NotiOpsBackendStack:ExportsOutputRefIdleDetectorUserPoolIdleDetectorWebClient2C1FB96D43EA59E1"
+    ],
+    "imports": []
+  },
+  "WebChatStack": {
+    "exports": [],
+    "imports": [
+      "NotiOpsBackendStack:ExportsOutputFnGetAttDevOpsAgentSpaceAgentSpaceId56302D38",
+      "NotiOpsBackendStack:ExportsOutputFnGetAttInspectionAgentSpaceAgentSpaceIdD00DD9D7",
+      "NotiOpsBackendStack:ExportsOutputFnGetAttReportsCDN7ADC2FBEDomainNameE62F8798",
+      "NotiOpsBackendStack:ExportsOutputRefDataBucketE3889A50250F5285",
+      "NotiOpsBackendStack:ExportsOutputRefIdleDetectorUserPool48FD3565791250E1",
+      "NotiOpsBackendStack:ExportsOutputRefIdleDetectorUserPoolIdleDetectorWebClient2C1FB96D43EA59E1"
+    ]
+  }
+}

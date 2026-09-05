@@ -125,10 +125,10 @@ Three optional parameters are worth knowing about:
   administrator).
 
 ⚠️ One-click deploys **Web Chat plus at most one IM bot**. It does **not** include scheduled
-inspections and proactive push, the admin dashboard, or CUR/Athena FinOps, and one stack can
-only carry one IM platform — use Option B for those. Prerequisites (region and Bedrock model
-access), a parameter-by-parameter walkthrough, the resource and cost breakdown,
-upgrade/rollback, and one-click teardown are in
+inspections and proactive push, the data behind the inspection dashboard and its threshold
+settings, or CUR/Athena FinOps, and one stack can only carry one IM platform — use Option B
+for those. Prerequisites (region and Bedrock model access), a parameter-by-parameter
+walkthrough, the resource and cost breakdown, upgrade/rollback, and one-click teardown are in
 [docs/DEPLOYMENT_ONECLICK.en.md](docs/DEPLOYMENT_ONECLICK.en.md); the two IM setup steps are in
 [docs/IM_WEBHOOK_SETUP.en.md](docs/IM_WEBHOOK_SETUP.en.md).
 
@@ -193,6 +193,7 @@ mode comparison and how to switch — see
 | **Cost / FinOps** | | |
 | FinOps dashboard (Cost Explorer data) | ✅ deploy account only | ✅ cross-account |
 | CUR + Athena billing-detail drill-down | ❌ | ✅ |
+| Daily cost-anomaly scan (self-built baseline, runs 01:15 UTC every day) | ❌ the "Daily Anomaly Scan" card on the FinOps page is not rendered at all — you do not get an empty card | ✅ |
 | Bring your own CUR data source (4 dashboard sheets + ask about that bill in chat) | ✅ optional, see note ⁵ | ✅ optional, see note ⁵ |
 | **Cases and Skills** | | |
 | Full AWS Support case management | ✅ | ✅ |
@@ -204,9 +205,9 @@ mode comparison and how to switch — see
 | **Proactive / IM** | | |
 | IM channels (Slack / Feishu) | ✅ one platform per stack, see note ⁴ | ✅ both at once |
 | Proactive push **to IM** (10 EventBridge sources) | ❌ | ✅ |
-| Daily scheduled inspection (idle resources / cost anomalies) | ❌ | ✅ |
+| Scheduled inspection (high load / idle & cost / structural risk) | ❌ | ✅ |
 | Notification inbox (the same 10 sources, into the web inbox) | ✅ | ✅ |
-| Admin dashboard (thresholds / target accounts / Skills management) | ❌ | ✅ |
+| Inspection dashboard (overview / high load / idle & cost / structural risk / inspection scope / thresholds & schedule) | ❌ the tab is still there, but Option A has no inspection backend, so opening it fails to load | ✅ |
 | **Scope** | | |
 | Multi-account (across an AWS Organization) | ✅ set `DeployMode=MultiAccount` + your organization id | ✅ `--multi-account` |
 | Upgrade | update the stack with the new template (~1 min) | re-run `./setup.sh` |
@@ -371,16 +372,17 @@ Web console (browser)        Customer IM (Slack / Feishu)
         │                              │
         └──────────────┬───────────────┘
                        ▼
-        ┌──────────────────────────────────────┐
-        │   NotiOps (this repo)                 │
-        │   · intent classification             │
-        │   · read-only defense in depth        │
-        │   · case management · bilingual i18n  │
+        ┌────────────────────────────────────────┐
+        │   NotiOps (this repo)                  │
+        │   · intent classification              │
+        │   · read-only defense in depth         │
+        │   · case management · bilingual i18n   │
         │   · MCP doc retrieval · Bedrock routing│
         │                 │                      │
         │                 ▼                      │
-        │   Lambdas (collector / analyzer /      │
-        │   health / notifier / cost) + handlers │
+        │   Lambdas (inspection × 4 / notifier / │
+        │   cost / cur-finalizer) + report /     │
+        │   push / PHD handlers                  │
         └──────┬────────────────────┬────────────┘
                ▼                    ▼
         AWS investigation     EventBridge × 10

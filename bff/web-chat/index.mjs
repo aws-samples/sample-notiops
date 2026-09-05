@@ -724,7 +724,12 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
       return json(200, await curSavingsPlans(q.from || "", q.to || ""));
     }
     if (method === "GET" && path.endsWith("/finops/dashboard")) {
-      return json(200, filterDashboard("nav:finops", await getFinopsDashboard(q.account || ""), eff));
+      // ⚠️ `visible` 给 dailyAnomaly 段用：它的行带 account_id，org 视图
+      //    （不选账号）把全部账号的异常摊开 —— 数据层「不给就拒」，
+      //    这里是唯一有 sub/groups/eff 的地方（与 /inspection/findings 同型）。
+      const finopsVis = await visibleAccountSet(sub, groups, eff);
+      return json(200, filterDashboard("nav:finops",
+        await getFinopsDashboard(q.account || "", { visible: finopsVis }), eff));
     }
     if (method === "GET" && path.endsWith("/security/dashboard")) {
       const acct = (event.queryStringParameters && event.queryStringParameters.account) || "";

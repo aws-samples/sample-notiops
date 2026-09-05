@@ -57,7 +57,7 @@ mkdir -p "$DEST"
 cleanup_on_fail() {
   local rc=$?
   if [ "$rc" -ne 0 ]; then
-    echo "[im-layer] ❌ 构建失败（exit $rc）—— 删除半成品 $DEST，避免被误当成可用层部署" >&2
+    echo "[im-layer] ❌ 构建失败（exit ${rc}）—— 删除半成品 ${DEST}，避免被误当成可用层部署" >&2
     rm -rf "$DEST"
   fi
   return "$rc"
@@ -81,7 +81,7 @@ pip install --upgrade pip --quiet
 RUNTIME_MV="3.14"
 PY_MV=$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')
 if [ "$PY_MV" != "$RUNTIME_MV" ]; then
-  echo "[im-layer] ❌ .venv 是 python $PY_MV，Lambda 运行时是 python $RUNTIME_MV。" >&2
+  echo "[im-layer] ❌ .venv 是 python ${PY_MV}，Lambda 运行时是 python ${RUNTIME_MV}。" >&2
   echo "           字节码按 minor 版本绑定，版本不一致的 .pyc 会被**静默忽略**（冷启动退回 >10s）。" >&2
   echo "           解法：用 python$RUNTIME_MV 重建虚拟环境 ——" >&2
   echo "             rm -rf .venv && python$RUNTIME_MV -m venv .venv && bash scripts/build_im_layer.sh" >&2

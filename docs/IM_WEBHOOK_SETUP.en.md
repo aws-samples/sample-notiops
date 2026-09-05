@@ -208,6 +208,34 @@ aws logs tail /aws/lambda/notiops-im-ingress-feishu --region <REGION> --since 5m
 aws logs tail /aws/lambda/notiops-im-worker-feishu  --region <REGION> --since 5m
 ```
 
+> ⚠️ **Those two names only hold for Option B (`./setup.sh`). Option A (one-click) must
+> resolve them first.** The same applies to every `/aws/lambda/notiops-im-*` later in this file.
+>
+> Why: under Option A the function names carry the stack-name prefix
+> (`<stack-name>-im-ingress-feishu`, so they cannot collide with a `setup.sh` deployment),
+> and the **log group names are CloudFormation-generated**
+> (`<stack-name>-FeishuIngressLogs<hash>-<random>`) — they do not even start with
+> `/aws/lambda/`, so no amount of stack-name substitution produces them. Option A leaves
+> them unnamed on purpose: hard-coding `/aws/lambda/<function>` collides with the group
+> the Lambda service creates itself, and `NAME_CONFLICT_VALIDATION` fails the whole stack
+> within 9 seconds (see `explicitLogGroupNames` in `infra/lib/constructs/im-core.ts`).
+>
+> Read them off the stack (the logical-ID prefixes are stable — do not guess the hash):
+>
+> ```bash
+> STACK=<the stack name you entered>   # e.g. notiops
+> REGION=<REGION>
+> lg() { aws cloudformation describe-stack-resources --stack-name "$STACK" --region "$REGION" \
+>   --query "StackResources[?starts_with(LogicalResourceId,'$1')].PhysicalResourceId" --output text; }
+>
+> aws logs tail "$(lg FeishuIngressLogs)" --region "$REGION" --since 5m
+> aws logs tail "$(lg FeishuWorkerLogs)"  --region "$REGION" --since 5m
+> # For Slack use SlackIngressLogs / SlackWorkerLogs; the progress poller is ImProgressLogs
+> ```
+>
+> The one exception is the deployment Lambda: its log group **is** hard-coded as
+> `/aws/lambda/<stack-name>-stager`.
+
 - ingress logs but no worker logs → signature check passed but the async handoff failed
   (read the ingress error)
 - `401 (signature/token)` in ingress → the two keys do not match the console; back to §1.2
@@ -398,6 +426,34 @@ cd infra && npx cdk deploy ImStack --output ../.cdk-out --region <REGION> \
 Feishu takes chat ids starting with `oc_`, Slack takes channel ids starting with `C` or
 `D`, comma-separated. Leave it empty for no restriction (same behaviour as the
 long-connection design).
+
+### 3.1 Two bots in one group (a test env and a production env)
+
+**Supported**, and they won't both answer: whichever one you @-mention replies, the other
+stays completely silent — it doesn't even add the "thinking" reaction.
+
+The criterion is the bot's own `open_id`. Feishu has **no** equivalent of Slack's
+`app_mention` event: once a bot is a member of a group, *every* message in that group
+arrives as `im.message.receive_v1`, carrying a single `mentions` array with **everyone**
+the message @-mentioned. So "who was mentioned" is something the bot has to decide for
+itself: on first use it calls `GET /bot/v3/info` once to learn its own `open_id`, and it
+only responds when that id appears in `mentions`.
+
+Consequences:
+
+- **Ordinary group chatter with no @ reaches neither bot** — group messages need an
+  @-mention to trigger anything (direct messages don't).
+- **Mixed mentions like `@alice @NotiOps take a look` do trigger it** — it only needs to
+  be one of the mentioned parties.
+- **If the bot cannot determine its own `open_id`** (expired credentials, a network
+  blip), it **stays silent in groups** rather than answering every @ it sees. We would
+  rather you notice "it stopped replying" immediately than have two bots answer and leave
+  you unable to tell which one did. **Direct messages keep working** in that state; look
+  for the `bot identity: GET /bot/v3/info` ERROR line in the ingress log (a transient
+  blip self-heals within a minute).
+
+> Slack doesn't need this layer: it has a dedicated `app_mention` event, so the platform
+> has already done the disambiguation for us.
 
 ---
 

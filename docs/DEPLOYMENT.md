@@ -46,7 +46,8 @@
 > 💡 **只想先试试 Web Chat?** 那这篇整个都不用读。[DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md)
 > 是一条**不需要本地装任何东西、也不需要 access key** 的路径:从 Release 下一个
 > CloudFormation 模板、在控制台上传、~4.5 分钟开完栈。代价是它**只部署 Web Chat** ——
-> 没有 IM bot、没有每日巡检、没有管理仪表盘。想要这些就回来走本篇的 `setup.sh`
+> 没有 IM bot、没有每日巡检、也没有巡检后端(巡检看板的入口在 Web Chat 里,但那条路上没有
+> 写侧,点进去是加载失败)。想要这些就回来走本篇的 `setup.sh`
 > (两条路径的管理员用户名都是 `admin`,先后走不冲突)。
 
 ### 0.1 一键部署
@@ -55,12 +56,12 @@
 ./setup.sh
 ```
 
-首次运行会**交互式引导**:确认 AWS 账号 + region →(可选)PHD 事件转发 → **选 IM 平台(默认 `0` 暂不部署,只上 web 端;想启用飞书 / Slack 才选)**→ 构建前端(admin 控制台 + chat-app)→ 部署 Web Chat Agent(AgentCore Runtime)→ 走 CDK bootstrap → CDK synth → CDK deploy `--all`。**Web Chat + 后端 agent 默认就会部署**;IM 凭据**不在此处采集**——CDK 只创建**空的** Secret,部署完成后再按结尾提示填(见 §4 / §5)。
+首次运行会**交互式引导**:确认 AWS 账号 + region →(可选)PHD 事件转发 → **选 IM 平台(默认 `0` 暂不部署,只上 web 端;想启用飞书 / Slack 才选)**→ 构建前端(只有一个:Web Chat 的 `frontend/chat-app`)→ 部署 Web Chat Agent(AgentCore Runtime)→ 走 CDK bootstrap → CDK synth → CDK deploy `--all`。**Web Chat + 后端 agent 默认就会部署**;IM 凭据**不在此处采集**——CDK 只创建**空的** Secret,部署完成后再按结尾提示填(见 §4 / §5)。
 
 > **关于钉钉**:钉钉的适配器代码(`platforms/dingtalk/`)完整保留,但 v1 `setup.sh` 不显示这个选项 → `enabledPlatforms` 默认不含 `dingtalk` → `ImStack` 不为钉钉创建任何 Lambda / webhook,不计费。v2 会开放钉钉的双 robot 凭据流程。
 
 部署的两栈(`cdk deploy --all` 一次部到位;选了 IM 平台时多一个 `ImStack`,共三栈):
-- `NotiOpsBackendStack`:共享后端(DDB、Lambda5 个、S3 报告 bucket、EventBridge rules)
+- `NotiOpsBackendStack`:共享后端(DDB、8 个 Lambda、S3 报告 bucket、EventBridge rules)
 - `ImStack`(选了 IM 才建):**IM 的运行路径(唯一一条)** —— 每个平台一个 API Gateway HTTP API + 一对 Lambda(ingress + worker)+ 进度 Lambda + 依赖 Layer + 去重表。部署后要把它输出的 webhook 地址填进 IM 平台控制台,见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md)
 - `WebChatStack`:浏览器端 agentic AI 助手(**默认部署**;BFF Lambda + Function URL、DDB 单表 `notiops-web-chat`、静态前端、通知 handler)
 
@@ -128,7 +129,7 @@ CDK 部署三个栈(选了 IM 平台时是四个,多一个 `ImStack`),`./setup.s
 
 | 栈(CDK 名) | 必选 | 部署内容 |
 |---|---|---|
-| **`notiops-*`** | ✅ 必选 | Lambda × 5(collector / analyzer / health-checker / notifier / cost-analyzer)、共享 DDB 表、S3 报告 bucket、EventBridge rules(5 条 IM push 规则 + 10 条 web 通知规则 + notiops schedules)、agent-trigger Role(供 STS AssumeRole) |
+| **`notiops-*`** | ✅ 必选 | Lambda × 8(`notiops-inspection-scheduler` / `-executor` / `-reconciler` / `-push`、`notiops-cost-analyzer`、`notiops-notifier`、`notiops-push-handler`、`notiops-phd-forwarder`)、共享 DDB 表、S3 报告 bucket、EventBridge rules(5 条 IM push 规则 + 10 条 web 通知规则 + notiops schedules)、agent-trigger Role(供 STS AssumeRole) |
 | **`WebChatStack`** | ✅ 默认部署 | 浏览器端 agentic AI 助手(**产品主入口**):BFF Lambda(`notiops-web-chat-bff`)+ Function URL(`AWS_IAM`)、DDB 单表 `notiops-web-chat`(会话/消息 + 通知收件箱)、静态前端(chat-app)、通知 handler。BFF 通过 `-c agentRuntimeArn` 注入上一步 agent 的 Runtime ARN |
 | **`ImStack`** | 选了 IM 才建 | **IM 的正式运行路径**:每个平台一个 **API Gateway HTTP API**(公网入口,`$default` catch-all)+ 一对 Lambda —— ingress(只验签 + 异步投递,`reservedConcurrentExecutions=10`)+ worker(真正干活,900s)、共用的依赖 Layer、去重表。Outputs 里的 `FeishuWebhookUrl` / `SlackWebhookUrl` 就是你要填进 IM 平台控制台的请求地址(见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md)) |
 | ~~**`BotStack`**~~ | ❌ **已退役(2026-09-03)** | 曾经是:VPC + Public Subnets、ECS Cluster(512 CPU / 1024 MB per task)、ECR repo、每个被勾选平台一个 Fargate Service、每个 task 内含 pricing + cost MCP sidecar、Task Role、Security Group。IM 重构 M2 之后 `infra/bin/app.ts` **不再实例化它**,所以新装机不会有 VPC / ECS / ECR,也不需要 finch / docker。源码(`infra/lib/bot-stack.ts` + 三个 Dockerfile)故意保留在仓库里当长连接回滚路径 —— 真要回滚就重新 `new BotStack(...)`,比从头重建 VPC/ECS + 重写镜像便宜。M2 之前装过的账号里这个栈还在:`teardown.sh` 仍按名字删它,也可以单独 `aws cloudformation delete-stack --stack-name BotStack`(它**没有任何 CFN Export**,不会被别的栈引用) |
@@ -136,7 +137,7 @@ CDK 部署三个栈(选了 IM 平台时是四个,多一个 `ImStack`),`./setup.s
 **部署顺序**(`./setup.sh` 自动处理):
 ```
 ./setup.sh(交互式选 region / 可选 PHD /【默认跳过 IM】)
-   → 构建前端(admin 控制台 + chat-app) → 部署 Web Chat Agent → cdk deploy --all
+   → 构建前端(只有一个:`frontend/chat-app`) → 部署 Web Chat Agent → cdk deploy --all
 (可选)想启用 IM 时:先 §3 注册 IM 应用,再重跑 setup.sh 选对应平台
 ```
 
@@ -382,13 +383,30 @@ CDK 栈始终通过 ARN 引用这些 secret,**本地不落任何凭据文件**�
 
 | Context | 默认 | 说明 |
 |---|---|---|
-| `bedrockModelId` | `us.anthropic.claude-sonnet-4-6` | LLM 推理 profile |
-| `agenticChatMode` | `enabled` | `disabled` / `qa_only` / `enabled` |
-| `awsMcpMode` | `docs_only` | `disabled` / `docs_only` |
-| `enableMcpPricing` | `true` | Pricing MCP sidecar 总开关 |
-| `defaultLocale` | `en` | `zh` / `en` |
-| `defaultLlmProvider` | `claude` | `claude` / `nova` / `gpt` |
-| `allowedOrigins` | (空 = 所有来源) | CORS 可信域名白名单,逗号分隔,如 `https://d123.cloudfront.net` |
+| `allowedOrigins` | (空 = 所有来源) | CORS 可信域名允许清单,逗号分隔,如 `https://d123.cloudfront.net` |
+| `organizationId` | (空) | 非空 = 多账号(Organizations)模式 |
+| `inspectionReportLocale` | (空 = 跟随 `DEFAULT_LOCALE`) | 巡检**判读正文**的语言,全局单值(`setup.sh` 从 `$INSPECTION_REPORT_LOCALE` 转成它) |
+| `monthlyLimitSeconds` | `-1`(= 不限) | 巡检执行器的月度秒数预算护栏 |
+| `opsAlertEmail` | (空) | 运维告警邮箱(SNS 订阅) |
+| `webBaseUrl` | (空) | 巡检推送正文里「查看详情 / 查看全部」深链的站点根;空 = 不带深链 |
+| `reportsCdnDomain` | (空) | 报告下载走自有 CDN 域名;空 = 回退 presigned URL(12h 后失效) |
+| `skipPhd` | `false` | `true` = 不建 PHD 转发器 |
+| `phdLinkedAccounts` | (空) | PHD 要关注的成员账号(逗号分隔) |
+| `oamSinkArn` | (空) | 复用已有 OAM sink,而不是新建一个 |
+| `costAgentMcpUrl` / `costAgentFunctionArn` | (空) | 客户自建 cost-agent MCP —— FinOps 里四张 CUR 报表的数据源;不配则这四个入口整个不出现(见 `requiresEnv`) |
+| `agentRuntimeArn` | (空) | 已部署好的 Web Chat AgentCore Runtime ARN |
+| `operatorAppAlreadyEnabled` | `false` | ⚠️ **不要手工传** —— 传 `true` 会让栈以为 Operator App 已启用而跳过启用步骤 |
+
+IM 侧的 `enabledPlatforms` / `imAllowedChatIds` 见 §14 的 `ImStack` context 表。
+`infra/cdk.json` 的 `context` 段里**没有**这些 key 的条目 —— 想改就在命令行 `-c` 传,
+或自己往 `cdk.json` 里加。
+
+> 🔴 **这张表以前列的 7 个 key 里有 6 个压根不存在**(`bedrockModelId` /
+> `agenticChatMode` / `awsMcpMode` / `enableMcpPricing` / `defaultLocale` /
+> `defaultLlmProvider`),而且 `bedrockModelId` 写的默认值 `us.anthropic.claude-sonnet-4-6`
+> 也早就不是现在的默认模型(现在是 `global.xai.grok-4.6`,且真值走 DDB 模型目录而不是
+> 部署参数)。它们是 M2 之前喂 `BotStack` Fargate 容器的老 key,那个栈已退役 ——
+> 判据:`git grep -n <key> -- infra/` 全部 0 命中。详见 §14 那条同名警告。
 
 > **⚠️ CORS 收窄(生产建议)**：REST API 与 Web Chat Function URL 的每个端点都已由
 > Cognito / AWS_IAM(SigV4)鉴权,浏览器 CORS 不是主要信任边界;因此**默认回退到
@@ -415,7 +433,7 @@ CDK 栈始终通过 ARN 引用这些 secret,**本地不落任何凭据文件**�
 4. 让你从 6 个选项里选 deploy region(默认 `ap-northeast-1`;含"自定义输入")
 5. (可选)问是否部署 PHD 事件转发功能(默认 `Y`)
 6. 让你选要部署哪些 IM 平台(**默认 `0` 暂不部署,只上 web 端**;`1` 飞书 / `2` Slack 可多选)。**只设 `enabledPlatforms` 开关,不采集凭据**
-7. **`[1/4]` 构建前端** —— admin 控制台(`frontend/frontend-app`)**和** Web Chat 前端(`frontend/chat-app`)都构建
+7. **`[1/4]` 构建前端** —— 只构建 Web Chat 前端(`frontend/chat-app`)。老 admin 控制台(`frontend/frontend-app`)连同它背后的老 REST API 已于 2026-09-04 随本版退役,目录在仓库里已不存在,`setup.sh` 不再构建它。这一步还会把 `config/capabilities.json` / `config/eol-dates.json` 复制进 `bff/web-chat/`(能力清单单一真源在 `config/`,而 Lambda 只打包 `bff/web-chat/`)并装 BFF 依赖(`npm ci --omit=dev`)
 8. **部署 Web Chat Agent** —— 跑 `scripts/deploy_agent.sh`,把 Strands agent 部署到 AgentCore Runtime,拿到 Runtime ARN(经 `-c agentRuntimeArn` 注入 WebChatStack;`SKIP_AGENT=true` 可跳过,BFF 回退 echo)
 9. **`[2/4]` 安装 Lambda 依赖**(boto3 / powertools / jinja2,`--platform manylinux2014_x86_64` 装 Linux 二进制)。**选了 IM 时**还会跑 `scripts/build_im_layer.sh` 构建 IM 依赖 Layer(`lark-oapi` / `slack-sdk` / `boto3`,同样是 manylinux 轮子);这一步失败会**当场中断**而不是静默跳过 —— Layer 里缺包时 `ImStack` synth 就直接报错
 10. CDK bootstrap(如果该账号 + region 还没 bootstrap 过;已 bootstrap 且健康则复用)
@@ -424,7 +442,7 @@ CDK 栈始终通过 ARN 引用这些 secret,**本地不落任何凭据文件**�
 13. **创建 Cognito `admin` 用户 + 临时密码**(首次部署),并把它加进 admin 组
 14. **`[4/4]`** 把 outputs 写到 `cdk-outputs.json`,并打印**以 Web Chat 为主入口**的完成横幅(Web Chat 地址 + `admin` 登录凭据在最上方)
 
-总耗时:首次 ~10-15 分钟(主要在 CDK deploy + agent 部署;选了 IM 再加镜像 build)。重跑只补差异 ~3-5 分钟。
+总耗时:首次 ~10-15 分钟(主要在 CDK deploy + agent 部署;选了 IM 再加上面第 9 步的 IM 依赖层构建 —— `pip --platform manylinux2014_x86_64 --only-binary=:all:` 交叉下载轮子,**不是镜像 build**)。重跑只补差异 ~3-5 分钟。
 
 ### 5.2 单独流程(不需要全量 deploy 时)
 
@@ -502,6 +520,46 @@ CDK 模板默认 `CfnAgentSpace` 是 **CREATE 一个新的**,理由:
 - ❌ **副作用**:已有 space 的客户需要在新 space 里重做配置(本节)
 
 后续规划里有一项 "支持复用已有 Agent Space" 的能力,会让 `setup.sh` 交互式问"你已有 Agent Space 想复用吗?"。当前版本 **不支持**。
+
+### 5.4 升级已装环境:跨栈 Export 退役预检(setup.sh 自动做)
+
+**只有升级会遇到,首装不会。** 已经装过老版本、现在重跑 `./setup.sh` 升级时,可能撞上这个:
+
+```
+Export NotiOpsBackendStack:ExportsOutputFnGetAttFrontendCDNF4E135DEDomainNameBF02A209
+cannot be deleted as it is in use by WebChatStack
+```
+
+随后 `NotiOpsBackendStack` 变成 `UPDATE_ROLLBACK_COMPLETE`、`WebChatStack` / `ImStack` 全部 SKIPPED。
+
+**为什么会这样**:方式 B 是三个栈(主栈 + WebChatStack + ImStack),栈之间传值(Cognito 池 id、报告 CDN 域名等)由 CDK 自动生成 **CFN Export**。某一版退掉一个跨栈传参时(本版退掉了随老控制台一起下线的 `idleConsoleUrl`),主栈这一版就要**删**那条 export;而你机器上已装的**老** WebChatStack 还持有 `Fn::ImportValue`,CloudFormation 硬拒。`cdk deploy --all` 先更主栈,所以先撞的就是这一堵墙。
+
+**⚠️ 关键点:平淡重跑不会自愈。** CloudFormation 把 `UPDATE_ROLLBACK_COMPLETE` 视为一个正常的稳定态,CDK 也不会 delete-and-recreate,所以再跑十遍 `--all` 都是同一个错。
+
+**你要做什么:什么都不用做 —— 重跑 `./setup.sh` 就行。** 本版起 `setup.sh` 在 `cdk deploy --all` 之前会自动跑一次预检([scripts/export_retire_plan.py](../scripts/export_retire_plan.py),只读 `describe-stacks` + 本地合成产物,不改任何资源),四种结论:
+
+| 预检结论 | 含义 | setup.sh 的动作 |
+|---|---|---|
+| `SKIP` | 首装,或本版不删除任何已部署的 export(**绝大多数升级**) | 照常 `--all`,行为与旧版逐字节一致 |
+| `REORDER <栈>…` | 本版要退役 export | **先**单独 `cdk deploy <消费者栈> --exclusively` 把引用放开,**再** `--all` |
+| `WAIT <状态>` | 主栈正在变更中(`UPDATE_IN_PROGRESS` 等) | 中止并让你等它结束再重跑 —— 此时任何判断都会过期 |
+| `FALLTHROUGH …` | 同一版**既退役又新增** export,消费者要用新增那条 | 大声告警后按常规顺序继续(见下) |
+
+**已经卡在 `UPDATE_ROLLBACK_COMPLETE` 了怎么办**:直接重跑 `./setup.sh` —— 预检会识别出来并自动重排。想手工做也可以:
+
+```bash
+cd infra
+# 1. 先单独更新消费者栈,让它不再 import 那条要被删的 export
+#    ⚠️ --exclusively 必须带:否则 CDK 会先去部它的依赖(主栈),等于又走一遍出问题的顺序
+#    ⚠️ -c 要带全(照 setup.sh 那一行抄),少一个就会 synth 出另一份模板
+npx cdk deploy WebChatStack --exclusively --require-approval never -c enabledPlatforms=feishu
+# 2. 再全量
+npx cdk deploy --all
+```
+
+**`FALLTHROUGH` 怎么办**:这种版本无法用重排救(先部消费者会 `No export named … found`,先部主栈会撞 export 删除失败)。正确做法是**拆两次发布**:先发只退役的那一版,再发新增的那一版。仓库侧有一道 CI 闸门(`cfn-export-gate` + [infra/exports.golden.json](../infra/exports.golden.json))在代码进 main 之前就把这种版本拦下来,所以你作为部署者基本不会看到它。
+
+> 📌 **方式 A(一键部署)不受影响**:它是**单栈**(`NotiOps`),没有任何跨栈引用,也就没有 CFN Export —— 结构上不存在这个失败模式,所以方式 A 侧不需要对应的预检步骤。这不是功能缺口(两条路径的 **web 功能**仍然完全一致)。
 
 ---
 

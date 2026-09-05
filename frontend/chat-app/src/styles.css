@@ -692,6 +692,32 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 .websearch-toggle.disabled, .websearch-toggle:disabled { opacity: .5; cursor: not-allowed; color: var(--muted); }
 .websearch-toggle.disabled:hover { color: var(--muted); border-color: var(--line); }
 .toggle-soon { font-size: 10px; font-weight: 700; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; margin-left: 2px; }
+/* ── 「回答模式」下拉（ModePicker）──────────────────────────────────────────────
+   收起态刻意长得**和联网搜索那个 pill 一样**（同圆角/同字号/同 .on 橙色描边）：它就是
+   原来那四个 pill 的位置，只是四个变一个，不该在视觉上变成另一类控件。
+   `.mode-wrap` 要 position:relative —— 菜单锚在按钮上而不是聊天框上（模型菜单那份是
+   写死的 right/bottom 偏移，这里的按钮位置随主题、随标签长度浮动，锚不住）。 */
+.mode-wrap { position: relative; display: inline-flex; }
+.modepick { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 18px; padding: 6px 12px; font-size: 12.5px; font-weight: 600; color: var(--muted); cursor: pointer; background: var(--card); font-family: inherit; white-space: nowrap; transition: all .15s; }
+.modepick:hover { color: var(--text); border-color: var(--muted); }
+.modepick svg { opacity: .85; }
+.modepick .caret { color: var(--muted); font-size: 11px; }
+.modepick.on { color: var(--orange2); border-color: var(--orange); background: color-mix(in srgb, var(--orange) 12%, transparent); }
+.modepick.on svg, .modepick.on .caret { opacity: 1; color: var(--orange2); }
+.modemenu { position: absolute; bottom: 100%; left: 0; margin-bottom: 8px; width: 330px; max-width: min(330px, calc(100vw - 40px)); background: var(--menu-bg); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 12px 32px rgba(13, 27, 42, .16); padding: 6px; z-index: 25; max-height: min(400px, 70vh); overflow-y: auto; }
+.modemenu.drop-down { bottom: auto; top: 100%; margin: 8px 0 0; }
+.mode-item { display: flex; align-items: flex-start; gap: 9px; width: 100%; text-align: left; border: none; background: transparent; padding: 9px 11px; border-radius: 9px; cursor: pointer; font-family: inherit; }
+.mode-item:hover { background: var(--menu-hover); }
+.mode-ico { display: inline-flex; color: var(--muted); padding-top: 1px; flex-shrink: 0; }
+.mode-body { display: flex; flex-direction: column; min-width: 0; }
+.mode-name { display: flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 600; color: var(--text); }
+.mode-desc { font-size: 11.5px; color: var(--muted); line-height: 1.45; margin-top: 2px; }
+.mode-check { margin-left: auto; color: var(--orange2); flex-shrink: 0; padding-top: 2px; }
+.mode-item.sel .mode-name, .mode-item.sel .mode-ico { color: var(--orange2); }
+/* 置灰项：不 hover 变色（会读成"能点"），说明行此时写的是"为什么点不动" */
+.mode-item.disabled { opacity: .55; cursor: not-allowed; }
+.mode-item.disabled:hover { background: transparent; }
+
 /* 多账号选择器（cbar 内，紧跟联网搜索） */
 .account-sel { margin-left: 8px; border: 1px solid var(--line); border-radius: 18px; padding: 6px 10px; font-size: 12.5px; font-weight: 600; color: var(--text); background: var(--card); font-family: inherit; cursor: pointer; max-width: 220px; }
 .account-sel:hover { border-color: var(--muted); }

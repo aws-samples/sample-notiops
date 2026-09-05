@@ -107,7 +107,30 @@ const webChat = new WebChatStack(app, "WebChatStack", {
   // 加进哪个 space 作为 monitor account」。前端不硬编码，每次重建栈 id 都会变。
   inspectionAgentSpaceId: main.inspectionAgentSpaceId,
   inspectionAgentSpaceName: `notiops-inspection-${main.account}`,
-  idleConsoleUrl: main.consoleUrl, // 侧栏「巡检 & 报告」外链
+  // ⚠️ `idleConsoleUrl` 已随老控制台（idle 控制台 + ApiLambda + FrontendCDN）
+  //    一起退役（2026-09-04）：巡检看板与管理页都在 web chat 站内，
+  //    侧栏那个外链本来就被 SHOW_INSPECTIONS=false 关着。
   reportsCdnDomain, // 「深度调查（直连）」报告链接（CloudFront+OAC，只暴露 reports/*）
 });
+// 🔴 这条依赖决定了 `cdk deploy --all` **先更主栈**。首装是对的（要先有
+//    Cognito 池），但**升级**时它是一个陷阱：主栈上那些 `ExportsOutput…` 是
+//    CDK 为跨栈引用自动生成的 CFN Export，退役一个引用（比如上面 2026-09-04
+//    退掉的 `idleConsoleUrl` / FrontendCDN）就意味着主栈这一版要**删**那条
+//    export；而那一刻客户机器上已装的**老** WebChatStack 还持有
+//    `Fn::ImportValue`，CloudFormation 硬拒：
+//
+//        Export <name> cannot be deleted as it is in use by WebChatStack
+//
+//    主栈随即 `UPDATE_ROLLBACK_COMPLETE`、后续栈全 SKIPPED，而且**平淡重跑
+//    永远撞同一堵墙**（CDK CLI 把 `UPDATE_ROLLBACK_COMPLETE` 归为
+//    `isRollbackSuccess`，不会 delete-and-recreate）。
+//
+//    ⚠️ 所以**别**靠改这里的顺序来治它 —— 首装依然需要主栈先出 Cognito 池。
+//    治法在部署侧：`setup.sh` 在 `cdk deploy --all` 之前跑
+//    `scripts/export_retire_plan.py`，发现有 export 要退役就先单独
+//    `cdk deploy <消费者栈> --exclusively` 把引用放开。改动这里的跨栈引用
+//    （新增/删除 `main.xxx` 的传参）会动到 export 集合，CI 上的
+//    `scripts/check_cfn_exports.py` + `infra/exports.golden.json` 会拦你一下，
+//    让你确认升级路径：golden diff 里只有新增 → 直接发；一旦出现删除，先单独
+//    部署消费者栈放开引用，再发主栈。
 webChat.addStackDependency(main);

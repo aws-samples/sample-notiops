@@ -723,16 +723,10 @@ def on_app_mention(event: dict, say, client) -> None:
                     "falling through to investigate", _agentic_mode, command)
         command = "investigate"
 
-    # query command — read existing DDB results and reply immediately.
+    # query command —— 老 idle-detector 的 DDB 报告查询已随老系统退役
+    # （2026-09-04，与 feishu/main.py 同步）。意图仍可能是 `query`，
+    # 直接落到 investigate，不静默丢弃。
     if command == "query":
-        from platforms.feishu.app.query_handler import handle as query_handle
-        query_type = analysis.get("query_type", "health_report")
-        result = query_handle(query_type, chat_id=channel_id, locale=locale)
-        if result:
-            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                    text=result)
-            return
-        # If query returned None, fall through to investigate
         command = "investigate"
 
     # case_* commands skip the dispatch-confirmation flow entirely and

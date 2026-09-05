@@ -219,7 +219,9 @@ describe("飞书配置步骤抽屉", () => {
   it("第 3 步直接给出本部署真实的 webhook 地址 + 复制按钮", async () => {
     // 这是整条接入流程里**唯一需要客户手抄**的值：抄错一个字符 → 飞书「校验失败」，
     // 而症状指向的是钥匙没配。所以宁可后端查一次，也不让客户去翻 CloudFormation Outputs。
-    const url = "https://e5er287z3e.execute-api.us-east-1.amazonaws.com/";
+    // API id 是**占位**（`a1b2c3d4e5`）。别贴真实部署的 webhook 地址进来：这个仓要外发，
+    // 而 IM webhook 是公网未鉴权入口，贴真值等于把某个部署的入口发到公网上。
+    const url = "https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/";
     getResp.feishu.webhook_url = url;
     await openImTab();
     fireEvent.click(document.querySelector("button.imx-guide-link") as HTMLButtonElement);
@@ -238,7 +240,7 @@ describe("飞书配置步骤抽屉", () => {
   });
 
   it("点复制写进剪贴板，并把按钮文案切成「已复制」", async () => {
-    const url = "https://e5er287z3e.execute-api.us-east-1.amazonaws.com/";
+    const url = "https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/";   // 占位，见上一条
     getResp.feishu.webhook_url = url;
     const writeText = vi.fn(async () => {});
     Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });

@@ -23,6 +23,11 @@
 3. **剩余时间不够就不发**。冷启动 INIT 撞 10s 上限后 Lambda 会把 init 挪进首次
    invoke 里重跑（现网实测重跑用掉 11.7s），那一次调用剩下的预算要留给"把 200 回出去"。
    判据走 `lambda_deadline`（ingress handler 入口已经 `set_from_context`）。
+   ⚠️ 这个判据在 `feishu()` / `slack()` **内部**，所以调用方在它前面自己打的 HTTP
+   不受它保护 —— 飞书 ingress 的「这条消息 worker 会不会回」要查 bot 自己的 open_id
+   （一次 token + 一次 OpenAPI），那一段发生在进到这里**之前**。故把判据导出成公开的
+   `budget_ok()`，调用方在花第一分钱之前先问一次。见
+   `platforms/feishu/lambda_ingress.py::_quick_ack`。
 
 ── 刻意没做的事 ─────────────────────────────────────────────────────────────
 · **不在答完之后把表情换成 ✅**。那要多两次 API 调用（remove + add），而卡片本身的
@@ -61,7 +66,9 @@ _SLACK_API = "https://slack.com/api/reactions.add"
 _slack_token: str | None = None
 
 
-def _budget_ok() -> bool:
+def budget_ok() -> bool:
+    """本次调用还够不够做"贴表情"这件闲事。**公开**：见约束 3 的 ⚠️ —— 调用方在自己
+    花 HTTP 之前也要问一次，不然这道闸只挡住了最后一步。"""
     # 没设过 context（单测 / 本地）→ `remaining_seconds` 返回默认 900，正常发。
     return lambda_deadline.remaining_seconds() >= MIN_REMAINING_SECONDS
 
@@ -76,12 +83,12 @@ def feishu(message_id: str) -> bool:
     的就不进（`feishu_utils` 本身很轻，但这条纪律要守住 —— 它 import 的
     `core.lazy_boto` 以后要是变重了，受害的是冷启动）。
     """
-    if not message_id or not _budget_ok():
+    if not message_id or not budget_ok():
         return False
     emoji = ack_variants.feishu_emoji(message_id)
     if _feishu_react(message_id, emoji):
         return True
-    if emoji == ack_variants.FEISHU_EMOJI_FALLBACK or not _budget_ok():
+    if emoji == ack_variants.FEISHU_EMOJI_FALLBACK or not budget_ok():
         return False
     # 走到这里最可能是"这个 emoji_type 键在本租户不认"。回落到实测过的那个再试一次 ——
     # 缺权限的话第二次也会失败（两条 WARNING，一眼看得出是权限不是键名）。
@@ -135,12 +142,12 @@ def _slack_bot_token() -> str:
 
 def slack(channel: str, ts: str) -> bool:
     """`reactions.add` —— 给用户那条消息加表情。`ts` 是消息自己的 `ts`，不是 thread_ts。"""
-    if not channel or not ts or not _budget_ok():
+    if not channel or not ts or not budget_ok():
         return False
     emoji = ack_variants.slack_emoji(ts)
     if _slack_react(channel, ts, emoji):
         return True
-    if emoji == ack_variants.SLACK_EMOJI_FALLBACK or not _budget_ok():
+    if emoji == ack_variants.SLACK_EMOJI_FALLBACK or not budget_ok():
         return False
     logger.warning("quick_ack.slack: emoji=%s rejected, retrying with %s",
                    emoji, ack_variants.SLACK_EMOJI_FALLBACK)

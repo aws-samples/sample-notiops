@@ -94,7 +94,6 @@ function synthTemplate(): Record<string, unknown> {
     userPoolClientId: "fixtureuserpoolclientid00",
     skillsBucketName: `notiops-data-${FIXTURE_ACCOUNT}-${FIXTURE_REGION}`,
     agentSpaceId: "fixture-agent-space",
-    idleConsoleUrl: "https://console.example.invalid",
     reportsCdnDomain: "reports.example.invalid",
   });
 

@@ -43,7 +43,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 )
 
 from platforms.common import lambda_deadline, quick_ack, warmup
-from platforms.feishu import webhook_adapter
+from platforms.feishu import bot_identity, webhook_adapter
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -125,18 +125,32 @@ def _will_be_answered(msg) -> bool:
     刻意保守（只贴 worker 一定会回的那些），差集是「bot 已经回过话的话题里免 @ 追问」：
     那一条要查 DDB（`is_bot_thread`）才能判定，而 ingress 没有表加载也没有那个权限。
     代价是这类追问看不到表情（照样有卡片），比"贴了却没人回"好。
+
+    ⚠️ **群消息这一路会打 HTTP**：`bot_identity` 要查本 bot 的 `open_id`（进程内缓存，
+    冷环境的第一条群 @ 要一次 token + 一次 OpenAPI）。所以调用方必须先过预算闸门 ——
+    见 `_quick_ack`。私聊与"群里闲聊"两条都在发第一个包之前就返回了。
     """
     if getattr(msg, "message_type", "") != "text":
         return False
     chat_id = getattr(msg, "chat_id", "") or ""
     if _ALLOWED_CHAT_IDS and chat_id not in _ALLOWED_CHAT_IDS:
         return False
-    # p2p = 私聊，一律受理；群里只认被 @ 到的那些（口径同 worker 的 _is_bot_mentioned）。
-    return getattr(msg, "chat_type", "") == "p2p" or bool(getattr(msg, "mentions", None))
+    # p2p = 私聊，一律受理；群里只认 @ 到**本** bot 的那些。判据与 worker 共用
+    # `platforms/feishu/bot_identity.py`（不是"照抄一遍"，是同一个函数），所以两处不会漂。
+    if getattr(msg, "chat_type", "") == "p2p":
+        return True
+    return bot_identity.is_bot_mentioned(msg)
 
 
 def _quick_ack(event: P2ImMessageReceiveV1) -> None:
     try:
+        # ⚠️ 预算闸门必须在 `_will_be_answered()` **之前** —— 群消息的那一路要查 bot
+        # 自己的 open_id（`bot_identity`：一次 token + 一次 OpenAPI），**那也是 HTTP**，
+        # 而 `quick_ack.feishu()` 自己的闸门在它后面才生效。本函数 timeout 只有 20s
+        # （`infra/lib/constructs/im-core.ts`），先花掉这段再问"还有预算吗"就晚了：
+        # 表情照样不发，时间照样花掉，函数被平台杀掉 → 对飞书回 5xx → 白挨一轮重试。
+        if not quick_ack.budget_ok():
+            return
         msg = event.event.message
         if not _will_be_answered(msg):
             return

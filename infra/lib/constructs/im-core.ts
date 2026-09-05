@@ -251,6 +251,18 @@ export interface ImCoreResult {
    *  `Error occurred while GetObject. S3 Error Code: NoSuchKey`：CFN 会并行创建，
    *  函数可能比产物先到。方式B 用 fromAsset（资产在 cdk deploy 前就上传好了），不需要。 */
   functions: lambda.Function[];
+  /** 三个 IM 函数共用的那份环境变量（表名 / 区域 / 桶 / CDN …）。
+   *
+   *  方式A 的 **DevOps Agent 调查回调** Lambda 建在栈里（方式B 建在自己那个栈层），
+   *  它读的表和桶与 IM 侧是同一批。暴露出来让那边直接 `...im.commonEnv` 展开，而不是
+   *  在栈里再抄一份：抄一份的症状是静默的 —— 少注一个表名，回调就把报告写到"没有
+   *  消费者"的地方，IM 面板照样显示调查已结束。*/
+  commonEnv: Record<string, string>;
+  /** 本次实际生效的 Secret 名（props 没给就是默认值）。
+   *
+   *  同上：回调 Lambda 要靠 `FEISHU_SECRET_NAME` / `SLACK_BOT_TOKEN_ARN` 才发得出卡片，
+   *  而 `imRole` 的 secretsmanager 语句是按**这三个名字**收窄的。两处必须同源。 */
+  secretNames: { feishu: string; slackBotToken: string; slackSigningSecret: string };
 }
 
 export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult {
@@ -443,7 +455,16 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
     architecture: lambda.Architecture.X86_64,  // 层是 manylinux2014_x86_64
   };
 
-  const result: ImCoreResult = { imRole, functions: [] };
+  const result: ImCoreResult = {
+    imRole,
+    functions: [],
+    commonEnv,
+    secretNames: {
+      feishu: feishuSecret,
+      slackBotToken: slackTokenSecret,
+      slackSigningSecret,
+    },
+  };
 
   // ─── 飞书 ──────────────────────────────────────────────────────────────
   if (props.platforms.feishu) {

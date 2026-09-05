@@ -6,7 +6,7 @@
   "private": true,
   "main": "index.mjs",
   "scripts": {
-    "test": "for f in authz capabilities_env_gate cur_dashboard_failsoft admin_role_perms agentcore wait_hint warmup llm_config llmcfg_disabled inspection cross_account_identity manual_onboard_flow alias_and_batch_run judge_finding deep_investigation_availability investigation_ref dashboard_insight_requests devops_chat devops_skill feishu_config; do node tests/$f.test.mjs | tee /dev/stderr | grep -q ', 0 failed' || { echo \"GUARD FAIL: tests/$f.test.mjs 没打印成功行\" >&2; exit 1; }; done"
+    "test": "for f in authz capabilities_env_gate cur_dashboard_failsoft admin_role_perms agentcore wait_hint warmup llm_config llmcfg_disabled inspection cross_account_identity manual_onboard_flow alias_and_batch_run judge_finding deep_investigation_availability investigation_ref dashboard_insight_requests devops_chat devops_skill feishu_config daily_anomaly; do node tests/$f.test.mjs | tee /dev/stderr | grep -q ', 0 failed' || { echo \"GUARD FAIL: tests/$f.test.mjs 没打印成功行\" >&2; exit 1; }; done"
   },
   "dependencies": {
     "@aws-crypto/sha256-js": "^5.2.0",

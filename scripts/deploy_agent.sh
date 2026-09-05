@@ -56,7 +56,7 @@ ENABLE_WEBSEARCH="${ENABLE_WEBSEARCH:-true}"
 STACK="AgentCore-NotiOpsWebChat-default"
 
 if [ ! -d "$AGENT_DIR" ]; then
-  echo "  $(t "⚠ 未找到 agent 工程目录 $AGENT_DIR，跳过 agent 部署。" "⚠ Agent project dir $AGENT_DIR not found; skipping agent deployment.")" >&2
+  echo "  $(t "⚠ 未找到 agent 工程目录 ${AGENT_DIR}，跳过 agent 部署。" "⚠ Agent project dir $AGENT_DIR not found; skipping agent deployment.")" >&2
   exit 1
 fi
 
@@ -87,7 +87,7 @@ fi
 # 客户要试新版：AGENTCORE_CLI_VERSION=x.y.z bash scripts/deploy_agent.sh。
 AGENTCORE_CLI_VERSION="${AGENTCORE_CLI_VERSION:-0.24.2}"
 if ! command -v agentcore >/dev/null 2>&1; then
-  echo "  $(t "安装 AgentCore CLI（@aws/agentcore@$AGENTCORE_CLI_VERSION）..." "Installing AgentCore CLI (@aws/agentcore@$AGENTCORE_CLI_VERSION)...")"
+  echo "  $(t "安装 AgentCore CLI（@aws/agentcore@${AGENTCORE_CLI_VERSION}）..." "Installing AgentCore CLI (@aws/agentcore@$AGENTCORE_CLI_VERSION)...")"
   npm install -g "@aws/agentcore@$AGENTCORE_CLI_VERSION" >/dev/null 2>&1 || {
     echo "  $(t "❌ 无法安装 agentcore CLI；请手动 'npm install -g @aws/agentcore@$AGENTCORE_CLI_VERSION' 后重试。" "❌ Failed to install agentcore CLI; run 'npm install -g @aws/agentcore@$AGENTCORE_CLI_VERSION' manually and retry.")" >&2
     exit 1
@@ -103,7 +103,7 @@ else
   # 所以只能硬停。逃生口留给知情的人：AGENTCORE_CLI_ALLOW_MISMATCH=1。
   HAVE_CLI="$(agentcore --version 2>/dev/null | tr -d '[:space:]' || echo '?')"
   if [ "$HAVE_CLI" != "$AGENTCORE_CLI_VERSION" ] && [ "${AGENTCORE_CLI_ALLOW_MISMATCH:-}" != "1" ]; then
-    echo "  $(t "❌ agentcore CLI 版本不匹配：当前 $HAVE_CLI，NotiOps 验证过的是 $AGENTCORE_CLI_VERSION。" "❌ agentcore CLI version mismatch: found $HAVE_CLI, NotiOps validated $AGENTCORE_CLI_VERSION.")" >&2
+    echo "  $(t "❌ agentcore CLI 版本不匹配：当前 ${HAVE_CLI}，NotiOps 验证过的是 ${AGENTCORE_CLI_VERSION}。" "❌ agentcore CLI version mismatch: found $HAVE_CLI, NotiOps validated $AGENTCORE_CLI_VERSION.")" >&2
     echo "  $(t "   更新的 CLI 会改写仓库里入库的 agentcore/cdk/package.json（@aws/agentcore-cdk 版本），" "   A newer CLI rewrites the in-repo agentcore/cdk/package.json (@aws/agentcore-cdk version),")" >&2
     echo "  $(t "   与入库的 lib/cdk-stack.ts 不匹配 → tsc 编译失败 → agent 上不了线（Web Chat 只回显）。" "   which no longer matches the in-repo lib/cdk-stack.ts → tsc fails → the agent never deploys (Web Chat only echoes).")" >&2
     echo "     npm install -g @aws/agentcore@$AGENTCORE_CLI_VERSION" >&2
@@ -114,7 +114,7 @@ else
     echo "  $(t "   明知风险仍要继续：AGENTCORE_CLI_ALLOW_MISMATCH=1 重跑本脚本。" "   To proceed anyway: re-run this script with AGENTCORE_CLI_ALLOW_MISMATCH=1.")" >&2
     exit 1
   elif [ "$HAVE_CLI" != "$AGENTCORE_CLI_VERSION" ]; then
-    echo "  $(t "⚠ agentcore CLI $HAVE_CLI ≠ 验证版本 $AGENTCORE_CLI_VERSION，已按 AGENTCORE_CLI_ALLOW_MISMATCH=1 放行。" "⚠ agentcore CLI $HAVE_CLI != validated $AGENTCORE_CLI_VERSION; proceeding because AGENTCORE_CLI_ALLOW_MISMATCH=1.")" >&2
+    echo "  $(t "⚠ agentcore CLI $HAVE_CLI ≠ 验证版本 ${AGENTCORE_CLI_VERSION}，已按 AGENTCORE_CLI_ALLOW_MISMATCH=1 放行。" "⚠ agentcore CLI $HAVE_CLI != validated $AGENTCORE_CLI_VERSION; proceeding because AGENTCORE_CLI_ALLOW_MISMATCH=1.")" >&2
   fi
 fi
 
@@ -221,7 +221,7 @@ except Exception:
     print('')
 " "$AGENT_DIR/agentcore/cdk/package.json" 2>/dev/null || echo '')"
 if [ -n "$HARNESS_PIN_ACTUAL" ] && [ "$HARNESS_PIN_ACTUAL" != "$HARNESS_PIN_EXPECTED" ]; then
-  echo "  $(t "❌ CDK harness 依赖被改动：@aws/agentcore-cdk = $HARNESS_PIN_ACTUAL（应为 $HARNESS_PIN_EXPECTED）。" "❌ The CDK harness dependency was modified: @aws/agentcore-cdk = $HARNESS_PIN_ACTUAL (expected $HARNESS_PIN_EXPECTED).")" >&2
+  echo "  $(t "❌ CDK harness 依赖被改动：@aws/agentcore-cdk = ${HARNESS_PIN_ACTUAL}（应为 ${HARNESS_PIN_EXPECTED}）。" "❌ The CDK harness dependency was modified: @aws/agentcore-cdk = $HARNESS_PIN_ACTUAL (expected $HARNESS_PIN_EXPECTED).")" >&2
   echo "  $(t "   几乎一定是更新版的 agentcore CLI 改写过它 —— 与入库的 lib/cdk-stack.ts 不兼容，tsc 会失败。还原：" "   Almost certainly rewritten by a newer agentcore CLI — incompatible with the in-repo lib/cdk-stack.ts; tsc will fail. Restore it:")" >&2
   echo "     git checkout -- agent-build/NotiOpsWebChat/agentcore/cdk/package.json agent-build/NotiOpsWebChat/agentcore/cdk/package-lock.json" >&2
   echo "     rm -rf agent-build/NotiOpsWebChat/agentcore/cdk/node_modules && (cd agent-build/NotiOpsWebChat/agentcore/cdk && npm ci)" >&2
@@ -255,7 +255,7 @@ if ! ( cd "$AGENT_DIR" && agentcore deploy -y ); then
   echo "" >&2
   echo "  $(t "❌ agentcore deploy 失败。" "❌ agentcore deploy failed.")" >&2
   if [ -n "$CLI_LOG" ]; then
-    echo "  $(t "── agentcore CLI 自己的日志（$CLI_LOG，最后 60 行）──" "── The agentcore CLI's own log ($CLI_LOG, last 60 lines) ──")" >&2
+    echo "  $(t "── agentcore CLI 自己的日志（${CLI_LOG}，最后 60 行）──" "── The agentcore CLI's own log ($CLI_LOG, last 60 lines) ──")" >&2
     tail -60 "$CLI_LOG" | sed 's/^/    /' >&2
   else
     echo "  $(t "（未找到 CLI 日志：$AGENT_DIR/agentcore/.cli/logs/deploy/）" "(No CLI log found under $AGENT_DIR/agentcore/.cli/logs/deploy/)")" >&2

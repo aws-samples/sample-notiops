@@ -24,6 +24,7 @@ import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-r
 import { CostAndUsageReportServiceClient, DescribeReportDefinitionsCommand } from "@aws-sdk/client-cost-and-usage-report-service";
 import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
 import { getEdpCommitmentMock } from "./edp_mock.mjs";
+import { getDailyAnomalies } from "./daily_anomaly.mjs";
 import { getPotentialSavings } from "./potential_savings.mjs";
 import { getCostExplorerDashboard, currentPayerAccountId, setAccountScope, listCostAllocationTagKeys, listCostAllocationTagValues, getCostByTag } from "./cost_explorer.mjs";
 import { findPayerAccount, getAssumedCredentialsForAccount } from "./devops_agent_accounts.mjs";
@@ -658,13 +659,18 @@ export async function getTagCost(accountId, tagKey, tagValue) {
   }
 }
 
-export async function getFinopsDashboard(accountId) {
+export async function getFinopsDashboard(accountId, { visible = null } = {}) {
   // 多账号：payer 视角天然含全组织；选中成员账号 → CE 查询按 LINKED_ACCOUNT 过滤。
   // budgets / COH savings / DevOps Agent credit / EDP 承诺 等板块无该过滤维度，保持组织级，
   // orgOnlySections 告知前端如实标注口径。
   setAccountScope(accountId || "");
-  const [budgetAlerts, curStatus, costExplorer, potentialSavings] = await Promise.all([
+  const [budgetAlerts, curStatus, costExplorer, potentialSavings, dailyAnomaly] = await Promise.all([
     getBudgetAlerts(), getCurAthenaStatus(), getCostExplorerDashboard(), getPotentialSavings(),
+    // 每日多因子异常扫描（lambda5 产数）。与 costExplorer.anomalies 是两套
+    // 引擎（见 daily_anomaly.mjs 头注释），并排展示不合并。
+    // ⚠️ `visible` 从路由层传进来 —— 行上带 account_id，org 视图不过滤
+    //    就是把别人账号的成本异常端给受限用户（数据层不给就拒）。
+    getDailyAnomalies(accountId, { visible }),
   ]);
   let devOpsAgentCost = { available: false, reason: "cur_not_ready" };
   if (curStatus.status === "READY") {
@@ -677,7 +683,10 @@ export async function getFinopsDashboard(accountId) {
   const costDataSourceAccountId = currentPayerAccountId() || (await _accountId());
   return {
     budgetAlerts, curStatus, devOpsAgentCost, costExplorer, edpCommitment, potentialSavings, costDataSourceAccountId,
+    dailyAnomaly,
     accountScope: String(accountId || ""),
+    // ⚠️ `dailyAnomaly` 不在 orgOnlySections：它的行带 account_id，
+    //    选中成员账号时按账号过滤，是真的账号级口径。
     orgOnlySections: ["budgetAlerts", "potentialSavings", "devOpsAgentCost", "edpCommitment", "anomalies", "coverage"],
   };
 }

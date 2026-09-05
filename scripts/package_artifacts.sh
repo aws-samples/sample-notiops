@@ -252,6 +252,15 @@ check("im-code.zip has the Slack worker handler", "platforms/slack/lambda_worker
 check("im-code.zip has the progress poller handler", "platforms/common/lambda_progress.py" in im_code)
 check("im-code.zip has the deterministic router", "platforms/common/router.py" in im_code)
 check("im-code.zip has core/devops_agent.py", "core/devops_agent.py" in im_code)
+# 方式A 的调查结果回调函数与 IM 三个函数**共用这同一个 zip**（方式B 那边是独立资产）。
+# 少了它，客户账号里的回调一调就 `No module named 'devops_agent_callback'`，
+# 而那条链路是异步的 → 客户只看到「深度调查跑完了，报告和公网 URL 永远不来」。
+# 曾经真的漏过：`infra/im-code-exclude.txt` 里有一行把整个包剪掉了（2026-09-04 移除）。
+check("im-code.zip has the DevOps Agent callback handler",
+      "devops_agent_callback/handler.py" in im_code,
+      "infra/im-code-exclude.txt must NOT exclude devops_agent_callback/**")
+check("im-code.zip has the report delivery handler",
+      "shared/report_delivery/report_handler.py" in im_code)
 check("im-code.zip carries no node_modules / dist / infra",
       not any(n.startswith(("node_modules/", "dist/", "infra/", "frontend/")) or "/node_modules/" in n
               for n in im_code),
@@ -304,6 +313,26 @@ step "SHA256SUMS"
 (cd "$OUT_DIR" && shasum -a 256 bff.zip chat-dist.zip web-notif.zip \
     im-code.zip im-layer.zip agent-code.zip > SHA256SUMS)
 cat "$OUT_DIR/SHA256SUMS"
+
+# ── 5.5 把六个校验和写进 release notes ───────────────────────────────────────
+# 客户唯一能自己核对产物的东西就是 Release 正文里那六行 sha256（模板里烧的是同
+# 一份，栈下载后逐个比对）。到 2026-09-04 发 v1.0.20 为止，这一步是纯手抄：上面
+# 那个 `cat SHA256SUMS` 打出来，人再贴进 notes。抄错一位不会有任何东西报警，
+# 后果出现在**客户账号里**（checksum 不匹配 → 栈 ROLLBACK）。
+#
+# notes 还没写不是错误（正文常常在打完产物之后才写完），但**必须大声说**该补哪条
+# 命令 —— 静默跳过就等于把手抄那一步原样留着。
+NOTES="publish/RELEASE_NOTES_$RELEASE_TAG.md"
+step "release notes checksums"
+if [ -f "$NOTES" ]; then
+  python3 scripts/write_release_notes_sums.py --sha256 "$OUT_DIR/SHA256SUMS" --notes "$NOTES"
+else
+  echo "  ⚠ 还没有 $NOTES —— 六个校验和**没有**写进任何地方。"
+  echo "    正文写好后（范式见发布手册的「校验和段」一节）补跑一次:"
+  echo "      python3 scripts/write_release_notes_sums.py \\"
+  echo "        --sha256 $OUT_DIR/SHA256SUMS --notes $NOTES"
+  echo "    别手抄 —— 抄错一位的报错现场在客户账号里。"
+fi
 
 # ── 6. 后处理模板 ─────────────────────────────────────────────────────────────
 step "postprocess template"

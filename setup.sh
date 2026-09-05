@@ -635,17 +635,14 @@ else
   PLATFORM_FLAG="-c enabledPlatforms=$ENABLED_PLATFORMS"
 fi
 
-# 1. 构建前端（idle 控制台 + web chat）
+# 1. 构建前端（web chat。老 idle 控制台已于 2026-09-04 退役，不再构建）
 echo ""
 echo "$(t "[1/4] 构建前端..." "[1/4] Building frontends...")"
-cd "$PROJECT_ROOT/frontend/frontend-app"
-npm ci --silent   # ci: 严格按 package-lock.json 安装，保证可复现 + 不放宽 override floor（安全要求）
-npm run build
-echo "  $(t "✓ idle 控制台前端构建完成" "✓ Console frontend built")"
 
 # Web Chat 前端（WebChatStack 的 BucketDeployment 部署其 dist/）
 cd "$PROJECT_ROOT/frontend/chat-app"
-npm ci --silent
+npm ci --loglevel=error   # ci: 严格按 package-lock.json 安装，保证可复现 + 不放宽 override floor（安全要求）
+                          # loglevel=error 而非 --silent：--silent 连报错都吞，配合 set -e 会「一声不吭直接退出」
 npm run build
 echo "  $(t "✓ web chat 前端构建完成" "✓ Web Chat frontend built")"
 
@@ -657,7 +654,7 @@ cp "$PROJECT_ROOT/config/capabilities.json" "$PROJECT_ROOT/bff/web-chat/capabili
 echo "  $(t "✓ 能力清单 capabilities.json 已复制进 BFF" "✓ capabilities.json copied into BFF")"
 cp "$PROJECT_ROOT/config/eol-dates.json" "$PROJECT_ROOT/bff/web-chat/eol-dates.json"
 echo "  $(t "✓ EOL 兜底表 eol-dates.json 已复制进 BFF" "✓ eol-dates.json copied into BFF")"
-npm ci --omit=dev --silent --no-audit --no-fund   # ci: 严格按 lockfile（安全要求）
+npm ci --omit=dev --loglevel=error --no-audit --no-fund   # ci: 严格按 lockfile（安全要求）；loglevel=error 让失败可见
 echo "  $(t "✓ web chat BFF 依赖安装完成" "✓ Web Chat BFF dependencies installed")"
 
 # ── 客户自有 CUR 数据源（cost-agent MCP，可选加装项）──
@@ -726,7 +723,12 @@ if [ "${SKIP_AGENT:-false}" != "true" ] && [ -d "$PROJECT_ROOT/agent-build/NotiO
     AGENT_STATUS="failed"
     echo "  $(t "⚠ Agent 部署失败 —— web 端仍会部署，但 BFF 暂回退 echo。" "⚠ Agent deployment failed — the web UI still deploys, but BFF falls back to echo for now.")"
     echo "    $(t "修复后可单独重跑：" "After fixing, re-run separately: ")DEPLOY_REGION=$DEPLOY_REGION bash scripts/deploy_agent.sh"
-    echo "    $(t "然后：" "then: ")cd infra && npx cdk deploy WebChatStack --exclusively -c agentRuntimeArn=<ARN>"
+    # ⚠️ 这里**不给** `npx cdk deploy … -c agentRuntimeArn=<ARN>` 那条单栈命令：
+    #    在脚本这个位置 $PLATFORM_FLAG / $ORG_FLAG / $INSPECTION_FLAGS 还没算完，
+    #    照着只带一个 -c 的命令手工部会把其余 context 全部丢掉 —— 后果是静默的
+    #    功能退化（IM 平台被关、org 模式失效、巡检深链变空）。文末的提示在所有
+    #    flag 都算完之后打印，那里才给完整命令。
+    echo "    $(t "然后重跑一次 setup.sh —— 它会把 ARN 连同其余 -c 一起注入。" "Then re-run setup.sh once -- it injects the ARN together with all the other -c flags.")"
   fi
 elif [ "${SKIP_AGENT:-false}" = "true" ]; then
   echo "  $(t "（SKIP_AGENT=true：跳过 agent 部署，BFF 走 echo 回退。）" "(SKIP_AGENT=true: skipping agent deployment, BFF uses echo fallback.)")"
@@ -827,7 +829,7 @@ fi
 echo ""
 echo "$(t "[3/4] CDK 部署到 " "[3/4] CDK deploying to ")$DEPLOY_REGION$(t "(约 10-15 分钟)..." " (~10-15 min)...")"
 cd "$PROJECT_ROOT/infra"
-npm ci --silent   # ci: 严格按 lockfile，保证可复现 + 不放宽 override floor（安全要求）
+npm ci --loglevel=error   # ci: 严格按 lockfile，保证可复现 + 不放宽 override floor（安全要求）；loglevel=error 让失败可见
 
 CDK_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
 
@@ -1130,6 +1132,96 @@ fi
 
 rm -f cdk-synth-stderr.log
 
+# ── 升级预检：退役的 CFN Export 必须「消费者优先」 ─────────────────────────
+#
+# 🔴 这一段治的是一个**不可自愈**的升级失败，只在升级已装环境时出现：
+#
+#    CDK 的跨栈引用会在**生产者**（NotiOpsBackendStack）上自动生成一条 CFN
+#    Export，消费者栈（WebChatStack / ImStack）里是 `Fn::ImportValue`。某一版
+#    退役了这个引用 → HEAD 的主栈不再 export 它。而 `cdk deploy --all` 按
+#    `addStackDependency`（`infra/bin/app.ts`）**先更主栈** —— 那一刻客户机器上
+#    已装的**老**消费者栈还持有那个 import，CloudFormation 硬拒：
+#
+#        Export <name> cannot be deleted as it is in use by WebChatStack
+#
+#    结果：主栈 `UPDATE_ROLLBACK_COMPLETE`、后续栈全 SKIPPED、`set -e` 就地
+#    中止。**而且平淡重跑永远撞同一堵墙** —— CDK CLI 把
+#    `UPDATE_ROLLBACK_COMPLETE` 归为 `isRollbackSuccess`，不会 delete-and-recreate，
+#    所以客户手上那套环境从此升不动，除非有人手工先部消费者栈。
+#
+# 解法就是把顺序倒过来：先单独部消费者栈（它的新模板已经没有那条 import），
+# 引用一放开，主栈就能删掉 export。判据（要不要倒 / 倒哪些栈）在
+# `scripts/export_retire_plan.py`，零 AWS 调用、可单测（见 §3.73）。
+#
+# ⚠️ **首装与绝大多数升级走 SKIP 分支，行为逐字节不变** —— 这里只加一次
+#    read-only 的 `describe-stacks`。
+MAIN_DESC=$(aws cloudformation describe-stacks --stack-name NotiOpsBackendStack \
+  --region "$DEPLOY_REGION" --output json 2>/dev/null || echo '{"Stacks":[]}')
+RETIRE_ERR="$CDK_OUT_DIR/export-retire-plan.err"
+if ! RETIRE_PLAN=$(printf '%s' "$MAIN_DESC" \
+      | python3 "$PROJECT_ROOT/scripts/export_retire_plan.py" \
+          --outdir "$CDK_OUT_DIR" 2>"$RETIRE_ERR"); then
+  # fail closed：判据自己坏了就**不许**继续部署 —— 猜"大概没事"正是上面那个
+  # 死锁的来路。
+  echo ""
+  echo "  $(t "❌ 升级预检（CFN Export 退役检查）失败，已停在部署之前：" \
+              "❌ Upgrade preflight (CFN export retirement check) failed, stopped before deploying:")"
+  cat "$RETIRE_ERR" 2>/dev/null
+  echo "  $(t "这是有意的保护 —— 请修好上面的问题后重跑 setup.sh。" \
+              "This guard is intentional -- fix the above and re-run setup.sh.")"
+  exit 1
+fi
+
+case "${RETIRE_PLAN%% *}" in
+  SKIP)
+    : # 常规路径，无事可做。原因（首装 / 本次不删 export）不值得刷屏。
+    ;;
+  WAIT)
+    echo ""
+    echo "  $(t "⏳ 主栈正在变更中（" "⏳ The main stack is mid-change (")${RETIRE_PLAN#WAIT }$(t "），现在部署一定失败。" "), deploying now would fail.")"
+    echo "  $(t "请等 CloudFormation 收敛（控制台看 NotiOpsBackendStack 的事件）后重跑 setup.sh。" \
+                "Wait for CloudFormation to settle (watch NotiOpsBackendStack events in the console), then re-run setup.sh.")"
+    exit 1
+    ;;
+  REORDER)
+    echo "  $(t "🔁 检测到有 CFN Export 要退役 —— 先单独部署消费者栈以放开引用：" \
+                "🔁 A CFN export is being retired -- deploying consumer stacks first to release the reference:")${RETIRE_PLAN#REORDER }"
+    for _retire_stack in ${RETIRE_PLAN#REORDER }; do
+      echo "  $(t "  → 先部署 " "  -> deploying first: ")$_retire_stack"
+      # 🔴 **绝不许在这里传 `--outputs-file`**：它是全量覆写，会把
+      #    cdk-outputs.json 写成只含这一个栈的输出，后面读 ChatUrl / 各 ARN 的
+      #    步骤就会静默拿到空值。输出文件只由下面那条 `--all` 负责。
+      # ⚠️ `--exclusively` 是关键：不加它 CDK 会先去部依赖（也就是主栈），
+      #    正好把要避开的顺序又走一遍。
+      # ⚠️ `-c` 必须与下面 `--all` 那行**同一套**，否则两次 synth 出的模板不同。
+      npx cdk deploy "$_retire_stack" --exclusively --require-approval never \
+        --output "$CDK_OUT_DIR" \
+        $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG \
+        $PLATFORM_FLAG $AGENT_ARN_FLAG $ORG_FLAG $INSPECTION_FLAGS $COST_AGENT_FLAG
+    done
+    ;;
+  FALLTHROUGH)
+    # 同一版里既退役 export 又新增 export，且消费者要用新增的那条 —— 消费者优先
+    # 在这种版本上**无解**（先部消费者会 `No export named … found`，同一个死锁
+    # 换个方向复活）。照常规顺序部，但把话说清楚。真正拦这种组合的是 CI 上的
+    # `scripts/check_cfn_exports.py` + `infra/exports.golden.json`。
+    echo ""
+    echo "  $(t "⚠️  升级预检：本版同时退役与新增 CFN Export，无法用「消费者优先」规避。" \
+                "⚠️  Upgrade preflight: this version both retires and adds CFN exports; consumer-first cannot help.")"
+    echo "  ${RETIRE_PLAN#FALLTHROUGH }"
+    echo "  $(t "将按常规顺序部署。若主栈报 \"Export … cannot be deleted as it is in use\"，" \
+                "Deploying in the normal order. If the main stack reports \"Export ... cannot be deleted as it is in use\",")"
+    echo "  $(t "需要把这次发布拆成两步（先只加、后再删），见 docs/DEPLOYMENT.md「升级路径」。" \
+                "split this release in two (add first, remove later) -- see docs/DEPLOYMENT.md \"Upgrade path\".")"
+    ;;
+  *)
+    echo ""
+    echo "  $(t "❌ 升级预检返回了无法识别的结论，已停在部署之前：" \
+                "❌ Upgrade preflight returned an unrecognized verdict, stopped before deploying:")$RETIRE_PLAN"
+    exit 1
+    ;;
+esac
+
 echo "  $(t "执行完整部署..." "Running full deployment...")"
 # Same --output outside repo root as synth above (avoids fromAsset recursion).
 # $AGENT_ARN_FLAG（若 agent 部署成功）= "-c agentRuntimeArn=<ARN>"，让 WebChatStack 的 BFF
@@ -1289,11 +1381,12 @@ cd "$PROJECT_ROOT/infra"
 # NotiOpsBackendStack; hardcode it.
 STACK_NAME="NotiOpsBackendStack"
 
-CLOUDFRONT_URL=$(jq -r ".[\"$STACK_NAME\"].CloudFrontUrl" cdk-outputs.json)
+# CloudFrontUrl / ApiUrl 已随老控制台退役（2026-09-04）——容错读取，老栈升级时可能还有
+CLOUDFRONT_URL=$(jq -r ".[\"$STACK_NAME\"].CloudFrontUrl" cdk-outputs.json 2>/dev/null || echo "N/A")
 USER_POOL_ID=$(jq -r ".[\"$STACK_NAME\"].UserPoolId" cdk-outputs.json)
 IDLE_ROLE_ARN=$(jq -r ".[\"$STACK_NAME\"].IdleDetectionRoleArn" cdk-outputs.json)
 LAMBDA_ROLE_ARN=$(jq -r ".[\"$STACK_NAME\"].LambdaExecutionRoleArn" cdk-outputs.json)
-API_URL=$(jq -r ".[\"$STACK_NAME\"].ApiUrl" cdk-outputs.json)
+API_URL=$(jq -r ".[\"$STACK_NAME\"].ApiUrl" cdk-outputs.json 2>/dev/null || echo "N/A")
 DATA_BUCKET=$(jq -r ".[\"$STACK_NAME\"].DataBucketName" cdk-outputs.json 2>/dev/null || echo "N/A")
 FEISHU_SECRET=$(jq -r ".[\"$STACK_NAME\"].FeishuSecretArn" cdk-outputs.json 2>/dev/null || echo "N/A")
 SLACK_BOT_TOKEN_SECRET=$(jq -r ".[\"$STACK_NAME\"].SlackBotTokenSecretArn" cdk-outputs.json 2>/dev/null || echo "N/A")
@@ -1514,7 +1607,9 @@ fi
 echo ""
 echo "$(t "── LLM 模型目录 ──" "── LLM model catalogue ──")"
 if command -v python3 >/dev/null 2>&1; then
-  if AWS_REGION="$DEPLOY_REGION" python3 "$(dirname "$0")/scripts/seed_llm_catalog.py" \
+  # 用 $PROJECT_ROOT 而不是 $(dirname "$0")：执行到这里时已经 cd 进 infra/，
+  # 相对 $0 的路径会解析成 infra/./scripts/... → No such file，seed 静默失败
+  if AWS_REGION="$DEPLOY_REGION" python3 "$PROJECT_ROOT/scripts/seed_llm_catalog.py" \
        --table notiops-config --region "$DEPLOY_REGION" 2>/tmp/notiops-llmcfg-seed-err.log; then
     :
   else
@@ -1575,14 +1670,10 @@ echo ""
 echo "  $(t "👤 登录:  admin / " "👤 Login:  admin / ")$ADMIN_PASSWORD_MSG"
 echo ""
 echo "  $(t "Web Chat 就是你和终端用户的全部入口 —— 聊天 / 故障调查 / FinOps 成本 /" "Web Chat is the single entry for you and your end users — chat / investigation / cost /")"
-echo "  $(t "Support 案例 / 通知，都在左侧菜单。所有管理配置也从这里深入,无需记第二个地址:" "Support cases / notifications — all in the left menu. All admin config is reached from here too, no second URL to remember:")"
-echo "    $(t "· 阈值 / 目标账户 / 巡检报告 / Skills 管理" "· Thresholds / target accounts / inspection reports / Skills management")"
-echo "      $(t "→ Web Chat 左侧「更多 → 巡检 & 报告」会打开控制台配置页(同一 admin 账号)" "→ Web Chat left menu \"More → Inspections & Reports\" opens the console config page (same admin account)")"
+echo "  $(t "Support 案例 / 通知 / 巡检看板 / 管理配置(阈值·账号·Skills)，都在站内。" "Support cases / notifications / inspection dashboards / admin config (thresholds, accounts, skills) — all in-app.")"
 echo ""
 echo "$(t "── 其它地址(排查 / 高级用途,平时不用管)──" "── Other URLs (troubleshooting / advanced, usually ignore) ──")"
-echo "  $(t "· 巡检控制台直达(= 上面「巡检 & 报告」打开的页面): " "· Console direct link (= the page opened by \"Inspections & Reports\"): ")$CLOUDFRONT_URL"
 echo "  $(t "· Web Chat BFF Function URL(排查用):              " "· Web Chat BFF Function URL (troubleshooting):   ")$CHAT_BFF_URL"
-echo "  $(t "· API 地址:                                        " "· API endpoint:                                  ")$API_URL"
 echo "  · IdleDetectionRole:  $IDLE_ROLE_ARN"
 echo "  · LambdaExecutionRole: $LAMBDA_ROLE_ARN  $(t "← 跨账户信任策略填这个" "← use this in cross-account trust policy")"
 echo ""
@@ -1641,7 +1732,13 @@ if [ "$AGENT_STATUS" != "deployed" ]; then
   echo "  $(t "   然后重跑这两步(不必重建其余资源):" "   Then re-run these two steps (no need to rebuild anything else):")"
   echo "      DEPLOY_REGION=$DEPLOY_REGION bash scripts/deploy_agent.sh"
   echo "      $(t "# 上一步会打印 Runtime ARN,填到下面这条里" "# the step above prints the Runtime ARN; paste it below")"
-  echo "      cd infra && npx cdk deploy WebChatStack --exclusively -c agentRuntimeArn=<ARN>"
+  # 🔴 必须带**全套** -c，不能只带 agentRuntimeArn。少一个的后果都是静默的：
+  #    少 -c enabledPlatforms → IM 平台被关（已配好的 bot 不再收消息）；
+  #    少 $ORG_FLAG → org 模式失效（跨账号查询报 org_mode_disabled）；
+  #    少 $INSPECTION_FLAGS → 推送深链变空、巡检预算护栏关掉。
+  #    CDK 的 context 不是"合并进已部署的栈"，而是每次 synth 从零重算。
+  echo "      cd infra && npx cdk deploy WebChatStack --exclusively --require-approval never -c agentRuntimeArn=<ARN> $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG $PLATFORM_FLAG $ORG_FLAG $INSPECTION_FLAGS $COST_AGENT_FLAG"
+  echo "  $(t "   （上面这条已带本次部署用的全套 -c；少任何一个都会静默关掉对应功能。）" "   (The command above already carries the full -c set used by this deployment; dropping any one silently disables that feature.)")"
   echo ""
 fi
 

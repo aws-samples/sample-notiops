@@ -116,7 +116,8 @@ export function finopsPanelVisible(id: string, can: (k: string) => boolean): boo
   const deepDive = ["cloudwatch", "datatransfer", "ec2", "s3"].some((k) => can(`nav:finops:deep-dive:${k}`));
   return ({
     spend: can("nav:finops:spend-overview") || can("nav:finops:marketplace") || can("nav:finops:top5"),
-    optimization: can("nav:finops:potential-savings") || can("nav:finops:anomalies") || can("nav:finops:ri-sp"),
+    optimization: can("nav:finops:potential-savings") || can("nav:finops:anomalies")
+      || can("nav:finops:daily-anomaly") || can("nav:finops:ri-sp"),
     progress: can("nav:finops:commitment") || can("nav:finops:devops-credit") || can("nav:finops:ai-spend"),
     movers: can("nav:finops:movers"),
     deepdive: deepDive,
@@ -200,6 +201,8 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
   const forecast = ce?.forecast;
   const savings = data.potentialSavings;
   const anomalies = ce?.anomalies;
+  // 每日多因子扫描（lambda5）—— 与上面 CE 异常检测是两套引擎，两张卡并排。
+  const dailyAnomaly = data.dailyAnomaly;
   const coverage = ce?.coverage;
   const topServices = ce?.topServices;
   // 预测月末环比：用「预测月末 vs 上月完整」，避免 MTD-vs-上月的部分月失真
@@ -248,6 +251,7 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
     top5: can("nav:finops:top5"),
     savings: can("nav:finops:potential-savings"),
     anomalies: can("nav:finops:anomalies"),
+    dailyAnomaly: can("nav:finops:daily-anomaly"),
     riSp: can("nav:finops:ri-sp"),
     commitment: can("nav:finops:commitment"),
     devopsCredit: can("nav:finops:devops-credit"),
@@ -440,6 +444,44 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
             )
           ) : (
             <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>{zh ? "未配置异常监控" : "No anomaly monitor"}</div>
+          )}
+        </Card>
+        )}
+
+        {/* 每日多因子异常扫描（lambda5，01:15 UTC 自建基线）。
+            🔴 与上面那张（AWS Cost Anomaly Detection，要配 monitor）是
+               **两套引擎**，各自标注来源、绝不合并数字 —— 合并的数字对不上
+               任何一边的控制台。老 idle 控制台退役后这是 lambda5 唯一读侧。
+            🔴 三态：available:false = 没跑/读失败（说「未跑」，不是「无异常」）；
+               0 = 跑了且干净；>0 = 数字 + 高分明细。 */}
+        {canCard.dailyAnomaly && dailyAnomaly && (
+        <Card accent={(dailyAnomaly.totalAnomalies || 0) > 0 ? "red" : undefined}>
+          <Label>{zh ? `每日异常扫描${dailyAnomaly.date ? ` · ${dailyAnomaly.date}` : ""}` : `Daily Anomaly Scan${dailyAnomaly.date ? ` · ${dailyAnomaly.date}` : ""}`}</Label>
+          {dailyAnomaly.available ? (
+            (dailyAnomaly.totalAnomalies || 0) > 0 ? (
+              <>
+                <div style={{ fontSize: 26, fontWeight: 800, color: "#d13212" }}>
+                  {dailyAnomaly.totalAnomalies}<span style={{ fontSize: 12, fontWeight: 500, color: "var(--muted)" }}> {zh ? "个" : "found"}</span>
+                </div>
+                <div style={{ fontSize: 12.5, marginTop: 4 }}>{zh ? "预计 7 天额外 " : "Projected 7d extra "}<b>{fmtUsd(dailyAnomaly.projected7dExtraUsd || 0)}</b></div>
+                <div style={{ marginTop: 8, fontSize: 12 }}>
+                  {(dailyAnomaly.details || []).slice(0, 3).map((a) => (
+                    <div key={`${a.accountId}-${a.service}`} style={{ display: "flex", justifyContent: "space-between", marginTop: 3, gap: 8 }}>
+                      <span style={{ color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                        title={`${a.accountId} · ${zh ? "评分" : "score"} ${a.score}`}>{a.service}</span>
+                      <span style={{ fontWeight: 600, flexShrink: 0 }}>{fmtUsd(a.projected7dExtraUsd)}</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize: 13, color: "var(--green)", fontWeight: 600, marginTop: 6 }}>{zh ? "当日扫描无异常" : "No anomalies today"}</div>
+            )
+          ) : (
+            /* 「没跑」≠「无异常」—— 与巡检看板 R9.11 同一条纪律 */
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>
+              {zh ? "近 3 天没有扫描记录（每日 01:15 UTC 跑）" : "No scan in the last 3 days (runs 01:15 UTC daily)"}
+            </div>
           )}
         </Card>
         )}

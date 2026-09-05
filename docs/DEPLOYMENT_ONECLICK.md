@@ -10,7 +10,7 @@
 > **预期完成时间**：**~10 分钟**（其中开栈本身实测 ~4.5 分钟）。
 >
 > **配套文档**：
-> - [DEPLOYMENT.md](DEPLOYMENT.md) — 完整部署手册（`setup.sh` 路径：IM bot、巡检、仪表盘、CUR/Athena 全量功能）
+> - [DEPLOYMENT.md](DEPLOYMENT.md) — 完整部署手册（`setup.sh` 路径：IM bot、巡检及其看板后端、CUR/Athena 全量功能）
 > - [USER_GUIDE.md](USER_GUIDE.md) — 部署完之后怎么用
 
 ---
@@ -23,10 +23,10 @@
 |---|---|---|
 | 你要准备什么 | git、Node、Python、uv、AWS CDK + 一份能部署的 AWS 凭证(**不需要 Docker/finch** —— IM 侧 2026-09-03 / M2 之后走 Lambda Layer,不再构建镜像) | **只要一个能登进 AWS 控制台的浏览器** |
 | 怎么开始 | clone 仓库 → `./setup.sh` | 从 Release 下一个模板文件 → 在 CloudFormation 控制台上传 |
-| 部署内容 | Web Chat + IM bot（飞书/Slack）+ 每日巡检 + 管理仪表盘 + CUR/Athena FinOps 数据源 | **Web Chat**（聊天界面 + BFF + agent + DevOps Agent Agent Space；可选多账号）**+ 可选一个 IM 机器人**（飞书/Lark 或 Slack，见 [§2.11](#211-加装-im-机器人飞书lark-或-slack)） |
+| 部署内容 | Web Chat + IM bot（飞书/Slack）+ 每日巡检（含巡检看板的写侧）+ CUR/Athena FinOps 数据源 | **Web Chat**（聊天界面 + BFF + agent + DevOps Agent Agent Space；可选多账号）**+ 可选一个 IM 机器人**（飞书/Lark 或 Slack，见 [§2.11](#211-加装-im-机器人飞书lark-或-slack)） |
 | 适合 | 长期使用、要 IM 推送和自动巡检 | 先试用 / 演示 / 只要浏览器里那个只读运维助手（想在群里 @ 它也可以） |
 
-**两条路径可以先后走**：先一键部署试用（需要 IM 机器人的话直接在参数页选上，见 [§2.11](#211-加装-im-机器人飞书lark-或-slack)），之后想要自动巡检、主动推送、管理仪表盘，再按 [DEPLOYMENT.md](DEPLOYMENT.md) 跑 `setup.sh`（两边建的管理员用户名都是 `admin`，不会打架）。
+**两条路径可以先后走**：先一键部署试用（需要 IM 机器人的话直接在参数页选上，见 [§2.11](#211-加装-im-机器人飞书lark-或-slack)），之后想要自动巡检、主动推送、以及让巡检看板真的有数据，再按 [DEPLOYMENT.md](DEPLOYMENT.md) 跑 `setup.sh`（两边建的管理员用户名都是 `admin`，不会打架）。
 
 ### 0.1 一键部署**不包含**什么
 
@@ -34,8 +34,11 @@
 
 - **往 IM 主动推送**：每日巡检报告、告警推到飞书/Slack 群。IM 机器人本身**可以装**（见 [§2.11](#211-加装-im-机器人飞书lark-或-slack)：你在群里 @ 它、它回你），但那是**被动应答**；主动推送要 `setup.sh` 那条路径的报告流水线。（同样这 10 类信号源**会**进浏览器里的「通知」收件箱，见 [§2.9](#29-通知收件箱)；不进的只是 IM 群。）
 - **钉钉**机器人（飞书/Lark 和 Slack 都支持）。
-- **每日自动巡检**（闲置资源检测、成本异常扫描）与它的 5 个 Lambda。
-- **管理仪表盘**（阈值配置、目标账户管理、Skills 管理界面）——一键部署只有聊天界面。
+- **每日自动巡检**（闲置资源检测、成本异常扫描）与它那 4 个 Lambda(`notiops-inspection-scheduler` / `-executor` / `-reconciler` / `-push`)以及成本异常扫描器 `notiops-cost-analyzer`。
+- **巡检的写侧(所以也是「巡检看板 / 阈值配置 / 扫描范围 / 目标账户管理」这几个页面的数据)**：
+  这些页面本身是 chat-app 的一部分,**两条路径都在**,但一键部署不建 `notiops-inspection` 表,
+  点进去会加载失败(BFF 返回 `ddb_error`)。要让它们真的有数据,得走 `setup.sh`。
+  (**Skills 管理界面不在此列** —— 一键部署照样建 Skills 存储桶,那个页面能用。)
 - **CUR + Athena 成本明细数据源**：FinOps 提问仍可用 Cost Explorer 口径，但没有账单明细级下钻。
 - **跨账号的自动巡检与事件推送**：一键部署可以做**跨账号只读排查/调查/开案例**（`DeployMode=MultiAccount`，见 [§2.6](#26-可选多账号组织内跨账号)），但成员账号侧的 **CloudWatch OAM Sink** 与 **跨账号事件转发**（Health / DevOps Agent 调查事件回流）不在这条路径里 —— 那两样要 `setup.sh`。
 
@@ -272,6 +275,17 @@ notiops-webchat.template.json
 
 **它不烧 token**：进来的每条消息先走确定性路由（正则 + 关键词，中英文都认），命中「查资源 / 发起调查 / 看进度 / 切模型 / 切语言」这些直接调 API，**一个 token 都不花**。只有**案例流程**（要把你的描述写成案例正文）才真的走大模型。
 
+**群里发起的深度调查会把报告送回群里**：调查跑完（通常几分钟），栈里那个回调函数把 HTML 报告写进数据桶的 `investigations/` 前缀，再往群里发一张卡片，带一条**限时的公网下载链接** —— 收报告的人不需要有这个 AWS 账号的权限。链接背后是本栈自己那个只放行报告路径的 CloudFront distribution。
+
+> ⚠️ 这条链路是**异步**的（EventBridge → Lambda），所以它坏掉的时候**没有任何报错**：
+> 进度卡照样走到 100%（那是另一个函数轮询任务状态画的），然后报告就是不来。
+> 真遇到就按这个顺序查：`aws lambda get-function --function-name <栈名>-devops-callback`
+> 在不在 → 它的日志组（名字是 CFN 生成的随机名，按逻辑 ID 前缀
+> `DevOpsCallbackLogs` 解析，命令形状见 [§4](#4-出问题了怎么办) 那张排障表）里
+> 有没有 `account_not_configured` →
+> `aws s3 ls s3://<数据桶>/investigations/` 有没有本次调查的对象。
+> 三样都在还不来，看那个函数的死信队列（DLQ）。
+
 **部署后还差两步**，两步都做完机器人才会说话（Outputs 里的 `ImNextSteps` 也会提醒你）：
 
 1. **凭证进 Secrets Manager** —— 机器人要有钥匙才能验签和回消息。
@@ -391,7 +405,7 @@ CloudFront 分发要几分钟才在全球生效。先等 2–3 分钟、强刷�
 |---|---|
 | 凭证有没有写全 | Secrets Manager 里那个 secret 存在吗、键齐吗（飞书要四个键）。入口函数是**故意**在缺钥匙时冷启动就失败的 —— 宁可起不来，也不开一个谁都能伪造请求的公网入口。 |
 | 请求地址填了吗 | 飞书要填**两处**（事件配置 + 回调配置），Slack 要填**三处**（Events / Interactivity / Slash Commands），都是同一个 URL。 |
-| 日志 | CloudWatch 日志组 `/aws/lambda/<栈名>-im-*`（`feishu-ingress` / `feishu-worker` / `progress`）。入口函数里能看到验签失败、或者干脆没有任何日志（= IM 平台根本没打过来，说明地址没填对）。 |
+| 日志 | ⚠️ 一键部署的**日志组名是 CloudFormation 生成的随机名**（`<栈名>-FeishuIngressLogs<hash>-<随机>`），**没有** `/aws/lambda/` 前缀，拿栈名拼不出来（理由与解析命令见 [IM_WEBHOOK_SETUP.md §1.5](IM_WEBHOOK_SETUP.md#15-验证)）。查名字：`aws cloudformation describe-stack-resources --stack-name <栈名> --region <区域> --query "StackResources[?starts_with(LogicalResourceId,'FeishuIngressLogs')].PhysicalResourceId" --output text`（worker 换 `FeishuWorkerLogs`、Slack 换 `SlackIngressLogs` / `SlackWorkerLogs`、进度刷新换 `ImProgressLogs`）。**函数名**倒是可以拼：`<栈名>-im-ingress-feishu` / `<栈名>-im-worker-feishu` / `<栈名>-im-progress`。入口函数里能看到验签失败、或者干脆没有任何日志（= IM 平台根本没打过来，说明地址没填对）。 |
 
 排查步骤和每个报错的含义在 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) 里。
 
@@ -548,5 +562,5 @@ aws s3 cp im-layer.zip   s3://my-mirror/notiops/v1.2.3/
 
 - [USER_GUIDE.md](USER_GUIDE.md) — 界面怎么用、有哪些主题（成本、故障调查、Support 案例、Skills…）
 - [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) — 装了 IM 机器人（[§2.11](#211-加装-im-机器人飞书lark-或-slack)）之后，在飞书/Slack 那边要点什么
-- [DEPLOYMENT.md](DEPLOYMENT.md) — 想要自动巡检、往 IM 主动推送、管理仪表盘时，走完整版部署
+- [DEPLOYMENT.md](DEPLOYMENT.md) — 想要自动巡检、往 IM 主动推送、以及让巡检看板真的有数据时，走完整版部署
 - [TECHNICAL_DESIGN.md](TECHNICAL_DESIGN.md) — 架构与设计取舍

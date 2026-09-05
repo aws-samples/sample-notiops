@@ -204,10 +204,23 @@ cd ../../infra && npx cdk deploy ImStack
 | [app/feishu_utils.py](app/feishu_utils.py) | tenant_access_token 缓存、消息/卡片/表情发送 |
 | [app/case_flow.py](app/case_flow.py) | 案例 CRUD 的卡片回调处理 |
 | [app/support_flow.py](app/support_flow.py) | "升级到 AWS Support" 飞书 UI 层 |
-| [app/query_handler.py](app/query_handler.py) | `query` 命令：读 DDB 里的巡检/报告结果渲染成卡片 |
-| [app/main.py](app/main.py) | ⚠️ **已退役**：Fargate 长连接主进程，留作回滚路径 |
+| [app/main.py](app/main.py) | 原 Fargate 长连接主进程（`BotStack` 已于 M2 退役、不再实例化）；文件本身仍在服务：`lambda_worker.py` 惰性 import 它的 `on_card_action` 处理卡片按钮回调 |
 | [Dockerfile](Dockerfile) | ⚠️ **已退役**：`BotStack` 用它构建镜像，留作回滚路径 |
 | [requirements.txt](requirements.txt) | `lark-oapi` + `boto3`（Lambda Layer 与镜像共用） |
+
+> 老 `query` 命令（读 DDB 里的巡检 / 报告结果渲染成卡片）已随老 idle-detector 系统一起
+> 退役：`app/query_handler.py` 已删除（有回归测试盯着，不许它复活）。现在的意图路由
+> (`core/nl_router.py` → `platforms/common/router.py`)里**没有** `query` 这条能力 ——
+> 写「深挖 / 深度调查 / 根因分析」走 `investigate`；「看下巡检报告」这类问法既不是命令、
+> 也不命中深挖措辞，落到兜底的 `chat`（DevOps Agent 直连问答，同样 0 token），
+> 不再有**用户主动拉取**巡检报告的卡片路径 —— 新巡检的报告在 Web Chat 的巡检看板里看。
+>
+> ⚠️ 这只关掉了 pull，**push 仍在线**：每日推送照旧把 DDB 里的巡检结果渲染成飞书交互
+> 卡片（`lambda4_notifier/handler.py:99` 读 `notiops-inspection` 表 → `:471`
+> `_format_inspection_section` → `:391` `shared/feishu_sender.FeishuSender`，
+> `msg_type: interactive`），另一条同构路径是 `inspection/adapters/broadcast.py` →
+> `shared/report_delivery/feishu_sender.send_markdown` → `_send_summary_cards`。
+> 所以飞书里仍然看得到巡检报告卡片,只是不能再用一句话把它问出来。
 
 平台无关 (`../common/` 与 `../../core/` 共享):
 

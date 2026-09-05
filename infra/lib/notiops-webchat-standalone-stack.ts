@@ -30,6 +30,7 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as s3 from "aws-cdk-lib/aws-s3";
+import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as fs from "fs";
 import * as path from "path";
 // IM（飞书 / Slack）三件套 —— 与 `im-stack.ts`（方式 B）**共用同一个 construct**。
@@ -47,6 +48,20 @@ import {
   webNotifRuleDescription,
   webNotifRuleName,
 } from "./constructs/web-notif-sources";
+// DevOps Agent 调查结果回调 —— 同样与方式 B **共用同一份**定义（source / detail-type /
+// 超时 / 描述）。别把常量抄进本文件，理由见那个文件头。
+import {
+  DEVOPS_CALLBACK_DLQ_RETENTION_DAYS,
+  DEVOPS_CALLBACK_FUNCTION_DESCRIPTION,
+  DEVOPS_CALLBACK_HANDLER,
+  DEVOPS_CALLBACK_MEMORY_MB,
+  DEVOPS_CALLBACK_RETRY_ATTEMPTS,
+  DEVOPS_CALLBACK_TIMEOUT_SECONDS,
+  DEVOPS_EVENT_SOURCE,
+  DEVOPS_INVESTIGATION_DETAIL_TYPES,
+  DEVOPS_REPORT_S3_PREFIX,
+  devopsCallbackRuleDescription,
+} from "./constructs/devops-callback";
 
 const INFRA_DIR = path.join(__dirname, "..");
 
@@ -1601,6 +1616,197 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     for (const fn of im.functions) {
       (fn.node.defaultChild as lambda.CfnFunction).addDependency(stagerArtifacts);
     }
+
+    // ══ DevOps Agent 调查结果回调 ═══════════════════════════════════════════════
+    // 🔴 **这一整块过去只有方式 B 有**，一键部署里一条都没有。后果是整条深度调查链路
+    //    在**最后一步**静默断掉：调查真的跑完了、DevOps Agent 也真的把 `aws.aidevops`
+    //    事件发到了默认事件总线，但这个账号里没有任何人订阅它 —— 于是最终报告和那个
+    //    公网访问 URL 永远不来，而 IM 面板上进度条一路走到「调查已结束」
+    //    （那是 progress Lambda 轮询 journal 自己画的，与报告无关）。
+    //    CloudWatch 上一片绿，没有错误、没有日志。
+    //    2026-09-03 在验证账号上实测：飞书发起深度调查
+    //    `investigation/ec0f6542-f0d5-4eb0-9f92-3582cd812157`，面板显示结束，报告不来。
+    //
+    // 与「通知」生产端是同一类缺陷、同一种静默（见上面那段），所以修法也一样：
+    // source / detail-type / 超时 / 描述全部 import 自 `constructs/devops-callback.ts`，
+    // 与方式 B 同源。
+    //
+    // 方式 A 与方式 B 允许的差异只有三条，全部在那个文件头里记了：
+    //   · 物理名带 `${StackName}-` 前缀（同账号可能已有 setup.sh 部署的同名函数）；
+    //   · DLQ 与规则**不指定物理名**（同理）；
+    //   · **只有 default bus 那一条规则** —— 方式 A 不建 Custom Bus（那是跨账号转发的
+    //     落点），本账号自己的 DevOps Agent 事件本来就发到 default bus。
+    //
+    // 整块挂 `installIm`：回调唯一的产出是「往飞书/Slack 会话里发一张卡」，
+    // 只装 web 的客户没有可发的地方（web 端的深度调查走 BFF 直连，不经这条链路）。
+    const devopsCallbackFnName = `${cdk.Aws.STACK_NAME}-devops-callback`;
+
+    // 日志组：**不写死** `/aws/lambda/<函数名>`。理由与 WebNotifLogs 那段完全相同 ——
+    // 账号里若曾跑过 setup.sh，Lambda 服务自建的那个同名组不属于任何栈，
+    // CFN 的 NAME_CONFLICT_VALIDATION 会让整栈在 9 秒内失败。
+    const devopsCallbackLogs = new logs.LogGroup(this, "DevOpsCallbackLogs", {
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    (devopsCallbackLogs.node.defaultChild as cdk.CfnResource).cfnOptions.condition = installIm;
+
+    // 一个 DLQ 兜两类失败（与方式 B 同一个取舍：排查时只有一个地方要看）：
+    //   · 函数抛异常 → Lambda 异步重试 2 次 → 落这里（`deadLetterConfig`）；
+    //   · EventBridge 连 Invoke 都没成功 → 落这里（规则 target 的 `deadLetterConfig`）。
+    // ⚠️ 保留期 14 天，过了就没了 —— 每一条都是一次判读结果永久丢失。
+    // 不指定 queueName：方式 B 写死 `notiops-devops-callback-dlq`，同账号会撞名。
+    const devopsCallbackDlq = new sqs.Queue(this, "DevOpsCallbackDlq", {
+      retentionPeriod: cdk.Duration.days(DEVOPS_CALLBACK_DLQ_RETENTION_DAYS),
+      enforceSSL: true,
+    });
+    (devopsCallbackDlq.node.defaultChild as cdk.CfnResource).cfnOptions.condition = installIm;
+
+    // 调查报告落 `investigations/<task_id>/report.md|report.html|trace.html` 再 presign。
+    // 🔴 `im-core.ts` 只给了 `skills/*` / `mcp-snapshots/*` / `reports/*` —— 少了这条，
+    //    报告写不进去；而**即使**写进去了，presigned URL 携带的是签名者的权限，
+    //    签名方缺 GetObject 时链接照样生成、客户点开才 `AccessDenied`（静默降级）。
+    // 加在这里而不是 im-core 里：方式 B 的 IM 三个函数确实用不到这个前缀
+    // （那边的回调是独立函数、走 `lambdaRole`），塞进共用构件等于给方式 B 放宽权限。
+    im.imRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      sid: "ImDevOpsInvestigationReports",
+      actions: ["s3:GetObject", "s3:PutObject"],
+      resources: [`arn:${this.partition}:s3:::${base.dataBucket.bucketName}/${DEVOPS_REPORT_S3_PREFIX}*`],
+    }));
+    // 函数级 DLQ 的写权限。CDK 在 L2 上会自动补，走 L1 `deadLetterConfig` 不会 ——
+    // 缺了它 Lambda 丢弃事件时连 DLQ 都写不进去（只体现为 `AsyncEventsDropped`）。
+    im.imRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      sid: "ImDevOpsCallbackDlq",
+      actions: ["sqs:SendMessage"],
+      resources: [devopsCallbackDlq.queueArn],
+    }));
+
+    const devopsCallbackFn = new lambda.CfnFunction(this, "DevOpsCallbackFn", {
+      functionName: devopsCallbackFnName,
+      role: im.imRole.roleArn,
+      runtime: "python3.14",
+      handler: DEVOPS_CALLBACK_HANDLER,
+      // 与 IM 三个函数**同一个** zip + 同一个层：`devops_agent_callback/` 只有 116KB，
+      // 而它 import 的 `shared/**` / `core/**` 本来就在 im-code.zip 里，依赖也只用到
+      // stdlib + boto3（全是惰性 import）。单独发第 8 个产物会牵动整条发布流程
+      // （发布手册里四处写死「八个产物」，还要把模板的 sha256 重烧一遍）。
+      code: { s3Bucket: stagingBucket.bucketName, s3Key: imCodeKey },
+      layers: [imLayer.layerVersionArn],
+      timeout: DEVOPS_CALLBACK_TIMEOUT_SECONDS,
+      memorySize: DEVOPS_CALLBACK_MEMORY_MB,
+      deadLetterConfig: { targetArn: devopsCallbackDlq.queueArn },
+      environment: {
+        variables: {
+          // 与方式 A 的 IM 函数**同一份** commonEnv（表名 / 桶名 / 区域 / 账号闸门）。
+          // `shared/report_delivery/report_handler.py` 的 S3 桶按
+          // `S3_BUCKET or DATA_BUCKET or SKILLS_BUCKET` 解析 → commonEnv 里的
+          // SKILLS_BUCKET 就够（它指的是同一个业务桶）。
+          ...im.commonEnv,
+          // 发卡片要的两个凭证名。与 `imRole` 上按名字收窄的那条 secretsmanager
+          // 语句同源（`im.secretNames`），两处不会漂。
+          FEISHU_SECRET_NAME: im.secretNames.feishu,
+          // ⚠️ 变量名是 `*_ARN` 但值是 secret **名** —— 与 im-core 里 Slack 那两个
+          // 环境变量同一个历史包袱（`slack_sender.py` 拿它当 SecretId，两种都能用）。
+          SLACK_BOT_TOKEN_ARN: im.secretNames.slackBotToken,
+          // 刻意**不注入**的三个，都不是漏写：
+          //   · INSPECTION_TABLE / INSPECT_AGENT_SPACE_ID —— 一键部署不含资源巡检，
+          //     没有那张表也没有那个 space。handler 侧对空值记 ERROR 后照常走排障
+          //     分支（不会崩），而给一个假表名反而会让每次回调多一次必然失败的写。
+          //   · BEDROCK_API_KEY_SECRET_ARN —— 方式 A 的 IM 一律用执行角色的 IAM
+          //     凭证打 Bedrock（commonEnv 里也没有它），回调保持一致。
+        },
+      },
+      description: DEVOPS_CALLBACK_FUNCTION_DESCRIPTION,
+      loggingConfig: { logGroup: devopsCallbackLogs.logGroupName },
+    });
+    devopsCallbackFn.cfnOptions.condition = installIm;
+    devopsCallbackFn.addDependency(devopsCallbackLogs.node.defaultChild as cdk.CfnResource);
+    devopsCallbackFn.addDependency(devopsCallbackDlq.node.defaultChild as cdk.CfnResource);
+    devopsCallbackFn.addDependency(imLayerCfn);
+    // 代码在 staging 桶里 → 必须等 StagerFn 搬完
+    //（`scripts/postprocess_template.py::assert_clean` 也强制校验这条依赖存在）。
+    devopsCallbackFn.addDependency(stagerArtifacts);
+    const imRolePolicy = im.imRole.node.tryFindChild("DefaultPolicy")?.node.defaultChild;
+    if (imRolePolicy) devopsCallbackFn.addDependency(imRolePolicy as cdk.CfnResource);
+
+    // EventBridge → Lambda 的调用许可。走 L1 是为了能打 Condition（L2 的
+    // `targets.LambdaFunction` 会自己建一个不带条件的 Permission）。
+    // sourceArn 收口到本账号的 EventBridge 规则，不是「谁都能调它」。
+    const devopsCallbackPermission = new lambda.CfnPermission(this, "DevOpsCallbackInvokeByEvents", {
+      action: "lambda:InvokeFunction",
+      functionName: devopsCallbackFn.attrArn,
+      principal: "events.amazonaws.com",
+      sourceArn: `arn:${this.partition}:events:${this.region}:${this.account}:rule/*`,
+    });
+    devopsCallbackPermission.cfnOptions.condition = installIm;
+
+    // EventBridge 往 target DLQ 投递需要**队列侧**的资源策略（函数级那条走的是执行
+    // 角色，两者不能互相顶替）。L2 的 `targets.LambdaFunction({deadLetterQueue})`
+    // 会自动加这条，L1 规则不会 —— 少了它「投不进去」的事件连 DLQ 都进不去。
+    devopsCallbackDlq.addToResourcePolicy(new iam.PolicyStatement({
+      sid: "AllowEventBridgeToDlq",
+      principals: [new iam.ServicePrincipal("events.amazonaws.com")],
+      actions: ["sqs:SendMessage"],
+      resources: [devopsCallbackDlq.queueArn],
+      conditions: { StringEquals: { "aws:SourceAccount": this.account } },
+    }));
+    const devopsCallbackDlqPolicy = devopsCallbackDlq.node.tryFindChild("Policy")?.node.defaultChild;
+    if (devopsCallbackDlqPolicy) {
+      (devopsCallbackDlqPolicy as cdk.CfnResource).cfnOptions.condition = installIm;
+    }
+
+    // 只建 default bus 那一条规则（方式 A 不建 Custom Bus，见上面的差异说明）。
+    // detail-type 那张 7 条清单来自共享模块 —— **别在这里重写一遍**，那正是方式 B
+    // 里它曾被逐字抄两遍、加第 8 个类型就静默漏消费的原因。
+    const devopsCallbackRule = new events.CfnRule(this, "DevOpsCallbackDefaultRule", {
+      description: devopsCallbackRuleDescription("default"),
+      eventPattern: {
+        source: [DEVOPS_EVENT_SOURCE],
+        "detail-type": [...DEVOPS_INVESTIGATION_DETAIL_TYPES],
+      },
+      state: "ENABLED",
+      targets: [{
+        id: "DevOpsCallbackTarget",
+        arn: devopsCallbackFn.attrArn,
+        // 只兜「**投不进去**」（Invoke 拿不到 202）；函数抛异常靠上面的函数级 DLQ。
+        retryPolicy: { maximumRetryAttempts: DEVOPS_CALLBACK_RETRY_ATTEMPTS },
+        deadLetterConfig: { arn: devopsCallbackDlq.queueArn },
+      }],
+    });
+    devopsCallbackRule.cfnOptions.condition = installIm;
+    devopsCallbackRule.addDependency(devopsCallbackPermission);
+
+    // ── 部署账号自己的 DevOps Agent 上车行（`PK=da#<账号>`）──
+    // 🔴 少了这一行，回调函数即使存在也在第 2 步就
+    //    `{"status":"skipped","reason":"account_not_configured"}` 直接返回 ——
+    //    同一个症状（报告永不回来），但换成另一个原因。所以这两件事必须一起修。
+    //    方式 B 用 `AutoOnboardFunction` 那个内联 Lambda 写它；这里复用**唯一的**
+    //    搬运工（本栈文件头禁止 `cr.Provider` / `Code.fromAsset`，再加一个内联
+    //    Lambda 就是引入第二种模式），细节见 stager 的 `_devops_onboard`。
+    // 挂 `deepInvestigationEnabled` 而不是 `installIm`：这一行的核心字段是
+    // `agent_space_id`，没有 space 时无从写起；而且 web 端「上传到哪个 Agent Space」
+    // 那个下拉也按 `da#accounts` 列举，只装 web 的客户同样需要它。
+    const stagerDevOpsOnboard = new cdk.CfnResource(this, "StagerDevOpsOnboard", {
+      type: "Custom::NotiOpsStagerDevOpsOnboard",
+      properties: {
+        ServiceToken: stagerFn.attrArn,
+        Phase: "DevOpsOnboard",
+        ConfigTable: base.configTable.tableName,
+        AccountId: this.account,
+        AgentSpaceId: agentSpace.attrAgentSpaceId,
+        AgentSpaceArn: agentSpace.attrArn || "",
+        DeployRegion: this.region,
+        // 自愈触发器。**不能**用方式 B 那个 `Date.now()`：一键模板是预先合成发布的，
+        // synth 期时间戳会被烧成常量，所有客户拿到同一个值 → CFN 判定无变更 →
+        // 升级时这个 Phase 根本不重跑（配置表被删/重建后这一行就永久丢了）。
+        ReleaseTag: releaseTag,
+      },
+    });
+    stagerDevOpsOnboard.cfnOptions.condition = deepInvestigationEnabled;
+    stagerDevOpsOnboard.addDependency(stagerFn);
+    stagerDevOpsOnboard.addDependency(agentSpace);
+    // 上车行的写权限复用 `SeedLlmCatalog` 那条语句（同一张 config 表的 PutItem），
+    // 所以这里只需要保证策略先建好。
+    if (stagerPolicy) stagerDevOpsOnboard.addDependency(stagerPolicy as cdk.CfnResource);
 
     // ══ 多账号落地（Phase=OrgSetup，仅 MultiAccount）═══════════════════════════
     // 两个成员账号 StackSet 的模板在**合成期**读进来、当字符串内联 —— 不是 CDK 资产

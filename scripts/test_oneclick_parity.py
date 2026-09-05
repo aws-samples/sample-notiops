@@ -469,13 +469,20 @@ def _oneclick_seeds_llm_catalog() -> list[str]:
         ("the write is conditional on both paths",
          "attribute_not_exists(PK)" in stager and "attribute_not_exists(PK)" in seeder),
         # 条件写让「已存在」成为每次升级的常态路径，所以两条路径都必须在那一支里把
-        # **后来新增的模型**补上（只增不改，且只在 generation==0 时）。少了这一步，
-        # 首次部署之后加进目录的模型永远到不了那个环境 —— 不报错，只是管理台「模型」页
-        # 和模型选择器里少一个（2026-08-27 现网的 zai-glm-5 就是这么丢的）。
+        # **后来新增的模型**补上（只在 generation==0 时）。少了这一步，首次部署之后
+        # 加进目录的模型永远到不了那个环境 —— 不报错，只是管理台「模型」页和模型选择器
+        # 里少一个（2026-08-27 现网的 zai-glm-5 就是这么丢的）。
         # 一条路径补、另一条不补，等于同一个客户换种装法就少几个模型。
         ("both paths top up models added after the first deploy",
          "generation = :zero" in stager and "generation = :zero" in seeder
-         and "merge_missing_models" in stager and "merge_missing_models" in seeder),
+         and "reconcile_models" in stager and "reconcile_models" in seeder),
+        # 光补不够：两边都有的条目也必须**整条对齐**目录。2026-09-04 现网：
+        # claude-haiku-4-5 已 enabled:false、openai-gpt-5-6-luna 已收窄成只剩 im，
+        # web 模型选择器里两个都还在 —— 因为老实现把库里已有的条目逐字段照抄。
+        # "退休一个模型"是唯一一类本来就该让用户看见的目录修改，它不能只在首次部署生效；
+        # 一条路径对齐、另一条不对齐，等于换种装法就多出两个本该下线的模型。
+        ("both paths realign entries the catalogue already had",
+         "realigned" in stager and "realigned" in seeder),
         # 同一支里还必须跟 **default_model**。2026-09-02 现网:目录默认从 claude-sonnet-5
         # 换成 xai-grok-4-6,grok 被补进了模型列表、默认却还停在 Sonnet 5 —— 因为那次
         # 只写了 `models`。难查的原因是其它槽位(SSM /notiops/agent/model_id、
@@ -1342,6 +1349,153 @@ def test_cur_dashboard_parity() -> None:
            "但聊天里问客户费用恒失败降级到 CE，症状是「数字口径莫名变了」")
 
 
+# ─────────── 第十个维度：DevOps Agent 调查结果回调（异步链路的最后一跳）───────────
+#
+# 这一节是 2026-09-03 在验证账号上实测出来的缺陷补上的：飞书里发起
+# 深度调查，IM 面板一路走到「调查已结束」，而**最终报告与公网访问 URL 永远不来**。
+# 根因是方式 A 的单栈里**整条回调链一个都没有**（方式 B 全都有），四处独立的缺口：
+#
+#   (a) 没写 `da#<部署账号>` 上车记录 → callback 第 2 步返回
+#       `{"status":"skipped","reason":"account_not_configured"}`
+#   (b) 没建 callback Lambda / `aws.aidevops` 规则 / DLQ → 事件发到 default bus 无人订
+#   (c) `imRole` 没有 S3 `investigations/*` → 报告写不进去、presign 出的链接点开 403
+#   (d) `im-code-exclude.txt` 把 `devops_agent_callback/**` 剪掉了 → 函数一调就
+#       `Runtime.ImportModuleError`
+#
+# 四个缺口的症状**完全一样**且完全静默：链路是异步的（EventBridge → Lambda），
+# 客户那边只看到「调查跑完了，报告不来」，CloudWatch 上一片绿。
+# ⇒ 所以四条都要各自有判据，不能只钉「函数建了没」。
+CALLBACK_SHARED = "infra/lib/constructs/devops-callback.ts"
+BACKEND = "infra/lib/notiops-backend-stack.ts"
+STAGER_ONBOARD = "_devops_onboard"
+
+# `da#` 上车记录两条路径都要写。字段集合逐项比对，**允许的差异必须在这里登记**
+# （登记 = 有人想过；不登记 = 漏写，而漏写的症状是静默的）。
+ONBOARD_FIELD_DIFF_ALLOWED = {
+    "trigger_role_arn": (
+        "只在**跨账号**分支被读（core/devops_agent.py 的 is_deploy=False 一路 + "
+        "_assume_client 会校验 ARN 里的账号段）。方式 A 根本不建 "
+        "notiops-agent-trigger-* 角色 —— 写个假 ARN 反而会让将来真有跨账号需求时"
+        "静默 assume 失败。"),
+    "inspect_agent_space_id": (
+        "方式 A 不含资源巡检，没有那个 space。callback 侧对空值记 ERROR 后"
+        "照常走排障分支，不会崩。"),
+}
+
+_DDB_KEY_RE = re.compile(r"""^\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*:""", re.M)
+
+
+def _onboard_fields(rel: str, start: str, end: str) -> set[str]:
+    """从一段 `Item={...}` / `item = {...}` 字面量里取出写进 DDB 的字段名。"""
+    block = _scope(rel, start, end)
+    fields = set(_DDB_KEY_RE.findall(block))
+    if "PK" not in fields or "SK" not in fields:
+        raise AssertionError(
+            f"{rel}: 取不到 da# 上车记录的字段（连 PK/SK 都没有）—— 提取器的锚点过期了")
+    return fields
+
+
+def test_devops_callback_parity() -> None:
+    """深度调查的**结果回调**：两条路径都必须有完整的消费端。
+
+    与 ⑤⑨ 同构（定义只有一份，两个栈 import 同一个 `constructs/devops-callback.ts`），
+    但多三层：代码包、S3 前缀授权、以及部署期那一行上车记录。
+
+    两条路径**允许的差异**只有物理命名与总线：
+      · 方式 B 函数名 `notiops-devops-callback`，**两条**规则（default + Custom Bus）；
+      · 方式 A 函数名带 `${StackName}-` 前缀（同账号里可能已有 setup.sh 部署的那个，
+        撞名会 already-exists 整栈回滚），**只有 default 那条**（它不建 Custom Bus）。
+    """
+    print("\ntest_devops_callback_parity")
+    shared = _read(CALLBACK_SHARED)
+    oneclick = _read(ONECLICK)
+    backend = _read(BACKEND)
+    stager = _read(STAGER)
+
+    # ── 定义只有一份 ──
+    _check("回调的定义只有一份（source / detail-type / 超时 / 描述）",
+           "DEVOPS_EVENT_SOURCE" in shared and "DEVOPS_INVESTIGATION_DETAIL_TYPES" in shared,
+           f"{CALLBACK_SHARED} 里找不到共享常量 —— 它被挪回某个栈了")
+    for rel, src in ((ONECLICK, oneclick), (BACKEND, backend)):
+        _check(f"{os.path.basename(rel)} import 的是那一份",
+               "constructs/devops-callback" in src or "./constructs/devops-callback" in src
+               or "./devops-callback" in src,
+               "自己抄了一份 = 以后加一个 detail-type 只在一条路径上生效，而且是静默的")
+
+    # ── (b) 方式 A 真的建了消费端 ──
+    _check("方式 A 建了 callback Lambda",
+           '"DevOpsCallbackFn"' in oneclick and "DEVOPS_CALLBACK_HANDLER" in oneclick,
+           "事件发到 default bus 但没有订阅者 —— 报告永远不来，且完全静默")
+    _check("方式 A 建了 default bus 的规则",
+           'devopsCallbackRuleDescription("default")' in oneclick,
+           "没有规则 = 函数建了也没人调它")
+    _check("方式 A 给了 EventBridge 调用这个函数的许可",
+           '"DevOpsCallbackInvokeByEvents"' in oneclick,
+           "缺 lambda:InvokeFunction 的资源策略：规则匹配上了，投递被拒，只留在规则的"
+           "FailedInvocations 指标里")
+    _check("方式 A 有 DLQ（投不进去 + 函数抛都落它）",
+           "DevOpsCallbackDlq" in oneclick and "deadLetterConfig" in oneclick,
+           "EventBridge 对这个函数是**异步**调用（方式 B 实测 "
+           "AsyncEventsReceived == Invocations）—— 没有 DLQ 就是静默丢弃")
+
+    # ── (c) 报告前缀的 S3 授权 ──
+    _check("方式 A 的 IM 角色能读写 investigations/",
+           'sid: "ImDevOpsInvestigationReports"' in oneclick
+           and "DEVOPS_REPORT_S3_PREFIX" in oneclick,
+           "报告写不进桶；就算写进去了，presign 的签名方自己没有 GetObject —— "
+           "链接照样生成，客户点开才 AccessDenied（静默降级）")
+
+    # ── (d) 代码包里真的有这个模块 ──
+    excl = _read("infra/im-code-exclude.txt")
+    _check("im-code.zip 没把 devops_agent_callback 剪掉",
+           not re.search(r"^devops_agent_callback/\*\*", excl, re.M),
+           "方式 A 的回调函数与 IM 三个函数共用 im-code.zip —— 剪掉它，函数一调就 "
+           "Runtime.ImportModuleError，而链路是异步的，症状与「压根没建这个函数」一样")
+    _check("打包时断言这个包里有 handler.py",
+           "devops_agent_callback/handler.py" in _read("scripts/package_artifacts.sh"),
+           "排除清单里少一行不会有任何构建报错 —— 判据必须在打包那一步")
+
+    # ── (a) 部署期那一行上车记录 ──
+    # ⚠️ 锚点必须**只**框住那个 `Item={...}`：方式 B 的内联 Lambda 里还有一个
+    #    `send_cfn` 的响应体字面量（Status / StackId / RequestId …），从函数头开始框
+    #    会把那 7 个键也当成 DDB 字段，于是断言报「方式 A 少写了 StackId」这种噪音。
+    b_fields = _onboard_fields(BACKEND, "table.put_item(", "send_cfn(event, context, 'SUCCESS'")
+    a_fields = _onboard_fields(STAGER, f"def {STAGER_ONBOARD}(", "boto3.resource(")
+    missing = sorted((b_fields - a_fields) - set(ONBOARD_FIELD_DIFF_ALLOWED))
+    _check("方式 A 也写 da# 上车记录，且字段不少",
+           not missing,
+           f"方式 A 少写了这些字段：{missing} —— callback 的授权判据"
+           "（onboarding_status='active' 与 enabled=True 的**与**）过不去时，"
+           "返回的是 account_not_configured，深度调查跑完但报告永远不来")
+    extra = sorted(a_fields - b_fields)
+    _check("方式 A 没多写方式 B 没有的字段", not extra,
+           f"多出来的字段：{extra} —— 两条路径的同一行数据形状漂了")
+    for field, why in sorted(ONBOARD_FIELD_DIFF_ALLOWED.items()):
+        _check(f"允许的差异仍然成立：方式 A 不写 {field}",
+               field in b_fields and field not in a_fields,
+               f"登记的理由是「{why}」；现在实际情况与登记不符 —— 要么补上，要么改这张表")
+
+    _check("方式 A 的 stager 定义了这个 Phase 且真的调用了它",
+           f"def {STAGER_ONBOARD}(" in stager
+           and re.search(rf"{STAGER_ONBOARD}\(props\)", _strip_comments(stager)) is not None,
+           "定义了但没调用 = 静默不生效")
+    _check("方式 A 挂上了这个自定义资源",
+           '"StagerDevOpsOnboard"' in oneclick and 'Phase: "DevOpsOnboard"' in oneclick,
+           "stager 里有这个 Phase 但栈里没有对应的 Custom::，等于没写")
+    _check("Delete 分支显式处理了这个 Phase",
+           stager.count('elif phase == "DevOpsOnboard"') == 2,
+           "stager 的 Delete 兜底分支读 props[\"StagingBucket\"]，这个 Phase 不传它 → "
+           "KeyError → 自定义资源 Delete 失败 → **整个栈删不掉**")
+    # 自愈触发器：两条路径机制不同，但都必须有一个「会变」的属性。
+    _check("方式 B 每次部署都重跑（Date.now()）",
+           "timestamp: Date.now().toString()" in backend,
+           "配置表被删/重建后 CFN 判定无变化 → da# 记录永久丢失")
+    _check("方式 A 每个版本至少自愈一次（ReleaseTag）",
+           re.search(r'Phase: "DevOpsOnboard"[\s\S]{0,900}?ReleaseTag', oneclick) is not None,
+           "一键模板是**预先合成好**发布的：synth 期的 Date.now() 会被烧成常量，"
+           "所有客户拿到同一个值 → 属性永不变化 → 这个 Phase 在升级时根本不重跑")
+
+
 def main() -> int:
     print("=" * 72)
     print("方式 A（一键部署）与方式 B（setup.sh）的 web 功能一致性")
@@ -1357,6 +1511,7 @@ def main() -> int:
         test_agentcore_memory_parity()
         test_first_login_handoff_parity()
         test_cur_dashboard_parity()
+        test_devops_callback_parity()
     except AssertionError as e:
         # 提取器找不到目标 = 有人改了源码的形态。必须失败而不是静默通过 ——
         # 静默通过的断言比没有断言更糟：它让人以为这件事有人守着。

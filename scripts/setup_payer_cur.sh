@@ -70,7 +70,7 @@ _write_state() {
 CURRENT_STATE=$(_read_state)
 STATE_ACCOUNT=$(echo "$CURRENT_STATE" | jq -r '.account_id // ""')
 if [ -n "$STATE_ACCOUNT" ] && [ "$STATE_ACCOUNT" != "$ACCOUNT_ID" ]; then
-  echo "⚠️  本地状态文件记录的账号（$STATE_ACCOUNT）与当前凭证账号（$ACCOUNT_ID）不一致。"
+  echo "⚠️  本地状态文件记录的账号（${STATE_ACCOUNT}）与当前凭证账号（${ACCOUNT_ID}）不一致。"
   echo "   如果你是故意换了账号，删除 $STATE_FILE 后重跑；否则请检查凭证配置。"
   exit 1
 fi
@@ -137,7 +137,7 @@ if [ "$MODE" = "finalize" ]; then
     --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NOT_FOUND")
 
   if [ "$EXISTING_STACK_STATUS" = "CREATE_COMPLETE" ] || [ "$EXISTING_STACK_STATUS" = "UPDATE_COMPLETE" ]; then
-    echo "  ✓ 栈已存在且状态正常（$EXISTING_STACK_STATUS），跳过重新创建"
+    echo "  ✓ 栈已存在且状态正常（${EXISTING_STACK_STATUS}），跳过重新创建"
   else
     aws cloudformation create-stack --stack-name "$STACK_NAME" \
       --template-url "$TEMPLATE_URL" \
@@ -281,7 +281,7 @@ EOF
   rm -f /tmp/notiops-payer-cur-bucket-policy.json
 fi
 
-echo "  → 创建 CUR ReportDefinition: $CUR_REPORT_NAME（Hourly + Resource IDs + Athena/Parquet）"
+echo "  → 创建 CUR ReportDefinition: ${CUR_REPORT_NAME}（Hourly + Resource IDs + Athena/Parquet）"
 aws cur put-report-definition --region "$REGION" --report-definition "{
   \"ReportName\": \"$CUR_REPORT_NAME\",
   \"TimeUnit\": \"HOURLY\",

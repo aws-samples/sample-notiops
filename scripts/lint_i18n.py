@@ -174,6 +174,36 @@ CJK_ALLOWLIST = {
     #      没起作用、A 的绿是假的
     #    搬进 core/i18n.py 之后这两条会被压成键名，而它们的价值就在于原地可读。
     "scripts/probe_arnlike_bus_policy.py",
+    # 把六个产物 sha256 写进 release notes 的发布工具。同上 —— **发布者工具**,
+    # 由发的人在自己终端里跑,客户永远看不到;它连外发都不算(scripts/ 虽然在
+    # publish/include.txt 里,但客户不会去跑维护者的发布脚本)。
+    #
+    # ⚠️ 它的中文有三处是护栏,必须紧贴代码:
+    #    ① 「本脚本**不会**替你新建这一段」+ 该去抄哪份范式 —— 这是它拒绝猜的
+    #      理由;压成键名之后读者只会看到一句"找不到标题",然后手工加错地方
+    #    ② 「产物清单与预期不符 —— 先看 package_artifacts.sh 第 5 步」—— 指路
+    #    ③ 「别手抄 —— 抄错一位的报错现场在客户账号里」—— 这一条是整个脚本
+    #      存在的理由,它必须出现在人看得见的地方
+    "scripts/write_release_notes_sums.py",
+    # 跨栈 CFN Export 退役的两个工具(见 §3.73)。同上一类 —— **部署者 / CI
+    # 工具**:一个由 `setup.sh` 在 `cdk deploy --all` 之前调,一个只在 CI 的
+    # `cfn-export-gate` job 里跑,输出只出现在部署终端与 CI 日志里。
+    #
+    #   export_retire_plan.py   退役预检,吐 SKIP / WAIT / REORDER / FALLTHROUGH
+    #   check_cfn_exports.py    把 export/import 集合钉在 infra/exports.golden.json
+    #
+    # ⚠️ 这里的中文有两处不能搬:
+    #    ① 两个脚本的报错正文就是**护栏**:「删除仍被 Fn::ImportValue 持有的
+    #      export → UPDATE_ROLLBACK_COMPLETE,而且重跑不自愈」——「重跑不自愈」
+    #      这五个字是人看到红之后唯一会改变行为的信息(否则默认反应就是再跑一遍
+    #      `cdk deploy`,而那只会再卡一次)。压成键名之后它就消失了。
+    #    ② `check_cfn_exports.py` 里那段中文会被 `--update` **写进
+    #      infra/exports.golden.json 的 `__doc__`**。golden 是要 diff 的文件 ——
+    #      让它的正文随 locale 变,等于每换一次语言环境就假红一次。
+    #    机器可读的部分本来就是 ASCII(结论前缀 SKIP / REORDER / WAIT /
+    #    FALLTHROUGH 由 setup.sh 解析),中文只是给人读的那一半。
+    "scripts/export_retire_plan.py",
+    "scripts/check_cfn_exports.py",
     # ── WEB-CHAT AGENT-side core modules (whole group) ──────────────────────
     # These run INSIDE the Bedrock AgentCore Runtime (mirrored under
     # agent-build/NotiOpsWebChat/app/NotiOpsWebChat/core/, where there is NO

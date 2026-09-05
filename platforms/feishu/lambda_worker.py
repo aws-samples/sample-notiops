@@ -31,6 +31,7 @@ from core import i18n
 from core import locale_resolver
 from platforms.common import lambda_deadline, quoted_context, router
 from platforms.common.im_types import ImMessage
+from platforms.feishu import bot_identity
 from platforms.feishu.app import feishu_utils
 from platforms.feishu.caps import FeishuCaps, PLATFORM
 
@@ -118,13 +119,14 @@ def _normalize_message(event: P2ImMessageReceiveV1) -> ImMessage | None:
 
 
 def _is_bot_mentioned(msg) -> bool:
-    """与 platforms/feishu/app/main.py:_is_bot_mentioned 同口径 —— 事件里带 mentions 即可。
+    """这条消息 @ 到的是不是**本** bot —— 比对 `mentions[].id.open_id`。
 
-    这里不做 app_id 精确匹配（那需要 SecretsManager 里读 APP_ID），因为群里 @ 别人再 @
-    bot 的场景是允许的：SDK 只在 receive_v1 里投递给我们 mention 到本 bot 的消息，
-    群里 @ 别人的消息根本不会进来。
+    判据与实现都在 `platforms/feishu/bot_identity.py`（ingress 用的是同一个模块，
+    两边口径由此不可能再漂）。**不要**退回成「有 mentions 就算」：飞书没有 Slack 的
+    `app_mention` 事件类型，群里每一句话都投过来，那样写会让同一个群里的两个 NotiOps
+    bot（测试 + 生产）一起抢答。
     """
-    return bool(getattr(msg, "mentions", None))
+    return bot_identity.is_bot_mentioned(msg)
 
 
 def _handle_message(event_dict: dict) -> None:

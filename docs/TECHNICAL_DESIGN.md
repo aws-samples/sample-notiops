@@ -510,7 +510,7 @@ def analyze_intent(user_text: str, *, locale: str = "zh") -> dict:
 | `case_reply` | ✅ | 回复某个 case | "回复 case 12345 已重启" |
 | `case_resolve` | ✅ | 关闭 case | "关闭 case 12345" |
 | `case_analyze` | ✅ | LLM 复盘某个 case(根因 + 下一步 + 待补信息) | "分析 case 12345" / "summarize case 12345" |
-| `query` | ✅ | 读已有巡检报告 / 闲置 / 优化结果(秒回,不发起新调查) | "今天的巡检报告" / "闲置资源" |
+| `query` | ⚠️ 已并入 `investigate` | 意图分类仍可能给出 `query`(用户问"看下巡检报告"),但它依赖的老 DynamoDB 报告查询已随 2026-09-04 退役的老后端一起下线。现网飞书 / Slack webhook 路径由 `core/nl_router` 做确定性路由,压根没有 `query` 这条路;仍在用 LLM 分类器的回滚路径(`platforms/{feishu,slack}/app/main.py`)会把 `query` 改判成 `investigate`,而不是静默丢弃用户这句话。巡检报告本身改在 Web Chat 的「巡检」看板里看 | "今天的巡检报告" → 按 investigate 处理 |
 | `chitchat` | ⚠️ 仅 `enabled` 档 | 寒暄 | "你好" / "你能干什么" |
 | `general_qa` | ⚠️ 仅 `qa_only` / `enabled` 档 | AWS 概念问答 | "ALB 和 NLB 有什么区别" |
 
@@ -1432,6 +1432,14 @@ Web Chat 有自己的部署链路(见 §2.4):
 
 ### 7.1 日志位置
 
+> ⚠️ **下表是方式 B(`./setup.sh`)的名字。方式 A(一键部署)只有 stager 的日志组名对得上**
+> —— 其余全是 CloudFormation 生成的随机名(`<栈名>-FeishuIngressLogs<hash>-<随机>`,
+> 连 `/aws/lambda/` 前缀都没有)。方式 A 刻意不写死:写死 `/aws/lambda/<函数名>` 会撞上
+> Lambda 服务自建的同名组,`NAME_CONFLICT_VALIDATION` 让整栈 9 秒内失败(见
+> `infra/lib/constructs/im-core.ts` 的 `explicitLogGroupNames`)。方式 A 怎么解析出真名:
+> [IM_WEBHOOK_SETUP.md §1.5](IM_WEBHOOK_SETUP.md#15-验证)。**函数名**两条路径都可推导
+> (方式 A 多一个 `<栈名>-` 前缀)。
+
 | 组件 | CloudWatch Log Group(命名规则) | 备注 |
 |---|---|---|
 | Feishu ingress | `/aws/lambda/notiops-im-ingress-feishu` | 验签 + 幂等去重 + 异步投递(**收不到消息先看这里**) |
@@ -1667,13 +1675,23 @@ notiops/
 ├── devops_agent_callback/             # DevOps Agent 调查结果回调 Lambda
 │   └── handler.py
 ├── phd_event_forwarder/               # AWS Health 事件翻译转发 Lambda
-├── lambda1_collector/                 # 四阶段采集 + EC2 Trusted Advisor
-├── lambda2_analyzer/                  # 深度分析与判定
-├── lambda3_health_checker/            # RDS / ElastiCache AI 巡检
-├── lambda4_notifier/                  # 定时推送通知
+├── lambda4_notifier/                  # 每日运维通知(飞书;数据源已切到新巡检系统)
 ├── lambda5_cost_analyzer/             # 每日成本异常分析
-├── api/                               # API Lambda(路由分发)
-├── mcp_server/                        # MCP Server(21 个工具)
+├── lambda6_cur_finalizer/             # CUR/Athena 集成收尾(一次性 Scheduler 触发)
+├── lambda_inspection_scheduler/       # 巡检调度(每 15 分钟 tick → 抢锁 fan-out 到 SQS)
+├── lambda_inspection_executor/        # 巡检执行(SQS 消费者 + 批量 GetMetricData)
+├── lambda_inspection_reconciler/      # 巡检对账(每小时:判读终态 + 采集缺口)
+├── lambda_inspection_push/            # 巡检结果推送(Rule 每 15 分钟,时段窗口在代码里判)
+├── inspection/                        # 巡检域逻辑(pipeline / domain / adapters / skills)
+├── agent/                             # 手写参考骨架(Strands),**不参与部署**;已与下面那份分叉
+│                                      #   (405 行 vs 2819 行),读现网行为请读 agent-build/
+├── agent-build/                       # ★ 现网 Web Chat agent 的源码 + AgentCore CLI 脚手架 ——
+│   └── NotiOpsWebChat/                #   agentcore.json 的 codeLocation 指向 app/NotiOpsWebChat/,
+│                                      #   scripts/deploy_agent.sh 只 cd 到这里跑 `agentcore deploy`
+├── bff/web-chat/                      # ★ Web Chat BFF(Node.js;Lambda Function URL,AWS_IAM + SSE)
+│   └── preset-skills/                 # ★ 11 个预置 skill 源码(author=notiops-system,随代码打包)
+├── frontend/chat-app/                 # ★ Web Chat 前端(React 19 + Vite,自写组件)
+├── config/                            # 配置单一真源(capabilities / LLM 模型目录种子 / EOL 兜底表)
 ├── platforms/
 │   ├── common/                        # 三平台共用的适配层
 │   │   ├── router.py                  # 确定性分发(0 token)+ prompt-injection 二道门

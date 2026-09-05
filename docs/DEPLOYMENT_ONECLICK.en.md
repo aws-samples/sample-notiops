@@ -9,7 +9,7 @@
 > **Time**: **~10 minutes** (the stack itself measured ~4.5 minutes).
 >
 > **See also**:
-> - [DEPLOYMENT.en.md](DEPLOYMENT.en.md) — the full deployment guide (`setup.sh`: IM bots, scheduled inspection, admin dashboard, CUR/Athena)
+> - [DEPLOYMENT.en.md](DEPLOYMENT.en.md) — the full deployment guide (`setup.sh`: IM bots, scheduled inspection and its dashboard's write path, CUR/Athena)
 > - [USER_GUIDE.en.md](USER_GUIDE.en.md) — how to use it once deployed
 
 ---
@@ -22,10 +22,10 @@ The repository ships **two** ways to deploy, with different scope. This document
 |---|---|---|
 | What you need | git, Node, Python, uv, AWS CDK, plus deployment credentials (**no Docker/finch** — since 2026-09-03 / M2 the IM side ships as a Lambda Layer and builds no images) | **just a browser logged into the AWS console** |
 | How you start | clone the repo → `./setup.sh` | download one template from the Release → upload it in the CloudFormation console |
-| What gets deployed | Web Chat + IM bots (Feishu/Slack) + daily inspection + admin dashboard + CUR/Athena FinOps source | **Web Chat** (chat UI + BFF + agent + a DevOps Agent space; multi-account optional) **plus one optional IM bot** (Feishu/Lark or Slack — see [§2.11](#211-add-an-im-bot-feishulark-or-slack)) |
+| What gets deployed | Web Chat + IM bots (Feishu/Slack) + daily inspection (including the inspection dashboard's write path) + CUR/Athena FinOps source | **Web Chat** (chat UI + BFF + agent + a DevOps Agent space; multi-account optional) **plus one optional IM bot** (Feishu/Lark or Slack — see [§2.11](#211-add-an-im-bot-feishulark-or-slack)) |
 | Good for | long-term use, IM notifications, scheduled inspection | trying it out / demos / just the read-only ops assistant in a browser (with the option of @-mentioning it in a group chat) |
 
-**You can do both, in order**: deploy one-click to try it (tick the IM bot right there on the parameters page if you want one — see [§2.11](#211-add-an-im-bot-feishulark-or-slack)), then run `setup.sh` later when you want scheduled inspection, proactive push and the admin dashboard. (Both paths create the same admin username, `admin`, so they don't collide.)
+**You can do both, in order**: deploy one-click to try it (tick the IM bot right there on the parameters page if you want one — see [§2.11](#211-add-an-im-bot-feishulark-or-slack)), then run `setup.sh` later when you want scheduled inspection, proactive push, and the inspection dashboard to actually have data. (Both paths create the same admin username, `admin`, so they don't collide.)
 
 ### 0.1 What one-click does **not** include
 
@@ -33,8 +33,13 @@ Better said up front than discovered later. These require `setup.sh`:
 
 - **Proactive push into IM**: daily inspection reports and alerts posted into a Feishu/Slack group. The IM bot itself **can** be installed (see [§2.11](#211-add-an-im-bot-feishulark-or-slack) — you @-mention it, it answers), but that is **request/response only**; proactive push needs the report pipeline that only `setup.sh` deploys. (The same 10 signal sources **do** land in the in-browser Notifications inbox — see [§2.9](#29-notifications-inbox); only the IM leg is missing.)
 - **DingTalk** bots (Feishu/Lark and Slack are both supported).
-- **Scheduled daily inspection** (idle-resource detection, cost-anomaly scanning) and its 5 Lambdas.
-- **The admin dashboard** (thresholds, target-account management, Skills management UI). One-click ships the chat UI only.
+- **Scheduled daily inspection** (idle-resource detection, cost-anomaly scanning) and its four Lambdas (`notiops-inspection-scheduler` / `-executor` / `-reconciler` / `-push`) plus the cost-anomaly scanner `notiops-cost-analyzer`.
+- **The inspection write path** — and therefore the data behind the *inspection dashboard /
+  thresholds / scan scope / target-account* pages. Those pages are part of chat-app and ship on
+  **both** paths, but one-click never creates the `notiops-inspection` table, so opening them
+  fails to load (the BFF returns `ddb_error`). Making them show anything needs `setup.sh`.
+  (**The Skills management UI is not in this list** — one-click still creates the Skills bucket,
+  so that page works.)
 - **CUR + Athena cost detail**: FinOps questions still work at Cost Explorer granularity, but there is no bill-line-level drill-down.
 - **Cross-account scheduled inspection and event forwarding**: one-click *can* do **cross-account read-only inspection / investigation / case creation** (`DeployMode=MultiAccount`, see [§2.6](#26-optional-multi-account-across-an-organization)), but the member-account **CloudWatch OAM Sink** and **cross-account event forwarding** (Health / DevOps Agent investigation events flowing back) are not part of this path — those need `setup.sh`.
 
@@ -271,6 +276,10 @@ That **What to install** dropdown in the first parameter group:
 
 **It doesn't burn tokens**: every incoming message first goes through deterministic routing (regex + keywords, in both English and Chinese); anything that matches "look at resources / start an investigation / check progress / switch model / switch language" calls the API directly and costs **zero tokens**. Only the **case flow** (turning your description into case text) actually calls the model.
 
+**A deep investigation started from a group chat delivers its report back to that group**: when the investigation finishes (usually a few minutes), a callback function in the stack writes the HTML report under the `investigations/` prefix of the data bucket and posts a card to the group carrying a **time-limited public download link** — whoever reads the report does not need access to this AWS account. The link is served by this stack's own CloudFront distribution, the one whose function only allows report paths.
+
+> ⚠️ This path is **asynchronous** (EventBridge → Lambda), so when it breaks it does so **without any error**: the progress card still reaches 100% (a different function draws that by polling task state) and then the report simply never arrives. If that happens, check in this order: does `aws lambda get-function --function-name <stack-name>-devops-callback` exist → does its log group (a CFN-generated random name; resolve it by the logical-ID prefix `DevOpsCallbackLogs`, same command shape as the table in [§4](#4-troubleshooting)) contain `account_not_configured` → does `aws s3 ls s3://<data-bucket>/investigations/` hold an object for this investigation. If all three are fine and it still doesn't arrive, look at that function's dead-letter queue.
+
 **Two steps are left to you after deploying**, and the bot stays silent until both are done (the `ImNextSteps` output reminds you too):
 
 1. **Put credentials in Secrets Manager** — the bot needs keys to verify signatures and to reply.
@@ -388,7 +397,7 @@ This is a **silent failure**, and it's almost always one of the two steps in [§
 |---|---|
 | Are the credentials complete | Does the secret exist in Secrets Manager, and does it have every key (Feishu needs all four)? The ingress function fails **on purpose** at cold start when a key is missing — better not to start at all than to expose a public entry point anyone can forge requests to. |
 | Did you fill in the request URL | Feishu needs it in **two** places (event config + callback config), Slack in **three** (Events / Interactivity / Slash Commands) — the same URL each time. |
-| The logs | CloudWatch log groups `/aws/lambda/<stack-name>-im-*` (`feishu-ingress` / `feishu-worker` / `progress`). The ingress function shows signature-verification failures — or no logs at all, which means the IM platform never called it, i.e. the URL isn't set correctly. |
+| The logs | ⚠️ Under one-click deployment the **log group names are CloudFormation-generated** (`<stack-name>-FeishuIngressLogs<hash>-<random>`); they do **not** start with `/aws/lambda/` and cannot be derived from the stack name (rationale and resolver in [IM_WEBHOOK_SETUP.en.md §1.5](IM_WEBHOOK_SETUP.en.md#15-verify)). To look one up: `aws cloudformation describe-stack-resources --stack-name <stack-name> --region <region> --query "StackResources[?starts_with(LogicalResourceId,'FeishuIngressLogs')].PhysicalResourceId" --output text` (use `FeishuWorkerLogs`, `SlackIngressLogs` / `SlackWorkerLogs`, or `ImProgressLogs` for the others). The **function** names, in contrast, are derivable: `<stack-name>-im-ingress-feishu` / `<stack-name>-im-worker-feishu` / `<stack-name>-im-progress`. The ingress function shows signature-verification failures — or no logs at all, which means the IM platform never called it, i.e. the URL isn't set correctly. |
 
 The step-by-step checks and what each error means are in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md).
 
@@ -547,5 +556,5 @@ Integrity still holds: every artifact's SHA256 in the template was computed over
 
 - [USER_GUIDE.en.md](USER_GUIDE.en.md) — using the UI and its topics (cost, investigation, Support cases, Skills…)
 - [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) — what to click on the Feishu/Slack side once you installed an IM bot ([§2.11](#211-add-an-im-bot-feishulark-or-slack))
-- [DEPLOYMENT.en.md](DEPLOYMENT.en.md) — the full deployment, when you want scheduled inspection, proactive push into IM and the admin dashboard
+- [DEPLOYMENT.en.md](DEPLOYMENT.en.md) — the full deployment, when you want scheduled inspection, proactive push into IM, and the inspection dashboard to have data
 - [TECHNICAL_DESIGN.en.md](TECHNICAL_DESIGN.en.md) — architecture and design trade-offs

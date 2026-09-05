@@ -45,6 +45,7 @@ from core import skill_dispatcher
 from core import llm_pref_resolver
 from core import model_catalog
 from shared.devops_agent import create_investigation
+from platforms.feishu import bot_identity
 from platforms.feishu.app import feishu_utils
 
 PLATFORM = "feishu"
@@ -624,15 +625,11 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
                     "falling through to investigate", _agentic_mode, command)
         command = "investigate"
 
-    # query command — read existing DDB results and reply immediately.
+    # query command —— 老 idle-detector 的 DDB 报告查询已随老系统退役
+    # （2026-09-04）。意图路由仍可能给出 `query`（用户问「看下巡检报告」），
+    # 直接落到 investigate：agentic 路径能回答，且新巡检的报告在 Web Chat
+    # 看板里 —— 静默丢弃用户的这句话是最坏的选项。
     if command == "query":
-        from platforms.feishu.app.query_handler import handle as query_handle
-        query_type = analysis.get("query_type", "health_report")
-        result = query_handle(query_type, chat_id=chat_id, locale=locale)
-        if result:
-            _reply(msg, result)
-            return
-        # If query returned None, fall through to investigate
         command = "investigate"
 
     # case_* commands skip the dispatch-confirmation card entirely and
@@ -1729,55 +1726,21 @@ def _handle_next_step_dispatch(action_value: dict,
 
 
 # ===========================================================================
-# Bot identity (cached) — used to check if @ mentions target this bot
+# Bot identity — used to check if @ mentions target this bot
 # ===========================================================================
-_bot_open_id: str | None = None
-_bot_app_id_cached: str | None = None
-
-
-def _get_bot_open_id() -> str | None:
-    """Fetch and cache the bot's own open_id via /bot/v3/info."""
-    global _bot_open_id, _bot_app_id_cached
-    if _bot_open_id is not None:
-        return _bot_open_id
-    try:
-        resp = feishu_utils.call_openapi("GET", "/bot/v3/info")
-        if resp.get("code") == 0:
-            bot = resp.get("bot", {})
-            _bot_open_id = bot.get("open_id", "")
-            _bot_app_id_cached = bot.get("app_id", "")
-            logger.info("Bot identity: open_id=%s app_id=%s",
-                        _bot_open_id, _bot_app_id_cached)
-        else:
-            logger.warning("Could not fetch bot info: %s", resp)
-            _bot_open_id = ""
-    except Exception as e:
-        logger.warning("Bot info fetch failed: %s", e)
-        _bot_open_id = ""
-    return _bot_open_id
+# The implementation lives in `platforms/feishu/bot_identity.py` so that this
+# module, `lambda_worker.py` and `lambda_ingress.py` all share ONE definition of
+# "was I the one being @-ed". Feishu has no `app_mention` event type: in a group
+# every message arrives as `im.message.receive_v1`, so a "has any mentions" test
+# makes two NotiOps bots in the same group both answer the same line.
+#
+# Note there is no `app_id` fallback any more: neither the SDK mention model nor
+# `GET /bot/v3/info` exposes one, so that branch could never fire.
 
 
 def _is_bot_mentioned(msg) -> bool:
-    """True iff the message's mentions list includes this bot's open_id/app_id.
-
-    Feishu populates `msg.mentions` with the participants the user @-ed; for
-    bots, `id.open_id` is the open_id and `name` is the bot's display name.
-    Some Feishu versions also populate `app_id`. We accept either.
-    """
-    bot_open_id = _get_bot_open_id() or ""
-    mentions = getattr(msg, "mentions", None) or []
-    for m in mentions:
-        try:
-            mid = m.id
-            open_id = getattr(mid, "open_id", "") or ""
-            app_id = getattr(mid, "app_id", "") or ""
-        except AttributeError:
-            continue
-        if bot_open_id and open_id == bot_open_id:
-            return True
-        if _bot_app_id_cached and app_id == _bot_app_id_cached:
-            return True
-    return False
+    """True iff the message's mentions list includes this bot's own open_id."""
+    return bot_identity.is_bot_mentioned(msg)
 
 
 def _toast(text: str) -> P2CardActionTriggerResponse:

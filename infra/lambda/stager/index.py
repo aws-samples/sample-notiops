@@ -328,27 +328,41 @@ def _write_config(props) -> None:
     print("wrote config.json")
 
 
-def _merge_missing_models(existing, catalog):
-    """把目录里有、库里没有的模型条目补进去，返回 `(合并后的列表, 新增的 alias)`。
+def _reconcile_models(existing, catalog):
+    """让库里的模型列表回到目录的样子，返回 `(合并后的列表, 新增的 alias, 被对齐的 alias)`。
 
-    **只增不改**：库里已有的条目逐字段照抄（绝不重新启用、改标签、换 model_id），
-    库里有而目录里没有的留在末尾；唯一的改动是把缺的按目录顺序插进去。
-    与 `scripts/seed_llm_catalog.py::merge_missing_models` 是同一份逻辑的两份实现
+    `generation == 0`（已 seed、没人编辑过）时的不变式是**库里的模型列表 == 打包进来
+    的目录**，所以两边都有的 alias 直接**整条替换**成目录里的那条。这才是让字段级改动
+    （`enabled` / `surfaces` / `label` / `model_id` / `max_tokens`）到得了**已经装好**
+    的环境的原因 —— 旧版本把库里已有的条目逐字段照抄，等于让每一次这类修改都只在首次
+    部署生效。缺的条目按目录顺序插入，管理台的排序才是有意的。
+
+    库里有、目录里没有的 alias **保留**在末尾：目录退休一个模型走 `enabled: false`
+    而不是删除，就是为了让历史消息还能查到它的标签 —— 这里把不认识的 alias 丢掉，
+    会把以前版本发过的模型的这个性质一起丢掉。
+
+    与 `scripts/seed_llm_catalog.py::reconcile_models` 是同一份逻辑的两份实现
     （一键路径 import 不到仓库脚本），由 `scripts/test_oneclick_parity.py` 钉住。
     """
     by_alias = {m.get("alias"): m for m in existing if isinstance(m, dict)}
-    merged, added = [], []
+    merged, added, realigned = [], [], []
     for entry in catalog:
         alias = entry.get("alias")
-        if alias in by_alias:
-            merged.append(by_alias[alias])
-        else:
+        if alias not in by_alias:
             merged.append(entry)
             added.append(alias)
+            continue
+        merged.append(entry)
+        stored = by_alias[alias]
+        # 只报字段名：值可能很长（model_id），而这串是要进部署日志的。
+        drifted = sorted(k for k in set(stored) | set(entry)
+                         if stored.get(k) != entry.get(k))
+        if drifted:
+            realigned.append(f"{alias} ({', '.join(drifted)})")
     known = {e.get("alias") for e in catalog}
     merged.extend(m for m in existing
                   if isinstance(m, dict) and m.get("alias") not in known)
-    return merged, added
+    return merged, added, realigned
 
 
 def _default_model_drift(item, cfg):
@@ -375,12 +389,18 @@ def _top_up_llm_catalog(table, cfg) -> str:
 
     为什么必须有这一步：条件写让"已存在"成为每次升级的常态路径，于是首次部署之后
     再改 `config/llm-model-catalog.json` 的东西**永远到不了已经装好的环境**。
-    两类漂移，都是"不报错、只是不对"：
+    三类漂移，都是"不报错、只是不对"：
 
     1. **目录里新增的模型** —— 症状是管理台「模型」页和聊天的模型选择器缺了它，
        客户合理地以为"这功能没做"。2026-08-27 现网实际发生：`zai-glm-5` 前一天
        进了目录，列表里没有。
-    2. **`default_model`** —— 2026-09-02 现网实际发生：目录默认从 `claude-sonnet-5`
+    2. **两边都有的模型的字段** —— 2026-09-04 现网实际发生：`claude-haiku-4-5`
+       （已 `enabled: false` 退休）和 `openai-gpt-5-6-luna`（已收窄成
+       `surfaces: ["im"]`）落地一天后，web 模型选择器里还都在。和第 1 类同形、
+       同根因 —— 旧的 top-up 只会**新增**条目，于是对"已经存在的条目"的每一次修改
+       都只在首次部署生效。而"退休一个模型"恰恰是唯一一类**本来就该让用户看见**的
+       目录修改，所以它更不该需要重建环境。
+    3. **`default_model`** —— 2026-09-02 现网实际发生：目录默认从 `claude-sonnet-5`
        换成 `xai-grok-4-6`，`xai-grok-4-6` 确实被补进了模型列表，而默认**还停在
        Sonnet 5**。旧代码只写 `models`，理由是"新模型绝不能顺手变成默认模型" ——
        那个理由今天依然成立，而这里做的**不是**那件事：写进去的是目录**声明**的
@@ -388,30 +408,31 @@ def _top_up_llm_catalog(table, cfg) -> str:
        （`/notiops/agent/model_id` SSM 参数、health-checker 的 `BEDROCK_MODEL_ID`）
        都跟着改了 —— 从 CLI 看整个环境是一致的，只有 web 聊天还开在 Sonnet 5。
 
-    两类都以 `generation == 0` 为闸门（已 seed、从未被管理员编辑过）。管理员一保存
-    这页就归他管：他可能是**故意**没留某个模型、或**故意**选了别的默认模型，一次升级
+    三类都以 `generation == 0` 为闸门（已 seed、从未被管理员编辑过）。管理员一保存
+    这页就归他管：他可能是**故意**关掉了某个模型、或**故意**选了别的默认模型，一次升级
     把它改掉跟覆盖整份配置是同一类缺陷。那种情况只打印"本来会改什么"，把决定权留给他
-    —— 这里静默无动作正是上面两个缺陷都难发现的原因。
+    —— 这里静默无动作正是上面几个缺陷都难发现的原因。
     """
     item = table.get_item(Key={"PK": "llmcfg", "SK": "meta"}).get("Item") or {}
-    merged, added = _merge_missing_models(item.get("models") or [],
-                                         cfg.get("models") or [])
+    merged, added, realigned = _reconcile_models(item.get("models") or [],
+                                                cfg.get("models") or [])
     new_default = _default_model_drift(item, cfg)
-    if not added and not new_default:
+    if not added and not realigned and not new_default:
         print("llm catalogue already present and complete; left untouched")
         return "already present"
 
-    pending = list(added) + ([f"default_model -> {new_default}"] if new_default else [])
+    pending = (list(added) + list(realigned)
+               + ([f"default_model -> {new_default}"] if new_default else []))
     gen = item.get("generation")
     if gen is not None and int(gen) != 0:
         print(f"llm catalogue edited in console (generation={int(gen)}); "
               f"not applying {pending}")
         return f"already present (admin-managed; {len(pending)} not applied)"
 
-    # 只写漂了的那几个属性：credential_mode / backend_tasks 和库里每一条模型
-    # 条目都保持原样。
+    # 只写漂了的那几个属性：credential_mode / backend_tasks 不动，库里那些目录已经
+    # 不带的 alias 也原样留着。
     sets, names, values = [], {}, {":zero": 0}
-    if added:
+    if added or realigned:
         sets.append("#m = :m")
         names["#m"] = "models"
         values[":m"] = merged
@@ -476,6 +497,78 @@ def _seed_llm_catalog(props) -> str:
     n = len(cfg.get("models") or [])
     print(f"seeded llm catalogue: {n} model(s), default={cfg.get('default_model')!r}")
     return f"seeded ({n} models)"
+
+
+def _devops_onboard(props) -> str:
+    """把**部署账号自己**那一行 DevOps Agent 上车记录写进 `notiops-config`
+    （`PK=da#<账号> / SK=meta`）。
+
+    这是 `notiops-backend-stack.ts` 的 `AutoOnboardFunction`（方式 B）在一键路径上的
+    对应物。一键路径原先**根本不写这一行**，后果全是静默的：
+
+      · `devops_agent_callback/handler.py` 第 2 步查不到这一行就
+        `{"status":"skipped","reason":"account_not_configured"}` 直接返回 ——
+        深度调查跑完了，飞书/Slack 里**最终报告和公网访问 URL 永远不来**，
+        IM 面板上进度条却一路走到「调查已结束」（那是 progress 轮询 journal 画的）。
+        2026-09-03 在验证账号上实测到，实测那一行确实不存在。
+      · `bff/web-chat/devops_agent_skills.mjs` 的「上传到哪个 Agent Space」下拉按
+        GSI `da#accounts` 列举，部署账号自己不在里面。
+
+    为什么调查**还能发起**、只有回调断：`core/devops_agent.py::_client_and_space`
+    对「目标 == 部署账号」走的是 `ListAgentSpaces` 自动发现，压根不读这一行；
+    只有回调那一侧把它当作「这个账号被授权了吗」的判据。
+
+    与方式 B 那份 item 的**两处刻意差异**（都不是漏写）：
+      · **没有 `trigger_role_arn`** —— 那个字段只在跨账号分支被读
+        （`_client_and_space` 的 `is_deploy=False` 一路 + `_assume_client`），
+        而一键部署根本不建 `notiops-agent-trigger-*` 角色：本栈只有
+        `DevOpsAgentPrimaryRole` / `DevOpsAgentOperatorAppRole`，两个都由
+        `aidevops.amazonaws.com` 承担，不是给我们自己 AssumeRole 用的。
+        写一个假 ARN 进去反而会让将来真有跨账号需求时静默 assume 失败。
+      · **没有 `inspect_agent_space_id`** —— 一键部署不含资源巡检，没有那个 space。
+        callback 侧对空值记 ERROR 后照常走排障分支（不会崩）。
+
+    判据 `onboarding_status='active'` + `enabled=True` 两个都必须有：callback 侧
+    (`shared/devops_agent.py:80`) 是 `!= "active" or enabled is not True` 的**与**判据。
+
+    **无条件 put_item**（不是条件写），与方式 B 逐字一致：这是一条 auto 管理记录
+    (`account_alias="deploy-account (auto)"`)，整条覆盖幂等；反过来，条件写会让
+    「配置表被删/重建」之后这一行永久丢失，症状就是上面那个静默的断链。
+    代价是客户若在控制台改过**部署账号这一行**的 alias，会在下次升级时被改回来 ——
+    方式 B 同样如此，属于已接受的取舍。
+
+    ⚠️ 自愈的触发器是 `ReleaseTag`（同 Site / OrgSetup），**不是**方式 B 那个
+    `Date.now()`：一键模板是预先合成好发布的，synth 期的时间戳会被烧进模板，
+    所有客户拿到的是同一个常量 → 属性永不变化 → CFN 判定无变更 → 这个 Phase
+    在栈升级时根本不重跑。用 ReleaseTag 换来的是「每个版本至少自愈一次」。
+    """
+    table = props.get("ConfigTable") or ""
+    account_id = props.get("AccountId") or ""
+    space_id = props.get("AgentSpaceId") or ""
+    if not (table and account_id and space_id):
+        # 深度调查关掉、或所在区不支持 DevOps Agent 时 space id 就是空串 ——
+        # 那时**没有**要上车的东西，跳过是正确行为（不是失败）。
+        return (f"skipped (table={bool(table)} account={bool(account_id)} "
+                f"space={bool(space_id)})")
+    item = {
+        "PK": f"da#{account_id}",
+        "SK": "meta",
+        # GSI1 是「列出所有上车账号」那条查询的入口（BFF 的 Agent Space 下拉、
+        # 巡检的 enabled_accounts 都走它）。少了这两个字段，行在、但列不出来。
+        "GSI1PK": "da#accounts",
+        "GSI1SK": account_id,
+        "account_id": account_id,
+        "account_alias": "deploy-account (auto)",
+        "agent_space_id": space_id,
+        "agent_space_arn": props.get("AgentSpaceArn") or "",
+        "region": props.get("DeployRegion") or "",
+        "onboarding_status": "active",
+        "enabled": True,
+        "related_business_accounts": [],
+    }
+    boto3.resource("dynamodb").Table(table).put_item(Item=item)
+    print(f"onboarded deploy account {account_id} -> agent space {space_id}")
+    return f"onboarded ({account_id})"
 
 
 def _invalidate(props) -> None:
@@ -1034,6 +1127,15 @@ def handler(event, context):
                 #     跨账号角色 —— 跨账号的破坏性操作不能由「删一个栈」隐式触发。
                 data = {"LeftInPlace": "trusted access + member StackSets (delete them by hand "
                                        "if you also want the member-account roles gone)"}
+            elif phase == "DevOpsOnboard":
+                # 什么都不做，两个理由：
+                #   · `TeardownMode=KeepData` 要保住 `notiops-config` 整张表（含这一行），
+                #     而 `DeleteEverything` 会把表本身删掉（Site 阶段收尾）—— 两种模式下
+                #     单独删这一行都是多余动作；
+                #   · 这个分支**必须显式存在**：落到下面那个 else 会去读
+                #     `props["StagingBucket"]`（本 Phase 不带这个属性）→ KeyError →
+                #     自定义资源 Delete 失败 → **整个栈删不掉**。
+                data = {"LeftInPlace": "da# row (the config table itself follows TeardownMode)"}
             else:
                 data = {"StagingObjectsDeleted": str(_empty_bucket(props["StagingBucket"]))}
         elif phase == "Artifacts":
@@ -1042,6 +1144,8 @@ def handler(event, context):
             data, pid = _websearch(props, prior_pid)
         elif phase == "OrgSetup":
             data = _org_setup(props)
+        elif phase == "DevOpsOnboard":
+            data = {"Onboarded": _devops_onboard(props)}
         elif phase == "Site":
             n = _publish_frontend(props)
             _write_config(props)

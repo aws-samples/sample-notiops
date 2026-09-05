@@ -18,17 +18,14 @@ export const STRINGS: Dict = {
   "topic.general": { zh: "通用", en: "General" },
   "whatsnew.card": { zh: "What's New", en: "What's New" },
   "whatsnew.cardSub": { zh: "AWS 最新发布 · 与你的业务结合", en: "Latest AWS launches · tied to your workloads" },
-  // ⚠️ 下面这条是**旧的外链入口**（外链到 idle 控制台），由
-  //    `Sidebar.tsx` 的 `SHOW_INSPECTIONS = false` 关着，代码保留未删。
-  //    站内的资源巡检看板用 `insp.*` 命名空间，**不要复用这条** ——
-  //    复用会让「外链到控制台」与「站内看板」共用一个文案，
-  //    将来恢复外链时两个入口显示同一个名字。
-  "nav.inspections": { zh: "巡检 & 报告", en: "Inspections & reports" },
+  // （`nav.inspections` —— 外链到老 idle 控制台的入口文案 —— 已随控制台
+  //   退役删除，2026-09-04。站内巡检看板用 `insp.*` 命名空间，键名刻意
+  //   不同：`inspection.test.ts` 有断言钉着「站内看板不复用旧外链键」。）
   "nav.admin": { zh: "管理", en: "Admin" },
 
   // ── 资源巡检看板（R10.9）──────────────────────────────
   // 导航与页签
-  "insp.title": { zh: "资源巡检", en: "Resource Inspection" },
+  "insp.title": { zh: "巡检", en: "Inspection" },
   /**
    * 默认落地页。**「待处置」而不是「总览」** —— 客户打开看板要回答的是
    * 「今天我要处置什么」，而总览回答的是「巡检系统本身正常吗」。
@@ -1725,6 +1722,19 @@ export const STRINGS: Dict = {
     en: "FinOps Agent deep analysis coming soon; use DevOps Agent to analyze cost & usage for now",
   },
   "composer.soon": { zh: "即将上线", en: "Soon" },
+  // 「回答模式」下拉（ModePicker）—— 原来工具条上四个各自独立的 pill 收成一个控件。
+  // 名字取「回答模式」而不是「深度模式」：这一组选的是**谁来答、答到多深**（NotiOps 自己的
+  // 模型 / 客户自己的 DevOps Agent / 发起一次完整调查），"深度"只覆盖其中一半。
+  "composer.mode.label": { zh: "回答模式", en: "Answer mode" },
+  "composer.mode.hint": {
+    zh: "选这段对话由谁来答、答到多深（默认由 NotiOps 直接回答）",
+    en: "Choose who answers and how deep (default: NotiOps answers directly)",
+  },
+  "composer.mode.off": { zh: "不启用", en: "Off" },
+  "composer.mode.off.desc": {
+    zh: "普通对话，由 NotiOps 用你选的模型回答",
+    en: "Normal chat, answered by NotiOps with the model you picked",
+  },
   // 深度调查不可用（这个部署/这个账号没有 DevOps Agent Agent Space）。开关置灰 + 说清原因与出路，
   // 而不是让用户点开、发一轮、再吃一句 no_local_agent_space / account_not_onboarded。
   "composer.devops.na": { zh: "未接入", en: "N/A" },

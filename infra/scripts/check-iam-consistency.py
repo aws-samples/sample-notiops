@@ -448,8 +448,9 @@ def check_sql_consistency() -> CheckResult:
         ("cost_anomaly_summarys", "cost_anomaly_summary"),
     ]
 
+    # （../api 与 ../lambda3_health_checker 随老系统退役，2026-09-04）
     scan_dirs = [
-        "../lambda4_notifier", "../api", "../lambda3_health_checker",
+        "../lambda4_notifier",
         "../lambda5_cost_analyzer", "../agent",
     ]
 

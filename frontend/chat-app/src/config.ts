@@ -14,7 +14,6 @@ interface AppConfig {
   cognitoClientId: string;
   cognitoIdentityPoolId: string;
   region: string;
-  idleConsoleUrl?: string;
   rumAppMonitorId?: string;
   rumIdentityPoolId?: string;
   rumGuestRoleArn?: string;
@@ -43,7 +42,6 @@ export async function loadConfig(): Promise<AppConfig> {
     cognitoClientId: import.meta.env.VITE_COGNITO_CLIENT_ID ?? "",
     cognitoIdentityPoolId: import.meta.env.VITE_COGNITO_IDENTITY_POOL_ID ?? "",
     region: import.meta.env.VITE_AWS_REGION ?? "us-east-1",
-    idleConsoleUrl: import.meta.env.VITE_IDLE_CONSOLE_URL ?? "",
   };
   console.log("Using .env config (local dev)");
   return _config;

@@ -47,11 +47,22 @@ S3_BUCKET = (os.environ.get("S3_BUCKET")
              or "")
 PRESIGN_EXPIRY = int(os.environ.get("PRESIGN_EXPIRY", "604800"))
 
-# Degraded summary_card hard cap (≈16KB). When Bedrock summarization fails we
-# fall back to a TRUNCATED slice of long_report as the card; this bound keeps
-# the DDB investigation row well under the 400KB item limit (H7 fix, degrade
-# branch). The full long_report still goes to S3 (single source of truth).
-_DEGRADE_CARD_MAX_CHARS = 16000
+# ── 卡片正文预算：**本文件是唯一的所有者** ──────────────────────────────────
+#
+# 🔴 2026-09-05 之前这里有两道剪刀：本文件按 16000 字符切一次（那时是
+#    「Bedrock 摘要失败 → 截断长报告」的降级分支），feishu_sender 再按 12000
+#    切第二次。于是 12000–16000 那一段永远被扔掉、而用户会看到**两条**截断
+#    提示。现在正文由本文件一次性切好，sender 只保留一道**平台硬上限**兜底
+#    （见各 sender 的 `_HARD_*` 常量），正常情况下不会二次触发。
+#
+# 为什么同时管字符和字节：飞书/Slack 的限制是**字节**（JSON 以
+# `ensure_ascii=False` 编码，一个中文 3 字节），而可读性看的是**字符**。
+# 只管字符会让一段纯中文正文在字节上超限（3000 字 ≈ 9KB）；只管字节会让
+# 英文正文长到没人看。两个都设，谁先到按谁切。
+_CARD_MAX_CHARS = 3000
+_CARD_MAX_BYTES = 9000
+# ⚠️ 上界的另一个消费者是 DDB：`summary_card` 会写进 investigation 行。
+#    3000 字符 / 9KB 远低于 400KB 行上限，H7（行被几万字符正文撑爆）不会再现。
 # New name; old FEISHU_CONVERSATIONS_TABLE kept as fallback during the
 # Phase 3 transition — both env vars resolve to the same table.
 CONVERSATIONS_TABLE = (os.environ.get("CONVERSATIONS_TABLE")
@@ -114,21 +125,35 @@ _feishu_ddb_table = None
 class ReportArtifacts:
     """Output of build_investigation_report.
 
-    summary_card: the single short representation (Bedrock card, or — on
-        degrade — a TRUNCATED long_report slice capped at _DEGRADE_CARD_MAX_CHARS).
+    summary_card: the single short representation — a **deterministic** slice of
+        DA's own report, cut once at _CARD_MAX_CHARS / _CARD_MAX_BYTES. No LLM
+        involved any more (see `_card_from_report`).
     long_report: full markdown source (for support-context case body; NOT
         inlined into the DDB row).
     report_md_key / report_html_key / trace_html_key: stable S3 keys; None when
         that object failed to upload.
     report_url / trace_url: freshly-minted presigned GET URLs (for delivery).
     report_available: False when any critical step failed (degraded result).
-    report_truncated: True when summary_card is a truncated long_report slice.
-    model_id: Bedrock model used (None on degrade/no-summary).
+    report_truncated: True when summary_card is a truncated slice — the senders
+        render the notice from `report.summary_truncated`.
+    model_id: 恒为 None。字段保留是因为 DDB 里既有的行写过它、
+        `tests/queries/test_reports.py` 也读它；报告链路已不再调用任何模型。
     journal_records: the sliced journal records this run already fetched for
         trace.html. Exposed so downstream gates do not re-fetch — see the
         attribute's own note.
     """
     summary_card: str = ""
+    title: str = ""
+    """本次调查的标题 / 问题描述（通常就是用户在 IM 里问的那句话）。
+
+    🔴 2026-09-05 加（用户报障 D1）：报告页、Trace 页、IM 报告卡此前只有
+    `task_id` / `execution_id` 两串 uuid，跑过几次调查之后没人认得出哪个链接
+    对应哪次提问。空串合法（`task#` 行 TTL 24h 过期 / 非聊天发起的调查），
+    此时各渲染处退回通用标题，**不要**编一个占位标题。
+
+    ⚠️ 用户原文 = 不可信输入 + 隐私内容：**SHALL NOT 进任何日志、
+    SHALL NOT 进 S3 key**（key 会进 CloudTrail data event 并长期留存）。
+    """
     long_report: str | None = None
     report_md_key: str | None = None
     report_html_key: str | None = None
@@ -159,24 +184,25 @@ class ReportArtifacts:
 class CardMode(str, Enum):
     """`summary_card` 怎么产出（R9.4）。
 
-    ⚠️ 枚举而不是布尔。布尔只能表达「要不要卡片」，而这里有**三种**语义，
-    其中两种在布尔下会被压成同一个值：
+    ⚠️ 枚举而不是布尔。布尔只能表达「要不要卡片」，而这里是两种**不同来源**：
 
     ```
-    BEDROCK   调 Bedrock 摘要，失败降级成截断片段   ← 排障链路，默认
-    SKIP      压根不调 Bedrock，卡片留一行占位文本   ← 巡检链路
+    BEDROCK   按上限确定性切一段 DA 报告当卡片正文   ← 排障链路，默认
+    SKIP      压根不产卡片，留一行占位文本            ← 巡检链路
     ```
+
+    🔴 名字为什么还叫 `BEDROCK`：2026-09-05 起这一档**不再调用任何模型**
+    （见 `_card_from_report` 的成因说明）。枚举**值**会落进 DDB
+    与一键部署模板的既有配置，改名等于要做一次数据迁移；这条注释就是
+    那份「名字与实现已经脱钩」的说明。要改名请单开一个 MR 一起迁数据。
 
     🔴 `SKIP` **不等于**「把 `long_report` 原样放进 `summary_card`」。
-    那是 明写要避免的错：`_summarize_with_degrade` 是函数体内
-    第 ② 步且原本无开关，直接跳过会让 DA 全文进 `summary_card`，
-    撞 `_DEGRADE_CARD_MAX_CHARS`(16000) 上界 —— 也就是重开 H7
+    卡片正文有上限（`_CARD_MAX_CHARS` / `_CARD_MAX_BYTES`），原样塞会重开 H7
     （DDB 行被一段几万字符的正文撑爆）。
 
     ⚠️ 巡检为什么不要卡片：`summary_card` 是给 IM 卡片显示用的短表示，
     而巡检不投 IM 卡片（走 Phase 10 的广播层）。它要的是 `long_report`
     —— 按 finding_id 分节的判读全文，回拼时要逐节解析。
-    多调一次 Bedrock 只是白花钱，还会把已经结构化的分节文本重新压成散文。
     """
 
     BEDROCK = "bedrock"
@@ -316,39 +342,115 @@ def _card_mode_of(value: CardMode | str | None) -> CardMode:
         return CardMode.BEDROCK
 
 
-def _summarize_with_degrade(long_report: str | None) -> tuple[str, str | None, bool]:
-    """Bedrock summarize → (summary_card, model_id, truncated).
+def _cut_on_boundary(text: str, max_chars: int, max_bytes: int) -> tuple[str, bool]:
+    """按「字符 + 字节」双上限截断，尽量落在**段落/行边界**上。
 
-    On Bedrock/config failure, degrade to a TRUNCATED long_report slice
-    (≤ _DEGRADE_CARD_MAX_CHARS) so the DDB row stays bounded (H7 degrade-branch
-    fix). When long_report is empty, return a placeholder card.
+    返回 `(切好的文本, 是否截断了)`。两个上限都没超 → 原样返回 + False。
+
+    ⚠️ 边界优先级：空行（段落）> 换行（行）> 硬切。落不到边界时宁可硬切也
+    不放弃上限 —— 一段没有换行的长表格/长 JSON 必须也能被切住。
+    """
+    s = text or ""
+    if not s:
+        return "", False
+    over = len(s) > max_chars or len(s.encode("utf-8")) > max_bytes
+    if not over:
+        return s, False
+    head = s[:max_chars]
+    # 字节超限时按字节再收一次（UTF-8 逐字符累加，避免切出半个字）。
+    if len(head.encode("utf-8")) > max_bytes:
+        acc, out = 0, []
+        for ch in head:
+            n = len(ch.encode("utf-8"))
+            if acc + n > max_bytes:
+                break
+            acc += n
+            out.append(ch)
+        head = "".join(out)
+    # 回退到最近的段落 / 行边界（只在丢失不超过 25% 的前提下，否则硬切）。
+    floor = int(len(head) * 0.75)
+    cut = head.rfind("\n\n")
+    if cut < floor:
+        cut = head.rfind("\n")
+    if cut >= floor:
+        head = head[:cut]
+    return head.rstrip(), True
+
+
+def _card_from_report(long_report: str | None) -> tuple[str, bool]:
+    """报告卡正文 = **DevOps Agent 自己那份报告的确定性切片**。返回 `(卡片正文, 是否截断)`。
+
+    🔴 2026-09-05 重写（用户报障 D4/D5）。此前这一步会调一次 Bedrock 让大模型把
+    DA 的报告"压缩成卡片"，实测的结果是：
+
+      · `shared/bedrock_summarizer.py` 的输出预算 1024 token 是**总预算**，而
+        509cb42 之后全槽位默认模型是 Grok 4.6 —— 推理模型的 thinking token 先把
+        这 1024 吃掉，正文 `content` 恒为空、`stop_reason=max_tokens`；
+      · `shared/llm_provider.py` 又会把一句 35 字符的「⚠️ 报告因 token 限制被截断」
+        拼到空 `content` 上，于是空响应变成"非空"，
+        `bedrock_summarizer` 的空值检查从此是死代码 —— 用户看到的整张卡片就只有
+        那句告警（实测有一次卡片长度 = 35）。
+
+    ⇒ 报告卡不再经过任何大模型。深度调查本来就是 DA 在跑，它已经产出了一份
+      写好的报告；再花一次 token 把它重写一遍，既是**多余的**（web 侧的直连
+      路径 `bff/web-chat/devops_investigate.mjs` 一直是 0 token），也引入了上面
+      这条纯粹由预算/协议造成的失败链。
+
+    ⚠️ 截断**必须有提示**，且提示要指向「📊 查看完整报告」那个按钮 ——
+      卡片是短表示，完整正文一直在 S3（`report.md` / `report.html`）。
+      提示文案由各 sender 用 `i18n.t("report.summary_truncated")` 渲染，本函数
+      只返回 `truncated=True`，不在正文里拼中文 —— 拼了就没法双语。
     """
     if not long_report or not long_report.strip():
-        return "调查已完成，但未能获取报告内容。", None, False
-    from shared.bedrock_summarizer import summarize_investigation
-    from shared.summarizer_config import load_summarizer_config
+        # ⚠️ 空正文是**真实存在**的状态（DA 四级取数全空）。给一句诚实的占位，
+        #    而不是"调查失败了" —— 调查确实完成了，只是没拿到正文。
+        #    渲染成什么语言由 sender 决定，这里留空让 sender 走 `report.no_body`。
+        return "", False
+    return _cut_on_boundary(long_report.strip(), _CARD_MAX_CHARS, _CARD_MAX_BYTES)
 
-    model_id = None
-    try:
-        config = load_summarizer_config()
-        model_id = config["model_id"]
-        card = summarize_investigation(
-            long_report=long_report, model_id=model_id,
-            agent_prompt=config.get("agent_prompt"),
-            # 协议 / 区域随 model_id 一起从目录投影下来。少了它们，只在
-            # bedrock-mantle 上架的模型会被当成 Converse 调，报「model identifier
-            # is invalid」，然后整段降级成截断的长报告 —— 归因很难。
-            model_kind=config.get("model_kind", ""),
-            model_region=config.get("model_region", ""),
-        )
-        return card, model_id, False
-    except Exception as e:
-        logger.warning("Bedrock summarize failed, degrading to truncated "
-                       "long_report (cap=%d): %s", _DEGRADE_CARD_MAX_CHARS, e)
-        card = long_report[:_DEGRADE_CARD_MAX_CHARS]
-        if len(long_report) > _DEGRADE_CARD_MAX_CHARS:
-            card += "\n\n…（摘要降级：内容已截断，完整报告见「查看完整报告」）"
-        return card, model_id, True
+
+_TITLE_MAX_CHARS = 200
+"""`ReportArtifacts.title` 的存储上限（字符）。
+
+比两个 HTML 模板的 140 大一些 —— 模板那 140 是**显示**上限，各自再截；
+这里只防一个极端长的提问（实测有人贴一整段报错）把 DDB 行 / 卡片撑大。
+"""
+
+
+def _resolve_report_title(explicit: str, incident_id: str, task_id: str) -> str:
+    """本次调查的标题 / 问题描述。顺序：显式入参 → `task#` 行的 `raw_text` → 空串。
+
+    🔴 **不用 `metadata.title`**：那个字段在 IM 侧恒为常量
+    `"DevOps Agent 调查"`（见 `devops_agent_callback/handler.py` 里同名局部变量），
+    拿它当标题等于每个报告都叫同一个名字 —— 正是用户报障 D1 的现象。
+
+    ⚠️ 在**函数内部**解析，而不是让调用方传进来：`lambda_handler`（本文件那份
+    未部署的孪生实现）与真正部署的 `devops_agent_callback/handler.py` 是两个
+    调用方，只在其中一个里解析就会让两条路径的报告页长得不一样。
+
+    ⚠️ 失败一律回落空串，**绝不抛** —— 标题是锦上添花，不能让它拖垮整条回调。
+    ⚠️ 解析结果 SHALL NOT 进日志（用户原文）。
+    """
+    title = " ".join(str(explicit or "").split())
+    if not title:
+        try:
+            target = _resolve_chat_target(incident_id, task_id) or {}
+            title = " ".join(str(target.get("raw_text") or "").split())
+        except Exception as e:
+            logger.warning("report title lookup failed: %s", e)
+            title = ""
+    return title[:_TITLE_MAX_CHARS]
+
+
+# ⚠️ 这里曾有一个 `_console_deep_link(agent_space_id, task_id)`，给最终报告卡
+# 拼「🔬 查看本次调查」（DevOps Agent 控制台深链）那颗按钮用。2026-09-05 加上、
+# 当天按用户要求去掉：报告卡上其余链接都是预签名的 S3 / CDN URL（7 天内有效、
+# 免登录），控制台深链却必须先登录 AWS 控制台，两种混在一排按钮里，底下那行
+# 说明就只能同时写「无需登录」和「需要登录」——现网真的这么显示过。
+#
+# 进度卡 / 推送卡上那颗**保留**（那里深链是唯一的链接，说明不矛盾），它们各自
+# 在 sender 内部从 `core.devops_agent.operator_urls()` 取，不经过这个模块。
+# 要再给报告卡加控制台入口，先想清楚那行说明怎么写才不骗人。
 
 
 def build_investigation_report(*, execution_id: str, target_account_id: str,
@@ -360,13 +462,19 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
                                account_already_authorized: bool = False,
                                text_source: TextSource | str = (
                                    TextSource.PRODUCT_REPORT),
+                               title: str = "",
                                ) -> ReportArtifacts:
     """Single-source-of-truth report pipeline (completed investigations).
 
     ① cross-account fetch long_report ONCE (4-level fallback + slice)
-    ② Bedrock → summary_card (degrade w/ truncation)
+    ② deterministic slice of that report → summary_card (0 token)
     ③ write S3 stable keys investigations/<task_id>/report.md|report.html|trace.html
     ④ return ReportArtifacts
+
+    `title`: 本次调查的标题 / 问题描述。留空则由 `_resolve_report_title` 从
+    `task#` 行的 `raw_text` 反查（见那个函数说明为什么不能用
+    `metadata.title`）。它会进两个 HTML 页的页头和 IM 报告卡 ——
+    **不进任何日志、不进 S3 key**。
 
     Wrapped in an outer try/except: ANY uncaught error degrades to
     report_available=False with whatever pointers succeeded — NEVER raises, so
@@ -429,6 +537,14 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
 
         report_md_key, report_html_key, trace_html_key = _stable_keys(
             task_id, key_prefix=key_prefix)
+
+        # 🔴 `title` 解析放在 `common` 之前、且 `common` 是**两个 HTML 页共用**的
+        #    那份入参 —— 于是标题一次解析、两页都有，不会出现「报告页有标题、
+        #    Trace 页没有」这种半截状态（用户报障 D1 里两页都缺）。
+        #    ⚠️ 它**不**参与 `_stable_keys`：key 会进 CloudTrail data event。
+        resolved_title = _resolve_report_title(title, incident_id, task_id)
+        artifacts.title = resolved_title
+
         common = dict(
             status=data.get("status", "UNKNOWN"),
             priority=data.get("priority", "UNKNOWN"),
@@ -437,6 +553,7 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
             agent_space_id=agent_space_id,
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
+            title=resolved_title,
         )
 
         # ① fetch long_report ONCE (cross-account client injected + slice)
@@ -447,17 +564,16 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
             text_source=text_source)
         artifacts.long_report = long_report
 
-        # ② Bedrock summarize → summary_card (degrade w/ truncation)
+        # ② summary_card = DA 报告的确定性切片（**0 token**，见 `_card_from_report`）
         #
         # ⚠️ `CardMode.SKIP` 走的是「给一行占位文本」，**不是**「把 long_report
-        #    原样放进 summary_card」。后者会撞 _DEGRADE_CARD_MAX_CHARS 上界
+        #    原样放进 summary_card」。后者会撞 `_CARD_MAX_CHARS` 上界
         #    并把 DDB 行撑爆 —— 也就是重开 H7（明写要避免）。
         if _card_mode_of(card_mode) is CardMode.SKIP:
-            summary_card, model_id, truncated = _SKIP_CARD_PLACEHOLDER, None, False
+            summary_card, truncated = _SKIP_CARD_PLACEHOLDER, False
         else:
-            summary_card, model_id, truncated = _summarize_with_degrade(long_report)
+            summary_card, truncated = _card_from_report(long_report)
         artifacts.summary_card = summary_card
-        artifacts.model_id = model_id
         artifacts.report_truncated = truncated
 
         # ③ write S3 stable keys (pointer set only AFTER successful upload, so
@@ -473,9 +589,16 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
 
         # trace.html — cross-account full record listing (best-effort), sliced
         try:
+            # 🔴 `fetch_errors` 是**出参**（in-out list）。原本取记录失败会被
+            #    上面那个 except 吞掉、`records` 恒为 `[]`，于是 Trace 页写
+            #    "No records found." —— 用户报障 D2 里，方式A 因为 `da#` 行缺
+            #    `trigger_role_arn` 每次都走这条路，而页面把「取失败」显示成
+            #    「没记录」，一个配置缺陷因此在现网被误读了很久。
+            fetch_errors: list[str] = []
             records = list_journal_records_cross_account(
                 execution_id=execution_id, target_account_id=target_account_id,
                 account_already_authorized=account_already_authorized,
+                errors=fetch_errors,
                 # 🔴 **必须传本函数已经解析出来的 space。** 那个函数默认去读
                 #    `da#<acct>.agent_space_id`（**排障** space），而巡检的
                 #    execution 活在 `inspect_agent_space_id` 里 —— 不传的表现是
@@ -489,7 +612,19 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
             #    把赋值放在后面会让「trace 上传失败」连带把 skill 门禁也关掉，
             #    而那两件事完全无关。
             artifacts.journal_records = tuple(records or ())
-            trace_html = generate_trace_html(records=records, **common)
+            # DA 自己那张「Investigation timeline」卡 → markdown。用户要的就是
+            # 后台面板上那条时间线（D2 后半），不是我们排障用的原始记录铺开。
+            # `core.da_ui_tree` 是两棵 core 树共用的那份摊平逻辑（_MUST_MATCH）。
+            try:
+                from core.da_ui_tree import timeline_md as _timeline_md
+                da_timeline = _timeline_md(records)
+            except Exception as e:
+                # 摊平失败不该让整页丢掉 —— 下面还有原始记录那一段。
+                logger.warning("timeline flatten failed (non-fatal): %s", e)
+                da_timeline = ""
+            trace_html = generate_trace_html(
+                records=records, timeline_md=da_timeline,
+                fetch_errors=fetch_errors, **common)
             upload_to_s3(trace_html, trace_html_key)
             artifacts.trace_html_key = trace_html_key
             artifacts.trace_url = generate_presigned_url(trace_html_key)
@@ -504,31 +639,86 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
     return artifacts
 
 
+def _supported_kwargs(fn, kwargs: dict) -> dict:
+    """只留 `fn` 真正接受的关键字参数。签名读不出来时**原样返回**。
+
+    🔴 2026-09-05 换掉的是这段：
+
+    ```python
+    try:
+        sender.send_report(locale=locale, **kwargs)
+    except TypeError:
+        sender.send_report(**kwargs)          # ← 只为兼容"还没有 locale 参数"的老 sender
+    ```
+
+    那个写法有两个真问题，而且随着这次给 sender 加新参数（`title`）
+    会立刻踩到：
+
+      1. **它把所有 TypeError 都当成"缺 locale"。** 一旦 `kwargs` 里有任何
+         一个 sender 不认识的键，两次调用都抛 —— 结果是一张卡都发不出去，
+         而日志里只有一个泛泛的 TypeError。
+      2. **重试不是幂等的。** sender 的 `send_report` 可能发多条消息
+         （飞书当时是「摘要卡 + 头卡」两张，Slack 是两次 postMessage）；
+         如果 TypeError 是在第二条上抛的，重试会把第一条**再发一次** ——
+         用户看到重复卡片。2026-09-05 起飞书/Slack 都合成了一条（D5），
+         但钉钉仍然可能多发，而且这条推理对任何未来的 sender 都成立。
+
+    按签名过滤则是「发之前就对齐」，既不会重复发送，也能把丢掉的键
+    如实记进日志（键名，不记值 —— 值里有用户原文）。
+    带 `**kwargs` 的 sender（钉钉）会被识别为全收，不做过滤。
+    """
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    kept = {k: v for k, v in kwargs.items() if k in params}
+    dropped = sorted(set(kwargs) - set(kept))
+    if dropped:
+        # 只记键名。`title` / `summary_md` 的值是用户原文与报告正文。
+        logger.warning("sender %s does not accept %s; dropped",
+                       getattr(fn, "__module__", "?"), dropped)
+    return kept
+
+
 def _call_send_report(sender, platform: str, target: dict, *, status: str,
                       priority: str, detail_type: str, task_id: str,
                       summary_card: str, report_url: str | None,
                       trace_url: str | None, incident_id: str,
                       linked_case_display_id: str, next_steps: list,
-                      locale: str) -> None:
+                      locale: str, title: str = "",
+                      report_truncated: bool = False) -> None:
     """Invoke sender.send_report with the report-link mapped to each platform's
     slot (dingtalk uses `html_url`, feishu/slack use `report_url`) and
-    summary_card passed via the existing `summary_md` slot. locale-aware with
-    TypeError fallback for older senders."""
+    summary_card passed via the existing `summary_md` slot.
+
+    `title`: 本次调查的标题 / 问题描述，渲染在卡片顶部（用户报障 D1）。
+    `report_truncated`: 正文是被裁过的切片。截断提醒由 sender 按 locale
+    自己渲染 —— **不要**把提醒拼进 `summary_card`，否则它会跟着正文一起
+    落进 S3 的完整报告里，而那份报告根本没被截断（D4）。
+
+    ⚠️ 参数按 sender 签名过滤（`_supported_kwargs`），**不再**用
+    `except TypeError` 重试 —— 理由见那个函数。
+
+    ⚠️ **没有 `console_url`**（报告卡上不放控制台深链）—— 理由见本文件里
+    `_console_deep_link` 原址的那段注释。钉钉 sender 带 `**kwargs`，会把补回
+    来的键悄悄吃掉，所以加回它不会报错，只会让说明重新自相矛盾。
+    """
     kwargs = dict(
         chat_id=target["chat_id"], root_message_id=target["root_message_id"],
         status=status, priority=priority, detail_type=detail_type,
         task_id=task_id, trace_url=trace_url, summary_md=summary_card,
         incident_id=incident_id, linked_case_display_id=linked_case_display_id,
-        next_steps=next_steps,
+        next_steps=next_steps, locale=locale, title=title,
+        report_truncated=report_truncated,
     )
     if platform == "dingtalk":
         kwargs["html_url"] = report_url
     else:
         kwargs["report_url"] = report_url
-    try:
-        sender.send_report(locale=locale, **kwargs)
-    except TypeError:
-        sender.send_report(**kwargs)
+    sender.send_report(**_supported_kwargs(sender.send_report, kwargs))
 
 
 def _resolve_locale(target: dict, incident_id: str) -> str:
@@ -579,19 +769,31 @@ def deliver_report_card(*, artifacts: ReportArtifacts, incident_id: str,
 
     linked_case_display_id = _extract_case_display_id(incident_id)
     locale = _resolve_locale(target, incident_id)
-    try:
-        from core import next_steps as _ns
-        ns_actions = _ns.generate(summary_md=artifacts.summary_card,
-                                  status=status, locale=locale)
-    except Exception as e:
-        logger.warning("next_steps.generate failed: %s", e)
-        # ⚠️ 空列表是**降级兜底**，不是「待收集的容器」。
-        #    `scripts/lint_seams.py` 的③会把它报成「传出去之后没人读」——
-        #    那条检查找的是「创建一个空列表收集痕迹，然后自己从不读它」
-        #    （`skipped` 那个缺陷的形态）。这里正好相反：值由上面
-        #    `_ns.generate()` 产出，空列表只是它失败时的替代，
-        #    而它的**用途就是传给 sender**。已钉进 .seams_baseline.json。
-        ns_actions = []
+
+    # 🔴 「下一步建议」不再由大模型生成（2026-09-05）。此前这里会调一次
+    #    `core.next_steps.generate()`（1500 token 输出预算）让模型读一遍摘要，
+    #    再产出 2–3 个按钮。删掉的理由：
+    #
+    #      · 深度调查这条链路是 **DevOps Agent 在跑**，web 侧的直连路径
+    #        （`bff/web-chat/devops_investigate.mjs`）一直是 0 token；
+    #        IM 侧却在**投递阶段**额外烧两次 token（摘要 + 下一步），
+    #        两条路径对同一个功能给出不一样的成本与失败面。
+    #      · 实际产出的按钮长期就是那几个确定性动作（看报告 / 看 trace /
+    #        看控制台 / 升级 Support）—— 那些**不需要**模型推断，卡片上本来
+    #        就有。模型只是偶尔多编一个点不动的建议。
+    #      · 每次调用都在 120s 的 Lambda 超时预算里占一段（实测峰值 102.8s、
+    #        并且真的超时过）。
+    #
+    #    ⚠️ 传空列表而不是删参数：**已经发出去的卡片**还留在用户的聊天记录里，
+    #      上面的 next-step 按钮还会被点。三端的 `next_step_dispatch` 处理器
+    #      与 sender 的 `next_steps` 参数因此都必须留着。
+    #    ⚠️ 确定性的「下一步」= 卡片上那排按钮，见 `_call_send_report`。
+    #    ⚠️ `scripts/lint_seams.py` 会把这一行报成「出参黑洞」（建了个空列表、
+    #      传下去、自己从不读）。这里**本来就该是黑洞**：它永远是空的，存在的
+    #      意义只是保住 sender 的参数形状。所以它登记在
+    #      `scripts/.seams_baseline.json` 里 —— 这段注释就是那条豁免的理由。
+    #      改动本函数导致行号漂了的话，跑 `lint_seams.py --update-baseline`。
+    ns_actions: list = []
 
     sender = _load_sender(target.get("platform", ""))
     if sender:
@@ -602,6 +804,8 @@ def deliver_report_card(*, artifacts: ReportArtifacts, incident_id: str,
             report_url=artifacts.report_url, trace_url=artifacts.trace_url,
             incident_id=incident_id, linked_case_display_id=linked_case_display_id,
             next_steps=ns_actions, locale=locale,
+            title=artifacts.title,
+            report_truncated=artifacts.report_truncated,
         )
     else:
         logger.warning("No sender for platform=%s; incident_id=%s report stored "
@@ -688,6 +892,10 @@ def deliver_failure_card(*, incident_id: str, task_id: str, detail: dict,
                 report_url=None, trace_url=None, incident_id=incident_id,
                 linked_case_display_id=_extract_case_display_id(incident_id),
                 next_steps=[], locale=locale,
+                # 失败卡**也**要带标题：调查失败时用户更需要知道「是哪一次问的
+                # 那件事失败了」。`target` 已经在手，不必再查一次 DDB。
+                title=_resolve_report_title(
+                    target.get("raw_text", ""), incident_id, task_id),
             )
     if incident_id:
         _mark_progress_row_completed(incident_id, event_status)
@@ -809,7 +1017,7 @@ def fetch_investigation_results(agent_space_id, execution_id, summary_record_id,
             logger.info("Source: %s (%d chars, text_source=%s)",
                         level, len(text), _text_source_of(text_source).value)
             return text
-    # 四级全空。返回空串而不是 None —— 调用方 (`_summarize_with_degrade` /
+    # 四级全空。返回空串而不是 None —— 调用方 (`_card_from_report` /
     # `upload_to_s3` / `parse_sections`) 都按字符串处理，None 会在三处各炸一次。
     logger.warning("取正文四级全空: execution_id=%s text_source=%s",
                    execution_id, _text_source_of(text_source).value)
@@ -819,6 +1027,8 @@ def fetch_investigation_results(agent_space_id, execution_id, summary_record_id,
 _FETCH_LEVELS = {
     "investigation_summary_md": lambda sp, ex, ts, cl: _try_record_type(
         sp, ex, "investigation_summary_md", ts, client=cl),
+    "ui_investigation_summary": lambda sp, ex, ts, cl: _try_ui_summary(
+        sp, ex, ts, client=cl),
     "finding": lambda sp, ex, ts, cl: _try_record_type(
         sp, ex, "finding", ts, client=cl),
     "assistant_message": lambda sp, ex, ts, cl: _try_last_assistant_message(
@@ -826,19 +1036,26 @@ _FETCH_LEVELS = {
     "all_records": lambda sp, ex, ts, cl: _try_all_records(
         sp, ex, ts, client=cl),
 }
-"""取正文的四个取数器。键名会进日志，改名要同步改 `_FETCH_ORDER`。"""
+"""取正文的五个取数器。键名会进日志，改名要同步改 `_FETCH_ORDER`。"""
 
 _FETCH_ORDER = {
     TextSource.PRODUCT_REPORT: (
-        "investigation_summary_md", "finding", "assistant_message",
-        "all_records"),
+        # 🔴 `ui_investigation_summary` 排第二（2026-09-05 加）：它是后台
+        #    Summary / Root cause 面板的数据源，实测 100% 存在。而
+        #    `investigation_summary_md` 只是**有时**产出 —— 它缺席的那些调查
+        #    以前一路落到 `assistant_message`，用户在报告页看到的是一段对话
+        #    式独白。放在第二位而不是第一位：`investigation_summary_md` 在时
+        #    它是 DA 的成品报告，行为保持不变。
+        "investigation_summary_md", "ui_investigation_summary", "finding",
+        "assistant_message", "all_records"),
     TextSource.AGENT_OUTPUT: (
         # 🔴 `assistant_message` 在第一位是这个模式**唯一**的意义。
         #    实测：巡检要的 `## <finding_id>` 信封只在这一级里，而
         #    `investigation_summary_md` 是 DA 的模板报告、恒无信封 ——
         #    它排在前面时巡检 100% 落到 parse_failed（见 `TextSource`）。
+        #    `ui_investigation_summary` 同理无信封，排在 all_records 之前兜底。
         "assistant_message", "investigation_summary_md", "finding",
-        "all_records"),
+        "ui_investigation_summary", "all_records"),
 }
 """两种模式的取数顺序。
 
@@ -897,6 +1114,30 @@ def _try_last_assistant_message(agent_space_id, execution_id, slice_after_ts=Non
         return ""
 
 
+def _try_ui_summary(agent_space_id, execution_id, slice_after_ts=None, client=None):
+    """从 `ui_investigation_summary` 的**执行摘要卡**取正文（结构化，最贴近 DA 控制台）。
+
+    🔴 2026-09-05 补上这一级。在此之前取正文只有四级，全都拿不到这条记录，
+    而它**在实测的 100% 的 execution 里都存在**（DA 控制台的 Summary /
+    Root cause 面板就是它渲染的）。后果是：`investigation_summary_md` 那条
+    恰好没产出的调查（用户 2026-09-05 报障的两次都是），正文一路落到
+    `assistant_message` —— 用户在报告页看到的是一段**对话式**的自然语言，
+    而不是「概要 / 核心建议」，与 web 端同一次调查的观感完全不同。
+
+    ⚠️ 排在 `investigation_summary_md` **之后**：那一级存在时是 DA 的成品报告，
+    行为保持不变；这一级只补它的空档。
+    """
+    try:
+        records = _list_records(agent_space_id, execution_id,
+                               "ui_investigation_summary", client=client)
+        records = _filter_after_ts(records, slice_after_ts)
+        from core.da_ui_tree import summary_md
+        return summary_md(records) or ""
+    except Exception as e:
+        logger.warning("Failed to fetch ui_investigation_summary: %s", e)
+        return ""
+
+
 def _try_all_records(agent_space_id, execution_id, slice_after_ts=None, client=None):
     try:
         records = _list_records(agent_space_id, execution_id, client=client)
@@ -918,10 +1159,18 @@ def _try_all_records(agent_space_id, execution_id, slice_after_ts=None, client=N
             t = t.strip()
             if t and len(t) > 30:
                 parts.append(t)
-        return "\n\n---\n\n".join(parts) if parts else "No investigation content available."
+        # 🔴 空就返回**空串**，不要返回哨兵句（2026-09-05 改）。
+        #    以前这里返回 "No investigation content available."，于是
+        #    `fetch_investigation_results` 的「五级全空」判据永远不成立：
+        #    那句英文哨兵是非空字符串，会被当成正文一路渲染进报告 HTML，
+        #    而 :812 那条 warning 和渲染层「内容为空 → 给一句诚实的占位」
+        #    的分支从此都是死代码。
+        return "\n\n---\n\n".join(parts) if parts else ""
     except Exception as e:
         logger.error("All fetch attempts failed: %s", e)
-        return f"Error: {e}"
+        # 同理：**不**把裸异常文本当正文返回 —— 那会让 boto3 的报错原文
+        # （可能含 ARN / request id）出现在客户看到的报告里。
+        return ""
 
 
 # ===========================================================================

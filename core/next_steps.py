@@ -5,10 +5,26 @@ Each suggestion is one of:
   - {type: "dispatch", label, query}     → fire a new investigation with `query`
   - {type: "open_url", label, url}       → AWS Console deep link
 
-Used by the report-handler so the user can act on the agent's findings
-with one click instead of writing a new mention. Failures (Bedrock down,
-malformed JSON, etc.) return [] — the report still ships, just without
-next-step buttons.
+Failures (Bedrock down, malformed JSON, etc.) return [] — the caller ships
+its report either way, just without next-step buttons.
+
+🔴 2026-09-05：**本模块当前没有生产调用方。** `report_handler` 是唯一的
+调用者，它已经不再调 `generate()`（见那里 `ns_actions: list = []` 上方的注释）——
+IM 侧深度调查整条链路改成 0 token，跟 web 直连路径口径一致；用户明确要求
+「也去掉，走确定性建议」。卡片上那排「下一步」按钮现在是确定性的，由
+`shared/report_delivery/*_sender.py` 直接渲染。
+
+留着不删的两个理由（别顺手清掉）：
+
+  1. **已经发出去的卡片还在用户的聊天记录里**，上面的 `next_step_dispatch`
+     按钮还会被点。三端的 dispatch 处理器与 sender 的 `next_steps` 参数
+     因此都必须留着；这个模块是它们的格式契约（`type` / `label` / `query` /
+     `url` 和那几个长度上界）的**唯一**书面来源。
+  2. 删掉它会让 `tests/test_report_delivery.py` 里的
+     `patch("core.next_steps.generate", ...)` 变成 patch 一个不存在的
+     属性 —— 那个 patch 现在正是「报告链路不许再调模型」的把手。
+
+要真正退役，得连 dispatch 处理器和 sender 参数一起做一个独立 MR。
 """
 from __future__ import annotations
 

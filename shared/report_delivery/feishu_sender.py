@@ -391,139 +391,380 @@ _STATUS_TEMPLATE = {
 _STATUS_EMOJI = {"COMPLETED": "✅", "FAILED": "❌", "TIMED_OUT": "⏰", "CANCELLED": "🚫"}
 
 
-def _header_card(status: str, priority: str, detail_type: str, task_id: str,
-                 report_url: str, trace_url: str, incident_id: str = "",
-                 linked_case_display_id: str = "",
-                 next_steps: list[dict] | None = None,
-                 locale: str = "zh") -> dict:
-    emoji = _STATUS_EMOJI.get(status, "ℹ️")
-    template = _STATUS_TEMPLATE.get(status, "blue")
-    # Use ** instead of * because Feishu lark_md uses double-star for
-    # bold (Slack uses single-star). The i18n templates are written
-    # with single-star — patch them up here for Feishu.
-    def _bold(s: str) -> str:
-        # Slack-style "*x*" → Feishu-style "**x**". Idempotent if
-        # already double-star.
-        import re as _re
-        return _re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"**\1**", s)
-    body_lines = [
-        _bold(i18n.t("report.header.event", locale, detail_type=detail_type)),
-        _bold(i18n.t("report.header.status_priority", locale,
-                     status=status, priority=priority)),
-        _bold(i18n.t("report.header.task", locale, task_id=task_id)),
-    ]
-    if linked_case_display_id:
-        body_lines.append(_bold(
-            i18n.t("report.header.linked_case", locale,
-                   case_display_id=linked_case_display_id)))
-    elements: list = [
-        {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(body_lines)}},
-        {"tag": "hr"},
-        {"tag": "action",
-         "actions": [
-             {"tag": "button",
-              "text": {"tag": "plain_text",
-                       "content": i18n.t("report.see_full", locale)},
-              "type": "primary",
-              "url": report_url,
-              "multi_url": {"url": report_url, "android_url": report_url,
-                            "ios_url": report_url, "pc_url": report_url}},
-             {"tag": "button",
-              "text": {"tag": "plain_text",
-                       "content": i18n.t("report.see_trace", locale)},
-              "type": "default",
-              "url": trace_url,
-              "multi_url": {"url": trace_url, "android_url": trace_url,
-                            "ios_url": trace_url, "pc_url": trace_url}},
-         ]},
-        {"tag": "note",
-         "elements": [{"tag": "plain_text",
-                       "content": i18n.t("report.link_validity", locale)}]},
-    ]
+#: 合并卡里最多保留几个原生 `table` 组件。飞书的 per-card 上限是 5
+#: (`_MAX_V2_TABLES_PER_CARD`)，这里留一个余量：合并之后同一张卡上还多了
+#: 元信息、两排按钮和脚注，撞上限整张卡会被拒（用户侧就是"报告没发出来"）。
+_MAX_CARD_TABLES = 4
 
-    # Bedrock-derived "next step" buttons. Each is one of:
-    #   - {type: "dispatch", label, query}  → dispatched as a fresh
-    #       investigation by the platform bot (handled in main.on_card_action)
-    #   - {type: "open_url", label, url}    → opens AWS Console deep link
-    if next_steps:
+#: 整张卡 JSON 的字节预算。飞书对 `content` 的实测上限在 30KB 量级，
+#: 这里留 2KB 余量。正文在 report_handler 侧已经按 3000 字符 / 9000 字节
+#: 截过（`_CARD_MAX_CHARS` / `_CARD_MAX_BYTES`），所以这条是**兜底**，
+#: 不是第二把剪刀 —— 真正生效只会发生在正文里全是表格这种极端形状上。
+_MAX_CARD_JSON_BYTES = 28000
+
+
+def _bold(s: str) -> str:
+    """Slack-style `*x*` → Feishu-style `**x**`. Idempotent.
+
+    The i18n templates are written single-star (Slack's bold). Feishu's
+    lark_md **and** the v2 `markdown` component both read single-star as
+    *italic*, so every i18n string that goes into a Feishu card has to
+    come through here.
+    """
+    return _re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"**\1**", s)
+
+
+def _meta_lines(status: str, priority: str, detail_type: str, task_id: str,
+                title: str, linked_case_display_id: str, locale: str) -> str:
+    """The report card's metadata block (title + event + status + task).
+
+    `title` (D1) is the user's own question. It leads, because `task_id`
+    is opaque to humans: with several investigations in one chat the old
+    card gave no way to tell which report belonged to which question.
+    Display-capped at 140 chars — the storage cap is 200 (report_handler
+    `_TITLE_MAX_CHARS`), and a wrapped 200-char line pushes the buttons
+    off the first screen on mobile.
+    """
+    lines: list[str] = []
+    if title:
+        shown = title if len(title) <= 140 else title[:139] + "…"
+        lines.append(_bold(i18n.t("report.header.subject", locale,
+                                  title=_escape_md(shown))))
+    lines.append(_bold(i18n.t("report.header.event", locale,
+                              detail_type=detail_type)))
+    lines.append(_bold(i18n.t("report.header.status_priority", locale,
+                              status=status, priority=priority)))
+    lines.append(_bold(i18n.t("report.header.task", locale, task_id=task_id)))
+    if linked_case_display_id:
+        lines.append(_bold(i18n.t("report.header.linked_case", locale,
+                                  case_display_id=linked_case_display_id)))
+    return "\n".join(lines)
+
+
+def _escape_md(s: str) -> str:
+    """Neutralise the two characters that can restructure a Feishu card.
+
+    `title` is **user-typed text**. A stray `|` turns the metadata line
+    into a table row; a leading `#` turns it into a heading. Everything
+    else renders harmlessly as-is.
+    """
+    return (s or "").replace("|", "\\|").replace("#", "＃")
+
+
+def _action_rows_spec(*, report_url: str, trace_url: str,
+                      incident_id: str, linked_case_display_id: str,
+                      next_steps: list[dict] | None,
+                      locale: str) -> list[list[dict]]:
+    """Platform-neutral description of the card's button rows.
+
+    Each button is one of:
+      {"kind": "url",      "label", "url",   "style"}
+      {"kind": "callback", "label", "value", "style"}
+
+    Built once here so the v2 card and the v1 fallback cannot drift in
+    **button order**.
+
+    ⚠️ 报告卡上**没有**「🔬 查看本次调查」(DevOps Agent 控制台深链)。
+    2026-09-05 加过、当天按用户要求去掉:这张卡上其余每个链接都是预签名
+    的、7 天内免登录,而控制台深链**必须登录 AWS 控制台**。两种链接放在
+    一排按钮里,底下那行说明就只能同时写「无需登录」和「需要登录」——
+    用户看到的是自相矛盾的一行。少一颗按钮换一句不会骗人的说明。
+    「🔍 调查过程 Trace」已经覆盖了「想看这次调查过程」这个需求。
+    进度卡 / 推送卡上那颗**保留**:那里控制台深链是唯一的链接,说明
+    不矛盾。
+    """
+    rows: list[list[dict]] = []
+    rows.append([
+        {"kind": "url", "label": i18n.t("report.see_full", locale),
+         "url": report_url, "style": "primary"},
+        {"kind": "url", "label": i18n.t("report.see_trace", locale),
+         "url": trace_url, "style": "default"},
+    ])
+
+    # "Next step" buttons. Nothing generates these any more (the report
+    # path is 0-token since 2026-09-05), but cards already sitting in
+    # users' chat history still carry them, so the rendering + the three
+    # platforms' `next_step_dispatch` handlers stay.
+    ns_row: list[dict] = []
+    for ns in (next_steps or [])[:3]:
+        label = ns.get("label", "")
+        if not label:
+            continue
+        if ns.get("type") == "dispatch" and ns.get("query"):
+            ns_row.append({"kind": "callback", "label": label,
+                           "style": "default",
+                           "value": {"action": "next_step_dispatch",
+                                     "incident_id": incident_id,
+                                     "query": ns["query"]}})
+        elif ns.get("type") == "open_url" and ns.get("url"):
+            ns_row.append({"kind": "url", "label": label,
+                           "style": "default", "url": ns["url"]})
+    if ns_row:
+        rows.append(ns_row)
+
+    # Exactly one escalation button.
+    tail: list[dict] = []
+    if linked_case_display_id and incident_id:
+        # Push the agent's findings onto the case the user already opened.
+        tail.append({"kind": "callback",
+                     "label": i18n.t("report.sync_to_case", locale,
+                                     case_display_id=linked_case_display_id),
+                     "style": "primary",
+                     "value": {"action": "case_sync_report",
+                               "incident_id": incident_id,
+                               "case_display_id": linked_case_display_id}})
+    elif incident_id:
+        # No linked case yet → offer to open one. Mutually exclusive with
+        # the sync button: creating a second case from one investigation
+        # is rarely what the user wants.
+        tail.append({"kind": "callback",
+                     "label": i18n.t("report.escalate_support", locale),
+                     "style": "danger",
+                     "value": {"action": "ask_support",
+                               "incident_id": incident_id}})
+    if tail:
+        rows.append(tail)
+    return rows
+
+
+def _note_lines(locale: str) -> list[str]:
+    """Footnotes. Exactly one line, and it is unconditionally true: every
+    link left on this card is a presigned S3 / CDN URL — valid 7 days, no
+    console login.
+
+    ⚠️ 别再往这里加「需要登录」那句(`progress.link_login_warning`)。
+    它当年是为控制台深链加的,而那颗按钮已经从报告卡上去掉了(见
+    `_action_rows_spec`)。飞书 v1 的 `note` 组件会把它的多个子元素**同行
+    拼接**(不换行、连空格都不加),于是「无需登录控制台即可访问」和
+    「需登录 AWS 控制台才能查看」会连成一句自相矛盾的话 —— 2026-09-05
+    现网就是这么出来的。返回列表形状保留:调用方按元素逐个渲染,以后要
+    加第二条说明时不必再改渲染侧。
+    """
+    return [i18n.t("report.link_validity", locale)]
+
+
+def _v2_button(spec: dict) -> dict:
+    """One `_action_rows_spec` entry → a v2 (`schema: 2.0`) button.
+
+    ⚠️ v2 buttons carry their behaviour in `behaviors`, NOT in v1's
+    `value` / `url` / `multi_url`. Feeding a v1 button into a v2 card is
+    the exact failure shape that made 「同步到 case」 silently do nothing
+    for weeks (see `platforms/feishu/app/case_flow.py`): no error, no
+    render, no way to notice.
+    """
+    btn = {"tag": "button",
+           "text": {"tag": "plain_text", "content": spec["label"]},
+           "type": spec.get("style", "default")}
+    if spec["kind"] == "url":
+        u = spec["url"]
+        btn["behaviors"] = [{"type": "open_url", "default_url": u,
+                             "android_url": u, "ios_url": u, "pc_url": u}]
+    else:
+        btn["behaviors"] = [{"type": "callback", "value": spec["value"]}]
+    return btn
+
+
+def _v1_button(spec: dict) -> dict:
+    """One `_action_rows_spec` entry → a v1 (top-level `elements`) button."""
+    btn = {"tag": "button",
+           "text": {"tag": "plain_text", "content": spec["label"]},
+           "type": spec.get("style", "default")}
+    if spec["kind"] == "url":
+        u = spec["url"]
+        btn["url"] = u
+        btn["multi_url"] = {"url": u, "android_url": u,
+                            "ios_url": u, "pc_url": u}
+    else:
+        btn["value"] = spec["value"]
+    return btn
+
+
+def _summary_blocks(summary_md: str, locale: str) -> tuple[list[dict], bool]:
+    """Report body → v2 body elements. Returns `(blocks, trimmed)`.
+
+    `trimmed` is True only when **this** function dropped something (too
+    many tables). The caller ORs it with the pipeline's own truncation
+    flag and renders exactly ONE notice — two notices on one card is what
+    the user saw in D4.
+
+    Empty body renders `report.no_body`, never a truncation notice:
+    "we didn't get the body" and "the body was cut" are different facts
+    and used to collapse into the same (wrong) message.
+    """
+    if not (summary_md or "").strip():
+        return [{"tag": "markdown",
+                 "content": i18n.t("report.no_body", locale)}], False
+    blocks = _md_to_v2_blocks(_normalize_md_tables(summary_md))
+    if not blocks:
+        return [{"tag": "markdown", "content": summary_md}], False
+    kept: list[dict] = []
+    tables = 0
+    for b in blocks:
+        if b.get("tag") == "table":
+            if tables >= _MAX_CARD_TABLES:
+                # Stop at the first over-cap table rather than skipping it
+                # and keeping what follows — the notice promises "only the
+                # beginning of the report", so the card must actually be a
+                # prefix.
+                return kept or [{"tag": "markdown",
+                                 "content": i18n.t("report.no_body",
+                                                   locale)}], True
+            tables += 1
+        kept.append(b)
+    return kept, False
+
+
+def _fit_json_budget(build, blocks: list[dict],
+                     truncated: bool) -> dict:
+    """Render via `build(blocks, truncated)`, dropping trailing body blocks
+    until the card fits `_MAX_CARD_JSON_BYTES`.
+
+    Rebuilt each round on purpose: switching `truncated` on adds the
+    notice element, which itself costs bytes.
+    """
+    bl = list(blocks)
+    trunc = truncated
+    while True:
+        card = build(bl, trunc)
+        size = len(json.dumps(card, ensure_ascii=False).encode("utf-8"))
+        if size <= _MAX_CARD_JSON_BYTES or len(bl) <= 1:
+            if size > _MAX_CARD_JSON_BYTES:
+                logger.warning(
+                    "report card still %d bytes with a single body block — "
+                    "sending anyway (v1 fallback covers a reject)", size)
+            return card
+        bl = bl[:-1]
+        trunc = True
+
+
+def _report_card_v2(*, status: str, priority: str, detail_type: str,
+                    task_id: str, report_url: str, trace_url: str,
+                    summary_md: str, title: str = "",
+                    incident_id: str = "", linked_case_display_id: str = "",
+                    truncated: bool = False,
+                    next_steps: list[dict] | None = None,
+                    locale: str = "zh") -> dict:
+    """The report card — **one** card carrying body + metadata + actions.
+
+    Until 2026-09-05 this was two messages: 「📝 Report Summary」 (body)
+    followed by 「✅ NotiOps 报告」 (metadata + buttons). Feishu drops
+    `root_message_id` for report delivery on purpose (see `_send_card`),
+    so the two arrived as unrelated messages and users read the first one
+    as the whole report. Merged on user request (D5).
+
+    v2 (`schema: "2.0"`) is the primary schema because native `table`
+    components — the only way Feishu renders a pipe table — exist only
+    in v2. `_report_card_v1` is the fallback for a v2 reject.
+    """
+    emoji = _STATUS_EMOJI.get(status, "ℹ️")
+    rows = _action_rows_spec(
+        report_url=report_url, trace_url=trace_url,
+        incident_id=incident_id,
+        linked_case_display_id=linked_case_display_id,
+        next_steps=next_steps, locale=locale)
+    blocks, table_trimmed = _summary_blocks(summary_md, locale)
+
+    def build(body_blocks: list[dict], trunc: bool) -> dict:
+        elements: list = [
+            {"tag": "markdown",
+             "content": _meta_lines(status, priority, detail_type, task_id,
+                                    title, linked_case_display_id, locale)},
+            {"tag": "hr"},
+        ]
+        elements.extend(body_blocks)
+        if trunc:
+            elements.append({"tag": "markdown",
+                             "content": i18n.t("report.summary_truncated",
+                                               locale)})
         elements.append({"tag": "hr"})
-        # i18n.t returns "*🤖 ...*" (single-star); _bold() converts to "**".
+        for idx, row in enumerate(rows):
+            if idx == 1 and next_steps:
+                elements.append({"tag": "markdown",
+                                 "content": _bold(i18n.t(
+                                     "report.next_steps_header", locale))})
+            elements.append({"tag": "action",
+                             "actions": [_v2_button(b) for b in row]})
+        for note in _note_lines(locale):
+            elements.append({"tag": "markdown", "content": note})
+        return {
+            "schema": "2.0",
+            "config": card_config(streaming_mode=False),
+            "header": {
+                "title": {"tag": "plain_text",
+                          "content": i18n.t("report.header.title", locale,
+                                            emoji=emoji)},
+                "template": _STATUS_TEMPLATE.get(status, "blue"),
+            },
+            "body": {"elements": elements},
+        }
+
+    return _fit_json_budget(build, blocks, truncated or table_trimmed)
+
+
+def _report_card_v1(*, status: str, priority: str, detail_type: str,
+                    task_id: str, report_url: str, trace_url: str,
+                    summary_md: str, title: str = "",
+                    incident_id: str = "", linked_case_display_id: str = "",
+                    truncated: bool = False,
+                    next_steps: list[dict] | None = None,
+                    locale: str = "zh") -> dict:
+    """v1-schema twin of `_report_card_v2`, used when v2 is rejected.
+
+    Same content, same button order; pipe tables degrade to `column_set`
+    pseudo-tables (`_md_to_card_elements`). Better degraded than dropped —
+    a v2 reject used to mean the user got no report body at all.
+    """
+    emoji = _STATUS_EMOJI.get(status, "ℹ️")
+    elements: list = [
+        {"tag": "div",
+         "text": {"tag": "lark_md",
+                  "content": _meta_lines(status, priority, detail_type,
+                                         task_id, title,
+                                         linked_case_display_id, locale)}},
+        {"tag": "hr"},
+    ]
+    body_elements = _md_to_card_elements(summary_md or "")
+    if not body_elements:
+        body_elements = [{"tag": "div",
+                          "text": {"tag": "lark_md",
+                                   "content": (summary_md
+                                               or i18n.t("report.no_body",
+                                                         locale))}}]
+    elements.extend(body_elements)
+    if truncated:
         elements.append({"tag": "div",
                          "text": {"tag": "lark_md",
-                                  "content": _bold(i18n.t(
-                                      "report.next_steps_header", locale))}})
-        ns_buttons = []
-        for ns in next_steps[:3]:
-            ns_type = ns.get("type")
-            label = ns.get("label", "")
-            if ns_type == "dispatch":
-                query = ns.get("query", "")
-                if not label or not query:
-                    continue
-                ns_buttons.append({
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": label},
-                    "type": "default",
-                    "value": {"action": "next_step_dispatch",
-                              "incident_id": incident_id,
-                              "query": query},
-                })
-            elif ns_type == "open_url":
-                url = ns.get("url", "")
-                if not label or not url:
-                    continue
-                ns_buttons.append({
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": label},
-                    "type": "default",
-                    "url": url,
-                    "multi_url": {"url": url, "android_url": url,
-                                  "ios_url": url, "pc_url": url},
-                })
-        if ns_buttons:
-            elements.append({"tag": "action", "actions": ns_buttons})
-    # Sync-to-case button: only when this investigation was kicked off by a
-    # "create case + dispatch" flow. Lets the user push the agent's findings
-    # to AWS Support engineers as a comment on that case for context.
-    if linked_case_display_id and incident_id:
-        elements.append({"tag": "hr"})
-        elements.append({
-            "tag": "action",
-            "actions": [
-                {"tag": "button",
-                 "text": {"tag": "plain_text",
-                          "content": i18n.t("report.sync_to_case", locale,
-                                            case_display_id=linked_case_display_id)},
-                 "type": "primary",
-                 "value": {"action": "case_sync_report",
-                           "incident_id": incident_id,
-                           "case_display_id": linked_case_display_id}},
-            ],
-        })
-    if incident_id:
-        # Generic "ask for human support" button — covers the path where the
-        # user *didn't* dispatch a linked case at create time and now wants
-        # to escalate. We hide it when a linked case already exists, since
-        # creating a second case from the same investigation is rarely what
-        # the user wants.
-        if not linked_case_display_id:
-            elements.append({"tag": "hr"})
-            elements.append({
-                "tag": "action",
-                "actions": [
-                    {"tag": "button",
-                     "text": {"tag": "plain_text",
-                              "content": i18n.t("report.escalate_support", locale)},
-                     "type": "danger",
-                     "value": {"action": "ask_support", "incident_id": incident_id}},
-                ],
-            })
+                                  "content": i18n.t("report.summary_truncated",
+                                                    locale)}})
+    elements.append({"tag": "hr"})
+    rows = _action_rows_spec(
+        report_url=report_url, trace_url=trace_url,
+        incident_id=incident_id,
+        linked_case_display_id=linked_case_display_id,
+        next_steps=next_steps, locale=locale)
+    for idx, row in enumerate(rows):
+        if idx == 1 and next_steps:
+            elements.append({"tag": "div",
+                             "text": {"tag": "lark_md",
+                                      "content": _bold(i18n.t(
+                                          "report.next_steps_header",
+                                          locale))}})
+        elements.append({"tag": "action",
+                         "actions": [_v1_button(b) for b in row]})
+    # ⚠️ **一条说明一个 `note` 组件**,不要把多条塞进同一个 `note` 的
+    # `elements` 里 —— 飞书把一个 `note` 的子元素**同行拼接**(不换行,连
+    # 空格都不补),两句说明会连成一句话。v2 那边每条是独立 `markdown`
+    # 元素,天然分行;v1 必须自己拆,否则两个 schema 的观感会不一致。
+    for n in _note_lines(locale):
+        elements.append({"tag": "note",
+                         "elements": [{"tag": "plain_text", "content": n}]})
     return {
         "config": card_config(wide_screen_mode=True),
         "header": {
             "title": {"tag": "plain_text",
-                      "content": i18n.t("report.header.title", locale, emoji=emoji)},
-            "template": template,
+                      "content": i18n.t("report.header.title", locale,
+                                        emoji=emoji)},
+            "template": _STATUS_TEMPLATE.get(status, "blue"),
         },
         "elements": elements,
     }
@@ -659,8 +900,13 @@ def _split_blocks_into_cards(blocks: list[dict]) -> list[list[dict]]:
 
 
 def _summary_card_v2_from_blocks(blocks: list[dict],
-                                  header_suffix: str = "") -> dict:
-    """Wrap a list of v2 elements into a Report Summary card.
+                                  header_suffix: str = "",
+                                  locale: str = "zh") -> dict:
+    """Wrap a list of v2 elements into a standalone markdown card.
+
+    Used by `send_markdown` (the inspection-digest broadcast). The report
+    path does **not** come through here any more — it renders one merged
+    card (`_report_card_v2`).
 
     `width_mode: fill` (from `core.feishu_card.card_config`) makes the card
     stretch to the chat container's full width on desktop / mobile — required
@@ -672,7 +918,7 @@ def _summary_card_v2_from_blocks(blocks: list[dict],
     looked conspicuously wider than every other panel; now all cards go
     through `card_config()` and share this width.
     """
-    title = "📝 Report Summary"
+    title = i18n.t("report.summary_header", locale)
     if header_suffix:
         title = f"{title} · {header_suffix}"
     return {
@@ -682,24 +928,26 @@ def _summary_card_v2_from_blocks(blocks: list[dict],
             "title": {"tag": "plain_text", "content": title},
             "template": "blue",
         },
-        "body": {"elements": blocks or [{"tag": "markdown",
-                                         "content": "(no summary)"}]},
+        "body": {"elements": blocks or [
+            {"tag": "markdown", "content": i18n.t("report.no_body", locale)}]},
     }
 
 
-def _summary_card_v1_fallback(summary_md: str) -> dict:
+def _summary_card_v1_fallback(summary_md: str, locale: str = "zh") -> dict:
     """Last-resort: v1 schema with column_set fake-tables. Used when v2
     send fails (network/schema issue) — keeps the bot responsive even
     if the v2 path breaks."""
-    elements = _md_to_card_elements(summary_md or "(no summary)")
+    empty = i18n.t("report.no_body", locale)
+    elements = _md_to_card_elements(summary_md or empty)
     if not elements:
         elements = [{"tag": "div",
                      "text": {"tag": "lark_md",
-                              "content": summary_md or "(no summary)"}}]
+                              "content": summary_md or empty}}]
     return {
         "config": card_config(wide_screen_mode=True),
         "header": {
-            "title": {"tag": "plain_text", "content": "📝 Report Summary"},
+            "title": {"tag": "plain_text",
+                      "content": i18n.t("report.summary_header", locale)},
             "template": "blue",
         },
         "elements": elements,
@@ -1069,12 +1317,18 @@ def _normalize_md_tables(md: str) -> str:
 
 def _send_summary_cards(chat_id: str, root_message_id: str,
                         summary_md: str, locale: str = "zh") -> bool:
-    """Send the report summary as one or more v2 interactive cards.
+    """Send a standalone markdown body as one or more v2 interactive cards.
+
+    ⚠️ 2026-09-05：**报告链路不再走这里**。报告现在是一张合并卡
+    （`_report_card_v2` / D5），正文上界由 `report_handler._CARD_MAX_CHARS`
+    单点持有。这个函数现在只服务 `send_markdown`（巡检播报）—— 那条路径
+    没有「查看完整报告」按钮、也没有上游截断，所以**下面那道 12000 字
+    的闸门要留着**：它在这里不是第二把剪刀，而是唯一一把。
 
     Returns True when delivery succeeded (either the v2 cards or the v1
-    fallback). `send_report` ignores the return value; the inspection
-    broadcast layer needs it because a fan-out has to report per-chat
-    success — a silent None makes "which group didn't get it?" unanswerable.
+    fallback). The inspection broadcast layer needs the boolean because a
+    fan-out has to report per-chat success — a silent None makes
+    "which group didn't get it?" unanswerable.
 
     Why v2 cards (and not `msg_type: text` or v2 single-`markdown`)?
       - For Feishu **application bots** (this project), `msg_type: text`
@@ -1110,7 +1364,7 @@ def _send_summary_cards(chat_id: str, root_message_id: str,
          degraded than dropped.
     """
     if not summary_md:
-        summary_md = "(no summary)"
+        summary_md = i18n.t("report.no_body", locale)
     if len(summary_md) > 12000:
         summary_md = (summary_md[:12000] + "\n\n…"
                       + i18n.t("report.summary_truncated", locale))
@@ -1128,17 +1382,18 @@ def _send_summary_cards(chat_id: str, root_message_id: str,
         suffix = f"{idx}/{total}" if total > 1 else ""
         ok = _try_send_card(
             chat_id, root_message_id,
-            _summary_card_v2_from_blocks(card_blocks, header_suffix=suffix),
+            _summary_card_v2_from_blocks(card_blocks, header_suffix=suffix,
+                                         locale=locale),
         )
         if idx == 1:
             first_ok = ok
         if not ok and idx == 1:
             logger.warning("v2 summary card rejected — falling back to v1 schema")
             return _try_send_card(chat_id, root_message_id,
-                                  _summary_card_v1_fallback(summary_md))
+                                  _summary_card_v1_fallback(summary_md, locale))
     if not first_ok:
         return _try_send_card(chat_id, root_message_id,
-                              _summary_card_v1_fallback(summary_md))
+                              _summary_card_v1_fallback(summary_md, locale))
     return True
 
 
@@ -1147,39 +1402,48 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
                 summary_md: str, incident_id: str = "",
                 linked_case_display_id: str = "",
                 next_steps: list[dict] | None = None,
-                locale: str = "zh") -> None:
-    """Send investigation results back to Feishu as two interactive cards.
+                locale: str = "zh", title: str = "",
+                report_truncated: bool = False) -> None:
+    """Send investigation results back to Feishu as **one** interactive card.
+
+    `title` (D1) is the user's own question, rendered at the top so a chat
+    with several investigations in it stays readable.
+
+    ⚠️ **没有 `console_url` 参数** —— DevOps Agent 控制台深链不上报告卡,
+    理由见 `_action_rows_spec`。它是 2026-09-05 加进来又当天去掉的,别看
+    见调用方手里有 `console_url` 就"顺手补回"这个参数:补回来会同时把
+    「需要登录」那句说明拽回来,而这张卡上其余链接都是免登录的。
+
+    `report_truncated` says the body handed to us is a cut-down slice
+    (`report_handler._card_from_report`); we render the notice per-locale
+    rather than letting the pipeline splice Chinese into the body.
 
     `linked_case_display_id` is set when the investigation was triggered by
     a "create case + dispatch" flow (incident_id like "feishu-case-NNNN");
-    causes the header card to render a "sync to case" button instead of
-    the generic "ask for human support" one.
+    renders a "sync to case" button instead of the generic
+    "ask for human support" one.
 
-    `next_steps` is a list of Bedrock-suggested follow-up actions
-    (dispatch / open_url) rendered as a button row on the header card.
-
-    `locale` controls report card output language. P1 currently only
-    threads `locale` through to next-step button labels (which were
-    already locale-aware via their generation prompt) and the i18n keys
-    we have. The Feishu summary-card markdown (rendered server-side
-    from the agent's GFM output) and the Chinese header-card chrome
-    are still always-Chinese — full i18n there is P2 work.
+    `next_steps` is retained for cards already in users' chat history; the
+    report path stops generating them as of 2026-09-05 (0 token).
     """
     if not is_configured():
         logger.warning("Feishu not configured — skipping send_report")
         return
 
-    # Send summary first, then the header card (with action buttons + 🆘
-    # escalation) — putting the header last keeps it at the bottom of the
-    # thread so users land on the actionable card without scrolling past
-    # the long markdown body.
-    _send_summary_cards(chat_id, root_message_id, summary_md, locale=locale)
-    _send_card(chat_id, root_message_id,
-               _header_card(status, priority, detail_type, task_id,
-                            report_url, trace_url, incident_id=incident_id,
-                            linked_case_display_id=linked_case_display_id,
-                            next_steps=next_steps,
-                            locale=locale))
+    kwargs = dict(
+        status=status, priority=priority, detail_type=detail_type,
+        task_id=task_id, report_url=report_url, trace_url=trace_url,
+        summary_md=summary_md, title=title,
+        incident_id=incident_id,
+        linked_case_display_id=linked_case_display_id,
+        truncated=report_truncated, next_steps=next_steps, locale=locale)
+    if _try_send_card(chat_id, root_message_id, _report_card_v2(**kwargs)):
+        return
+    # A v2 reject (bad table shape, size, schema drift) used to leave the
+    # user with no body at all. Degrade to v1 — same content, same button
+    # order, pseudo-tables — rather than dropping the report.
+    logger.warning("v2 report card rejected — falling back to v1 schema")
+    _send_card(chat_id, root_message_id, _report_card_v1(**kwargs))
 
 def send_markdown(chat_id: str, markdown: str, *, locale: str = "zh") -> bool:
     """Post a standalone markdown body into a chat. Returns True on success.

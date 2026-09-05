@@ -234,7 +234,26 @@ def _get_litellm_config() -> dict:
 # Bedrock — 复用 lambda3 现有 invoke 逻辑(import 它,避免代码漂移)
 # ---------------------------------------------------------------------------
 
-_TRUNCATION_NOTICE = "\n\n---\n⚠️ 报告因 token 限制被截断,部分内容可能不完整。"
+# 🔴 **这里以前有一个 `_TRUNCATION_NOTICE`，撞 `max_tokens` 时直接拼到
+#    `content` 末尾。2026-09-05 删掉 —— 它是个跨模块的静默数据污染源。**
+#
+#    坏法：这个 provider 是**通用**的，`content` 的消费者里有一半根本不是
+#    「给人看的正文」，而是要**解析**的结构化输出。拼一句中文告警进去 ⇒
+#
+#      • `core/case_classifier.py`   要 `json.loads(content)` ⇒ 解析失败 ⇒
+#        真实生产事故：日志里 `raw='---\n⚠️ 报告因 token 限制被截断…'`，
+#        一个真的 support case 被降级成 `fallback (classifier unavailable)` 误分类。
+#      • 推理型模型（Grok 4.6 起全槽位默认）会把输出预算花在 thinking 上，
+#        于是 `text` 块**空**而 `stopReason == max_tokens` ⇒ 拼完 `content`
+#        只剩那 35 个字符的告警本身 ⇒ 下游的「空内容」判据全部失效（它不空了），
+#        降级路径永不触发，用户看到的是一张**只有一句告警**的卡片。
+#        这正是 2026-09-05 用户报的 D4。
+#
+#    正确的分工：截断是**元信息**，本来就已经在返回值里（`stop_reason`）。
+#    要不要提示用户、提示在哪一层，由**渲染层**决定（它知道自己在渲染卡片
+#    还是在喂 `json.loads`）。provider 不许改写 payload。
+#
+# ⚠️ 别再加回来。要加提示就在渲染处读 `stop_reason`。
 
 _bedrock_config = Config(
     read_timeout=300,
@@ -440,9 +459,8 @@ def _invoke_bedrock(
     stop_reason = response.get("stopReason", "")
     usage = response.get("usage", {})
 
-    if stop_reason == "max_tokens":
-        content += _TRUNCATION_NOTICE
-
+    # ⚠️ 撞 max_tokens 时**不**改写 content —— 截断信息就在 stop_reason 里，
+    #    由渲染层决定要不要提示。理由见文件上方那段注释。
     return {"content": content, "stop_reason": stop_reason, "usage": usage}
 
 
@@ -586,13 +604,11 @@ def _invoke_mantle_responses(
 
     content = _mantle_text(payload)
     # Responses 用 `status` + `incomplete_details.reason` 表达截断，Bedrock 用
-    # `stopReason == "max_tokens"`。映射成后者，上游那套 _TRUNCATION_NOTICE /
-    # 截断判定就不用为第二种协议再写一遍。
+    # `stopReason == "max_tokens"`。映射成后者，上游那套截断判定就不用为第二种
+    # 协议再写一遍。⚠️ 只映射元信息，**不**改写 content（理由见文件上方注释）。
     reason = str(((payload.get("incomplete_details") or {}).get("reason") or ""))
     stop_reason = "max_tokens" if reason == "max_output_tokens" else str(
         payload.get("status") or "")
-    if stop_reason == "max_tokens":
-        content += _TRUNCATION_NOTICE
 
     # usage 字段名对齐 Bedrock（调用方与既有测试都按 inputTokens/outputTokens 读）。
     u = payload.get("usage") or {}
@@ -702,8 +718,7 @@ def _invoke_litellm(
         "tool_calls": "tool_use",
     }.get(finish_reason, finish_reason or "end_turn")
 
-    if stop_reason == "max_tokens":
-        content += _TRUNCATION_NOTICE
+    # ⚠️ 撞 max_tokens 时**不**改写 content（理由见文件上方注释）。
 
     # 把 OpenAI 的 usage 名字标准化成 Bedrock 风格,日志和监控能看
     bedrock_usage = {

@@ -110,7 +110,6 @@ def test_send_report_posts_markdown():
             summary_md="### Root cause\n- CPU bound nginx",
             html_url="https://example/r.html",
             trace_url="https://example/trace",
-            console_url="https://console.example",
             next_steps=[
                 {"label": "Check ALB", "url": "dispatch://alb"},
                 {"label": "Look at RDS slow queries", "url": ""},
@@ -131,9 +130,28 @@ def test_send_report_posts_markdown():
         text = body["markdown"]["text"]
         _check("body has summary",
                "Root cause" in text and "CPU bound" in text)
-        _check("body has Full report link", "Full report" in text)
-        _check("body has Trace link",       "Trace" in text)
-        _check("body has Console link",     "Console" in text)
+        # 🔴 2026-09-05：这几条原本断言硬编码的英文字面量（"Full report" /
+        #    "Trace" / "Console"）。链接文案改走 `core/i18n` 之后前两条直接
+        #    红了，而第三条更糟 —— 它是**误绿**：正文里根本没有 "Console"
+        #    这颗链接的文案，命中的是脚注那句「requires an active AWS
+        #    Console login」。所以改成拿 i18n 取实际文案再断言：文案调整不再
+        #    误报，而链接真丢了一定报。
+        from core import i18n  # noqa: PLC0415 —— 延迟导入，与本文件其余部分一致
+        _check("body has Full report link",
+               i18n.t("report.see_full", "en") in text)
+        _check("body has Trace link",
+               i18n.t("report.see_trace", "en") in text)
+        # 🔴 同日晚：控制台深链从报告卡上**去掉**了（它要登录控制台，而卡上
+        #    其余链接都是预签名、免登录的，一行说明写不下两种事实）。所以那
+        #    条断言反转成"不许有"，连带那句登录提醒也不许有。钉钉的
+        #    `send_report` 带 `**_kwargs`，传 `console_url=` 会被静默吞掉，
+        #    断言渲染结果是唯一守得住的方式。
+        _check("body has NO console deep link",
+               i18n.t("progress.btn.open_link", "en") not in text)
+        _check("body has NO console-login warning",
+               i18n.t("progress.link_login_warning", "en") not in text)
+        _check("body has link-validity footnote",
+               i18n.t("report.link_validity", "en") in text)
         _check("body has next-step",        "Check ALB" in text)
 
 

@@ -1373,10 +1373,17 @@ STAGER_ONBOARD = "_devops_onboard"
 # （登记 = 有人想过；不登记 = 漏写，而漏写的症状是静默的）。
 ONBOARD_FIELD_DIFF_ALLOWED = {
     "trigger_role_arn": (
-        "只在**跨账号**分支被读（core/devops_agent.py 的 is_deploy=False 一路 + "
-        "_assume_client 会校验 ARN 里的账号段）。方式 A 根本不建 "
-        "notiops-agent-trigger-* 角色 —— 写个假 ARN 反而会让将来真有跨账号需求时"
-        "静默 assume 失败。"),
+        "只在**跨账号**分支被读。方式 A 根本不建 notiops-agent-trigger-* 角色 —— "
+        "写个假 ARN 反而会让将来真有跨账号需求时静默 assume 失败。\n"
+        "        ⚠️ 有**两个**读者，别只记得一个（2026-09-05 现网 D2 就是漏了第二个）：\n"
+        "          · core/devops_agent.py —— is_deploy=False 一路，_assume_client "
+        "会校验 ARN 里的账号段；\n"
+        "          · shared/devops_agent.py::_get_cross_account_client —— "
+        "报告链路拉 UI trace 用的那份。它原来无条件 mapping['trigger_role_arn']，"
+        "方式 A 缺键 → KeyError → 被 except 吞掉 → 记录列表返回 [] → "
+        "「调查 Trace」页面显示 No records found。\n"
+        "        所以这条登记的含义是「**每个**读者都必须容忍这个键不存在」，"
+        "不是「方式 A 该补上这个键」。"),
     "inspect_agent_space_id": (
         "方式 A 不含资源巡检，没有那个 space。callback 侧对空值记 ERROR 后"
         "照常走排障分支，不会崩。"),
@@ -1474,6 +1481,23 @@ def test_devops_callback_parity() -> None:
         _check(f"允许的差异仍然成立：方式 A 不写 {field}",
                field in b_fields and field not in a_fields,
                f"登记的理由是「{why}」；现在实际情况与登记不符 —— 要么补上，要么改这张表")
+
+    # 登记「允许方式 A 不写」只是一半；另一半是**每个读者都得容忍它不在**。
+    # 2026-09-05 现网 D2：shared/devops_agent.py 无条件下标
+    # `mapping["trigger_role_arn"]`，方式 A 缺键 → KeyError → 被 except 吞 →
+    # 「调查 Trace」显示 No records found。
+    #
+    # 断言取**正向证据**（存在 `.get("trigger_role_arn")` 这道判空）而不是
+    # 「不许出现下标」：core/devops_agent.py 里那处下标（:188）是**先 .get 判空
+    # 早返回、之后才下标**，本身是对的；一刀切禁下标会把正确写法也判红，
+    # 于是下一个人只会去改断言。
+    for reader in ("core/devops_agent.py", "shared/devops_agent.py"):
+        src = _read(reader)
+        _check(f"{reader} 对缺失的 trigger_role_arn 有判空",
+               re.search(r"""\.get\(\s*['"]trigger_role_arn['"]""", src) is not None,
+               "方式 A 的 da# 行没有这个键（上面那张表登记过）。没有判空就意味着"
+               "无条件下标 → KeyError；若外层有 except 兜底，症状是静默的空结果，"
+               "不是报错")
 
     _check("方式 A 的 stager 定义了这个 Phase 且真的调用了它",
            f"def {STAGER_ONBOARD}(" in stager

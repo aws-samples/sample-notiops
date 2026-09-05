@@ -336,11 +336,22 @@ sequenceDiagram
     L->>Agent: ListJournalRecords (pull full journal)
     L->>L: render trace.html + extract summary_md
     L->>S3: upload with 7-day presigned URL
-    L->>H: next_steps.generate(summary_md)
-    H-->>L: [{type, label, query/url}, ...]
     L->>DDB: lookup incident#xxx → routing info
-    L->>U: deliver via sender back to the original channel: 📝 Report Summary + ✅ NotiOps Report<br/>(View report / Trace / 🤖 next-step / 🆘 escalate Support)
+    L->>U: deliver via sender back to the original channel: **one** ✅ NotiOps report card<br/>(investigation target + report body + View full report / Trace / Escalate Support)
 ```
+
+> 🔴 **2026-09-05: the last two LLM calls on this path are gone — it is now 0 token.**
+> There used to be two more steps here: `bedrock_summarizer` re-summarizing the DA report
+> (`_MAX_TOKENS = 1024`) and `next_steps.generate` producing suggestion buttons
+> (1500 tokens). Once the default model became a reasoning model, its thinking tokens ate
+> that 1024-token output budget ⇒ the summary card's body frequently held nothing but
+> "report truncated due to token limits", and sometimes nothing at all. The fix was not to
+> tune the budget but to **remove the LLM from this stage entirely**: the body is now the
+> DA report's own text, and "next steps" are the deterministic buttons on the card. That
+> makes deep investigation **0 token** on IM, matching the web path
+> (`bff/web-chat/devops_investigate.mjs`). The two cards were merged into one as well —
+> from a user's point of view "📝 Report Summary" + "✅ NotiOps Report" read as two
+> separate reports.
 
 > ⚠️ **Before M2 / M3 this pipeline looked different** — troubleshoot older installs
 > against the old diagram: the entrypoint was a long-connection process on ECS Fargate
@@ -952,9 +963,22 @@ Code: [core/progress_card.py](../core/progress_card.py) `translate_thinking_zh()
 
 ---
 
-### 4.5 Next-step suggestions `next_steps`
+### 4.5 Next-step suggestions `next_steps` (🔴 **no production caller** as of 2026-09-05)
 
-#### 4.5.1 Why proactively suggest next steps
+> 🔴 **The report path no longer calls this.** `shared/report_delivery/report_handler.py`
+> passes senders an **empty list**, so LLM-generated suggestion buttons no longer appear on
+> production report cards. The reason is in the §3.1 note: this step was a 1500-token LLM
+> call whose output overlapped the deterministic buttons already on the card (View full
+> report / Trace / Escalate Support), and dropping it makes the
+> whole deep-investigation path 0 token.
+>
+> ⚠️ **The module and the parameter are kept deliberately**, not by oversight: ① buttons on
+> already-delivered cards are still clickable, so the callback side must keep recognising the
+> `dispatch` / `open_url` shapes; ② actually retiring it needs its own MR covering the
+> dispatch handler and all three senders' parameters. What follows describes **that format
+> contract**, not current runtime behaviour.
+
+#### 4.5.1 Why we proactively suggested next steps
 
 After the investigation report is finished, offering only a "view full report" button is passive. The **truly agentic experience** is for the bot, having read the report, to proactively tell the user "here's what you might want to look at next".
 
@@ -1627,7 +1651,7 @@ Current progress:
 |---|---|---|---|
 | 1 | Multi-turn context | ❌ Reverted (2026-05-27) | History prior caused chitchat misclassification, conflicted with #8 |
 | 2 | Pre-dispatch enrichment | ⏳ Not started | Improves single-investigation quality; needs ReadOnly IAM design |
-| 3 | next-step buttons | ✅ Implemented (2026-05-25) | Bedrock generates dispatch / open_url |
+| 3 | next-step buttons | 🔴 Retired (2026-09-05) | Formerly Bedrock-generated dispatch / open_url; dropped to make the deep-investigation path 0 token — format contract in §4.5 |
 | 4 | Proactive monitoring v1 | ✅ Implemented (2026-05-25) | 6 event sources + 5-minute dedup |
 | 4' | Proactive monitoring v2 | ⏳ Not started | rollup storms / routing table / cross-account |
 | 5 | Scheduled inspection cron | ⏳ Not started | Daily scans of IAM / SG / cost anomalies |

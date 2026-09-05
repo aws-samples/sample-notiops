@@ -329,11 +329,19 @@ sequenceDiagram
     L->>Agent: ListJournalRecords (拉完整 journal)
     L->>L: 渲染 trace.html + 提取 summary_md
     L->>S3: upload 7 天预签 URL
-    L->>H: next_steps.generate(summary_md)
-    H-->>L: [{type, label, query/url}, ...]
     L->>DDB: 查 incident#xxx → 路由信息
-    L->>U: 通过 sender 发回原群:📝 Report Summary + ✅ NotiOps Report<br/>(查看报告 / Trace / 🤖 next-step / 🆘 升级 Support)
+    L->>U: 通过 sender 发回原群:**一张** ✅ NotiOps 报告卡<br/>(调查目标 + 报告正文 + 查看完整报告 / Trace / 升级 Support)
 ```
+
+> 🔴 **2026-09-05:这条链路上的最后两次大模型调用被去掉了,现在它 0 token。**
+> 原来这里还有两步:`bedrock_summarizer` 把 DA 报告再摘要一遍(`_MAX_TOKENS = 1024`)、
+> `next_steps.generate` 生成建议按钮(1500 tokens)。默认模型换成推理模型之后,
+> thinking token 吃光了 1024 的输出预算 ⇒ 摘要卡正文经常只剩一句「报告因 token
+> 限制被截断」,偶尔完全空白。修法不是调预算,而是**把这一段的 LLM 整个拿掉**:
+> 正文直接取 DA 报告原文,「下一步」换成卡上那排确定性按钮。于是「深度调查」
+> 在 IM 侧与 web 侧(`bff/web-chat/devops_investigate.mjs`)一样是 **0 token**。
+> 两张卡也合成了一张(用户视角:「📝 Report Summary」+「✅ NotiOps 报告」读起来
+> 像两份报告)。
 
 > ⚠️ **M2 / M3 之前这条链路不一样**,老部署的排查按老图走:入口是 ECS Fargate 上的长连接
 > 进程(没有 API GW / ingress / worker 之分),意图靠 `bedrock_intent.analyze_intent()`
@@ -937,9 +945,20 @@ agent 已经拿到 EC2 元信息和最近 1 小时的 CPU 指标,
 
 ---
 
-### 4.5 next-step 建议 `next_steps`
+### 4.5 next-step 建议 `next_steps`(🔴 2026-09-05 起**没有生产调用方**)
 
-#### 4.5.1 为什么主动给建议
+> 🔴 **报告链路已经不调它了。** `shared/report_delivery/report_handler.py` 往
+> sender 传的是**空列表**,所以现网报告卡上不会再出现 LLM 生成的建议按钮。
+> 原因见 §3.1 那段说明:这一步是 1500 tokens 的大模型调用,而它产出的东西
+> 与卡上那排确定性按钮(查看完整报告 / Trace / 升级 Support)
+> 重叠,去掉之后整条深度调查链路 0 token。
+>
+> ⚠️ **模块和参数都刻意留着**,不是忘了删:① 已经发出去的卡片上那些按钮仍然
+> 可点,回调侧要认得 `dispatch` / `open_url` 这两种形状;② 真要退役得单独一个
+> MR 覆盖 dispatch handler 与三个 sender 的参数。下面这节描述的是**那个格式契约**,
+> 不是当前的运行时行为。
+
+#### 4.5.1 为什么当初主动给建议
 
 调查报告完成后,只给一个"查看完整报告"按钮是被动的。**真正的 agentic 体验**是 bot 看完报告后,主动告诉用户"接下来你可能想看 X"。
 
@@ -969,7 +988,7 @@ agent 已经拿到 EC2 元信息和最近 1 小时的 CPU 指标,
 
 防止 Bedrock 编造危险内容:
 
-1. **`open_url` 域名白名单**:只允许 `console.aws.amazon.com`(及子域),非控制台 URL 直接丢弃
+1. **`open_url` 域名允许清单**:只允许 `console.aws.amazon.com`(及子域),非控制台 URL 直接丢弃
 2. **`dispatch` 去重**:用 `sha1(parent_incident_id + query)` 作为 synth event_id,DDB conditional put 保证多次点击不重复派发
 3. **JSON 解析失败 fallback**:Bedrock 输出非合法 JSON → 返回空数组,header 卡只显示原本的查看报告按钮
 
@@ -1598,7 +1617,7 @@ class ProgressCardIR:
 |---|---|---|---|
 | 1 | 多轮上下文 | ❌ 已撤销 (2026-05-27) | history 强先验把 chitchat 误判,与 #8 打架 |
 | 2 | 派发前 enrichment | ⏳ 未开始 | 提升单次调查质量,需 ReadOnly IAM 设计 |
-| 3 | next-step 按钮 | ✅ 已实现 (2026-05-25) | Bedrock 生成 dispatch / open_url |
+| 3 | next-step 按钮 | 🔴 已退役 (2026-09-05) | 曾由 Bedrock 生成 dispatch / open_url;为了让深度调查链路 0 token 去掉,格式契约见 §4.5 |
 | 4 | 主动观察一期 | ✅ 已实现 (2026-05-25) | 6 事件源 + 5 分钟去重 |
 | 4' | 主动观察二期 | ⏳ 未开始 | rollup 风暴 / 路由表 / 跨账号 |
 | 5 | 定时巡检 cron | ⏳ 未开始 | 每天扫 IAM / SG / 费用异常 |

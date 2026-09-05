@@ -439,9 +439,28 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "📝 报告概要",
         "en": "📝 Report summary",
     },
+    # ⚠️ 措辞**不许再带方向词**（原文是「详见**上方**…链接」）。
+    # 2026-09-05 起摘要与操作按钮合并成同一张卡，链接在正文**下方**；
+    # 而 `send_markdown`（巡检播报）那条路径上根本没有这颗按钮。
+    # 带方向的文案在这两处都是错的，而且错了不会报错 —— 只是让用户
+    # 照着指错的方向找。
     "report.summary_truncated": {
-        "zh": "…(详见上方 *查看完整报告* 链接)",
-        "en": "…(see *View full report* link above)",
+        "zh": "⚠️ 卡片仅展示报告的开头部分 · 完整内容见「📊 查看完整报告」",
+        "en": "⚠️ This card shows only the beginning of the report — "
+              "full content via *📊 View full report*",
+    },
+    # 用户原始问题 / 调查目标。D1：报告卡与两个 HTML 页面上原来只有
+    # task_id，用户看不出「这份报告是哪一次调查」。
+    "report.header.subject": {
+        "zh": "*🎯 调查目标* · {title}",
+        "en": "*🎯 Investigation target* · {title}",
+    },
+    # 「没取到正文」≠「正文被截断」。以前两者都渲染成一句截断告警
+    # （D4：现网出现过整张卡只有 35 个字符的告警、正文一个字都没有）。
+    "report.no_body": {
+        "zh": "_未取到报告正文 · 请用「📊 查看完整报告」，或看「🔍 调查过程 Trace」_",
+        "en": "_No report body was retrieved — use *📊 View full report*, "
+              "or the *🔍 Investigation trace*_",
     },
     "report.see_full": {
         "zh": "📊 查看完整报告",

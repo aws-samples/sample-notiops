@@ -72,7 +72,7 @@ sequenceDiagram
     Bot->>Agent: create_investigation(incident_id=feishu-<event_id>)
     Bot-->>User: ✅ 已派发，⏳ 调查启动中
     Agent-->>Bot: （EventBridge 回调）调查完成
-    Bot-->>User: 📝 Report Summary + 📊 查看完整报告（按钮）
+    Bot-->>User: ✅ NotiOps 报告（一张卡：调查目标 + 报告正文 + 四颗按钮）
 ```
 
 ### 方式二：群聊 @机器人
@@ -96,7 +96,7 @@ sequenceDiagram
     User2->>Group: 点「🚀 派发调查」
     Bot->>Agent: create_investigation(incident_id=feishu-<event_id>)
     Agent-->>Bot: （EventBridge 回调）调查完成
-    Bot-->>Group: 📝 Report Summary + 📊 查看完整报告（回贴到发起线程）
+    Bot-->>Group: ✅ NotiOps 报告（一张卡，回贴到发起线程）
 ```
 
 ### 关键点

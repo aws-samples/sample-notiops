@@ -690,11 +690,35 @@ instead, and falls back to plain text only if that fails too.
 runs it in the background, **without occupying your chat**. You get two cards:
 
 1. a **progress card**, refreshed once a minute (accepted → investigating → completed);
-2. a **final report card**, posted back to the **same conversation** when the run finishes,
-   with a summary plus a **report link** and a trace link.
+2. a **final report card**, posted back to the **same conversation** when the run finishes:
+   the question you asked at the top, the opening slice of the report as the body, and three
+   buttons underneath (📊 View full report / 🔍 Investigation trace /
+   🆘 Escalate to AWS Support). The "🔬 Open this investigation" console deep link lives on
+   the **progress card** only — every other link on the report card is presigned and needs no
+   login, so adding one that requires a console session would force the footnote beneath them
+   to claim "no login required" and "login required" at once.
 
+> 🔴 **As of v1.0.22 there is only one report card.** It used to be two ("📝 Report Summary"
+> + "✅ NotiOps Report"), and the first one's body came from an LLM summary — once the default
+> model became a reasoning model, its thinking tokens ate the whole 1024-token output budget,
+> so the body frequently held nothing but "report truncated due to token limits", and
+> occasionally nothing at all. It is now one card whose body is the DevOps Agent's own text,
+> which makes the whole deep-investigation path **0 token**.
+>
 > ⚠️ The report link is an **S3 presigned URL valid for 7 days** — not a permanent link, and
 > not a CloudFront URL. Download the file if you need to keep it.
+>
+> ⚠️ When the report does not fit on the card, the body ends with "⚠️ This card shows only the
+> beginning of the report — full content via *📊 View full report*". The content behind that
+> button is **not** truncated; conversely, no such line means the card holds the whole thing.
+> **"No body was retrieved" is a different message** ("No report body was retrieved…") — do
+> not read the two as the same thing.
+>
+> ⚠️ The **📊 View full report** page carries **Summary + Root cause**; the
+> **🔍 Investigation trace** page carries the **investigation timeline** (what the Agent
+> checked at each step). If the trace page says `No records found.` while the investigation
+> clearly ran, cross-account permissions blocked the journal read — the page now lists the
+> read failures instead of leaving only that empty notice.
 >
 > ⚠️ Only the case where the progress card reaches "completed" and the report card **never
 > arrives** is a real failure. That means the chat-routing row (`task#<task_id>`) was not

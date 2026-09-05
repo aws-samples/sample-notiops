@@ -29,6 +29,10 @@ import os
 import boto3
 from botocore.exceptions import ClientError, BotoCoreError
 
+# DA `ui_investigation_summary` 组件树的摊平器 —— 单一来源，两棵 core/ 树逐字节一致
+# （tests/test_core_tree_parity.py 的 _MUST_MATCH）。IM 侧的 report-handler 读的是同一份。
+from core.da_ui_tree import summary_md as _ui_summary_from_records
+
 logger = logging.getLogger(__name__)
 
 
@@ -632,126 +636,13 @@ def _md_record_from_records(records: list, record_type: str) -> str:
 
 
 # ── ui_investigation_summary：后台 Summary 页的数据源（一棵 UI 组件树，不是 markdown） ──────
-# 实测终版树的形状（exe-ops1-0cbea51b…）：
-#   container
-#     card#summary            ← ①执行摘要卡：标题 + 状态/严重性徽章 + 问题概要/根本原因/修复方案
-#     card                    ← ②调查发现与证据（= Root cause tab，我们那一区已经有了）
-#     container(卡片指标)      ← ③统计小卡
-#     card                    ← ④缓解方案（= Mitigation plan tab，我们那一区已经有了）
-# 所以 Summary 区**只取 ①**，否则一篇报告里三个区互相重复。
-_UI_HEADINGS = {"title", "card-title"}
-
-
-def _ui_leaves(node) -> list:
-    """深度优先收集 (type, text) 叶子文本。"""
-    out = []
-    if not isinstance(node, dict):
-        return out
-    s = node.get("text")
-    if isinstance(s, str) and s.strip():
-        out.append(((node.get("type") or "").lower(), s.strip()))
-    for ch in node.get("children") or []:
-        out.extend(_ui_leaves(ch))
-    return out
-
-
-def _flatten_ui(node, out: list) -> None:
-    """把 UI 组件树摊平成 markdown 行（正文一律原文透传，只做层级/列表符号的映射）。
-    产出的标题从 `###` 起（外面套的章节标题是 `##`）。"""
-    if not isinstance(node, dict):
-        return
-    t = (node.get("type") or "").lower()
-    txt = (node.get("text") or "").strip()
-    props = node.get("props") or {}
-    kids = node.get("children") or []
-    if t in ("card-header", "accordion-trigger"):
-        # 标题行：标题文字 + 徽章合成**一行**（徽章用 code 记号，避免和正文混淆）
-        leaves = _ui_leaves(node)
-        heads = [s for k, s in leaves if k in _UI_HEADINGS or k == "text"]
-        badges = [s for k, s in leaves if k == "badge"]
-        descs = [s for k, s in leaves if k in ("card-description", "markdown")]
-        line = " ".join(f"**{h}**" for h in heads[:1]) if heads else ""
-        if badges:
-            line = (line + " " if line else "") + " · ".join(f"`{b}`" for b in badges)
-        if line:
-            out.append(line)
-        out.extend(descs)
-        return
-    if t == "title":
-        lvl = props.get("level")
-        try:
-            lvl = int(lvl)
-        except (TypeError, ValueError):
-            lvl = 3
-        if txt:
-            out.append("#" * max(3, min(6, lvl)) + " " + txt)
-        return
-    if t in ("markdown", "text", "paragraph", "code"):
-        if txt:
-            out.append(txt)
-        return
-    if t == "badge":
-        if txt:
-            out.append(f"`{txt}`")
-        return
-    if t == "list-item":
-        if txt:
-            out.append(f"- {txt}")
-        return
-    if txt:
-        out.append(txt)
-    for ch in kids:
-        _flatten_ui(ch, out)
-
-
-def _ui_summary_from_records(records: list) -> str:
-    """从 `ui_investigation_summary` 终版里取**执行摘要卡**并摊平成 markdown。
-    找不到 / 解析失败 → 空串（调用方退化到末条 assistant 原文）。"""
-    tree = None
-    for r in records or []:
-        if not isinstance(r, dict) or r.get("recordType") != "ui_investigation_summary":
-            continue
-        c = r.get("content")
-        try:
-            c = json.loads(c) if isinstance(c, str) else c
-        except (ValueError, TypeError):
-            continue
-        if isinstance(c, dict):
-            tree = c.get("content") if isinstance(c.get("content"), dict) else c
-    if not isinstance(tree, dict):
-        return ""
-    # 执行摘要卡：优先按 id 命中（后台稳定用 "summary" 前缀），否则退化到树里第一张 card。
-    card = None
-
-    def _find(n):
-        nonlocal card
-        if card is not None or not isinstance(n, dict):
-            return
-        if (n.get("type") or "").lower() == "card":
-            if str(n.get("id") or "").split("__")[0] == "summary":
-                card = n
-                return
-        for ch in n.get("children") or []:
-            _find(ch)
-
-    _find(tree)
-    if card is None:
-        def _first_card(n):
-            if not isinstance(n, dict):
-                return None
-            if (n.get("type") or "").lower() == "card":
-                return n
-            for ch in n.get("children") or []:
-                got = _first_card(ch)
-                if got is not None:
-                    return got
-            return None
-        card = _first_card(tree)
-    if card is None:
-        return ""
-    lines: list = []
-    _flatten_ui(card, lines)
-    return "\n\n".join(x for x in lines if x).strip()
+# 🔴 摊平逻辑**已经搬到 `core/da_ui_tree.py`**（2026-09-05），这里只留一个薄委托。
+#    搬的理由：同一棵树 IM 侧的 report-handler Lambda 也要读（报告页取「概要 /
+#    核心建议」、Trace 页取「调查过程时间线」），而在此之前逻辑只有 web 这一份，
+#    于是同一次调查在 web 上有结构、在 IM 的报告 HTML 里只剩一段对话式正文。
+#    两棵 core/ 树的 `da_ui_tree.py` 由 tests/test_core_tree_parity.py 锁成逐字节一致。
+#
+# ⚠️ 别在这里再写一份 —— 那正是被这次改动消掉的那种漂移。import 在文件顶部。
 
 
 def _demote_md(md: str, times: int = 1) -> str:

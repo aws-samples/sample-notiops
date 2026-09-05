@@ -170,31 +170,59 @@ The progress card refreshes every 20 seconds until the Agent finishes.
 
 ### 3.4 Report card explained
 
+When an investigation finishes, the channel gets **one** card. Its first line is the
+question you asked — that is how you tell cards apart when several investigations
+are running in the same channel:
+
 ```
-✅ NotiOps Report · COMPLETED
+✅ NotiOps Report
 ─────────────────────
-📝 Report Summary
-
-# i-0abc123def456 CPU anomaly analysis
-
-## Symptoms
-- CPU sustained >95% over the past hour
-- Window: 14:30–15:30 UTC
-- Top processes: nginx + php-fpm
+🎯 Investigation target · Why is CPU pinned on EC2 i-0abc123def456
+Event · Investigation
+Status · COMPLETED    Priority · P2
+Task · abcdef0123456789
+─────────────────────
+## Summary
+CPU sustained >95% over the past hour; top processes nginx + php-fpm.
 
 ## Root cause
 Application-layer CPU bound. nginx is configured with worker_connections=1024,
 which is too few — many requests are queueing up.
+─────────────────────
+[ 📊 View full report ]   [ 🔍 Investigation trace ]
+[ 🆘 Escalate to AWS Support ]
 
-## Recommendations
-1. Set worker_processes to auto
-2. Raise nginx worker_connections to 4096
-3. Consider horizontal scaling (ASG min=2)
-
-[ 📄 View full report ]   [ 🔬 Trace ]   [ 📋 Next steps ]
+🔗 Links valid for 7 days · no console login required
 ```
 
-**The report card has next-step suggestion buttons at the bottom**, e.g. "Investigate the related ALB" / "Check RDS slow queries" — one click dispatches a new investigation. It reuses this channel's context, and the new report comes back to this same channel.
+Where the three buttons go:
+
+| Button | Opens | Console login |
+|---|---|---|
+| 📊 View full report | The complete report page on S3 (full Summary + Root cause) | No |
+| 🔍 Investigation trace | The investigation timeline: what the Agent checked at each step and what it saw | No |
+| 🆘 Escalate to AWS Support | Open a Support case from this report (becomes "Sync to Case" once a case is linked) | Yes |
+
+> The report card carries **no** "🔬 Open this investigation" (DevOps Agent console
+> deep link). The first two buttons open presigned links — valid 7 days, no login —
+> whereas a console deep link requires an active AWS Console session. Mixing both
+> into one row of buttons forces the footnote below them to claim "no login required"
+> and "login required" at the same time. If you want the raw console page, the
+> progress card still has its "🔬 Open this investigation" button (see §3.3) and it
+> stays clickable after the investigation finishes.
+
+**The card body is the opening slice of the full report.** When the report is longer
+than a card can hold, the body ends with
+"⚠️ This card shows only the beginning of the report — full content via *📊 View full report*"
+— the content behind that button is **not** truncated. Conversely, no such line means
+what you see on the card is the whole thing.
+
+> 🔴 Before v1.0.22 this was **two** cards ("📝 Report Summary" + "✅ NotiOps Report"),
+> and the first one's body came from an LLM summary with a 1024-token budget — a
+> reasoning model's thinking tokens ate that budget, so it frequently rendered nothing
+> but "report truncated due to token limits", and occasionally nothing at all. It is now
+> one card whose body is the DevOps Agent's own text, which makes the whole
+> deep-investigation path **0 token**.
 
 ### 3.5 Investigation samples
 

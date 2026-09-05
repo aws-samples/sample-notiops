@@ -21,7 +21,7 @@
   · region 白名单：非法值不得进 hostname（region 来自 DDB，Admin 可写）
   · usage 字段名归一到 Bedrock（inputTokens / outputTokens / totalTokens）
   · 截断映射：status=incomplete + reason=max_output_tokens → stop_reason="max_tokens"
-    并追加 _TRUNCATION_NOTICE（复用既有截断逻辑，不为第二种协议重写一遍）
+    （只映射元信息；content 保持原样，截断提示由渲染层负责）
   · 单轮无工具 → 显式 `store: false`（默认 true 会在**请求源区**留存 30 天）
   · 凭证：配了 Bedrock API Key → `Authorization: Bearer`；没配 → SigV4
   · 文本提取跳过 reasoning 块，只取 output_text
@@ -219,8 +219,14 @@ def test_response_normalisation() -> None:
     r2 = lp._invoke_mantle_responses("m", "sys", "usr", 8, "us-east-2")
     _check("incomplete + max_output_tokens → stop_reason='max_tokens'",
            r2["stop_reason"] == "max_tokens", r2["stop_reason"])
-    _check("截断时追加 _TRUNCATION_NOTICE（复用既有逻辑）",
-           r2["content"].endswith(lp._TRUNCATION_NOTICE), r2["content"])
+    # 🔴 截断**只**体现在 stop_reason 上；provider 不许往 content 里塞告警。
+    #    以前它拼一句中文告警进去，于是 (a) 要 json.loads 的调用方直接解析失败
+    #    （真实事故：case_classifier 误分类），(b) 推理型模型 text 块本来就空时
+    #    整个 content 只剩那句告警 ⇒ 下游「空内容」判据全部失效、降级不触发。
+    _check("截断时 content 保持原样（不拼告警）", r2["content"] == "半截", r2["content"])
+    _check("_TRUNCATION_NOTICE 已从模块里删除",
+           not hasattr(lp, "_TRUNCATION_NOTICE"),
+           "它又被加回来了：截断提示必须由渲染层读 stop_reason 自己加")
 
 
 def test_request_body() -> None:

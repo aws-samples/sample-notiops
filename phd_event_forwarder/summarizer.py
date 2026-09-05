@@ -151,7 +151,12 @@ def summarize_event(phd_event: PHDEvent) -> str:
         model_id=model_id,
         system_prompt=SYSTEM_PROMPT,
         user_prompt=user_prompt,
-        max_tokens=1024,
+        # 🔴 2026-09-05：1024 → 2000。`maxTokens` 管的是「摘要 **+ 推理** 一共
+        # 多长」，而默认模型（509cb42 起全槽位 Grok 4.6）是推理模型：thinking
+        # token 先把 1024 吃光，`stopReason` 恒为 `max_tokens`，`content` 里只剩
+        # `reasoningContent` → 摘要是空串。口径与 `core/bot_llm._MIN_MAX_TOKENS`
+        # 一致（同一个坑的同一个数字），产品级目标是 `_OUTPUT_TARGET` = 6000。
+        max_tokens=2000,
         kind=model_kind,
         region=model_region,
     )
@@ -160,4 +165,14 @@ def summarize_event(phd_event: PHDEvent) -> str:
         "LLM PHD summary completed: model=%s, stop_reason=%s, usage=%s",
         model_id, result.get("stop_reason"), result.get("usage"),
     )
-    return result.get("content", "")
+    content = (result.get("content") or "").strip()
+    if not content:
+        # 不许静默降级：空摘要以前会被 `format_message` 原样渲染成一张
+        # 「有标题、没内容」的卡（D4 在飞书侧的同款形状）。抛出去让
+        # `handler.py` 的 except 走 `format_fallback_message` —— 那条路径
+        # 至少把 PHD 原始事件完整转发出去，用户不会一无所获。
+        raise RuntimeError(
+            "PHD summary came back empty (model=%s stop_reason=%s); "
+            "falling back to raw event forwarding"
+            % (model_id, result.get("stop_reason")))
+    return content

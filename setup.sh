@@ -388,25 +388,78 @@ ORG_FLAG=""
 #    两个 StackSet（notiops-member-onboarding / notiops-member-devops-agent）
 #    压根不创建。
 #
-#    表现：`cdk deploy` 成功、看板能打开、Web Chat 能聊，**只有接入功能是死的**
-#    —— 管理页照常显示、「一键接入」按钮照常存在（`oneClickOnboardAvailable()`
-#    只看 env 有没有注入），点了才拿到 StackSetNotFound。
+#    表现：`cdk deploy` 成功、看板能打开、Web Chat 能聊，**只有多账号那一整套
+#    静默地不存在** —— 下面那段检测没跑 ⇒ ORG_FLAG 为空 ⇒ web-chat 栈的
+#    organizationId 为空 ⇒ MEMBER_ONBOARDING_STACKSET_NAME 注入成空串 ⇒
+#    跨账号查询一律 org_mode_disabled、LOCKED_ACCOUNT_ID 把一切钉在部署账号上。
+#
+# ⚠️ **不是「按钮还在、点了报 StackSetNotFound」**（这段注释 2026-09-04 原本
+#    这么写，与代码不符）：BFF 的 `oneClickOnboardAvailable()`
+#    （`bff/web-chat/member_accounts.mjs:57`）只看那个 env 有没有值，前端拿到
+#    `oneClickOnboard: false` 后把一键接入整块**换成一段提示**
+#    （`AdminPanel.tsx:2175`，文案 `admin.accounts.noOneClick`），逐账号的接入
+#    按钮也一并不渲染（`:2305`）—— 所以没有可点的东西、也不会有那个报错。
+#
+#    真正的坏处正在于此：**没有任何东西在部署当时告诉你选错了**，而唯一的补救
+#    是带 flag 重跑整个 setup.sh（~15 分钟）。一个静默少掉的能力比一个会报错的
+#    按钮更难发现 —— 客户看到的是「文档里写的一键接入我这儿没有」。
 #
 #    而 README 把 `./setup.sh` 写成「一键部署（唯一入口）」。
 #
-# ⇒ 当前账号明明是组织管理账号却没带 flag 时，明确说出来。**不自动开启** ——
-#   开多账号模式会动 Organizations 的可信访问与 StackSets，那是用户该决定的。
+# ⇒ 当前账号能管成员账号却没带 flag 时，**当场问**（不是打一行警告就往下走）。
+#
+#   为什么从「只警告」改成「问」（2026-09-04，实测踩中）：这段原本只 echo 三行
+#   就继续部署。而它打印的位置在几十行 CDK/巡检/权限检查输出的**中间**，
+#   一次真实部署里被直接刷过去了 —— 部署完打开管理页才发现一键接入那一块
+#   压根没渲染出来，那时已经过了 15 分钟，只能整套重跑。
+#   决定权仍在用户手里（默认 N = 保持单账号），所以「不自动开启」那条原则没破。
+#
+# 🔴 判据是**「能不能列出成员账号」**，不是「是不是管理账号」。
+#    StackSets 委派管理员也能建 StackSet，按管理账号判会把这类部署漏掉 ——
+#    而漏掉的表现和上面一样：多账号那一整套静默地不存在。
+#    顺带只数 ACTIVE：SUSPENDED 账号接不进来，算进去会虚报。
 if [ "$MULTI_ACCOUNT_MODE" != true ]; then
   _org_probe=$(aws organizations describe-organization \
     --query 'Organization.[Id,MasterAccountId]' --output text 2>/dev/null || echo "")
   if [ -n "$_org_probe" ]; then
+    _org_id=$(echo "$_org_probe" | awk '{print $1}')
     _org_mgmt=$(echo "$_org_probe" | awk '{print $2}')
     _me=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
-    if [ -n "$_me" ] && [ "$_me" = "$_org_mgmt" ]; then
+    # 列不出来(AccessDenied / 非 org)就不提示 —— 那种部署本来就只能单账号，
+    # 提示了也没有可执行的下一步，只会变成噪音。
+    _org_total=$(aws organizations list-accounts \
+      --query 'length(Accounts[?Status==`ACTIVE`])' --output text 2>/dev/null || echo "")
+    _org_members=""
+    case "$_org_total" in
+      ''|*[!0-9]*) _org_members="" ;;
+      *) _org_members=$(( _org_total - 1 )) ;;   # 减掉当前账号自己
+    esac
+    if [ -n "$_org_members" ] && [ "$_org_members" -gt 0 ]; then
       echo ""
-      echo "  $(t "⚠ 当前账号是组织管理账号(Org: $(echo "$_org_probe" | awk '{print $1}'))，但**没有**带 --multi-account。" "⚠ This account is the Organization management account (Org: $(echo "$_org_probe" | awk '{print $1}')), but --multi-account was NOT passed.")"
-      echo "    $(t "⇒ 两个成员账号 StackSet 不会创建，「一键接入」与「一键关联」都会报 StackSetNotFound。" "⇒ The two member-account StackSets will not be created; both one-click onboarding steps will fail with StackSetNotFound.")"
-      echo "    $(t "要接入成员账号请改用: ./setup.sh --multi-account" "To onboard member accounts, run: ./setup.sh --multi-account")"
+      echo "  $(t "⚠ 检测到 AWS Organizations: ${_org_id}" "⚠ AWS Organizations detected: ${_org_id}")"
+      if [ -n "$_me" ] && [ "$_me" = "$_org_mgmt" ]; then
+        echo "    $(t "当前账号 ${_me} 是组织管理账号(payer)，组织内另有 ${_org_members} 个 ACTIVE 成员账号。" "This account (${_me}) is the Organization management account (payer); the org has ${_org_members} other ACTIVE member account(s).")"
+      else
+        echo "    $(t "当前账号 ${_me} 能列出组织里的账号(StackSets 委派管理员)，另有 ${_org_members} 个 ACTIVE 账号。" "This account (${_me}) can list org accounts (StackSets delegated admin); there are ${_org_members} other ACTIVE account(s).")"
+      fi
+      echo "    $(t "本次**没有**带 --multi-account ⇒ 两个成员账号 StackSet 不会创建。" "--multi-account was NOT passed ⇒ the two member-account StackSets will not be created.")"
+      echo "    $(t "后果：管理页里「一键接入」/「一键关联」整块不会出现（换成一段说明），跨账号查询报 org_mode_disabled。" "Consequence: the Admin page will not show the one-click onboarding section at all (a note replaces it), and cross-account queries return org_mode_disabled.")"
+      echo "    $(t "(「手动接入账号」那条路不受影响：客户自行部署 CFN + 回填 Outputs)" "(The \"manual onboarding\" path is unaffected: the customer deploys the CFN themselves and you backfill the Outputs.)")"
+      if [ -t 0 ]; then
+        # ⚠️ `|| true`：`set -e` 下 read 读到 EOF 返回非 0 会让整个脚本退出。
+        read -p "    $(t "现在就启用多账号模式(等同 --multi-account)？[y/N]: " "Enable multi-account mode now (same as --multi-account)? [y/N]: ")" _want_multi || true
+        case "${_want_multi:-}" in
+          [yY]*)
+            MULTI_ACCOUNT_MODE=true
+            echo "    $(t "✓ 已启用多账号模式 —— 会建两个 StackSet 并向 OU 下发成员账号资源。" "✓ Multi-account mode enabled — the two StackSets will be created and rolled out to the OU.")"
+            ;;
+          *)
+            echo "    $(t "ℹ 继续单账号部署。以后要一键接入：重跑 ./setup.sh --multi-account" "ℹ Continuing single-account. To enable one-click onboarding later, re-run: ./setup.sh --multi-account")"
+            ;;
+        esac
+      else
+        echo "    $(t "(非交互环境，按单账号继续) 要一键接入：./setup.sh --multi-account" "(Non-interactive; continuing single-account.) For one-click onboarding: ./setup.sh --multi-account")"
+      fi
       echo ""
     fi
   fi

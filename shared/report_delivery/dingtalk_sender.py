@@ -42,6 +42,7 @@ feishu_sender / slack_sender — the dispatcher does positional +
 keyword calls both ways.
 """
 from __future__ import annotations
+from core import i18n
 from shared.net import safe_urlopen
 
 import base64
@@ -50,6 +51,7 @@ import hmac
 import json
 import logging
 import os
+import re as _re
 import time
 import urllib.error
 import urllib.parse
@@ -186,21 +188,55 @@ def reply_text(parent_message_id: str, text: str) -> None:
         parent_message_id[:24], (text or "")[:80])
 
 
+#: 正文字符上界。钉钉自定义机器人对 markdown `text` 的实测上限在 20000
+#: **字节**量级；中文一字 3 字节，4000 字符 ≈ 12000 字节，留足余量。
+#: 报告链路上游（`report_handler._CARD_MAX_CHARS`）已经按 3000 字符裁过，
+#: 所以这条只在别的调用方（或上游哪天放宽）时才生效 —— 但它必须存在：
+#: 钉钉此前**一道闸门都没有**，超限的表现是整条消息发不出去。
+_MD_MAX_CHARS = 4000
+
+
+def _escape_md(s: str) -> str:
+    """中和 `title` 里会改变 markdown 结构的字符。
+
+    `title` 是**用户手打的原文**：行首一个 `#` 会把整行变成标题，一个 `|`
+    在钉钉里会被当成表格分隔符。用户不会知道自己"打坏了卡片"。
+    """
+    return (s or "").replace("|", "\\|").replace("#", "＃")
+
+
+def _bold(s: str) -> str:
+    """把 i18n 文案里的 `*x*` 提成 `**x**`。
+
+    i18n 文案里的强调统一写成单星（Slack mrkdwn 的语法），而钉钉 markdown
+    跟标准 GFM 一样把单星读成**斜体**。不转的话「🎯 调查目标」在钉钉上
+    是歪的 —— 不会报错，只是看着不对。
+    """
+    return _re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"**\1**", s or "")
+
+
 def send_report(chat_id: str, root_message_id: str, status: str,
                 priority: str, detail_type: str, task_id: str,
                 summary_md: str, html_url: str, trace_url: str,
-                console_url: str | None = None,
                 next_steps: list[dict] | None = None,
-                locale: str = "zh", **_kwargs) -> None:
-    """Render a markdown summary into the DingTalk group via the
-    custom-bot webhook.
+                locale: str = "zh", title: str = "",
+                report_truncated: bool = False, **_kwargs) -> None:
+    """Render the investigation result into the DingTalk group via the
+    custom-bot webhook — one markdown message.
 
-    Phase 2a: markdown only (no ActionCard buttons). next_steps
-    are inlined as `[label](dispatch://...)`-style links — they
-    aren't real buttons but they're visible and clickable enough
-    for the report-summary use case. Real ActionCard buttons +
-    interactive next-step dispatch ship in Phase 2c alongside the
-    cardTemplateId registration.
+    markdown only (no ActionCard buttons): next_steps and the report /
+    trace links are inlined as markdown links. They aren't real buttons
+    but they're visible and clickable, and the ordering matches
+    feishu/slack so the three platforms read the same.
+
+    ⚠️ **没有 `console_url` 参数**（控制台深链不上报告卡）——理由见下面
+    `link_lines` 处的注释。`**_kwargs` 会把它悄悄吃掉，所以这条**只能**
+    靠注释和测试守住：补回它不会报错，只会让说明重新自相矛盾。
+
+    `title` (D1) is the user's own question — rendered first, because
+    without it the reader can't tell which investigation this report is.
+    `report_truncated` (D4) says the body is a cut-down slice; the notice
+    is rendered here per-locale, never spliced into `summary_md`.
 
     `chat_id` is accepted for parity with feishu/slack but not
     used: the custom-bot webhook is bound to ONE specific group
@@ -208,19 +244,43 @@ def send_report(chat_id: str, root_message_id: str, status: str,
     needs to fan out to multiple groups, they configure multiple
     sender stacks each with its own webhook URL.
     """
-    title = f"[{status}] {detail_type or 'NotiOps'} — {task_id[:8]}"
-    body_parts: list[str] = [f"### {title}"]
+    # ⚠️ 这个局部变量原来也叫 `title`，跟新加的 `title` 入参**同名**。
+    # 改名而不是复用：卡片顶部的 h3 是给钉钉列表页看的短标签（带 status /
+    # task_id），跟用户问的那句话是两回事，混在一起两边都表达不清。
+    heading = f"[{status}] {detail_type or 'NotiOps'} — {task_id[:8]}"
+    body_parts: list[str] = [f"### {heading}"]
+    if title:
+        # 展示上界 140：存储上界是 200（`report_handler._TITLE_MAX_CHARS`）。
+        shown = title if len(title) <= 140 else title[:139] + "…"
+        body_parts.append(_bold(i18n.t("report.header.subject", locale,
+                                       title=_escape_md(shown))))
     if priority:
         body_parts.append(f"**Priority:** {priority}")
-    if summary_md:
-        body_parts.append(summary_md)
+
+    body = (summary_md or "").strip()
+    truncated = report_truncated
+    if len(body) > _MD_MAX_CHARS:
+        body = body[:_MD_MAX_CHARS]
+        truncated = True
+    if body:
+        body_parts.append(body)
+        if truncated:
+            body_parts.append(_bold(i18n.t("report.summary_truncated", locale)))
+    else:
+        # 「没取到正文」≠「正文被截断」。以前这里两种情况都渲染成
+        # `(empty report)`，读者无从判断该不该点完整报告链接（D4）。
+        body_parts.append(_bold(i18n.t("report.no_body", locale)))
+
     link_lines: list[str] = []
     if html_url:
-        link_lines.append(f"[📄 Full report]({html_url})")
+        link_lines.append(f"[{i18n.t('report.see_full', locale)}]({html_url})")
     if trace_url:
-        link_lines.append(f"[🔬 Trace]({trace_url})")
-    if console_url:
-        link_lines.append(f"[🌐 Console]({console_url})")
+        link_lines.append(f"[{i18n.t('report.see_trace', locale)}]({trace_url})")
+    # ⚠️ 这里**没有**「🔬 查看本次调查」（DevOps Agent 控制台深链）：上面
+    # 两条都是预签名链接、7 天内免登录，而控制台深链必须登录 AWS 控制台。
+    # 混在同一行 `·` 分隔的链接里，底下那句说明就只能同时写「无需登录」和
+    # 「需要登录」——2026-09-05 现网就是这么自相矛盾的。少一个入口换一句
+    # 不骗人的说明；进度卡上那颗保留（那里深链是唯一的链接）。
     if link_lines:
         body_parts.append(" · ".join(link_lines))
     if next_steps:
@@ -233,13 +293,18 @@ def send_report(chat_id: str, root_message_id: str, status: str,
             elif label:
                 nl.append(f"- {label}")
         if nl:
-            body_parts.append("**Next steps:**\n" + "\n".join(nl))
+            body_parts.append(_bold(i18n.t("report.next_steps_header", locale))
+                              + "\n" + "\n".join(nl))
 
-    text_md = "\n\n".join(body_parts).strip() or "(empty report)"
+    # 一句话，而且无条件为真：这条消息里剩下的每个链接都是预签名的。
+    # ⚠️ 别再加 `progress.link_login_warning`（它是给控制台深链的）。
+    body_parts.append(_bold(i18n.t("report.link_validity", locale)))
+
+    text_md = "\n\n".join(body_parts).strip()
 
     _post_webhook({
         "msgtype": "markdown",
-        "markdown": {"title": title, "text": text_md},
+        "markdown": {"title": heading, "text": text_md},
         "at": {"isAtAll": False},
     })
 

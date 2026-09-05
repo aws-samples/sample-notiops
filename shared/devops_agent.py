@@ -98,6 +98,36 @@ def _query_account_mapping_raw(account_id: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+_own_account_id_cache: str | None = None
+
+
+def _own_account_id() -> str:
+    """本 Lambda 自己所在的账号 ID（模块级缓存，一次冷启动只问 STS 一次）。
+
+    只服务一个判据：「目标账号是不是我自己」——见 `_get_cross_account_client`
+    里没有 `trigger_role_arn` 的那条分支。
+
+    查不到返回 `""`（⇒ 判据不成立 ⇒ 走显式报错），**不**回落成
+    「当作同账号，用本地凭证试试」：那样一次 STS 抖动就能把
+    「跨账号取不到」变成「静默拿部署账号的凭证去打别人的账号」。
+    """
+    global _own_account_id_cache
+    if _own_account_id_cache is not None:
+        return _own_account_id_cache
+    region = os.environ.get("AWS_REGION", "ap-northeast-1")
+    try:
+        _own_account_id_cache = boto3.client(
+            "sts", region_name=region
+        ).get_caller_identity()["Account"]
+    except Exception as e:  # noqa: BLE001
+        # 只记异常类型：这条路上没有敏感值，但保持全仓「不打原始 payload」的习惯
+        logger.warning(
+            "STS GetCallerIdentity 失败，无法确认自身账号: %s", type(e).__name__
+        )
+        _own_account_id_cache = ""
+    return _own_account_id_cache
+
+
 def _infer_component_from_source(source: str) -> str:
     """从 source 推断 component 字段（用于 RoleSessionName 审计）。
 
@@ -218,15 +248,55 @@ def _get_cross_account_client(
 
     Requirements: R4.3
     """
+    trigger_role_arn = (mapping.get("trigger_role_arn") or "").strip()
+    region = (mapping.get("region") or "").strip() or os.environ.get(
+        "AWS_REGION", "ap-northeast-1"
+    )
+
+    # 🔴 **这两个字段都不许裸下标**（2026-09-05 实测踩中，方式A 独有的坏法）。
+    #
+    #    一键部署（方式A）的 stager 写 `da#<acct>` 行时**不写 trigger_role_arn**
+    #    （`infra/lambda/stager/index.py`）—— 方式A 把 DevOps Agent 装在部署账号
+    #    自己身上，压根没有跨账号这件事，所以没建 Trigger Role。方式B 的 CDK 才
+    #    建 `DevOpsAgentTriggerRole` 并回写 ARN（`notiops-backend-stack.ts`）。
+    #
+    #    裸 `mapping["trigger_role_arn"]` ⇒ `KeyError` ⇒ 被
+    #    `list_journal_records_cross_account` 那个 best-effort 的 except 吞掉
+    #    ⇒ `records=[]` ⇒ 报告面板的「调查 Trace」页**恒显示 "No records found."**。
+    #    而报告正文那一侧因为另有一条本账号 client 的兜底，看着是好的 ⇒
+    #    正是本模块反复警告的「正文取到了、trace 是空的」半通状态，
+    #    并且**只有方式A 坏、方式B 正常**（部署路径不对等，铁律见
+    #    notiops-web-feature-parity-both-paths）。
+    #
+    # ⇒ 目标账号就是本 Lambda 所在账号时，用执行角色直连（同账号本来就不需要
+    #    AssumeRole）；是**别的**账号却没有 Role，则显式抛错让上层记 ERROR，
+    #    绝不拿本地凭证去打别人的账号 —— 那只会把一个能读懂的配置缺失换成一个
+    #    难查的 AccessDenied。
+    if not trigger_role_arn:
+        own = _own_account_id()
+        if own and own == str(target_account_id):
+            logger.info(
+                "账号 %s 未配置 trigger_role_arn，且它就是本 Lambda 所在账号，"
+                "用执行角色直连 devops-agent（同账号无需 AssumeRole；"
+                "一键部署形态的正常路径）",
+                target_account_id,
+            )
+            return boto3.client("devops-agent", region_name=region)
+        raise CrossAccountAssumeRoleError(
+            f"账号 {target_account_id} 的 DevOps Agent 配置缺少 trigger_role_arn，"
+            f"且它不是本 Lambda 所在账号(self={own or '未知'})，无法访问。"
+            f"请在管理页重新接入该账号（接入会创建 Trigger Role 并回写 ARN）"
+        )
+
     creds = _get_cross_account_credentials(
         target_account_id=target_account_id,
-        trigger_role_arn=mapping["trigger_role_arn"],
+        trigger_role_arn=trigger_role_arn,
         component=component,
         source=source,
     )
     return boto3.client(
         "devops-agent",
-        region_name=mapping["region"],
+        region_name=region,
         aws_access_key_id=creds["AccessKeyId"],
         aws_secret_access_key=creds["SecretAccessKey"],
         aws_session_token=creds["SessionToken"],
@@ -799,6 +869,7 @@ def list_journal_records_cross_account(
     record_type: str | None = None,
     account_already_authorized: bool = False,
     agent_space_id: str = "",
+    errors: list[str] | None = None,
 ) -> list[dict]:
     """跨账户分页拉取一次 execution 的全部 journal records（供 trace.html 生成）。
 
@@ -821,18 +892,30 @@ def list_journal_records_cross_account(
             为真时跳过 `LOCKED_ACCOUNT_ID` 闸门。语义与理由见
             `build_cross_account_devops_client`（两处必须一起传，否则会出现
             「报告正文取到了、trace 是空的」这种半通状态）。
+        errors: 可选的**出参**列表。本函数把每一次「拉取失败」的原因 append 进去，
+            让调用方能把「真的一条记录都没有」和「我们没取到」**区分开**。
+            不传则行为一字不变（全部失败仍然只返回 []）。
+
+            ⚠️ 为什么用出参而不是改返回值：`[]` 这个返回形状被 4 个测试文件和
+            报告管道依赖；而「空 trace 页面骗人说 No records found」是个真实
+            事故（2026-09-05 用户报障），必须让渲染层拿到失败原因。
 
     Returns:
-        records 列表；失败返回 []
+        records 列表；失败返回 []（失败原因见 `errors` 出参）
 
     Requirements: R3.1, R3.3
     """
+    def _fail(reason: str) -> list[dict]:
+        if errors is not None:
+            errors.append(reason)
+        return []
+
     if not execution_id or not target_account_id:
         logger.warning(
             "list_journal_records_cross_account 缺少参数: execution_id=%s target_account=%s",
             execution_id, target_account_id,
         )
-        return []
+        return _fail("缺少 execution_id 或 target_account_id")
 
     # 🔴 与 `build_cross_account_devops_client` **同一个判据形状**：必须授权。
     #    上一版是「没授权时回落到闸门」，而 orgMode 下闸门恒放行 ⇒ 判据 no-op。
@@ -845,7 +928,7 @@ def list_journal_records_cross_account(
             "best-effort 吞掉的，那种半通完全静默",
             target_account_id,
         )
-        return []
+        return _fail(f"账号 {target_account_id} 未被调用方授权（active+enabled）")
 
     mapping = _query_account_mapping_raw(target_account_id)
     if mapping is None:
@@ -853,7 +936,7 @@ def list_journal_records_cross_account(
             "账户未配置 DevOps Agent，无法列举 trace records: target_account=%s",
             target_account_id,
         )
-        return []
+        return _fail(f"账号 {target_account_id} 没有 DevOps Agent 配置")
 
     # 🔴 **调用方传进来的 space 优先。** `mapping` 里那个是**排障** space
     #    （`da#<acct>.agent_space_id`），而巡检的 execution 活在**巡检** space
@@ -879,7 +962,7 @@ def list_journal_records_cross_account(
         logger.warning(
             "账户配置缺少 agent_space_id: target_account=%s", target_account_id,
         )
-        return []
+        return _fail(f"账号 {target_account_id} 的配置缺少 agent_space_id")
 
     try:
         client = _get_cross_account_client(
@@ -893,10 +976,15 @@ def list_journal_records_cross_account(
             "列举 trace records 失败：跨账户 AssumeRole 失败 target_account=%s error=%s",
             target_account_id, e,
         )
-        return []
+        return _fail(f"跨账号访问失败: {e}")
     except Exception as e:
-        logger.error("创建 devops-agent client 失败: %s", e)
-        return []
+        # ⚠️ 这里以前把**任何**异常（含 `mapping["trigger_role_arn"]` 的 KeyError）
+        #    吞成 []，于是一个纯配置缺失表现为「trace 页永远 No records found」。
+        #    现在类型名进日志、原因进 `errors` 出参 —— 别再改回裸吞。
+        logger.error(
+            "创建 devops-agent client 失败: %s: %s", type(e).__name__, e
+        )
+        return _fail(f"创建 devops-agent client 失败: {type(e).__name__}: {e}")
 
     records: list[dict] = []
     params: dict = {
@@ -932,6 +1020,11 @@ def list_journal_records_cross_account(
             "列举 trace records 异常（返回已拉取的 %d 条）: execution_id=%s error=%s",
             len(records), execution_id, e,
         )
+        if errors is not None:
+            errors.append(
+                f"ListJournalRecords 中断（已拉到 {len(records)} 条）: "
+                f"{type(e).__name__}: {e}"
+            )
     return records
 
 

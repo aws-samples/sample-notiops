@@ -676,7 +676,10 @@ Expected:
 1. Within seconds, a **🚀 Start Investigation** edit card appears (three input fields + 💡 LLM dimension hint)
 2. Click **🚀 Dispatch Investigation** → the card updates to **✅ Dispatched, ⏳ Investigation starting**
 3. A few seconds later, an **🔭 Investigation Started** card + progress updates
-4. After 1–3 minutes, a **📝 Report Summary** + **✅ Report** header card lands in the original channel
+4. After 1–3 minutes, **one** **✅ NotiOps Report** card lands in the original channel (its first line is
+   "🎯 Investigation target · <your question>", with three buttons underneath: 📊 View full report /
+   🔍 Investigation trace / 🆘 Escalate to AWS Support — the report card should carry **no**
+   "🔬 Open this investigation"; that one belongs to the progress card)
 
 Then try a plain question that is **not** an investigation (it goes to the DevOps chat path, e.g.
 `@NotiOps list every S3 bucket with its size`):

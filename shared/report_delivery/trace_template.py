@@ -16,12 +16,38 @@ import re
 from datetime import datetime, timezone
 
 
+_TITLE_MAX_CHARS = 140
+"""标题显示上限。理由同 `html_template._TITLE_MAX_CHARS`（两页要一致）。"""
+
+
 def generate_trace_html(
     records, status, priority, detail_type,
     task_id, execution_id, agent_space_id,
-    created_at, updated_at,
+    created_at, updated_at, title="", timeline_md="", fetch_errors=None,
 ):
-    """Generate an HTML page showing the full investigation process."""
+    """Generate an HTML page showing the full investigation process.
+
+    `title`：本次调查的标题 / 问题描述。理由与转义要求见
+    `html_template.generate_html_report`（同一段用户原文，同样不许进日志）。
+
+    `timeline_md`：DevOps Agent 自己那张「Investigation timeline」卡片摊平成的
+    markdown（`core.da_ui_tree.timeline_md`）。
+
+    🔴 为什么要它（2026-09-05，用户报障 D2 的后半）：本页原来只渲染**原始
+    journal 记录**（tool_use / tool_result / thinking 一条一条铺开）。那是给
+    我们排障用的视图，不是用户在后台看到的那条「调查时间线」。用户明确要的是
+    后台那条 —— 所以现在两段都有：上面是 DA 整理过的时间线，下面是原始记录。
+
+    `fetch_errors`：拉记录时**失败的原因**（`shared.devops_agent
+    .list_journal_records_cross_account` 的 `errors` 出参）。
+
+    🔴 为什么必须区分（同一个报障）：原来记录为空时页面只写一句
+    "No records found."，而实测那句话有两个完全不同的成因 ——
+    「这次调查确实没有记录」和「跨账号取记录失败了（方式A 的
+    `trigger_role_arn` 缺字段 → KeyError 被吞 → 恒返回 `[]`）」。
+    两者的下一步天差地别，而页面把它们显示成同一句话，
+    于是一个**配置缺陷**在现网被当成「调查没留痕」看了很久。
+    """
     status_color = {
         "COMPLETED": "#10b981", "FAILED": "#ef4444",
         "TIMED_OUT": "#f59e0b", "CANCELLED": "#6b7280",
@@ -35,15 +61,47 @@ def generate_trace_html(
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     # Build timeline entries from records
-    timeline_html = _build_timeline(records)
-    entry_count = len(records)
+    timeline_html = _build_timeline(records, fetch_errors=fetch_errors)
+    entry_count = len(records or ())
+
+    # DA 自己那张时间线卡（curated view）。为空就整段不渲染 —— 留一个空标题
+    # 会让人以为「DA 什么都没记」，而实际是这次调查没产出那张卡。
+    da_timeline_html = _md_lite(timeline_md)
+    da_block = (
+        f'    <h2>{_esc(_DA_TIMELINE_HEADING)}</h2>\n'
+        f'    <div class="da-timeline">{da_timeline_html}</div>\n'
+        if da_timeline_html else ""
+    )
+    raw_heading = (_RAW_RECORDS_HEADING if da_block else _TIMELINE_HEADING)
+
+    # 🔴 头部元数据一律 HTML-escape 后再插进 f-string。
+    #    这些值来自 DevOps Agent 的 callback event（外部输入），而本模板此前
+    #    是**裸插**的 —— 与 html_template.py:43-52 那段注释所修的正是同一类
+    #    问题，只是当时漏了这一份。
+    status = _esc(status)
+    priority = _esc(priority)
+    detail_type = _esc(detail_type)
+    task_id_short = _esc(str(task_id)[:12])
+    task_id = _esc(task_id)
+    execution_id = _esc(execution_id)
+    agent_space_id = _esc(agent_space_id)
+    created_at = _esc(created_at)
+    updated_at = _esc(updated_at)
+
+    raw_title = " ".join(str(title or "").split())
+    if len(raw_title) > _TITLE_MAX_CHARS:
+        raw_title = raw_title[:_TITLE_MAX_CHARS - 1] + "…"
+    title_esc = _esc(raw_title)
+    doc_title = f"🔍 {raw_title}" if raw_title else f"🔍 Investigation Trace — {task_id_short}"
+    doc_title = _esc(doc_title)
+    title_block = f'\n    <div class="ttl">{title_esc}</div>' if title_esc else ""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔍 Investigation Trace — {task_id[:12]}</title>
+<title>{doc_title}</title>
 <style>
 :root {{
   --c-dark:#232f3e; --c-blue:#37475a; --c-orange:#ff9900;
@@ -62,6 +120,9 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-
 .header::before{{content:'';position:absolute;top:-50%;right:-20%;width:500px;height:500px;
   background:radial-gradient(circle,rgba(66,153,225,.15),transparent 70%);border-radius:50%}}
 .header h1{{font-size:24px;font-weight:700;position:relative}}
+.header .ttl{{font-size:15px;font-weight:500;margin-top:10px;position:relative;
+  opacity:.95;line-height:1.5;word-break:break-word;
+  padding-left:12px;border-left:3px solid #4299e1}}
 .header .sub{{opacity:.7;font-size:13px;margin-top:4px;position:relative}}
 .header .bar{{width:60px;height:4px;background:#4299e1;border-radius:2px;margin-top:14px;position:relative}}
 
@@ -83,6 +144,23 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-
 .timeline{{background:var(--bg1);padding:32px 48px;border-radius:0 0 var(--r-lg) var(--r-lg)}}
 .timeline h2{{color:var(--c-dark);font-size:18px;margin-bottom:20px;
   padding-bottom:8px;border-bottom:2px solid #4299e1}}
+.timeline h2+h2,.da-timeline+h2{{margin-top:36px}}
+
+.da-timeline{{font-size:14px;color:var(--t2);margin-bottom:8px}}
+.da-timeline h3{{color:var(--c-blue);font-size:15px;font-weight:600;margin:18px 0 8px;
+  padding-left:10px;border-left:3px solid var(--c-orange)}}
+.da-timeline p{{margin:8px 0}}
+.da-timeline li{{margin:4px 0 4px 20px}}
+.da-timeline code{{background:#f1f5f9;color:#be185d;padding:1px 6px;border-radius:3px;
+  font-size:12.5px;font-family:'SF Mono','Fira Code','Consolas',monospace}}
+.da-timeline strong{{color:var(--t1)}}
+
+.empty{{padding:16px 18px;background:#fffbeb;border-left:4px solid var(--c-orange);
+  border-radius:var(--r-sm);font-size:13px;color:var(--t2)}}
+.empty ul{{margin:8px 0 0 20px}}
+.empty li{{margin:3px 0}}
+.empty code{{font-family:'SF Mono','Fira Code',monospace;font-size:12px;
+  background:#fff;padding:1px 5px;border-radius:3px}}
 
 .entry{{position:relative;padding:16px 0 16px 32px;border-left:2px solid var(--bdr)}}
 .entry:last-child{{border-left-color:transparent}}
@@ -133,7 +211,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-
 <body>
 <div class="page">
   <div class="header">
-    <h1>🔍 Investigation Trace — Analysis Process</h1>
+    <h1>🔍 Investigation Trace — Analysis Process</h1>{title_block}
     <div class="sub">{detail_type} &middot; {generated_at}</div>
     <div class="bar"></div>
   </div>
@@ -152,7 +230,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-
     <span>Total steps: <strong>{entry_count}</strong></span>
   </div>
   <div class="timeline">
-    <h2>Investigation Timeline</h2>
+{da_block}    <h2>{raw_heading}</h2>
 {timeline_html}
   </div>
   <div class="footer">
@@ -172,10 +250,24 @@ document.querySelectorAll('.toggle-btn').forEach(btn => {{
 </html>"""
 
 
-def _build_timeline(records):
-    """Convert journal records into timeline HTML entries."""
+_DA_TIMELINE_HEADING = "Investigation Timeline"
+"""DA 那张整理过的时间线卡的小标题（与后台面板同名，便于对照）。"""
+
+_RAW_RECORDS_HEADING = "Raw Journal Records"
+"""原始记录段的小标题 —— 只在上面那段**也在**时用，避免两个 Timeline 打头。"""
+
+_TIMELINE_HEADING = "Investigation Timeline"
+"""只有原始记录时沿用原标题（保持既有页面观感不变）。"""
+
+
+def _build_timeline(records, fetch_errors=None):
+    """Convert journal records into timeline HTML entries.
+
+    `fetch_errors`：取记录失败的原因列表。空/None = 取成功。
+    见 `generate_trace_html` 里为什么必须把「取失败」和「确实没有」分开。
+    """
     entries = []
-    for i, r in enumerate(records):
+    for i, r in enumerate(records or ()):
         record_type = r.get("recordType", "unknown")
         record_id = r.get("recordId", "")
         created = r.get("createdAt", "")
@@ -204,7 +296,93 @@ def _build_timeline(records):
       </div>
     </div>""")
 
-    return "\n".join(entries) if entries else "<p>No records found.</p>"
+    if entries:
+        return "\n".join(entries)
+
+    # ── 空态。**两个完全不同的成因，必须显示成两句不同的话。** ──────────────
+    #    以前这里恒是 "No records found."，于是一个跨账号取数**失败**在现网
+    #    被当成「这次调查没留痕」看了很久（用户 2026-09-05 报障 D2）。
+    if fetch_errors:
+        items = "\n".join(f"      <li>{_esc(str(m))}</li>"
+                          for m in list(fetch_errors)[:5])
+        return (
+            '    <div class="empty">\n'
+            "      <b>无法读取调查记录</b>（不是「本次调查没有记录」）。"
+            "报告正文不受影响，只有这一页取不到数据。原因：\n"
+            f"      <ul>\n{items}\n      </ul>\n"
+            "      如果原因里提到 <code>trigger_role_arn</code>，"
+            "请到管理页重新接入该账号（接入会创建 Trigger Role 并回写 ARN）。\n"
+            "    </div>"
+        )
+    return (
+        '    <div class="empty">\n'
+        "      本次调查没有留下逐步记录（DevOps Agent 未产出 journal 记录）。"
+        "调查结论请看「查看调查报告」那一页。\n"
+        "    </div>"
+    )
+
+
+# 只处理 `core.da_ui_tree` 会产出的那几种记号 —— 它不是通用 markdown 渲染器。
+_MD_H3_RE = re.compile(r"^(#{3,6})\s+(.*)$")
+_MD_LI_RE = re.compile(r"^[-*]\s+(.*)$")
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_MD_CODE_RE = re.compile(r"`([^`]+)`")
+
+
+def _md_lite(md: str) -> str:
+    """把 `core.da_ui_tree` 产出的**受限** markdown 渲染成 HTML 片段。
+
+    支持：`### ~ ###### 标题` / `- 列表项` / `**粗体**` / `` `行内代码` `` /
+    其余按段落。产出为空（入参空/全空白）时返回空串，由调用方决定整段不渲染。
+
+    🔴 **先 escape 再套记号**：`_esc` 走在最前面，所以之后的正则只可能在
+    已转义的文本上加我们自己生成的标签 —— 内容里的 `<script>` 早已成为
+    `&lt;script&gt;`，没有注入面。顺序颠倒就是一个 XSS。
+
+    ⚠️ 故意**不**支持表格 / 链接 / 代码块。这一段的来源是 DA 的组件树
+    （`markdown` / `badge` / `list-item` 叶子），实测只有上面那几种记号；
+    多写的分支既没有输入能覆盖，也就没有测试能守住。要渲染任意 markdown
+    请走 `html_template` 那份客户端渲染器。
+    """
+    text = (md or "").strip()
+    if not text:
+        return ""
+    out: list[str] = []
+    in_list = False
+
+    def _inline(s: str) -> str:
+        s = _esc(s)
+        s = _MD_BOLD_RE.sub(r"<strong>\1</strong>", s)
+        s = _MD_CODE_RE.sub(r"<code>\1</code>", s)
+        return s
+
+    def _close_list() -> None:
+        nonlocal in_list
+        if in_list:
+            out.append("</ul>")
+            in_list = False
+
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            _close_list()
+            continue
+        m = _MD_H3_RE.match(stripped)
+        if m:
+            _close_list()
+            out.append(f"<h3>{_inline(m.group(2))}</h3>")
+            continue
+        m = _MD_LI_RE.match(stripped)
+        if m:
+            if not in_list:
+                out.append("<ul>")
+                in_list = True
+            out.append(f"<li>{_inline(m.group(1))}</li>")
+            continue
+        _close_list()
+        out.append(f"<p>{_inline(stripped)}</p>")
+    _close_list()
+    return "\n".join(out)
 
 
 def _parse_record(content, record_type):

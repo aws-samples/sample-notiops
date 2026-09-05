@@ -11,13 +11,37 @@ import json
 import re
 from datetime import datetime, timezone
 
+_TITLE_MAX_CHARS = 140
+"""报告页标题的显示上限（字符数）。
+
+用户在 IM 里问的那句话可能很长（实测有贴一整段报错的）。整段塞进 `<h1>` 会
+把页头撑成一屏，也塞不进 `<title>`。超出部分以 `…` 收尾 —— 正文里有完整问题，
+这里只需要「一眼认出是哪次调查」。
+"""
+
 
 def generate_html_report(
     summary_md, status, priority, detail_type,
     task_id, execution_id, agent_space_id,
-    created_at, updated_at,
+    created_at, updated_at, title="",
 ):
-    """Generate a polished, self-contained HTML report from Markdown content."""
+    """Generate a polished, self-contained HTML report from Markdown content.
+
+    `title`：本次调查的**标题 / 问题描述**（通常就是用户在 IM 里问的那句话）。
+
+    🔴 为什么加这个参数（2026-09-05，用户报障 D1）：在此之前整页只有
+    「NotiOps Report」+ task_id/execution_id 两串 uuid。用户跑了几次调查之后
+    收到几个链接，点开谁也认不出哪个报告对应哪次提问 —— 报告本身写得再好，
+    找不到就等于没有。
+
+    ⚠️ 空串是**合法**入参（`task#` 行 TTL 24h 过期、或调查不是从聊天发起的），
+    此时页面退回原来的通用标题，**不要**编一个占位标题假装有。
+
+    ⚠️ 这段文字是用户原文（不可信输入 + 隐私内容）：
+      · 必须 HTML-escape 后再插进 f-string（下面统一做）；
+      · **SHALL NOT 进任何日志、SHALL NOT 进 S3 key** —— key 会进 CloudTrail
+        data event 并长期留存。
+    """
     status_color = {
         "COMPLETED": "#10b981", "FAILED": "#ef4444",
         "TIMED_OUT": "#f59e0b", "CANCELLED": "#6b7280",
@@ -51,6 +75,16 @@ def generate_html_report(
     created_at = html.escape(str(created_at), quote=True)
     updated_at = html.escape(str(updated_at), quote=True)
 
+    # 标题：先按显示长度截断**再** escape（反过来会把 `&amp;` 切成 `&am`）。
+    raw_title = " ".join(str(title or "").split())      # 折叠换行/多空格
+    if len(raw_title) > _TITLE_MAX_CHARS:
+        raw_title = raw_title[:_TITLE_MAX_CHARS - 1] + "…"
+    title_esc = html.escape(raw_title, quote=True)
+    # <title> 里也带上，浏览器标签页/收藏夹/IM 链接预览都直接可读。
+    doc_title = f"{status_emoji} {raw_title}" if raw_title else f"{status_emoji} NotiOps Report"
+    doc_title = html.escape(doc_title, quote=True)
+    title_block = f'\n    <div class="ttl">{title_esc}</div>' if title_esc else ""
+
     # Escape markdown for safe embedding in JS template literal
     md_escaped = (summary_md
         .replace("\\", "\\\\")
@@ -63,7 +97,7 @@ def generate_html_report(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{status_emoji} NotiOps Report</title>
+<title>{doc_title}</title>
 <style>
 :root {{
   --c-dark:#232f3e; --c-blue:#37475a; --c-orange:#ff9900; --c-orange-l:#ffb84d;
@@ -83,6 +117,9 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-
 .header::before{{content:'';position:absolute;top:-50%;right:-20%;width:500px;height:500px;
   background:radial-gradient(circle,rgba(255,153,0,.15),transparent 70%);border-radius:50%}}
 .header h1{{font-size:26px;font-weight:700;position:relative}}
+.header .ttl{{font-size:16px;font-weight:500;margin-top:10px;position:relative;
+  opacity:.95;line-height:1.5;word-break:break-word;
+  padding-left:12px;border-left:3px solid var(--c-orange)}}
 .header .sub{{opacity:.7;font-size:14px;margin-top:4px;position:relative}}
 .header .bar{{width:60px;height:4px;background:var(--c-orange);border-radius:2px;margin-top:16px;position:relative}}
 
@@ -155,7 +192,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-
 <body>
 <div class="page">
   <div class="header">
-    <h1>{status_emoji} NotiOps Report</h1>
+    <h1>{status_emoji} NotiOps Report</h1>{title_block}
     <div class="sub">{detail_type} &middot; {generated_at}</div>
     <div class="bar"></div>
   </div>

@@ -46,6 +46,11 @@ finding 持续消耗，而看板上那条 finding 永远是空的。
 `TaskStatus`（11 档）。⚠️ `CANCELED` 是**一个 L**。
 拼错的表现是它落不进 `TERMINAL` → 每轮都去 probe 一条永远不会变的任务。
 `test_inspection_dispatch_recon.py` 有元断言直接读那份模型比对。
+
+⚠️ 那条元断言比的是**覆盖**（模型 ⊆ 本枚举）而不是相等，因为 `requirements.txt`
+给 boto3 的是下限而不是钉死的版本：botocore 1.43.73 的模型只有 10 档，1.43.88 才
+加上 `WAITING`。本枚举**允许先于**本机装的服务模型知道新的一档（多出来的那档必须
+登记进测试里的 `AHEAD_OF_MODEL`），但**不允许**少于它。
 """
 
 from __future__ import annotations

@@ -231,12 +231,14 @@ def check_out_param_black_holes() -> list[str]:
             # ② 作为关键字实参传出去的
             passed: dict[str, str] = {}
             arg_nodes: set[int] = set()
+            pass_calls: dict[str, set[int]] = {}
             for node in ast.walk(fn):
                 if not isinstance(node, ast.Call):
                     continue
                 for kw in node.keywords:
                     if isinstance(kw.value, ast.Name) and kw.value.id in created:
-                        passed[kw.value.id] = kw.arg or "?"
+                        passed.setdefault(kw.value.id, kw.arg or "?")
+                        pass_calls.setdefault(kw.value.id, set()).add(id(node))
                         # ⚠️ **只**排除关键字转发这一处。第一版把所有位置实参
                         #    也排除了，于是 `sorted(skipped)` 这种**真读点**被
                         #    当成转发 —— 正确的写法（收集完 sorted 落库）
@@ -249,6 +251,15 @@ def check_out_param_black_holes() -> list[str]:
                         arg_nodes.add(id(kw.value))
             # ③ 除了传参之外还有没有读点
             for name, kwname in sorted(passed.items()):
+                # 🔴 2026-09-05 补的判据：传给了**两个以上不同的调用**就不算黑洞。
+                #    一个是收集点（`list_journal_records_cross_account(errors=X)`
+                #    往里 append），另一个就是消费点（`generate_trace_html(
+                #    fetch_errors=X)` 把它渲染出来）—— 那正是"接线接好了"的形状。
+                #    没有这条时 `report_handler` 里那个 `fetch_errors`（D2 修复的
+                #    一部分）被报成缺口，而它恰恰是**修好之后**的样子。这是
+                #    docstring 里点名最怕的假阳性：让人去"修"一段本来对的代码。
+                if len(pass_calls.get(name, ())) > 1:
+                    continue
                 reads = 0
                 for node in ast.walk(fn):
                     if (isinstance(node, ast.Name) and node.id == name

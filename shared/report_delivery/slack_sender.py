@@ -282,18 +282,30 @@ _STATUS_EMOJI = {"COMPLETED": "✅", "FAILED": "❌",
                  "TIMED_OUT": "⏰", "CANCELLED": "🚫"}
 
 
+#: Slack rejects a message with more than 50 blocks (`invalid_blocks`) —
+#: and it rejects the WHOLE message, so overflowing means "that channel got
+#: nothing", with no partial output to hint at why. 48 leaves headroom.
+_MAX_BLOCKS = 48
+
+
 def _summary_blocks(summary_md: str, locale: str, *,
-                    header_text: str = "") -> list[dict]:
+                    header_text: str = "",
+                    with_header: bool = True,
+                    max_blocks: int = _MAX_BLOCKS) -> list[dict]:
     """GFM markdown → Slack blocks, with both hard caps applied.
 
     Extracted from `send_report` so the inspection broadcast layer
     (`send_markdown`) renders through the exact same path — two copies of
-    the 8000-char / 48-block caps would drift, and the drift only shows up
-    on a long report as `invalid_blocks` (Slack rejects the WHOLE message,
-    so the symptom is "that channel got nothing" with no partial output).
+    the 8000-char / block caps would drift, and the drift only shows up
+    on a long report as `invalid_blocks`.
+
+    `with_header=False` drops the leading `header` block (`to_blocks`
+    always emits one): the merged report message carries its own
+    「NotiOps 报告」 header, and two stacked headers read as two reports —
+    which is exactly the confusion D5 asked us to remove.
     """
     header = header_text or i18n.t("report.summary_header", locale)
-    text = (summary_md or "(no summary)").strip()
+    text = (summary_md or "").strip() or i18n.t("report.no_body", locale)
     if len(text) > 8000:
         text = text[:8000] + "\n\n" + i18n.t("report.summary_truncated", locale)
     try:
@@ -303,9 +315,10 @@ def _summary_blocks(summary_md: str, locale: str, *,
         logger.warning("slack_mrkdwn rendering failed; falling back to plain: %s",
                        _safe_err(e))
         blocks = [_header(header), _section(text)]
-    # Slack caps per-message blocks at 50; truncate aggressively if needed.
-    if len(blocks) > 48:
-        blocks = blocks[:47] + [
+    if not with_header:
+        blocks = blocks[1:]
+    if len(blocks) > max_blocks:
+        blocks = blocks[:max_blocks - 1] + [
             _section("_" + i18n.t("report.summary_truncated", locale) + "_")]
     return blocks
 
@@ -315,40 +328,52 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
                 summary_md: str, incident_id: str = "",
                 linked_case_display_id: str = "",
                 next_steps: list[dict] | None = None,
-                locale: str = "en") -> None:
+                locale: str = "en", title: str = "",
+                report_truncated: bool = False) -> None:
+    """Post the investigation result as **one** Slack message.
+
+    Until 2026-09-05 this posted two messages — body, then a separate
+    "header card" with the buttons. Merged on user request (D5); see
+    `feishu_sender.send_report` for the same change on Feishu.
+
+    `title` (D1) is the user's own question. `report_truncated` says the
+    body is a cut-down slice, so the notice is rendered here (per-locale)
+    rather than spliced into the body.
+
+    ⚠️ **没有 `console_url` 参数**(控制台深链不上报告卡)——理由见下面
+    `action_row` 处的注释。别看见调用方手里有这个值就补回参数。
+    """
     if not is_configured():
         logger.warning("Slack not configured — skipping send_report")
         return
     emoji = _STATUS_EMOJI.get(status, "ℹ️")
 
-    # 1. Summary message — convert the agent's GFM markdown to a list of
-    # Slack blocks (real headers / table rows / code blocks) so it
-    # renders properly instead of dumping raw markdown text.
-    summary_header = i18n.t("report.summary_header", locale)
-    summary_blocks = _summary_blocks(summary_md, locale,
-                                     header_text=summary_header)
-    _post("/chat.postMessage", {
-        "channel": chat_id,
-        "thread_ts": root_message_id or None,
-        "text": summary_header,
-        "blocks": summary_blocks,
-    })
-
-    # 2. Header / actionable card.
-    body_lines = [
+    meta_lines = []
+    if title:
+        # Display cap: the storage cap is 200 (report_handler
+        # `_TITLE_MAX_CHARS`); a wrapped 200-char first line pushes the
+        # buttons off-screen on mobile.
+        shown = title if len(title) <= 140 else title[:139] + "…"
+        meta_lines.append(i18n.t("report.header.subject", locale,
+                                 title=_escape(shown)))
+    meta_lines += [
         i18n.t("report.header.event", locale, detail_type=detail_type),
         i18n.t("report.header.status_priority", locale,
                status=status, priority=priority),
         i18n.t("report.header.task", locale, task_id=task_id),
     ]
     if linked_case_display_id:
-        body_lines.append(
+        meta_lines.append(
             i18n.t("report.header.linked_case", locale,
                    case_display_id=linked_case_display_id))
 
-    blocks_out: list = [
+    head: list = [
         _header(i18n.t("report.header.title", locale, emoji=emoji)),
-        _section("\n".join(body_lines)),
+        _section("\n".join(meta_lines)),
+        _divider(),
+    ]
+
+    tail: list = [
         _divider(),
         _actions(
             _button(i18n.t("report.see_full", locale), "open_report",
@@ -356,15 +381,14 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
             _button(i18n.t("report.see_trace", locale), "open_trace",
                     url=trace_url),
         ),
-        _context(i18n.t("report.link_validity", locale)),
     ]
 
-    # Bedrock-derived next-step buttons. Each button's action_id MUST be
-    # unique within the message — Slack's chat.postMessage rejects the
-    # whole message with `invalid_blocks` if two buttons share an
-    # action_id. We suffix each one with its index. The `main.py`
-    # block_actions handler uses a regex to match `next_step_dispatch_N`
-    # and `open_next_step_url_N` so the suffix doesn't break dispatch.
+    # Next-step buttons. Nothing generates these any more (the report path
+    # is 0-token since 2026-09-05) but cards already in users' history do,
+    # so the rendering + `main.py`'s block_actions handlers stay.
+    # Each action_id MUST be unique within the message — Slack rejects the
+    # whole message with `invalid_blocks` on a duplicate — hence the index
+    # suffix, which `main.py` matches with a regex.
     if next_steps:
         ns_buttons = []
         for idx, ns in enumerate(next_steps[:3]):
@@ -385,35 +409,54 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
                 ns_buttons.append(_button(
                     label, f"open_next_step_url_{idx}", url=url))
         if ns_buttons:
-            blocks_out.append(_divider())
-            blocks_out.append(_section(i18n.t("report.next_steps_header", locale)))
-            blocks_out.append(_actions(*ns_buttons))
+            tail.append(_divider())
+            tail.append(_section(i18n.t("report.next_steps_header", locale)))
+            tail.append(_actions(*ns_buttons))
 
-    # Sync-to-case button: only when linked_case_display_id is set
-    # (case-create + dispatch flow). Suppresses the generic 🆘 button.
+    # Exactly one escalation button. ⚠️ 报告卡上**没有**「🔬 查看本次调查」
+    # (控制台深链):这张卡上其余链接都是预签名、7 天免登录,而深链要求登录
+    # AWS 控制台 —— 两者并排会逼着底下的说明同时写「无需登录」和「需要
+    # 登录」。2026-09-05 加过当天去掉。进度卡上那颗保留(见 `progress_sender`)。
+    action_row: list = []
     if linked_case_display_id and incident_id:
-        blocks_out.append(_divider())
-        blocks_out.append(_actions(
+        action_row.append(
             _button(i18n.t("report.sync_to_case", locale,
                            case_display_id=linked_case_display_id),
                     "case_sync_report",
                     value={"incident_id": incident_id,
                            "case_display_id": linked_case_display_id},
-                    style="primary"),
-        ))
+                    style="primary"))
     elif incident_id:
-        blocks_out.append(_divider())
-        blocks_out.append(_actions(
-            _button(i18n.t("report.escalate_support", locale),
-                    "ask_support",
-                    value={"incident_id": incident_id}, style="danger"),
-        ))
+        action_row.append(
+            _button(i18n.t("report.escalate_support", locale), "ask_support",
+                    value={"incident_id": incident_id}, style="danger"))
+    if action_row:
+        tail.append(_divider())
+        tail.append(_actions(*action_row))
+
+    # One line, unconditionally true: every link left on this card is a
+    # presigned S3 / CDN URL. ⚠️ 别再加 `progress.link_login_warning` ——
+    # 它是给控制台深链的,而那颗按钮已不在这张卡上。
+    tail.append(_context(i18n.t("report.link_validity", locale)))
+
+    # Body budget = whatever the block cap leaves after the chrome, minus
+    # one slot for the truncation notice.
+    budget = max(1, _MAX_BLOCKS - len(head) - len(tail) - 1)
+    body = _summary_blocks(summary_md, locale, with_header=False,
+                           max_blocks=budget)
+    # `_summary_blocks` may already have appended the notice (8000-char cut or
+    # block-cap cut). Rendering it twice reads as two separate warnings, so
+    # only add ours when it isn't there yet.
+    notice_text = i18n.t("report.summary_truncated", locale)
+    already = any(notice_text in ((b.get("text") or {}).get("text") or "")
+                  for b in body if b.get("type") == "section")
+    notice = [] if (already or not report_truncated) else [_section(notice_text)]
 
     _post("/chat.postMessage", {
         "channel": chat_id,
         "thread_ts": root_message_id or None,
-        "text": f"{emoji} NotiOps Report ({status})",
-        "blocks": blocks_out,
+        "text": i18n.t("report.header.title", locale, emoji=emoji),
+        "blocks": head + body + notice + tail,
     })
 
 

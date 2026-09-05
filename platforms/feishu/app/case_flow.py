@@ -651,11 +651,14 @@ def _create_worker(card_message_id: str, ctx: dict,
 #    「确实同步成功了，但是飞书里面没有任何的信息反馈」）。原来的写法是
 #    `update_card(<报告卡的 message_id>, 结果卡)`，两处都错：
 #
-#      1. 报告卡（`shared/report_delivery/feishu_sender.py::_header_card`）是一张
-#         **v1** 卡（顶层 `elements`），而这里的结果卡 / pending 卡是 **v2**
-#         （`"schema": "2.0"` + `body.elements`）。往 v1 消息上 PATCH 一份 v2 正文，
-#         飞书**不报错也不渲染** —— 现网日志实证：`add_communication` 成功、整个
-#         invocation 里一条 `Feishu API non-zero` / HTTP 错误都没有，用户屏幕上零变化。
+#      1. 载体不匹配就会静默失败。当时报告卡是一张 **v1** 卡（顶层 `elements`），
+#         而这里的结果卡 / pending 卡是 **v2**（`"schema": "2.0"` + `body.elements`）。
+#         往 v1 消息上 PATCH 一份 v2 正文，飞书**不报错也不渲染** —— 现网日志实证：
+#         `add_communication` 成功、整个 invocation 里一条 `Feishu API non-zero` /
+#         HTTP 错误都没有，用户屏幕上零变化。
+#         ⚠️ 2026-09-05：报告卡已经换成 `_report_card_v2`（v1 只是被拒时的兜底），
+#         所以"schema 对不上"这条**具体**成因不再成立；但下面第 2 条（业务错误码
+#         只 warning）没变，PATCH 失败照样看不见 —— 所以结论不变：发新消息。
 #      2. 就算渲染出来了也是错的：报告卡被结果卡**顶掉**，报告正文和那两个
 #         presigned「查看完整报告 / 调查过程」链接一起没了。
 #

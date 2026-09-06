@@ -10,8 +10,10 @@ DevOps Agent 深度调查接入（Web Chat / AgentCore 侧，**自包含重写**
 连接方式（实测对齐本账号真实情况）：
   - **部署账号（默认）**：DevOps Agent 的 Agent Space 就在本账号里（IM 部署时自动创建），
     **直接用 runtime 执行角色的本地凭证调 `devops-agent`**（boto3 service 名带连字符），
-    **无需 config 表、无需跨账号 AssumeRole**。Agent Space 通过 ListAgentSpaces **自动发现**
-    （优先名为 `notiops-devops-<account>` 的；可用 env DEVOPS_AGENT_SPACE_ID 覆盖）。
+    **无需 config 表、无需跨账号 AssumeRole**。Agent Space 优先读 env
+    `DEVOPS_AGENT_SPACE_ID`（两条部署路径的 CDK 都会注入：web 侧 web-chat-core.ts、
+    IM 侧 im-core.ts）；env 为空时才回退 ListAgentSpaces 按名字发现
+    （`notiops-devops-<account>` 方式B / `notiops-oneclick-<account>` 方式A）。
   - **跨账号（可选，留口）**：若 config 表有 da#{account} 行且目标≠部署账号，沿用 IM 的
     AssumeRole trigger_role_arn 方式。本期跨账号受 LOCKED 闸门约束，通常用不到。
 
@@ -126,7 +128,13 @@ def _client_and_space(account_id: str) -> tuple:
 
 def _discover_space(client, account_id: str) -> str | None:
     """自动发现部署账号里**排障用**的 Agent Space。env 指定优先；否则按名字
-    `notiops-devops-<account>` 匹配。结果缓存。
+    `notiops-devops-<account>`（方式B）/ `notiops-oneclick-<account>`（方式A）匹配。
+    结果缓存。
+
+    ⚠️ 这整个函数是**兜底**，不是主路径：两条部署路径的 CDK 都会把
+    `DEVOPS_AGENT_SPACE_ID` 注进 Lambda（web 侧 `web-chat-core.ts`、IM 侧
+    `im-core.ts`），有 env 时第一行就返回了。会走到 ListAgentSpaces 的只有
+    「栈还没更新到含该 env 的版本」的老部署。
 
     ⚠️ **不再兜底取 `spaces[0]`。** 本账号现在有两个 agent space
     （`notiops-devops-<account>` 排障 · `notiops-inspection-<account>` 巡检，
@@ -153,8 +161,19 @@ def _discover_space(client, account_id: str) -> str | None:
         spaces = resp.get("agentSpaces") or resp.get("agentSpaceSummaries") or []
         if not spaces:
             return None
-        preferred = f"notiops-devops-{account_id}"
-        chosen = next((s for s in spaces if s.get("name") == preferred), None)
+        # 两条部署路径给 space 起的名字不同，按优先级都认：
+        #   · 方式B（setup.sh / CDK）    → notiops-devops-<account>
+        #   · 方式A（一键 CFN 单栈）      → notiops-oneclick-<account>
+        # 正常情况下 CDK 已经把 DEVOPS_AGENT_SPACE_ID 注进来了，走不到这里；这份
+        # 名字清单是**第二道防线**，兜住老部署（栈还没更新、env 还是空的）。
+        preferred_names = [
+            f"notiops-devops-{account_id}",
+            f"notiops-oneclick-{account_id}",
+        ]
+        chosen = next(
+            (s for name in preferred_names for s in spaces if s.get("name") == name),
+            None,
+        )
         if chosen is None:
             # ⚠️ 只有一个 space 且名字不匹配时（如客户手工建的、或早期版本命名不同），
             # 沿用它 —— 否则会把本来能用的环境判成未上车。两个及以上就必须明确，
@@ -162,15 +181,15 @@ def _discover_space(client, account_id: str) -> str | None:
             if len(spaces) == 1:
                 chosen = spaces[0]
                 logger.info(
-                    "devops_agent: 唯一的 agent space 名字不是 %s，沿用它: name=%s",
-                    preferred, chosen.get("name"),
+                    "devops_agent: 唯一的 agent space 名字不在 %s 里，沿用它: name=%s",
+                    preferred_names, chosen.get("name"),
                 )
             else:
                 logger.error(
-                    "devops_agent: 账号 %s 有 %d 个 agent space 但没有名为 %s 的，"
+                    "devops_agent: 账号 %s 有 %d 个 agent space 但没有一个叫 %s，"
                     "拒绝猜测（猜错会把调查跑到巡检 space 且无任何信号）。"
                     "请设置 DEVOPS_AGENT_SPACE_ID。现有: %s",
-                    account_id, len(spaces), preferred,
+                    account_id, len(spaces), preferred_names,
                     [s.get("name") for s in spaces],
                 )
                 return None

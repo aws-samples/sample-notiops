@@ -90,6 +90,10 @@ if (enabledPlatforms !== "none") {
     skillsBucketName: main.dataBucketName,
     // IM 侧长回答超出卡片正文上限时落 HTML 报告，链接走这个 CDN（见 im-core.ts）。
     reportsCdnDomain,
+    // 排障 Agent Space —— **与 WebChatStack 传的是同一个值**（见下面 :105），
+    // 所以 IM 与 web 必然指向同一个 space。不传的后果不是报错，是让 IM 侧退回
+    // 「按名字 ListAgentSpaces 碰运气」，账号里多一个 space 就全线判成未接入。
+    devopsAgentSpaceId: main.agentSpaceId,
   });
   imStack.addStackDependency(main);
 }

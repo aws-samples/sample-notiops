@@ -12,6 +12,12 @@ export interface ImStackProps extends cdk.StackProps {
   skillsBucketName: string;
   /** 报告分发 CDN 域名（`REPORTS_CDN_DOMAIN`）。见 infra/bin/app.ts 里那段注释。 */
   reportsCdnDomain?: string;
+  /** 排障 Agent Space id（`DEVOPS_AGENT_SPACE_ID`）。app.ts 传 `main.agentSpaceId`。
+   *
+   *  这是**跨栈引用**（Export/ImportValue），但不新增 Export —— WebChatStack 早就
+   *  引用了同一个 `main.agentSpaceId`（app.ts:105），CDK 会复用那个 Export。
+   *  语义与作用见 `im-core.ts` 的 `devopsAgentSpaceId` prop 注释。 */
+  devopsAgentSpaceId?: string;
   /** 逗号分隔；默认取 -c enabledPlatforms（BotStack 同一个 context 键）。 */
   enabledPlatforms?: string[];
 }
@@ -165,6 +171,7 @@ export class ImStack extends cdk.Stack {
       reportsCdnDomain: props.reportsCdnDomain,
       lockedAccountId,
       allowedChatIds,
+      devopsAgentSpaceId: props.devopsAgentSpaceId,
       code: imCode,
       layer: imLayer,
       // 写死物理名：客户文档（docs/IM_WEBHOOK_SETUP.md 的 `aws logs tail` 命令）、

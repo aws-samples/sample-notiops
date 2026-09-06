@@ -1598,6 +1598,14 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       // 的功能必须一致）。默认空 = 不限制；客户拿到群 id 后更新栈即可收窄。
       // 不能写死空串 —— 那样客户只能手改 Lambda 环境变量，下一次栈更新又会覆盖回去。
       allowedChatIds: imAllowedChatIds.valueAsString,
+      // 排障 Agent Space —— **与 BFF 传的是同一个值**（`agentSpaceIdOrEmpty`，见 :864）。
+      // ⚠️ 必须传：本栈的 space 叫 `notiops-oneclick-<account>`，而 IM 侧自动发现只认
+      //    `notiops-devops-<account>`，靠"账号里恰好只有一个 space"活着。客户账号里
+      //    多出第二个 space 后，深度调查会一律回「该账号未接入」—— 已有客户命中。
+      // 这里包 `Fn.conditionIf` 是**必须的**（别照抄别处那些裸 `GetAtt`）：space 是
+      // **条件资源**，关掉深度调查时它不存在，直接取 GetAtt 会让整栈合成失败。
+      // 空串 = 没配，回退自动发现。
+      devopsAgentSpaceId: agentSpaceIdOrEmpty,
       code: lambda.Code.fromBucket(stagingBucket, imCodeKey),
       layer: imLayer,
       // 带 StackName 前缀：一键模板可能与 setup.sh 部署共存于同一账号（后者写死

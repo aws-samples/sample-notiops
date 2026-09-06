@@ -213,6 +213,22 @@ export interface ImCoreProps {
   reportsCdnDomain?: string;
   /** 单账号模式下锁定的账号；多账号（Organizations）模式传空串。 */
   lockedAccountId: string;
+  /**
+   * 排障用的 DevOps Agent Space id（`DEVOPS_AGENT_SPACE_ID`）。与 `web-chat-core.ts`
+   * 的 `agentSpaceId` 是同一个值、同一个语义 —— 之前**只有 web 侧注了**，IM 侧漏了。
+   *
+   * 漏传的后果不是报错，是**看名字碰运气**：`core/devops_agent.py::_discover_space`
+   * 在 env 为空时回退 `ListAgentSpaces`，只认 `notiops-devops-<account>` 这个名字。
+   *   · 方式B 的 space 就叫这个名 → 撞上了，能用；
+   *   · 方式A 的 space 叫 `notiops-oneclick-<account>` → **永远不匹配**，只靠
+   *     「账号里恰好只有一个 space」那条兜底活着。客户账号里一旦出现第二个
+   *     agent space（自己建的、或后来装了巡检），`_discover_space` 就按设计**拒绝
+   *     猜测**返回 None → 每一次深度调查都回「该账号未接入」。已有客户命中。
+   *
+   * 传了之后 `_SPACE_ENV` 是最高优先级，两条路径都变成确定性引用，且**少一次
+   * ListAgentSpaces**。空串 = 没配（例如方式A 关掉了深度调查），回退自动发现。
+   */
+  devopsAgentSpaceId?: string;
   /** 群/频道允许清单，逗号分隔。留空 = 不限制。 */
   allowedChatIds: string;
   /** 三个函数共用的代码。 */
@@ -286,6 +302,10 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
     LOCKED_ACCOUNT_ID: props.lockedAccountId,
     SKILLS_BUCKET: props.skillsBucketName,
     SKILL_DISPATCH_ENABLED: "false",
+    // 排障 Agent Space（深度调查 / 直连问答都用它）。与 web 侧
+    // `web-chat-core.ts` 的 `DEVOPS_AGENT_SPACE_ID` 逐字同源。空串 = 回退
+    // `ListAgentSpaces` 自动发现（见上面 prop 注释里那条已命中客户的坑）。
+    DEVOPS_AGENT_SPACE_ID: props.devopsAgentSpaceId ?? "",
     AWS_MCP_PRICING_ENABLED: "false",
     AWS_MCP_COST_ENABLED: "false",
     // 长回答落 HTML 报告的链接域名（`core/reports.py`）。空串 = 回退 presigned。

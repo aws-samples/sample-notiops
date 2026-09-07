@@ -1,10 +1,21 @@
 # Skill format (S3 layout) — drop-in 3rd-party skills
 
-A skill is **just files in S3**. The bot reads them at runtime — no code change,
-no redeploy. Drop a correctly-formatted skill into the bucket and it is
-**immediately** usable: it shows in `/skills list`, runs via `/skills run`, and
-is auto-discovered by natural-language dispatch (the bot's LLM router lists
-active skills and may auto-select yours from a plain-English question).
+> 🗑️ **Status (2026-09-06): the IM entry points described here are gone.** The
+> skill feature was retired from the IM side entirely — `/skills` and every
+> `/skills <sub>` command, both `app/skill_commands.py` files and
+> `core/skill_authoring.py` are deleted; typing `/skills` now returns the `/help`
+> menu at 0 tokens. **Skills live on in full in the web console** (upload, list,
+> version, run), and this on-disk/S3 layout is still exactly what the web side
+> reads — so the format sections below remain authoritative. Only the `/skills …`
+> command examples are dead; read them as "the equivalent action in the web
+> console". The auto-dispatch machinery (`core/skill_dispatcher.py`,
+> `core/skill_registry.py`) still exists but only on the **undeployed** Fargate
+> message path, and goes away with it.
+
+A skill is **just files in S3**. The reader picks them up at runtime — no code
+change, no redeploy. Drop a correctly-formatted skill into the bucket and it is
+**immediately** usable: it shows up in the web console's Skills list and can be
+run from there.
 
 Bucket: the value of the `SKILLS_BUCKET` env var. This is the deploy-generated
 data bucket, whose name includes your AWS account ID and region so it is globally
@@ -74,14 +85,16 @@ Rules:
 ## Robustness
 
 `list_skills` skips a malformed `meta.json` with a logged warning rather than
-failing the whole list — so one bad 3rd-party skill won't break `/skills list`
-or hide the others. Check the bot logs for `list_skills: skipping malformed
-meta ...` if a dropped-in skill doesn't appear.
+failing the whole list — so one bad 3rd-party skill won't break the list or hide
+the others. Check the logs for `list_skills: skipping malformed meta ...` if a
+dropped-in skill doesn't appear.
 
 ## Quick validation after dropping a skill in
 
-1. `/skills list` → your skill appears with its `latest_version`.
-2. `/skills get <skill-id>` → name, description, parameters look right.
-3. `/skills run <skill-id> <param>=<value> ...` → dispatches; report returns to thread.
-4. Ask in natural language something your `description`/`tags` cover → the bot
-   should auto-select it (explainable card with a confidence score).
+In the **web console → Skills** (the IM `/skills …` commands these steps used to
+name were retired on 2026-09-06 — see the banner at the top):
+
+1. The list → your skill appears with its `latest_version`.
+2. Open it → name, description, parameters look right.
+3. Run it with the parameters filled in → the report comes back and is
+   downloadable.

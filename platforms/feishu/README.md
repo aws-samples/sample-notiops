@@ -46,7 +46,7 @@ ACK → 异步投给 worker Lambda 干活。平台无关的业务逻辑在
 │     platforms.common.router.dispatch         │
 │     → platforms.feishu.caps.FeishuCaps       │
 │  4. card_action：解码成 SDK 对象后交给        │
-│     case_flow / support_flow / skill_commands│
+│     case_flow / support_flow                 │
 └──────────────────────────────────────────────┘
          │
          ▼

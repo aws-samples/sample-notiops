@@ -214,6 +214,20 @@ export interface ImCoreProps {
   /** 单账号模式下锁定的账号；多账号（Organizations）模式传空串。 */
   lockedAccountId: string;
   /**
+   * NotiOps 自己的 AgentCore Runtime ARN（`AGENT_RUNTIME_ARN`）。缺省时读
+   * `-c agentRuntimeArn=...`，与 `web-chat-core.ts` 同一个开关、同一个值。
+   *
+   * 干什么用：用户在 IM 里发 `/agent notiops` 之后，对话由 `core/agent_chat.py` 走这个
+   * runtime（走模型）。**默认 agent 是 devops 直连，所以不传也能正常上线** —— 不传的
+   * 后果是 `/agent notiops` 当场**明确拒绝**（`agent.not_configured`），不是静默回落。
+   * 那条拒绝路径是刻意设计的（见 `core/agent_chat.py::configured`），所以这个属性可选。
+   *
+   * 两条路径怎么拿到值：方式B（setup.sh / CDK）里 agent 由 `agentcore deploy` 单独部署，
+   * 部署完把 ARN 用 `-c agentRuntimeArn=` 传回来；方式A（一键单栈）里 Runtime 是**同栈
+   * 资源**，直接传它的 `GetAtt`（一个部署期 token）。
+   */
+  agentRuntimeArn?: string;
+  /**
    * 排障用的 DevOps Agent Space id（`DEVOPS_AGENT_SPACE_ID`）。与 `web-chat-core.ts`
    * 的 `agentSpaceId` 是同一个值、同一个语义 —— 之前**只有 web 侧注了**，IM 侧漏了。
    *
@@ -285,6 +299,12 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
   const feishuSecret = props.secretNames?.feishu ?? "notiops/im-bot-feishu";
   const slackTokenSecret = props.secretNames?.slackBotToken ?? "notiops/slack-bot-token";
   const slackSigningSecret = props.secretNames?.slackSigningSecret ?? "notiops/slack-signing-secret";
+  // NotiOps agent runtime ARN（`/agent notiops` 那条路要用）。取值口径与
+  // `web-chat-core.ts` 里那一行**逐字一致** —— 两边都读同一个 `-c agentRuntimeArn`，
+  // 只要 setup.sh 传了，web 和 IM 就一定指向同一个 runtime（会话隔离靠 runtimeSessionId，
+  // 见 `core/agent_chat.py::to_session_id`）。为空 = 这个部署没接，IM 侧会明确拒绝。
+  const agentRuntimeArn = props.agentRuntimeArn
+    || (scope.node.tryGetContext("agentRuntimeArn") as string) || "";
 
   // ─── 公共环境变量 ─────────────────────────────────────────────────────────
   // 对齐 BotStack 里 Fargate 容器的 environment，**去掉** MCP sidecar 那两个
@@ -302,6 +322,9 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
     LOCKED_ACCOUNT_ID: props.lockedAccountId,
     SKILLS_BUCKET: props.skillsBucketName,
     SKILL_DISPATCH_ENABLED: "false",
+    // NotiOps agent runtime（`/agent notiops` 走模型那条路）。空串 = 没接，
+    // `core/agent_chat.py::configured()` 返回 false → 切换命令当场拒绝，不静默回落。
+    AGENT_RUNTIME_ARN: agentRuntimeArn,
     // 排障 Agent Space（深度调查 / 直连问答都用它）。与 web 侧
     // `web-chat-core.ts` 的 `DEVOPS_AGENT_SPACE_ID` 逐字同源。空串 = 回退
     // `ListAgentSpaces` 自动发现（见上面 prop 注释里那条已命中客户的坑）。
@@ -401,6 +424,17 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
   imRole.addToPrincipalPolicy(new iam.PolicyStatement({
     actions: ["aidevops:ListAgentSpaces"],
     resources: ["*"],
+  }));
+
+  // AgentCore Runtime —— worker 在用户发过 `/agent notiops` 之后走**我们自己的** agent
+  // 回答（`core/agent_chat.py`，走模型、会烧 token）。默认 agent 仍是上面那条 aidevops
+  // 直连，所以这条权限在默认配置下**根本不会被用到** —— 但没有它的症状是：用户切过去、
+  // 每一轮都收到 `AccessDeniedException`，而 web 端同一个 runtime 一切正常
+  // （web 走 web-chat-core.ts 里那条同名授权）。与那边逐字一致，包括资源通配的理由：
+  // runtime ARN 在部署后才有，收窄到本账号本区域的 `runtime/*` 已经是能给的最紧范围。
+  imRole.addToPrincipalPolicy(new iam.PolicyStatement({
+    actions: ["bedrock-agentcore:InvokeAgentRuntime"],
+    resources: [`arn:aws:bedrock-agentcore:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:runtime/*`],
   }));
 
   // AWS Support API —— 案例全生命周期。

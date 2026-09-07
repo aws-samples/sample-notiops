@@ -712,55 +712,42 @@ language zh     # switch back to Chinese
 > **Push mode** = AWS service events automatically trigger investigations and the bot pushes results to the channel. **By default the push-mode lambda does not send cards after deploy** (`PushTargetChatId` left empty); it must be turned on explicitly.
 
 ### 7.1 Enable push (fill in the chat ID)
+`setup.sh` **does not ask** for a push target chat id (it only asks whether to deploy PHD event forwarding). To turn push on, put the target group into the `notify_chat_ids` field of the `notiops/im-bot-feishu` secret, or configure it under Web Chat admin → "IM Integration". Empty = the Lambda short-circuits and posts no card.
 
-`setup.sh` **does not ask** for a push target chat id (it only asks whether to deploy PHD event forwarding). To turn push on, set the target chat id after deploy:
-
-```bash
-# Edit infra/cdk.json — set pushTargetChatIds.<platform> to the chat id
-$EDITOR infra/cdk.json
-cd infra && npx cdk deploy NotiOpsBackendStack
-```
-
-> For Feishu you can also put the target group into the `notify_chat_ids` field of the `notiops/im-bot-feishu` secret, or configure it under Web Chat admin → "IM Integration".
+<!-- Corrected 2026-09-06: this section used to point at a set of push toggle keys in
+     infra/cdk.json — the code never reads those keys (repo-wide grep hits docs only),
+     so following it silently did nothing. The real mechanism is the EventBridge rule
+     toggle below. tests/test_docs_no_phantom_config.py pins this. -->
 
 ### 7.2 Tune push event sources
 
-6 independent toggles, **3 on / 3 off by default**:
+IM push consists of 5 EventBridge rules (`notiops-push-<source>`), **all DISABLED by
+default** — the toggle is enabling/disabling the rule itself; no redeploy needed:
 
-| Parameter | Default | Description |
-|---|---|---|
-| `EnableCloudWatchAlarmPush` | ✅ `true` | CloudWatch alarm transitions to ALARM |
-| `EnableHealthPush` | ✅ `true` | AWS Health events |
-| `EnableBackupPush` | ✅ `true` | Backup job FAILED / EXPIRED / ABORTED |
-| `EnableGuardDutyPush` | `false` | GuardDuty findings (severity ≥ `GuardDutyMinSeverity`, default 7) |
-| `EnableCostAnomalyPush` | `false` | Cost Anomaly Detection (requires a monitor) |
-| `EnableTrustedAdvisorPush` | `false` | TA ERROR-status changes (requires Business+ Support) |
-
-Edit the corresponding boolean in `infra/cdk.json`, then:
+| Rule name | Event source |
+|---|---|
+| `notiops-push-cloudwatchalarm` | CloudWatch alarm state changes (NotiOps' own ops alarms excluded) |
+| `notiops-push-backupjob` | Backup job state changes |
+| `notiops-push-guardduty` | GuardDuty findings |
+| `notiops-push-costanomaly` | Cost Anomaly Detection (requires a monitor; global service, emits in us-east-1 only) |
+| `notiops-push-trustedadvisor` | Trusted Advisor check item changes (requires Business+ Support; us-east-1 only) |
 
 ```bash
-# Example: enable GuardDuty with threshold 8
-# infra/cdk.json:
-#   "enableGuardDutyPush": true,
-#   "guardDutyMinSeverity": 8
-cd infra && npx cdk deploy NotiOpsBackendStack
-
-# Example: disable Health push
-# infra/cdk.json: "enableHealthPush": false
-cd infra && npx cdk deploy NotiOpsBackendStack
+# Example: enable GuardDuty push
+aws events enable-rule  --name notiops-push-guardduty  --region <deploy-region>
+# Example: disable CloudWatch alarm push
+aws events disable-rule --name notiops-push-cloudwatchalarm --region <deploy-region>
 ```
+
+> The web "Notifications" inbox uses a **separate** set of rules (`notiops-web-notif-*`,
+> 5 on by default); the two do not affect each other. Method B can tune those at synth
+> time with `-c webNotif<Id>=on|off`; Method A toggles them in the EventBridge console.
 
 ### 7.3 Fully silent (record events but don't post cards)
 
-Set `pushTargetChatIds` to empty for every platform:
-
-```bash
-# infra/cdk.json:
-#   "pushTargetChatIds": { "feishu": "", "slack": "" }
-cd infra && npx cdk deploy NotiOpsBackendStack
-# Lambda short-circuits incoming events; EventBridge rules remain so logs still show event volume
-```
-
+Clear `notify_chat_ids` in the secret (or the target group under admin → "IM Integration"):
+the Lambda short-circuits and posts no card; the EventBridge rules remain, so event volume
+is still observable in the logs.
 ### 7.4 Test push
 
 ```bash
@@ -854,7 +841,7 @@ aws dynamodb delete-item --table-name <conv-table> \
 
 | Level | Action | Impact |
 |---|---|---|
-| **L1 disable a single feature** | Edit `infra/cdk.json` (e.g. `enableHealthPush: false`) → `cdk deploy NotiOpsBackendStack` | Single event source, ~2 min |
+| **L1 disable a single event source** | `aws events disable-rule --name notiops-push-<source>` (IM push) or `notiops-web-notif-<source>` (web inbox), see §7.2 | Single event source, instant, no deploy |
 | **L2 disable a whole conversation tier** | Edit `agenticChatMode: "disabled"` → `cdk deploy ImStack` | chitchat / general_qa paths |
 | **L3 take IM from webhook back to long connection** | ⚠️ **No longer "minutes" after M2 (2026-09-03)** — `BotStack` is not instantiated by `infra/bin/app.ts` any more, so you first add `new BotStack(...)` back, install finch/docker, and `cdk deploy BotStack` (which creates VPC/ECS/ECR and builds images), then set the Feishu / Slack console delivery mode back to long connection / Socket Mode. Pre-M2 installs (stack still present) stay minutes-level: switch the delivery mode + `aws ecs update-service --desired-count 1 ...` | Single platform; ~20 min on fresh installs, minutes on pre-M2 installs ([IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §1.6) |
 | **L4 turn the bot off entirely** | webhook mode: `aws lambda put-function-concurrency --reserved-concurrent-executions 0` (the ingress starts 429-ing everything at once); long-connection mode: `aws ecs update-service --desired-count 0 ...` | Single platform, instant |
@@ -867,7 +854,7 @@ aws dynamodb delete-item --table-name <conv-table> \
 > the stacks in reverse dependency order and cleans up the non-CDK leftovers (CUR report
 > definition, the one-shot EventBridge schedule, the WebSearch gateway, the 30-day
 > recovery window on the secrets, orphaned log groups). Start with
-> `./teardown.sh --dry-run`; the default keeps the three RETAIN'd tables, and
+> `./teardown.sh --dry-run`; the default keeps the four RETAIN'd tables, and
 > `--delete-everything` wipes them too.
 
 ---
@@ -917,15 +904,11 @@ All tunable parameters live under the `context` block in `infra/cdk.json`. After
 |---|---|---|
 | `agentSpaceId` | (auto) | DevOps Agent space id. **No need to supply one** — CDK auto-creates `notiops-devops-<account>` (see §5.3.5); this context is for advanced override only |
 | `devOpsAgentRegion` | `us-east-1` | Region of the DevOps Agent service (used in IAM Resource ARN); today `us-east-1` only |
-| `pushTargetChatIds` | `{}` | Per-platform target chat id; empty = Lambda short-circuits and posts no card |
-| `enableCloudWatchAlarmPush` | `true` | CloudWatch alarm |
-| `enableHealthPush` | `true` | AWS Health |
-| `enableBackupPush` | `true` | Backup |
-| `enableGuardDutyPush` | `false` | GuardDuty |
-| `guardDutyMinSeverity` | `7` | Severity threshold |
-| `enableCostAnomalyPush` | `false` | Cost Anomaly |
-| `enableTrustedAdvisorPush` | `false` | Trusted Advisor |
 | `reportUrlExpirationSeconds` | `604800` | Pre-signed URL TTL (7 days) |
+
+> IM push targets and per-source toggles are **not** CDK context: targets live in the
+> Feishu secret's `notify_chat_ids` (or admin → "IM Integration"), and per-source toggles
+> are the EventBridge rules `notiops-push-<source>` (see §7.2).
 
 > The report bucket is auto-created (named `notiops-report-${AccountId}-${Region}`, private + KMS-encrypted; no parameter required).
 

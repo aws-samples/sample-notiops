@@ -73,8 +73,8 @@ class Route:
     """A deterministic routing decision, or a no-op sentinel.
 
     ``kind`` is one of:
-      "help" | "language" | "model" | "skills" | "investigate" |
-      "investigate_status" | "case" | ""
+      "help" | "language" | "model" | "agent" | "web" |
+      "investigate" | "investigate_status" | "case" | ""
 
     An empty ``kind`` means "not recognised — caller falls through". All the
     other fields carry the parsed parameters for that kind; unused fields are
@@ -82,7 +82,7 @@ class Route:
     """
     kind: str = ""
     form: str = ""            # "command" | "nl" | "ref" — provenance, logging
-    arg: str = ""            # investigate text / skills rest / language target
+    arg: str = ""            # investigate text / language target
     lang: str = ""           # "zh" | "en" — only for kind == "language"
     model_arg: str = ""      # "" | "list" | "default" | "<alias>" — kind==model
     case_command: str = ""   # case_create|case_list|case_view|case_reply|
@@ -147,7 +147,50 @@ _HELP_RE = re.compile(
 )
 _LANGUAGE_RE = _cmd("language", "lang", "语言", "語言")
 _MODEL_RE = _cmd("model", "模型")
-_SKILLS_RE = _cmd("skills", "skill", "技能")
+# `/agent notiops|devops` — 选这一轮对话由谁来答（见 core/im_prefs.py）。
+# 「助手」故意**不**收进词表：`助手 帮我查一下` 这种叫法太常见，收了就会把一句正常
+# 的提问吃成一次开关切换。「智能体」没有这个歧义。
+_AGENT_RE = _cmd("agent", "智能体", "智能體")
+# `/web on|off` — 只对 `agent=notiops` 有意义。长词在前：`_cmd` 的 `\b` 在
+# 「联网」和「搜索」之间不成立（中文都是 word char），短词先命中会导致整条不匹配。
+_WEB_RE = _cmd("websearch", "web-search", "web_search", "web",
+               "联网搜索", "聯網搜索", "联网", "聯網")
+
+# ── 两条开关命令认得的入参 —— **也是裸词形式的精度门** ────────────────────────
+# `platforms/common/pref_commands.py` 从这里取（那边把 arg 翻成动作），一份词表两个
+# 消费者，少一份就会漂。
+#
+# ⚠️ 为什么必须有这道门（2026-09-06 实测的真 bug）：`_cmd("web")` 会匹配**任何**以
+# web 开头的句子 —— 「web 服务 502 怎么排查」`kind="web"`，落到 `web_reply` 里参数认不
+# 出来，用户只拿到一句「用法: /web on|off」，真正的问题被丢掉。同理「agent 是什么意思」。
+# 所以：**裸词形式**（没打斜杠）只在参数为空或认得出来时才算命令；**带斜杠**无条件
+# 算命令（那时意图明确，参数不认就回用法，比丢给模型好）。
+#
+# 这道门只管 `agent` / `web` —— 它们的触发词恰好是运维日常词汇。`model` / `case` 有
+# 同形状的问题（「模型 部署最佳实践」→ model、「case study for eks」→ case），但那是
+# 既有行为，改动面更大，单独处理（见 §B.1）。
+AGENT_ARG_WORDS: frozenset[str] = frozenset({
+    "devops", "dev", "devops-agent", "notiops", "noti", "notiops-agent",
+    "default", "clear", "reset", "auto",
+})
+#: on / off 两侧分开导出 —— `pref_commands` 要分别判断，合起来它就没法知道用户要哪边。
+WEB_ON_WORDS: frozenset[str] = frozenset({
+    "on", "1", "true", "yes", "enable", "enabled", "开", "打开", "开启",
+})
+WEB_OFF_WORDS: frozenset[str] = frozenset({
+    "off", "0", "false", "no", "disable", "disabled", "关", "关闭",
+})
+WEB_ARG_WORDS: frozenset[str] = WEB_ON_WORDS | WEB_OFF_WORDS
+
+
+def _switch_arg_ok(text: str, rest: str, words: frozenset[str]) -> bool:
+    """裸词形式的精度门（上面那段注释就是它的理由）。"""
+    if text.lstrip().startswith("/"):
+        return True                      # 打了斜杠 = 意图明确
+    r = (rest or "").strip().lower()
+    return r == "" or r in words         # 裸词：空参（= 查看当前值）或认得的参数
+
+
 _INVESTIGATE_RE = _cmd(
     "investigate", "inv", "investigation", "调查", "調查", "排查", "深度调查",
     "深度調查",
@@ -216,10 +259,15 @@ def parse_command(text: str) -> Route:
         return Route(kind="model", form="command",
                      model_arg=(m.group("rest") or "").strip().lower())
 
-    m = _SKILLS_RE.match(s)
-    if m:
-        return Route(kind="skills", form="command",
-                     arg=(m.group("rest") or "").strip())
+    m = _AGENT_RE.match(s)
+    if m and _switch_arg_ok(s, m.group("rest"), AGENT_ARG_WORDS):
+        return Route(kind="agent", form="command",
+                     arg=(m.group("rest") or "").strip().lower())
+
+    m = _WEB_RE.match(s)
+    if m and _switch_arg_ok(s, m.group("rest"), WEB_ARG_WORDS):
+        return Route(kind="web", form="command",
+                     arg=(m.group("rest") or "").strip().lower())
 
     for pat, canonical in _CASE_CMD_PATTERNS:
         m = pat.match(s)
@@ -464,6 +512,38 @@ def parse_model_switch_intent(text: str) -> bool:
     return bool(_MODEL_SWITCH_RE.search(s))
 
 
+# --- 退役 / 打错的斜杠命令 → `/help`（0 token）。-----------------------------
+# 打了斜杠就是明确在用命令，而**认不出来的命令绝不能落进 `chat`** —— 那会拿一句
+# `/skil` 去问 DevOps Agent，白跑一趟（现网实测过一次 318s 才 connection_error），
+# 答案还必然不对。给一张菜单是唯一有用的回答。
+#
+# 2026-09-06 加这道门的直接原因是 `/skills` 退役（见文件末尾那段说明）：客户 Slack 里
+# 那条 slash command 要手工去注册页删，删之前用户照旧打得出来。顺带把所有打错的命令
+# （`/investigat`、`/案例列` …）一起收了。
+#
+# ⚠️ 形状必须收紧，否则会把**日志路径 / 资源名**当命令吃掉：
+#   `/aws/lambda/foo` `/var/log/messages 满了` `/123` 裸 `/`  → **不匹配**
+#   （斜杠后只允许一段"命令形状"的词，且后面必须紧跟空白或结尾）
+_UNKNOWN_SLASH_RE = re.compile(
+    r"^\s*/(?:[A-Za-z][A-Za-z0-9_-]{0,23}|[\u4e00-\u9fff]{1,8})(?=\s|$)")
+
+# 多段路径靠"第二个斜杠"自然就排掉了，**单段**的排不掉 —— `/tmp 满了`、
+# `/data 目录只剩 2%` 跟 `/skil` 形状一模一样。运维日常里这种句子不少，回一张菜单
+# 等于把真问题吞掉（比落进 `chat` 更糟），所以再挂一张文件系统根目录的排除表
+# （FHS 顶层 + `data`；闭集，不会长）。与现有命令词零冲突 —— help / language /
+# model / investigate / agent / web / case 一个都不在表里。
+_FS_ROOT_WORDS = frozenset("""
+bin boot data dev etc home lib lib64 media mnt opt proc root run sbin srv sys
+tmp usr var
+""".split())
+
+
+def _is_unknown_slash(text: str) -> bool:
+    """打了斜杠、但上面一条命令都没认出来 —— 且不是在说一个文件系统路径。"""
+    m = _UNKNOWN_SLASH_RE.match(text or "")
+    return bool(m) and m.group(0).strip().lstrip("/").lower() not in _FS_ROOT_WORDS
+
+
 # ===========================================================================
 # Top-level classify — command form first, then NL. 0 token, never raises.
 # ===========================================================================
@@ -480,7 +560,8 @@ def classify(text: str) -> Route:
       4. guessed investigation reference (裸 uuid + 状态词)
       5. NL strong-investigate signal
       6. NL case signal
-      7. (nothing) → caller's default: DevOps chat / analyze_intent
+      7. **认不出来的斜杠命令** → `help`（退役 / 打错的命令不许落进 `chat`）
+      8. (nothing) → caller's default: DevOps chat / analyze_intent
 
     Language and case NL are the token-relevant catches: firing them here means
     the Bedrock classifier never runs for those messages.
@@ -519,6 +600,13 @@ def classify(text: str) -> Route:
     if case:
         return case
 
+    # 最后一道：打了斜杠但上面**一条都没认出来** → 回菜单，而不是丢给模型。
+    # ⚠️ 必须放在所有 NL 轴**之后**：`/根因分析 EBS 慢` 的「根因分析」只在
+    # `_STRONG_INVESTIGATE_RE` 的词表里（`_INVESTIGATE_RE` 没有它），提到 `parse_command`
+    # 里或挪到这几个 NL 轴之前，它就会被当成"不认识的命令"回一张菜单 —— 那是回归。
+    if _is_unknown_slash(text):
+        return Route(kind="help", form="command")
+
     return Route()
 
 
@@ -532,13 +620,24 @@ HELP_COMMANDS: tuple[tuple[str, str, str], ...] = (
     # (feature, "en command(s)", "zh command(s)")
     ("investigate", "/investigate <text>", "/调查 <内容>"),
     ("case",        "/case · /cases",       "/案例 · /工单"),
+    ("agent",       "/agent notiops|devops", "/智能体 notiops|devops"),
+    ("web",         "/web on|off",          "/联网 on|off"),
     ("model",       "/model · /model list", "/模型 · /模型 list"),
     ("language",    "/language zh|en",      "/语言 zh|en"),
     ("help",        "/help",                "/帮助"),
 )
-#: ⚠️ 2026-09-03 起 `skills` **不在这张菜单里**。IM 侧 `/skills` 从来没有真正实现过
-#: （`caps.skills` 只回一句"请用 `/skills create …`"，而那条命令在 IM 路径上无人处理
-#: —— 用户照着提示打一遍会拿到同一句，是个自指的死循环）；skill 的创建/上传/运行需要
-#: S3 + Secrets 权限，一直留在 Web 端。把一个做不到的能力挂在 `/help` 里比不挂更糟。
-#: `parse_command` 里的 `skills` 分支**保留**（`_SKILLS_RE`）：打了 `/skills` 要有一句
-#: 确定性的"去 Web 端"指路（0 token），删掉路由会让它掉进 `chat` 去问 DevOps Agent。
+#: ⚠️ **skill 在 IM 侧已经彻底退役**（2026-09-06 产品决策）。这个能力完整地在 Web 端，
+#: IM 侧连一条路由都不留：`_SKILLS_RE` / `Caps.skills` / `KINDS` 里的 `"skills"` 全删了。
+#:
+#: 分两步走的历史（别把中间态当结论）：
+#:   2026-09-03 先从这张菜单里摘掉（IM 的 `/skills` 从来没真正实现过 —— `caps.skills`
+#:              只回一句"请用 `/skills create …`"，而那条命令在 IM 路径上无人处理，
+#:              照着提示再打一遍拿到同一句，是个自指的死循环），但**保留了路由**，
+#:              理由是"打了 `/skills` 总得有句确定性的去 Web 端指路，别掉进 `chat`"。
+#:   2026-09-06 连路由一起删。上面那条理由现在由 `_UNKNOWN_SLASH_RE` 统一兜住：任何
+#:              认不出来的斜杠命令都回菜单（0 token），退役的和打错的一视同仁 ——
+#:              为一个退役能力单独留一条 i18n 文案是维护负担，菜单本身就是答案。
+#:
+#: ⚠️ 客户 Slack 里那条 `/skills` slash command 要**手工**去 Slack app 配置页删
+#: （注册表在我们代码外，见 docs/IM_WEBHOOK_SETUP.md §2.4，现在共 8 条）。删之前用户
+#: 照旧打得出来 —— 这正是 `_UNKNOWN_SLASH_RE` 必须存在、而不是"以后再说"的原因。

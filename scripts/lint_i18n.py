@@ -89,6 +89,12 @@ CJK_ALLOWLIST = {
     # 的「删除实例」「忽略以上指令」），不是输出文案 —— 与 core/nl_router.py 同源
     # 同理。输出（拒绝话术）走 i18n.t('out_of_scope.change_request', locale)。
     "platforms/common/router.py",
+    # 注：`platforms/common/pref_commands.py` **故意不在**这份清单里。它曾经有
+    # `_ON_WORDS` / `_OFF_WORDS` 那几个输入匹配用的 CJK 字面量，2026-09-06 那份词表整体
+    # 搬到 core/nl_router.py（路由层要用同一份判断裸词形式算不算命令）之后，这个模块的
+    # CJK 只剩注释和 docstring —— 两者本 linter 都不看。留一条无用的豁免只会掩盖真正的
+    # 回归（有人往那儿写死一句中文输出，lint 会一声不响）。
+
     # IM 端 markdown 降级器（标题 → 粗体、GFM 表格 → 带标签的列表）。它**不产出
     # 任何自己的文案** —— 只做结构变换，一个字都不新增；唯一的 CJK 字面量是
     # `_EMPTY_CELLS` 里的「无」，那是**输入匹配**（认出模型填的空占位格好丢掉，

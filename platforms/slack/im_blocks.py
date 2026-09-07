@@ -66,19 +66,40 @@ _ANSWER_TITLES = {
     "thinking": "im.chat.thinking_title",
 }
 
+#: 终态标题按"谁答的"分两套。**与飞书那份 `im_cards._FINAL_TITLES` 逐字对齐**。
+_FINAL_TITLES = {
+    "devops": "im.chat.card_title",
+    "notiops": "im.chat.card_title.notiops",
+}
+
+
+def usage_footer(locale: str, *, agent: str = "devops", usage=None) -> str:
+    """落款 —— **与飞书 `im_cards.usage_footer` 逐字对齐**（口径见那份的 docstring：
+    直连说"无模型消耗"，走模型的那条报**实际生效的模型 id**；用量 2026-09-06 起
+    只统计不显示；拿不到模型 id 也不许退成"无模型消耗"）。
+    """
+    if agent != "notiops":
+        return i18n.t("router.direct_no_token", locale)
+    model = str((usage or {}).get("modelId") or "").strip()
+    if not model:
+        return i18n.t("router.agent_model_unknown", locale)
+    return i18n.t("router.agent_model", locale, model=model)
+
 
 def answer_blocks(reply: str, locale: str, *,
                   steps=None, state: str = "final", elapsed: int = 0,
-                  report_url: str = "") -> list[dict]:
-    """DevOps Agent 直连问答的答案消息 —— 「思考中」与「答完」**共用**这一份。
+                  report_url: str = "", sources=None,
+                  agent: str = "devops", usage=None) -> list[dict]:
+    """对话问答的答案消息 —— 「思考中」与「答完」**共用**这一份，两个 agent 也共用。
 
     与 `im_cards.answer_card` 逐参数对齐（含 `state` 三态 queued/thinking/final、
-    **只有终版挂按钮**、`report_url` 只挂按钮不上传的口径），方便两边一起改 ——
-    包括 2026-09-03 那次"去掉默认的升级/开案例两个按钮"（理由见飞书那份的说明）。
-    过程行的 markdown 由 `live_card.steps_md` 统一生成。
+    **只有终版挂按钮**、`report_url` 只挂按钮不上传的口径、`agent` 只影响标题与落款），
+    方便两边一起改 —— 包括 2026-09-03 那次"去掉默认的升级/开案例两个按钮"（理由见飞书
+    那份的说明）。过程行 / 来源的 markdown 由 `live_card.steps_md` / `sources_md` 统一生成。
     """
     final = state == "final"
-    title_key = _ANSWER_TITLES.get(state, "im.chat.card_title")
+    title_key = _ANSWER_TITLES.get(
+        state, _FINAL_TITLES.get(agent, "im.chat.card_title"))
     out: list[dict] = [
         blocks.header(i18n.t(title_key, locale, seconds=elapsed)),
         # ⚠️ section 的文本**不能为空**（Slack 直接 `invalid_blocks`，整条消息发不出去）。
@@ -89,8 +110,13 @@ def answer_blocks(reply: str, locale: str, *,
     if md:
         # 过程行单独一个 section：与正文合并会双双撞上 3000 字符上限（超限是整条消息 400）。
         out.append(_sec(md, locale))
+    # 来源只在**终版**渲染（口径同飞书：过程中它会随每次 update 增长，看着抖）。
+    if final:
+        src = live_card.sources_md(sources, locale)
+        if src:
+            out.append(_sec(src, locale))
     out.append(blocks.divider())
-    out.append(blocks.context(i18n.t("router.direct_no_token", locale)))
+    out.append(blocks.context(usage_footer(locale, agent=agent, usage=usage)))
     btns: list[dict] = []
     if report_url and final:
         # url 按钮不产生回调，`action_id` 只用来占位。

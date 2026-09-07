@@ -276,6 +276,10 @@ export async function resolveTarget(accountId, opts = {}) {
     return { agentSpaceId: cfg.agent_space_id, credentials: undefined, accountId: id,
              scope: "cross-payer", region: cfg.region || REGION, probeOnly: true };
   }
+  // 🔴 confused-deputy 防御（见 role_guard.mjs）：ARN 指向别的账号就拒绝 ——
+  //    否则判读 skill 会被上传进攻击者的 space。
+  const { assertRoleBelongsTo } = await import("./role_guard.mjs");
+  assertRoleBelongsTo(cfg.trigger_role_arn, id);
   const { STSClient, AssumeRoleCommand } = await import("@aws-sdk/client-sts");
   const sts = new STSClient({});
   const r = await sts.send(new AssumeRoleCommand({

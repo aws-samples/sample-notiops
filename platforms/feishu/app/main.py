@@ -26,7 +26,6 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTriggerResponse,
 )
 
-from platforms.feishu.app import skill_commands
 from core import bedrock_intent
 from core import nl_router
 from core import chat_history
@@ -35,11 +34,6 @@ from core import dispatch_compose
 from core import i18n
 from core.feishu_card import card_config
 from core import locale_resolver
-# webhook_dispatch is retained ONLY for skill_commands' `/skills run` path,
-# which still POSTs to the single fixed Agent Space. The @-mention
-# investigate path below uses idle's cross-account STS+API instead — see
-# the dispatch rationale block in on_card_action / _handle_edit_dispatch_submit.
-from core import webhook_dispatch
 from core import skill_registry
 from core import skill_dispatcher
 from core import llm_pref_resolver
@@ -432,19 +426,11 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
         elif root_id:
             locale_resolver.lock_for_thread(PLATFORM, root_id, locale)
 
-    # `/skills ...` short-circuit — same pattern as slack.
     if not ddb_state.put_new_event(event_id, platform=PLATFORM, chat_id=chat_id,
                                    root_message_id=msg.message_id,
                                    user_id=user_id, raw_text=raw_text,
                                    locale=locale):
         logger.info("Duplicate event %s — skipped", event_id)
-        return
-
-    # `/skills ...` short-circuit — AFTER the duplicate-event guard so a
-    # message delivered more than once is handled exactly once. (BUG-2 fix.)
-    if skill_commands.maybe_handle_skill_command(
-            msg, chat_id=chat_id, user_id=user_id,
-            event_id=msg.message_id, raw_text=raw_text, locale=locale):
         return
 
     # Mark this Feishu thread as bot-active so subsequent follow-ups
@@ -459,15 +445,12 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
     if locale_source == "auto" and not root_id and msg.message_id:
         locale_resolver.lock_for_thread(PLATFORM, msg.message_id, locale)
 
-    # Authoring-intent nudge (Option A): "write me a skill" is not a run/
-    # investigate request — point the user to the admin `/skills create` path.
-    # Admin-aware (_is_admin returns True in open mode, i.e. SKILLS_ADMINS unset).
-    if skill_dispatcher.looks_like_authoring_request(raw_text):
-        _key = ("skill.author.hint" if skill_commands._is_admin(user_id)
-                else "skill.author.denied")
-        _reply(msg, i18n.t(_key, locale))
-        return
-
+    # ⚠️ 2026-09-06: the `/skills …` short-circuit and the authoring-intent nudge
+    # that used to sit here are GONE — skill authoring/running retired from the IM
+    # side entirely (it lives in the web console). See core/nl_router.py's closing
+    # comment. The skill **auto-dispatch** below still exists and dies with this
+    # Fargate path at M2.
+    #
     # ── Deterministic 0-token routing (core.nl_router) ───────────────────
     # Explicit case commands (`/案例` `/case` …) and clearly-worded NL case
     # requests ("我要开案例" / "open a case") route STRAIGHT to the case flow
@@ -879,20 +862,11 @@ def on_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     if action_tag == "edit_dispatch_submit":
         return _handle_edit_dispatch_submit(action_value, event)
 
-    # ── Authoring confirm-card button callbacks (save/edit/edit-submit/cancel) ─
-    if action_tag in (skill_commands.ACTION_SAVE, skill_commands.ACTION_EDIT,
-                      skill_commands.ACTION_EDIT_SUBMIT, skill_commands.ACTION_CANCEL):
-        try:
-            if action_tag == skill_commands.ACTION_SAVE:
-                return skill_commands.handle_author_save(action_value, event, event_id)
-            if action_tag == skill_commands.ACTION_EDIT:
-                return skill_commands.handle_author_edit(action_value, event, event_id)
-            if action_tag == skill_commands.ACTION_EDIT_SUBMIT:
-                return skill_commands.handle_author_edit_submit(action_value, event, event_id)
-            return skill_commands.handle_author_cancel(action_value, event, event_id)
-        except Exception as e:
-            logger.exception("skill authoring action crashed: %s", e)
-            return _toast(i18n.t("skill.error.unexpected", "zh"))  # Security: detail → CloudWatch
+    # ⚠️ 2026-09-06: the four skill-**authoring** button callbacks (save / edit /
+    # edit-submit / cancel) used to be handled here. Authoring retired from IM
+    # entirely — `platforms/feishu/app/skill_commands.py` and
+    # `core/skill_authoring.py` are deleted. A stale card from before this deploy
+    # falls through to the unknown-action toast below, which is the right answer.
 
     # ── 🔄 Switch skill: user picked a different skill from the body picker ──
     if action_tag == skill_dispatcher.ACTION_SWITCH_SKILL:
@@ -968,8 +942,8 @@ def on_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     #   3. Latency is equivalent: both are sub-second "fire" operations that
     #      just return a task_id; the actual investigation runs async for
     #      minutes and reports back via EventBridge. The user perceives no diff.
-    #   core/webhook_dispatch.py is left in the tree (used by skill_commands'
-    #   /skills run for now) but the @-mention investigate path uses STS+API.
+    #   core/webhook_dispatch.py is left in the tree (case_flow + push_handler +
+    #   dingtalk still use it) but the @-mention investigate path uses STS+API.
     #
     # incident_id stays as the LOCAL routing key (`<platform>-<event_id>`) — it
     # keys the Conversations row that progress-poller / report-handler use to

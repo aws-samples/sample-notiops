@@ -22,9 +22,10 @@ _SSM_PARAMETER = "/notiops/agent/model_id"
 #
 # 历史约束已解除（留着，因为它解释了为什么这个默认值长期落后于模型目录）：本函数的
 # 返回值喂给 bedrock_intent / next_steps / case_analyze / skill_dispatcher /
-# case_classifier / progress_card ×2 / skill_authoring 这 8 处调用，它们原先各自手搓
+# case_classifier / progress_card ×2 这 7 处调用（2026-09-06 前还有第 8 处
+# skill_authoring，随 skill 能力从 IM 侧退役而删除），它们原先各自手搓
 # Anthropic 原生 body，所以这里**必须**是 Claude，换非 Claude 模型 = ValidationException。
-# 2026-09-01 那 8 处已统一到 core/bot_llm.py → shared/llm_provider.py::invoke_llm
+# 2026-09-01 那几处已统一到 core/bot_llm.py → shared/llm_provider.py::invoke_llm
 # （Bedrock Converse），于是这个默认值跟随目录 default_model 改成 Grok 4.6。
 #
 # ⚠️ 仍不能填只在 bedrock-mantle 上架的模型（GPT-5.6 系列）：`core/bot_llm.py` 恒走

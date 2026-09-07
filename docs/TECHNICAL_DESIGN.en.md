@@ -1033,7 +1033,7 @@ The bot should be **zero-config plug-and-play for customers** — once deployed,
 | Cost Anomaly Detection | ⛔ OFF | `aws.ce` | Customer must create a Billing monitor first |
 | Trusted Advisor ERROR-status changes | ⛔ OFF | `aws.trustedadvisor` | Only effective on Business+ Support plans; only ERROR state changes are pushed, not refresh notifications; `TA_INCLUDE_CATEGORIES` defaults to allowlist `security,fault_tolerance,service_limits` |
 
-Each source maps to one EventBridge rule + one boolean CFN parameter (`EnableCloudWatchAlarmPush` / `EnableHealthPush` / ...).
+Each source maps to one EventBridge rule (`notiops-push-<source>`, DISABLED by default); the toggle is enabling/disabling the rule itself — there is no corresponding CFN parameter.
 
 #### 4.6.3 Event normalization
 

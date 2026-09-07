@@ -18,21 +18,26 @@
  4. **默认语言是 en**（飞书是 zh）。这里不硬编码：`msg.locale` 由 worker 用
     `locale_resolver` 解析好；`DEFAULT_LOCALE` 环境变量决定兜底值。
 
-只有 `case` 这一条走 LLM（`analyze_intent` 抽 display_id / 标题 / 正文），
-其余六条全是确定性渲染 —— 这是"压 token"这条决策的落点（§8.1）。
+**默认配置下**只有 `case` 这一条会烧 NotiOps 侧 token（`case_analyze` 与「提交开案例
+表单」那一刻，见 `Caps.case`），其余全是确定性渲染 —— 这是"压 token"这条决策的落点
+（§8.1）。用户显式 `/agent notiops` 之后 `chat` 也会走模型（见 `Caps.chat`）；默认值
+仍是 DevOps Agent 直连，所以开箱即用的口径不变。
 """
 from __future__ import annotations
 
 import logging
 import os
 
+from core import agent_chat
 from core import ddb_state
 from core import devops_chat
 from core import i18n
+from core import im_prefs
 from core import llm_pref_resolver
 from core import locale_resolver
 from core import model_catalog
-from platforms.common import ack_variants, chat_lease, live_card, long_answer
+from platforms.common import (ack_variants, chat_lease, live_card, long_answer,
+                              pref_commands)
 from platforms.common.im_types import Caps, ImMessage
 from platforms.slack import im_blocks
 
@@ -139,7 +144,7 @@ class SlackCaps(Caps):
         # thread_ts=None 会被 slack_sdk 直接丢掉（不会发成字符串 "None"）
         return get_client().chat_postMessage(**kwargs)
 
-    # ---- 七个能力 ----
+    # ---- 九个能力 ----
     def help(self, msg: ImMessage) -> None:
         """`/help` 命令菜单 —— 发 blocks，且正文必须过 `blocks.to_mrkdwn()`。
 
@@ -234,14 +239,17 @@ class SlackCaps(Caps):
         key = "model.set_dm" if is_dm else "model.set_chat"
         self.reply_text(msg, i18n.t(key, msg.locale, label=entry.label))
 
-    def skills(self, msg: ImMessage, arg: str) -> None:
-        """`/skills` —— 一句确定性的"去 Web 端"指路（0 token）。
+    def agent(self, msg: ImMessage, arg: str) -> None:
+        """`/agent [notiops|devops|default]` —— 这个会话的对话由谁答（0 token）。
 
-        与飞书同口径、同一次改动（理由见 `platforms/feishu/caps.py::skills`）：
-        2026-09-03 起 skills 不在 `/help` 菜单里，IM 侧也不再回那句自指的
-        "请用 `/skills create …`"。路由保留，否则 `/skills` 会掉进 `chat`。
+        与飞书**同一份**逻辑和文案（`platforms.common.pref_commands`）；两边各写一遍
+        必然漂移，见那个模块的文件头。
         """
-        self.reply_text(msg, i18n.t("skill.im_web_only", msg.locale))
+        self.reply_text(msg, pref_commands.agent_reply(msg, arg, platform=PLATFORM))
+
+    def web(self, msg: ImMessage, arg: str) -> None:
+        """`/web [on|off]` —— 联网搜索开关（0 token）。只对 NotiOps Agent 生效。"""
+        self.reply_text(msg, pref_commands.web_reply(msg, arg, platform=PLATFORM))
 
     def investigate(self, msg: ImMessage, text: str) -> None:
         """发起一次深度调查 —— **0 token**：只 create_backlog_task，NotiOps 侧不总结、
@@ -376,7 +384,10 @@ class SlackCaps(Caps):
                               locale=msg.locale, user_id=msg.user_id)
 
     def case(self, msg: ImMessage, command: str, case_id: str, text: str) -> None:
-        """案例路径 —— **唯一保留 LLM 的能力**（`analyze_intent` 抽 display_id/标题/正文）。
+        """案例路径 —— **默认配置下唯一会烧 NotiOps 侧 token 的能力**。
+        成因与两处真实调用点见 `platforms/feishu/caps.py::Caps.case` 的 docstring
+        （🔴 不是 `analyze_intent`：那是 2026-09-06 校正掉的旧说法；同一天把"唯一"
+        限定成了"默认配置下" —— `/agent notiops` 之后 `chat` 也走模型）。
 
         直接调 `platforms/slack/app/case_flow.py` 的现成实现（那 1300 行 Block Kit +
         modal 已经在线上跑了很久，重写只会引入回归）。注意参数顺序是
@@ -413,10 +424,18 @@ class SlackCaps(Caps):
                                         kind=type(e).__name__))
 
     def chat(self, msg: ImMessage, text: str) -> None:
-        """DevOps 对话直连 —— **NotiOps 侧 0 token**（`core.devops_chat`）。
+        """对话问答 —— **两条路，同一条消息**。由 `/agent` 开关（`core.im_prefs`）决定：
 
-        多轮上下文靠 `imchat#<channel_id>` 存的 `execution_id`（按 channel 归属，
-        不按用户拆 —— §15）。
+          · `devops`（默认）→ `core.devops_chat.run_devops_chat`，客户 DevOps Agent
+            直答，**NotiOps 侧 0 token**。多轮上下文靠 `imchat#<channel_id>` 存的
+            `execution_id`（按 channel 归属，不按用户拆 —— §15）。
+          · `notiops` → `core.agent_chat.run_agent_chat`，走我们的 AgentCore runtime，
+            **会消耗 token**。多轮上下文靠 `imagent#<channel_id>` 存的 runtime session
+            id（6 小时轮换，理由见 `core.ddb_state.im_agent_session_id`）。
+
+        ⚠️ 与飞书那份**逐字对齐**（分流只影响 ack 文案 / 调哪个 runner / 消息上
+        `agent=` `sources=` `usage=` 三个参数），排队、心跳、终版、截断落报告、兜底
+        全部共用下面这一份。
 
         答案发 blocks 而不是纯文本：要有状态标题（排队中/思考中/答完 + 计时）、过程行、
         正文超长时的「查看完整报告」外链 —— 纯文本这三样一样都做不到。
@@ -440,8 +459,18 @@ class SlackCaps(Caps):
         抢不到就把首条消息发成「排队中」，轮到自己**就地**转成「思考中」继续答；
         等不到也明说，不静默丢问题。
         """
+        # 第 -1 步：这个会话现在由谁答。**在发第一条消息之前**读 —— ack 文案和落款都要它。
+        agent, _src = im_prefs.resolve_agent(
+            platform=PLATFORM, chat_id=msg.chat_id, user_id=msg.user_id,
+            is_dm=msg.is_direct)
+        notiops = agent == im_prefs.AGENT_NOTIOPS
+
         session = ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
         question = (text or msg.text or "").strip()
+
+        # 来源 / 用量要等这一轮跑完才知道，而 `LiveCard` 的 `render` 回调只透传五个固定
+        # kwarg。所以放一个可变盒子让 `render=` 的闭包读（与飞书同一个做法）。
+        extra: dict = {"sources": [], "usage": {}}
 
         # 第 0 步：抢这个会话的"轮次"。`acquire()` 不阻塞 —— 先把消息发出去再等，
         # 否则用户在排队的那几分钟里一个字都看不到。
@@ -455,10 +484,10 @@ class SlackCaps(Caps):
         # 不是说法 —— 用户不会看到卡片自己改口。
         ack_seed = msg.message_id or msg.event_id
         ack = (i18n.t("im.chat.queued_body", msg.locale) if queued
-               else ack_variants.ack_body(ack_seed, msg.locale))
+               else ack_variants.ack_body(ack_seed, msg.locale, agent))
         try:
             resp = self._post(msg, blocks_out=im_blocks.answer_blocks(
-                ack, msg.locale, state=state, elapsed=0))
+                ack, msg.locale, state=state, elapsed=0, agent=agent))
         except Exception as e:                    # noqa: BLE001
             logger.error("caps.chat: ack postMessage failed: %s", type(e).__name__)
             resp = None
@@ -475,7 +504,8 @@ class SlackCaps(Caps):
                 render=lambda **kw: im_blocks.answer_blocks(
                     kw["body"], msg.locale,
                     steps=kw["steps"], state=kw["state"], elapsed=kw["elapsed"],
-                    report_url=kw["report_url"]),
+                    report_url=kw["report_url"],
+                    agent=agent, sources=extra["sources"], usage=extra["usage"]),
                 update=_update,
             )
             # 心跳：agent 可以整整 5 分钟不吐一个事件（现网 cd0f6745），只靠 emit 驱动
@@ -492,22 +522,43 @@ class SlackCaps(Caps):
             if queued:
                 # 排队转正：就地把这条消息变成「思考中」（不新发一条）。
                 if live is not None:
-                    live.set_ack(ack_variants.ack_body(ack_seed, msg.locale))
+                    live.set_ack(ack_variants.ack_body(ack_seed, msg.locale, agent))
                     live.set_state("thinking")
                     live.flush(force=True)
                 # 前一轮很可能刚写过 execution_id，重新读一遍才是最新的上下文。
                 session = ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
 
             # 第 3 步：跑，并把过程实时刷回那条消息。
-            result = devops_chat.run_devops_chat(
-                text=question, locale=msg.locale,
-                account_id=msg.account_id or None,
-                session=session,
-                emit=(live.emit if live is not None else None),
-            )
-            sess = result.get("session") or {}
-            if sess.get("execution_id"):
-                ddb_state.put_im_chat_session(PLATFORM, msg.chat_id, sess)
+            if notiops:
+                # 短别名直接透传（`core.llm_config` 认短别名），不在这里翻译 ——
+                # 见 core/model_catalog.py 顶部关于两套别名命名空间的说明。
+                model_alias, _msrc = llm_pref_resolver.resolve(
+                    platform=PLATFORM, chat_id=msg.chat_id, user_id=msg.user_id,
+                    is_dm=msg.is_direct)
+                result = agent_chat.run_agent_chat(
+                    question, locale=msg.locale,
+                    session_id=ddb_state.im_agent_session_id(PLATFORM, msg.chat_id),
+                    model=model_alias,
+                    account_id=msg.account_id or None,
+                    web_search=im_prefs.resolve_web(
+                        platform=PLATFORM, chat_id=msg.chat_id,
+                        user_id=msg.user_id, is_dm=msg.is_direct)[0],
+                    emit=(live.emit if live is not None else None),
+                )
+                # 填盒子 —— 必须在 `finish()` 之前。
+                extra["sources"] = result.get("sources") or []
+                extra["usage"] = result.get("usage") or {}
+                # 这条路**不写 `imchat#`**：会话连续性由 `imagent#` 那行负责。
+            else:
+                result = devops_chat.run_devops_chat(
+                    text=question, locale=msg.locale,
+                    account_id=msg.account_id or None,
+                    session=session,
+                    emit=(live.emit if live is not None else None),
+                )
+                sess = result.get("session") or {}
+                if sess.get("execution_id"):
+                    ddb_state.put_im_chat_session(PLATFORM, msg.chat_id, sess)
         finally:
             # 租约必须在 finally 里放；心跳线程同理（Lambda 返回后冻结环境，
             # 没 join 的 daemon 线程是下一次调用的幽灵）。`finish()` 会再 close 一次。
@@ -532,7 +583,9 @@ class SlackCaps(Caps):
             return
         # 首条没发出去 / 这条已经改不动了 → 再发一条新消息；还不行才退纯文本。
         blocks_out = im_blocks.answer_blocks(body, msg.locale,
-                                             report_url=report_url)
+                                             report_url=report_url, agent=agent,
+                                             sources=extra["sources"],
+                                             usage=extra["usage"])
         try:
             resp = self._post(msg, blocks_out=blocks_out)
         except Exception as e:                    # noqa: BLE001
@@ -541,5 +594,7 @@ class SlackCaps(Caps):
         if resp is None or not im_blocks.ts_of(resp):
             # blocks 发失败 → 答案本身不能丢，退成文本（丢的只是消息外观：状态标题 /
             # 过程行 / 报告按钮；报告链接在 `body` 的截断提示里，不依赖按钮）。
-            self.reply_text(msg, body + "\n\n"
-                            + i18n.t("router.direct_no_token", msg.locale))
+            # ⚠️ 落款走 `usage_footer` 而**不是**硬编码 `router.direct_no_token`：
+            # 走模型那条路上那句是假的。
+            self.reply_text(msg, body + "\n\n" + im_blocks.usage_footer(
+                msg.locale, agent=agent, usage=extra["usage"]))

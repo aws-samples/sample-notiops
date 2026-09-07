@@ -372,25 +372,54 @@ Two things you must know first:
 2. **Interactivity & Shortcuts** → turn on → Request URL (buttons and modal submissions
    both go here)
 3. **Slash Commands** → Create New Command for each one; the Request URL is the same
+   (**this step is optional** — see the end of §2.4: every command also works without the
+   slash, and registering only buys you Slack's native `/` autocomplete)
 
 ### 2.4 Slash commands
 
 | Command | What it does |
 |---|---|
 | `/devops` | talk to the DevOps Agent directly (0 tokens) |
+| `/agent` | pick which agent answers: `/agent devops` (default, 0 tokens) \| `/agent notiops` (goes through the model, **consumes tokens**); no argument shows the current value |
+| `/web` | web search for the NotiOps Agent: `/web on` \| `/web off` (off by default; no effect on the DevOps direct path) |
 | `/investigate` | start a deep investigation |
 | `/case` · `/cases` | cases: open / list / view / reply |
 | `/model` | switch model (`/model list` shows the catalog) |
 | `/language` | switch language (`/language zh` \| `/language en`) |
-| `/skills` | list the available skills |
 | `/help` | command menu |
 
+> 📌 **Upgrade note: `/skills` was retired from the IM side on 2026-09-06** (the skill
+> feature lives on in full in the web console). If you registered it from an older
+> version of this guide, **delete it by hand** under **Slash Commands** in your Slack
+> App config — that registry lives in your own app, we cannot change it. Leaving it is
+> harmless: typing `/skills` returns the command menu at 0 tokens, it just keeps
+> showing up in autocomplete.
+
 > ⚠️ Slack command names accept only lowercase letters, digits, hyphens and
-> underscores, so **Chinese slash commands cannot be registered** (on Feishu `/调查`
-> and `/开案例` work fine). The Chinese entry points on Slack are the other two, both
+> underscores, so **Chinese slash commands cannot be registered** (on Feishu `/调查`,
+> `/开案例`, `/智能体` and `/联网` work fine). The Chinese entry points on Slack are the other two, both
 > fully supported: **Chinese natural language** ("帮我调查一下 xxx", "我要开案例") and
 > **`@bot 调查 xxx`**. Switching language also understands Chinese phrasing
 > ("切换成中文").
+
+> 💡 **Registering the slash commands is optional — every command above also works
+> without the slash.** The leading slash is optional in the parser itself
+> ([`core/nl_router.py`](../core/nl_router.py), `_cmd()`: `^\s*/?\s*(?:...)`), so
+> `@bot agent notiops`, `@bot web on`, `@bot 智能体 notiops` and `@bot 联网 on` are
+> **exactly equivalent** to `/agent notiops` and `/web on` (in a DM you can drop the
+> `@bot` too). Registering only buys Slack's native `/` autocomplete and argument hints.
+>
+> Why we cannot register them for you: the slash-command registry lives in **your own
+> Slack app configuration**, and changing it needs a workspace configuration token (write
+> access, expires in 12 hours, only a human can mint it in the Slack admin UI) — NotiOps
+> does not hold, and does not want to hold, write credentials for your IM. Feishu has no
+> such registry (`/智能体` is just message text), which is why nothing is needed there.
+>
+> **What it looks like when you skip it**: the Slack client intercepts it on the spot
+> (Slackbot answers "that is not a valid command") and the request never reaches API
+> Gateway — so there is nothing in the ingress / worker logs; don't go looking. That is a
+> different failure from `dispatch_failed`, which means the command **is** registered but
+> nothing answered within 3 seconds (see §2.5).
 
 ### 2.5 Verify
 

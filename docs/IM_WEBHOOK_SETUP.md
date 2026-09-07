@@ -329,23 +329,46 @@ aws secretsmanager put-secret-value --secret-id notiops/slack-signing-secret \
    `app_mention` · `message.im` · `message.channels` · `message.groups`
 2. **Interactivity & Shortcuts** → 打开 → Request URL（按钮、弹窗提交都走这里）
 3. **Slash Commands** → 逐条 Create New Command，Request URL 都是同一个
+   （**这一步是可选的** —— 见 §2.4 末尾：所有命令都能不带斜杠用，注册只是为了拿 Slack
+   原生的 `/` 自动补全）
 
 ### 2.4 斜杠命令清单
 
 | Command | 说明 |
 |---|---|
 | `/devops` | 直接跟 DevOps Agent 对话（0 token） |
+| `/agent` | 换对话用的 agent：`/agent devops`（默认，0 token）\| `/agent notiops`（走模型，**会消耗 token**）；不带参数是查看当前值 |
+| `/web` | NotiOps Agent 的联网搜索开关：`/web on` \| `/web off`（默认关；DevOps 直连那条路上不生效） |
 | `/investigate` | 发起深度调查 |
 | `/case` · `/cases` | 案例：开 / 列表 / 查看 / 回复 |
 | `/model` | 切换模型（`/model list` 看清单） |
 | `/language` | 切中英文（`/language zh` \| `/language en`） |
-| `/skills` | 列出可用 skill |
 | `/help` | 命令菜单 |
 
+> 📌 **升级提示：`/skills` 已于 2026-09-06 从 IM 侧退役**（skill 能力完整保留在 Web
+> 控制台）。如果你之前按旧文档注册过它，请到 Slack App 配置的 **Slash Commands** 里
+> **手工删掉**这一条 —— 注册表在你自己的 App 里，我们改不了。不删也不会出错：打了
+> `/skills` 会 0 token 回一张命令菜单，只是它还会出现在自动补全里。
+
 > ⚠️ Slack 的 command 名只接受小写字母/数字/连字符/下划线，**中文命令注册不上**
-> （飞书那边 `/调查`、`/开案例` 是可以的）。Slack 上的中文入口靠另外两条，都能用：
+> （飞书那边 `/调查`、`/开案例`、`/智能体`、`/联网` 是可以的）。Slack 上的中文入口靠另外两条，都能用：
 > **中文自然语言**（「帮我调查一下 xxx」「我要开案例」）和 **`@bot 调查 xxx`**。
 > 语言切换本身也支持中文说法（「切换成中文」）。
+
+> 💡 **注册斜杠命令是可选的 —— 上面每一条都能不带斜杠用。** 解析器里斜杠本身是可选的
+> （[`core/nl_router.py`](../core/nl_router.py) 的 `_cmd()`：`^\s*/?\s*(?:...)`），所以
+> `@bot agent notiops`、`@bot web on`、`@bot 智能体 notiops`、`@bot 联网 on` 与
+> `/agent notiops`、`/web on` **完全等价**（DM 里连 `@bot` 都不用）。注册买到的只是 Slack
+> 原生的 `/` 自动补全与参数提示。
+>
+> 为什么不能替你注册：斜杠命令的注册表在**你自己的 Slack App 配置里**，改它要一把
+> workspace configuration token（写权限、12 小时过期、只能人工在 Slack 后台生成）——
+> NotiOps 不持有、也不打算持有你 IM 的写凭证。飞书没有这层注册表（`/智能体` 就是一条
+> 普通消息文本），所以飞书侧一步都不用做。
+>
+> **没注册时的症状**：Slack 客户端**当场就拦下了**（Slackbot 回一句「不是有效命令」），
+> 请求根本不会到 API Gateway —— 所以 ingress / worker 日志里查不到任何东西，别去翻日志。
+> 这与 `dispatch_failed` 是两回事：后者是命令**已注册**、但 3 秒内没应答（见 §2.5）。
 
 ### 2.5 验证
 

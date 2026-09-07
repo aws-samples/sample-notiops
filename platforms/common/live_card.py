@@ -89,6 +89,49 @@ def steps_md(steps, locale: str) -> str:
     return i18n.t("im.chat.steps_title", locale) + "\n\n" + body
 
 
+#: 一张卡上最多列几条来源。窄工具集下 `aws_docs_search` + `web_search` 一轮能带回十几条，
+#: 全列出来正文就被参考文献吃掉了（飞书 3500 / Slack 2900 是硬上限）。
+MAX_SOURCES = 5
+
+#: 单条来源标题的长度上限 —— 文档标题动辄七八十字符。
+MAX_SOURCE_LINE = 120
+
+
+def sources_md(sources, locale: str) -> str:
+    """把 `core.agent_chat` 收集的来源渲染成一段 markdown。**两个平台共用这一份**
+    （理由同 :func:`steps_md`）。
+
+    只有 NotiOps Agent 那条路会有来源（`aws_docs_*` / `web_search` 的结果）；
+    DevOps Agent 直连那条路我们拿不到它的引用，`sources` 恒为空 → 返回空串 →
+    调用方整块不渲染。
+
+    每条来源是 `{"icon","title","detail"}`（与 Web 端 SSE 同一形状）。`detail` 是 URL
+    时渲染成链接，否则只出标题 —— **不许**把非 URL 的 detail 硬塞进 `(...)`，那会让
+    飞书/Slack 渲染出一个点不开的假链接。
+    """
+    items = []
+    for s in (sources or []):
+        if not isinstance(s, dict):
+            continue
+        title = str(s.get("title") or "").strip()
+        detail = str(s.get("detail") or "").strip()
+        if not title and not detail:
+            continue
+        label = title or detail
+        if len(label) > MAX_SOURCE_LINE:
+            label = label[:MAX_SOURCE_LINE] + "…"
+        if detail.startswith("http://") or detail.startswith("https://"):
+            items.append(f"- [{label}]({detail})")
+        else:
+            items.append(f"- {label}")
+        if len(items) >= MAX_SOURCES:
+            break
+    if not items:
+        return ""
+    # 标题与列表之间必须留空行 —— 同 `steps_md` 的那条渲染坑。
+    return i18n.t("im.chat.sources_title", locale) + "\n\n" + "\n".join(items)
+
+
 class LiveCard:
     """一条消息的实时刷新器。**永不抛异常** —— 它只是个显示层。
 

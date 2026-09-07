@@ -419,6 +419,37 @@ ORG_FLAG=""
 #    而漏掉的表现和上面一样：多账号那一整套静默地不存在。
 #    顺带只数 ACTIVE：SUSPENDED 账号接不进来，算进去会虚报。
 if [ "$MULTI_ACCOUNT_MODE" != true ]; then
+  # 🔴 降级守卫（2026-09-06 交叉 review 抓出）：现网**已经是**多账号部署时，
+  #    不带 flag 重跑不是「少个功能」而是**降级现网**：
+  #      · LOCKED_ACCOUNT_ID 被重新锁死（成本分析/深度调查退回单账号）
+  #      · PHD SNS 的 PrincipalOrgID 整组放行语句被删（成员账号 Publish 变 AccessDenied）
+  #      · 一键接入按钮还在，点了报 StackSetNotFound
+  #    所以这里的默认值与「首装询问」相反：保护现网状态，默认**保持多账号**。
+  #    判据用「member-onboarding StackSet 存在」—— 它只在 --multi-account 路径创建。
+  if aws cloudformation describe-stack-set --stack-set-name notiops-member-onboarding \
+       --region "${DEPLOY_REGION:-us-east-1}" >/dev/null 2>&1; then
+    echo ""
+    echo "  $(t "⚠ 现网已是多账号部署（member-onboarding StackSet 存在），但本次没带 --multi-account。" "⚠ The live deployment is multi-account (the member-onboarding StackSet exists), but --multi-account was NOT passed.")"
+    echo "    $(t "按单账号重部会【降级现网】：重锁账号闸门、删掉 PHD 的组织放行、一键接入报错。" "Redeploying single-account would DOWNGRADE it: relock the account gate, drop the PHD org-wide allow, break one-click onboarding.")"
+    if [ -t 0 ]; then
+      read -p "    $(t "保持多账号模式继续？[Y/n]: " "Keep multi-account mode? [Y/n]: ")" _keep_multi || true
+      case "${_keep_multi:-}" in
+        [nN]*)
+          echo "    $(t "⚠ 按你的选择降级为单账号部署 —— 上述三个后果会真实发生。" "⚠ Downgrading to single-account per your choice — the three consequences above WILL happen.")"
+          ;;
+        *)
+          MULTI_ACCOUNT_MODE=true
+          echo "    $(t "✓ 保持多账号模式。" "✓ Keeping multi-account mode.")"
+          ;;
+      esac
+    else
+      MULTI_ACCOUNT_MODE=true
+      echo "    $(t "(非交互环境) 自动保持多账号模式，避免静默降级现网。" "(Non-interactive) keeping multi-account mode to avoid silently downgrading the live deployment.")"
+    fi
+    echo ""
+  fi
+fi
+if [ "$MULTI_ACCOUNT_MODE" != true ]; then
   _org_probe=$(aws organizations describe-organization \
     --query 'Organization.[Id,MasterAccountId]' --output text 2>/dev/null || echo "")
   if [ -n "$_org_probe" ]; then

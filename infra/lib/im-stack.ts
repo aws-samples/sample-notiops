@@ -72,6 +72,15 @@ export class ImStack extends cdk.Stack {
     // 群白名单（可选）。留空 = 不限制（与长连接时代行为一致）。
     const allowedChatIds = (this.node.tryGetContext("imAllowedChatIds") as string || "").trim();
 
+    // NotiOps agent runtime ARN —— `/agent notiops` 那条路（走模型）要用。
+    // **与 BackendStack 的 BFF 读的是同一个 `-c agentRuntimeArn`**（setup.sh:767 的
+    // `$AGENT_ARN_FLAG` 已经挂在 :1288 的 `--all` 上，所以 setup.sh 不用改），
+    // 于是 web 和 IM 必然指向同一个 runtime。
+    // 留空是允许的、且**不是**降级：`core/agent_chat.py::configured()` 会返回 false，
+    // 用户发 `/agent notiops` 当场收到明确拒绝（`agent.not_configured`），而不是被
+    // 悄悄丢回 devops 直连。见 im-core.ts 里 `agentRuntimeArn` prop 的注释。
+    const agentRuntimeArn = (this.node.tryGetContext("agentRuntimeArn") as string || "").trim();
+
     // ─── 依赖层 ───────────────────────────────────────────────────────────
     // lark_oapi + slack_sdk + boto3/botocore。**必须**用 scripts/build_im_layer.sh 构建
     // （--platform manylinux2014_x86_64），否则 Mac 上装出来的是 macOS 二进制，
@@ -171,6 +180,7 @@ export class ImStack extends cdk.Stack {
       reportsCdnDomain: props.reportsCdnDomain,
       lockedAccountId,
       allowedChatIds,
+      agentRuntimeArn,
       devopsAgentSpaceId: props.devopsAgentSpaceId,
       code: imCode,
       layer: imLayer,

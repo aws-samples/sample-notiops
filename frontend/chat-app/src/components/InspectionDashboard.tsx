@@ -937,7 +937,16 @@ export default function InspectionDashboard({
             <div role="group"
               aria-label={zh ? "选择账号" : "Select accounts"}
               style={{
-                position: "absolute", zIndex: 30, marginTop: 30, right: 0,
+                /* 🔴 `top: "100%"` 必须显式给（2026-09-06 实测踩中）。
+                   没有 `top` 时绝对定位元素落在「静态位置」，而 flex 容器
+                   （工具栏是 `display:flex; alignItems:center`）里绝对定位
+                   子元素的静态位置是**被当成唯一 flex item 垂直居中** ——
+                   弹层 ~180px 高在 ~26px 高的按钮行里"居中"，等于往上探出
+                   ~77px，顶部（标题 + 第一行「部署账号」）扎进页面顶栏底下
+                   被盖住。客户看到的列表里"没有管理账号"，实际是被遮住了。
+                   弹层越高（账号越多）遮得越多；jsdom 不做布局，渲染测试
+                   抓不到布局本身，靠 inspection.render.test.tsx 钉住 top 属性。 */
+                position: "absolute", zIndex: 30, top: "100%", marginTop: 6, right: 0,
                 background: C.card, border: `1px solid ${C.line}`,
                 borderRadius: 10, padding: 10, minWidth: 250, maxWidth: 330,
                 boxShadow: "0 8px 24px rgba(0,0,0,.14)",

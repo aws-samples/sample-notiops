@@ -73,13 +73,23 @@ class ImAction:
 
 @runtime_checkable
 class Caps(Protocol):
-    """七个能力 + 传输，由平台层实现。
+    """九个能力 + 传输，由平台层实现。
 
     每个方法都**必须自己完成回复**（发文本或发卡片），返回值只用于日志 / 测试断言。
     这样决策层完全不碰传输，Slack 的 Block Kit 与飞书的 v2 card 各自演进不互相牵连。
 
-    ⚠️ 只有 `case` 这一条允许走 LLM（`analyze_intent` 抽 display_id / 标题 / 正文）。
-    其余六条全是确定性渲染 —— 这是"压 token"这条决策的落点（§8.1）。
+    ⚠️ 会烧 NotiOps 侧 token 的只有两条路径（2026-09-06 校正，其余七条全是确定性渲染）：
+
+      1. `case` —— 但**不是**在路由/抽参那一步（`display_id` / 标题 / 正文由
+         `core.nl_router` 确定性抽出，`analyze_intent` 在活路径上已不再被调用）。
+         花钱的是下游两处：`case_analyze` 的工单总结，和 `case_create` **提交表单**
+         时的 `core.case_classifier`（整份服务目录进 prompt，全 IM 最贵的单次输入）。
+      2. `chat` **且** `im_prefs.resolve_agent(...) == "notiops"` —— 走
+         `core.agent_chat` 打 NotiOps Agent（模型 + 窄工具集）。默认值是
+         `"devops"`（直连客户自己的 DevOps Agent，NotiOps 侧 0 token），用户要
+         显式 `/agent notiops` 才切过去。见 `core/agent_chat.py` 头部注释。
+
+    `agent` / `web` 这两条**本身**是 0 token 的开关（只读写一行 DDB 偏好）。
 
     `investigate_status` 与 `investigate` 的分工：前者**回读一条已有调查**（0 token，
     不新建任何东西），后者**新起一条**（付费）。分成两个能力而不是在 `investigate`
@@ -89,14 +99,16 @@ class Caps(Protocol):
     # ---- 传输 ----
     def reply_text(self, msg: ImMessage, text: str) -> None: ...
 
-    # ---- 七个能力 ----
+    # ---- 九个能力 ----
     def help(self, msg: ImMessage) -> None: ...
 
     def language(self, msg: ImMessage, arg: str, lang: str = "") -> None: ...
 
     def model(self, msg: ImMessage, model_arg: str) -> None: ...
 
-    def skills(self, msg: ImMessage, arg: str) -> None: ...
+    def agent(self, msg: ImMessage, arg: str) -> None: ...
+
+    def web(self, msg: ImMessage, arg: str) -> None: ...
 
     def investigate(self, msg: ImMessage, text: str) -> None: ...
 
@@ -111,7 +123,11 @@ class Caps(Protocol):
 # 决策层认识的能力名 —— 与 core.nl_router.Route.kind 一一对应，加一条 "chat" 兜底。
 # 保持这份清单是**闭集**：worker 里 `getattr(caps, kind)` 之前先查它，避免一个畸形
 # Route 变成任意方法调用。
+#: ⚠️ `"skills"` 2026-09-06 从这里删掉 —— skill 能力完整地在 Web 端，IM 侧不再有入口
+#: （详见 `core/nl_router.py` 文件末尾那段）。删的是**闭集里的一条**，所以万一别处漏了
+#: 一个 `Route(kind="skills")`，worker 的白名单检查会把它挡在 `getattr` 之前而不是
+#: 抛 AttributeError。
 KINDS: frozenset[str] = frozenset({
-    "help", "language", "model", "skills", "investigate", "investigate_status",
-    "case", "chat",
+    "help", "language", "model", "agent", "web", "investigate",
+    "investigate_status", "case", "chat",
 })

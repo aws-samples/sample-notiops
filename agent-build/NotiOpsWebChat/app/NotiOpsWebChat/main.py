@@ -1237,7 +1237,8 @@ import asyncio as _asyncio  # noqa: E402
 
 _DEVOPS_POLL_INTERVAL = int(_os.environ.get("NOTIOPS_DEVOPS_POLL_SEC", "8"))   # 轮询间隔（秒）
 # 最长**同步**等待。⚠️ 硬约束：BFF Lambda 上限 900s(AWS 平台硬顶，不可再高)。总墙钟 =
-# ①cycle-1 模型决策(带 ~17K 工具 schema，约 10-30s) + ②发起调查 + ③本轮询循环(waited) +
+# ①cycle-1 模型决策(带本主题的工具 schema：开了深度调查开关是 3.3K，没开的 investigate
+# 主题是 34.7K —— 实测表见 `_tools_for_topic` 上方；约 10-30s) + ②发起调查 + ③本轮询循环(waited) +
 # ④终态后读摘要+落 S3+收尾(约 10-40s) + ⑤模型收尾一句。waited 只计循环本身，故必须给前后
 # 开销留足余量，否则会被 Lambda **硬杀**（用户看到报错，而非我们的"稍后续查"优雅提示）。
 # 取 840s(14min)：较此前 780s 延长 1 分钟，仍留 ~60s 兜底。想更久：调大 env
@@ -1490,6 +1491,80 @@ def _topic_has_devops(topic) -> bool:
     return (topic or "general") not in _DEVOPS_TOPICS_EXCLUDED
 
 
+# ── 工具 schema 的常量成本（实测，2026-09-06）──────────────────────────────────
+# 这些数字是**每一轮都要重发**的固定开销（工具 schema 进 `toolConfig`，不是历史、不受
+# conversation manager 裁剪影响）。口径：把每个工具的 `TOOL_SPEC`（name + description +
+# inputSchema）按 Bedrock Converse `toolConfig` 的形状 `json.dumps` 后用 cl100k_base 计数。
+# 复现方法：在装了 strands 的环境里 import 本模块，对 `_tools_for_topic(<topic>)` 的返回
+# 逐个取 `t.tool_spec` 序列化计数即可（本地 mac 没装 strands，跑不了；跑在 agent 容器里）。
+#
+#   工具组                          个数    tokens
+#   基础本地工具 `tools`              7      2,022
+#   `_case_tools`                     9      1,492
+#   `_resource_tools`(RDS/EC2)        7        857
+#   `_devops_tools`                   5      1,289
+#   `_xacct_fallback_tools`           1        288
+#   aws-api MCP(call_aws 等)          2      1,751
+#   cost-agent MCP                    2       ~600
+#   finops MCP  CORE / FULL         7 / 18   9,127 / 17,045
+#   investigation MCP CORE / FULL   8 / 22   8,471 / 17,574
+#
+#   → 按主题合计：`general` **24,320**(42 个) · `investigate` 34,712 · `finops` 33,527
+#     · 深度调查强制(devops_deep) 3,311(12 个) · **`im-chat` 2,055(5 个)**
+#
+# ⚠️ 在别处引用这些数字时**指到这里**，不要抄一份：此前 `main.py` 有三处注释写「~17K
+# 工具 schema」，实际 17,045 只是 **finops 那 18 个工具自己**的量，真实总量被低估了
+# 43%~104% —— 一个被抄了三遍的错口径，比没有数字更糟。
+#
+# ── IM 侧对话的窄工具集（主题 `im-chat`）──────────────────────────────────────
+# IM 的 `chat` 走 NotiOps Agent 时用**这一组、只有这一组**工具，不是 web 那 42 个。
+# 理由（实测 2026-09-06，cl100k_base，按 Converse `toolConfig` 序列化后计）：
+#   web `general` 主题 42 个工具 = 24,320 tokens 的 schema，**每一轮都重发**；
+#   这里 5 个 = 2,055 tokens。**省 22,265 / −91.5%**。
+# IM 是被动入口（群里 @ 一下就是一轮、一个群一天几十轮），schema 常量成本比 web 敏感得多；
+# 而 IM 侧要的能力恰好就两件：查 AWS 文档 / 查自己账号里的东西（外加可选联网）。
+# case 管理、RDS/EC2 巡检、FinOps、故障调查那些主题工具在 IM 上另有确定性入口
+# （`core/nl_router.py` 的 `case` / `investigate` 等 kind，0 token 直连），不需要模型挑工具。
+#
+# ⚠️ 这个列表**按名字**挑，挑不到就少一个，**不报错**：上游任何一个工具改名/下线时，IM 只是
+# 少一个能力，不会连 agent 都起不来。名字对不上的代价是静默降级，所以
+# `tests/test_im_chat_narrow_tools.py` 会断言这 5 个名字都还挑得到。
+_IM_CHAT_TOPIC = "im-chat"
+
+#: `tools`（基础本地工具）里 IM 要留的 3 个。**顺序固定** —— 工具顺序进 prompt，抖动会
+#: 让 Bedrock 的 prompt 缓存失效。
+_IM_CHAT_LOCAL_TOOL_NAMES = ("aws_docs_search", "aws_docs_read", "web_search")
+
+
+def _tool_name_of(t) -> str:
+    """Strands 工具的名字。`@tool` 装饰后是 `tool_name`；MCP 代理来的也是这个字段。"""
+    return str(getattr(t, "tool_name", None) or getattr(t, "__name__", "") or "")
+
+
+def _pick_tools(pool, names):
+    """按 `names` 的**固定顺序**从 pool 里挑；挑不到的名字跳过（不抛）。"""
+    idx = {_tool_name_of(t): t for t in pool}
+    return [idx[n] for n in names if n in idx]
+
+
+def _im_chat_tools(account_id: str | None):
+    """IM 对话的窄工具集：AWS 文档 ×2 +（可选）联网 + 云上只读查询。
+
+    云上查询那一半**必须按账号分流**，理由与 `_tools_for_topic` 里完全一样：
+    aws-api-mcp 是容器级常驻子进程、凭据在 `start()` 时锁死 = 部署账号，跨账号会串号
+    （查成员账号却返回部署账号数据）。所以跨账号时换成按 account AssumeRole 的原生 boto3
+    只读兜底 `aws_readonly`（288 tokens，比 call_aws + suggest 的 1,751 还便宜）。
+    """
+    _t = _pick_tools(tools, _IM_CHAT_LOCAL_TOOL_NAMES)
+    if _is_cross_account(account_id):
+        _t += _xacct_fallback_tools
+    else:
+        _t += _aws_api_tools()
+    log.info("im-chat narrow tool set: %d tools (xacct=%s)",
+             len(_t), _is_cross_account(account_id))
+    return _t
+
+
 def _tools_for_topic(topic, account_id: str | None = None, devops_deep: bool = False):
     """工具选择(**账号感知 + 深度调查感知**)。
 
@@ -1503,6 +1578,12 @@ def _tools_for_topic(topic, account_id: str | None = None, devops_deep: bool = F
     DevOps Agent。此时**只挂 devops 工具 + 文档/基础工具**,不挂 rds_*/ec2_*/MCP/boto3 兜底等
     直接查询工具——从工具层面强制模型走 investigate_live(prompt 强制 + 无替代工具,双保险)。
     devops_agent 走 core/devops_agent.py,已按 account AssumeRole trigger role,跨账号安全。"""
+    # IM 侧对话:窄工具集,**在所有分支之前**返回(见 `_im_chat_tools`)。
+    # 放最前面是刻意的:IM 的深度调查不走这里(`core/nl_router.py` 的 `investigate` kind 直连
+    # DevOps Agent、0 token),所以 `devops_deep` 对 im-chat 无意义,不该让它把窄集撑回去。
+    if (topic or "") == _IM_CHAT_TOPIC:
+        return _im_chat_tools(account_id)
+
     if devops_deep and _topic_has_devops(topic):
         # 强制深度调查:只给 devops 工具 + 基础工具(tools 含文档/web_search 等,用于概念问答兜底)。
         # 不挂任何直接查环境的工具,模型只能走 investigate_live。
@@ -1811,6 +1892,32 @@ _TOPIC_FOCUS = {
         "  （想显式控制完整列表也可用 `aws_whats_new_report(...)`，行为一致。）\n"
         "- 始终给**官方链接**作为来源。目标：既帮用户关注新服务，又能学到原理、看到与自己业务的结合点。]\n\n"
     ),
+    # ── IM（飞书 / Slack / 企业微信）里的对话 ────────────────────────────────
+    # 这一段存在的**唯一理由**是：IM 与网页的载体差异会让默认 system prompt 里的几句话
+    # 直接变成错话，而"错话"在 IM 上是不可挽回的（用户照着做，发现没有那个界面）：
+    #   · DEFAULT_SYSTEM_PROMPT 让模型提示用户「打开输入框下方的联网搜索」—— IM 没有
+    #     输入框下方那一排开关，正确说法是发一句 `/web on`；
+    #   · 卡片正文有硬上限（飞书 3500 / Slack 2900 字符，超了是**整条消息发不出去**，
+    #     见 `platforms/*/im_{cards,blocks}.py` 的 MAX_BODY），所以必须短；
+    #   · IM 侧的工具只有 4~5 个（见 `_im_chat_tools`），不能像网页那样承诺 case / 成本 /
+    #     深度调查 —— 那些在 IM 上是**确定性命令**（0 token 直连），得指路而不是假装能做。
+    "im-chat": (
+        "[当前你在 **IM 群聊/私聊**（飞书 / Slack / 企业微信）里回答，不是网页控制台。\n"
+        "- **必须简短**：答案会渲染成一张 IM 卡片，正文超过约 2900 字符的部分会被挪进"
+        "一份网页报告、卡片里只留开头加一个链接（内容不丢，但体验差很多）。"
+        "默认 300 字以内说清结论，要点用 `-` 列表；**不要输出大表格、不要长代码块**"
+        "（IM 里横向滚动几乎不可读）。用户要细节时再展开。\n"
+        "- **你在这里只有这几个工具**：`aws_docs_search` / `aws_docs_read`（AWS 技术问题"
+        "**先查官方文档再答**，别凭记忆）、`call_aws` 或 `aws_readonly`（查用户账号里的资源，"
+        "**严格只读**）、可能还有 `web_search`。没有别的工具，**不要声称自己能开案例、"
+        "跑成本分析或做深度调查**。\n"
+        "- **联网搜索关着**（`web_search` 返回 OFF）时：告诉用户**在这个会话里发一句 "
+        "`/web on`** 打开——**绝不要说「打开输入框下方的联网搜索」**，IM 里没有那个界面。\n"
+        "- 用户要的事超出上面这几个工具时，**指路到对应命令**（发 `/help` 可看全部）："
+        "开/查案例 → `/case`；深度调查、根因分析 → `/investigate <内容>`；换模型 → `/model`。"
+        "这些命令都是直连、不消耗模型，比你转述一遍更快也更准。\n"
+        "- **严格只读**：只给只读命令示例（describe-* / get-* / list-*），绝不输出任何变更命令。]\n\n"
+    ),
 }
 
 def _topic_directive(topic) -> str:
@@ -1835,7 +1942,9 @@ def _extract_prompt(payload: dict):
     return prompt
 
 
-# —— P2a：寒暄/问候快路径（跳过 agentic loop + ~17K 工具 schema）——
+# —— P2a：寒暄/问候快路径（跳过 agentic loop + 整套工具 schema）——
+# 省掉的量按主题算：`general` 24.3K / `investigate` 34.7K / `im-chat` 2.1K
+# （实测表见 `_tools_for_topic` 上方）。
 # 只匹配**明确**的问候/致谢（高精度，绝不误伤真问题）：短、且整句就是寒暄词。
 # 命中 → 用一个无工具、极简 prompt 的临时 agent 直接答一句，省掉工具 schema 与多轮循环。
 _GREETING_WORDS = (
@@ -2326,7 +2435,8 @@ async def invoke(payload, context):
     _allowed_accounts.set(str(payload.get("allowed_accounts") or "*"))
 
     # ── P2a：寒暄/问候快路径 ──
-    # 明确的问候/致谢（hi/你好/谢谢…）不该走 agentic loop、也不该带 ~17K 工具 schema。
+    # 明确的问候/致谢（hi/你好/谢谢…）不该走 agentic loop、也不该带整套工具 schema
+    # （`general` 实测 24.3K，见 `_tools_for_topic` 上方那张表）。
     # 用无工具的临时 agent 直接答一句，省 token、也避免模型在大上下文里乱调工具。
     _raw_q = str(payload.get("prompt") or payload.get("text") or "")
     if not web_on and not finops_deep and _is_trivial_greeting(_raw_q):

@@ -65,6 +65,20 @@ ACK_BODY_KEYS: tuple[str, ...] = (
     "im.chat.ack_body.5",
 )
 
+#: 同一批文案的 NotiOps Agent 版本（`/agent notiops` 之后走的那条路）—— 只换了 agent
+#: 的名字。**同一个种子在两套里选到同一个下标**，所以"这条消息的语气"仍然是一致的。
+#:
+#: 为什么要分两套而不是把名字含糊掉：默认那条路是"直连你自己的 DevOps Agent"（NotiOps
+#: 侧 0 token），这条是"我们的 NotiOps Agent 在花你的 token"。名字一含糊，用户就分不清
+#: 这一轮谁在答、花没花钱 —— 而这正是 `/agent` 这个开关存在的意义。
+ACK_BODY_KEYS_NOTIOPS: tuple[str, ...] = (
+    "im.chat.ack_body.notiops.1",
+    "im.chat.ack_body.notiops.2",
+    "im.chat.ack_body.notiops.3",
+    "im.chat.ack_body.notiops.4",
+    "im.chat.ack_body.notiops.5",
+)
+
 
 def _index(seed: str, n: int) -> int:
     """种子 → `[0, n)`。
@@ -102,16 +116,21 @@ def slack_emoji(seed: str) -> str:
         SLACK_EMOJI_POOL[_index(seed, len(SLACK_EMOJI_POOL))]
 
 
-def ack_body_key(seed: str) -> str:
-    """开场文案的 i18n key。选 key 而不是选文本，locale 由调用方决定。"""
-    return ACK_BODY_KEYS[_index(seed, len(ACK_BODY_KEYS))]
+def ack_body_key(seed: str, agent: str = "devops") -> str:
+    """开场文案的 i18n key。选 key 而不是选文本，locale 由调用方决定。
+
+    `agent` ∈ {"devops"（默认）, "notiops"} —— 见 :data:`ACK_BODY_KEYS_NOTIOPS`。
+    不认识的值一律当 "devops"（**宁可说成默认那条，也不要凭空宣称在花钱**）。
+    """
+    keys = ACK_BODY_KEYS_NOTIOPS if agent == "notiops" else ACK_BODY_KEYS
+    return keys[_index(seed, len(keys))]
 
 
-def ack_body(seed: str, locale: str) -> str:
+def ack_body(seed: str, locale: str, agent: str = "devops") -> str:
     """「思考中」卡片的开场话。
 
     ⚠️ `i18n` 的 import 在函数体里 —— 见模块头「依赖纪律」。ingress 只用表情那两个
     函数，不该为 i18n 那张大表付 INIT 时间。
     """
     from core import i18n
-    return i18n.t(ack_body_key(seed), locale)
+    return i18n.t(ack_body_key(seed, agent), locale)

@@ -47,6 +47,7 @@ vi.mock("./api/admin", async (orig) => {
     offboardMemberAccount: vi.fn(),
     fetchAccountAccess: vi.fn(),
     putAccountAccess: vi.fn(),
+    generateLaunchStack: vi.fn(),
   };
 });
 
@@ -429,5 +430,179 @@ describe("账号 alias（显示名）", () => {
         "pushLabelUpdated=false 却报「都改好了」—— 客户以为 IM 推送里也改了",
       ).not.toBeNull();
     });
+  });
+});
+
+describe("下线后的「需手动删栈」提示（2026-09-06 交叉 review）", () => {
+  /* 🔴 原缺陷：`setErr(offboardRetained…)` 之后同一个 handler 里 `await reload()`，
+   *    而 reload 第一行就是 `setErr("")` —— 两次 setErr 在同一次 React 批处理里
+   *    后写胜出，「要删哪个栈」这条唯一带栈名和 region 的指引**一帧都渲染不出来**。
+   *    agent space 是计费资源，这条提示是下线手动接入账号后唯一的回收指引。
+   *    修法：reload({silent:true}) + 无提示时显式清旧错误。 */
+  it("★★★ stackRetained 的栈名提示在 reload 之后必须仍然可见", async () => {
+    vi.mocked(admin.fetchMemberAccounts).mockResolvedValue(
+      resp([{ ...OK, onboardSource: "manual" }]) as never);
+    vi.mocked(admin.offboardMemberAccount).mockResolvedValue({
+      stackRetained: true,
+      stackName: "notiops-devops-agent-012345678901",
+      stackRegion: "ap-northeast-1",
+    } as never);
+    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue("012345678901");
+    try {
+      render(<AccountsView />);
+      await waitFor(() => {
+        const btn = screen.queryByText("下线") || screen.queryByText("Offboard");
+        expect(btn, "下线按钮没渲染出来（前置条件失败）").not.toBeNull();
+      });
+      fireEvent.click(screen.queryByText("下线") || screen.getByText("Offboard"));
+      // 等 offboard → setErr → reload 整条链跑完，栈名必须还在屏幕上
+      await waitFor(() => {
+        expect(
+          screen.queryByText(/notiops-devops-agent-012345678901/),
+          "「需手动删除的栈名」提示不见了 —— 它被 reload() 里的 setErr(\"\") 清掉了"
+          + "（同一批处理后写胜出）。客户下线后看不到要删哪个栈，计费的 agent space 静默残留",
+        ).not.toBeNull();
+      });
+      // region 也要带上（跨区部署时光有栈名还要猜区）—— 断言在**消息元素内**，
+      // 页面上别处（账号行的 region 列）也有同名文本，用全局查询会多命中。
+      const msgEl = screen.getByText(/notiops-devops-agent-012345678901/);
+      expect(msgEl.textContent).toContain("ap-northeast-1");
+    } finally { promptSpy.mockRestore(); }
+  });
+});
+
+describe("跨 Payer 的 Launch Stack 链接（2026-09-06 交叉 review）", () => {
+  /* 🔴 原缺陷：Launch Stack URL 渲染成可直点的 <a target=_blank>，文案写着
+   *    「点此在目标账号的 AWS 控制台部署」。quick-create URL 用的是**打开者
+   *    当前会话**的凭证 —— 管理页操作者手里最可能是部署账号的会话，直点的
+   *    结果是把成员模板（IAM 角色 + 计费的 agent space）部署进部署账号，而
+   *    回填/测试连接（同账号 AssumeRole）照样全绿，零错误信号。
+   *    修法：与 InspectionCrossAccountSection 同一标准 —— 只给复制按钮。 */
+  const openXpayerAndGenerate = async () => {
+    vi.mocked(admin.fetchMemberAccounts).mockResolvedValue(resp([]) as never);
+    vi.mocked(admin.generateLaunchStack).mockResolvedValue({
+      launchStackUrl: "https://console.aws.amazon.com/cloudformation/home#/stacks/create/review?templateURL=x",
+      templateUrl: "https://x", expiresHours: 12,
+    } as never);
+    render(<AccountsView />);
+    const title = await waitFor(() => {
+      const el = screen.queryByText(/手动接入账号/) || screen.queryByText(/Manual onboarding/);
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    fireEvent.click(title);
+    const input = await waitFor(() => screen.getByPlaceholderText("123456789012"));
+    fireEvent.change(input, { target: { value: "444455556666" } });
+    fireEvent.click(screen.queryByText("生成链接") || screen.getByText("Generate link"));
+    await waitFor(() => expect(vi.mocked(admin.generateLaunchStack)).toHaveBeenCalled());
+  };
+
+  it("★★★ 不许渲染指向 quick-create 的可点链接", async () => {
+    await openXpayerAndGenerate();
+    await waitFor(() => {
+      const copyBtn = screen.queryByText(/复制 Launch Stack 链接/)
+        || screen.queryByText(/Copy the Launch Stack link/);
+      expect(copyBtn, "复制按钮没渲染 —— 链接生成后唯一的分发动作就是复制").not.toBeNull();
+    });
+    const badLinks = [...document.querySelectorAll("a")]
+      .filter((a) => (a.getAttribute("href") || "").includes("cloudformation"));
+    expect(badLinks.length,
+      "又出现了可直点的 quick-create 链接 —— 它会用点击者（通常是部署账号）的会话建栈，"
+      + "把成员模板部署进部署账号且零错误信号。只许复制后发给目标账号管理员",
+    ).toBe(0);
+  });
+
+  it("★★★ 提示文案必须警告「别自己点开」", async () => {
+    const { STRINGS } = await import("./i18n");
+    const hint = STRINGS["admin.xpayer.stackHint"];
+    expect(hint.zh).toMatch(/别自己点开|不要自己点开/);
+    expect(hint.en.toLowerCase()).toContain("do not open it yourself");
+  });
+});
+
+describe("巡检范围字段行（2026-09-07 UX 重做）", () => {
+  /* 🔴 原「改 Region」是个长得像状态徽章的悬空按钮（客户原话「做成了和状态
+   *    一样的 tag 形式，非常误导人…新用户怎么知道是改什么 region？」）：
+   *    动作与数据分离、动词悬空、唯一的说明藏在编辑态里。
+   *    重做后的三个不变量，哪个退化都会回到误导形态：
+   *      ① 值有名字 —— 「巡检范围」标签与值同行可见
+   *      ② 说明常驻 —— 标签带 title（ⓘ），不点编辑也能看到解释
+   *      ③ 编辑挂在数据上 —— 点字段行里的编辑按钮展开编辑器，而不是一个
+   *        混在状态徽章里的「改 Region」 */
+  it("★★★ 已接入账号渲染「巡检范围」字段行：标签 + 值 + 常驻说明", async () => {
+    vi.mocked(admin.fetchMemberAccounts).mockResolvedValue(
+      resp([{ ...OK, regions: ["ap-northeast-1", "us-east-1"] }]) as never);
+    render(<AccountsView />);
+    const label = await waitFor(() => {
+      const el = screen.queryByText(/^巡检范围/) || screen.queryByText(/^Inspection scope/);
+      expect(el, "「巡检范围」标签没渲染 —— 值又变回没名字的裸文本了").not.toBeNull();
+      return el!;
+    });
+    // ② 说明常驻：标签自带 title（ⓘ 悬停解释），内容必须说清管什么资源
+    expect(label.getAttribute("title") || "",
+      "标签没有常驻说明（title）—— 解释又只活在编辑态里了"
+    ).toMatch(/RDS|resources/);
+    // ① 值可见且与标签同处一行区域
+    expect(screen.queryByText(/ap-northeast-1 · us-east-1/),
+      "范围值没渲染在字段行里").not.toBeNull();
+    // 旧的悬空按钮不许复活
+    expect(screen.queryByText("改 Region"),
+      "「改 Region」tag 按钮复活了 —— UX 重做被回退").toBeNull();
+  });
+
+  it("★★★ 编辑挂在字段行上：点「编辑」展开编辑器并能提交", async () => {
+    vi.mocked(admin.fetchMemberAccounts).mockResolvedValue(
+      resp([{ ...OK, regions: ["us-east-1"] }]) as never);
+    vi.mocked(admin.setMemberAccountRegions).mockResolvedValue(
+      { accountId: OK.accountId, regions: ["us-west-2"] } as never);
+    render(<AccountsView />);
+    await waitFor(() => expect(screen.queryByText(/^巡检范围|^Inspection scope/)).not.toBeNull());
+    fireEvent.click(screen.getByText(/✎/));
+    const input = await waitFor(() => screen.getByPlaceholderText("us-east-1,us-east-2"));
+    fireEvent.change(input, { target: { value: "us-west-2" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(vi.mocked(admin.setMemberAccountRegions))
+      .toHaveBeenCalledWith(OK.accountId, ["us-west-2"]));
+  });
+});
+
+describe("部署账号固定行（巡检范围可配，2026-09-07）", () => {
+  /* 🔴 此前部署账号恒扫全部 17 个 region 且**没有任何入口能改**（scan_region_scope
+   *    的短路分支 + 它被成员列表排除）。这一行是它唯一的配置入口。 */
+  const DEPLOY = { accountId: "444455556666", regions: [] as string[] };
+
+  it("★★★ BFF 回传 deployAccount → 渲染固定行，空 regions 显示「全部 region」", async () => {
+    vi.mocked(admin.fetchMemberAccounts).mockResolvedValue(
+      { ...resp([]), deployAccount: DEPLOY } as never);
+    render(<AccountsView />);
+    await waitFor(() => {
+      expect(screen.queryByText("部署账号") || screen.queryByText("Deployment account"),
+        "部署账号固定行没渲染 —— 它的巡检范围又变成配不了的隐藏行为了").not.toBeNull();
+    });
+    expect(screen.queryByText(/全部 region|All regions/),
+      "空 regions 没有显示成「全部 region (*)」—— 客户看不出默认行为是什么").not.toBeNull();
+    expect(screen.queryByText("444455556666")).not.toBeNull();
+  });
+
+  it("★★★ 部署账号行的范围能编辑并提交到自己的账号 ID", async () => {
+    vi.mocked(admin.fetchMemberAccounts).mockResolvedValue(
+      { ...resp([]), deployAccount: DEPLOY } as never);
+    vi.mocked(admin.setMemberAccountRegions).mockResolvedValue(
+      { accountId: DEPLOY.accountId, regions: ["ap-northeast-1"] } as never);
+    render(<AccountsView />);
+    await waitFor(() => expect(screen.queryByText(/部署账号|Deployment account/)).not.toBeNull());
+    fireEvent.click(screen.getByText(/✎/));
+    const input = await waitFor(() => screen.getByPlaceholderText("us-east-1,us-east-2"));
+    fireEvent.change(input, { target: { value: "ap-northeast-1" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(vi.mocked(admin.setMemberAccountRegions))
+      .toHaveBeenCalledWith(DEPLOY.accountId, ["ap-northeast-1"]));
+  });
+
+  it("★★ 老 BFF（无 deployAccount 字段）→ 不渲染固定行，页面其余照常", async () => {
+    vi.mocked(admin.fetchMemberAccounts).mockResolvedValue(resp([OK]) as never);
+    render(<AccountsView />);
+    await waitFor(() => expect(screen.queryByText(OK.accountId)).not.toBeNull());
+    expect(screen.queryByText("部署账号") || screen.queryByText("Deployment account")).toBeNull();
   });
 });

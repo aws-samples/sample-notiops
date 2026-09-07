@@ -89,7 +89,10 @@ write access.
 - 💬 **IM channels**: Slack / Feishu full-feature — a card comes back **immediately** after you
   ask, and progress / thinking / the answer all refresh **in that same card** (the seconds in
   its title are the "still running" signal); when a deep investigation finishes, its report
-  card is posted back to the conversation that started it
+  card is posted back to the conversation that started it. **Two agents to pick from**:
+  `/agent devops` is the default (straight to the DevOps Agent, 0 tokens on the NotiOps side),
+  `/agent notiops` switches to the model-backed path (with a `/web on` web-search toggle; the
+  answer card's footer states how many tokens that turn cost)
 
 ---
 
@@ -204,6 +207,7 @@ mode comparison and how to switch — see
 | Bedrock API key as the credential | ✅ | ✅ |
 | **Proactive / IM** | | |
 | IM channels (Slack / Feishu) | ✅ one platform per stack, see note ⁴ | ✅ both at once |
+| Two agents in IM (`/agent devops`, the 0-token default \| `/agent notiops`, model-backed) + the `/web` toggle | ✅ | ✅ |
 | Proactive push **to IM** (10 EventBridge sources) | ❌ | ✅ |
 | Scheduled inspection (high load / idle & cost / structural risk) | ❌ | ✅ |
 | Notification inbox (the same 10 sources, into the web inbox) | ✅ | ✅ |

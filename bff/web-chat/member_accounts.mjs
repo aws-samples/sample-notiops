@@ -345,12 +345,29 @@ export async function listMemberAccounts() {
     }
   }));
   items.sort((x, y) => x.accountId.localeCompare(y.accountId));
+  // ── 部署账号的巡检范围（2026-09-07）──
+  // 部署账号仍然**不进 items**（它不是"成员接入"，没有 StackSet 可下线），
+  // 但它的巡检 region 范围从这版起可配 —— 单独回传，UI 在列表顶部钉一行。
+  // regions 为空数组 = 没配过 = 读侧(scan_region_scope)默认扫全部。
+  // ⚠️ 不复用 GSI 查询结果：部署账号的 account# 行由 CDK Custom Resource 写，
+  //    不保证带 GSI1PK —— 直接按主键读。
+  let deployAccount = null;
+  if (selfId) {
+    let regions = [];
+    try {
+      const r = await ddb.send(new GetCommand({
+        TableName: CONFIG_TABLE, Key: { PK: `account#${selfId}`, SK: "meta" },
+      }));
+      regions = Array.isArray(r.Item && r.Item.regions) ? r.Item.regions : [];
+    } catch { /* 读不到就按「没配过」展示 —— 与读侧的安全方向一致（全部） */ }
+    deployAccount = { accountId: selfId, regions };
+  }
   // 🔴 把降级**说出来**，UI 据此提示「只显示已登记的账号」——
   //    不说的话客户会以为「组织里只有这几个账号」。
   //
   // ⚠️ 返回对象而**不是**把标记挂在数组上：`JSON.stringify([...])` 会
   //    静默丢掉数组的自有属性，于是那个标记永远到不了前端。
-  return { items, orgListable };
+  return { items, orgListable, deployAccount };
 }
 
 /** 单账号一键接入。返回 {operationId, accountId}。 */
@@ -401,6 +418,17 @@ export async function onboardAccount(accountId, regions) {
   } catch (err) {
     if (err.name === "OperationInProgressException") {
       const e = new Error("operation_in_progress"); e.code = "bad_request"; throw e;
+    }
+    // 🔴 StackSetNotFound 必须翻译成「怎么办」（2026-09-06 客户实测踩中）：
+    //    部署时没带 --multi-account 时 StackSet 压根不存在，而按钮照常显示 ——
+    //    裸抛的结果是客户看到 `StackSet notiops-member-onboarding not found`
+    //    的原始报错，完全不知道下一步。原因和出路都是确定的，就该写出来。
+    if (err.name === "StackSetNotFoundException") {
+      const e = new Error(
+        "一键接入不可用：member-onboarding StackSet 不存在（部署时没带 --multi-account）。"
+        + "两条路：重跑 ./setup.sh --multi-account 补建（推荐，同时把后端切成多账号模式）；"
+        + "或用下方「手动接入账号」（不需要 StackSet）。");
+      e.code = "config_error"; throw e;
     }
     throw err;
   }
@@ -514,7 +542,14 @@ export async function setAccountRegions(accountId, regions) {
   }
   const cfg = await getConfigAccount(id);
   if (!cfg) {
-    const e = new Error("account_not_registered"); e.code = "bad_request"; throw e;
+    // 部署账号例外（2026-09-07 起它的巡检范围可配）：它的 account# 行由
+    // CDK Custom Resource 写，老部署里可能压根没有 —— 允许由这次写入建行。
+    // 成员账号维持原判：没登记就没有"改范围"这回事。
+    const { selfAccountId } = await import("./xacct.mjs");
+    const self = await selfAccountId().catch(() => "");
+    if (!self || id !== self) {
+      const e = new Error("account_not_registered"); e.code = "bad_request"; throw e;
+    }
   }
   const list = [...new Set(
     (Array.isArray(regions) ? regions : String(regions || "").split(/[,;\s]+/))
@@ -853,6 +888,13 @@ export async function associateDevopsAgent(accountId) {
     if (err.name === "OperationInProgressException") {
       const e = new Error("operation_in_progress"); e.code = "bad_request"; throw e;
     }
+    // 同 onboardAccount：StackSet 不存在的原因与出路都是确定的，写给用户。
+    if (err.name === "StackSetNotFoundException") {
+      const e = new Error(
+        "一键关联不可用：member-devops-agent StackSet 不存在（部署时没带 --multi-account）。"
+        + "重跑 ./setup.sh --multi-account 补建；或用「手动接入账号」流程（不需要 StackSet）。");
+      e.code = "config_error"; throw e;
+    }
     throw err;
   }
   // da# 记录：provisioning（与 idle 控制台向导同一张表同一状态机）。
@@ -942,6 +984,14 @@ export async function devopsAgentAssocStatus(operationId, accountId) {
       `devopsAgentAssocStatus: account ${id} 的 InspectionAgentSpaceId `
       + `形状不对（${inspectSpaceId}）—— 要的是 UUID。已丢弃该值。`);
     inspectSpaceId = "";
+  }
+  // 🔴 confused-deputy 防御（见 role_guard.mjs）：这一笔写下去就是 callback
+  //    白名单的最强判据行（active + enabled=true），TriggerRoleArn 来自成员账号
+  //    可控的栈输出 —— 账号段不等于目标账号就拒写。手动接入路径（manualPayloadSave）
+  //    一直有这道校验，org 一键路径此前漏了，两条路标准必须一致。
+  {
+    const { assertRoleBelongsTo } = await import("./role_guard.mjs");
+    assertRoleBelongsTo(outs.TriggerRoleArn, id, "config_error");
   }
   await ddb.send(new UpdateCommand({
     TableName: CONFIG_TABLE, Key: { PK: `da#${id}`, SK: "meta" },
@@ -1328,6 +1378,15 @@ export async function testDaConnection(accountId, probe = null) {
     throw Object.assign(new Error(
       "account not configured — fill in Agent Space ID and Trigger Role ARN "
       + "(or click Save first)"), { code: "bad_request" });
+  }
+  // 🔴 confused-deputy 防御（见 role_guard.mjs）：测试连接是唯一会用**未保存的
+  //    probe 值**去 AssumeRole 的入口，账号段不匹配必须在第 0 步就拒 ——
+  //    按本函数的分步结果约定返回结构化失败，让 UI 说得清是哪一步、为什么。
+  try {
+    const { assertRoleBelongsTo } = await import("./role_guard.mjs");
+    assertRoleBelongsTo(cfg.trigger_role_arn, id);
+  } catch (e) {
+    return { success: false, step: "RoleArnCheck", error: e.message };
   }
   const sts = new STSClient({});
   let creds;

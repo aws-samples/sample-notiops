@@ -920,8 +920,9 @@ export const STRINGS: Dict = {
   "admin.xpayer.acctLabel": { zh: "目标账号 ID (12 位)", en: "Target account ID (12 digits)" },
   "admin.xpayer.invalidId": { zh: "账号 ID 格式错误(需 12 位数字)", en: "Invalid account ID (must be 12 digits)" },
   "admin.xpayer.genBtn": { zh: "生成链接", en: "Generate link" },
-  "admin.xpayer.openStack": { zh: "→ 点此在目标账号的 AWS 控制台部署", en: "→ Click to deploy in the target account's AWS console" },
-  "admin.xpayer.stackHint": { zh: "将此链接发给目标账号管理员,在其 AWS 控制台中一键部署;完成后把 Stack Outputs 里的 AgentSpaceId 和 TriggerRoleArn 贴回下方。", en: "Share this link with the target account admin to deploy via their AWS console; once done, paste the AgentSpaceId and TriggerRoleArn from the Stack Outputs below." },
+  "admin.xpayer.copyLink": { zh: "复制 Launch Stack 链接", en: "Copy the Launch Stack link" },
+  "admin.xpayer.copied": { zh: "已复制。发给目标账号管理员，用目标账号登录后打开。", en: "Copied. Send it to the target account admin — open it while signed in to the target account." },
+  "admin.xpayer.stackHint": { zh: "将此链接发给目标账号管理员,用【目标账号】登录后在其 AWS 控制台一键部署;完成后把 Stack Outputs 里的 AgentSpaceId 和 TriggerRoleArn 贴回下方。⚠️ 别自己点开 —— 链接用打开者当前登录的账号建栈,在这里点开会把栈建进部署账号。", en: "Share this link with the target account admin to deploy while signed in to the TARGET account; once done, paste the AgentSpaceId and TriggerRoleArn from the Stack Outputs below. Do not open it yourself — the link deploys into whichever account the opener is signed in to." },
   "admin.xpayer.saveBtn": { zh: "保存并激活", en: "Save & activate" },
   // 🔴 **别再写「（可选）」。** 2026-08-31 实机接入时用户明确反馈「我被误导了」。
   //
@@ -973,10 +974,22 @@ export const STRINGS: Dict = {
   //    finding，回来改这个框改成什么都没用）。现在它生效了，代价是「全部」
   //    要显式表达 —— 就是这个 `*`。
   "admin.accounts.regionsPrompt": {
-    zh: "采集 Region（逗号分隔，如 us-east-1,us-east-2）。填 * 表示所有 region；不填默认 us-east-1",
-    en: "Regions to collect (comma-separated, e.g. us-east-1,us-east-2). Use * for all regions; defaults to us-east-1" },
-  "admin.accounts.regionsEdit": { zh: "改 Region", en: "Edit regions" },
-  "admin.accounts.regionsSaved": { zh: "采集 Region 已更新", en: "Regions updated" },
+    zh: "NotiOps 只在这些 region 里巡检该账号的资源并采集指标（逗号分隔，如 us-east-1,us-east-2）。填 * 表示全部 region；留空默认 us-east-1。改动下一轮巡检生效。",
+    en: "NotiOps inspects this account's resources and collects metrics only in these regions (comma-separated, e.g. us-east-1,us-east-2). Use * for all regions; empty defaults to us-east-1. Takes effect on the next inspection run." },
+  "admin.accounts.regionsSaved": { zh: "巡检范围已更新", en: "Inspection scope updated" },
+  /* ── 巡检范围字段行（2026-09-07 UX 重做）──
+     原「改 Region」是个长得像状态徽章的悬空按钮（regionsEdit 键已随之退役）：
+     动作与数据分离、动词悬空、说明藏在编辑态。现在值有名字（巡检范围）、
+     编辑挂在值旁边、说明常驻（ⓘ + 编辑器内）。 */
+  "admin.accounts.scopeLabel": { zh: "巡检范围", en: "Inspection scope" },
+  "admin.accounts.scopeAll": { zh: "全部 region (*)", en: "All regions (*)" },
+  "admin.accounts.scopeEditBtn": { zh: "编辑", en: "Edit" },
+  "admin.accounts.scopeHint": { zh: "NotiOps 在这些 region 里发现并巡检该账号的资源（RDS / Aurora / ElastiCache）并采集监控指标。这不会改动账号里的任何资源。填 * 表示全部 region；改动下一轮巡检生效。", en: "NotiOps discovers and inspects this account's resources (RDS / Aurora / ElastiCache) and collects metrics in these regions only. It changes nothing inside the account. Use * for all regions; takes effect on the next inspection run." },
+  "admin.accounts.scopeHintDeploy": { zh: "NotiOps 在这些 region 里发现并巡检本账号（系统部署所在账号）的资源并采集指标。不配置时默认扫全部 region —— 本账号是系统家底所在，漏扫的代价比多扫大，收窄是显式动作。改动下一轮巡检生效。", en: "NotiOps discovers and inspects this account's (the deployment account's) resources and collects metrics in these regions. When unset it defaults to ALL regions - narrowing is an explicit action. Takes effect on the next inspection run." },
+  "admin.accounts.scopePromptDeploy": { zh: "部署账号的巡检范围（逗号分隔，如 ap-northeast-1,us-east-1）。填 * = 扫全部 region（不配置时的默认）。改动下一轮巡检生效。", en: "Inspection scope of the deployment account (comma-separated, e.g. ap-northeast-1,us-east-1). Use * to scan all regions (the default when unset). Takes effect on the next inspection run." },
+  "admin.accounts.deployRowTitle": { zh: "部署账号", en: "Deployment account" },
+  "admin.accounts.deployRowBadge": { zh: "本账号", en: "This account" },
+  "admin.accounts.deployRowBadgeTip": { zh: "NotiOps 系统部署所在的账号。它不属于「成员接入」（数据天然可见、没有可下线的资源），这里只提供巡检范围的配置。", en: "The account NotiOps is deployed in. It is not a 'member onboarding' (its data is natively visible; nothing to offboard) - only its inspection scope is configurable here." },
   /* ── 账号显示名（alias）─────────────────────────────────────────────────
      🔴 这几条为什么重要：`account_name` / `account_alias` 此前**只在接入那一刻
         写一次**，来源是 `organizations:DescribeAccount` 的 Account.Name。

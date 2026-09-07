@@ -9,8 +9,8 @@
      **不自动检测**）；否则 `language en` 之类会在 `set_user_pref` 之前把 DM 锁成 en；
   3. **规范化事件**成 `ImMessage`，调用 `platforms.common.router.dispatch` 落到
      `FeishuCaps` 上；
-  4. **卡片按钮**（card_action）—— 首版直接沿用平台里现成的 case_flow / support_flow /
-     skill_commands 的 handler；这一层只做 dict → SDK 对象的解码。
+  4. **卡片按钮**（card_action）—— 首版直接沿用平台里现成的 case_flow / support_flow
+     的 handler；这一层只做 dict → SDK 对象的解码。
 """
 from __future__ import annotations
 
@@ -47,7 +47,9 @@ ALLOWED_CHAT_IDS = {
 # `create_investigation`（实测个位数秒，但跨账号 AssumeRole 慢时会到几十秒）。
 _THREAD_JOIN_TIMEOUT = 600
 
-# 每次冷启动装一次 bedrock 凭证（case 路径用到 analyze_intent）
+# 每次冷启动装一次 bedrock 凭证 —— 案例路径的两处模型调用要用
+# （`core.case_analyze` 与提交开案例表单时的 `core.case_classifier`；
+#  不是 `analyze_intent`，它在重构后的活路径上已不再被调到）。
 try:
     bedrock_credentials.install()
 except Exception as e:                        # noqa: BLE001

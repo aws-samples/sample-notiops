@@ -390,6 +390,53 @@ REPORTS_CDN="$(aws cloudformation describe-stacks --region "$REGION" --stack-nam
 # 显式传 reportsCdnDomain:不传的话 WebChatStack 会引用主栈的 Export,`--exclusively`
 # 就不再是"只动 WebChatStack"（会被迫先 update 主栈，顺带带上主栈上所有未部署的改动）。
 [ -n "$REPORTS_CDN" ] && CDK_CTX+=(-c "reportsCdnDomain=$REPORTS_CDN")
+# 客户自有 CUR 数据源（cost-agent MCP，可选加装项）。两个值都是 synth 期 context：
+#   costAgentMcpUrl      漏传 → BFF 的 COST_AGENT_MCP_URL 变空 → capabilities 摘掉
+#                        4 个 nav:finops:cur-* 节点 → 客户的 4 张 CUR sheet 静默消失
+#   costAgentFunctionArn 漏传 → synth 直接报错（web-chat-core 有互斥校验），不会静默
+# MCP URL 能从现网 BFF env 反推；函数 ARN 不在 env 里（只用于 synth 期 IAM 授权），
+# 从 BFF 执行角色的 inline policy 里找 lambda:InvokeFunctionUrl 那条反推。
+# 反推不出来就**硬停**让使用者显式传 —— 静默降级正是本脚本存在要修的那类问题。
+COST_MCP="${COST_AGENT_MCP_URL:-$(aws lambda get-function-configuration --region "$REGION" --function-name "$BFF_FN" \
+  --query 'Environment.Variables.COST_AGENT_MCP_URL' --output text 2>/dev/null || true)}"
+[ "$COST_MCP" = "None" ] && COST_MCP=""
+if [ -n "$COST_MCP" ]; then
+  COST_FN_ARN="${COST_AGENT_FN_ARN:-}"
+  if [ -z "$COST_FN_ARN" ]; then
+    BFF_ROLE_NAME="$(aws lambda get-function-configuration --region "$REGION" --function-name "$BFF_FN" \
+      --query 'Role' --output text 2>/dev/null | awk -F'/' '{print $NF}')"
+    for _pol in $(aws iam list-role-policies --role-name "$BFF_ROLE_NAME" --query 'PolicyNames[]' --output text 2>/dev/null); do
+      COST_FN_ARN="$(aws iam get-role-policy --role-name "$BFF_ROLE_NAME" --policy-name "$_pol" --output json 2>/dev/null \
+        | python3 -c '
+import json, sys
+doc = json.load(sys.stdin)["PolicyDocument"]
+for st in doc.get("Statement", []):
+    acts = st.get("Action", [])
+    acts = [acts] if isinstance(acts, str) else acts
+    if any(a == "lambda:InvokeFunctionUrl" for a in acts):
+        res = st.get("Resource", [])
+        res = [res] if isinstance(res, str) else res
+        for r in res:
+            if r.startswith("arn:") and ":function:" in r:
+                print(r); raise SystemExit
+' 2>/dev/null)"
+      [ -n "$COST_FN_ARN" ] && break
+    done
+  fi
+  if [ -n "$COST_FN_ARN" ]; then
+    CDK_CTX+=(-c "costAgentMcpUrl=$COST_MCP" -c "costAgentFunctionArn=$COST_FN_ARN")
+    say "    $(t "沿用现网 CUR 数据源 costAgentMcpUrl（函数 ARN 已从 BFF 角色策略反推）" \
+              "carrying over the live CUR data source costAgentMcpUrl (function ARN recovered from the BFF role policy)")"
+  else
+    echo "$(t "❌ 现网 BFF 配了 CUR 数据源（COST_AGENT_MCP_URL 非空），但反推不出配套的函数 ARN。" \
+              "❌ The live BFF has a CUR data source configured (COST_AGENT_MCP_URL is set), but the function ARN could not be recovered.")" >&2
+    echo "$(t "   不传它重部会把客户的 4 张 CUR sheet 静默降级掉 —— 拒绝继续。" \
+              "   Redeploying without it silently drops the customer's 4 CUR sheets — refusing to continue.")" >&2
+    echo "$(t "   带上环境变量重跑：COST_AGENT_MCP_URL=$COST_MCP COST_AGENT_FN_ARN=<函数ARN> bash scripts/fix_web_chat_echo.sh --region $REGION" \
+              "   Re-run with: COST_AGENT_MCP_URL=$COST_MCP COST_AGENT_FN_ARN=<function-arn> bash scripts/fix_web_chat_echo.sh --region $REGION")" >&2
+    exit 1
+  fi
+fi
 # enabledPlatforms=none 只是让 synth 跳过 IM 侧（ImStack）。配合 --exclusively 不会动到
 # 已部署的 IM 栈 —— CDK 从不删除"不在 app 里"的栈。
 # 历史：M2（2026-09-03）之前这一行的主要作用是跳过 BotStack 那 5 处

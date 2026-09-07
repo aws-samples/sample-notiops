@@ -4,27 +4,39 @@
 每个方法接收规范化的 `ImMessage`，返回值只用于日志/断言。
 
 复用策略：
-  · `case`、`skills` 直接调平台里已经写好的 `case_flow` / `skill_commands`（M0 的目标就是
-    把这些"业务模块"独立出来 —— 它们本来就跟 SDK 事件类型解耦）。
+  · `case` 直接调平台里已经写好的 `case_flow`（M0 的目标就是把这些"业务模块"独立
+    出来 —— 它们本来就跟 SDK 事件类型解耦）。
   · `investigate` 走 `core.devops_agent.start_investigation`（BFF「深度调查(直连)」同款，
     **不是** Fargate 时代的 `shared.devops_agent.create_investigation`）—— **不烧 token**：
     只 create_backlog_task，正文 = 用户原话；不做 NotiOps 侧摘要/翻译。
     2026-09-03 起 `case_flow._dispatch_for_case`（「开案例 + 起调查」）也走同一条路。
-  · `chat` 走 M1 新增的 `core.devops_chat.run_devops_chat`（客户 DevOps Agent 直答，
-    NotiOps 侧 0 token）。
-  · `language` / `model` / `help` 全是确定性文本回复，直接调 `feishu_utils.reply_text`。
+  · `chat` **两条路**，由会话开关 `/agent` 决定（`core.im_prefs`）：
+      - `devops`（默认）→ `core.devops_chat.run_devops_chat`，客户 DevOps Agent 直答，
+        **NotiOps 侧 0 token**；
+      - `notiops` → `core.agent_chat.run_agent_chat`，走我们的 AgentCore runtime，
+        **会消耗 token**（窄工具集 `im-chat`，口径见 `core/agent_chat.py` 头部注释）。
+  · `language` / `model` / `agent` / `web` / `help` 全是确定性文本回复，直接调
+    `feishu_utils.reply_text`。
+
+⚠️ 「哪些能力花钱」的口径（改这里之前先把 `core/agent_chat.py` 的头部注释读完）：
+默认配置下只有 `case_analyze` 和 `case_create` 的表单提交会烧 NotiOps 侧 token；
+用户显式 `/agent notiops` 之后 `chat` 也会 —— 所以卡片落款必须按 agent 分两套说法
+（`im_cards.usage_footer`），不许一律写「无模型消耗」。
 """
 from __future__ import annotations
 
 import logging
 
+from core import agent_chat
 from core import i18n
 from core import ddb_state
 from core import devops_chat
+from core import im_prefs
 from core import llm_pref_resolver
 from core import locale_resolver
 from core import model_catalog
-from platforms.common import ack_variants, chat_lease, live_card, long_answer
+from platforms.common import (ack_variants, chat_lease, live_card, long_answer,
+                              pref_commands)
 from platforms.common.im_types import Caps, ImMessage
 from platforms.feishu import im_cards
 from platforms.feishu.app import feishu_utils
@@ -42,7 +54,7 @@ class FeishuCaps(Caps):
         in_thread = not msg.is_direct
         feishu_utils.reply_text(msg.message_id, text, in_thread=in_thread)
 
-    # ---- 七个能力 ----
+    # ---- 九个能力 ----
     def help(self, msg: ImMessage) -> None:
         """`/help` 命令菜单 —— 必须发**卡片**，不能发纯文本。
 
@@ -141,17 +153,17 @@ class FeishuCaps(Caps):
         key = "model.set_dm" if is_dm else "model.set_chat"
         self.reply_text(msg, i18n.t(key, msg.locale, label=entry.label))
 
-    def skills(self, msg: ImMessage, arg: str) -> None:
-        """`/skills` —— 一句确定性的"去 Web 端"指路（0 token）。
+    def agent(self, msg: ImMessage, arg: str) -> None:
+        """`/agent [notiops|devops|default]` —— 这个会话的对话由谁答（0 token）。
 
-        ⚠️ 2026-09-03：skills **不再出现在 `/help` 菜单里**，IM 侧也不再假装能做。
-        原来这里回的是 `skill.author.hint`（"请用 `/skills create <目标>`"），可是
-        `/skills create` 在 IM 路径上没有任何处理 —— 用户照着提示再打一遍会拿到同一句，
-        是个自指的死循环。skill 的创建/上传/运行需要 S3 + Secrets 权限，一直只在 Web 端。
-        路由**保留**：删掉的话 `/skills` 会掉进 `chat` 去问 DevOps Agent（白跑一趟、
-        答案还不对）。
+        逻辑与文案全在 `platforms.common.pref_commands`：这两条命令没有任何平台差异，
+        两边各写一遍必然漂移（见那个模块的文件头）。
         """
-        self.reply_text(msg, i18n.t("skill.im_web_only", msg.locale))
+        self.reply_text(msg, pref_commands.agent_reply(msg, arg, platform=PLATFORM))
+
+    def web(self, msg: ImMessage, arg: str) -> None:
+        """`/web [on|off]` —— 联网搜索开关（0 token）。只对 NotiOps Agent 生效。"""
+        self.reply_text(msg, pref_commands.web_reply(msg, arg, platform=PLATFORM))
 
     def investigate(self, msg: ImMessage, text: str) -> None:
         """发起一次深度调查 —— **0 token**：只 create_backlog_task，NotiOps 侧不总结、
@@ -283,7 +295,24 @@ class FeishuCaps(Caps):
                               locale=msg.locale, user_id=msg.user_id)
 
     def case(self, msg: ImMessage, command: str, case_id: str, text: str) -> None:
-        """案例路径 —— **唯一保留 LLM 的能力**（`analyze_intent` 抽 display_id/标题/正文）。
+        """案例路径 —— **默认配置下唯一会烧 NotiOps 侧 token 的能力**。
+
+        （"默认配置下"这四个字是 2026-09-06 加的：用户显式 `/agent notiops` 之后
+        `chat` 也会走模型。默认值仍是 `devops` 直连，所以开箱即用时只有这一条。）
+
+        🔴 别把这里的 LLM 记成 `analyze_intent`（2026-09-06 校正）：`display_id` /
+        标题 / 正文是 `core.nl_router` **确定性**抽出来的，`analyze_intent` 在
+        重构后的活路径上**一次都不会被调到**。真正花钱的只有两处，都在下游：
+
+          - `case_analyze` → `core/case_analyze.py`（读工单往来后总结，1500 输出上限）；
+          - `case_create` 的**表单提交那一刻** → `core/case_classifier.py`，把
+            `describe_services` 的**整份服务目录**塞进 system prompt 换一个合法的
+            `(serviceCode, categoryCode, issueType)` 三元组。**这是全 IM 单次
+            输入最贵的一次调用**（现网实测 ~1.8 万输入 token，且无 prompt cache）。
+            发出表单本身是 0 token —— 标题预填是确定性的，见
+            `case_flow._summarize_subject`。
+
+        其余四个 `case_*`（view / reply / resolve / list）都是纯 boto3 + 确定性渲染。
 
         M1 首版：由 worker 直接把 `ImMessage` 转成老 `case_flow` 的入参调用。案例卡片
         渲染仍走 platforms/feishu/app/case_flow.py 的现成实现。
@@ -310,9 +339,19 @@ class FeishuCaps(Caps):
                                         kind=type(e).__name__))
 
     def chat(self, msg: ImMessage, text: str) -> None:
-        """DevOps 对话直连 —— **NotiOps 侧 0 token**（`core.devops_chat`）。
+        """对话问答 —— **两条路，同一张卡**。由 `/agent` 开关（`core.im_prefs`）决定：
 
-        多轮上下文靠 `imchat#<chat_id>` 存的 `execution_id`。
+          · `devops`（默认）→ `core.devops_chat.run_devops_chat`，客户 DevOps Agent
+            直答，**NotiOps 侧 0 token**。多轮上下文靠 `imchat#<chat_id>` 存的
+            `execution_id`。
+          · `notiops` → `core.agent_chat.run_agent_chat`，走我们的 AgentCore runtime，
+            **会消耗 token**。多轮上下文靠 `imagent#<chat_id>` 存的 runtime session id
+            （6 小时轮换，因为 AgentCore 的 `maxLifetime` 是 8 小时而 IM 的 chat_id 是
+            永久的 —— 详见 `core.ddb_state.im_agent_session_id`）。
+
+        ⚠️ 分流**只影响三件事**：ack 文案用哪一套、调哪个 runner、卡片上 `agent=` /
+        `sources=` / `usage=` 三个参数。排队/心跳/终版/截断落报告/兜底全部共用下面这一份
+        —— 两条路各写一遍 `chat()` 是这个文件最容易长出漂移的地方。
 
         答案发**卡片**而不是文本：要有状态标题（排队中/思考中/答完 + 计时）、过程行、
         正文超长时的「查看完整报告」外链。纯文本这三样一样都做不到。
@@ -339,9 +378,20 @@ class FeishuCaps(Caps):
         所以进来先抢会话租约（`platforms/common/chat_lease.py`）：抢不到就把首卡发成
         「排队中」，等前一个跑完**就地**转成「思考中」继续答；等不到也明说。
         """
+        # 第 -1 步：这个会话现在由谁答。**在发卡之前**读 —— ack 文案和卡片落款都要它。
+        agent, _src = im_prefs.resolve_agent(
+            platform=PLATFORM, chat_id=msg.chat_id, user_id=msg.user_id,
+            is_dm=msg.is_direct)
+        notiops = agent == im_prefs.AGENT_NOTIOPS
+
         # 群会话按 chat 归属（§15：一个 chat 一个会话，不按用户拆）
         session = ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
         question = (text or msg.text or "").strip()
+
+        # 来源 / 用量要等这一轮跑完才知道，而 `LiveCard` 的 `render` 回调只透传五个
+        # 固定 kwarg（body/steps/state/elapsed/report_url）。所以放一个可变盒子让
+        # `render=` 的闭包读 —— 终版之前填好，`finish()` 那一刷就带上了。
+        extra: dict = {"sources": [], "usage": {}}
 
         # 第 0 步：抢这个会话的"轮次"。`acquire()` 不阻塞 —— 先把卡发出去再等，
         # 否则用户在排队的那几分钟里一个字都看不到（正是本次要修的那种体验）。
@@ -355,10 +405,11 @@ class FeishuCaps(Caps):
         # 不是说法 —— 用户不会看到卡片自己改口。
         ack_seed = msg.message_id or msg.event_id
         ack = (i18n.t("im.chat.queued_body", msg.locale) if queued
-               else ack_variants.ack_body(ack_seed, msg.locale))
+               else ack_variants.ack_body(ack_seed, msg.locale, agent))
         resp = feishu_utils.send_card(
             msg.chat_id,
-            im_cards.answer_card(ack, msg.locale, state=state, elapsed=0))
+            im_cards.answer_card(ack, msg.locale, state=state, elapsed=0,
+                                 agent=agent))
         card_message_id = im_cards.message_id_of(resp)
         live = None
         if card_message_id:
@@ -367,7 +418,8 @@ class FeishuCaps(Caps):
                 render=lambda **kw: im_cards.answer_card(
                     kw["body"], msg.locale,
                     steps=kw["steps"], state=kw["state"], elapsed=kw["elapsed"],
-                    report_url=kw["report_url"]),
+                    report_url=kw["report_url"],
+                    agent=agent, sources=extra["sources"], usage=extra["usage"]),
                 update=lambda payload: feishu_utils.update_card(
                     card_message_id, payload),
             )
@@ -392,23 +444,46 @@ class FeishuCaps(Caps):
                 # 排队转正：就地把这张卡变成「思考中」（不新发一条 —— 争抢一次只该
                 # 占一条消息）。这一下值得 force：用户最想知道的就是"轮到我了"。
                 if live is not None:
-                    live.set_ack(ack_variants.ack_body(ack_seed, msg.locale))
+                    live.set_ack(ack_variants.ack_body(ack_seed, msg.locale, agent))
                     live.set_state("thinking")
                     live.flush(force=True)
                 # 前一轮很可能刚写过 execution_id，重新读一遍才是最新的上下文。
                 session = ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
 
             # 第 3 步：跑，并把过程实时刷回那张卡。
-            result = devops_chat.run_devops_chat(
-                text=question, locale=msg.locale,
-                account_id=msg.account_id or None,
-                session=session,
-                emit=(live.emit if live is not None else None),
-            )
-            # 持久化下一轮的 execution_id
-            sess = result.get("session") or {}
-            if sess.get("execution_id"):
-                ddb_state.put_im_chat_session(PLATFORM, msg.chat_id, sess)
+            if notiops:
+                # 模型偏好用与 Web 端同一套（`/model` 那条命令的产物）。短别名直接透传
+                # 给 agent —— `core.llm_config` 认短别名，不需要在这里翻译一层
+                # （见 core/model_catalog.py 顶部关于两套别名命名空间的说明）。
+                model_alias, _msrc = llm_pref_resolver.resolve(
+                    platform=PLATFORM, chat_id=msg.chat_id, user_id=msg.user_id,
+                    is_dm=msg.is_direct)
+                result = agent_chat.run_agent_chat(
+                    question, locale=msg.locale,
+                    session_id=ddb_state.im_agent_session_id(PLATFORM, msg.chat_id),
+                    model=model_alias,
+                    account_id=msg.account_id or None,
+                    web_search=im_prefs.resolve_web(
+                        platform=PLATFORM, chat_id=msg.chat_id,
+                        user_id=msg.user_id, is_dm=msg.is_direct)[0],
+                    emit=(live.emit if live is not None else None),
+                )
+                # 填盒子（见上面 `extra` 的注释）—— 必须在 `finish()` 之前。
+                extra["sources"] = result.get("sources") or []
+                extra["usage"] = result.get("usage") or {}
+                # 这条路**不写 `imchat#`**：会话连续性由 `imagent#` 那行的 session id
+                # 负责，而它的轮换逻辑整个在 `ddb_state.im_agent_session_id` 里面。
+            else:
+                result = devops_chat.run_devops_chat(
+                    text=question, locale=msg.locale,
+                    account_id=msg.account_id or None,
+                    session=session,
+                    emit=(live.emit if live is not None else None),
+                )
+                # 持久化下一轮的 execution_id
+                sess = result.get("session") or {}
+                if sess.get("execution_id"):
+                    ddb_state.put_im_chat_session(PLATFORM, msg.chat_id, sess)
         finally:
             # 租约必须在 finally 里放 —— 中途抛异常还占着，整个会话要等 TTL 到期才解锁。
             turn.release()
@@ -435,12 +510,16 @@ class FeishuCaps(Caps):
             return
         # 走到这里：要么首卡没发出去，要么这张卡已经刷不动了（被撤回/一直被拒）。
         # 答案本身不能丢 —— 再发一张新卡；新卡也发不出去才退纯文本。
-        card = im_cards.answer_card(body, msg.locale, report_url=report_url)
+        card = im_cards.answer_card(body, msg.locale, report_url=report_url,
+                                   agent=agent, sources=extra["sources"],
+                                   usage=extra["usage"])
         resp = feishu_utils.send_card(msg.chat_id, card)
         if not im_cards.message_id_of(resp):
             # 退纯文本丢的只是卡片外观（状态标题 / 过程行 / 报告按钮）。
             # 报告链接不会丢：它在 `body` 的截断提示里（正文自带，不依赖按钮）。
+            # ⚠️ 落款走 `usage_footer` 而**不是**硬编码 `router.direct_no_token`：
+            # 走模型那条路上那句是假的（这一轮确实花了钱）。
             logger.error("caps.chat: final send_card failed code=%s",
                          (resp or {}).get("code"))
-            self.reply_text(msg, body + "\n\n"
-                            + i18n.t("router.direct_no_token", msg.locale))
+            self.reply_text(msg, body + "\n\n" + im_cards.usage_footer(
+                msg.locale, agent=agent, usage=extra["usage"]))

@@ -1,9 +1,9 @@
 """IM/后端小任务的**单轮 LLM 调用**收口 —— 从"手搓 Anthropic body"改成 Converse。
 
 ── 为什么有这个模块 ────────────────────────────────────────────────────────────
-`core/` 下有 8 处「一个 system prompt + 一段用户文本 → 一段（通常是 JSON 的）文本」
+`core/` 下有 7 处「一个 system prompt + 一段用户文本 → 一段（通常是 JSON 的）文本」
 的调用：`bedrock_intent`、`next_steps`、`case_analyze`、`skill_dispatcher`、
-`case_classifier`、`progress_card`（两处）、`skill_authoring`。它们原来各自
+`case_classifier`、`progress_card`（两处）。它们原来各自
 `invoke_model(body={"anthropic_version": "bedrock-2023-05-31", ...})` —— 也就是
 **写死了 Anthropic 的原生协议**。
 
@@ -32,9 +32,9 @@ from __future__ import annotations
 
 import logging
 
-# `get_bot_model_id` is **deliberately re-exported**: `skill_dispatcher` /
-# `skill_authoring` log an `llm_audit: … model=%s …` line next to each call and
-# need the same id this module resolved. Don't "clean up the unused import".
+# `get_bot_model_id` is **deliberately re-exported**: `skill_dispatcher` logs an
+# `llm_audit: … model=%s …` line next to each call and needs the same id this
+# module resolved. Don't "clean up the unused import".
 from shared.model_config import get_bot_model_id
 
 __all__ = ["invoke_bot_text", "strip_code_fence", "get_bot_model_id"]

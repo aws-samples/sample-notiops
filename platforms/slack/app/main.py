@@ -26,19 +26,11 @@ from core import ddb_state
 from core import dispatch_compose
 from core import i18n
 from core import locale_resolver
-# webhook_dispatch is retained ONLY for skill_commands' `/skills run` path,
-# which still POSTs to the single fixed Agent Space. The @-mention
-# investigate path below uses idle's cross-account STS+API instead — see
-# the dispatch rationale block in _handle_dispatch_decision.
-from core import webhook_dispatch
 from core import skill_dispatcher
 from core import skill_registry
-from core import skill_authoring
-from core import webhook_dispatch
 from core import llm_pref_resolver
 from core import model_catalog
 from shared.devops_agent import create_investigation
-from platforms.slack.app import skill_commands
 
 from platforms.slack.app import blocks
 
@@ -552,16 +544,6 @@ def on_app_mention(event: dict, say, client) -> None:
         logger.info("Duplicate event %s — skipped", event_id)
         return
 
-    # `/skills ...` short-circuit — runs AFTER the duplicate-event guard so a
-    # DM @mention (delivered by Slack as BOTH a `message` and an `app_mention`
-    # event, same event_id) is handled exactly once. Runs after full locale
-    # resolve so replies match the conversation language. (BUG-2 fix.)
-    if skill_commands.maybe_handle_skill_command(
-            client, channel_id=channel_id, thread_ts=thread_ts,
-            event_ts=event.get("ts", ""), user_id=user_id,
-            raw_text=raw_text, locale=locale):
-        return
-
     # Mark this Slack thread as bot-active so subsequent follow-ups in
     # the same thread route through `on_message_event` without needing
     # a fresh @-mention. `thread_ts` is either the existing thread root
@@ -572,25 +554,12 @@ def on_app_mention(event: dict, say, client) -> None:
     if thread_ts:
         ddb_state.mark_bot_thread(PLATFORM, thread_ts)
 
-    # Authoring-intent nudge (Option A): "write me a skill" is not a run/
-    # investigate request — point the user to the admin `/skills create` path
-    # instead of dispatching an investigation. Admin-aware (_is_admin returns
-    # True in open mode, i.e. SKILLS_ADMINS unset).
-    if skill_dispatcher.looks_like_authoring_request(raw_text):
-        if skill_commands._is_admin(user_id):
-            # Author directly from the NL request — no need to retype as
-            # `/skills create`. Extract the goal and run the create flow
-            # (enrich → lint → confirm card).
-            goal = skill_dispatcher.extract_authoring_goal(raw_text)
-            skill_commands.begin_authoring(
-                client, channel_id=channel_id, thread_ts=thread_ts,
-                event_ts=event.get("ts", ""), user_id=user_id,
-                locale=locale, mode="create", skill_id="", goal=goal)
-        else:
-            say(channel=channel_id, thread_ts=thread_ts,
-                text=i18n.t("skill.author.denied", locale))
-        return
-
+    # ⚠️ 2026-09-06: the `/skills …` short-circuit and the authoring-intent nudge
+    # that used to sit here are GONE — skill authoring/running retired from the IM
+    # side entirely (it lives in the web console). See core/nl_router.py's closing
+    # comment. The skill **auto-dispatch** below still exists and dies with this
+    # Fargate path at M2.
+    #
     # ── Deterministic 0-token routing (core.nl_router) ───────────────────
     # Explicit / clearly-worded case requests route straight to the case flow
     # with NO Bedrock classify. Explicit investigate commands force the
@@ -1316,8 +1285,8 @@ def _handle_dispatch_decision(body: dict, client, action: str) -> None:
     #   3. Latency is equivalent: both are sub-second "fire" operations that
     #      just return a task_id; the actual investigation runs async for
     #      minutes and reports back via EventBridge. The user perceives no diff.
-    #   core/webhook_dispatch.py is left in the tree (used by skill_commands'
-    #   /skills run for now) but the @-mention investigate path uses STS+API.
+    #   core/webhook_dispatch.py is left in the tree (case_flow + push_handler +
+    #   dingtalk still use it) but the @-mention investigate path uses STS+API.
     #
     # incident_id stays as the LOCAL routing key (`<platform>-<event_id>`) — it
     # keys the Conversations row that progress-poller / report-handler use to
@@ -1654,83 +1623,11 @@ def _event_id_from_message(body: dict) -> str:
     return ""
 
 
-# ── Authoring confirm-card handlers (delegate to skill_commands builders) ─────
-
-@app.action(skill_authoring.ACTION_SAVE_SKILL)
-def on_skill_author_save(ack: Ack, body: dict, client) -> None:
-    """✅ Save the LLM-drafted skill."""
-    ack()
-    import json as _json
-    action = (body.get("actions") or [{}])[0]
-    event_id = _json.loads(action.get("value") or "{}").get("event_id", "")
-    channel_id = (body.get("channel") or {}).get("id", "")
-    msg_ts = (body.get("message") or {}).get("ts", "")
-    skill_commands.save_authored_skill(event_id, channel_id, msg_ts, client)
-
-
-@app.action(skill_authoring.ACTION_EDIT_SKILL)
-def on_skill_author_edit(ack: Ack, body: dict, client) -> None:
-    """✏️ Open a modal pre-filled with the draft's editable fields."""
-    ack()
-    import json as _json
-    action = (body.get("actions") or [{}])[0]
-    event_id = _json.loads(action.get("value") or "{}").get("event_id", "")
-    draft, convo = skill_commands._load_draft(event_id)
-    locale = convo.get("locale", "en")
-    if not draft:
-        return
-    fields = [
-        ("name", draft.get("name", "")),
-        ("description", draft.get("description", "")),
-        ("prompt", draft.get("prompt", "")),
-        ("tags", " ".join(draft.get("tags", []))),
-    ]
-    modal_blocks = [
-        blocks.text_input(
-            label=i18n.t(f"skill.author.field.{f}", locale),
-            action_id=f"{skill_authoring.DRAFT_BLOCK_PREFIX}{f}_input",
-            block_id=f"{skill_authoring.DRAFT_BLOCK_PREFIX}{f}",
-            initial_value=v, multiline=(f == "prompt"),
-            optional=(f != "prompt"), max_length=3000)
-        for f, v in fields
-    ]
-    client.views_open(
-        trigger_id=body["trigger_id"],
-        view=blocks.modal(
-            i18n.t("skill.author.edit_title", locale), modal_blocks,
-            callback_id="skill_author_edit_submit",
-            private_metadata=_json.dumps({"event_id": event_id})))
-
-
-@app.view("skill_author_edit_submit")
-def on_skill_author_edit_submit(ack: Ack, body: dict, view: dict, client) -> None:
-    """Fold modal edits back into the draft, re-lint, re-render the card."""
-    ack()
-    import json as _json
-    event_id = _json.loads(view.get("private_metadata") or "{}").get("event_id", "")
-    state = (view.get("state") or {}).get("values") or {}
-    edits = {}
-    for f in ("name", "description", "prompt", "tags"):
-        bid = f"{skill_authoring.DRAFT_BLOCK_PREFIX}{f}"
-        aid = f"{bid}_input"
-        edits[f] = ((state.get(bid, {}) or {}).get(aid, {}) or {}).get("value", "") or ""
-    skill_commands.apply_authoring_edits(event_id, edits, client)
-
-
-@app.action(skill_authoring.ACTION_CANCEL_SKILL)
-def on_skill_author_cancel(ack: Ack, body: dict, client) -> None:
-    """❌ Cancel — discard the draft, clear the card."""
-    ack()
-    import json as _json
-    action = (body.get("actions") or [{}])[0]
-    event_id = _json.loads(action.get("value") or "{}").get("event_id", "")
-    _, convo = skill_commands._load_draft(event_id)
-    locale = convo.get("locale", "en")
-    channel_id = (body.get("channel") or {}).get("id", "")
-    msg_ts = (body.get("message") or {}).get("ts", "")
-    if msg_ts:
-        client.chat_update(channel=channel_id, ts=msg_ts,
-                           text=i18n.t("skill.author.cancelled", locale), blocks=[])
+# ⚠️ 2026-09-06: the four skill-**authoring** handlers (save / edit / edit-submit
+# modal / cancel) used to live here. Authoring retired from IM entirely —
+# `platforms/slack/app/skill_commands.py` and `core/skill_authoring.py` are
+# deleted. A stale card from before this deploy now gets no handler, which Slack
+# surfaces as an unresponsive button — acceptable for a retired feature.
 
 
 @app.action("edit_dispatch_submit_inline")

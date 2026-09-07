@@ -770,6 +770,156 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Want a different model? Here's the list — reply `model <alias>` to switch:",
     },
 
+    # -- @bot agent / web —— 两个会话级开关（core/im_prefs.py）。归属规则与 `model`
+    # 完全一致：群里一个群一份、私聊按人，任何成员都能切（不设管理员门）。
+    #
+    # ⚠️ 切到 notiops 的那句**必须**把"要花钱"说出来。IM 是被动入口（群里 @ 一下就是
+    # 一轮），默认值是 devops（NotiOps 侧 0 token）；用户显式切过去时如果我们不说，
+    # 他就是在不知情的前提下开了计费开关。这条口径的完整理由见 `core/im_prefs.py` 头部。
+    "agent.label.devops": {
+        "zh": "DevOps Agent(直连 · 无模型消耗)",
+        "en": "DevOps Agent (direct · no model usage)",
+    },
+    "agent.label.notiops": {
+        "zh": "NotiOps Agent(走模型 · 会消耗 token)",
+        "en": "NotiOps Agent (uses the model · consumes tokens)",
+    },
+    "agent.current": {
+        "zh": "🧭 当前对话由 **{label}** 回答(来源: {source})",
+        "en": "🧭 Chat is answered by **{label}** (source: {source})",
+    },
+    "agent.set_chat": {
+        "zh": "✅ 已切到 **{label}**。本群所有人之后都用它。",
+        "en": "✅ Switched to **{label}**. Everyone in this chat will use it from now on.",
+    },
+    "agent.set_dm": {
+        "zh": "✅ 已切到 **{label}**(仅本私聊)。",
+        "en": "✅ Switched to **{label}** (this DM only).",
+    },
+    "agent.cleared": {
+        "zh": "✅ 已清除偏好,回到默认的 DevOps Agent(无模型消耗)。",
+        "en": "✅ Cleared preference; back to the default DevOps Agent (no model usage).",
+    },
+    "agent.set_failed": {
+        "zh": "⚠️ 切换失败(DDB 写入错误),请稍后再试 —— 当前仍然是原来那个。",
+        "en": "⚠️ Switch failed (DDB write error); please try again — still on the previous one.",
+    },
+    "agent.unknown": {
+        "zh": "⚠️ 未知的 agent `{arg}`。可用: `notiops` · `devops`",
+        "en": "⚠️ Unknown agent `{arg}`. Available: `notiops` · `devops`",
+    },
+    "agent.token_notice": {
+        "zh": "⚠️ NotiOps Agent 走大模型,每一轮问答都会消耗 token。想回到不花钱的那条:`agent devops`。",
+        "en": "⚠️ The NotiOps Agent calls the model — every turn consumes tokens. "
+              "To go back to the free path: `agent devops`.",
+    },
+    "agent.usage": {
+        "zh": "用法:`agent` 查看 · `agent notiops` 切到 NotiOps Agent(走模型) · "
+              "`agent devops` 切回直连(无模型消耗) · `agent default` 清除偏好",
+        "en": "Usage: `agent` to view · `agent notiops` for the NotiOps Agent (uses the model) · "
+              "`agent devops` for the direct path (no model usage) · `agent default` to clear",
+    },
+    "agent.not_configured": {
+        "zh": "⚠️ 这套部署没有接 NotiOps Agent(缺 `AGENT_RUNTIME_ARN`),切不过去。"
+              "当前仍然是 DevOps Agent 直连。",
+        "en": "⚠️ This deployment has no NotiOps Agent wired in (missing `AGENT_RUNTIME_ARN`), "
+              "so the switch was not applied. Still on the DevOps Agent direct path.",
+    },
+
+    # ── NotiOps Agent 那条路**跑起来之后**的失败话术（core/agent_chat.py）──────
+    # 与上面 `agent.not_configured` 的区别是**时机**，不是措辞：那条是用户发
+    # `/agent notiops` **切不过去**时的拒绝，这几条是已经切过去了、每一轮问答真的去
+    # 调 runtime 时的失败。所以这几条都必须带**可执行的下一步**（切回直连 / 拆小问题 /
+    # 走 `/investigate`）—— IM 里用户没有控制台可看，我们不说他就只有一句"失败了"。
+    #
+    # ⚠️ 这五条原本是 `core/agent_chat.py` 里一个本地 `dv(zh, en)` 三元helper，
+    # 双语是全的、功能没错。搬过来的理由是**回退方向相反**：`dv()` 只判
+    # `startswith("en")`，于是任何意外 locale（""、"ja"）都掉回**中文**，而
+    # `i18n.t` 掉回**英文** —— 同一张卡里其它文案全走 `t()`，就会中英混排。
+    "agent.chat.not_configured": {
+        "zh": "⚠️ 这个部署没有接入 NotiOps Agent(缺 AGENT_RUNTIME_ARN)。\n\n"
+              "先用 `/agent devops` 切回 DevOps Agent 直连(0 token),"
+              "或者请管理员重新部署以接入。",
+        "en": "⚠️ This deployment is not wired to the NotiOps agent "
+              "(AGENT_RUNTIME_ARN is unset).\n\n"
+              "Use `/agent devops` to switch back to the DevOps Agent direct path "
+              "(0 tokens), or ask your administrator to redeploy with it enabled.",
+    },
+    "agent.chat.invoke_failed": {
+        "zh": "⚠️ 调用 NotiOps Agent 失败({err})。稍后再试,"
+              "或用 `/agent devops` 走 DevOps Agent 直连。",
+        "en": "⚠️ Failed to reach the NotiOps agent ({err}). "
+              "Please retry, or use `/agent devops` for the direct path.",
+    },
+    "agent.chat.no_stream": {
+        "zh": "⚠️ NotiOps Agent 没有返回事件流。",
+        "en": "⚠️ The NotiOps agent returned no event stream.",
+    },
+    "agent.chat.timed_out": {
+        "zh": "⏱️ 这个问题跑了超过 {sec} 秒还没答完。可以拆小一点再问,"
+              "或者用 `/investigate` 发起一次深度调查(异步,跑完回帖)。",
+        "en": "⏱️ This took longer than {sec}s without finishing. "
+              "Try a narrower question, or run `/investigate` "
+              "(asynchronous — it posts back when done).",
+    },
+    "agent.chat.failed": {
+        "zh": "⚠️ NotiOps Agent 这轮失败了({etype})。稍后再试,"
+              "或用 `/agent devops` 走 DevOps Agent 直连。",
+        "en": "⚠️ The NotiOps agent failed this turn ({etype}). "
+              "Please retry, or use `/agent devops` for the direct path.",
+    },
+    "agent.chat.partial": {
+        # 有正文但被我们掐断了 —— 追加在答案后面，所以不能自带换行/标题。
+        "zh": "⏱️(已超过 {sec} 秒,上面是截断到此的部分答案)",
+        "en": "⏱️ (cut off at {sec}s — the answer above is partial)",
+    },
+
+    "web.on": {"zh": "开", "en": "on"},
+    "web.off": {"zh": "关", "en": "off"},
+    "web.current": {
+        "zh": "🌐 联网搜索:**{state}**(来源: {source})",
+        "en": "🌐 Web search: **{state}** (source: {source})",
+    },
+    "web.set_chat": {
+        "zh": "✅ 联网搜索已**{state}**。本群所有人之后都是这个设置。",
+        "en": "✅ Web search is now **{state}**. Applies to everyone in this chat.",
+    },
+    "web.set_dm": {
+        "zh": "✅ 联网搜索已**{state}**(仅本私聊)。",
+        "en": "✅ Web search is now **{state}** (this DM only).",
+    },
+    "web.set_failed": {
+        "zh": "⚠️ 设置失败(DDB 写入错误),请稍后再试。",
+        "en": "⚠️ Update failed (DDB write error); please try again.",
+    },
+    "web.usage": {
+        "zh": "用法:`web` 查看 · `web on` 开 · `web off` 关。只对 NotiOps Agent 生效。",
+        "en": "Usage: `web` to view · `web on` · `web off`. Only affects the NotiOps Agent.",
+    },
+    "web.not_configured": {
+        # ⚠️ 这条**目前没有任何调用点**，是留给后续那一步的，不是漏接线：
+        # `core.web_search.configured()` 判的是 `AGENTCORE_WEBSEARCH_GATEWAY_URL`，而这个
+        # 环境变量只注入到 **agent runtime**（方式A `notiops-webchat-standalone-stack.ts`
+        # 的 conditionIf / 方式B `agentcore/agentcore.json` 的 envVars），IM Lambda 的
+        # `commonEnv` 里没有 —— 也就是说 IM 侧**根本看不到**这套部署有没有联网出口，
+        # 现在加检查只会是个永远为假的判断。
+        # 而这也正好与 Web 端一致：`bff/web-chat/index.mjs` 把 `web_search` 原样透传，
+        # 同样不做能力门。要让这条真能用，必须在**两条路径**上都把
+        # `AGENTCORE_WEBSEARCH_GATEWAY_URL` 注进 `im-core.ts` 的 `commonEnv`（只接一边
+        # 会让方式A/方式B 行为分叉，违反两条路径必须对等那条铁律）。
+        "zh": "⚠️ 这套部署没有配联网搜索出口,打不开。要用的话请先在部署时启用联网搜索。",
+        "en": "⚠️ This deployment has no web-search gateway configured, so it can't be enabled. "
+              "Enable web search at deploy time first.",
+    },
+    "web.devops_noop": {
+        # 追加在**查看**和**设置**两条回复后面，所以这句不能自带"设置已记下"——
+        # 查看路径什么都没写，那样说就是假的。
+        "zh": "ℹ️ 当前是 DevOps Agent 直连,联网与否由你自己那套 agent 决定 —— 这个开关只对 "
+              "NotiOps Agent(`agent notiops`)生效。",
+        "en": "ℹ️ You're on the DevOps Agent direct path, where web access is decided by your own "
+              "agent — this switch only affects the NotiOps Agent (`agent notiops`).",
+    },
+
     # -- /help — the command menu. Bilingual, lists BOTH language forms of
     # every command because a Chinese user won't guess `/调查` exists unless
     # we tell them. Rendered from core.nl_router.HELP_COMMANDS. --------------
@@ -800,6 +950,23 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
               "or just say “open a case” / “escalate”, "
               "or in Chinese 「我要开案例」",
     },
+    # ⚠️ 这两行的示例故意就是**命令本身**（`/` 可省略，所以「智能体 notiops」是真的
+    # 能打的说法）。不给"大白话"示例是有意的：`agent` / `web` 是开关，猜错的代价是
+    # 悄悄开了计费或者悄悄关了联网,宁漏不误。引号样式仍要中英各一条（见上面那段）。
+    "help.row.agent": {
+        "zh": "🧭 **谁来回答** — `/agent notiops|devops`、`/智能体 notiops|devops`;"
+              "默认是 DevOps Agent 直连(无模型消耗),说「智能体 notiops」换成走模型的 "
+              "NotiOps Agent,英文 “agent devops” 一样认",
+        "en": "🧭 **Who answers** — `/agent notiops|devops`, `/智能体 notiops|devops`; "
+              "defaults to the DevOps Agent (no model usage). Say “agent notiops” for the "
+              "model-backed NotiOps Agent, or in Chinese 「智能体 devops」",
+    },
+    "help.row.web": {
+        "zh": "🌐 **联网搜索** — `/web on|off`、`/联网 on|off`;默认关,只对 NotiOps Agent 生效,"
+              "说「联网 on」打开,英文 “web off” 一样认",
+        "en": "🌐 **Web search** — `/web on|off`, `/联网 on|off`; off by default and only affects "
+              "the NotiOps Agent. Say “web on” to enable, or in Chinese 「联网 off」",
+    },
     "help.row.model": {
         "zh": "🧠 **切换模型** — `/model`、`/model list`、`/模型 list`;也可以说「换个模型」,英文 “switch model” 一样认",
         "en": "🧠 **Switch model** — `/model`, `/model list`, `/模型 list`; "
@@ -812,14 +979,10 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "🌐 **Switch language** — `/language zh|en`, `/语言 zh|en`; "
               "or say “switch to English” / 「说中文」",
     },
-    # ⚠️ 没有 `help.row.skills`：IM 侧不提供 skills（原因见 nl_router.HELP_COMMANDS
-    # 下面那段注释）。打了 `/skills` 回下面这句指路，不是菜单项。
-    "skill.im_web_only": {
-        "zh": "🧩 Skills（技能）目前只能在 NotiOps Web 控制台里创建和管理 —— IM 这边不支持。"
-              "你可以直接把想做的事说给我听，我按需调查。",
-        "en": "🧩 Skills are created and managed in the NotiOps web console only — "
-              "not available here in chat. Just tell me what you need and I'll look into it.",
-    },
+    # ⚠️ 既没有 `help.row.skills` 也没有 `skill.im_web_only`：skill 能力 2026-09-06 从
+    # IM 侧整体退役（完整实现在 Web 端），连"去 Web 端"那句指路都不留 —— 打了 `/skills`
+    # 由 `nl_router._UNKNOWN_SLASH_RE` 统一回 `/help` 菜单（0 token）。原因见
+    # `core/nl_router.py` 文件末尾那段。别再把 skill 相关文案加回这张表。
     "help.row.help": {
         "zh": "❓ **帮助** — `/help`、`/帮助`",
         "en": "❓ **Help** — `/help`, `/帮助`",
@@ -849,6 +1012,32 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "⚡ 直连 DevOps Agent · 无模型消耗",
         "en": "⚡ Direct to DevOps Agent · no model usage",
     },
+    # 走 NotiOps Agent 那条路的对应落款 —— 报**哪个 agent、哪个模型**。
+    #
+    # ⚠️ 2026-09-06 产品决策：**用量先不给客户看**。原来这两句写的是
+    # 「🧠 NotiOps Agent · 8,545 tokens · 1 轮」,现在换成
+    # 「Agent: NotiOps | Model: <真实模型 id>」。**统计本身一个字没动** ——
+    # `core.agent_chat.run_agent_chat` 照样回 `usage`（`totalTokens` / `cycles` /
+    # 缓存读写),照样进日志与指标;只是**不渲染到卡片上**。要重新露出来就是在
+    # `usage_footer` 里把它拼回去,不需要动链路。
+    #
+    # 模型 id 来自 `usage["modelId"]`（`core.llm_config.resolve(alias).model_id`,
+    # 与 agent 侧 `resolve_model_id()` 同一个模块、同一行 DDB 配置）—— 不是硬编码的
+    # 默认模型名:Admin 换过默认模型、或用户 `/model` 点的那个已被停用而实际回落到别的
+    # 模型时,落款必须说**实际生效**的那个,否则就是在跟客户报一个假的模型。
+    #
+    # 两个 locale **故意逐字相同**:这一行是技术标识（agent 名 + 模型 id）,翻译它
+    # 只会让同一次回答在中英文界面看起来像用了两个不同的东西。
+    "router.agent_model": {
+        "zh": "Agent: NotiOps | Model: {model}",
+        "en": "Agent: NotiOps | Model: {model}",
+    },
+    # 拿不到模型 id（配置读失败等）→ 只报 agent，**不许**退成上面那句"无模型消耗"：
+    # 那是把"不知道"说成"没花钱"。宁可少说一半，也不能说反。
+    "router.agent_model_unknown": {
+        "zh": "Agent: NotiOps",
+        "en": "Agent: NotiOps",
+    },
 
     # =====================================================================
     # AWS Support case management — Feishu / Slack UI
@@ -856,30 +1045,11 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
     # Grouped at end of dict per Agent-friendly insertion contract.
     # =====================================================================
 
-    # ---- Subject summarizer (Bedrock system prompt) ---------------------
-    "case.create.summarizer_system_prompt": {
-        "zh": (
-            "你是 AWS Support case subject 生成器。给定用户的中文/英文运维问题描述,"
-            "**严格按格式提炼一个 ≤80 字符的 subject**:\n"
-            "  - 格式:「服务名 + 资源标识(可选) + 现象关键词」\n"
-            "  - 例:「RDS db-prod-01 间歇性 5xx 慢查询」\n"
-            "  - 不要写完整句子,不要带语气词('帮我'、'请')。\n"
-            "  - 输入语言中文 → 输出中文;输入英文 → 输出英文。\n"
-            "  - 用户没说服务名时,subject 留空字符串。\n"
-            "  - 只输出 subject 文本,不要 JSON、不要解释、不要 markdown。"
-        ),
-        "en": (
-            "You generate concise subjects for AWS Support cases. Given the "
-            "user's Chinese/English ops issue description, "
-            "**produce a single subject ≤80 characters in this format**:\n"
-            "  - Format: `service + resource id (optional) + symptom keywords`\n"
-            "  - Example: `RDS db-prod-01 intermittent 5xx slow query`\n"
-            "  - Do NOT write a full sentence; no filler words.\n"
-            "  - If input is Chinese, output Chinese; if English, output English.\n"
-            "  - If the user did not name a service, return an empty string.\n"
-            "  - Output the subject only — no JSON, explanation, or markdown."
-        ),
-    },
+    # ---- Subject summarizer：2026-09-06 随飞书那条死掉的 LLM 分支一起删 -------
+    # 原 `case.create.summarizer_system_prompt` 是给
+    # `platforms/feishu/app/case_flow.py::_summarize_subject` 第四步用的 system
+    # prompt。那一步删了（成因见该函数 docstring），键也就没有调用方了。
+    # 别再把它加回来：标题预填现在两端都是确定性的。
 
     # ---- Filter labels (status_filter slug → human label) ---------------
     "case.list.filter.recent": {
@@ -2963,11 +3133,19 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
     },
 
     # ── IM webhook (Lambda) 卡片文案 ────────────────────────────────────────
-    # 这批 key 只被 platforms/*/caps.py 用。全部是确定性渲染（0 token）：
+    # 这批 key 只被 platforms/*/caps.py 用。**这些文案本身**全是确定性渲染（0 token）：
     # 没有任何一条会去过模型，所以文案必须自己是双语的，不能靠运行时翻译。
+    #
+    # ⚠️ "文案 0 token" ≠ "这条路径 0 token"（2026-09-06 校正）：同一批卡片也用在
+    # `/agent notiops` 之后那条走 NotiOps Agent 的路上，那条路是**烧 token 的**。
+    # 落款分两套（`router.direct_no_token` / `router.agent_model`），标题也分两套。
     "im.chat.card_title": {
         "zh": "DevOps Agent 回答",
         "en": "DevOps Agent answer",
+    },
+    "im.chat.card_title.notiops": {
+        "zh": "NotiOps Agent 回答",
+        "en": "NotiOps Agent answer",
     },
     # 「边想边看」三条 —— 见 platforms/common/live_card.py。
     # 立刻回一张这个标题的卡（不等答案），用户才知道"收到了、要等一会儿"：实测一个
@@ -3023,9 +3201,57 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
               "needs a few minutes; progress and conclusion both **update in "
               "this card**, so no need to ask again.",
     },
+    # 同样 5 条，给 `/agent notiops` 那条路 —— 只换了 agent 的名字，其余口径（那句
+    # 「不用重复发问」「这张卡片」、不带 `{占位符}`）与上面 5 条**逐字同规矩**，
+    # `tests/test_im_ack_variants.py` 对两套 key 都跑同一批断言。
+    #
+    # 为什么不共用一套中性文案：默认那条路是"直连你自己的 DevOps Agent"，这条是"我们
+    # 的 NotiOps Agent 在花你的 token"。把名字含糊掉，用户就分不清这一轮到底谁在答、
+    # 花没花钱 —— 而这正是 `/agent` 这个开关存在的意义。
+    "im.chat.ack_body.notiops.1": {
+        "zh": "已收到，正在让 NotiOps Agent 分析。复杂问题可能要跑几分钟，"
+              "过程和结论都会**更新到这张卡片**上，不用重复发问。",
+        "en": "Got it — the NotiOps Agent is working on this. Complex questions "
+              "can take a few minutes; progress and the answer will both "
+              "**update in this card**, so no need to ask again.",
+    },
+    "im.chat.ack_body.notiops.2": {
+        "zh": "收到，NotiOps Agent 已经开始查了。复杂一点的问题要跑几分钟，"
+              "查到哪一步、结论是什么，都会**写在这张卡片**里，不用重复发问。",
+        "en": "On it — the NotiOps Agent has started digging. Anything "
+              "non-trivial takes a few minutes; each step and the final answer "
+              "land **in this card**, so no need to ask again.",
+    },
+    "im.chat.ack_body.notiops.3": {
+        "zh": "这个问题交给 NotiOps Agent 了，正在翻数据。可能要等几分钟，"
+              "中间的进展和最后的结论都会**刷到这张卡片**上，不用重复发问。",
+        "en": "Handed this to the NotiOps Agent — it is pulling the data now. "
+              "This can take a few minutes; progress and the final answer both "
+              "refresh **in this card**, so no need to ask again.",
+    },
+    "im.chat.ack_body.notiops.4": {
+        "zh": "好，NotiOps Agent 接手了。查得细的时候会慢一点，"
+              "但每一步都会**同步到这张卡片**，结论也在这里，不用重复发问。",
+        "en": "Sure — the NotiOps Agent has picked this up. A thorough look "
+              "takes a bit longer, but every step syncs **into this card** and "
+              "the answer lands here too, so no need to ask again.",
+    },
+    "im.chat.ack_body.notiops.5": {
+        "zh": "收到了，正在查。NotiOps Agent 挖得深一些需要几分钟，"
+              "过程和结论会一起**更新在这张卡片**上，不用重复发问。",
+        "en": "Got it, looking into this now. A deeper dig by the NotiOps Agent "
+              "needs a few minutes; progress and conclusion both **update in "
+              "this card**, so no need to ask again.",
+    },
     "im.chat.steps_title": {
         "zh": "**过程**",
         "en": "**Progress**",
+    },
+    # 引用来源 —— 只有 NotiOps Agent 那条路会有（`aws_docs_*` / `web_search` 的结果）。
+    # DevOps Agent 直连那条路我们拿不到它的引用，所以这一段在那条路上根本不渲染。
+    "im.chat.sources_title": {
+        "zh": "**参考来源**",
+        "en": "**Sources**",
     },
     # 「正文放不下」三条 —— 见 platforms/common/long_answer.py。
     # 飞书卡片正文上限 3500 / Slack section 2900，原来是裸切片，客户看到的是一个

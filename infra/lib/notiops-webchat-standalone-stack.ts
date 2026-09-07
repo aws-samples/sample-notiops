@@ -1598,6 +1598,13 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       // 的功能必须一致）。默认空 = 不限制；客户拿到群 id 后更新栈即可收窄。
       // 不能写死空串 —— 那样客户只能手改 Lambda 环境变量，下一次栈更新又会覆盖回去。
       allowedChatIds: imAllowedChatIds.valueAsString,
+      // NotiOps agent runtime —— `/agent notiops` 那条路（走模型）要用。
+      // **与 BFF 传的是同一个 GetAtt**（见 :1243），所以 web 和 IM 必然指向同一个 runtime。
+      // ⚠️ 不要包 `Fn.conditionIf`：Runtime 是**无条件**资源（BFF 那行就是无条件 GetAtt
+      //    的活证据），包条件反而会在只装 IM 的栈上把值算成占位串。
+      // ⚠️ 也不要因为「IM 默认不用它」就不传：不传 = 客户切过去只能收到拒绝，而这个能力
+      //    在方式 B 是有的 —— 那正是「方式A/方式B 功能必须一致」这条铁律要挡的偏差。
+      agentRuntimeArn: runtime.getAtt("AgentRuntimeArn").toString(),
       // 排障 Agent Space —— **与 BFF 传的是同一个值**（`agentSpaceIdOrEmpty`，见 :864）。
       // ⚠️ 必须传：本栈的 space 叫 `notiops-oneclick-<account>`，而 IM 侧自动发现只认
       //    `notiops-devops-<account>`，靠"账号里恰好只有一个 space"活着。客户账号里

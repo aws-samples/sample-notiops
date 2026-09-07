@@ -405,6 +405,7 @@ def clear_convo_session(platform: str, chat_id: str, user_id: str,
 #
 #   imtask#<incident_id>  一次「发起深度调查」的全部上下文 + 进度游标
 #   imchat#<chat_id>      一个会话的 DevOps Agent execution_id（多轮上下文）
+#   imagent#<chat_id>     一个会话的 NotiOps Agent runtimeSessionId（会滚动，见下）
 #
 # 为什么把 execution_id 存 DDB 而不是靠模型记忆：IM 不需要 web 那套"合成历史"
 # （≈150 token/轮）来"记住"上一轮的 execution_id —— 它确定性地就在这行上。
@@ -693,6 +694,94 @@ def clear_im_chat_session(platform: str, chat_id: str) -> None:
         _table.delete_item(Key={"lookup_key": _k_im_chat(platform, chat_id)})
     except Exception as e:
         logger.warning("clear_im_chat_session (%s) failed: %s",
+                       chat_id, _safe_err(e))
+
+
+# ---------------------------------------------------------------------------
+# NotiOps Agent 会话（imagent#）—— 只存"这个 chat 现在用哪个 runtimeSessionId"
+# ---------------------------------------------------------------------------
+# `core/agent_chat.py` 那条路径（`/agent notiops`）的多轮上下文由 AgentCore 服务端按
+# `runtimeSessionId` 保管，我们这边只需要记住"用的是哪个 id"。
+#
+# ⚠️ **为什么不能直接拿 chat_id 当会话 id**：AgentCore runtime 的会话有 `maxLifetime`
+# （现网 28800s = 8h，见 `agentcore.json::lifecycleConfig`），到点服务端回收，再拿同一个
+# id 调就失败。而 IM 的 chat_id 是**永久**的 —— 那样写等于"每个群聊用满 8 小时后永久
+# 坏掉"，且是静默的。所以这里存一个**会滚动**的 id，超过 `_IM_AGENT_SESSION_MAX_AGE`
+# 就换新的（= 换一段新上下文，但至少能用）。
+_IM_AGENT_SESSION_TTL_SECONDS = 12 * 3600
+#: 一个 runtimeSessionId 最多用多久。取 6h：稳稳小于 8h 硬上限，且留足一轮长问答
+#: （worker Lambda 上限 900s）的余量。
+_IM_AGENT_SESSION_MAX_AGE = 6 * 3600
+
+
+def _k_im_agent(platform: str, chat_id: str) -> str:
+    return f"imagent#{platform}:{chat_id}"
+
+
+def _fallback_agent_session(platform: str, chat_id: str) -> str:
+    """DDB 读写不可用时的兜底会话 id —— **确定性**地按 6 小时时间桶算。
+
+    同一个 6 小时窗口内的两轮问答会算出同一个 id（上下文照样连着），跨桶时换一个新的
+    （与正常路径的滚动语义一致）。这样"DDB 抖一下"最坏只是丢一次上下文，而不是让
+    对话整个不可用。
+    """
+    bucket = int(time.time()) // _IM_AGENT_SESSION_MAX_AGE
+    return f"imagent-{platform}-{chat_id}-{bucket}"
+
+
+def im_agent_session_id(platform: str, chat_id: str) -> str:
+    """取（必要时新建）该 chat 的 NotiOps Agent 会话 id。**永不抛。**
+
+    返回的是**未规整**的原始字符串；调用方要过 `core.agent_chat.to_session_id`
+    （补长度 / 去非法字符）—— 规整逻辑只有一份，在那边。
+    """
+    if not (platform and chat_id):
+        return ""
+    now = int(time.time())
+    try:
+        resp = _table.get_item(Key={"lookup_key": _k_im_agent(platform, chat_id)},
+                               ConsistentRead=False)
+        item = resp.get("Item") or {}
+    except Exception as e:
+        logger.warning("im_agent_session_id read (%s) failed: %s",
+                       chat_id, _safe_err(e))
+        return _fallback_agent_session(platform, chat_id)
+
+    sid = str(item.get("session_id") or "")
+    started = int(item.get("started_at", 0) or 0)
+    if sid and started and (now - started) < _IM_AGENT_SESSION_MAX_AGE:
+        return sid
+
+    # 新建一段会话。用 uuid 而不是 chat_id 本身：会话 id 会出现在 AgentCore 的
+    # 服务端日志里，chat_id 拼进去等于把"哪个群"泄漏到我们控制不了的地方。
+    import uuid
+    sid = f"imagent-{uuid.uuid4().hex}{uuid.uuid4().hex}"
+    try:
+        _table.put_item(Item={
+            "lookup_key": _k_im_agent(platform, chat_id),
+            "platform": platform,
+            "chat_id": chat_id,
+            "session_id": sid,
+            "started_at": now,
+            "ttl": now + _IM_AGENT_SESSION_TTL_SECONDS,
+        })
+    except Exception as e:
+        logger.warning("im_agent_session_id write (%s) failed: %s",
+                       chat_id, _safe_err(e))
+        # 写不进去就别用这个随机 id —— 下一轮读不到会再随机一个，等于每轮都新会话
+        # （上下文全丢）。退回确定性的时间桶 id，至少一个窗口内是连着的。
+        return _fallback_agent_session(platform, chat_id)
+    return sid
+
+
+def clear_im_agent_session(platform: str, chat_id: str) -> None:
+    """丢掉该 chat 的 NotiOps Agent 上下文（切 agent / 显式重置时用）。"""
+    if not (platform and chat_id):
+        return
+    try:
+        _table.delete_item(Key={"lookup_key": _k_im_agent(platform, chat_id)})
+    except Exception as e:
+        logger.warning("clear_im_agent_session (%s) failed: %s",
                        chat_id, _safe_err(e))
 
 

@@ -76,7 +76,9 @@ _THREAD_JOIN_TIMEOUT = 600
 # 与 platforms/slack/app/main.py:138 同一条正则（`<@U123ABC> ` 前缀）。
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>\s*")
 
-# 每次冷启动装一次 bedrock 凭证（case 路径用到 analyze_intent）
+# 每次冷启动装一次 bedrock 凭证 —— 案例路径的两处模型调用要用
+# （`core.case_analyze` 与提交开案例表单时的 `core.case_classifier`；
+#  不是 `analyze_intent`，它在重构后的活路径上已不再被调到）。
 try:
     bedrock_credentials.install()
 except Exception as e:                        # noqa: BLE001
@@ -379,8 +381,8 @@ def _handle_block_actions(body: dict, elapsed: float) -> None:
             support_flow.handle_action(base_action, body, client)
         else:
             # skill_* / confirm_dispatch / edit_dispatch —— 这些卡片只有 Fargate 路径
-            # 会渲染出来（webhook 路径的 skills 只回一句引导）。真收到了说明用户点了
-            # 一张切换前留下的旧卡片：给一句人话，别静默。
+            # 会渲染出来（webhook 路径压根没有 skill 入口，2026-09-06 起连引导都没有）。
+            # 真收到了说明用户点了一张切换前留下的旧卡片：给一句人话，别静默。
             logger.info("block_actions: legacy action %s (Fargate-era card)", action_id)
             locale = _action_locale(action_value,
                                     str((body.get("user") or {}).get("id") or ""))

@@ -17,9 +17,16 @@ callback router for these card.action.trigger types:
   case_resolve_yes        - call ResolveCase
   case_resolve_no         - dismiss confirmation
 
-`main.py` dispatches inbound mentions by `command` (from
-`core.bedrock_intent.analyze_intent`) into the `start_*` entry points
-defined here; clicked card buttons re-enter via `handle()`.
+Inbound mentions reach the `start_*` entry points below by `command`;
+clicked card buttons re-enter via `handle()`.
+
+⚠️ **Who computes that `command`** (2026-09-06 correction): on the live path
+it is `platforms/common/router.py` + `core/nl_router.py` — deterministic
+regex, 0 token. The retired Fargate `main.py` used
+`core.bedrock_intent.analyze_intent`; that module is no longer on any live
+path, so do not read the LLM cost of the case flow as living here. The two
+model calls that *do* cost tokens are `core.case_analyze` (case_analyze) and
+`core.case_classifier` (the moment the create form is submitted).
 
 Bilingual: every user-facing string flows through `core.i18n.t()` with
 the conversation locale plumbed in. Card builders that produce visible
@@ -124,16 +131,14 @@ def _bold(s: str) -> str:
 def start_create(chat_id: str, raw_text: str, locale: str = "zh") -> None:
     """Send the case-create form into the chat.
 
-    Subject pre-fill: if the user's original message contains enough signal
-    (service name, resource id, error keywords), ask Bedrock to summarize
-    it into a clean "service + resource + symptom" subject. Otherwise we
-    leave Subject empty so the markdown hint above the input can guide
-    them — much better than dumping the entire user message into Subject.
+    Subject pre-fill is **deterministic** (0 token): strip the "开案例" /
+    "create case" intent marker and use what's left. The user edits it in
+    the form anyway, so a model round-trip buys nothing here.
     """
     if not chat_id:
         return
     locale = _normalize_locale(locale)
-    initial_subject = _summarize_subject(raw_text, locale=locale)
+    initial_subject = _summarize_subject(raw_text)
     feishu_utils.send_card(chat_id=chat_id,
                            card=_create_form_card(subject=initial_subject,
                                                   locale=locale))
@@ -151,18 +156,34 @@ _INTENT_ONLY_PATTERNS = (
 )
 
 
-def _summarize_subject(raw_text: str, locale: str = "zh") -> str:
+def _summarize_subject(raw_text: str) -> str:
     """Return a clean subject pre-fill, or '' if the input has no usable
-    detail. Uses Bedrock for the summarization."""
+    detail. **确定性、0 token** —— 与 Slack 侧同一份逻辑（`slack/app/case_flow.py`）。
+
+    🔴 2026-09-06：这里原本有第四步「长输入交给 Bedrock 抽一句
+    `服务 + 资源 + 症状` 的标题」。那段调的是 `bedrock_intent._bedrock.invoke_model`
+    与 `bedrock_intent.BEDROCK_MODEL_ID`，而这两个符号在 2026-09-01 改走
+    `core/bot_llm`（Converse 统一入口）时就被删了 —— 于是它每次都
+    `AttributeError`、被自己的 `except Exception` 吞掉、回落到 `stripped[:200]`，
+    只留一行 warning。也就是说**这条 LLM 分支从那天起就一直是死的**，
+    用户看到的一直是确定性结果。
+
+    删而不是修活，有三个理由：
+      1. Slack 侧从一开始就是确定性的（明写 sans Bedrock）—— 修活会让两端分叉；
+      2. 标题是**表单里的预填值**，用户提交前本来就要看一眼、随手能改，
+         值不上一次模型往返；
+      3. 重构之后 IM 只剩两个案例动作烧 token（`case_analyze` 与提交开案例表单时
+         的 `core.case_classifier`）。把这条留着"以后修活"等于把那个口径变回三个。
+
+    ⚠️ 行为与删除前的**运行时**表现逐字符一致：`len(stripped) <= 60` 那条早退返回
+    `stripped`，长输入的 except 分支返回 `stripped[:200]` —— 合起来就是下面这一行。
+    """
     text = (raw_text or "").strip()
     if not text:
         return ""
 
-    # Step 1: strip a leading "create case" / "开案例" intent marker if
-    # present, anywhere in the text — many users type "@bot 开案例 调查
-    # EC2 CPU 过高" where the meaningful topic is what FOLLOWS the marker.
-    # Removing the marker first means we treat that as a real subject
-    # rather than fall through to Bedrock with the verbose original.
+    # 抹掉句中任意位置的「开案例」/「create case」意图标记 —— 很多人打
+    # 「@bot 开案例 调查 EC2 CPU 过高」，真正的主题是标记**后面**那段。
     lowered = text.lower()
     stripped = text
     for p in _INTENT_ONLY_PATTERNS:
@@ -174,49 +195,9 @@ def _summarize_subject(raw_text: str, locale: str = "zh") -> str:
             stripped = (head + " " + tail).strip() if head else tail
             break
 
-    # Step 2: empty after stripping → user only said "create case" with
-    # no topic; leave Subject blank so the form's hint guides them.
-    if not stripped:
-        return ""
-
-    # Step 3: short enough to use as-is — no Bedrock round-trip needed.
-    # Bumped the threshold from 30 to 60 since CJK characters carry a lot
-    # of meaning per char and the kind of phrases users type tend to be
-    # already concise enough to use verbatim.
-    if len(stripped) <= 60:
-        return stripped
-
-    # Step 4: long input — ask Bedrock to extract a clean
-    # "service + resource + symptom" subject.
-    try:
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 120,
-            "system": i18n.t("case.create.summarizer_system_prompt", locale),
-            "messages": [{"role": "user", "content": text}],
-        }
-        # Reuse the bedrock client already initialized in core.bedrock_intent
-        # so we don't pay a second cold start.
-        from core import bedrock_intent
-        resp = bedrock_intent._bedrock.invoke_model(
-            modelId=bedrock_intent.BEDROCK_MODEL_ID,
-            contentType="application/json",
-            accept="application/json",
-            body=__import__("json").dumps(body),
-        )
-        import json as _json
-        data = _json.loads(resp["body"].read())
-        subject = ""
-        for block in data.get("content", []):
-            if block.get("type") == "text":
-                subject = block["text"].strip().strip('"').strip("'")
-                break
-        # Bedrock got it: use that. Otherwise fall back to the
-        # marker-stripped text so users still see SOMETHING relevant.
-        return (subject[:200] if subject else stripped[:200])
-    except Exception as e:
-        logger.warning("Subject summarization failed; falling back to stripped text: %s", e)
-        return stripped[:200]
+    # 抹完是空的 → 用户只说了「开案例」、没给主题；留空让表单上方那句提示引导他，
+    # 比把整段原话塞进 Subject 好。
+    return stripped[:200] if stripped else ""
 
 
 # Mapping of status_filter slug → i18n key for the human-readable label.
@@ -285,8 +266,9 @@ def start_view(chat_id: str, display_id: str,
         return
     locale = _normalize_locale(locale)
     if not display_id and not internal_id:
-        # Defensive — bedrock_intent.analyze_intent should have already
-        # downgraded to case_list, but main.py can still call us.
+        # Defensive — the router (`core.nl_router.parse_case_ref`) already
+        # downgrades a case_view with no id to case_list, but callers can
+        # still reach us directly.
         start_list(chat_id, locale=locale)
         return
     summary = case_management.describe_case(display_id,

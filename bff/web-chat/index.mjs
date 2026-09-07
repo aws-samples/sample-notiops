@@ -420,6 +420,8 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
           items: r.items,
           orgListable: r.orgListable !== false,
           oneClickOnboard: oneClickOnboardAvailable(),
+          // 部署账号的巡检范围（2026-09-07 起可配）—— UI 在列表顶部钉一行。
+          deployAccount: r.deployAccount || null,
         });
       }
       if (method === "POST" && path.endsWith("/admin/member-accounts")) {

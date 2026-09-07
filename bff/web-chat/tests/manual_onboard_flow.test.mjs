@@ -91,7 +91,7 @@ function ok(name, cond) {
  *      （grep 里刻意**不**写条数 —— 条数只在这个文件里有一处，
  *        否则加一条断言要改两个文件。）
  */
-const EXPECTED_TOTAL = 104;
+const EXPECTED_TOTAL = 107;
 
 /** 剥掉行注释，专给「不该出现某个字符串」这类**否定式**断言用。
  *
@@ -132,7 +132,14 @@ ok("ListAccounts 包在 try 里",
 ok("降级时改列 DDB 已登记的账号",
   /orgListable = false;[\s\S]{0,400}Object\.entries\(onboarded\)/.test(listBody));
 ok("降级**不静默** —— 返回 orgListable 标记",
-  /return \{ items, orgListable \}/.test(listBody));
+  /return \{ items, orgListable, deployAccount \}/.test(listBody));
+// ── 部署账号巡检范围（2026-09-07）——它不进 items（不是成员接入），单独回传 ──
+ok("列表回传 deployAccount（UI 钉固定行的数据源）",
+  /deployAccount = \{ accountId: selfId, regions \}/.test(listBody));
+ok("路由把 deployAccount 透出去（漏了 = UI 永远拿不到部署账号行）",
+  /deployAccount: r\.deployAccount \|\| null/.test(idx));
+ok("setAccountRegions 放行部署账号建行（老部署可能没有 account# 行）",
+  /if \(!self \|\| id !== self\) \{[\s\S]{0,120}account_not_registered/.test(src));
 // 🔴 标记不能挂在数组上：JSON.stringify 会静默丢掉数组的自有属性
 ok("标记走对象而不是挂数组属性",
   !/items\.orgListable = /.test(listCode));

@@ -676,55 +676,39 @@ language zh     # 切回中文
 > **Push 模式** = AWS 服务事件自动触发调查,bot 推送结果到群。**默认 Push 模式 lambda 部署后不发卡片**(`PushTargetChatId` 留空),需要显式打开。
 
 ### 7.1 启用 push(把 chat ID 填进去)
+`setup.sh` **不问** push target chat id(它只问是否部署 PHD 事件转发功能)。要开 push,部署后把目标群写进飞书 Secret `notiops/im-bot-feishu` 的 `notify_chat_ids` 字段,或在 Web Chat 管理控制台 →「集成 IM」里配。留空 = Lambda 收到事件 short-circuit 不发卡。
 
-`setup.sh` **不问** push target chat id(它只问是否部署 PHD 事件转发功能)。要开 push,部署后设置目标 chat id:
-
-```bash
-# 编辑 infra/cdk.json,把 pushTargetChatIds.<platform> 设成对应的 chat id
-$EDITOR infra/cdk.json
-cd infra && npx cdk deploy NotiOpsBackendStack
-```
-
-> 飞书还可把目标群写进 Secret `notiops/im-bot-feishu` 的 `notify_chat_ids`,或在 Web Chat 管理控制台 →「集成 IM」里配。
+<!-- ⚠️ 2026-09-06 订正:此前这一节教人改 infra/cdk.json 里的一组 push 开关 key ——
+     那些 key 代码里**从来不读**(全仓 grep 只有文档命中),照做静默无效。
+     真实机制是下面的 EventBridge 规则开关。tests/test_docs_no_phantom_config.py 盯着别写回来。 -->
 
 ### 7.2 调整 push 事件源
 
-6 个独立开关,**默认 3 个开 / 3 个关**:
+IM push 有 5 条 EventBridge 规则(`notiops-push-<源>`),**全部默认 DISABLED** ——
+开关就是 enable / disable 那条规则,不需要重新部署:
 
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `EnableCloudWatchAlarmPush` | ✅ `true` | CloudWatch alarm 状态变 ALARM |
-| `EnableHealthPush` | ✅ `true` | AWS Health 事件 |
-| `EnableBackupPush` | ✅ `true` | Backup job FAILED / EXPIRED / ABORTED |
-| `EnableGuardDutyPush` | `false` | GuardDuty finding(severity ≥ `GuardDutyMinSeverity`,默认 7) |
-| `EnableCostAnomalyPush` | `false` | Cost Anomaly Detection(需先建 monitor) |
-| `EnableTrustedAdvisorPush` | `false` | TA ERROR-status 变更(需 Business+ Support) |
-
-改 `infra/cdk.json` 里对应的 boolean,然后:
+| 规则名 | 事件源 |
+|---|---|
+| `notiops-push-cloudwatchalarm` | CloudWatch alarm 状态变更(已排除 NotiOps 自身运维告警) |
+| `notiops-push-backupjob` | Backup job 状态变更 |
+| `notiops-push-guardduty` | GuardDuty finding |
+| `notiops-push-costanomaly` | Cost Anomaly Detection(需先建 monitor;全局服务,只在 us-east-1 发事件) |
+| `notiops-push-trustedadvisor` | Trusted Advisor 检查项变更(需 Business+ Support;同上只在 us-east-1) |
 
 ```bash
-# 例:打开 GuardDuty + 阈值 8
-# infra/cdk.json:
-#   "enableGuardDutyPush": true,
-#   "guardDutyMinSeverity": 8
-cd infra && npx cdk deploy NotiOpsBackendStack
-
-# 例:关掉 Health 推送
-# infra/cdk.json: "enableHealthPush": false
-cd infra && npx cdk deploy NotiOpsBackendStack
+# 例:打开 GuardDuty 推送
+aws events enable-rule  --name notiops-push-guardduty  --region <部署区域>
+# 例:关掉 CloudWatch alarm 推送
+aws events disable-rule --name notiops-push-cloudwatchalarm --region <部署区域>
 ```
+
+> Web 端「通知」收件箱是**另一组**规则(`notiops-web-notif-*`,默认开 5 个),互不影响;
+> 方式 B 可在合成期用 `-c webNotif<Id>=on|off` 调整,方式 A 直接在 EventBridge 控制台开关。
 
 ### 7.3 完全静默(不发卡片但仍记录事件)
 
-把 `pushTargetChatIds` 全部设成空字符串:
-
-```bash
-# infra/cdk.json:
-#   "pushTargetChatIds": { "feishu": "", "slack": "" }
-cd infra && npx cdk deploy NotiOpsBackendStack
-# Lambda 收到事件 short-circuit 不发卡;EventBridge rule 仍存在,日志可观察事件量
-```
-
+把 Secret 里的 `notify_chat_ids`(或管理控制台「集成 IM」的目标群)清空即可:
+Lambda 收到事件 short-circuit 不发卡;EventBridge rule 仍存在,日志可观察事件量。
 ### 7.4 测试 push
 
 ```bash
@@ -815,7 +799,7 @@ aws dynamodb delete-item --table-name <conv-table> \
 
 | 级别 | 操作 | 影响 |
 |---|---|---|
-| **L1 关闭单个功能** | 改 `infra/cdk.json`(如 `enableHealthPush: false`)→ `cdk deploy NotiOpsBackendStack` | 单个事件源,~2 分钟 |
+| **L1 关闭单个事件源** | `aws events disable-rule --name notiops-push-<源>`(IM push)或 `notiops-web-notif-<源>`(Web 收件箱),见 §7.2 | 单个事件源,瞬时,无需部署 |
 | **L2 关闭整个对话档位** | 改 `agenticChatMode: "disabled"` → `cdk deploy ImStack` | chitchat / general_qa 路径 |
 | **L3 IM 从 webhook 退回长连接** | ⚠️ **2026-09-03(M2)之后这条不再是"分钟级"** —— `BotStack` 已不再由 `infra/bin/app.ts` 实例化,得先把 `new BotStack(...)` 加回去、装好 finch/docker、`cdk deploy BotStack`(要建 VPC/ECS/ECR + build 镜像),再把飞书 / Slack 控制台的订阅方式改回长连接 / Socket Mode。老装机(栈还在)仍是分钟级:改订阅方式 + `aws ecs update-service --desired-count 1 ...` | 单平台;新装机 ~20 分钟,老装机分钟级([IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §1.6)|
 | **L4 关闭整个 bot** | webhook 模式:`aws lambda put-function-concurrency --reserved-concurrent-executions 0`(ingress 立刻全部 429);长连接模式:`aws ecs update-service --desired-count 0 ...` | 单平台,瞬时 |
@@ -826,7 +810,7 @@ aws dynamodb delete-item --table-name <conv-table> \
 > 要**删掉整个环境**(而不是回滚单个栈),别逐个 `cdk destroy` —— 用仓库根目录的
 > `./teardown.sh`:它按依赖倒序删栈,并收掉 CDK 之外的尾巴(CUR 报告定义、一次性
 > EventBridge schedule、WebSearch Gateway、secret 的 30 天恢复期、孤儿日志组)。
-> 先 `./teardown.sh --dry-run` 看清单;默认保留三张 RETAIN 表,`--delete-everything` 全删。
+> 先 `./teardown.sh --dry-run` 看清单;默认保留四张 RETAIN 表,`--delete-everything` 全删。
 
 ---
 
@@ -874,15 +858,11 @@ aws dynamodb delete-item --table-name <conv-table> \
 |---|---|---|
 | `agentSpaceId` | (自动) | DevOps Agent space id。**无需手动提供** —— CDK 自动新建 `notiops-devops-<account>`(见 §5.3.5);此 context 仅供高级覆盖 |
 | `devOpsAgentRegion` | `us-east-1` | DevOps Agent 服务所在 region(用于 IAM Resource ARN),目前只有 `us-east-1` |
-| `pushTargetChatIds` | `{}` | 每平台一个 chat id,留空 = Lambda short-circuit 不发卡 |
-| `enableCloudWatchAlarmPush` | `true` | CloudWatch alarm |
-| `enableHealthPush` | `true` | AWS Health |
-| `enableBackupPush` | `true` | Backup |
-| `enableGuardDutyPush` | `false` | GuardDuty |
-| `guardDutyMinSeverity` | `7` | severity 阈值 |
-| `enableCostAnomalyPush` | `false` | Cost Anomaly |
-| `enableTrustedAdvisorPush` | `false` | Trusted Advisor |
 | `reportUrlExpirationSeconds` | `604800` | 预签 URL TTL(7 天) |
+
+> IM push 的目标群与事件源开关**不是** CDK context:目标群在飞书 Secret 的
+> `notify_chat_ids`(或管理控制台「集成 IM」),事件源开关是 EventBridge 规则
+> `notiops-push-<源>`(见 §7.2)。
 
 > 报告 bucket 自动创建(命名 `notiops-report-${AccountId}-${Region}`,私有 + KMS 加密,无需配置)。
 

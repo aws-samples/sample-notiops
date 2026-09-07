@@ -58,11 +58,46 @@ _ANSWER_TITLES = {
     "thinking": "im.chat.thinking_title",
 }
 
+#: 终态标题按"谁答的"分两套。**与 Slack 那份 `im_blocks._FINAL_TITLES` 逐字对齐**。
+_FINAL_TITLES = {
+    "devops": "im.chat.card_title",
+    "notiops": "im.chat.card_title.notiops",
+}
+
+
+def usage_footer(locale: str, *, agent: str = "devops", usage=None) -> str:
+    """卡片落款 —— 「这一轮是哪条路、哪个模型」。**与 Slack 那份逐字对齐。**
+
+    两条路两套说法，故意不含糊：
+      · `devops`  → `router.direct_no_token`（直连，NotiOps 侧 0 token）；
+      · `notiops` → `router.agent_model`，报 `usage["modelId"]`（`core.agent_chat`
+        用 `llm_config.resolve()` 算出的**实际生效**模型 id）。拿不到就退
+        `router.agent_model_unknown`（只报 agent 名）—— **绝不能**退成"无模型消耗"
+        那句：那是把"不知道"说成"没花钱"。
+
+    ⚠️ **用量刻意不出现在这里**（2026-09-06 产品决策）：`usage` 里
+    `totalTokens` / `cycles` 照样是实测值、照样进日志与指标，只是先不给客户看。
+    要重新露出来就在这一行拼回去（两个平台一起改，见 `tests/
+    test_im_agent_card_parity.py`），链路不用动。
+    """
+    if agent != "notiops":
+        return i18n.t("router.direct_no_token", locale)
+    model = str((usage or {}).get("modelId") or "").strip()
+    if not model:
+        return i18n.t("router.agent_model_unknown", locale)
+    return i18n.t("router.agent_model", locale, model=model)
+
 
 def answer_card(reply: str, locale: str, *,
                 steps=None, state: str = "final", elapsed: int = 0,
-                report_url: str = "") -> dict:
-    """DevOps Agent 直连问答的答案卡 —— 「思考中」与「答完」**共用**这一张。
+                report_url: str = "", sources=None,
+                agent: str = "devops", usage=None) -> dict:
+    """对话问答的答案卡 —— 「思考中」与「答完」**共用**这一张，两个 agent 也共用。
+
+    `agent` ∈ {"devops"（默认，直连客户的 DevOps Agent，NotiOps 侧 0 token）,
+    "notiops"（走模型的 NotiOps Agent）}。它只影响**标题**和**落款**（见
+    `usage_footer`）—— 结构共用一张，是为了不让两条路的卡片各自演进出差异。
+    `sources` / `usage` 实际上只有 notiops 那条路有值。
 
     `state` 三态（`platforms/common/live_card.py` 每隔几秒 PATCH 一次时给）：
       · ``"queued"`` —— 还没轮到（同一个会话前一个问题在跑，见 `chat_lease.py`），
@@ -95,15 +130,23 @@ def answer_card(reply: str, locale: str, *,
     if md:
         elements.append({"tag": "hr"})
         elements.append(_md(md, locale))
+    # 来源只在**终版**渲染：过程中它会随每次 PATCH 增长，卡片跟着抖，而用户在那个
+    # 阶段要看的是"跑到哪一步了"。空列表整块不渲染（`sources_md` 返回空串）。
+    if final:
+        src = live_card.sources_md(sources, locale)
+        if src:
+            elements.append({"tag": "hr"})
+            elements.append(_md(src, locale))
     elements.append({"tag": "hr"})
     elements.append({"tag": "markdown",
-                     "content": i18n.t("router.direct_no_token", locale)})
+                     "content": usage_footer(locale, agent=agent, usage=usage)})
     actions: list[dict] = []
     if report_url and final:
         actions.append(_url_btn(i18n.t("report.see_full", locale), report_url))
     if actions:
         elements.append({"tag": "action", "actions": actions})
-    title_key = _ANSWER_TITLES.get(state, "im.chat.card_title")
+    title_key = _ANSWER_TITLES.get(
+        state, _FINAL_TITLES.get(agent, "im.chat.card_title"))
     return {
         "config": card_config(wide_screen_mode=True),
         "header": {"template": "blue",

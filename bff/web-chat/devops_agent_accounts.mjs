@@ -56,6 +56,16 @@ function _extractAccount(assoc) {
  * 返回 { credentials, isPayer } 或 null（AssumeRole 本身失败，如 Trust Policy 未配置）。
  */
 async function _assumeAndCheckPayer(accountId, roleArn) {
+  // 🔴 confused-deputy 防御（见 role_guard.mjs）：这里的 roleArn 来自 DA 关联
+  //    配置（外部数据），同样不许指向别的账号。契约与本文件另一处相同：失败
+  //    返回 null 不抛。
+  try {
+    const { assertRoleBelongsTo } = await import("./role_guard.mjs");
+    assertRoleBelongsTo(roleArn, accountId);
+  } catch (e) {
+    console.error(`_assumeAndCheckPayer: ${e.message}`);
+    return null;
+  }
   let creds;
   try {
     const resp = await _sts.send(new AssumeRoleCommand({
@@ -175,6 +185,16 @@ export async function getAssumedCredentialsForAccount(accountId, roleArn) {
     } catch {
       return null;
     }
+  }
+  // 🔴 confused-deputy 防御（见 role_guard.mjs）：ARN 账号段必须等于目标账号。
+  //    本函数契约是「失败返回 null 绝不抛」（抛会拖垮 FinOps 整页），所以
+  //    不匹配走 null —— 但必须留下响亮的日志，静默的安全拒绝等于没拒绝。
+  try {
+    const { assertRoleBelongsTo } = await import("./role_guard.mjs");
+    assertRoleBelongsTo(arn, accountId);
+  } catch (e) {
+    console.error(`getAssumedCredentialsForAccount: ${e.message}`);
+    return null;
   }
   try {
     const resp = await _sts.send(new AssumeRoleCommand({

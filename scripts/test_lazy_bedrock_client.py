@@ -79,8 +79,9 @@ def test_import_builds_no_bedrock_client() -> None:
 
     boto3.client = spy
     try:
+        # `skill_authoring` 2026-09-06 随 skill 能力从 IM 侧退役而删除（原来是第 8 个）。
         for mod in ("bedrock_intent", "case_analyze", "case_classifier",
-                    "next_steps", "progress_card", "skill_authoring",
+                    "next_steps", "progress_card",
                     "skill_dispatcher", "bedrock_chat"):
             __import__(f"core.{mod}")
     finally:
@@ -94,7 +95,7 @@ def test_import_builds_no_bedrock_client() -> None:
     # access forwards, and truthiness holds (call sites do `x or _bedrock`).
     #
     # 2026-09-01: `core/bedrock_chat.py` is the **only** module left holding a
-    # module-level LazyClient — the other seven moved to `core/bot_llm.py` →
+    # module-level LazyClient — the other six moved to `core/bot_llm.py` →
     # `shared/llm_provider.py::invoke_llm`, which builds its client per call.
     # Asserting on bedrock_chat (not bedrock_intent, which no longer has one)
     # keeps this test measuring the thing that still exists.

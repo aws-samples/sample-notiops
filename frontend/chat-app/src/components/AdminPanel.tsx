@@ -1870,6 +1870,9 @@ export function AccountsView() {
    */
   const [orgListable, setOrgListable] = useState(true);
   const [oneClick, setOneClick] = useState(true);
+  /** 部署账号的巡检范围（null = 老 BFF 没回传 → 不渲染那一行）。 */
+  const [deployAcct, setDeployAcct] = useState<
+    { accountId: string; regions: string[] } | null>(null);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(true);
   const [target, setTarget] = useState<MemberAccountRec | null>(null);
@@ -1902,6 +1905,7 @@ export function AccountsView() {
         setAccounts(r.items);
         setOrgListable(r.orgListable);
         setOneClick(r.oneClickOnboard);
+        setDeployAcct(r.deployAccount);
       })
       // ⚠️ 不再把 `org_mode_disabled` 特殊处理成「整页不可用」——
       //    后端已经不抛它了（改成两个标记）。这里只剩真正的错误。
@@ -1986,6 +1990,86 @@ export function AccountsView() {
       //    而打错的 region 在运行时的表现是「那个区一直没被采」，看不出原因。
       setErr(String((e as Error)?.message || e));
     } finally { setSavingRegions(false); }
+  };
+  /**
+   * 巡检范围字段行：标签 + ⓘ说明 + 当前值 + ✎编辑，编辑器展开在行下方。
+   *
+   * 🔴 2026-09-07 UX 重做（客户原话「改 Region 做成了和状态一样的 tag 形式，
+   *    非常误导人…新用户怎么知道是改什么 region？」）。原实现三个问题：
+   *      · 动作长得像状态徽章（视觉语法说"我是标签"，实际是按钮）
+   *      · 动词悬空 ——「改 Region」不挨着它改的那个值，值本身混在第二行
+   *        的灰色文本里没有名字
+   *      · 唯一的解释文案藏在编辑态里，不点开永远看不到
+   *    现在：编辑动作挂在被编辑的数据上；值有标签（巡检范围）；说明常驻
+   *    （ⓘ title + 编辑器内一份）。
+   *
+   * ⚠️ 部署账号（deploy=true）与成员账号共用这一行，两处语义差异：
+   *      · 值为空 = 没配过 = 扫全部（成员账号不会出现空值，接入时必填）
+   *      · 说明文案分开 —— 部署账号要说清「不配置默认全部」，成员账号要
+   *        说清「不填默认 us-east-1」
+   */
+  const scopeRow = (id: string, regions: string[], deploy = false) => {
+    const editing = editRegions?.accountId === id;
+    const all = !regions.length || regions.includes("*");
+    return (
+      <div key={`scope-${id}`}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8,
+          marginTop: 5, fontSize: 12, flexWrap: "wrap" }}>
+          <span title={t(deploy ? "admin.accounts.scopeHintDeploy"
+            : "admin.accounts.scopeHint")}
+            style={{ color: "var(--muted)", cursor: "help", whiteSpace: "nowrap" }}>
+            {t("admin.accounts.scopeLabel")} ⓘ
+          </span>
+          <span style={{ color: "var(--text)", fontWeight: 500 }}>
+            {all ? t("admin.accounts.scopeAll") : regions.join(" · ")}
+          </span>
+          <button onClick={() => setEditRegions(editing ? null : {
+            accountId: id,
+            value: regions.filter((r) => r !== "*").join(","),
+          })}
+            style={{ fontSize: 12, padding: "1px 9px", borderRadius: 8,
+              border: "1px solid var(--line)",
+              background: editing ? "rgba(255,153,0,.10)" : "transparent",
+              color: "var(--blue)", cursor: "pointer" }}>
+            ✎ {t("admin.accounts.scopeEditBtn")}
+          </button>
+        </div>
+        {editing && (
+          <div style={{ marginTop: 8, padding: 10, borderRadius: 8,
+            border: "1px solid var(--line)", background: "var(--bg2, transparent)" }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input value={editRegions!.value}
+                onChange={(e) => setEditRegions({ accountId: id, value: e.target.value })}
+                onKeyDown={(e) => { if (e.key === "Enter") void submitRegions(); }}
+                placeholder="us-east-1,us-east-2"
+                style={{ flex: 1, padding: "6px 10px", borderRadius: 8,
+                  border: "1px solid var(--line)", background: "var(--bg)",
+                  color: "var(--text)", fontSize: 13 }} />
+              <button onClick={() => void submitRegions()} disabled={savingRegions}
+                style={{ fontSize: 12.5, fontWeight: 700, padding: "6px 14px",
+                  borderRadius: 8, border: "none", background: "var(--orange)",
+                  color: "#fff", cursor: savingRegions ? "default" : "pointer" }}>
+                {t("admin.accounts.confirmBtn")}
+              </button>
+              <button onClick={() => setEditRegions(null)}
+                style={{ fontSize: 12.5, padding: "6px 12px", borderRadius: 8,
+                  border: "1px solid var(--line)", background: "transparent",
+                  color: "var(--muted)", cursor: "pointer" }}>
+                {t("admin.accounts.cancelBtn")}
+              </button>
+            </div>
+            {/* 🔴 这一句必须在：说清「这个范围管什么」（巡检 + 采集都读它，
+                2026-08-29 起两条链路共用，见 api/admin.ts 的 regions docstring）、
+                `*` 的语义、默认值。缺省行为两类账号不同，文案分开。 */}
+            <div style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 6,
+              whiteSpace: "pre-line" }}>
+              {t(deploy ? "admin.accounts.scopePromptDeploy"
+                : "admin.accounts.regionsPrompt")}
+            </div>
+          </div>
+        )}
+      </div>
+    );
   };
 
   /**
@@ -2221,8 +2305,35 @@ export function AccountsView() {
                 : t("admin.accounts.emptyRegistered")}
             </div>
           )}
+          {/* ── 部署账号固定行（2026-09-07）──
+              它不是"成员接入"（没有 StackSet 可下线、数据天然可见），所以不进
+              成员列表、没有接入/停用/下线按钮 —— 但它的巡检范围从这版起可配
+              （此前恒扫全部 17 个 region 且没有任何入口能改，见
+              inspection/adapters/accounts.py::scan_region_scope 的说明）。
+              ⚠️ deployAcct 为 null（老 BFF）时整行不渲染，页面其余部分不受影响。 */}
+          {deployAcct && (
+            <div style={{ padding: "11px 0" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ fontWeight: 600, fontSize: 13.5, color: "var(--text)",
+                  flex: 1, minWidth: 0 }}>
+                  {t("admin.accounts.deployRowTitle")}
+                </div>
+                <span title={t("admin.accounts.deployRowBadgeTip")}
+                  style={{ fontSize: 11.5, fontWeight: 600, padding: "2px 10px",
+                    borderRadius: 100, color: "var(--orange)",
+                    border: "1px solid var(--orange)", cursor: "help",
+                    whiteSpace: "nowrap" }}>
+                  {t("admin.accounts.deployRowBadge")}
+                </span>
+              </div>
+              <div style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 2 }}>
+                {deployAcct.accountId}
+              </div>
+              {scopeRow(deployAcct.accountId, deployAcct.regions || [], true)}
+            </div>
+          )}
           {accounts.map((a, i) => (
-            <div key={a.accountId} style={{ borderTop: i === 0 ? "none" : "1px solid var(--line)" }}>
+            <div key={a.accountId} style={{ borderTop: (i === 0 && !deployAcct) ? "none" : "1px solid var(--line)" }}>
             {/* 行布局：
                   第 1 行  名称 ······················ 状态徽章  [操作按钮]
                   第 2 行  账号号 · 邮箱 · region（一条 muted 行）
@@ -2261,7 +2372,7 @@ export function AccountsView() {
                   {a.aliasManual && (
                     <span title={t("admin.accounts.aliasManualHint")}
                       style={{ fontSize: 11, padding: "2px 8px",
-                        borderRadius: 6, border: "1px dashed var(--line)",
+                        borderRadius: 100, border: "1px dashed var(--line)",
                         color: "var(--muted)", cursor: "help",
                         whiteSpace: "nowrap" }}>
                       {t("admin.accounts.aliasManual")}
@@ -2270,7 +2381,7 @@ export function AccountsView() {
                   {a.outOfOrg && (
                     <span title={t("admin.accounts.outOfOrgHint")}
                       style={{ fontSize: 11, fontWeight: 600, padding: "2px 8px",
-                        borderRadius: 6, border: "1px solid var(--line)",
+                        borderRadius: 100, border: "1px solid var(--line)",
                         color: "var(--muted)", cursor: "help",
                         whiteSpace: "nowrap" }}>
                       {t("admin.accounts.outOfOrg")}
@@ -2287,7 +2398,7 @@ export function AccountsView() {
                   {a.needsStackUpdate && (
                     <span title={t("admin.accounts.needsUpdateHint")}
                       style={{ fontSize: 11, fontWeight: 600, padding: "2px 8px",
-                        borderRadius: 6, border: "1px solid #d13212",
+                        borderRadius: 100, border: "1px solid #d13212",
                         color: "#d13212", background: "rgba(209,50,18,.08)",
                         cursor: "help", whiteSpace: "nowrap" }}>
                       {t("admin.accounts.needsUpdate")}
@@ -2308,25 +2419,9 @@ export function AccountsView() {
                   {a.orgOnboardStatus === "FAILED" ? t("admin.accounts.retryBtn") : t("admin.accounts.onboardBtn")}
                 </button>
               )}
-              {/* 🔴 采集 Region 的**内联编辑**。此前那个输入框只出现在「接入」
-                  流程里（`setTarget`），也就是说账号一旦上车就**再也改不了**
-                  它的采集范围 —— 而唯一的入口「接入」按钮在 `a.onboarded &&
-                  a.enabled` 之后就不渲染了。
-                  ⚠️ 走独立路由（PUT .../regions），不触发 StackSet 下发。 */}
-              {a.onboarded && (
-                <button onClick={() => setEditRegions(
-                  editRegions?.accountId === a.accountId
-                    ? null
-                    : { accountId: a.accountId, value: a.regions.join(",") })}
-                  style={{ fontSize: 12, padding: "5px 12px", borderRadius: 8,
-                    border: "1px solid var(--line)",
-                    background: editRegions?.accountId === a.accountId
-                      ? "rgba(255,153,0,.10)" : "transparent",
-                    color: "var(--muted)", cursor: "pointer" }}
-                  title={a.regions.join(", ")}>
-                  {t("admin.accounts.regionsEdit")}
-                </button>
-              )}
+              {/* ⚠️ 巡检范围的编辑不在这排按钮里 —— 它是「巡检范围」字段行
+                  自带的 ✎（2026-09-07 UX 重做，见 scopeRow 的说明）：编辑动作
+                  挂在被编辑的数据上，而不是一个悬空的「改 Region」。 */}
               {/* 🔴 显示名（alias）的内联编辑。
                   这两个字段此前**只在接入那一刻写一次**，来源是
                   `organizations:DescribeAccount` 的 Account.Name ——
@@ -2374,11 +2469,18 @@ export function AccountsView() {
                     if (r.operationId) setPolling((prev) => ({ ...prev, [r.operationId]: a.accountId }));
                     // 后端确认那个栈没被删 → 把要删的栈名直接给出来，
                     // 而不是让客户自己去 CloudFormation 里认哪个是我们的。
+                    // 🔴 reload 必须 silent（2026-09-06 交叉 review 抓出）：
+                    //    reload() 第一行就是 setErr("")，与上面的 setErr 在同一次
+                    //    React 批处理里后写胜出 —— 这条「要删哪个栈」的唯一指引
+                    //    一帧都渲染不出来，而 agent space 是计费资源。
+                    //    没有栈名要提示时则显式清掉旧错误（silent reload 不清了）。
                     if (r.stackRetained && r.stackName) {
                       setErr(`${t("admin.accounts.offboardRetained")} ${r.stackName}`
                         + (r.stackRegion ? ` (${r.stackRegion})` : ""));
+                    } else {
+                      setErr("");
                     }
-                    await reload();
+                    await reload({ silent: true });
                   } catch (e) { setErr(String((e as Error)?.message || e)); }
                 }}
                   style={{ fontSize: 12, padding: "5px 12px", borderRadius: 8, border: "1px solid #d13212", background: "transparent", color: "#d13212", cursor: "pointer" }}>
@@ -2386,47 +2488,14 @@ export function AccountsView() {
                 </button>
               )}
               </div>
-              {/* 第 2 行：号 · 邮箱 · region 合成一条，而不是各占一列 */}
+              {/* 第 2 行：号 · 邮箱（region 不再混在这里 —— 它是有名字的
+                  「巡检范围」字段行，见下。原来这串裸 region 和账号号挤在
+                  同一个灰色文本节点里，没人知道它是什么、也没法编辑） */}
               <div style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 2 }}>
-                {[a.accountId, a.email, (a.regions || []).join(", ")]
-                  .filter(Boolean).join(" · ")}
+                {[a.accountId, a.email].filter(Boolean).join(" · ")}
               </div>
-              {/* 采集 Region 的编辑行（点上面那个「改 Region」才展开） */}
-              {editRegions?.accountId === a.accountId && (
-                <div style={{ marginTop: 8, padding: 10, borderRadius: 8,
-                  border: "1px solid var(--line)", background: "var(--bg2, transparent)" }}>
-                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                    <input value={editRegions.value}
-                      onChange={(e) => setEditRegions(
-                        { accountId: a.accountId, value: e.target.value })}
-                      onKeyDown={(e) => { if (e.key === "Enter") void submitRegions(); }}
-                      placeholder="us-east-1,us-east-2"
-                      style={{ flex: 1, padding: "6px 10px", borderRadius: 8,
-                        border: "1px solid var(--line)", background: "var(--bg)",
-                        color: "var(--text)", fontSize: 13 }} />
-                    <button onClick={() => void submitRegions()} disabled={savingRegions}
-                      style={{ fontSize: 12.5, fontWeight: 700, padding: "6px 14px",
-                        borderRadius: 8, border: "none", background: "var(--orange)",
-                        color: "#fff", cursor: savingRegions ? "default" : "pointer" }}>
-                      {t("admin.accounts.confirmBtn")}
-                    </button>
-                    <button onClick={() => setEditRegions(null)}
-                      style={{ fontSize: 12.5, padding: "6px 12px", borderRadius: 8,
-                        border: "1px solid var(--line)", background: "transparent",
-                        color: "var(--muted)", cursor: "pointer" }}>
-                      {t("admin.accounts.cancelBtn")}
-                    </button>
-                  </div>
-                  {/* 🔴 这一句必须在。客户在这里填 `us-east-1` 的自然预期是
-                      「只看这个区」，而**资源巡检不读这个字段** —— 它扫账号下
-                      全部已启用 region。不说清楚的话客户第二天在巡检报告里看到
-                      eu-west-1 的 finding，会回来反复改这个框，而改成什么都没用。 */}
-                  <div style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 6,
-                    whiteSpace: "pre-line" }}>
-                    {t("admin.accounts.regionsPrompt")}
-                  </div>
-                </div>
-              )}
+              {/* 第 2.5 行：巡检范围字段行（标签 + 值 + ✎编辑 + ⓘ说明） */}
+              {a.onboarded && scopeRow(a.accountId, a.regions || [])}
               {/* 显示名的编辑行（点上面那个「改名」才展开） */}
               {editAlias?.accountId === a.accountId && (
                 <div style={{ marginTop: 8, padding: 10, borderRadius: 8,
@@ -2653,9 +2722,28 @@ function CrossPayerSection({ onDone }: { onDone: () => void }) {
             <>
               <div>
                 <FieldLabel>Launch Stack URL</FieldLabel>
-                <a href={launchUrl} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12.5, color: "var(--blue)", wordBreak: "break-all" }}>
-                  {t("admin.xpayer.openStack")}
-                </a>
+                {/* 🔴 只给「复制」，不给可直点的链接（2026-09-06 交叉 review 抓出）。
+                    quick-create URL 用的是**打开者当前会话**的凭证 —— 在管理页操作
+                    的人手里最可能是部署账号的会话，直点的结果是把成员模板部署进
+                    部署账号（IAM 角色 + 计费的 agent space），而回填/测试连接照样
+                    全绿，零错误信号。旁边 InspectionCrossAccountSection 早就为同一个
+                    坑只给复制按钮，两处标准必须一致。 */}
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <button style={btnPrimary} onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(launchUrl);
+                      setMsg({ ok: true, text: t("admin.xpayer.copied") });
+                    } catch {
+                      setMsg({ ok: false, text: launchUrl });
+                    }
+                  }}>
+                    {t("admin.xpayer.copyLink")}
+                  </button>
+                  <code style={{ fontSize: 10.5, color: "var(--muted)", maxWidth: 340,
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {launchUrl}
+                  </code>
+                </div>
                 <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>{t("admin.xpayer.stackHint")}</div>
               </div>
               {/* Step 2: 回填 */}

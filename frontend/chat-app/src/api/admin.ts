@@ -204,6 +204,10 @@ export interface MemberAccountsResp {
   items: MemberAccountRec[];
   orgListable: boolean;
   oneClickOnboard: boolean;
+  /** 部署账号的巡检范围（2026-09-07 起可配）。它不进 items（不是"成员接入"），
+   *  UI 在列表顶部钉一行。regions 为空数组 = 没配过 = 巡检默认扫全部 region。
+   *  null = 老 BFF（没有这个字段）→ 不渲染部署账号行，其余功能不受影响。 */
+  deployAccount: { accountId: string; regions: string[] } | null;
 }
 export async function fetchMemberAccounts(): Promise<MemberAccountsResp> {
   const r = await req<Partial<MemberAccountsResp>>("GET", "/admin/member-accounts");
@@ -214,6 +218,7 @@ export async function fetchMemberAccounts(): Promise<MemberAccountsResp> {
     //    突然显示一堆「不可用」提示。
     orgListable: r.orgListable !== false,
     oneClickOnboard: r.oneClickOnboard !== false,
+    deployAccount: r.deployAccount || null,
   };
 }
 export async function onboardMemberAccount(accountId: string, regions: string[]): Promise<{ operationId: string; accountId: string }> {

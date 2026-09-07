@@ -440,12 +440,11 @@ DevOps Agent 已自动启动调查...
 
 ### 6.3 静默期间
 
-群里某个事件源太吵?管理员可以单独关闭:
+群里某个事件源太吵?管理员可以单独关闭(disable 对应的 EventBridge 规则,瞬时生效、不用重新部署):
 
-```
-# 关 GuardDuty(管理员侧,修改 CDK context 后重新部署)
-# 编辑 infra/cdk.json 里的 "enableGuardDutyPush": false,然后:
-./setup.sh
+```bash
+# 关 GuardDuty 推送(管理员侧)
+aws events disable-rule --name notiops-push-guardduty --region <部署区域>
 ```
 
 详细配置选项见 [DEPLOYMENT.md §7](DEPLOYMENT.md#7-开启--调整-push-模式)。

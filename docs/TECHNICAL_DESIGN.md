@@ -1013,7 +1013,7 @@ bot **零客户配置即装即用** —— 部署后自动订阅 6 个 EventBrid
 | Cost Anomaly Detection | ⛔ OFF | `aws.ce` | 需客户先在 Billing 建 monitor |
 | Trusted Advisor ERROR-status changes | ⛔ OFF | `aws.trustedadvisor` | 仅 Business+ Support 计划生效;只推 ERROR 状态变更,不推 refresh notification;`TA_INCLUDE_CATEGORIES` 默认白名单 `security,fault_tolerance,service_limits` |
 
-每个源对应一个 EventBridge rule + 一个 boolean CFN parameter(`EnableCloudWatchAlarmPush` / `EnableHealthPush` / ...)。
+每个源对应一条 EventBridge rule(`notiops-push-<源>`,默认 DISABLED);开关就是 enable/disable 那条规则本身,没有对应的 CFN parameter。
 
 #### 4.6.3 事件归一化
 

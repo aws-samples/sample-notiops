@@ -7,8 +7,9 @@
 # EventBridge Scheduler、WebSearch Gateway、Secrets 的恢复期)一起收尾。
 #
 # 两档语义(与一键部署的 TeardownMode 对齐):
-#   默认(保数据)          删栈与运行时,保留三张 RETAIN 表(notiops-config /
-#                         notiops-conversations / notiops-web-chat)与 CUR 报告/CUR 桶。
+#   默认(保数据)          删栈与运行时,保留四张 RETAIN 表(notiops-config /
+#                         notiops-conversations / notiops-web-chat /
+#                         notiops-inspection)与 CUR 报告/CUR 桶。
 #   --delete-everything   连表、CUR 报告、CUR 桶、Athena 保存查询、残留日志组一起删。
 #
 # ⚠️ 数据桶 notiops-data-<账号>-<区域> 在 setup.sh 这条路径上是 DESTROY +
@@ -128,7 +129,11 @@ GW_ROLE="notiops-websearch-gateway-role"
 GW_ROLE_POLICY="NotiOpsWebSearchGateway"
 STACKSET_ONBOARD="notiops-member-onboarding"
 STACKSET_DA="notiops-member-devops-agent"
-TABLES_RETAINED=("notiops-config" "notiops-conversations" "notiops-web-chat")
+# ⚠️ 这个清单必须与 CDK 里 RemovalPolicy.RETAIN 的表**一一对应**（少一张的后果：
+#    teardown 后那张表带着 PITR 持续计费，且盘点/删除/清点四处循环全看不见它 ——
+#    notiops-inspection 就这样漏过一次，2026-09-04 实测删库时靠手工补删）。
+#    tests/test_teardown_retained_tables.py 把两边钉在一起，加表先加那边判据。
+TABLES_RETAINED=("notiops-config" "notiops-conversations" "notiops-web-chat" "notiops-inspection")
 SECRETS=("notiops/im-bot-feishu" "notiops/slack-bot-token" "notiops/slack-app-token" \
          "notiops/bedrock-api-key" "notiops/litellm-config")
 # 日志组:WebChatStack 走 logRetention(Lambda 自建 log group)、ECS/AgentCore 也各自建,
@@ -268,8 +273,8 @@ step "$(t "确认" "Confirm")"
 warn "$(t "即将删除账号 ${ACCOUNT} / ${REGION} 里的 NotiOps 环境。这是不可逆的。" \
          "About to delete the NotiOps environment in account ${ACCOUNT} / ${REGION}. This is irreversible.")"
 if [ "$DELETE_EVERYTHING" = true ]; then
-  warn "$(t "--delete-everything:三张 RETAIN 表、CUR 报告与 CUR 桶、Athena 保存查询、残留日志组也会删。" \
-           "--delete-everything: the three RETAIN'd tables, the CUR report and CUR bucket, Athena saved queries and leftover log groups will also be deleted.")"
+  warn "$(t "--delete-everything:四张 RETAIN 表、CUR 报告与 CUR 桶、Athena 保存查询、残留日志组也会删。" \
+           "--delete-everything: the four RETAIN'd tables, the CUR report and CUR bucket, Athena saved queries and leftover log groups will also be deleted.")"
 fi
 if [ "$ASSUME_YES" = false ]; then
   printf "%s" "$(t "请输入 12 位账号号码确认: " "Type the 12-digit account id to confirm: ")"

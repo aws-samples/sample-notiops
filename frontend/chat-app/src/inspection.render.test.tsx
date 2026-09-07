@@ -2814,6 +2814,40 @@ describe("统一视图（跨账号）", () => {
       })));
   });
 
+  it("★★★ 弹层必须显式锚定 top:100% —— flex 静态位置会把它顶进页面顶栏底下", async () => {
+    /* 2026-09-06 实测踩中：弹层原来只有 `marginTop: 30` 没有 `top`。
+       没有 `top` 的绝对定位元素落在「静态位置」，而 flex 容器
+       （工具栏 `display:flex; alignItems:center`）里绝对定位子元素的静态
+       位置是**被当成唯一 flex item 垂直居中** —— ~180px 高的弹层在 ~26px
+       高的按钮行里"居中"，顶部往上探出 ~77px，标题和第一行「部署账号」
+       扎进页面顶栏底下。客户的原话是「右上角没看到管理账号，只有一个 677」
+       —— 看起来像数据问题，实际是遮挡。弹层越高（账号越多）遮得越多。
+
+       ⚠️ jsdom 不做布局，测不了「真的没被遮住」。能钉的是两个必要条件：
+       `top` 显式给了（不依赖静态位置）+ 定位祖先存在（`right:0` 不会逃到
+       视口边上）。哪个断了都会回到被遮的形态。 */
+    vi.mocked(api.getInspectionOverview).mockResolvedValue(OVERVIEW);
+    render(<InspectionDashboard dashboardId="high-load"
+      accounts={ACCTS} can={() => true} />);
+    await waitFor(() => expect(screen.getByText(/跑高负载/)).toBeTruthy());
+    fireEvent.click(screen.getByText(/跑高负载/));
+    await waitFor(() => expect(screen.getByText(/跑哪些账号的高负载/)).toBeTruthy());
+
+    const pop = document.querySelector<HTMLElement>('[role="group"][aria-label]');
+    expect(pop, "弹层没渲染出来").toBeTruthy();
+    expect(pop!.style.top,
+      "弹层丢了显式 top —— 会退回 flex 静态位置（垂直居中），顶部被页面顶栏盖住"
+    ).toBe("100%");
+    let anc = pop!.parentElement; let anchored = false;
+    while (anc) {
+      if (anc.style.position === "relative") { anchored = true; break; }
+      anc = anc.parentElement;
+    }
+    expect(anchored,
+      "弹层没有 position:relative 的祖先 —— right:0 会相对视口解析，弹层飘到窗口右上角"
+    ).toBe(true);
+  });
+
   it("★★★ 勾多个 → 一次请求带 accounts 数组，且报数用后端回传的", async () => {
     /* 🔴 循环 N 次 POST 会产生部分成功（第 3 次失败时前两个已经在跑），
        而界面只能报一个结果 —— 要么谎报全失败（客户重试 → 前两个账号各跑

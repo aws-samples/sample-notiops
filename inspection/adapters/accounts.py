@@ -282,30 +282,46 @@ def scan_region_scope(
     """这个账号的巡检 region 范围 → `(要不要扫全部, 显式列表)`。
 
     ```
-    部署账号自己              → (True, [])              恒扫全部，没有 UI 可配
-    regions 含 "*"           → (True, [])              客户填了 *
-    regions 非空             → (False, [...])          就扫这些
-    都没有                    → (False, ["us-east-1"])  读时默认
+    部署账号自己:
+      account# 行没有 regions → (True, [])             默认扫全部（与成员相反）
+      regions 含 "*"          → (True, [])
+      regions 非空            → (False, [...])          就扫这些（2026-09-07 起可配）
+    成员账号:
+      regions 含 "*"          → (True, [])              客户填了 *
+      regions 非空            → (False, [...])          就扫这些
+      都没有                  → (False, ["us-east-1"])  读时默认
     ```
 
     ⚠️ `*` 与具体 region 混在一起时（`us-east-1,*`）**按全部算** —— 全部是
     具体列表的超集，取交集反而会让「多填了一个 *」表现成「只扫那一个」。
 
-    ⚠️ 部署账号那条分支是刻意的（2026-08-29 决定）：它不在
-    `listMemberAccounts` 返回的列表里（那个函数把自己排除了），所以没有
-    UI 行可以配它。恒扫全部 = 保持改造前的行为，不引入一个「配不了但会
-    影响行为」的隐藏设置。
+    ⚠️ 部署账号的**默认值与成员账号刻意相反**（没配 = 全部，不是 us-east-1）：
+       两个理由：① 零意外升级 —— 2026-09-07 之前它恒扫全部且不可配，存量部署
+       升级后行为必须不变；② 语义 —— 部署账号是系统家底所在，漏扫的代价比
+       多扫大，收窄应当是显式动作。
+       （2026-08-29 的旧决定是「恒扫全部、不可配」，理由是它不在成员列表里、
+       没有 UI 行可挂配置。2026-09-07 管理页给它钉了固定行，前提不再成立。）
 
     ⚠️ 读失败**抛**，不吞成默认值。吞掉的后果是「配置读不到」表现成
     「客户只配了 us-east-1」—— 而那与真的只配了 us-east-1 无法区分。
     """
     acct = str(account_id or "").strip()
-    if acct and acct == str(deploy_account_id or "").strip():
-        return True, []
+    is_deploy = bool(acct) and acct == str(deploy_account_id or "").strip()
     try:
         resp = config_table.get_item(
             Key={"PK": f"{ACCOUNT_PK_PREFIX}{acct}", "SK": "meta"})
     except Exception as e:                                     # noqa: BLE001
+        # 🔴 读失败的处置按账号类型分向 —— 两边的「安全方向」相反：
+        #    · 部署账号 → 退回扫全部（响亮告警）。它的危险方向是**收窄**
+        #      （家底漏扫），扫全部永远不会把数据记错，只是多花一点；
+        #      2026-09-07 之前它根本不读表，读挂了不该让整轮巡检跟着挂。
+        #    · 成员账号 → 抛。吞成默认值会让「配置读不到」表现成
+        #      「客户只配了 us-east-1」，两者无法区分。
+        if is_deploy:
+            logger.error(
+                "读部署账号 %s 的巡检 region 范围失败（%s: %s）—— 本轮退回扫全部。"
+                "若持续出现请查 config 表可用性", acct, type(e).__name__, e)
+            return True, []
         raise RuntimeError(
             f"读 {ACCOUNT_PK_PREFIX}{acct} 的巡检 region 范围失败: "
             f"{type(e).__name__}: {e}。吞成默认值会让「配置读不到」"
@@ -313,6 +329,11 @@ def scan_region_scope(
         ) from e
     item = resp.get("Item") or {}
     raw = item.get("regions") or []
+    # 部署账号且没配过 → 扫全部（见 docstring：默认与成员相反）。
+    # ⚠️ 判据是「字段缺失/空列表」而不是「行不存在」：部署账号的 account# 行
+    #    可能因别的字段（如 alias）先建出来而 regions 仍为空 —— 两种形态都算没配。
+    if is_deploy and not raw:
+        return True, []
     out: list[str] = []
     bad: list[str] = []
     for r in raw:
@@ -329,6 +350,10 @@ def scan_region_scope(
         logger.error("账号 %s 的 regions 里有形状不对的值，已跳过: %s",
                      acct, sorted(set(bad)))
     if not out:
+        # 部署账号配了却全是坏值 → 退回扫全部而不是 us-east-1：
+        # 打错字不该把系统账号的巡检静默收窄到一个区（上面刚打过 error 日志）。
+        if is_deploy:
+            return True, []
         return False, list(DEFAULT_SCAN_REGIONS)
     # 去重 + 排序：R14 要求同输入同输出
     return False, sorted(set(out))

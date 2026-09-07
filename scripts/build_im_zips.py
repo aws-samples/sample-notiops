@@ -55,6 +55,12 @@ REQUIRED_IN_CODE = (
     "core/devops_agent.py",
     "core/nl_router.py",
     "core/ddb_state.py",
+    # 案例多账号（2026-09-07）：`core/support_logic.py` → `core/aws_session.py`
+    # → `shared/account_scope.py` 这条链是**开工单**那条路的唯一凭证来源。缺了它
+    # 的形态与上面同类：方式A 的 worker 一 import case 就 ImportModuleError（等于
+    # 案例功能整条挂），而方式B 完全正常 —— 所以必须在这里当场判死。
+    "core/aws_session.py",
+    "shared/account_scope.py",
 )
 
 #: 层里必须真的装到了的包。**判具体包，不判 `python/` 目录在不在** ——

@@ -252,6 +252,13 @@ check("im-code.zip has the Slack worker handler", "platforms/slack/lambda_worker
 check("im-code.zip has the progress poller handler", "platforms/common/lambda_progress.py" in im_code)
 check("im-code.zip has the deterministic router", "platforms/common/router.py" in im_code)
 check("im-code.zip has core/devops_agent.py", "core/devops_agent.py" in im_code)
+# IM 多账号（`/account`）的两块：`core/im_accounts.py` 读账号注册表 + 算 `allowed_accounts`
+# 闸门，`shared/queries/accounts.py` 是它读的那条 GSI1 Query。
+# 少了任一个，worker 一收消息就 `No module named …` → **每一条**消息都失败（不只是
+# `/account`），因为 `lambda_worker._normalize_message` 每条都要解析当前账号。
+check("im-code.zip has core/im_accounts.py", "core/im_accounts.py" in im_code)
+check("im-code.zip has the account registry query",
+      "shared/queries/accounts.py" in im_code)
 # 方式A 的调查结果回调函数与 IM 三个函数**共用这同一个 zip**（方式B 那边是独立资产）。
 # 少了它，客户账号里的回调一调就 `No module named 'devops_agent_callback'`，
 # 而那条链路是异步的 → 客户只看到「深度调查跑完了，报告和公网 URL 永远不来」。

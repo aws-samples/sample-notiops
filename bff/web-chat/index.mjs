@@ -29,7 +29,7 @@ import { getSecurityDashboard, taCheckResources } from "./security.mjs";
 import { getGuarddutyDashboard, getBackupDashboard, getSecurityOrgSummary } from "./secops.mjs";
 import { getAlarmDashboard, getAlarmOrgSummary } from "./alarms.mjs";
 import { getEosDashboard, getEosOrgSummary } from "./eos.mjs";
-import { getOverview as getInspectionOverview, getFindings as getInspectionFindings, getFinding as getInspectionFinding, getSeries as getInspectionSeries, getScope as getInspectionScope, getConfig as getInspectionConfig, putExclusion as putInspectionExclusion, renewExclusion as renewInspectionExclusion, deleteExclusion as deleteInspectionExclusion, putSchedule as putInspectionSchedule, putRules as putInspectionRules, triggerRun as triggerInspectionRun, judgeFinding as judgeInspectionFinding, getResources as getInspectionResources, kindOfFinding } from "./inspection.mjs";
+import { getOverview as getInspectionOverview, getFindings as getInspectionFindings, getFinding as getInspectionFinding, getSeries as getInspectionSeries, getScope as getInspectionScope, getConfig as getInspectionConfig, putExclusion as putInspectionExclusion, renewExclusion as renewInspectionExclusion, deleteExclusion as deleteInspectionExclusion, putSchedule as putInspectionSchedule, putRules as putInspectionRules, triggerRun as triggerInspectionRun, judgeFinding as judgeInspectionFinding, getResources as getInspectionResources, kindOfFinding, inspectionConfigured } from "./inspection.mjs";
 import { authorize, effective, filterDashboard, satisfies, visibleTree } from "./authz.mjs";
 
 /**
@@ -213,10 +213,27 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
       // ⚠️ 数据层（`inspection.mjs::denyIfInvisible`）也拒一次。两道门防的是
       //    不同的遗漏：这一道集中、覆盖将来任何新端点；那一道贴着真正的写入
       //    动作、不受这里的键名清单是否完整影响。
+      // 🔴 `body.action.account_id` —— `/actions/execute` 把目标账号**嵌一层**
+      //    （`{action: {type, params, account_id}}`），于是下面那三个平铺键名
+      //    一个都不命中 —— 这个端点原来完全不过这道门。同一类缺陷
+      //    （键名分叉）本文件上面已经记录过两次，补法照旧：**补键名，
+      //    而不是在那个端点里单独写一道门** —— 键名还会再分叉，而门禁
+      //    这一处是集中的。
+      //    `/actions/execute` 是 support case 的**写**入口（开案例 / 回复 / 关闭）。
+      //    以前它只是"难以触达"（前端只回传 agent 自己提议的那个账号）；
+      //    2026-09-07 给开案例卡加上客户可选的账号下拉之后，这个键就变成
+      //    **客户直接控制**的了 —— 所以那个下拉的硬前置是先补上这道门。
+      //    ⚠️ 数据层仍是权威边界：`support.mjs::supportClientFor` 拿不到跨账号
+      //       凭证时返回 null、不回落到本地 client。两道门防不同的遗漏。
+      //
+      // ⚠️ 数组本体要**保持紧凑**：`tests/inspection.test.mjs` 里那条
+      //    「门禁逐个校验账号候选」只看 `accountCandidates` 开头后 900 字符，
+      //    把大段注释写进数组里会把 `isAccountVisible` 顶出那个窗口。
       const accountCandidates = [
         q && q.account,
         authBody && authBody.account_id,
         authBody && authBody.account,
+        authBody && authBody.action && authBody.action.account_id,  // /actions/execute
         keyAccount,
       ];
       for (const cand of accountCandidates) {
@@ -777,6 +794,24 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
       return json(200, await getEosOrgSummary(vis));
     }
     // ── 资源巡检看板（只读；门禁 nav:inspection，见 capabilities.json）──
+    //
+    // 🔴 这条部署路径上有没有巡检后端 —— **一道门，管住下面全部 10 个端点**。
+    //    方式 A（一键部署）的最小底座不含 `notiops-inspection` 表与那一族 Lambda，
+    //    于是 `INSPECTION_TABLE` 是空串（见 web-chat-core.ts 那一段）。
+    //    2026-09-07 现网实测：以前这里没有门，10 个端点各自去 Query 一张不存在的表，
+    //    前端拿到「加载失败 (ddb_error)」—— 一句既不说明原因也不给出路的话，
+    //    而客户会以为是自己配错了。
+    //
+    //    正常情况下客户**看不到**这个 tab（`nav:inspection` 的
+    //    `requiresEnv: "INSPECTION_TABLE"` 已经把它从 /capabilities 树里摘掉）。
+    //    这道门是给绕过前端的调用兜底：直接打 API、或者浏览器里缓存着旧的前端包。
+    //    所以判据是**诚实的错误码**而不是 404 —— 端点存在，只是这套部署没装这个后端。
+    if (path.includes("/inspection/") && !inspectionConfigured()) {
+      return json(200, {
+        ok: false, code: "inspection_not_deployed",
+        message: "Resource inspection is not part of this deployment.",
+      });
+    }
     //
     // ⚠️ `endsWith` 是后缀匹配且**顺序敏感**：`/inspection/findings` 必须排在
     //    `/inspection/finding` **之前**，否则 "…/findings".endsWith("/inspection/finding")

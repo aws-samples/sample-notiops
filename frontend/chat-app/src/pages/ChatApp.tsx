@@ -291,7 +291,18 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   // 一个都不需要 —— 在这里预取等于每次点开侧栏就打六次 DDB。
   // 各子页组件自己按需拉（见 InspectionDashboard）。
   const [inspectionDash, setInspectionDash] = useState<string | null>(null);
-  const showInspectionNav = isAdmin || (capsLoaded && can("nav:inspection"));
+  // 🔴 这一条**不能**用 `can()`（上面 L177：`isAdmin || capKeys.includes(...)`）——
+  //    「方式A 没有巡检后端」是**数据源**维度，不是权限维度：那张表 admin 也没有。
+  //    2026-09-07 现网反馈就是 admin 看到侧栏有「巡检」、点进去 `加载失败 (ddb_error)`；
+  //    只改后端那道 `requiresEnv` 闸门对 admin **完全无效**，因为 `can()` 自己先短路了。
+  //    所以这里读**服务端算好的**那份列表：`/me/capabilities` 返回的 `visibleTree` 已经
+  //    按 `requiresEnv: INSPECTION_TABLE` 把 `nav:inspection` 整棵子树摘掉了
+  //    （`bff/web-chat/authz.mjs`；方式B 上 admin 照旧拿得到这一项）。
+  //    ⚠️ 代价是 admin 要等能力加载完才看到入口（原来 `isAdmin ||` 让它立刻出现）——
+  //       这与本入口 fail-closed 的初衷一致：加载完成前**谁都不显示**，而不是先闪出来。
+  //    ⚠️ 别"顺手"把别的 `isAdmin || (capsLoaded && can(...))` 也改成这样：只有巡检
+  //       这一个 tab 的可见性带**环境依赖**，其余那些纯粹是权限，admin 短路是对的。
+  const showInspectionNav = capsLoaded && (capKeys || []).includes("nav:inspection");
   // dashboard **浏览账号**（finops/cases/security/investigate 仪表盘共用的全局浏览维度，与 chat
   // 会话账号解耦；见下方 acctPickerFor）。声明在此处——须在下面各 dashboard fetch effect 之前。
   const [dashAccountId, setDashAccountId] = useState("");
@@ -949,7 +960,11 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   // 用户在确认卡上点"确认" → 执行写操作（创建/回复/关闭 case），结果回填到该 action。
   // editedParams：可编辑建案卡(create_case_form)提交时传入客户改过的参数 —— 用它执行真正的
   // create_case（表单卡只负责收集，执行仍走确定性 /actions/execute）。
-  const confirmAction = async (msgId: string, idx: number, editedParams?: Record<string, unknown>) => {
+  // pickedAccount：开案例卡上那个账号下拉选中的账号（2026-09-07）。`undefined` = 下拉
+  // 没渲染（单账号部署 / 拿不到部署账号号）→ 沿用 agent 盖的 `action.account_id`。
+  const confirmAction = async (msgId: string, idx: number,
+                               editedParams?: Record<string, unknown>,
+                               pickedAccount?: string) => {
     const conv = conversations.find((c) => c.messages.some((m) => m.id === msgId));
     const convId = conv?.id ?? activeId;
     const msg = conv?.messages.find((m) => m.id === msgId);
@@ -959,8 +974,16 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     // 关键：必须带上 action.account_id —— 否则跨账号(linked account)建案会丢目标账号，
     // BFF 回退到部署账号,case 误落到部署账号(而非用户选中的账号)。见 support.mjs 的
     // supportClientFor(缺省=部署账号)。account_id 由 agent _propose 按本轮 _acct() 写入。
+    // 🔴 客户在下拉里选的账号**优先于** agent 盖的那个章 —— 那个下拉存在的全部理由
+    //    就是让客户能改这一项。空串是合法值（= 部署账号），所以判据是
+    //    `!== undefined` 而不是 `||`：用 `||` 会把"客户明确选了部署账号"错当成
+    //    "没选"，从而落回 agent 的章。
+    //    ⚠️ 后端对这个值做**可见性校验**（BFF `accountCandidates` 里的
+    //       `body.action.account_id`）+ 数据层拿不到跨账号凭证就返回 null 而不是
+    //       回落到部署账号（`support.mjs::supportClientFor`）。前端这一层只负责传对。
     const toExec = (action.type === "create_case_form" || action.type === "create_case_review")
-      ? { type: "create_case" as const, params: editedParams ?? action.params, account_id: action.account_id }
+      ? { type: "create_case" as const, params: editedParams ?? action.params,
+          account_id: pickedAccount !== undefined ? pickedAccount : action.account_id }
       : action;
     const result = await executeActionApi(toExec);
     patchMsgIn(convId, msgId, {
@@ -1429,7 +1452,10 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                 {active.messages.map((m) => (
                   <Message key={m.id} m={m} onOpenSources={openSources}
                     onOpenThinking={openThinking}
-                    onConfirmAction={(idx, editedParams) => confirmAction(m.id, idx, editedParams)}
+                    onConfirmAction={(idx, editedParams, acctId) => confirmAction(m.id, idx, editedParams, acctId)}
+                    /* 开案例卡的账号下拉数据源。已在挂载时加载好（`getAccountsFull`），
+                       Message 那边不再发请求。 */
+                    accounts={accounts} deployAccount={deployment.accountId}
                     onCancelAction={(idx) => cancelAction(m.id, idx)}
                     onFollowup={(prompt) => handleSend(prompt)}
                     /* 多账号模式下每条回复都标账号：成员账号=橙，management/部署账号(accountId 空)=蓝。

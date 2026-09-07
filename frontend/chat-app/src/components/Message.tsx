@@ -4,7 +4,7 @@ import ChartBlock, { tryParseChartSpec } from "./ChartBlock";
 import remarkGfm from "remark-gfm";
 import { useT, useLocale } from "../i18n";
 import { type ChatMessage, type ProposedAction } from "../types";
-import { getSupportServices, type SupportService } from "../api/chat";
+import { getSupportServices, type SupportService, type AccountInfo } from "../api/chat";
 // 模型署名：m.model 在流式时是显示名（如 "DeepSeek V3.2"），从历史加载时是
 // id（如 "deepseek-v3-2"）。两种都归一成显示名 —— 归一逻辑已挪到 models.ts，
 // 因为候选集现在由管理员在服务端决定，不再是编译期常量。
@@ -205,12 +205,41 @@ function CaseReviewCard({ action, onConfirm, onCancel, locale }: {
  * 服务/类别下拉数据来自 BFF /support/services(describe-services,权威,不编造);
  * 提交时把编辑后的参数交给 onSubmit → 走确定性 /actions/execute 建 create_case。
  */
-function CaseFormCard({ action, onSubmit, onCancel, locale }: {
-  action: ProposedAction; onSubmit: (edited: Record<string, unknown>) => void;
+function CaseFormCard({ action, onSubmit, onCancel, locale, accounts, deployAccount }: {
+  action: ProposedAction; onSubmit: (edited: Record<string, unknown>, accountId?: string) => void;
   onCancel: () => void; locale: string;
+  /** 已上车并启用的成员账号（`getAccountsFull`；不含部署账号）。空=不渲染账号下拉。 */
+  accounts?: AccountInfo[];
+  /** 部署账号号码。空 = 拿不到 → 不渲染下拉（说不清"默认开在哪"时给下拉只会让人猜）。 */
+  deployAccount?: string;
 }) {
   const en = locale === "en";
   const p = action.params || {};
+  /* 「开到哪个账号」（2026-09-07）—— 与 IM 侧的账号下拉同一个决策：
+     目标账号原来是**隐式**的（agent 提议时按会话当前账号盖一个 `action.account_id`，
+     卡上一个字都看不出来）。IM 侧 2026-09-07 现网实测到的故障就是这个形态：
+     卡上写着账号 A、案例开在账号 B，而这种错只能靠事后去控制台看工单落在哪才发现。
+     ⚠️ 默认值必须是 `action.account_id`（空 = 部署账号），这样"什么都不动直接提交"
+        的行为与加下拉之前逐字相同。
+     ⚠️ 数据在 `ChatApp` 里早就加载好了（`getAccountsFull`），这里不额外发请求。
+     ⚠️ 后端 `POST /actions/execute` 的 `body.action.account_id` 已进 BFF 那道集中
+        可见性门禁（`index.mjs` 的 `accountCandidates`）—— 这个下拉让客户直接控制
+        那个键，所以门禁是它的前置条件，不是可选加固。 */
+  const deployAcct = String(deployAccount || "").trim();
+  const acctOptions = deployAcct
+    ? [{ id: deployAcct, label: `${deployAcct}${en ? " (deployment account)" : "(部署账号)"}` },
+       ...(accounts || [])
+         .filter((a) => a.accountId && a.accountId !== deployAcct)
+         .sort((a, b) => a.accountId.localeCompare(b.accountId))
+         .map((a) => ({ id: a.accountId,
+                        label: a.accountName ? `${a.accountId} · ${a.accountName}` : a.accountId }))]
+    : [];
+  // 只有一项的下拉是纯噪音 —— 单账号部署下整块不渲染，行为与改动前一致。
+  const showAcct = acctOptions.length >= 2;
+  const [acct, setAcct] = useState(() => {
+    const stamped = String(action.account_id || "").trim();
+    return stamped && acctOptions.some((o) => o.id === stamped) ? stamped : deployAcct;
+  });
   const [subject, setSubject] = useState(String(p.subject || ""));
   const [serviceCode, setServiceCode] = useState(String(p.service_code || ""));
   const [categoryCode, setCategoryCode] = useState(String(p.category_code || ""));
@@ -380,6 +409,17 @@ function CaseFormCard({ action, onSubmit, onCancel, locale }: {
                 : "没能加载 AWS 服务目录，因此「服务」选不了、也无法从这里提交案例。请稍后重试，或在 AWS 控制台的 Support Center 手工提交。"}
             </div>
           )}
+          {/* 账号放**第一项**：这张表里只有它决定"这次写操作落在谁的账号上"。 */}
+          {showAcct && (
+            <label className="cf-field">
+              <span>{en ? "Open in which account" : "开到哪个账号"} *</span>
+              <select value={acct} onChange={(e) => setAcct(e.target.value)}>
+                {acctOptions.map((o) => (
+                  <option key={o.id} value={o.id}>{o.label}</option>
+                ))}
+              </select>
+            </label>
+          )}
           <label className="cf-field">
             <span>{en ? "Subject" : "主题"} *</span>
             <input value={subject} onChange={(e) => setSubject(e.target.value)}
@@ -446,6 +486,12 @@ function CaseFormCard({ action, onSubmit, onCancel, locale }: {
         </div>
       ) : (
         <div className="casecard-preview">
+          {/* 确认页必须复述账号 —— 这是提交前最后一眼，而账号是唯一不可撤销的那一项
+              （案例开错账号只能关掉重开）。 */}
+          {showAcct && (
+            <div className="cf-prev-row"><b>{en ? "Account" : "账号"}:</b>{" "}
+              {(acctOptions.find((o) => o.id === acct) || { label: acct }).label}</div>
+          )}
           <div className="cf-prev-row"><b>{en ? "Subject" : "主题"}:</b> {subject}</div>
           <div className="cf-prev-row"><b>{en ? "Case type" : "案例类型"}:</b> {(ISSUE_TYPE_OPTS.find((o) => o.code === issueType) || ISSUE_TYPE_OPTS[0])[en ? "en" : "zh"]}</div>
           <div className="cf-prev-row"><b>{en ? "Service" : "服务"}:</b> {svcName}{catName ? ` / ${catName}` : ""}</div>
@@ -459,7 +505,8 @@ function CaseFormCard({ action, onSubmit, onCancel, locale }: {
                 subject: subject.trim(), communication_body: finalBody,
                 service_code: serviceCode, category_code: categoryCode,
                 severity_code: severity, language, issue_type: issueType,
-              })}>{en ? "Create case" : "确认创建"}</button>
+              // 下拉没渲染时回传 `undefined` → 宿主沿用 `action.account_id`（向后兼容）。
+              }, showAcct ? acct : undefined)}>{en ? "Create case" : "确认创建"}</button>
           </div>
         </div>
       )}
@@ -530,15 +577,19 @@ function ActionCard({ action, onConfirm, onCancel, locale }: {
   );
 }
 
-export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAction, onCancelAction, onFollowup, accountLabel, accountIsMember }: {
+export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAction, onCancelAction, onFollowup, accountLabel, accountIsMember, accounts, deployAccount }: {
   m: ChatMessage;
   onOpenSources: (m: ChatMessage) => void;
   onOpenThinking?: (m: ChatMessage) => void;
-  onConfirmAction?: (idx: number, editedParams?: Record<string, unknown>) => void;
+  // 第三个入参 = 开案例卡里那个账号下拉选中的账号（`undefined` = 下拉没渲染，
+  // 宿主沿用 `action.account_id`）。
+  onConfirmAction?: (idx: number, editedParams?: Record<string, unknown>, accountId?: string) => void;
   onCancelAction?: (idx: number) => void;
   onFollowup?: (prompt: string) => void;
   accountLabel?: string;   // 本回复针对的账号显示名（"名 · id"）；由父组件解析后传入。空=不显示(单账号部署)
   accountIsMember?: boolean; // true=成员账号(橙)；false=部署/management 账号(蓝)。用于徽标配色区分。
+  accounts?: AccountInfo[];    // 开案例卡的账号下拉数据源（宿主早就加载好了，不在这里发请求）
+  deployAccount?: string;      // 部署账号号码；空 = 不渲染那个下拉
 }) {
   const t = useT();
   const { locale } = useLocale();
@@ -660,7 +711,8 @@ export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAct
                 {m.actions.map((a, i) => (
                   a.type === "create_case_form"
                     ? <CaseFormCard key={i} action={a} locale={locale}
-                        onSubmit={(edited) => onConfirmAction?.(i, edited)}
+                        accounts={accounts} deployAccount={deployAccount}
+                        onSubmit={(edited, acctId) => onConfirmAction?.(i, edited, acctId)}
                         onCancel={() => onCancelAction?.(i)} />
                     : a.type === "create_case_review"
                     ? <CaseReviewCard key={i} action={a} locale={locale}

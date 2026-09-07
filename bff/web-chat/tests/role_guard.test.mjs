@@ -101,15 +101,20 @@ for (const f of files) {
 // 6 个已知点：accounts×2（getAssumedCredentialsForAccount 与 _assumeAndCheckPayer，
 // 均已防御）、skills×1（已防御）、member×2（testDaConnection 已防御；
 // verifyCollectionRole 的 ARN 由 collectionRoleArn(id,...) 按账号拼出，天然账号
-// 匹配）、support×1（ARN 由 `arn:aws:iam::${acct}:role/...` 拼出，同上）。
+// 匹配）、support×1（2026-09-07 开案例支持多账号后 ARN 改成从注册表读，已防御）。
 ok(`AssumeRole 调用点总数 = 6（实际 ${sites}）—— 新增调用点必须来本判据分类：`
   + "ARN 来自表数据就加 assertRoleBelongsTo，按账号拼出来的登记进上面的白名单注释",
   sites === 6);
 ok("_assumeAndCheckPayer 也有防御（ARN 来自 DA 关联配置，同属外部数据）",
   /assertRoleBelongsTo\(roleArn, accountId\)/.test(accounts));
 // 白名单两处「拼出来」的形状还在（防止有人改成从表里读而绕开普查）
-ok("support.mjs 的 ARN 仍按账号拼出（安全 by construction）",
-  /RoleArn: `arn:aws:iam::\$\{acct\}:role\//.test(read("support.mjs")));
+// support.mjs 曾经是「按账号拼出、安全 by construction」那一类；2026-09-07 开案例
+// 打通多账号后它的 ARN 来自 config 表的 `account#<id>.role_arn`，于是落回「表数据」
+// 那一类 —— 必须过 role_guard 的解析。这里盯的是**用共享那一份**：手写
+// startsWith+split 的版本会拒掉 aws-cn 的合法 ARN，又放过非 role ARN。
+ok("support.mjs 的注册表 ARN 过 role_guard 校验账号段（不许手写第二份）",
+  /roleArnAccount\(arn\) !== acct/.test(read("support.mjs"))
+  && /from "\.\/role_guard\.mjs"/.test(read("support.mjs")));
 ok("verifyCollectionRole 的 ARN 仍来自 collectionRoleArn(id",
   /const roleArn = collectionRoleArn\(id/.test(member));
 

@@ -262,6 +262,11 @@ t("roles without it stay without it", () => {
 });
 
 t("visibleTree exposes the inspection tab and its viewState", async () => {
+  // ⚠️ `nav:inspection` 2026-09-07 起带 `requiresEnv: "INSPECTION_TABLE"`
+  //    （一键部署 / 方式A 的最小底座没有巡检后端 → 整个 tab 不出现）。这条断言
+  //    要验的是**授权**语义，所以先把数据源标成"配好了"；数据源那一维的判据在
+  //    `capabilities_env_gate.test.mjs`。
+  process.env.INSPECTION_TABLE = "notiops-inspection";
   const eff = { grants: ["nav:inspection:*"], denies: [] };
   const tree = await visibleTree(eff, { disabledModules: [] });
   const tab = tree.find((n) => n.key === "nav:inspection");
@@ -271,6 +276,7 @@ t("visibleTree exposes the inspection tab and its viewState", async () => {
   assert.equal(tab.viewState, "inspection");
   const subs = tree.filter((n) => n.parent === "nav:inspection");
   assert.ok(subs.length >= 6, `子页只可见 ${subs.length} 个`);
+  delete process.env.INSPECTION_TABLE;
 });
 
 // ---------------------------------------------------------------------------

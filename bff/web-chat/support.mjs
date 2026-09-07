@@ -17,15 +17,29 @@ import {
   DescribeServicesCommand,
 } from "@aws-sdk/client-support";
 import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
+import { roleArnAccount } from "./role_guard.mjs";
 import { fillAccountNames } from "./accounts.mjs";
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 
 // 多账号基座（BFF 侧）：按目标账号拿 SupportClient。
 // account_id 缺省/部署账号 → 本地凭证（缓存复用）；其他账号 → STS AssumeRole。
-// 与 agent 侧 core/aws_session.py 同语义；角色名约定一致。
+// 与 agent 侧 `core/aws_session.py::_role_arn_for` 同语义：**role_arn 只信 config
+// 表那一行，绝不按角色名约定拼**。
+//
+// 2026-09-07 改：这里原来拼 `arn:aws:iam::<acct>:role/${NOTIOPS_CROSS_ACCOUNT_ROLE}`。
+// 那个环境变量本身是**对的**（`web-chat-core.ts` 用 orgSwitch 在 org 模式下给了
+// `notiops-idle-detection-role-<部署账号>` 后缀，现网实测就是这个值），所以这不是
+// 一个"跨账号案例从来没通过"的 bug。换成查注册表是因为另外三件事：
+//   ① 角色名约定是**第二份事实来源**。注册表里存的 `role_arn` 是
+//      `member_accounts.mjs` 唯一写入、而且真 AssumeRole 探测通过才写的；手动接入
+//      的账号允许给一个不按约定命名的 role_arn（见 DEPLOYMENT 多账号一节），
+//      那种账号在这里会被拼成一个不存在的 ARN。
+//   ② **没有 `enabled` 闸门**：客户在 Admin「账户」页把某个成员账号停用后，
+//      `casesOrgSummary` 的聚合读会把它过滤掉（`_enabledAccounts`），但点开单账号
+//      视图 / 开工单这条路照样能 assume 进去 —— 停用没停干净。
+//   ③ 没有 confused-deputy 防线（见下面 `_registryRoleArn` 的账号段校验）。
 const _localClient = new SupportClient({ region: "us-east-1" });
 const _sts = new STSClient({ region: "us-east-1" });
-const CROSS_ACCT_ROLE = process.env.NOTIOPS_CROSS_ACCOUNT_ROLE || "notiops-idle-detection-role";
 const LOCKED_ACCOUNT_ID = (process.env.LOCKED_ACCOUNT_ID || "").trim();
 
 let _deployAccount = null;
@@ -40,15 +54,55 @@ async function deployAccountId() {
   return _deployAccount || null;
 }
 
-/** 返回针对 account_id 的 SupportClient；跨账号闸门拒绝/AssumeRole 失败 → null。 */
+/** 注册表那一行（`PK=account#<id>`, `SK=meta`）里的采集角色 ARN；不可用 → null。
+ *
+ *  返回 null 的四种情况都是"这个账号现在不该被跨账号访问"，与
+ *  `core/aws_session.py::role_arn_for` 逐条对位：
+ *    · 没有这一行（没在 Web 上上车）；
+ *    · `enabled !== true`（Web 上停用了）；
+ *    · 没有 `role_arn`（第二步"关联 DevOps Agent"写的是 `trigger_role_arn`，
+ *      那是**另一个角色**，绝不能拿来当采集角色用）；
+ *    · ARN 的账号段与目标账号不一致 —— confused deputy 防线，不靠写侧自觉：
+ *      将来多一个写入方（导入 / 迁移脚本 / 人工改表）就有人能让 BFF 的执行角色
+ *      assume 到他自己账号的角色，再用他控制的凭证替一个合法账号开工单。
+ */
+async function _registryRoleArn(acct) {
+  let row = null;
+  try {
+    const r = await _aggDdb.send(new _AggGet({
+      TableName: _CFG_TABLE, Key: { PK: `account#${acct}`, SK: "meta" },
+    }));
+    row = r.Item || null;
+  } catch {
+    return null;   // 读不到表 → 拒绝，不猜 ARN
+  }
+  if (!row || row.enabled !== true) return null;
+  const arn = String(row.role_arn || "").trim();
+  // 账号段必须一致 —— 用 role_guard.mjs 那一份解析（JS 侧单一真源）。手写
+  // `startsWith("arn:aws:iam::")` + `split(":")[4]` 两头都漏：aws-cn 分区的
+  // 合法 ARN 会被拒（中国区开不了工单），而 `…:user/x` 这种非 role ARN 反而
+  // 放过去。用不抛的 roleArnAccount 而不是 assertRoleBelongsTo，是因为本函数
+  // 的契约是「拿不到就 null」，由调用方照实报 cross_account_unavailable。
+  if (!arn || roleArnAccount(arn) !== acct) return null;
+  return arn;
+}
+
+/** 返回针对 account_id 的 SupportClient；跨账号闸门拒绝/AssumeRole 失败 → null。
+ *
+ *  ⚠️ 拿不到跨账号凭证一律 **null**，调用方照实报 `cross_account_unavailable`。
+ *     绝不许回落到 `_localClient` —— 那不是"少了个功能"，而是**在部署账号里**
+ *     执行了一次本该落在成员账号的写操作，而用户看到的是"提交成功"。
+ */
 async function supportClientFor(accountId) {
   const acct = (accountId || "").toString().trim();
   const deploy = await deployAccountId();
   if (!acct || (deploy && acct === deploy)) return _localClient; // 部署账号
   if (LOCKED_ACCOUNT_ID && acct !== LOCKED_ACCOUNT_ID) return null; // 跨账号 disabled
+  const roleArn = await _registryRoleArn(acct);
+  if (!roleArn) return null;
   try {
     const out = await _sts.send(new AssumeRoleCommand({
-      RoleArn: `arn:aws:iam::${acct}:role/${CROSS_ACCT_ROLE}`,
+      RoleArn: roleArn,
       RoleSessionName: `NotiOpsWebChat-${acct}`,
       DurationSeconds: 3600,
     }));

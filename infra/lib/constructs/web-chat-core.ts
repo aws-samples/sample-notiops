@@ -355,7 +355,25 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       // 巡检 space —— 管理页用它引导「把成员账号加为 monitor account」。
       INSPECT_AGENT_SPACE_ID: props.inspectionAgentSpaceId ?? "",
       INSPECT_AGENT_SPACE_NAME: props.inspectionAgentSpaceName ?? "",
-      INSPECTION_TABLE: "notiops-inspection",
+      /* 🔴 空串 = **这条部署路径上压根没有巡检**（不是"客户没配"）。
+         `notiops-inspection` 表、`notiops-inspection-{scheduler,executor}` 与那两条
+         EventBridge 规则都只在 `notiops-backend-stack.ts` 里；一键部署（方式 A）的最小
+         底座刻意只装 Web Chat（见 minimal-base-core.ts 文件头）。
+         2026-09-07：以前这里两条路径都无条件注入表名，于是方式 A 上「巡检」tab 恒可见、
+         点进去是 `ddb_error` 加载失败面板（HTTP 200，不是 403，也不自动隐藏）——
+         现网实测到的正是这个。三处同批落地才生效：
+           · 本行的 `props.staticTemplate` 条件（这个 construct 两条路径共用，
+             不给条件就等于两边都配上，闸门永不触发）
+           · `config/capabilities.json` + `bff/web-chat/capabilities.json` 给
+             `nav:inspection` 加 `"requiresEnv": "INSPECTION_TABLE"`（两份逐字节一致，
+             tests/test_capabilities_parity.py 守）
+           · **`bff/web-chat/inspection.mjs` 里那个 `|| "notiops-inspection"` 兜底
+             必须去掉** —— 那个 `||` 会把空串又填回成表名，闸门照样空转
+         ⚠️ 这是把一处已知拓扑缺口收口成「功能不出现」（不许静默降级），**不是**补齐
+            对等；真正对等要把巡检那一族 Lambda 装进一键底座，那是独立改动。
+         ⚠️ 改这一行会动 WebChatStack 模板：需要
+            `cd infra && UPDATE_GOLDEN=1 npx jest test/web-chat-golden.test.ts` 重生成。 */
+      INSPECTION_TABLE: props.staticTemplate ? "" : "notiops-inspection",
       // 「立即巡检」按钮要 invoke 它。
       // 🔴 原来 CDK **压根没注入**这一项，BFF 靠 `inspection.mjs` 里一个
       //    硬编码字符串兜底（`process.env.INSPECTION_SCHEDULER_FUNCTION

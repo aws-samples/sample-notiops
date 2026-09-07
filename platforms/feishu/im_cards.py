@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from core import i18n
 from core.feishu_card import card_config
-from platforms.common import im_markdown, live_card, long_answer
+from platforms.common import im_footer, im_markdown, live_card, long_answer
 
 # 卡片正文渲染上限（飞书对单个 markdown 元素有长度限制，超了整张卡不显示）。
 # ⚠️ 截断一律走 `long_answer.clip()`，**不要**写裸切片 `text[:MAX_BODY]` —— 那样切完
@@ -65,39 +65,38 @@ _FINAL_TITLES = {
 }
 
 
-def usage_footer(locale: str, *, agent: str = "devops", usage=None) -> str:
-    """卡片落款 —— 「这一轮是哪条路、哪个模型」。**与 Slack 那份逐字对齐。**
+def usage_footer(locale: str, *, agent: str = "devops", usage=None,
+                 account: str = "", deploy: str = "") -> str:
+    """卡片落款 —— 「这一轮是哪条路、哪个模型、问的哪个账号」。
 
-    两条路两套说法，故意不含糊：
-      · `devops`  → `router.direct_no_token`（直连，NotiOps 侧 0 token）；
-      · `notiops` → `router.agent_model`，报 `usage["modelId"]`（`core.agent_chat`
-        用 `llm_config.resolve()` 算出的**实际生效**模型 id）。拿不到就退
-        `router.agent_model_unknown`（只报 agent 名）—— **绝不能**退成"无模型消耗"
-        那句：那是把"不知道"说成"没花钱"。
+    ⚠️ 实现整个在 `platforms.common.im_footer` 里，**与 Slack 共用同一份**（不再是
+    两份逐字对齐的副本 —— 理由见那个模块的文件头）。这里只保留入口：`caps.py` 的
+    纯文本兜底路径直接调它，而那个调用点是飞书自己的。
 
-    ⚠️ **用量刻意不出现在这里**（2026-09-06 产品决策）：`usage` 里
-    `totalTokens` / `cycles` 照样是实测值、照样进日志与指标，只是先不给客户看。
-    要重新露出来就在这一行拼回去（两个平台一起改，见 `tests/
-    test_im_agent_card_parity.py`），链路不用动。
+    口径（都在 `im_footer` 的 docstring 里）：直连说"无模型消耗"、走模型的那条报
+    **实际生效**的模型 id、拿不到模型 id 也不许退成"无模型消耗"、用量只统计不显示、
+    账号号拿不到就整段不显示。
     """
-    if agent != "notiops":
-        return i18n.t("router.direct_no_token", locale)
-    model = str((usage or {}).get("modelId") or "").strip()
-    if not model:
-        return i18n.t("router.agent_model_unknown", locale)
-    return i18n.t("router.agent_model", locale, model=model)
+    return im_footer.usage_footer(locale, agent=agent, usage=usage,
+                                  account=account, deploy=deploy)
 
 
 def answer_card(reply: str, locale: str, *,
                 steps=None, state: str = "final", elapsed: int = 0,
                 report_url: str = "", sources=None,
-                agent: str = "devops", usage=None) -> dict:
+                agent: str = "devops", usage=None,
+                account: str = "", deploy: str = "") -> dict:
     """对话问答的答案卡 —— 「思考中」与「答完」**共用**这一张，两个 agent 也共用。
 
     `agent` ∈ {"devops"（默认，直连客户的 DevOps Agent，NotiOps 侧 0 token）,
     "notiops"（走模型的 NotiOps Agent）}。它只影响**标题**和**落款**（见
     `usage_footer`）—— 结构共用一张，是为了不让两条路的卡片各自演进出差异。
     `sources` / `usage` 实际上只有 notiops 那条路有值。
+
+    `account` / `deploy` 是落款里「这条回答基于哪个账号」那一段（多账号，2026-09-07）：
+    `account` 是本轮目标账号（空 = 部署账号，`ImMessage.account_id` 的契约），
+    `deploy` 是部署账号号。**两个都必须由调用方传** —— 渲染函数每几秒被
+    `LiveCard.flush` 调一次，在这里解析账号等于把一次 STS 塞进渲染循环。
 
     `state` 三态（`platforms/common/live_card.py` 每隔几秒 PATCH 一次时给）：
       · ``"queued"`` —— 还没轮到（同一个会话前一个问题在跑，见 `chat_lease.py`），
@@ -139,7 +138,8 @@ def answer_card(reply: str, locale: str, *,
             elements.append(_md(src, locale))
     elements.append({"tag": "hr"})
     elements.append({"tag": "markdown",
-                     "content": usage_footer(locale, agent=agent, usage=usage)})
+                     "content": usage_footer(locale, agent=agent, usage=usage,
+                                             account=account, deploy=deploy)})
     actions: list[dict] = []
     if report_url and final:
         actions.append(_url_btn(i18n.t("report.see_full", locale), report_url))
@@ -168,7 +168,7 @@ _DISPATCH_STATES = {
 
 def dispatch_card(body: str, locale: str, *, deep_link: str = "",
                   home: str = "", state: str = "dispatched",
-                  elapsed: int = 0) -> dict:
+                  elapsed: int = 0, account: str = "", deploy: str = "") -> dict:
     """深度调查卡 —— 「已发起」与后续每一次进度 PATCH **共用**这一张。
 
     `state` 只改 header 颜色/标题；正文 `body` 由调用方拼（发起时是一句 ack，
@@ -186,7 +186,11 @@ def dispatch_card(body: str, locale: str, *, deep_link: str = "",
     title = i18n.t(title_key, locale, seconds=elapsed)
     elements: list[dict] = [
         _md(body, locale),
-        {"tag": "markdown", "content": i18n.t("router.direct_no_token", locale)},
+        # 深度调查永远是直连那条路（0 token），所以落款固定 `agent="devops"`；
+        # 账号那一段跟答案卡同一个口径 —— 这张卡上尤其要有：深度调查是**真的去查
+        # 那个账号的资源**，查错账号的报告看起来跟查对了一模一样。
+        {"tag": "markdown",
+         "content": usage_footer(locale, account=account, deploy=deploy)},
     ]
     actions: list[dict] = []
     link = deep_link or home

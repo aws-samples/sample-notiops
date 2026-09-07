@@ -572,7 +572,7 @@ def delete_im_task(incident_id: str) -> None:
 def link_im_investigation(incident_id: str, task_id: str, *, platform: str,
                           chat_id: str, root_message_id: str,
                           locale: str = "", user_id: str = "",
-                          raw_text: str = "",
+                          raw_text: str = "", account_id: str = "",
                           ttl_seconds: int = DEFAULT_TTL_SECONDS) -> None:
     """写 `incident#` / `task#` 路由行 —— **最终报告卡靠这两行才知道发回哪个会话**。
 
@@ -607,6 +607,13 @@ def link_im_investigation(incident_id: str, task_id: str, *, platform: str,
     跳过发第二张卡。
     ⚠️ 别改成"按平台判断"、也别去删回调侧那条 Created 分支：`infra/lib/bot-stack.ts`
     还留在仓库里当长连接回滚路径，那条路径回来时那张卡是它**唯一**的实时进度。
+
+    `account_id`（2026-09-07 多账号，空 = 部署账号）：这次调查查的是**哪个账号**。
+    `put_im_task` 那行也存，但它的 TTL 只有 30 分钟（只够进度 Lambda 刷卡），而
+    最终报告卡上那颗「📎 同步到 case」按钮可以几个小时后才被点 —— 写案例是**跨账号
+    写操作**，账号错了就是把 agent 的结论写进别人的工单。所以这里也存一份：
+    `report_handler._resolve_chat_target()` 会把它带出来 → 落进
+    `support#<incident_id>` 行（7 天 TTL）→ 盖在报告卡的同步按钮上。
     """
     if not (chat_id and (incident_id or task_id)):
         return
@@ -614,6 +621,7 @@ def link_im_investigation(incident_id: str, task_id: str, *, platform: str,
         "platform": platform,
         "live_card_owner": LIVE_CARD_OWNER_IM_LAMBDA,
         "incident_id": incident_id or "",
+        "account_id": account_id or "",
         "chat_id": chat_id,
         "root_message_id": root_message_id or "",
         "user_id": user_id or "",

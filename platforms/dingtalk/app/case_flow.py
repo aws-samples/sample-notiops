@@ -29,6 +29,16 @@ This module is DingTalk-specific by design — feishu/slack have
 their own modal-driven case flows that look nothing like this.
 The only thing both share is calling into core/case_management +
 core/support_logic; the platform-specific bit is the UX shape.
+
+多账号（2026-09-07）：**本文件有意保持单账号**，工单一律开在部署账号下。
+理由不是"不想做"，而是这条路在两条部署路径里都到不了：钉钉走的是 M2 已退役的
+`infra/lib/bot-stack.ts`（Fargate 长连接容器，`infra/bin/app.ts` 不再实例化它），
+而 IM Lambda webhook 只接了飞书 / Slack；钉钉也没有 `platforms/dingtalk/caps.py`。
+写一份连不上现网、跑不到测试的账号透传，只会给以后的人留一份"看着像支持了"的
+假象。⚠️ 真要把钉钉接回 Lambda 那条路时，必须照 `platforms/feishu/app/case_flow.py`
+把 `account_id` 逐个入口透传下去（`create_case` / `describe_case` /
+`add_communication` / `resolve_case` / `case_analyze.analyze` 都已经收这个参数），
+并且把账号号渲染进回复文本 —— 控制台链接不带账号参数。
 """
 from __future__ import annotations
 

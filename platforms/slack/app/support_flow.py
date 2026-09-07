@@ -20,6 +20,19 @@ report card with), falls back to the linked DDB row keyed by
 incident_id, and finally to "en" (Slack default). Modal submit handlers
 read locale back from `view.private_metadata` since they don't see the
 original action payload.
+
+多账号（2026-09-07）：这条路上的两个写操作 —— 从报告卡 🆘 升级开工单、把报告
+同步成工单评论 —— 都要落在**这次调查查的那个 AWS 账号**里，不是"点按钮那一刻
+会话里选的账号"。账号来源按优先级：
+
+  ① 按钮 value 里的 `case_account_id`（只有「📎 同步到 case」那颗盖了章）；
+  ② `support#<incident_id>` 行里的 `account_id`（`report_handler
+     ._persist_support_context` 写的）—— 🆘 那条路只有这一个来源，也兜住本次
+     改动之前发出的旧卡。
+
+两处都空 = 部署账号 = 改动前的行为。**不读**当下的会话偏好：按钮可以几小时后
+才被点，那时 `/account` 可能已经切走了，而工单只在原账号里存在。与飞书侧
+`platforms/feishu/app/support_flow.py` 逐项对位。
 """
 from __future__ import annotations
 
@@ -136,12 +149,17 @@ def _open_form(body: dict, client) -> None:
 
     ctx = support_logic.load_support_context(incident_id) or {}
     default_subject = _build_subject_default(ctx)
+    # 工单开在**这次调查查的那个账号**里。⚠️ 不读当下的会话偏好，也不从按钮 value
+    # 里读：`ask_support` 那颗按钮没有盖 `case_account_id`（只有「📎 同步到 case」
+    # 盖了），而 `support#<incident_id>` 这一行本来就是同源的权威值。
+    # 空 = 部署账号 = 改动前的行为。
+    account_id = str(ctx.get("account_id") or "").strip()
 
     view = _build_form_view(incident_id=incident_id,
                             channel_id=(body.get("channel") or {}).get("id", ""),
                             thread_ts=(body.get("message") or {}).get("ts", ""),
                             initial_subject=default_subject,
-                            locale=locale)
+                            locale=locale, account_id=account_id)
     try:
         client.views_open(trigger_id=body.get("trigger_id"), view=view)
     except Exception as e:
@@ -184,6 +202,9 @@ def handle_view_submission(ack, body: dict, view: dict, client) -> None:
     incident_id = pm.get("incident_id", "")
     channel_id = pm.get("channel_id", "")
     thread_ts = pm.get("thread_ts", "")
+    # 开模态框那一刻定下的账号（`_open_form` 盖进 private_metadata 的）。提交时
+    # **不重新查会话偏好** —— 用户可能在填表途中切了账号，但表单上写的是这个。
+    account_id = str(pm.get("case_account_id") or "").strip()
 
     if severity not in SEVERITY_CODES:
         ack(response_action="errors",
@@ -210,6 +231,10 @@ def handle_view_submission(ack, body: dict, view: dict, client) -> None:
             errors={"subject_block": i18n.t(
                 "support.expired.modal_error_short", locale)})
         return
+
+    # 兜本次改动之前打开、改动之后才提交的模态框（它的 private_metadata 里没有
+    # 那个字段）：退回 ctx 这一行的账号，而不是默默开到部署账号去。
+    account_id = account_id or str(ctx.get("account_id") or "").strip()
 
     # Honor user-edited subject by overriding intent_summary in ctx.
     ctx = {**ctx, "intent_summary": subject}
@@ -241,7 +266,8 @@ def handle_view_submission(ack, body: dict, view: dict, client) -> None:
         args=(client, channel_id, thread_ts, ctx, incident_id,
               severity, language, extra, locale),
         kwargs={"service_text": service_text, "issue_type": issue_type,
-                "category_text": category_text},
+                "category_text": category_text,
+                "account_id": account_id},
         daemon=True,
     ).start()
 
@@ -250,27 +276,30 @@ def _create_case_worker(client, channel_id: str, thread_ts: str, ctx: dict,
                         incident_id: str, severity: str, language: str,
                         extra: str, locale: str = "en",
                         service_text: str = "", issue_type: str = "",
-                        category_text: str = "") -> None:
+                        category_text: str = "",
+                        account_id: str = "") -> None:
     locale = _normalize_locale(locale)
     try:
         result = support_logic.create_case(
             ctx, platform=PLATFORM, severity=severity, language=language,
             extra=extra, operator_name="",
             service_text=service_text, issue_type=issue_type,
-            category_text=category_text,
+            category_text=category_text, account_id=account_id,
         )
         subject_for_display = support_logic.build_subject(ctx, PLATFORM)
         result_blocks = _result_blocks(result, severity, language,
                                        incident_id, subject_for_display,
-                                       locale=locale)
+                                       locale=locale, account_id=account_id)
         result_text = (i18n.t("support.success.title", locale) if result.ok
                        else i18n.t("support.failure.title", locale,
                                    code=result.error_code or "Error"))
     except Exception as e:
         logger.exception("create_case worker crashed")  # full detail → CloudWatch only
-        result_blocks = [blocks.section(
-            i18n.t("support.failure.internal_error_block_slack", locale,
-                   kind=type(e).__name__))]
+        result_blocks = [
+            *case_flow._account_banner_blocks(account_id, locale),
+            blocks.section(
+                i18n.t("support.failure.internal_error_block_slack", locale,
+                       kind=type(e).__name__))]
         result_text = i18n.t("support.failure.title_no_code", locale)
 
     try:
@@ -285,7 +314,7 @@ def _create_case_worker(client, channel_id: str, thread_ts: str, ctx: dict,
 # ---------------------------------------------------------------------------
 def _build_form_view(*, incident_id: str, channel_id: str,
                      thread_ts: str, initial_subject: str,
-                     locale: str = "en") -> dict:
+                     locale: str = "en", account_id: str = "") -> dict:
     locale = _normalize_locale(locale)
     sev_labels = severity_labels(locale)
     severity_options = [(c, sev_labels[c]) for c in SEVERITY_CODES]
@@ -299,6 +328,8 @@ def _build_form_view(*, incident_id: str, channel_id: str,
         "channel_id": channel_id,
         "thread_ts": thread_ts,
         "locale": locale,
+        # 账号「盖章」：提交时只认这个，不查那一刻的会话偏好。
+        "case_account_id": account_id,
     }, ensure_ascii=False)
 
     # Slack modal title field is plain_text with a 24-char hard cap.
@@ -352,7 +383,12 @@ def _build_form_view(*, incident_id: str, channel_id: str,
                                    locale),
                 max_length=200, optional=True,
             ),
-            blocks.context(i18n.t("case.create.account_note", locale)),
+            # 落在哪个账号 —— 这是本产品唯一的写操作，必须在**提交之前**说清楚。
+            blocks.context(
+                i18n.t("case.create.account_note_target", locale,
+                       account=account_id)
+                if (account_id or "").strip()
+                else i18n.t("case.create.account_note", locale)),
         ],
     )
 
@@ -363,17 +399,18 @@ def _build_form_view(*, incident_id: str, channel_id: str,
 def _result_blocks(result: support_logic.CaseResult, severity: str,
                    language: str, incident_id: str,
                    subject: str,
-                   locale: str = "en") -> list[dict]:
+                   locale: str = "en", account_id: str = "") -> list[dict]:
     locale = _normalize_locale(locale)
     if not result.ok:
         code = result.error_code or "Error"
-        if code == "SubscriptionRequiredException":
-            hint = i18n.t("case.create.fail_subscription", locale)
-        else:
-            hint = (result.error_message or "")[:300]
-        return [blocks.section(
-            i18n.t("support.failure.fail_block_slack", locale,
-                   code=code, hint=blocks.escape_mrkdwn(hint)))]
+        # 失败文案统一走 `support_logic.failure_hint`（跨账号拿不到凭证 / 目标账号
+        # 缺 support 写权限 / 缺只读权限 / 没有 Support 计划，四种成因各有各的出路）。
+        # 别在这里再维护一条 if 链 —— 各渲染点各写一份的时候，漏掉的正是跨账号那两种。
+        hint = support_logic.failure_hint(result, locale)
+        return [*case_flow._account_banner_blocks(account_id, locale),
+                blocks.section(
+                    i18n.t("support.failure.fail_block_slack", locale,
+                           code=code, hint=blocks.escape_mrkdwn(hint)))]
 
     cls = result.classification or {}
     classification_block = ""
@@ -403,6 +440,8 @@ def _result_blocks(result: support_logic.CaseResult, severity: str,
     lang_label = LANGUAGE_LABELS.get(language, language)
     return [
         blocks.header(i18n.t("support.success.title", locale)),
+        # 跨账号时把账号号念出来：控制台链接不带账号参数，用户登错账号点进去是空的。
+        *case_flow._account_banner_blocks(account_id, locale),
         blocks.section(
             i18n.t("support.success.id_link_block_slack", locale,
                    case_id=result.display_id,
@@ -438,6 +477,9 @@ def _handle_sync_report(body: dict, client) -> None:
     incident_id = v.get("incident_id", "")
     display_id = v.get("case_display_id", "")
     locale = _locale_from_action(raw_value)
+    # 卡片上盖的账号章（`slack_sender.send_report` 写的）。取不到就退到 ctx 那一行
+    # （见下面 `load_support_context` 之后），兜的是本次改动之前发出的旧报告卡。
+    account_id = str(v.get("case_account_id") or "").strip()
     if not incident_id or not display_id:
         return
     if locale == "en":
@@ -449,7 +491,10 @@ def _handle_sync_report(body: dict, client) -> None:
         or (body.get("message") or {}).get("ts", "")
     user_id = (body.get("user") or {}).get("id", "")
 
-    if not support_logic.claim_inflight(f"sync:{incident_id}:{display_id}"):
+    # 去重键带上账号：不同账号可以有相同的 displayId，不带账号会把 B 账号的同号
+    # 工单误判成"正在同步中"而直接拒掉。
+    if not support_logic.claim_inflight(
+            f"sync:{account_id}:{incident_id}:{display_id}"):
         client.chat_postEphemeral(channel=channel_id, user=user_id,
                                   text=i18n.t("case.toast.syncing_in_progress",
                                               locale))
@@ -462,9 +507,14 @@ def _handle_sync_report(body: dict, client) -> None:
                                               locale))
         return
 
+    # 两处都空 = 部署账号 = 改动前的行为。两者本来同源（都来自 `incident#` /
+    # `task#` 路由行），真矛盾时以卡片为准 —— 用户点的就是那张卡。
+    account_id = account_id or str(ctx.get("account_id") or "").strip()
+
     threading.Thread(
         target=_sync_report_worker,
-        args=(client, channel_id, thread_ts, display_id, ctx, locale),
+        args=(client, channel_id, thread_ts, display_id, ctx, locale,
+              account_id),
         daemon=True,
     ).start()
     client.chat_postEphemeral(channel=channel_id, user=user_id,
@@ -474,15 +524,20 @@ def _handle_sync_report(body: dict, client) -> None:
 
 def _sync_report_worker(client, channel_id: str, thread_ts: str,
                         display_id: str, ctx: dict,
-                        locale: str = "en") -> None:
+                        locale: str = "en", account_id: str = "") -> None:
     locale = _normalize_locale(locale)
     from core import case_management
     try:
         body_text = _build_sync_body(ctx)
-        ok = case_management.add_communication(display_id, body_text)
+        # ⚠️ 这条评论必须写进**卡片那个账号**的工单。拿不到跨账号凭证 / 目标账号缺
+        #   `support:AddCommunicationToCase` 时 `add_communication` 返回 False，
+        #   照实报失败 —— 绝不回落到部署账号里找同号工单写（那是另一个客户的工单）。
+        ok = case_management.add_communication(display_id, body_text,
+                                               account_id=account_id)
         if ok:
             case_url = case_management._case_console_url(display_id)
             blocks_out = [
+                *case_flow._account_banner_blocks(account_id, locale),
                 blocks.section(i18n.t("support.sync.success_block_slack",
                                        locale, display_id=display_id)),
                 blocks.actions(
@@ -494,15 +549,19 @@ def _sync_report_worker(client, channel_id: str, thread_ts: str,
             ]
             text = i18n.t("case.sync.success_title", locale)
         else:
-            blocks_out = [blocks.section(i18n.t(
-                "support.sync.fail_block_slack", locale,
-                display_id=display_id))]
+            blocks_out = [
+                *case_flow._account_banner_blocks(account_id, locale),
+                blocks.section(i18n.t(
+                    "support.sync.fail_block_slack", locale,
+                    display_id=display_id))]
             text = i18n.t("case.sync.fail_title", locale)
     except Exception as e:
         logger.exception("sync_report worker crashed")  # full detail → CloudWatch only
-        blocks_out = [blocks.section(i18n.t(
-            "support.sync.internal_error_block_slack", locale,
-            kind=type(e).__name__))]
+        blocks_out = [
+            *case_flow._account_banner_blocks(account_id, locale),
+            blocks.section(i18n.t(
+                "support.sync.internal_error_block_slack", locale,
+                kind=type(e).__name__))]
         text = i18n.t("case.sync.fail_title", locale)
     try:
         client.chat_postMessage(channel=channel_id,

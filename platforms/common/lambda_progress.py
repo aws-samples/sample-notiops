@@ -26,6 +26,7 @@ import time
 from core import ddb_state
 from core import devops_agent
 from core import i18n
+from core import im_accounts
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -137,10 +138,16 @@ def _tick_one(row: dict) -> None:
     # （「只要一个答案就行」/「开案例」）已经去掉，渲染函数也不再接这个参数
     # （见 `platforms/feishu/im_cards.dispatch_card` 的说明）。行里的 `title`
     # 字段保留不动：它还是这条 imtask 行的人类可读标识，日志/排障要用。
+    # `account=` 必须带上（多账号，2026-09-07）：更新是**整体替换**，不传就等于把
+    # 落款里的账号那一段抹掉 —— 卡片发出来第一分钟有账号、第一次 PATCH 之后就没了。
+    # 行里的 `account_id` 是 `start_investigation` 解析后的具体 12 位数字（`""` 只在
+    # 老行 / 解析失败时出现），所以够用；`deploy` 每次 handler 各解析一次，`im_accounts`
+    # 那边有容器级缓存，一个执行环境里最多一次 STS。
     payload = render(
         rendered or i18n.t("progress.placeholder_analyzing", locale),
         locale, deep_link=deep_link, home=home,
         state=state, elapsed=elapsed,
+        account=account, deploy=im_accounts.deploy_account_id(),
     )
 
     message_id = row.get("message_id") or ""

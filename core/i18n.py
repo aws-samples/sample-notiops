@@ -920,6 +920,107 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
               "agent — this switch only affects the NotiOps Agent (`agent notiops`).",
     },
 
+    # -- /account — 「这个会话在问哪个 AWS 账号」。⚠️ 上车 / 启用 / 停用**只在 Web 做**，
+    # IM 侧对注册表只读（`core/im_accounts.py`），所以每一句"加不了账号"的文案都必须
+    # 把人指回 Web，而不是暗示"这里再试一次就行"。
+    # 这里刻意**不打印部署账号号**（`account.current_default`）：拿它要一次 STS，而紧跟
+    # 在后面的清单里那一行本来就带着 id，打两遍只是让查看路径多一次 AWS 调用。
+    "account.current_default": {
+        "zh": "🏦 当前在问**部署账号**(默认)。",
+        "en": "🏦 Currently asking about the **deployment account** (default).",
+    },
+    "account.current_selected": {
+        "zh": "🏦 当前在问账号 `{account}`(来源: {source})。",
+        "en": "🏦 Currently asking about account `{account}` (source: {source}).",
+    },
+    "account.stale": {
+        # §4.4 自愈：Web 上停用/下车之后**立刻**失效。这句是"为什么变回去了"的解释 ——
+        # 少了它用户只看到"当前是部署账号"，会以为自己上次没切成功。
+        "zh": "⚠️ 之前选的账号 `{account}` 现在不能问了(在 Web 端被停用或下车了),"
+              "已自动回到部署账号。",
+        "en": "⚠️ The account you picked earlier (`{account}`) is no longer available "
+              "(disabled or offboarded in the web app), so we fell back to the deployment account.",
+    },
+    "account.list_title": {
+        "zh": "可以问的账号:",
+        "en": "Accounts you can ask about:",
+    },
+    "account.list_tag_deploy": {
+        "zh": "部署账号(默认)",
+        "en": "deployment account (default)",
+    },
+    "account.list_tag_locked": {
+        # §4.1：闸门**不下沉**到列表 —— 已登记的账号照实列出来，只是标明现在切不过去。
+        # 直接不显示等于让人以为"Web 上启用了但 IM 没同步"，那是另一个（不存在的）故障。
+        "zh": "当前切不过去(单账号模式)",
+        "en": "not selectable right now (single-account mode)",
+    },
+    "account.list_empty": {
+        "zh": "ℹ️ 目前只有部署账号。要问别的账号,得先在 Web 端的「账号」页面把它上车并启用 —— "
+              "IM 侧只读这份清单,不能在这里上车。",
+        "en": "ℹ️ Only the deployment account is available. To ask about others, onboard and enable "
+              "them on the Accounts page in the web app — the bot only reads that list; it can't "
+              "onboard an account here.",
+    },
+    "account.locked_note": {
+        # **查看**路径用这条（ℹ️，陈述事实）；**切换**路径用 `account.locked_refused`
+        # （⚠️，明确说"没切"）。A1/A2 是两条不同的判据，共用一句会让"拒绝"看起来像"提示"。
+        "zh": "ℹ️ 这套部署是单账号模式,只能问部署账号。要跨账号得以多账号模式重新部署"
+              "(方式 A:开栈时选 `DeployMode=MultiAccount`;方式 B:`./setup.sh --multi-account`)。",
+        "en": "ℹ️ This deployment is single-account, so the deployment account is the only one "
+              "available. Cross-account needs a redeploy in multi-account mode "
+              "(Option A: `DeployMode=MultiAccount`; Option B: `./setup.sh --multi-account`).",
+    },
+    "account.locked_refused": {
+        "zh": "⚠️ 没切:这套部署是单账号模式。",
+        "en": "⚠️ Not switched: this deployment is single-account.",
+    },
+    "account.not_enabled": {
+        "zh": "⚠️ 没切:账号 `{account}` 不在已启用的清单里。请先在 Web 端的「账号」页面"
+              "把它上车并启用 —— 上车只能在 Web 做,IM 侧只能从已启用的里面选。",
+        "en": "⚠️ Not switched: account `{account}` is not in the enabled list. Onboard and enable "
+              "it on the Accounts page in the web app first — onboarding only happens there; here "
+              "you can only pick from what is already enabled.",
+    },
+    "account.set_chat": {
+        "zh": "✅ 已切到账号 `{account}`。本群所有人之后问的都是这个账号。",
+        "en": "✅ Switched to account `{account}`. Applies to everyone in this chat.",
+    },
+    "account.set_dm": {
+        "zh": "✅ 已切到账号 `{account}`(仅本私聊)。",
+        "en": "✅ Switched to account `{account}` (this DM only).",
+    },
+    "account.cleared": {
+        "zh": "✅ 已回到默认 —— 部署账号。",
+        "en": "✅ Back to the default — the deployment account.",
+    },
+    "account.set_failed": {
+        "zh": "⚠️ 切换失败(DDB 写入错误),请稍后再试 —— 当前仍然是原来那个账号。",
+        "en": "⚠️ Switch failed (DDB write error); please try again — you're still on the "
+              "previous account.",
+    },
+    "account.unknown": {
+        "zh": "🤔 没看懂 `{arg}` —— AWS 账号 id 是 12 位数字。",
+        "en": "🤔 Didn't understand `{arg}` — an AWS account id is 12 digits.",
+    },
+    "account.usage": {
+        "zh": "用法:`account` 看当前 + 列出可选 · `account <12 位账号 id>` 切换 · "
+              "`account default` 回到部署账号。上车 / 启用只在 Web 端做。",
+        "en": "Usage: `account` to see the current one and list the options · "
+              "`account <12-digit id>` to switch · `account default` back to the deployment "
+              "account. Onboarding and enabling happen in the web app.",
+    },
+    "account.case_notice": {
+        # 2026-09-07 起 `case` 也跟着切了（跨账号建案）。这句话**留着**而不是删掉：
+        # 开工单是本产品唯一的写操作,用户必须清楚它会落到哪个账号下 ——
+        # "落错账号"这种事等到工单开出来才发现就晚了。
+        "zh": "ℹ️ 说明:支持案例(开单 / 回复 / 关闭)也跟着走这个账号 —— 会开在 "
+              "`{account}` 下。前提是该账号 onboarding 时允许了 NotiOps 代开工单。",
+        "en": "ℹ️ Note: support cases (open / reply / resolve) follow this account too — "
+              "they will be opened under `{account}`. This requires that the account "
+              "allowed NotiOps to open cases on its behalf during onboarding.",
+    },
+
     # -- /help — the command menu. Bilingual, lists BOTH language forms of
     # every command because a Chinese user won't guess `/调查` exists unless
     # we tell them. Rendered from core.nl_router.HELP_COMMANDS. --------------
@@ -950,9 +1051,10 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
               "or just say “open a case” / “escalate”, "
               "or in Chinese 「我要开案例」",
     },
-    # ⚠️ 这两行的示例故意就是**命令本身**（`/` 可省略，所以「智能体 notiops」是真的
-    # 能打的说法）。不给"大白话"示例是有意的：`agent` / `web` 是开关，猜错的代价是
-    # 悄悄开了计费或者悄悄关了联网,宁漏不误。引号样式仍要中英各一条（见上面那段）。
+    # ⚠️ 这三行的示例故意就是**命令本身**（`/` 可省略，所以「智能体 notiops」是真的
+    # 能打的说法）。不给"大白话"示例是有意的：`agent` / `web` / `account` 是开关，猜错的
+    # 代价是悄悄开了计费、悄悄关了联网,或者**把整个群问到另一个 AWS 账号上**,宁漏不误。
+    # 引号样式仍要中英各一条（见上面那段）。
     "help.row.agent": {
         "zh": "🧭 **谁来回答** — `/agent notiops|devops`、`/智能体 notiops|devops`;"
               "默认是 DevOps Agent 直连(无模型消耗),说「智能体 notiops」换成走模型的 "
@@ -966,6 +1068,14 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
               "说「联网 on」打开,英文 “web off” 一样认",
         "en": "🌐 **Web search** — `/web on|off`, `/联网 on|off`; off by default and only affects "
               "the NotiOps Agent. Say “web on” to enable, or in Chinese 「联网 off」",
+    },
+    "help.row.account": {
+        "zh": "🏦 **问哪个 AWS 账号** — `/account <12 位账号 id>`、`/账号 <账号 id>`;"
+              "默认是部署账号,打「账号 列表」看有哪些可选,英文 “account list” 一样认。"
+              "账号的上车 / 启用只在 Web 端做",
+        "en": "🏦 **Which AWS account** — `/account <12-digit id>`, `/账号 <account id>`; "
+              "defaults to the deployment account. Type “account list” to see the options, "
+              "or in Chinese 「账号 列表」. Onboarding and enabling happen in the web app only",
     },
     "help.row.model": {
         "zh": "🧠 **切换模型** — `/model`、`/model list`、`/模型 list`;也可以说「换个模型」,英文 “switch model” 一样认",
@@ -1037,6 +1147,34 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
     "router.agent_model_unknown": {
         "zh": "Agent: NotiOps",
         "en": "Agent: NotiOps",
+    },
+    # 落款的**账号**那一段（2026-09-07,多账号)。渲染口径见
+    # `platforms/common/im_footer.py::account_line` —— 一句话:号码一定是具体的
+    # 12 位数字,拿不到就整段不显示。
+    #
+    # 🔴 为什么值得占卡片上一行:IM 侧 `/account` 切账号是**按会话**生效的,群里任何
+    #    人都能把整个群切到另一个已启用的账号。切完之后每一条回答都基于那个账号,而
+    #    在这一行出现之前卡片上一个字都看不出来 —— 客户拿着一张「EC2 都很健康」的卡
+    #    以为说的是生产账号,其实问的是另一个。
+    #
+    # ⚠️ 这里刻意**只报账号号,不报账号名**。名字要再读一次注册表(GSI1 Query),而落款
+    #    每张卡都要渲染、进度卡还每几秒 PATCH 一次 —— 为了一个可有可无的别名给每一次
+    #    回答加一次 DDB 往返不值得。要名字的地方有 `/account`(`account.list_title`
+    #    那份清单带别名)。
+    #
+    # ⚠️ 号码**不加反引号**(2026-09-07 产品决策)。落款是卡片最下面那一行灰色小字,
+    #    行内代码在飞书/Slack 里都会被渲染成一个带底色的小方块 —— 一行字里塞三段,
+    #    再给中间那段加个灰底盒子就是纯噪音。12 位数字本身已经足够显眼,不需要框。
+    "router.account": {
+        "zh": "账号: {account}",
+        "en": "Account: {account}",
+    },
+    "router.account_deploy": {
+        # 部署账号要盖章:只给号码的话客户还得自己回忆"这个号是不是我的部署账号"。
+        # 与 `account.list_tag_deploy`(「部署账号(默认)」)同一件事的短版 —— 落款是
+        # 一行字,带上"(默认)"就太长了。
+        "zh": "账号: {account}(部署账号)",
+        "en": "Account: {account} (deployment account)",
     },
 
     # =====================================================================
@@ -1313,9 +1451,68 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
                "DevOps Agent in parallel; you get a diagnostic report in "
                "minutes alongside the support engineer's reply._"),
     },
+    # 2026-09-07 多账号：这句原来写死「开在运行本 bot 的账号」,现在案例跟着
+    # `/account` 走了,所以拆成两句 —— 没选成员账号时仍是部署账号(措辞改精确),
+    # 选了成员账号时**必须把账号号念出来**(控制台链接不带账号参数,用户点进去看到的
+    # 是自己当前登录的那个账号,不写清就会误判工单没开出来)。
     "case.create.account_note": {
-        "zh": "_Case 将开在当前 AWS 账号(运行本 bot 的账号),需 Business / Enterprise Support 计划。_",
-        "en": "_The case is opened in the current AWS account (the one this bot runs in). Requires Business / Enterprise Support plan._",
+        "zh": "_Case 将开在本 bot 的部署账号下,需该账号有 Business / Enterprise Support 计划。_",
+        "en": "_The case will be opened in this bot's deployment account. That account needs a Business / Enterprise Support plan._",
+    },
+    "case.create.account_note_target": {
+        "zh": "_Case 将开在账号 `{account}` 下(当前会话选定的账号),需该账号有 "
+              "Business / Enterprise Support 计划,且 onboarding 时允许了 NotiOps 代开工单。_",
+        "en": "_The case will be opened under account `{account}` (the account selected "
+              "for this conversation). That account needs a Business / Enterprise Support "
+              "plan and must have allowed NotiOps to open cases on its behalf._",
+    },
+    # 2026-09-07 追加：卡片/modal 上真有一个**账号下拉**时用这一句，而不是上面那两句。
+    # 上面两句是"承诺"（案例会开在 X 下），有下拉时那个承诺的主语是客户自己刚点的那一项，
+    # 所以措辞必须换成"以下拉里选的为准"—— 沿用 `..._target` 会出现"卡上写着 A、
+    # 下拉里选了 B"这种自相矛盾的卡片。
+    "case.create.account_note_picker": {
+        "zh": "_Case 会开在表单里「开到哪个账号」选中的账号下(默认是本会话当前的账号)。"
+              "该账号需有 Business / Enterprise Support 计划,且 onboarding 时允许了 "
+              "NotiOps 代开工单。_",
+        "en": "_The case will be opened under the account selected in the \"Open in which "
+              "account\" field (defaults to this conversation's current account). That "
+              "account needs a Business / Enterprise Support plan and must have allowed "
+              "NotiOps to open cases on its behalf._",
+    },
+    "case.create.account_label": {
+        "zh": "开到哪个账号",
+        "en": "Open in which account",
+    },
+    "case.create.account_placeholder": {
+        "zh": "选择目标 AWS 账号",
+        "en": "Pick the target AWS account",
+    },
+    # 下拉回传了一个不在允许集里的账号号 → **拒绝提交**（`account_picker.resolve_choice`
+    # 返回 None）。这句必须说清"没开"，不能含糊：唯一比"开错账号"更糟的是让客户以为
+    # 开成功了。
+    "case.create.account_refused": {
+        "zh": "⚠️ 没创建:账号 `{account}` 不在可开案例的清单里。请先在 Web 端的「账号」"
+              "页面把它上车并启用,或改选别的账号重新提交。",
+        "en": "⚠️ Not created: account `{account}` is not in the list of accounts cases "
+              "can be opened in. Onboard and enable it on the Accounts page in the web "
+              "app, or pick a different account and submit again.",
+    },
+    # 跨账号卡片的账号横幅：list / view / reply / resolve / analyze / 结果卡通用。
+    #
+    # 2026-09-07 反转：原来只在选了成员账号时出现（"部署账号 = 历史行为,不给卡片
+    # 加噪音"）。现网实测到的症状是「✅ 已创建 AWS Support Case」这张卡上一个账号
+    # 字都没有 —— 而开案例是本产品**唯一的写操作**，这张卡就是那次写的收据。
+    # "没有横幅"同时对应两种完全不同的事实：① 开在部署账号（正常）② 目标账号丢了
+    # 所以回落成了部署账号（正是 2026-09-07 的那个 P0）。二者长得一模一样，客户
+    # 只能靠去控制台数工单才能分辨。所以现在**总是**报账号，口径与落款
+    # （`router.account*`）一致：部署账号盖「(部署账号)」的章。
+    "case.account_banner": {
+        "zh": "🏷️ 账号: `{account}`",
+        "en": "🏷️ Account: `{account}`",
+    },
+    "case.account_banner_deploy": {
+        "zh": "🏷️ 账号: `{account}`(部署账号)",
+        "en": "🏷️ Account: `{account}` (deployment account)",
     },
 
     # ---- Create result card (success) -----------------------------------
@@ -1379,6 +1576,40 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
     "case.create.fail_subscription": {
         "zh": "当前账号的 Support 计划不支持开 case。需要升级到 Business 或 Enterprise 计划。",
         "en": "The current account's Support plan does not allow creating cases. Please upgrade to Business or Enterprise.",
+    },
+    # 跨账号建案的两种失败（2026-09-07）。都必须给出**出路**：只说"失败了"等于让
+    # 客户去猜是自己没上车、还是没给权限、还是我们坏了。
+    "case.create.fail_cross_account": {
+        "zh": "拿不到目标账号的访问凭证,没有开单。可能是:该账号没在 Web 端上车 / 已被停用,"
+              "或跨账号角色还没在该账号里部署。请在 Web 端「账号」页确认后重试;"
+              "也可以先 `account default` 回到部署账号下开单。",
+        "en": "Could not obtain credentials for the target account, so nothing was created. "
+              "Either the account was never onboarded (or has been disabled) in the web app, "
+              "or its cross-account role is not deployed yet. Check the Accounts page in the "
+              "web app and retry; or run `account default` to open the case under the "
+              "deployment account instead.",
+    },
+    "case.create.fail_support_read_denied": {
+        "zh": "该账号的 NotiOps 角色连 Support 的只读权限都没有(探测 "
+              "support:DescribeSeverityLevels 被拒)。通常是该账号的接入角色没挂 "
+              "ReadOnlyAccess,或被 SCP / 权限边界拦住了。请检查该账号的接入栈。",
+        "en": "The NotiOps role in this account lacks even read access to AWS Support "
+              "(the support:DescribeSeverityLevels probe was denied). Usually its "
+              "onboarding role is missing ReadOnlyAccess, or an SCP / permissions "
+              "boundary is blocking it. Check that account's onboarding stack.",
+    },
+    "case.create.fail_write_not_granted": {
+        # 这不是 bug 也不是"权限不够"这种含糊说法 —— 是客户在成员账号 onboarding 时
+        # 主动关掉的一项授权。所以要点名那个参数,客户才知道去哪打开。
+        "zh": "该账号没有授权 NotiOps 代开工单,没有开单。成员账号接入时的 "
+              "`EnableSupportCaseWrite` 是关的(它控制 support:CreateCase / "
+              "AddCommunicationToCase / ResolveCase 三条权限)。要用这个能力,"
+              "请把该账号的接入模板改成 `true` 后重跑;不改也可以在 AWS 控制台自己开单。",
+        "en": "This account has not authorized NotiOps to open cases on its behalf, so "
+              "nothing was created. `EnableSupportCaseWrite` is off in its member-account "
+              "onboarding template (it controls support:CreateCase / "
+              "AddCommunicationToCase / ResolveCase). To use this feature, re-run that "
+              "template with `true`; otherwise open the case yourself in the AWS console.",
     },
     "case.create.error_title": {
         "zh": "❌ 开 case 失败",
@@ -2022,18 +2253,19 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "联系方式(可选,邮箱 / 电话)",
         "en": "Contact (optional, email / phone)",
     },
+    # ⚠️ 这条只讲"两种模式有什么区别"，**不许**再写案例落在哪个账号（2026-09-07
+    #    去掉了原来那句"开在当前 AWS 账号"）：多账号之后归属由 `/account` 决定，
+    #    写死在这里就是撒谎。账号归属另有一条随会话变的 context 块
+    #    （`case.create.account_note` / `..._target`），Slack 的
+    #    `_build_create_view` 紧跟在这条后面追加。
     "case.create.modal.context_hint": {
         "zh": ("_• 仅创建 Case: 把问题提给 AWS Support 工程师人工处理。_\n"
                "_• 创建 + 启动 Agent 调查: 同时让 DevOps Agent 立即开始调查,"
-               "几分钟内出诊断报告;两条线并行进行。_\n"
-               "_Case 将开在当前 AWS 账号(运行本 bot 的账号),"
-               "需 Business / Enterprise Support 计划。_"),
+               "几分钟内出诊断报告;两条线并行进行。_"),
         "en": ("_• Create case only — file the issue with AWS Support engineers._\n"
                "_• Create + start Agent investigation — also kick off "
                "DevOps Agent in parallel; you get a diagnostic report in "
-               "minutes alongside the support engineer's reply._\n"
-               "_The case is opened in the current AWS account (the one this "
-               "bot runs in). Requires Business / Enterprise Support plan._"),
+               "minutes alongside the support engineer's reply._"),
     },
     "case.reply.modal.title_short": {
         "zh": "✏️ 回复 {display_id}",
@@ -2459,9 +2691,20 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "取消升级",
         "en": "Cancel escalation",
     },
+    # 2026-09-07 多账号：这句原来写死「当前 AWS 账号(运行本 bot 的账号)」,现在从
+    # 报告卡升级出来的工单跟着**这次调查查的那个账号**走(不是"点按钮那一刻会话里选
+    # 的账号"——🆘 可以几小时后才被点)。所以拆成两句,选了成员账号时**必须把账号号
+    # 念出来**(控制台链接不带账号参数,用户点进去看到的是自己当前登录的那个账号)。
     "support.form.account_note": {
-        "zh": "_提示:案例将开在当前 AWS 账号(运行本 bot 的账号),需 Business / Enterprise Support 计划。_",
-        "en": "_Note: the case opens in the current AWS account (the one this bot runs in). Requires Business / Enterprise Support plan._",
+        "zh": "_提示:案例将开在本 bot 的部署账号下,需该账号有 Business / Enterprise Support 计划。_",
+        "en": "_Note: the case will be opened in this bot's deployment account. That account needs a Business / Enterprise Support plan._",
+    },
+    "support.form.account_note_target": {
+        "zh": "_提示:案例将开在账号 `{account}` 下(本次调查的账号),需该账号有 "
+              "Business / Enterprise Support 计划,且 onboarding 时允许了 NotiOps 代开工单。_",
+        "en": "_Note: the case will be opened under account `{account}` (the account this "
+              "investigation ran against). That account needs a Business / Enterprise "
+              "Support plan and must have allowed NotiOps to open cases on its behalf._",
     },
 
     # ---- Pending card ---------------------------------------------------

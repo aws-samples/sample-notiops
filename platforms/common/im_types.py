@@ -33,7 +33,15 @@ class ImMessage:
       quoted_author: 那条历史消息的发件人 id（只用于给 agent 标一句 "from …"）。
       is_direct: 是否私聊（决定回帖用 thread 还是行内）。
       mentioned: 是否 @ 了 bot（群里必须 @ 才响应）。
-      account_id: 目标 AWS 账号（空 = 部署账号）。
+      account_id: 目标 AWS 账号（**空 = 部署账号**，不是"未知"）。由平台的
+        `lambda_worker` 在规范化时用 `core.im_accounts.resolve(...)` 填 —— 那一层已经
+        把偏好拿去注册表校验过（Web 上停用了就回落到空），所以下游能力**不需要**再校验
+        一次。
+        ⚠️ `case` 那条路 2026-09-07 起也**跟着这个字段走**（原先有意忽略、只开在
+        部署账号）。它是本产品唯一的**写**路径：目标账号的角色必须带 support 写权限
+        （成员账号模板参数 `EnableSupportCaseWrite`，默认开），不具备时
+        `core.support_logic` 报确切原因，**绝不回落到部署账号**替客户写另一个账号的
+        工单。卡片/消息上会把账号号写出来（控制台的案例链接不带账号参数）。
       locale: 已解析好的 locale（"zh" / "en"）。⚠️ 命令类回复必须用 `_pre_locale`
         口径（只看用户偏好 + 锁，**不做自动检测**）—— `language en` 是纯 ASCII，
         自动检测会在 set_user_pref 之前就把这个私聊锁成 en。见 §8.1.4 #3。
@@ -73,12 +81,12 @@ class ImAction:
 
 @runtime_checkable
 class Caps(Protocol):
-    """九个能力 + 传输，由平台层实现。
+    """十个能力 + 传输，由平台层实现。
 
     每个方法都**必须自己完成回复**（发文本或发卡片），返回值只用于日志 / 测试断言。
     这样决策层完全不碰传输，Slack 的 Block Kit 与飞书的 v2 card 各自演进不互相牵连。
 
-    ⚠️ 会烧 NotiOps 侧 token 的只有两条路径（2026-09-06 校正，其余七条全是确定性渲染）：
+    ⚠️ 会烧 NotiOps 侧 token 的只有两条路径（2026-09-06 校正，其余八条全是确定性渲染）：
 
       1. `case` —— 但**不是**在路由/抽参那一步（`display_id` / 标题 / 正文由
          `core.nl_router` 确定性抽出，`analyze_intent` 在活路径上已不再被调用）。
@@ -89,7 +97,8 @@ class Caps(Protocol):
          `"devops"`（直连客户自己的 DevOps Agent，NotiOps 侧 0 token），用户要
          显式 `/agent notiops` 才切过去。见 `core/agent_chat.py` 头部注释。
 
-    `agent` / `web` 这两条**本身**是 0 token 的开关（只读写一行 DDB 偏好）。
+    `agent` / `web` / `account` 这三条**本身**是 0 token 的开关（只读写一行 DDB 偏好；
+    `account` 另加一次注册表 GSI1 Query，仍然一个模型都不碰）。
 
     `investigate_status` 与 `investigate` 的分工：前者**回读一条已有调查**（0 token，
     不新建任何东西），后者**新起一条**（付费）。分成两个能力而不是在 `investigate`
@@ -99,7 +108,7 @@ class Caps(Protocol):
     # ---- 传输 ----
     def reply_text(self, msg: ImMessage, text: str) -> None: ...
 
-    # ---- 九个能力 ----
+    # ---- 十个能力 ----
     def help(self, msg: ImMessage) -> None: ...
 
     def language(self, msg: ImMessage, arg: str, lang: str = "") -> None: ...
@@ -109,6 +118,8 @@ class Caps(Protocol):
     def agent(self, msg: ImMessage, arg: str) -> None: ...
 
     def web(self, msg: ImMessage, arg: str) -> None: ...
+
+    def account(self, msg: ImMessage, arg: str) -> None: ...
 
     def investigate(self, msg: ImMessage, text: str) -> None: ...
 
@@ -128,6 +139,6 @@ class Caps(Protocol):
 #: 一个 `Route(kind="skills")`，worker 的白名单检查会把它挡在 `getattr` 之前而不是
 #: 抛 AttributeError。
 KINDS: frozenset[str] = frozenset({
-    "help", "language", "model", "agent", "web", "investigate",
+    "help", "language", "model", "agent", "web", "account", "investigate",
     "investigate_status", "case", "chat",
 })

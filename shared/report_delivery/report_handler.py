@@ -689,7 +689,8 @@ def _call_send_report(sender, platform: str, target: dict, *, status: str,
                       trace_url: str | None, incident_id: str,
                       linked_case_display_id: str, next_steps: list,
                       locale: str, title: str = "",
-                      report_truncated: bool = False) -> None:
+                      report_truncated: bool = False,
+                      case_account_id: str = "") -> None:
     """Invoke sender.send_report with the report-link mapped to each platform's
     slot (dingtalk uses `html_url`, feishu/slack use `report_url`) and
     summary_card passed via the existing `summary_md` slot.
@@ -702,6 +703,12 @@ def _call_send_report(sender, platform: str, target: dict, *, status: str,
     ⚠️ 参数按 sender 签名过滤（`_supported_kwargs`），**不再**用
     `except TypeError` 重试 —— 理由见那个函数。
 
+    `case_account_id`（2026-09-07 多账号，空 = 部署账号）：那颗「📎 同步到 case」按钮
+    要写的是**哪个账号**的工单。sender 把它盖进按钮的回调值里，点回来时只认这个章 ——
+    用户那一刻在会话里选的账号可能已经换了，而工单只在原账号里存在。
+    ⚠️ 走 `_supported_kwargs` 过滤：钉钉 sender 没有这个参数也不会炸（钉钉那条链路
+    本来就没有同步按钮）。
+
     ⚠️ **没有 `console_url`**（报告卡上不放控制台深链）—— 理由见本文件里
     `_console_deep_link` 原址的那段注释。钉钉 sender 带 `**kwargs`，会把补回
     来的键悄悄吃掉，所以加回它不会报错，只会让说明重新自相矛盾。
@@ -712,7 +719,7 @@ def _call_send_report(sender, platform: str, target: dict, *, status: str,
         task_id=task_id, trace_url=trace_url, summary_md=summary_card,
         incident_id=incident_id, linked_case_display_id=linked_case_display_id,
         next_steps=next_steps, locale=locale, title=title,
-        report_truncated=report_truncated,
+        report_truncated=report_truncated, case_account_id=case_account_id,
     )
     if platform == "dingtalk":
         kwargs["html_url"] = report_url
@@ -765,6 +772,7 @@ def deliver_report_card(*, artifacts: ReportArtifacts, incident_id: str,
         raw_text=target.get("raw_text", ""),
         intent_summary=target.get("intent_summary", ""),
         platform=target.get("platform", ""),
+        account_id=target.get("account_id", ""),
     )
 
     linked_case_display_id = _extract_case_display_id(incident_id)
@@ -806,6 +814,7 @@ def deliver_report_card(*, artifacts: ReportArtifacts, incident_id: str,
             next_steps=ns_actions, locale=locale,
             title=artifacts.title,
             report_truncated=artifacts.report_truncated,
+            case_account_id=target.get("account_id", ""),
         )
     else:
         logger.warning("No sender for platform=%s; incident_id=%s report stored "
@@ -880,6 +889,7 @@ def deliver_failure_card(*, incident_id: str, task_id: str, detail: dict,
             raw_text=target.get("raw_text", ""),
             intent_summary=target.get("intent_summary", ""),
             platform=target.get("platform", ""),
+            account_id=target.get("account_id", ""),
         )
         sender = _load_sender(target.get("platform", ""))
         if sender:
@@ -892,6 +902,7 @@ def deliver_failure_card(*, incident_id: str, task_id: str, detail: dict,
                 report_url=None, trace_url=None, incident_id=incident_id,
                 linked_case_display_id=_extract_case_display_id(incident_id),
                 next_steps=[], locale=locale,
+                case_account_id=target.get("account_id", ""),
                 # 失败卡**也**要带标题：调查失败时用户更需要知道「是哪一次问的
                 # 那件事失败了」。`target` 已经在手，不必再查一次 DDB。
                 title=_resolve_report_title(
@@ -1570,11 +1581,16 @@ def _delete_progress_row(incident_id: str) -> None:
 def _persist_support_context(incident_id: str, task_id: str, agent_space_id: str,
                              execution_id: str, summary_md: str, report_url: str,
                              trace_url: str, raw_text: str, intent_summary: str,
-                             platform: str) -> None:
+                             platform: str, account_id: str = "") -> None:
     """Stash the report content under a `support#<incident_id>` key so the
     originating platform bot's support handler can retrieve it when the user
     clicks 'Ask for human support' on the report card. TTL matches the
     presigned URL expiry (7 days).
+
+    `account_id`（2026-09-07 多账号，空 = 部署账号）：这次调查查的是哪个账号，也就是
+    「🆘 升级到 Support」/「📎 同步到 case」应该开 / 写**哪个账号**的工单。它跟着这一行
+    活 7 天，而它的上游（`imtask#` 行）只活 30 分钟 —— 按钮被点的时候上游多半已经没了，
+    所以必须在这里落一份。⚠️ 拿不到就存空字符串 = 部署账号 = 改动前的行为，绝不猜。
     """
     table = _get_ddb_table()
     if not table:
@@ -1595,6 +1611,7 @@ def _persist_support_context(incident_id: str, task_id: str, agent_space_id: str
         "trace_url": trace_url,
         "raw_text": raw_text,
         "intent_summary": intent_summary,
+        "account_id": account_id or "",
         "ttl": int(_t.time()) + 7 * 24 * 3600,
     }
     try:
@@ -1674,6 +1691,11 @@ def _resolve_chat_target(incident_id: str, task_id: str) -> dict | None:
                         # event doesn't — see the backfill in
                         # deliver_report_card / deliver_failure_card.
                         "incident_id": item.get("incident_id", ""),
+                        # 这次调查查的是哪个 AWS 账号（空 = 部署账号）。写入点是
+                        # `core.ddb_state.link_im_investigation(account_id=…)`；
+                        # 读它的是 `_persist_support_context` —— 报告卡上那颗
+                        # 「📎 同步到 case」按钮要靠它把评论写进**对的**账号。
+                        "account_id": item.get("account_id", ""),
                         # Who owns the live/progress card for this run — see
                         # LIVE_CARD_OWNER_IM_LAMBDA below.
                         "live_card_owner": item.get("live_card_owner", "")}

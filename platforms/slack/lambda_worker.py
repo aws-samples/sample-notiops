@@ -49,6 +49,7 @@ import time
 from core import bedrock_credentials
 from core import ddb_state
 from core import i18n
+from core import im_accounts
 from core import locale_resolver
 from platforms.common import lambda_deadline, quoted_context, router
 from platforms.common.im_types import ImMessage
@@ -151,7 +152,11 @@ def _normalize_message(payload: dict) -> ImMessage | None:
         root_message_id=root_id or event_ts,
         is_direct=is_dm,
         mentioned=(itype == "app_mention"),
-        account_id="",
+        # 「这个会话在问哪个 AWS 账号」—— 空 = 部署账号。与飞书 worker 同一句：
+        # 没设过偏好时一次 GetItem 就短路，设过才多一次注册表校验，而校验只做这一次
+        # （下游能力拿到的已经是"Web 上确实启用着"的账号）。见 `core/im_accounts.py`。
+        account_id=im_accounts.resolve(
+            platform=PLATFORM, chat_id=channel_id, user_id=user_id, is_dm=is_dm),
         locale=pre_locale,
         quoted_message_id=quoted_id,
     )
@@ -269,7 +274,10 @@ def _handle_slash(payload: dict) -> None:
         text=routed_text, raw_text=text,
         # slash 没有"用户那条消息"可以 thread，所以 message_id / root 都是空。
         message_id="", root_message_id="",
-        is_direct=is_dm, mentioned=True, account_id="", locale=pre_locale,
+        is_direct=is_dm, mentioned=True,
+        account_id=im_accounts.resolve(
+            platform=PLATFORM, chat_id=channel_id, user_id=user_id, is_dm=is_dm),
+        locale=pre_locale,
     )
     if not routed_text:
         # 光打 `/devops` 不带内容 —— 给用法而不是把空串丢给 DevOps Agent。
@@ -333,7 +341,13 @@ def _action_message(body: dict, action_value: str, locale: str) -> ImMessage:
         chat_id=channel_id, user_id=user_id,
         text=text, raw_text=text,
         message_id=msg_ts, root_message_id=root or msg_ts,
-        is_direct=is_dm, mentioned=True, account_id="", locale=locale,
+        is_direct=is_dm, mentioned=True,
+        # 按钮回调也要带上会话选的账号 —— 否则「转深度调查」会悄悄回到部署账号。
+        # Slack 这边 `is_dm` 是**真实频道类型**（`D` 开头），所以直接按它的归属查一次
+        # 就够了（飞书那边拿不到 chat_type，多绕了一个 `_resolve_account_either_scope`）。
+        account_id=im_accounts.resolve(
+            platform=PLATFORM, chat_id=channel_id, user_id=user_id, is_dm=is_dm),
+        locale=locale,
     )
 
 

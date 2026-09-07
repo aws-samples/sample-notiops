@@ -73,7 +73,7 @@ class Route:
     """A deterministic routing decision, or a no-op sentinel.
 
     ``kind`` is one of:
-      "help" | "language" | "model" | "agent" | "web" |
+      "help" | "language" | "model" | "agent" | "web" | "account" |
       "investigate" | "investigate_status" | "case" | ""
 
     An empty ``kind`` means "not recognised — caller falls through". All the
@@ -155,8 +155,16 @@ _AGENT_RE = _cmd("agent", "智能体", "智能體")
 # 「联网」和「搜索」之间不成立（中文都是 word char），短词先命中会导致整条不匹配。
 _WEB_RE = _cmd("websearch", "web-search", "web_search", "web",
                "联网搜索", "聯網搜索", "联网", "聯網")
+# `/account <12 位账号 id>` —— 「这个会话在问哪个 AWS 账号」（见 `core/im_accounts.py`）。
+# 上车/启用/停用只在 Web 做，这里只选。
+# 「账号列表」/「帳號列表」单独收进词表：中文没有 word boundary，`_cmd("账号")` 的 `\b`
+# 在「号」与「列」之间**不成立**，不收就等于 `/账号列表` 整条不匹配（同 `_WEB_RE` 那条
+# 「长词在前」的坑）。空参本来就会把清单一起列出来，所以这两个词落到空参分支即正确。
+_ACCOUNT_RE = _cmd("account", "accounts", "acct",
+                   "账号列表", "帳號列表", "账户列表", "帳戶列表",
+                   "账号", "帳號", "账户", "帳戶")
 
-# ── 两条开关命令认得的入参 —— **也是裸词形式的精度门** ────────────────────────
+# ── 三条开关命令认得的入参 —— **也是裸词形式的精度门** ────────────────────────
 # `platforms/common/pref_commands.py` 从这里取（那边把 arg 翻成动作），一份词表两个
 # 消费者，少一份就会漂。
 #
@@ -166,9 +174,9 @@ _WEB_RE = _cmd("websearch", "web-search", "web_search", "web",
 # 所以：**裸词形式**（没打斜杠）只在参数为空或认得出来时才算命令；**带斜杠**无条件
 # 算命令（那时意图明确，参数不认就回用法，比丢给模型好）。
 #
-# 这道门只管 `agent` / `web` —— 它们的触发词恰好是运维日常词汇。`model` / `case` 有
-# 同形状的问题（「模型 部署最佳实践」→ model、「case study for eks」→ case），但那是
-# 既有行为，改动面更大，单独处理（见 §B.1）。
+# 这道门只管 `agent` / `web` / `account` —— 它们的触发词恰好是运维日常词汇。
+# `model` / `case` 有同形状的问题（「模型 部署最佳实践」→ model、「case study for eks」
+# → case），但那是既有行为，改动面更大，单独处理（见 §B.1）。
 AGENT_ARG_WORDS: frozenset[str] = frozenset({
     "devops", "dev", "devops-agent", "notiops", "noti", "notiops-agent",
     "default", "clear", "reset", "auto",
@@ -182,6 +190,25 @@ WEB_OFF_WORDS: frozenset[str] = frozenset({
 })
 WEB_ARG_WORDS: frozenset[str] = WEB_ON_WORDS | WEB_OFF_WORDS
 
+#: `/account` 的入参 —— **不是闭集**（真正的参数是 12 位账号 id），所以词表只覆盖两个
+#: 动作；判"裸词算不算命令"由 `_account_arg_ok` 额外放行一串 12 位数字。
+#: 两侧分开导出，理由同 `WEB_ON_WORDS` / `WEB_OFF_WORDS`：合起来 `pref_commands` 就
+#: 没法知道用户要"列清单"还是"回默认"。
+ACCOUNT_LIST_WORDS: frozenset[str] = frozenset({
+    "list", "ls", "all", "列表", "清单", "清單", "有哪些",
+})
+#: 「回到默认（部署账号）」。与 `/agent default` / `/model default` 同一批词，用户不用
+#: 记第三套；`deploy` / 「部署账号」是这一轴特有的说法。
+ACCOUNT_CLEAR_WORDS: frozenset[str] = frozenset({
+    "default", "clear", "reset", "auto", "deploy", "部署账号", "部署帳號",
+})
+ACCOUNT_ARG_WORDS: frozenset[str] = ACCOUNT_LIST_WORDS | ACCOUNT_CLEAR_WORDS
+
+#: 12 位 AWS 账号 id。**故意在这里再写一次**，不从 `core.im_prefs.is_account_id` 导入：
+#: 本模块是纯函数、零 AWS 依赖（`im_prefs` 拉 boto3），依赖方向只能是
+#: platforms → core.nl_router。口径一致由 `tests/test_im_multi_account.py` 钉住。
+_ACCT_ID_RE = re.compile(r"^\d{12}$")
+
 
 def _switch_arg_ok(text: str, rest: str, words: frozenset[str]) -> bool:
     """裸词形式的精度门（上面那段注释就是它的理由）。"""
@@ -189,6 +216,21 @@ def _switch_arg_ok(text: str, rest: str, words: frozenset[str]) -> bool:
         return True                      # 打了斜杠 = 意图明确
     r = (rest or "").strip().lower()
     return r == "" or r in words         # 裸词：空参（= 查看当前值）或认得的参数
+
+
+def _account_arg_ok(text: str, rest: str) -> bool:
+    """`/account` 专用的精度门 —— 比 `_switch_arg_ok` 多放行「一串 12 位数字」。
+
+    为什么单独一个函数：`account` 的入参不是闭集，而它的触发词又恰好是运维日常词汇。
+    没有这道门时「account 权限不够」`kind="account"`，用户拿到一句"用法：…"，真正的
+    问题被吞掉 —— 与 2026-09-06 在 `/web` 上实测到的真 bug 同一形状。
+    （中文侧「账号被锁了怎么办」另有一层保护：CJK 之间 `\\b` 不成立，`_ACCOUNT_RE`
+    压根不匹配。英文侧只有这道门。）
+    """
+    if text.lstrip().startswith("/"):
+        return True
+    r = (rest or "").strip().lower()
+    return r == "" or r in ACCOUNT_ARG_WORDS or bool(_ACCT_ID_RE.match(r))
 
 
 _INVESTIGATE_RE = _cmd(
@@ -267,6 +309,15 @@ def parse_command(text: str) -> Route:
     m = _WEB_RE.match(s)
     if m and _switch_arg_ok(s, m.group("rest"), WEB_ARG_WORDS):
         return Route(kind="web", form="command",
+                     arg=(m.group("rest") or "").strip().lower())
+
+    # 与上面两条开关放在一起（同一类：会话级偏好，0 token）。
+    # ⚠️ 别挪到 case 那一圈后面：`_CASE_ID_RE` 是 `\b(\d{6,})\b`，12 位账号 id 完全落在
+    # 它的形状里 —— 今天两边词表不相交所以没事，但把账号轴排在一个会去抽 6 位以上数字
+    # 的轴之后，是在等一次以后加词时的误伤。
+    m = _ACCOUNT_RE.match(s)
+    if m and _account_arg_ok(s, m.group("rest")):
+        return Route(kind="account", form="command",
                      arg=(m.group("rest") or "").strip().lower())
 
     for pat, canonical in _CASE_CMD_PATTERNS:
@@ -622,6 +673,7 @@ HELP_COMMANDS: tuple[tuple[str, str, str], ...] = (
     ("case",        "/case · /cases",       "/案例 · /工单"),
     ("agent",       "/agent notiops|devops", "/智能体 notiops|devops"),
     ("web",         "/web on|off",          "/联网 on|off"),
+    ("account",     "/account <id>",        "/账号 <账号 id>"),
     ("model",       "/model · /model list", "/模型 · /模型 list"),
     ("language",    "/language zh|en",      "/语言 zh|en"),
     ("help",        "/help",                "/帮助"),

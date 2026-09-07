@@ -823,6 +823,12 @@ Web Chat offers **two case-filing paths; you pick one**. Both run **deterministi
   - **Service** dropdown: options come from the real AWS service catalog (BFF `describe-services`, about **328** services), and the **category updates in tandem with the service**.
   - **Case type**: technical / customer-service (billing & account) / service-limit-increase.
   - **Severity** and **Language** (the conversation language of the case inside AWS Support).
+  - An **account** dropdown (multi-account deployments only): which account this case is
+    opened in. It defaults to the account the current session is already looking at, so
+    submitting without touching it behaves exactly as before; opening a case in another
+    account no longer requires switching the session account first. Only **enabled** member
+    accounts plus the deployment account are listed; on a single-account deployment the
+    field does not appear at all.
 - Flow: **fill in → preview → confirm**.
 - **Preventing invalid combinations**: if the model suggests a `service_code` that isn't in the real catalog, the frontend **corrects it by token matching or clears it**, avoiding illegal service/category combinations.
 

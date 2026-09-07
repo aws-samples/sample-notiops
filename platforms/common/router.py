@@ -1,6 +1,6 @@
 """确定性分发（IM 重构 / M0）—— 0 token，双语，三平台共用。
 
-这一层做且只做一件事：**把一条规范化消息路到九个能力之一**，然后调用平台的 `Caps` 实现。
+这一层做且只做一件事：**把一条规范化消息路到十个能力之一**，然后调用平台的 `Caps` 实现。
 路由判据全部来自 `core.nl_router`（正则；不过模型、不烧 token），本模块只负责：
 
   · 把 `Route` 映射成 `Caps` 的方法调用（含参数整形）；
@@ -8,8 +8,8 @@
   · prompt-injection 二道门（§8.3：只读由 DevOps Agent 侧保证，NotiOps 只留这一道）；
   · 把"派发前该拒的"拒掉，并且**永不抛**——任何异常都变成一句人话回复。
 
-为什么不在这里做 LLM 分类：全部九条路径里只有「案例」需要抽 display_id / 标题 / 正文，
-那一步在平台的 `caps.case()` 里做。其余八条的**路由**纯确定性。见 §8.1。
+为什么不在这里做 LLM 分类：全部十条路径里只有「案例」需要抽 display_id / 标题 / 正文，
+那一步在平台的 `caps.case()` 里做。其余九条的**路由**纯确定性。见 §8.1。
 
 ⚠️ "确定性路由" ≠ "整条路径 0 token"：`chat` 在用户 `/agent notiops` 之后会走
 `core.agent_chat` 打 NotiOps Agent（模型 + 窄工具集）。路由这一层仍然 0 token —— 花钱
@@ -27,7 +27,7 @@ from platforms.common.im_types import KINDS, ImMessage
 logger = logging.getLogger(__name__)
 
 # 会把文本原样交给 agent 的三条能力 —— **只有**这三条需要"被回复的历史消息"当背景
-# （B8 第 7 项）。`help` / `language` / `model` / `agent` / `web` 是确定性
+# （B8 第 7 项）。`help` / `language` / `model` / `agent` / `web` / `account` 是确定性
 # 回复（读写一行偏好或渲染一张卡），拼进去没有意义；
 # `investigate_status` 是回读一条已有调查（0 token，一个字都不发给 agent）。
 QUOTE_AWARE_KINDS: frozenset[str] = frozenset({"chat", "investigate", "case"})
@@ -105,10 +105,12 @@ def decide(text: str) -> tuple[str, dict]:
         return kind, {"arg": route.arg, "lang": route.lang}
     if kind == "model":
         return kind, {"model_arg": route.model_arg}
-    if kind in ("agent", "web"):
-        # `agent` / `web` 是两个会话级开关（`core.im_prefs`）—— 本身 0 token，
-        # 只读写一行 DDB。**故意不进 QUOTE_AWARE_KINDS**：引用的历史消息跟
-        # "把这个群切到 notiops" 没有关系，拼进去只会让参数解析变糊。
+    if kind in ("agent", "web", "account"):
+        # 三个会话级开关（`core.im_prefs`）—— 本身 0 token，只读写一行 DDB
+        # （`account` 另加一次注册表 GSI1 Query 做校验，仍然不碰模型）。
+        # **故意不进 QUOTE_AWARE_KINDS**：引用的历史消息跟"把这个群切到 notiops"、
+        # "把这个群切到 12 位账号"没有关系，拼进去只会让参数解析变糊 —— 账号轴尤其
+        # 危险，一条引用的告警卡片正文里就带着 `- Account: <id>`。
         return kind, {"arg": route.arg}
     if kind == "investigate":
         # command form 的 arg 是 `/调查` 后面那段；NL form 的 arg 是整句原话。

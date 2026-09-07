@@ -339,6 +339,7 @@ aws secretsmanager put-secret-value --secret-id notiops/slack-signing-secret \
 | `/devops` | 直接跟 DevOps Agent 对话（0 token） |
 | `/agent` | 换对话用的 agent：`/agent devops`（默认，0 token）\| `/agent notiops`（走模型，**会消耗 token**）；不带参数是查看当前值 |
 | `/web` | NotiOps Agent 的联网搜索开关：`/web on` \| `/web off`（默认关；DevOps 直连那条路上不生效） |
+| `/account` | 换"问哪个账号"：`/account <12 位账号 id>` \| `/account list` 看可选清单 \| `/account default` 回到部署账号；不带参数是查看当前值 |
 | `/investigate` | 发起深度调查 |
 | `/case` · `/cases` | 案例：开 / 列表 / 查看 / 回复 |
 | `/model` | 切换模型（`/model list` 看清单） |
@@ -422,6 +423,51 @@ bot 在群里是成员时，群里的每一句话都会作为 `im.message.receiv
   `bot identity: GET /bot/v3/info` 那行 ERROR（抖动会在一分钟内自愈）。
 
 > Slack 侧不需要这一层：它有独立的 `app_mention` 事件，平台已经替我们分好了。
+
+### 3.2 多账号：`/account` 换「问哪个账号」
+
+启用了多账号（方式 A 的 `DeployMode=MultiAccount`，或方式 B 的
+`./setup.sh --multi-account`）之后，IM 里可以用 `/account` 决定这一轮问的是哪个账号：
+
+| 打什么 | 结果 |
+|---|---|
+| `/account` | 看当前问的是哪个账号 |
+| `/account list` | 列出可选的账号（部署账号 + 已在 Web 上启用的成员账号） |
+| `/account 444455556666` | 切过去；**群里设一次对整群生效**，私聊里只对你自己生效 |
+| `/account default` | 回到部署账号 |
+
+三件事需要先说清楚，否则很容易误会：
+
+1. **账号上车（新增 / 启用 / 停用）只在 Web 控制台做，IM 只读那份清单。**
+   IM 侧**没有**、也不会有上车入口 —— `/account` 只能在「Web 上已经启用」的账号之间选。
+   在 Web 上启用一个新账号后，IM **下一条消息**就能选到它（不用重新部署、不用重启）；
+   在 Web 上停用之后，IM 那边原本指着它的选择会**自动回落到部署账号**并明确告诉你为什么。
+2. **两侧各自选账号，互不影响。** Web 上切到成员账号，不会把 IM 群也切过去；
+   反过来也一样。共享的只有「哪些账号可选」这份清单。
+3. **开案例也跟着 `/account` 走（2026-09-07 起）。** 看工单 / 开工单 / 回复 / 关闭 /
+   分析，都落在当前选定的那个账号里。三个前提，缺一个都会被**明确告知**而不是静默落错：
+   - 那个成员账号 onboarding 时允许了 NotiOps 代开工单（模板参数
+     `EnableSupportCaseWrite`，**默认开**）。关掉时 NotiOps 会说缺哪条 action
+     （`support:CreateCase` / `AddCommunicationToCase` / `ResolveCase`），
+     让你自己决定是补权限还是去控制台开。
+   - 那个账号自己有 Business / Enterprise On-Ramp / Enterprise 支持计划
+     （AWS Support API 在 Basic / Developer 上不可用）。**注意这是按账号算的**：
+     部署账号有计划不代表成员账号有。
+   - 该账号在 Web 上仍处于「已启用」。停用之后跨账号凭证就拿不到了。
+
+   卡片上会**写明这张工单开在哪个账号下**（工单号在不同账号之间可以撞号，而 AWS
+   控制台链接不带账号参数 —— 不写清楚的话你点进去看到的是自己当前登录账号的工单）。
+
+   一个例外值得单独记住：**从调查报告卡上的 🆘 升级开工单、以及「📎 同步到 case」，
+   跟的是「这次调查查的那个账号」，不是「点按钮那一刻会话里选的账号」。** 报告卡可能
+   几小时后才被点，那时 `/account` 早切走了 —— 跟着会话走才是错的。
+
+> ⚠️ **如实说清残留风险**：群里**任何**能 @ 到 bot 的成员都可以把这个群切到
+> **任何一个已启用**的账号 —— IM 侧没有按人的权限控制（IM 平台的身份不等于 AWS 身份，
+> 我们不拿它当授权依据）。控制手段是两条：**在 Web 上只启用真的该被问到的账号**，
+> 以及**用上面 §3 的群允许清单把 bot 限制在该看这些账号的群里**。
+> 越权的最后一道线在 agent 侧（只允许问「部署账号 + 已启用账号」这个集合，
+> 拿不到清单时是**拒绝**而不是放开）和目标账号自己那个只读角色的信任策略上。
 
 ---
 

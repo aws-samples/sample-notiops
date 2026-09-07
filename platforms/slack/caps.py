@@ -32,6 +32,7 @@ from core import agent_chat
 from core import ddb_state
 from core import devops_chat
 from core import i18n
+from core import im_accounts
 from core import im_prefs
 from core import llm_pref_resolver
 from core import locale_resolver
@@ -144,7 +145,7 @@ class SlackCaps(Caps):
         # thread_ts=None 会被 slack_sdk 直接丢掉（不会发成字符串 "None"）
         return get_client().chat_postMessage(**kwargs)
 
-    # ---- 九个能力 ----
+    # ---- 十个能力 ----
     def help(self, msg: ImMessage) -> None:
         """`/help` 命令菜单 —— 发 blocks，且正文必须过 `blocks.to_mrkdwn()`。
 
@@ -251,6 +252,13 @@ class SlackCaps(Caps):
         """`/web [on|off]` —— 联网搜索开关（0 token）。只对 NotiOps Agent 生效。"""
         self.reply_text(msg, pref_commands.web_reply(msg, arg, platform=PLATFORM))
 
+    def account(self, msg: ImMessage, arg: str) -> None:
+        """`/account [<12 位账号 id>|list|default]` —— 这个会话在问哪个 AWS 账号。
+
+        与飞书同一份逻辑和文案。0 token；**上车 / 启用 / 停用只在 Web 做**，这里只选。
+        """
+        self.reply_text(msg, pref_commands.account_reply(msg, arg, platform=PLATFORM))
+
     def investigate(self, msg: ImMessage, text: str) -> None:
         """发起一次深度调查 —— **0 token**：只 create_backlog_task，NotiOps 侧不总结、
         不翻译、不做任何 LLM 调用。`source` 打成 `notiops-im-slack` 方便 backlog 溯源。
@@ -277,8 +285,13 @@ class SlackCaps(Caps):
         home = result.get("console_home") or ""
         deep = result.get("console_url") or ""
         body = i18n.t("ack.dispatched", msg.locale)
-        blocks_out = im_blocks.dispatch_blocks(body, msg.locale, deep_link=deep,
-                                               home=home, state="dispatched")
+        # 落款带上账号 —— 深度调查是**真的去查那个账号**的资源。用
+        # `result["account_id"]`（已解析成具体 12 位数字）而不是 `msg.account_id`
+        # （空 = 部署账号）。
+        blocks_out = im_blocks.dispatch_blocks(
+            body, msg.locale, deep_link=deep, home=home, state="dispatched",
+            account=str(result.get("account_id") or ""),
+            deploy=im_accounts.deploy_account_id())
         try:
             resp = self._post(msg, blocks_out=blocks_out)
         except Exception as e:                    # noqa: BLE001
@@ -315,6 +328,8 @@ class SlackCaps(Caps):
             incident_id, result.get("task_id") or "",
             platform=PLATFORM, chat_id=msg.chat_id, root_message_id=card_ts,
             locale=msg.locale, user_id=msg.user_id, raw_text=q[:1000],
+            # 同飞书：报告卡上的账号横幅 + 升级/同步按钮的账号章都靠这一行。
+            account_id=msg.account_id or "",
         )
 
     def investigate_status(self, msg: ImMessage, ref_id: str,
@@ -360,7 +375,11 @@ class SlackCaps(Caps):
         blocks_out = im_blocks.dispatch_blocks(
             blocks.to_mrkdwn(inv_status.body(info, msg.locale, mode=mode)),
             msg.locale, deep_link=deep, home=home,
-            state=inv_status.card_state(info))
+            state=inv_status.card_state(info),
+            # 回读的是**那条调查**查的账号，不是本轮会话当前选的账号 —— 用户完全
+            # 可能已经 `/account` 切走了。
+            account=str(info.get("account_id") or msg.account_id or ""),
+            deploy=im_accounts.deploy_account_id())
         try:
             resp = self._post(msg, blocks_out=blocks_out)
         except Exception as e:                        # noqa: BLE001
@@ -393,8 +412,17 @@ class SlackCaps(Caps):
         modal 已经在线上跑了很久，重写只会引入回归）。注意参数顺序是
         `(client, channel_id, thread_ts, ...)`，且 `start_create` / `start_reply` 还要
         `user_id` —— 与飞书那份的入参形状不同，抄过来会静默错位。
+
+        多账号（2026-09-07，与飞书同口径）：这条路**跟着 `msg.account_id` 走**
+        （空 = 部署账号）—— `/account` 选了哪个成员账号，案例就在那个账号里读写。
+        之前这里有意忽略它、另发一句"案例只开在部署账号"的提示；现在改成真支持，
+        那句提示随之删掉。写操作（create / reply / resolve）要求目标账号的角色带
+        support 写权限（成员账号模板参数 `EnableSupportCaseWrite`，默认开）；不具备时
+        `core.support_logic` 给出确切原因，**绝不回落到部署账号**。
         """
         from platforms.slack.app import case_flow
+        # 空字符串 = 部署账号，全线统一口径（见 `platforms/common/im_types.py`）。
+        account_id = msg.account_id or ""
         client = get_client()
         # DM 不 thread（与 `_post` 和 main.py 同口径）。main.py 在 DM 分支里传的就是
         # `None`，case_flow 内部所有 `chat_postMessage(thread_ts=...)` 都吃 None。
@@ -402,22 +430,28 @@ class SlackCaps(Caps):
         try:
             if command == "case_view":
                 case_flow.start_view(client, msg.chat_id, thread_ts, case_id,
-                                     locale=msg.locale)
+                                     locale=msg.locale, account_id=account_id)
             elif command == "case_reply":
                 case_flow.start_reply(client, msg.chat_id, thread_ts, case_id,
-                                      text or "", msg.user_id, locale=msg.locale)
+                                      text or "", msg.user_id,
+                                      locale=msg.locale, account_id=account_id)
             elif command == "case_resolve":
                 case_flow.start_resolve(client, msg.chat_id, thread_ts, case_id,
-                                        locale=msg.locale)
+                                        locale=msg.locale,
+                                        account_id=account_id)
             elif command == "case_analyze":
                 case_flow.start_analyze(client, msg.chat_id, thread_ts, case_id,
-                                        locale=msg.locale)
+                                        locale=msg.locale,
+                                        account_id=account_id)
             elif command == "case_create":
                 case_flow.start_create(client, msg.chat_id, text or "",
-                                       msg.user_id, thread_ts, locale=msg.locale)
+                                       msg.user_id, thread_ts,
+                                       locale=msg.locale,
+                                       account_id=account_id)
             else:
                 case_flow.start_list(client, msg.chat_id, thread_ts,
-                                     status_filter="recent", locale=msg.locale)
+                                     status_filter="recent", locale=msg.locale,
+                                     account_id=account_id)
         except Exception as e:                    # noqa: BLE001
             logger.exception("caps.case failed kind=%s: %s", command, type(e).__name__)
             self.reply_text(msg, i18n.t("main.case_flow_crashed", msg.locale,
@@ -465,6 +499,10 @@ class SlackCaps(Caps):
             is_dm=msg.is_direct)
         notiops = agent == im_prefs.AGENT_NOTIOPS
 
+        # 落款里的账号那一段（多账号，2026-09-07）—— **这一轮只解析一次**（org 模式下
+        # 底下是 STS，而落款会被 `LiveCard.flush` 每几秒渲染一次）。与飞书同一个做法。
+        deploy_acct = im_accounts.deploy_account_id()
+
         session = ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
         question = (text or msg.text or "").strip()
 
@@ -487,7 +525,8 @@ class SlackCaps(Caps):
                else ack_variants.ack_body(ack_seed, msg.locale, agent))
         try:
             resp = self._post(msg, blocks_out=im_blocks.answer_blocks(
-                ack, msg.locale, state=state, elapsed=0, agent=agent))
+                ack, msg.locale, state=state, elapsed=0, agent=agent,
+                account=msg.account_id, deploy=deploy_acct))
         except Exception as e:                    # noqa: BLE001
             logger.error("caps.chat: ack postMessage failed: %s", type(e).__name__)
             resp = None
@@ -505,7 +544,8 @@ class SlackCaps(Caps):
                     kw["body"], msg.locale,
                     steps=kw["steps"], state=kw["state"], elapsed=kw["elapsed"],
                     report_url=kw["report_url"],
-                    agent=agent, sources=extra["sources"], usage=extra["usage"]),
+                    agent=agent, sources=extra["sources"], usage=extra["usage"],
+                    account=msg.account_id, deploy=deploy_acct),
                 update=_update,
             )
             # 心跳：agent 可以整整 5 分钟不吐一个事件（现网 cd0f6745），只靠 emit 驱动
@@ -540,6 +580,9 @@ class SlackCaps(Caps):
                     session_id=ddb_state.im_agent_session_id(PLATFORM, msg.chat_id),
                     model=model_alias,
                     account_id=msg.account_id or None,
+                    # 可见账号闸门（§4.2）。与飞书**逐字一致** —— 少传一边就等于那一个
+                    # 平台上闸门是全开的（`build_payload` 的默认值是 `"*"`）。
+                    allowed_accounts=im_accounts.allowed_accounts(),
                     web_search=im_prefs.resolve_web(
                         platform=PLATFORM, chat_id=msg.chat_id,
                         user_id=msg.user_id, is_dm=msg.is_direct)[0],
@@ -585,7 +628,9 @@ class SlackCaps(Caps):
         blocks_out = im_blocks.answer_blocks(body, msg.locale,
                                              report_url=report_url, agent=agent,
                                              sources=extra["sources"],
-                                             usage=extra["usage"])
+                                             usage=extra["usage"],
+                                             account=msg.account_id,
+                                             deploy=deploy_acct)
         try:
             resp = self._post(msg, blocks_out=blocks_out)
         except Exception as e:                    # noqa: BLE001
@@ -597,4 +642,5 @@ class SlackCaps(Caps):
             # ⚠️ 落款走 `usage_footer` 而**不是**硬编码 `router.direct_no_token`：
             # 走模型那条路上那句是假的。
             self.reply_text(msg, body + "\n\n" + im_blocks.usage_footer(
-                msg.locale, agent=agent, usage=extra["usage"]))
+                msg.locale, agent=agent, usage=extra["usage"],
+                account=msg.account_id, deploy=deploy_acct))

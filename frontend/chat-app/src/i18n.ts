@@ -397,6 +397,15 @@ export const STRINGS: Dict = {
   "insp.degraded.title": { zh: "判读缺失", en: "Analysis missing" },
 
   "insp.error.load": { zh: "加载失败", en: "Failed to load" },
+  // 一键部署（方式A）的最小底座不含巡检后端。正常情况下这个 tab 已经被
+  // `requiresEnv: INSPECTION_TABLE` 摘掉了，客户看不到；这两句是给"绕过前端
+  // 的调用 / 浏览器里缓存着旧前端包"兜底 —— 必须说清是**部署形态**决定的，
+  // 而不是坏了（客户会去重试、去查一个不存在的故障、以为自己配错了）。
+  "insp.error.not_deployed": { zh: "这套部署暂不支持资源巡检",
+                               en: "Resource inspection is not in this deployment" },
+  "insp.error.not_deployed.hint": {
+    zh: "一键部署（方式A）的最小底座只装 Web Chat，不含巡检所需的后端。需要巡检请用完整部署（方式B，setup.sh）。",
+    en: "The one-click minimal base installs Web Chat only and does not include the inspection backend. Use the full deployment (setup.sh) if you need it." },
   "insp.error.forbidden": { zh: "没有访问权限", en: "You do not have access" },
   "insp.retry": { zh: "重试", en: "Retry" },
 

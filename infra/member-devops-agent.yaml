@@ -108,6 +108,31 @@ Parameters:
       Language for inspection judgment output. Must match the management
       account's INSPECTION_REPORT_LOCALE.
 
+  EnableSupportCaseWrite:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    # 中文：是否允许 NotiOps 代表你**在这个账号下**开 / 回复 / 关闭 AWS Support 工单。
+    #       与 `member-account-onboarding.yaml` 的同名参数**逐字一致** —— 两条接入路径
+    #       （org 走 StackSets 那份 / 手动接入走本份）必须给出同一个角色，否则会出现
+    #       「一键接入的账号开得出工单，手动接入的账号开不出」这种按接入方式分裂的行为，
+    #       而 UI 上两种账号长得一模一样。`tests/test_inspection_cross_account.py::
+    #       test_两个成员模板的采集角色逐行一致` 钉住这一点。
+    Description: >
+      Whether NotiOps may open, reply to and resolve AWS Support cases FOR THIS
+      ACCOUNT on your behalf (support:CreateCase, support:AddCommunicationToCase,
+      support:ResolveCase). This is the ONLY write permission this template ever
+      grants and it can affect nothing but AWS Support cases - no resource in
+      this account can be created, changed or deleted with it.
+      Set to false to keep the role strictly read-only. NotiOps then tells the
+      user exactly which permission is missing (it probes before showing the
+      form) instead of failing silently, and cases for this account have to be
+      opened in the AWS console.
+      Requires a Business, Enterprise On-Ramp or Enterprise support plan on this
+      account either way - the AWS Support API is not available on Basic or
+      Developer plans.
+      Only takes effect when CreateCollectionRole is yes.
+
   DevOpsEventBusArn:
     Type: String
     Default: ""
@@ -136,6 +161,9 @@ Parameters:
 Conditions:
   HasOrgId: !Not [!Equals [!Ref OrganizationId, ""]]
   EnableCollectionRole: !Equals [!Ref CreateCollectionRole, "yes"]
+  # 只在 IdleDetectionRole（本身已 Condition: EnableCollectionRole）的 Policies 里用，
+  # 所以不用再叠 EnableCollectionRole。
+  HasSupportCaseWrite: !Equals [!Ref EnableSupportCaseWrite, "true"]
   EnableInspectionMonitor: !Not [!Equals [!Ref InspectionAgentSpaceArn, ""]]
   EnableEventForwarding: !Not [!Equals [!Ref DevOpsEventBusArn, ""]]
 
@@ -459,10 +487,15 @@ Resources:
     Condition: EnableCollectionRole
     Properties:
       RoleName: !Sub "notiops-idle-detection-role-${SystemAccountId}"
-      Description: "Allows NotiOps system account read-only access to this member account (RDS/EC2/CloudWatch/Cost/Support/Security etc.)"
+      Description: "Allows NotiOps system account read-only access to this member account (RDS/EC2/CloudWatch/Cost/Support/Security etc.), plus AWS Support case writes when EnableSupportCaseWrite is true"
       # 挂 AWS 托管 ReadOnlyAccess：与部署账号自身 agent 的广只读范围对齐，
-      # 让跨账号调查(EC2/成本/任意只读 API)与单账号体验一致。纯只读、无任何写权限。
+      # 让跨账号调查(EC2/成本/任意只读 API)与单账号体验一致。
       # 下方 inline notiops-readonly 保留：明确列出核心用到的 action(文档用途 + 兜底)。
+      #
+      # ⚠️ 这个角色**不再是纯只读**（2026-09-07，案例多账号）：`EnableSupportCaseWrite`
+      # 打开时多挂一份 inline `notiops-support-case-write`。与
+      # `member-account-onboarding.yaml` 那份逐字一致（理由见那边的长注释：独立一份
+      # policy 便于 `list-role-policies` 一眼看出有没有写权限、也便于客户单独摘掉）。
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/ReadOnlyAccess
       AssumeRolePolicyDocument:
@@ -583,6 +616,26 @@ Resources:
                   - s3:ListStorageLensConfigurations
                   - cur:DescribeReportDefinitions
                 Resource: "*"
+
+        # ─── (可选) AWS Support 工单写权限 ───
+        # 与 `member-account-onboarding.yaml` 里那一份**逐字一致**（那边有完整理由）。
+        # 一句话版本：**读**那三条工单 action 托管 ReadOnlyAccess 本来就带，所以"看别的
+        # 账号工单"从来就能用；缺的一直只有写。Support 是全局服务且 IAM 不支持给
+        # support:* 做资源级限定，只能靠 action 收窄 —— 最坏后果是给这个账号开了一张
+        # 不该开的工单，而不是动了任何资源。
+        - !If
+          - HasSupportCaseWrite
+          - PolicyName: notiops-support-case-write
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - support:CreateCase
+                    - support:AddCommunicationToCase
+                    - support:ResolveCase
+                  Resource: "*"
+          - !Ref "AWS::NoValue"
 
   # ─── 巡检②：DA 判读本账号资源的角色（辅助云来源）───
   #

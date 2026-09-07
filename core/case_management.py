@@ -19,6 +19,19 @@ Note: AWS Support API uses two different ids:
                 required by the write APIs
 We accept displayId in the public surface and resolve to caseId
 internally via DescribeCases.
+
+多账号（2026-09-07）：每个公开函数都收一个 `account_id`（关键字参数，空 = 部署
+账号 = 历史行为），走 `support_logic.support_client(account_id)` 拿 client。三条口径：
+
+  1. **两个 id 都是账号内唯一的。** `caseId` 里虽然嵌着账号号，但 DescribeCases 只在
+     调用凭证所属账号里查；`displayId` 更是不同账号可以撞号。所以**缓存了
+     `internal_id` 的调用方（卡片按钮）必须把当初那个 `account_id` 一起带回来**，
+     否则会在 A 账号里拿 B 账号的 caseId 去查，得到"案例不存在"。
+  2. **拿不到跨账号凭证 → 按"这个操作失败"返回**（`None` / `[]` / `False` / `""`），
+     绝不回落到部署账号的 client —— 回落等于在错误的账号里读写工单。
+  3. 控制台链接是**按账号登录**才打开得开的：`_case_console_url` 不带账号号（AWS
+     控制台没有这个参数），所以跨账号的卡片必须在文案里写清是哪个账号的工单，
+     否则用户点进去看到的是自己当前登录账号的工单列表。
 """
 from __future__ import annotations
 
@@ -28,9 +41,19 @@ from datetime import datetime, timedelta, timezone
 
 from botocore.exceptions import ClientError
 
-from .support_logic import _support  # reuse single boto3 client + region
+from . import support_logic
 
 logger = logging.getLogger(__name__)
+
+
+def _client(account_id: str = ""):
+    """目标账号的 Support client；`None` = 拒绝（见模块 docstring 口径 2）。
+
+    ⚠️ 走 `support_logic.support_client()` 而不是 `from .support_logic import _support`：
+       后者在 import 时就把模块级 client 绑成本地名字，`monkeypatch.setattr(
+       support_logic, "_support", fake)` 就打不进来了（测试会静默打真 AWS）。
+    """
+    return support_logic.support_client(account_id)
 
 
 @dataclass
@@ -105,7 +128,7 @@ def _to_communication(c: dict) -> Communication:
     )
 
 
-def _resolve_internal_id(display_id: str) -> str | None:
+def _resolve_internal_id(display_id: str, account_id: str = "") -> str | None:
     """Map a user-facing displayId to the opaque caseId required by writes.
 
     AWS Support API's `DescribeCases.caseIdList` is restricted by a regex
@@ -120,8 +143,14 @@ def _resolve_internal_id(display_id: str) -> str | None:
     Callers that already hold the internal_id (e.g. from a list response
     cached in a button's action_value) MUST skip this function — it's a
     fallback for the natural-language path where only displayId is known.
+
+    `account_id`：在**哪个账号**里扫。不同账号可以有相同的 displayId，所以扫错账号
+    的后果不是"找不到"而可能是**找到另一个账号里同号的工单**——必须带对。
     """
     if not display_id:
+        return None
+    client = _client(account_id)
+    if client is None:
         return None
     try:
         params: dict = {
@@ -134,7 +163,7 @@ def _resolve_internal_id(display_id: str) -> str | None:
         }
         scanned = 0
         while scanned < 200:
-            resp = _support.describe_cases(**params)
+            resp = client.describe_cases(**params)
             for case in resp.get("cases", []):
                 if case.get("displayId") == display_id:
                     return case.get("caseId") or None
@@ -165,7 +194,8 @@ SUPPORT_CONSOLE_LIST_URL = (
 
 
 def list_recent_cases(after_days: int = 90, max_items: int = 5,
-                      status_filter: str = "recent"
+                      status_filter: str = "recent",
+                      account_id: str = ""
                       ) -> list[CaseSummary]:
     """Return the most recently created `max_items` cases.
 
@@ -197,9 +227,12 @@ def list_recent_cases(after_days: int = 90, max_items: int = 5,
     }
     items: list[CaseSummary] = []
     scanned = 0
+    client = _client(account_id)
+    if client is None:
+        return []
     try:
         while len(items) < max_items and scanned < scan_budget:
-            resp = _support.describe_cases(**params)
+            resp = client.describe_cases(**params)
             for c in resp.get("cases", []):
                 scanned += 1
                 if not _matches_filter(c.get("status", ""), status_filter):
@@ -236,26 +269,34 @@ def _matches_filter(status: str, status_filter: str) -> bool:
 
 # Backwards-compat shim: any external code still importing the old name
 # keeps working. Internal callers should use list_recent_cases directly.
-def list_open_cases(after_days: int = 30, max_items: int = 10
-                    ) -> list[CaseSummary]:
+def list_open_cases(after_days: int = 30, max_items: int = 10,
+                    account_id: str = "") -> list[CaseSummary]:
     return list_recent_cases(after_days=after_days, max_items=max_items,
-                             status_filter="unresolved")
+                             status_filter="unresolved",
+                             account_id=account_id)
 
 
 # ---------------------------------------------------------------------------
 # 2. Describe a single case (with newest communication preview)
 # ---------------------------------------------------------------------------
 def describe_case(display_id: str,
-                  internal_id: str | None = None) -> CaseSummary | None:
+                  internal_id: str | None = None,
+                  account_id: str = "") -> CaseSummary | None:
     """Look up a single case. Pass `internal_id` if cached to avoid the
-    resolve scan."""
+    resolve scan.
+
+    `account_id` 必须与当初拿到 `internal_id` 的那个账号一致（见模块 docstring 口径 1）。
+    """
     if not display_id and not internal_id:
         return None
-    cid = internal_id or _resolve_internal_id(display_id)
+    client = _client(account_id)
+    if client is None:
+        return None
+    cid = internal_id or _resolve_internal_id(display_id, account_id)
     if not cid:
         return None
     try:
-        resp = _support.describe_cases(
+        resp = client.describe_cases(
             caseIdList=[cid],
             includeCommunications=True,
             includeResolvedCases=True,
@@ -273,7 +314,8 @@ def describe_case(display_id: str,
 # 3. List communications (full history, newest first)
 # ---------------------------------------------------------------------------
 def list_communications(display_id: str, max_items: int = 5,
-                        internal_id: str | None = None
+                        internal_id: str | None = None,
+                        account_id: str = ""
                         ) -> list[Communication]:
     """Most recent `max_items` communications, newest first.
 
@@ -283,7 +325,10 @@ def list_communications(display_id: str, max_items: int = 5,
     """
     if not display_id and not internal_id:
         return []
-    cid = internal_id or _resolve_internal_id(display_id)
+    client = _client(account_id)
+    if client is None:
+        return []
+    cid = internal_id or _resolve_internal_id(display_id, account_id)
     if not cid:
         return []
     out: list[Communication] = []
@@ -295,7 +340,7 @@ def list_communications(display_id: str, max_items: int = 5,
     }
     try:
         while len(out) < max_items:
-            resp = _support.describe_communications(**params)
+            resp = client.describe_communications(**params)
             for c in resp.get("communications", []):
                 out.append(_to_communication(c))
                 if len(out) >= max_items:
@@ -318,22 +363,30 @@ _COMM_MAX_CHARS = 7900
 
 
 def add_communication(display_id: str, body: str,
-                      internal_id: str | None = None) -> bool:
+                      internal_id: str | None = None,
+                      account_id: str = "") -> bool:
     """Append a customer-side communication. Returns True on success.
 
     Pass `internal_id` if you already have it to skip the resolve scan.
+
+    这是**写操作**：目标账号的角色必须带 `support:AddCommunicationToCase`
+    （成员账号模板参数 `EnableSupportCaseWrite`，默认开）。客户关掉时这里拿到的是
+    `AccessDenied` → 返回 False，上层照实告诉用户缺哪条 action，不静默成功。
     """
     if (not display_id and not internal_id) or not body:
         return False
-    cid = internal_id or _resolve_internal_id(display_id)
+    client = _client(account_id)
+    if client is None:
+        return False
+    cid = internal_id or _resolve_internal_id(display_id, account_id)
     if not cid:
         logger.warning("add_communication: cannot resolve display_id=%s",
                        display_id)
         return False
     body = body[:_COMM_MAX_CHARS]
     try:
-        _support.add_communication_to_case(caseId=cid,
-                                           communicationBody=body)
+        client.add_communication_to_case(caseId=cid,
+                                        communicationBody=body)
         logger.info("Added communication to case %s (display=%s, %d chars)",
                     cid, display_id, len(body))
         return True
@@ -346,20 +399,26 @@ def add_communication(display_id: str, body: str,
 # 5. Resolve (close)
 # ---------------------------------------------------------------------------
 def resolve_case(display_id: str,
-                 internal_id: str | None = None) -> str:
+                 internal_id: str | None = None,
+                 account_id: str = "") -> str:
     """Resolve a case. Returns the API-reported final status, or '' on error.
 
     Pass `internal_id` if you already have it to skip the resolve scan.
+
+    写操作，同 `add_communication`：需要目标账号的 `support:ResolveCase`。
     """
     if not display_id and not internal_id:
         return ""
-    cid = internal_id or _resolve_internal_id(display_id)
+    client = _client(account_id)
+    if client is None:
+        return ""
+    cid = internal_id or _resolve_internal_id(display_id, account_id)
     if not cid:
         logger.warning("resolve_case: cannot resolve display_id=%s",
                        display_id)
         return ""
     try:
-        resp = _support.resolve_case(caseId=cid)
+        resp = client.resolve_case(caseId=cid)
         return resp.get("finalCaseStatus", "resolved")
     except ClientError as e:
         logger.warning("resolve_case(%s) failed: %s", display_id, e)

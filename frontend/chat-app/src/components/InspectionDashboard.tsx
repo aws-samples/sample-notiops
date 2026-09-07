@@ -837,11 +837,18 @@ export default function InspectionDashboard({
    */
 
   if (err) {
-    // 403 与「加载失败」要分开：前者是权限问题（去找管理员），后者是故障
-    // （重试有意义）。混成一句会让客户反复重试一个永远不会成功的请求。
+    // 三种态必须分开，因为客户下一步该做的事完全不同：
+    //   `inspection_not_deployed`  这套部署没装这个后端 → 重试永远没用，出路是换部署方式
+    //   `http_403`                 权限问题 → 去找管理员
+    //   其他                       故障 → 重试有意义
+    // 混成一句「加载失败 (ddb_error)」的表现（2026-09-07 现网实测）是客户反复
+    // 重试一个永不成功的请求，并以为是自己配错了。
     return (
       <div style={page}><div style={inner}>
-        {err === "http_403" ? (
+        {err === "inspection_not_deployed" ? (
+          <Empty icon="i" title={t("insp.error.not_deployed")}
+            hint={t("insp.error.not_deployed.hint")} />
+        ) : err === "http_403" ? (
           <Empty icon="🔒" title={t("insp.error.forbidden")}
             hint={zh ? "看板入口可见但数据被拒 —— 找管理员确认能力配置。"
                      : "Ask an administrator to check your capabilities."} />

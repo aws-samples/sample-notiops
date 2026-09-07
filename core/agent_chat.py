@@ -414,6 +414,7 @@ def consume_stream(body, sink: Sink, *, max_wait_sec: int) -> dict:
 
 def run_agent_chat(text: str, *, locale: str = "en", session_id: str = "",
                    model: str = "", account_id: str | None = None,
+                   allowed_accounts: str = "",
                    web_search: bool = False, emit=None,
                    max_wait_sec: int | None = None) -> dict:
     """跑一轮 NotiOps Agent 对话。**永不抛** —— 失败也返回一句人话。
@@ -421,6 +422,13 @@ def run_agent_chat(text: str, *, locale: str = "en", session_id: str = "",
     返回 `{"reply","steps","sources","ok","usage","error"}`。
     `usage` 是**真实**用量（`{"totalTokens","cycles",...}`）；这一点与
     `core.devops_chat` 相反（那条是直连，硬编码 0）—— 卡片页脚据此选文案。
+
+    `allowed_accounts` = 逗号分隔的账号闸门，**agent 侧真正的越权拦截线**
+    （见 `agent-build/NotiOpsWebChat/app/NotiOpsWebChat/main.py::_resolve_acct`）。
+    传空 = 沿用 `build_payload` 的历史默认 `"*"`（全开）—— 所以 IM 两个平台的
+    `caps.chat` 都**必须**显式传 `core.im_accounts.allowed_accounts()`（fail-closed，
+    永不返回 `"*"`）。少传一边的症状：那一个平台上闸门全开，而另一个平台是关的，
+    两边看起来都"能用"，差别只在越权那一刻才显出来。
     """
     # 所有用户可见文案走 `agent.chat.*`（`core/i18n.py`）。`locale` 是调用方传的
     # `msg.locale`，已经是规整过的 `zh` / `en`；意外值由 `i18n.t` 回落到英文 —— 与同一张
@@ -453,7 +461,8 @@ def run_agent_chat(text: str, *, locale: str = "en", session_id: str = "",
     sid = to_session_id(session_id or "")
     payload = build_payload(prompt=question, model=model, locale=locale,
                             web_search=web_search,
-                            account_id=account_id or "")
+                            account_id=account_id or "",
+                            allowed_accounts=allowed_accounts or "")
     try:
         resp = _client().invoke_agent_runtime(
             agentRuntimeArn=arn,

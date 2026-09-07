@@ -88,8 +88,18 @@ describe("ChatApp wiring", () => {
     // 用 `!capsLoaded || can(...)`（Finops 那种 fail-open）会在能力
     // 加载完成前的一瞬间对所有人闪出这个入口。
     expect(src).toContain(
-      'const showInspectionNav = isAdmin || (capsLoaded && can("nav:inspection"))');
+      'const showInspectionNav = capsLoaded && (capKeys || []).includes("nav:inspection")');
     expect(src).not.toContain('!capsLoaded || can("nav:inspection")');
+  });
+
+  it("★ the sidebar entry does NOT go through can() —— admin 也没有那张表", () => {
+    // 🔴 2026-09-07：`can()` 自己带 `isAdmin ||`，于是方式A（一键部署，没有巡检后端）
+    //    上 admin 照旧看到「巡检」，点进去 `加载失败 (ddb_error)` —— 客户报的就是这个。
+    //    「有没有那张表」是**数据源**维度，admin 身份不能短路它；服务端的 visibleTree
+    //    已经按 `requiresEnv: INSPECTION_TABLE` 摘掉了整棵子树，这里必须**读那份列表**。
+    //    改回 `isAdmin || …` 或 `can("nav:inspection")` 都会让那个闸门重新空转。
+    expect(src).not.toContain('isAdmin || (capsLoaded && can("nav:inspection"))');
+    expect(src).not.toMatch(/showInspectionNav = [^;]*\bcan\(/);
   });
 });
 

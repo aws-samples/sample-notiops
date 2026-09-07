@@ -6,6 +6,10 @@
  * cost-agent MCP Lambda。绝大多数部署不接这个数据源，那时侧栏渲染出四个点进去空白的
  * tab 就是坏体验；反过来，配了却看不到入口同样是坏体验。两个方向都钉在这里。
  */
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { visibleTree, envConfigured, filterDashboard } from "../authz.mjs";
 import { allNodes } from "../capabilities.mjs";
 
@@ -97,6 +101,73 @@ const withScannerPayload = filterDashboard("nav:finops",
 ok("cost analyzer present → dailyAnomaly kept in the payload",
   "dailyAnomaly" in withScannerPayload);
 delete process.env.COST_ANALYZER_FUNCTION;
+
+/* ── 巡检（2026-09-07 现网反馈）：方式A 上整个 tab 必须消失 ────────────────────
+   客户实测到的症状：一键部署（方式A）的环境里侧栏有「巡检」，点进去是
+   「! 加载失败 (ddb_error)」—— 一个永不会成功的请求，客户会以为是自己配错了。
+   `notiops-inspection` 表与那一族 Lambda 只在 notiops-backend-stack.ts 里，
+   一键单栈不含它们。
+
+   🔴 这一条与前面几条**形态不同**：requiresEnv 挂在 **tab** 上（前面几条都是
+      subtab）。tab 级有一个独有的失效方式 —— `visibleTree` 的**祖先补全**会把
+      任何可见子页的父节点补回来，于是 tab 自己那道 requiresEnv 空转。
+      修法在 `authz.mjs` 的祖先补全里加 `envConfigured(parent.requiresEnv)`；
+      下面第二条断言（8 个子页也一起消失）就是钉这个的 —— 只钉 tab 会被
+      "tab 没了、子页还在" 的半修状态骗过去。
+
+   ⚠️ 本段依赖四处同批落地，缺一处就红：
+     · config/capabilities.json 给 nav:inspection 加 "requiresEnv": "INSPECTION_TABLE"
+     · bff/web-chat/capabilities.json 同步（test_capabilities_parity.py 守逐字节一致）
+     · web-chat-core.ts: INSPECTION_TABLE: props.staticTemplate ? "" : "notiops-inspection"
+     · inspection.mjs **不许**写 `process.env.INSPECTION_TABLE || "notiops-inspection"`
+       —— 那个兜底会把空串填回表名，闸门再次空转 */
+const INSP_TAB = "nav:inspection";
+ok(`${INSP_TAB} declares requiresEnv=INSPECTION_TABLE`,
+  byKey.get(INSP_TAB)?.requiresEnv === "INSPECTION_TABLE");
+delete process.env.INSPECTION_TABLE;
+const noInsp = await keysOf(ADMIN);
+ok("no inspection backend → admin does not see the tab", !noInsp.includes(INSP_TAB));
+ok("no inspection backend → **no subtab leaks either**（祖先补全不许把 tab 补回来）",
+  noInsp.filter((k) => k.startsWith("nav:inspection:")).length === 0);
+ok("no inspection backend → the other tabs are unaffected",
+  noInsp.includes("nav:chat") && noInsp.includes("nav:cases")
+  && noInsp.includes("nav:finops"));
+process.env.INSPECTION_TABLE = "notiops-inspection";
+const withInsp = await keysOf(ADMIN);
+ok("inspection backend present → the tab is back", withInsp.includes(INSP_TAB));
+ok("inspection backend present → all subtabs are back",
+  withInsp.filter((k) => k.startsWith("nav:inspection:")).length >= 6);
+// 门禁叠加而非替代：配好了也仍然按角色收。
+const noRights = await keysOf({ grants: ["nav:chat"], denies: [] });
+ok("inspection backend present → an unrelated role still does not see it",
+  !noRights.includes(INSP_TAB));
+delete process.env.INSPECTION_TABLE;
+
+/* ── 兜底口径：BFF 侧的 `inspectionConfigured()` 与前端 tab 判据同源 ──
+   前端不渲染入口是**第一层**；直接打 API（老缓存的前端 bundle / 脚本）时必须拿到
+   一个诚实的错误码，而不是 `ddb_error`（那是"数据库出错了"的意思，会让客户重试）。 */
+const inspSrc = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "..", "inspection.mjs"), "utf8");
+ok("inspection.mjs 没有把空串兜底成表名（那会让上面整段闸门空转）",
+  !/INSPECTION_TABLE\s*\|\|\s*["'`]notiops-inspection/.test(inspSrc));
+ok("inspection.mjs 导出 inspectionConfigured()（路由层的判据来源）",
+  /export const inspectionConfigured/.test(inspSrc));
+const idxSrc = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "..", "index.mjs"), "utf8");
+ok("index.mjs 在 /inspection/* 之前有一道 inspection_not_deployed 门",
+  /inspectionConfigured\(\)[\s\S]{0,200}inspection_not_deployed/.test(idxSrc));
+ok("那个码不是 ddb_error（客户会以为是自己配错了，反复重试）",
+  /code: "inspection_not_deployed"/.test(idxSrc));
+{
+  process.env.INSPECTION_TABLE = "";
+  const { inspectionConfigured } = await import("../inspection.mjs");
+  ok("空串 → inspectionConfigured() 为 false", inspectionConfigured() === false);
+  process.env.INSPECTION_TABLE = "   ";
+  ok("空白 → 仍是 false", inspectionConfigured() === false);
+  process.env.INSPECTION_TABLE = "notiops-inspection";
+  ok("真表名 → true", inspectionConfigured() === true);
+  delete process.env.INSPECTION_TABLE;
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

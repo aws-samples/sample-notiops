@@ -21,7 +21,8 @@
 ⚠️ 「哪些能力花钱」的口径（改这里之前先把 `core/agent_chat.py` 的头部注释读完）：
 默认配置下只有 `case_analyze` 和 `case_create` 的表单提交会烧 NotiOps 侧 token；
 用户显式 `/agent notiops` 之后 `chat` 也会 —— 所以卡片落款必须按 agent 分两套说法
-（`im_cards.usage_footer`），不许一律写「无模型消耗」。
+（`im_cards.usage_footer` → 实现在 `platforms/common/im_footer.py`，与 Slack 共用一份），
+不许一律写「无模型消耗」；落款同时报**这一轮问的哪个账号**（多账号，2026-09-07）。
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ from core import agent_chat
 from core import i18n
 from core import ddb_state
 from core import devops_chat
+from core import im_accounts
 from core import im_prefs
 from core import llm_pref_resolver
 from core import locale_resolver
@@ -54,7 +56,7 @@ class FeishuCaps(Caps):
         in_thread = not msg.is_direct
         feishu_utils.reply_text(msg.message_id, text, in_thread=in_thread)
 
-    # ---- 九个能力 ----
+    # ---- 十个能力 ----
     def help(self, msg: ImMessage) -> None:
         """`/help` 命令菜单 —— 必须发**卡片**，不能发纯文本。
 
@@ -165,6 +167,14 @@ class FeishuCaps(Caps):
         """`/web [on|off]` —— 联网搜索开关（0 token）。只对 NotiOps Agent 生效。"""
         self.reply_text(msg, pref_commands.web_reply(msg, arg, platform=PLATFORM))
 
+    def account(self, msg: ImMessage, arg: str) -> None:
+        """`/account [<12 位账号 id>|list|default]` —— 这个会话在问哪个 AWS 账号。
+
+        0 token（一次偏好读写 + 一次注册表 GSI1 Query）。**上车 / 启用 / 停用只在 Web
+        做**，这里只选。
+        """
+        self.reply_text(msg, pref_commands.account_reply(msg, arg, platform=PLATFORM))
+
     def investigate(self, msg: ImMessage, text: str) -> None:
         """发起一次深度调查 —— **0 token**：只 create_backlog_task，NotiOps 侧不总结、
         不翻译、不做任何 LLM 调用。正文直接是 `text`；`source` 打成 `notiops-im-feishu`
@@ -193,8 +203,13 @@ class FeishuCaps(Caps):
         home = result.get("console_home") or ""
         deep = result.get("console_url") or ""
         body = i18n.t("ack.dispatched", msg.locale)
+        # 落款带上账号 —— 深度调查是**真的去查那个账号**的资源（`start_investigation`
+        # 返回的 `account_id` 已经解析成具体 12 位数字了，比 `msg.account_id` 更准：
+        # 后者为空时代表"部署账号"）。
         card = im_cards.dispatch_card(body, msg.locale, deep_link=deep, home=home,
-                                      state="dispatched")
+                                      state="dispatched",
+                                      account=str(result.get("account_id") or ""),
+                                      deploy=im_accounts.deploy_account_id())
         resp = feishu_utils.send_card(msg.chat_id, card)
         card_message_id = im_cards.message_id_of(resp)
         if not card_message_id:
@@ -231,6 +246,10 @@ class FeishuCaps(Caps):
             platform=PLATFORM, chat_id=msg.chat_id,
             root_message_id=card_message_id,
             locale=msg.locale, user_id=msg.user_id, raw_text=q[:1000],
+            # 这次调查查的是哪个账号（空 = 部署账号）。报告卡靠它渲染账号横幅、
+            # 并给「🆘 升级到 Support」/「📎 同步到 case」盖上账号章 —— 那两个按钮
+            # 都是**写**操作，写错账号就是写进别人的工单。
+            account_id=msg.account_id or "",
         )
 
     def investigate_status(self, msg: ImMessage, ref_id: str,
@@ -273,7 +292,11 @@ class FeishuCaps(Caps):
         home = str(info.get("console_home") or "")
         card = im_cards.dispatch_card(
             inv_status.body(info, msg.locale, mode=mode), msg.locale,
-            deep_link=deep, home=home, state=inv_status.card_state(info))
+            deep_link=deep, home=home, state=inv_status.card_state(info),
+            # 回读的是**那条调查**查的账号（`imtask#` 行里落的那个），不是本轮会话
+            # 当前选的账号 —— 用户完全可能已经 `/account` 切走了。
+            account=str(info.get("account_id") or msg.account_id or ""),
+            deploy=im_accounts.deploy_account_id())
         resp = feishu_utils.send_card(msg.chat_id, card)
         card_message_id = im_cards.message_id_of(resp)
         if not card_message_id:
@@ -316,23 +339,40 @@ class FeishuCaps(Caps):
 
         M1 首版：由 worker 直接把 `ImMessage` 转成老 `case_flow` 的入参调用。案例卡片
         渲染仍走 platforms/feishu/app/case_flow.py 的现成实现。
+
+        多账号（2026-09-07）：这条路**跟着 `msg.account_id` 走**（空 = 部署账号）——
+        `/account` 选了哪个成员账号，案例就在那个账号里读写。之前这里有意忽略它、
+        另发一句"案例只开在部署账号"的提示；现在改成真支持，那句提示随之删掉。
+        写操作（create / reply / resolve）要求目标账号的角色带 support 写权限
+        （成员账号模板参数 `EnableSupportCaseWrite`，默认开）；不具备时
+        `core.support_logic` 会给出确切原因（缺哪条 action / 无 Support 计划 /
+        跨账号取不到凭证），**绝不回落到部署账号**去替客户写另一个账号的工单。
         """
         from platforms.feishu.app import case_flow
+        # 空字符串 = 部署账号，全线统一口径（见 `platforms/common/im_types.py`）。
+        account_id = msg.account_id or ""
         try:
             if command == "case_view":
-                case_flow.start_view(msg.chat_id, case_id, locale=msg.locale)
+                case_flow.start_view(msg.chat_id, case_id, locale=msg.locale,
+                                     account_id=account_id)
             elif command == "case_reply":
                 case_flow.start_reply(msg.chat_id, case_id, text or "",
-                                      locale=msg.locale)
+                                      locale=msg.locale,
+                                      account_id=account_id)
             elif command == "case_resolve":
-                case_flow.start_resolve(msg.chat_id, case_id, locale=msg.locale)
+                case_flow.start_resolve(msg.chat_id, case_id, locale=msg.locale,
+                                        account_id=account_id)
             elif command == "case_analyze":
-                case_flow.start_analyze(msg.chat_id, case_id, locale=msg.locale)
+                case_flow.start_analyze(msg.chat_id, case_id, locale=msg.locale,
+                                        account_id=account_id)
             elif command == "case_create":
-                case_flow.start_create(msg.chat_id, text or "", locale=msg.locale)
+                case_flow.start_create(msg.chat_id, text or "",
+                                       locale=msg.locale,
+                                       account_id=account_id)
             else:
                 case_flow.start_list(msg.chat_id, status_filter="recent",
-                                     locale=msg.locale)
+                                     locale=msg.locale,
+                                     account_id=account_id)
         except Exception as e:
             logger.exception("caps.case failed kind=%s: %s", command, type(e).__name__)
             self.reply_text(msg, i18n.t("main.case_flow_crashed", msg.locale,
@@ -384,6 +424,11 @@ class FeishuCaps(Caps):
             is_dm=msg.is_direct)
         notiops = agent == im_prefs.AGENT_NOTIOPS
 
+        # 卡片落款里的账号那一段（多账号，2026-09-07）。**这一轮只解析一次**：
+        # org 模式下 `deploy_account_id()` 底下是 STS，而落款会被 `LiveCard.flush`
+        # 每几秒渲染一次（`core.im_accounts` 那边还加了容器级缓存兜第二层）。
+        deploy_acct = im_accounts.deploy_account_id()
+
         # 群会话按 chat 归属（§15：一个 chat 一个会话，不按用户拆）
         session = ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
         question = (text or msg.text or "").strip()
@@ -409,7 +454,8 @@ class FeishuCaps(Caps):
         resp = feishu_utils.send_card(
             msg.chat_id,
             im_cards.answer_card(ack, msg.locale, state=state, elapsed=0,
-                                 agent=agent))
+                                 agent=agent, account=msg.account_id,
+                                 deploy=deploy_acct))
         card_message_id = im_cards.message_id_of(resp)
         live = None
         if card_message_id:
@@ -419,7 +465,8 @@ class FeishuCaps(Caps):
                     kw["body"], msg.locale,
                     steps=kw["steps"], state=kw["state"], elapsed=kw["elapsed"],
                     report_url=kw["report_url"],
-                    agent=agent, sources=extra["sources"], usage=extra["usage"]),
+                    agent=agent, sources=extra["sources"], usage=extra["usage"],
+                    account=msg.account_id, deploy=deploy_acct),
                 update=lambda payload: feishu_utils.update_card(
                     card_message_id, payload),
             )
@@ -463,6 +510,10 @@ class FeishuCaps(Caps):
                     session_id=ddb_state.im_agent_session_id(PLATFORM, msg.chat_id),
                     model=model_alias,
                     account_id=msg.account_id or None,
+                    # 可见账号闸门（§4.2）。**必须显式传** —— `build_payload` 的历史
+                    # 默认值是 `"*"`（全开），在 `account_id` 恒为空的年代无害，
+                    # 现在不是了。`allowed_accounts()` 自己 fail-closed，永不返回 `"*"`。
+                    allowed_accounts=im_accounts.allowed_accounts(),
                     web_search=im_prefs.resolve_web(
                         platform=PLATFORM, chat_id=msg.chat_id,
                         user_id=msg.user_id, is_dm=msg.is_direct)[0],
@@ -512,7 +563,8 @@ class FeishuCaps(Caps):
         # 答案本身不能丢 —— 再发一张新卡；新卡也发不出去才退纯文本。
         card = im_cards.answer_card(body, msg.locale, report_url=report_url,
                                    agent=agent, sources=extra["sources"],
-                                   usage=extra["usage"])
+                                   usage=extra["usage"],
+                                   account=msg.account_id, deploy=deploy_acct)
         resp = feishu_utils.send_card(msg.chat_id, card)
         if not im_cards.message_id_of(resp):
             # 退纯文本丢的只是卡片外观（状态标题 / 过程行 / 报告按钮）。
@@ -522,4 +574,5 @@ class FeishuCaps(Caps):
             logger.error("caps.chat: final send_card failed code=%s",
                          (resp or {}).get("code"))
             self.reply_text(msg, body + "\n\n" + im_cards.usage_footer(
-                msg.locale, agent=agent, usage=extra["usage"]))
+                msg.locale, agent=agent, usage=extra["usage"],
+                account=msg.account_id, deploy=deploy_acct))

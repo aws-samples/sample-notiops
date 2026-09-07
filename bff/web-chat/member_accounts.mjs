@@ -1804,6 +1804,11 @@ export async function generateCollectionStackUrl(accountId) {
     // 🔴 跨 payer 必须留空 —— 非空会给信任策略加 aws:PrincipalOrgID 条件，
     //    而组织外账号不在我们的 Org 里，那个条件永远不成立。
     + `&param_OrganizationId=`;
+  // ⚠️ `EnableSupportCaseWrite` **故意不预填**：这条路客户是在自己账号的
+  //    「创建堆栈 - 审核」页上一项项过的，让那个参数以模板 Default（true）
+  //    出现在他眼前、由他决定要不要关，比我们在 URL 里替他钉死更合规。
+  //    StackSet 那两条路（setup.sh / stager）没有这个页面，所以它们各自实现了
+  //    「升级时继承客户当前值」。
 
   return {
     accountId: id,

@@ -382,6 +382,7 @@ Two things you must know first:
 | `/devops` | talk to the DevOps Agent directly (0 tokens) |
 | `/agent` | pick which agent answers: `/agent devops` (default, 0 tokens) \| `/agent notiops` (goes through the model, **consumes tokens**); no argument shows the current value |
 | `/web` | web search for the NotiOps Agent: `/web on` \| `/web off` (off by default; no effect on the DevOps direct path) |
+| `/account` | pick which account you are asking about: `/account <12-digit account id>` \| `/account list` shows what you can pick \| `/account default` goes back to the deployment account; no argument shows the current value |
 | `/investigate` | start a deep investigation |
 | `/case` · `/cases` | cases: open / list / view / reply |
 | `/model` | switch model (`/model list` shows the catalog) |
@@ -483,6 +484,62 @@ Consequences:
 
 > Slack doesn't need this layer: it has a dedicated `app_mention` event, so the platform
 > has already done the disambiguation for us.
+
+### 3.2 Multi-account: `/account` picks which account you are asking about
+
+Once multi-account is on (`DeployMode=MultiAccount` on Option A, or
+`./setup.sh --multi-account` on Option B), `/account` decides which account this
+conversation is about:
+
+| You type | What happens |
+|---|---|
+| `/account` | shows which account you are currently asking about |
+| `/account list` | lists what you can pick (the deployment account + every member account enabled in the web console) |
+| `/account 444455556666` | switches; **in a group it applies to the whole group**, in a DM only to you |
+| `/account default` | back to the deployment account |
+
+Three things worth stating plainly, because they are easy to misread:
+
+1. **Onboarding (adding / enabling / disabling an account) happens only in the web
+   console; IM only reads that list.** There is no onboarding entry point in IM and there
+   will not be one — `/account` can only pick among accounts already enabled in the web
+   console. Enable a new account there and IM can pick it on its **very next message** (no
+   redeploy, no restart); disable it there and an IM selection pointing at it **falls back
+   to the deployment account** on the next message, with an explicit note saying why.
+2. **Each side picks independently.** Switching accounts in the web console does not move
+   your IM group, and vice versa. The only shared thing is *which accounts are available*.
+3. **Support cases follow `/account` too (since 2026-09-07).** Viewing, opening, replying to,
+   resolving and analysing a case all happen in the account you currently have selected.
+   Three preconditions — you are told **explicitly** when one is missing, rather than the case
+   silently landing in the wrong account:
+   - That member account allowed NotiOps to open cases on its behalf during onboarding
+     (template parameter `EnableSupportCaseWrite`, **on by default**). With it off, NotiOps
+     names the exact missing action (`support:CreateCase` / `AddCommunicationToCase` /
+     `ResolveCase`) so you can decide whether to grant it or open the case in the console.
+   - That account has a Business, Enterprise On-Ramp or Enterprise support plan (the AWS
+     Support API is not available on Basic or Developer). **This is per account** — a plan on
+     the deployment account says nothing about a member account.
+   - That account is still *enabled* in the web console. Once disabled, cross-account
+     credentials stop being issued.
+
+   The card **names the account the case was opened under**. Case display ids can collide
+   across accounts, and the AWS console link carries no account parameter — without the
+   account spelled out, clicking through lands you in whichever account you happen to be
+   signed into.
+
+   One exception worth remembering: **escalating to a case from a report card's 🆘 button, and
+   「📎 sync to case」, follow the account the *investigation* ran against — not the account
+   selected in the chat at the moment the button is clicked.** A report card may be clicked
+   hours later, long after `/account` moved on; following the chat would be the wrong answer.
+
+> ⚠️ **Residual risk, stated honestly**: **anyone** in the group who can @-mention the bot
+> can point that group at **any enabled** account — there is no per-person authorization on
+> the IM side (an IM identity is not an AWS identity, and we won't treat it as one). Your two
+> controls are: **only enable the accounts that should actually be asked about**, and **use
+> the group allowlist in §3 above** to keep the bot in groups that should see those accounts.
+> The last line against over-reach is on the agent side (only "deployment account + enabled
+> accounts" is allowed, and when that list can't be read the answer is **refuse**, not
+> open up) plus the trust policy on the read-only role in the target account itself.
 
 ---
 

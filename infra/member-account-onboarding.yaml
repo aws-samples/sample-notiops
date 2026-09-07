@@ -14,6 +14,11 @@ AWSTemplateFormatVersion: "2010-09-09"
 #   在业务账号内创建 NotiOps 多账号接入所需的全部资源：
 #   1. notiops-idle-detection-role — 系统账号跨账号只读采集角色
 #      （RDS/ElastiCache/CW/TA/CE/COH 等）——**巡检采集就靠它**
+#      · 可选 inline notiops-support-case-write（`EnableSupportCaseWrite=true`，
+#        默认开）：**本模板唯一的写权限**，且只能写 AWS Support 工单
+#        （CreateCase / AddCommunicationToCase / ResolveCase），碰不到本账号任何资源。
+#        关掉它 = 这个成员账号只能在控制台开工单，NotiOps 会明确告诉用户缺哪条
+#        action（见 `core/support_cases.py::case_capability`），不静默失败。
 #   2. DevOps Agent 事件转发 — EventBridge Rule + Role，把 aws.aidevops
 #      调查事件转发到系统账号 Custom Bus
 #   3. (可选) PHD 事件转发 — 把 AWS Health 事件转发到系统账号 SNS Topic
@@ -33,7 +38,10 @@ Description: >
   (4) optionally, a CloudWatch OAM link sharing metrics/logs/traces.
   Deployed via StackSets (service-managed) from the management account, or
   manually in a single account (aws cloudformation deploy).
-  No write permissions are granted to any resource in this account.
+  No permission to create, modify or delete any resource in this account is
+  granted. The only write permission - opening and updating AWS Support cases
+  for this account - is controlled by the EnableSupportCaseWrite parameter and
+  can be turned off.
 
 Parameters:
   SystemAccountId:
@@ -94,6 +102,31 @@ Parameters:
       management account. When set, an OAM link is created so this account's
       metrics, logs and traces can be read cross-account. Leave empty to skip.
 
+  EnableSupportCaseWrite:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    # 中文：是否允许 NotiOps 代表你**在这个账号下**开 / 回复 / 关闭 AWS Support 工单。
+    #       这是本模板唯一的写权限，作用面只有 Support 工单本身，碰不到任何资源。
+    #       关掉的后果不是"悄悄开到别的账号去" —— NotiOps 会在用户填表**之前**探测
+    #       一次（`support:DescribeSeverityLevels`，ReadOnlyAccess 就有），发现缺权限
+    #       就直接说缺哪条 action，让客户自己决定是补权限还是去控制台开。
+    # ⚠️ 默认 true：客户装 NotiOps 就是为了在 IM / Web 里开工单，多账号场景下
+    #    默认 false 等于"启用了第二个账号但开不出工单"，而失败点在另一个账号的 IAM 里。
+    Description: >
+      Whether NotiOps may open, reply to and resolve AWS Support cases FOR THIS
+      ACCOUNT on your behalf (support:CreateCase, support:AddCommunicationToCase,
+      support:ResolveCase). This is the ONLY write permission this template ever
+      grants and it can affect nothing but AWS Support cases - no resource in
+      this account can be created, changed or deleted with it.
+      Set to false to keep the role strictly read-only. NotiOps then tells the
+      user exactly which permission is missing (it probes before showing the
+      form) instead of failing silently, and cases for this account have to be
+      opened in the AWS console.
+      Requires a Business, Enterprise On-Ramp or Enterprise support plan on this
+      account either way - the AWS Support API is not available on Basic or
+      Developer plans.
+
   PrimaryRegion:
     Type: String
     Default: "us-east-1"
@@ -120,6 +153,9 @@ Conditions:
   EnableDevOpsForwarding: !Not [!Equals [!Ref DevOpsEventBusArn, ""]]
   IsPrimaryRegion: !Equals [!Ref "AWS::Region", !Ref PrimaryRegion]
   HasOrgId: !Not [!Equals [!Ref OrganizationId, ""]]
+  # 不用叠 IsPrimaryRegion：这个条件只在 IdleDetectionRole（本身已 Condition:
+  # IsPrimaryRegion）的 Policies 里用。
+  HasSupportCaseWrite: !Equals [!Ref EnableSupportCaseWrite, "true"]
 
 Resources:
   # ─── 1. 跨账号只读采集角色 ───
@@ -133,10 +169,19 @@ Resources:
     Condition: IsPrimaryRegion
     Properties:
       RoleName: !Sub "notiops-idle-detection-role-${SystemAccountId}"
-      Description: "Allows NotiOps system account read-only access to this member account (RDS/EC2/CloudWatch/Cost/Support/Security etc.)"
+      Description: "Allows NotiOps system account read-only access to this member account (RDS/EC2/CloudWatch/Cost/Support/Security etc.), plus AWS Support case writes when EnableSupportCaseWrite is true"
       # 挂 AWS 托管 ReadOnlyAccess：与部署账号自身 agent 的广只读范围对齐，
-      # 让跨账号调查(EC2/成本/任意只读 API)与单账号体验一致。纯只读、无任何写权限。
+      # 让跨账号调查(EC2/成本/任意只读 API)与单账号体验一致。
       # 下方 inline notiops-readonly 保留：明确列出核心用到的 action(文档用途 + 兜底)。
+      #
+      # ⚠️ 这个角色**不再是纯只读**（2026-09-07，案例多账号）：`EnableSupportCaseWrite`
+      # 打开时多挂一份 inline `notiops-support-case-write`。刻意做成**独立的一份
+      # policy** 而不是塞进 notiops-readonly：
+      #   · `aws iam list-role-policies` 一眼看得出这个角色有没有写权限，
+      #     不用逐条读 200 行 action；
+      #   · 客户安全审查时可以单独把它摘掉（或干脆 false 重下发），
+      #     而不用动巡检真正依赖的那一份。
+      # 全仓唯一给成员账号的写权限就是这三条 Support 工单 action。
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/ReadOnlyAccess
       AssumeRolePolicyDocument:
@@ -257,6 +302,31 @@ Resources:
                   - s3:ListStorageLensConfigurations
                   - cur:DescribeReportDefinitions
                 Resource: "*"
+
+        # ─── (可选) AWS Support 工单写权限 ───
+        # 案例多账号（IM `/account 切到成员账号后开工单` + Web 端账号切换器）唯一
+        # 需要的三条 action。**读**那三条（DescribeCases / DescribeCommunications /
+        # DescribeServices）在上面 notiops-readonly 里，托管 ReadOnlyAccess 也带，
+        # 所以"看别的账号工单"从来就能用 —— 缺的一直只有写。
+        #
+        # ⚠️ Support 是全局服务，endpoint 固定 us-east-1；但 IAM 不支持给 support:*
+        # 做资源级限定（API 只接受 `Resource: "*"`），所以这里只能靠 action 收窄。
+        # 收窄到什么程度：**没有** support:DescribeSupportLevel 之外的任何管理面动作，
+        # 也**没有** CreateCase 之外的开销类动作 —— 这三条的最坏后果是给这个账号
+        # 开了一张不该开的工单，而不是动了任何资源。
+        - !If
+          - HasSupportCaseWrite
+          - PolicyName: notiops-support-case-write
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - support:CreateCase
+                    - support:AddCommunicationToCase
+                    - support:ResolveCase
+                  Resource: "*"
+          - !Ref "AWS::NoValue"
 
   # ─── 2. (可选) DevOps Agent 调查事件转发 ───
   # DevOpsEventBusArn 留空 = 跳过整块（一键部署路径：系统账号没有这条总线）。

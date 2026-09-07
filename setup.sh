@@ -2063,6 +2063,25 @@ if [ "$ORG_MODE" = true ]; then
   if aws cloudformation describe-stack-set --stack-set-name "$STACKSET_NAME" \
        --region "$DEPLOY_REGION" >/dev/null 2>&1; then
     echo "  $(t "检测到已有 StackSet, 更新模板/参数..." "Existing StackSet detected, updating template/parameters...")"
+    # 🔴 **继承客户自己改过的 `EnableSupportCaseWrite`**（案例多账号，2026-09-07）。
+    #
+    #    `update-stack-set --parameters` 传的是**完整**列表，列表里没有的参数
+    #    **回落到模板 Default**（不是"保持原值"）。这个参数的 Default 是 `true`，
+    #    所以一个把它改成 `false` 的客户，只要我们下次升级就会被静默改回 `true`
+    #    —— 客户做过的安全决定被产品升级推翻，而现场没有任何提示。
+    #
+    #    也不能用 `UsePreviousValue=true`：从老模板升上来的那一次，这个参数在既有
+    #    StackSet 里压根不存在，CFN 直接 ValidationError("has no previous value")，
+    #    第一次升级就整块失败。所以只能 describe 一次、**存在才继承**。
+    #    与 `infra/lambda/stager/index.py::_PRESERVE_MEMBER_PARAMS` 同一口径。
+    _prev_scw=$(aws cloudformation describe-stack-set --stack-set-name "$STACKSET_NAME" \
+      --region "$DEPLOY_REGION" \
+      --query "StackSet.Parameters[?ParameterKey=='EnableSupportCaseWrite']|[0].ParameterValue" \
+      --output text 2>/dev/null || true)
+    if [ -n "$_prev_scw" ] && [ "$_prev_scw" != "None" ]; then
+      ONBOARD_SS_PARAMS+=("ParameterKey=EnableSupportCaseWrite,ParameterValue=$_prev_scw")
+      echo "  $(t "保留既有 EnableSupportCaseWrite=" "Keeping existing EnableSupportCaseWrite=")$_prev_scw"
+    fi
     aws cloudformation update-stack-set \
       --stack-set-name "$STACKSET_NAME" \
       --template-body "file://$MEMBER_TEMPLATE" \

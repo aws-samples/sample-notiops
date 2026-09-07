@@ -31,7 +31,7 @@ M2 删掉 Fargate 时 `progress_sender.py` 一起删。
 from __future__ import annotations
 
 from core import i18n
-from platforms.common import im_markdown, live_card, long_answer
+from platforms.common import im_footer, im_markdown, live_card, long_answer
 from platforms.slack.app import blocks
 
 # 正文渲染上限。Slack 单个 section 的 mrkdwn 上限是 3000 字符（超了整条消息 400），
@@ -73,29 +73,36 @@ _FINAL_TITLES = {
 }
 
 
-def usage_footer(locale: str, *, agent: str = "devops", usage=None) -> str:
-    """落款 —— **与飞书 `im_cards.usage_footer` 逐字对齐**（口径见那份的 docstring：
-    直连说"无模型消耗"，走模型的那条报**实际生效的模型 id**；用量 2026-09-06 起
-    只统计不显示；拿不到模型 id 也不许退成"无模型消耗"）。
+def usage_footer(locale: str, *, agent: str = "devops", usage=None,
+                 account: str = "", deploy: str = "") -> str:
+    """落款 —— 实现在 `platforms.common.im_footer`，**与飞书共用同一份**（不再是
+    两份"逐字对齐"的副本；理由见那个模块的文件头）。这里只保留入口，因为 `caps.py`
+    的纯文本兜底路径直接调它，而那个调用点是 Slack 自己的。
+
+    口径（都在 `im_footer` 里）：直连说"无模型消耗"、走模型的那条报**实际生效的
+    模型 id**、拿不到模型 id 也不许退成"无模型消耗"、用量只统计不显示、账号号
+    拿不到就整段不显示。
     """
-    if agent != "notiops":
-        return i18n.t("router.direct_no_token", locale)
-    model = str((usage or {}).get("modelId") or "").strip()
-    if not model:
-        return i18n.t("router.agent_model_unknown", locale)
-    return i18n.t("router.agent_model", locale, model=model)
+    return im_footer.usage_footer(locale, agent=agent, usage=usage,
+                                  account=account, deploy=deploy)
 
 
 def answer_blocks(reply: str, locale: str, *,
                   steps=None, state: str = "final", elapsed: int = 0,
                   report_url: str = "", sources=None,
-                  agent: str = "devops", usage=None) -> list[dict]:
+                  agent: str = "devops", usage=None,
+                  account: str = "", deploy: str = "") -> list[dict]:
     """对话问答的答案消息 —— 「思考中」与「答完」**共用**这一份，两个 agent 也共用。
 
     与 `im_cards.answer_card` 逐参数对齐（含 `state` 三态 queued/thinking/final、
     **只有终版挂按钮**、`report_url` 只挂按钮不上传的口径、`agent` 只影响标题与落款），
     方便两边一起改 —— 包括 2026-09-03 那次"去掉默认的升级/开案例两个按钮"（理由见飞书
     那份的说明）。过程行 / 来源的 markdown 由 `live_card.steps_md` / `sources_md` 统一生成。
+
+    `account` / `deploy` 是落款里「这条回答基于哪个账号」那一段（多账号，2026-09-07）：
+    `account` 是本轮目标账号（空 = 部署账号），`deploy` 是部署账号号。**两个都必须由
+    调用方传** —— 这个函数会被 `LiveCard.flush` 每几秒调一次，在这里解析账号等于把
+    一次 STS 塞进渲染循环。
     """
     final = state == "final"
     title_key = _ANSWER_TITLES.get(
@@ -116,7 +123,8 @@ def answer_blocks(reply: str, locale: str, *,
         if src:
             out.append(_sec(src, locale))
     out.append(blocks.divider())
-    out.append(blocks.context(usage_footer(locale, agent=agent, usage=usage)))
+    out.append(blocks.context(usage_footer(locale, agent=agent, usage=usage,
+                                          account=account, deploy=deploy)))
     btns: list[dict] = []
     if report_url and final:
         # url 按钮不产生回调，`action_id` 只用来占位。
@@ -139,7 +147,8 @@ _DISPATCH_TITLES = {
 
 def dispatch_blocks(body: str, locale: str, *, deep_link: str = "",
                     home: str = "", state: str = "dispatched",
-                    elapsed: int = 0) -> list[dict]:
+                    elapsed: int = 0, account: str = "",
+                    deploy: str = "") -> list[dict]:
     """深度调查消息 —— 「已发起」与后续每一次 `chat.update` **共用**这一份。
 
     与 `im_cards.dispatch_card` 逐参数对齐（含 2026-09-03 去掉的「只要一个答案就行」
@@ -151,7 +160,10 @@ def dispatch_blocks(body: str, locale: str, *, deep_link: str = "",
     out: list[dict] = [
         blocks.header(title),
         _sec(body, locale),
-        blocks.context(i18n.t("router.direct_no_token", locale)),
+        # 深度调查永远是直连那条路（0 token），所以落款固定 `agent="devops"`；账号那一段
+        # 在这张卡上尤其要有 —— 深度调查是**真的去查那个账号的资源**，查错了账号的报告
+        # 看起来跟查对了一模一样。
+        blocks.context(usage_footer(locale, account=account, deploy=deploy)),
     ]
     btns: list[dict] = []
     link = deep_link or home

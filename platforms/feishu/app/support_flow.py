@@ -23,6 +23,17 @@ Flow:
 Bilingual: every user-facing string flows through `core.i18n.t()` with the
 conversation locale plumbed in. Card builders that produce visible UI take
 a `locale: str = "zh"` parameter (default zh for legacy / safety).
+
+多账号（2026-09-07）：从报告卡 🆘 升级出来的工单要开在**这次调查查的那个 AWS
+账号**里，不是"点按钮那一刻会话里选的账号"。账号来源按优先级：
+
+  ① 表单提交按钮 value 里的 `case_account_id`（`_form_card` 渲染时盖的章）；
+  ② `support#<incident_id>` 行里的 `account_id`（`report_handler
+     ._persist_support_context` 写的）—— 兜住本次改动之前发出的旧表单卡。
+
+两处都空 = 部署账号 = 改动前的行为。**不读**当下的会话偏好：🆘 可以几小时后才被
+点，那时 `/account` 可能已经切走了，但报告讲的还是原账号的事。与 Slack 侧
+`platforms/slack/app/support_flow.py` 逐项对位。
 """
 from __future__ import annotations
 
@@ -123,8 +134,13 @@ def handle(action_tag: str, action_value: dict, event,
             # sees a sensible default; they can edit it before submitting.
             ctx = support_logic.load_support_context(incident_id) or {}
             default_subject = _build_subject_default(ctx)
+            # 工单开在**这次调查查的那个账号**里（空 = 部署账号 = 改动前的行为）。
+            # ⚠️ 不读当下的会话偏好，也不从 🆘 那颗按钮的 value 里读 —— 它没有盖
+            #   `case_account_id`（只有「📎 同步到 case」盖了），而
+            #   `support#<incident_id>` 这一行本来就是同源的权威值。
+            account_id = str(ctx.get("account_id") or "").strip()
             form_card = _form_card(incident_id, subject=default_subject,
-                                   locale=locale)
+                                   locale=locale, account_id=account_id)
             resp = feishu_utils.send_card(chat_id=chat_id, card=form_card)
             if resp.get("code") != 0:
                 logger.error("send form card failed: %s", resp)
@@ -185,7 +201,11 @@ def handle(action_tag: str, action_value: dict, event,
                         subject_override=subject_override,
                         service_text=service_text, issue_type=issue_type,
                         category_text=category_text,
-                        locale=locale)
+                        locale=locale,
+                        # 表单卡上盖的账号章。取不到（改动前渲染的旧表单卡）时
+                        # `_confirm` 会退到 ctx 那一行。
+                        account_id=str(
+                            action_value.get("case_account_id") or "").strip())
 
     return _toast(i18n.t("case.toast.unknown_action", locale))
 
@@ -199,7 +219,8 @@ def _confirm(incident_id: str, severity: str, language: str, extra: str,
              subject_override: str = "",
              service_text: str = "", issue_type: str = "",
              category_text: str = "",
-             locale: str = "zh") -> P2CardActionTriggerResponse:
+             locale: str = "zh",
+             account_id: str = "") -> P2CardActionTriggerResponse:
     locale = _normalize_locale(locale)
     if severity not in SEVERITY_CODES:
         return _toast(i18n.t("support.toast.invalid_severity", locale,
@@ -223,6 +244,10 @@ def _confirm(incident_id: str, severity: str, language: str, extra: str,
             ),
         )
 
+    # 兜本次改动之前渲染、改动之后才提交的表单卡（按钮 value 里没有那个章）：
+    # 退回 ctx 这一行的账号，而不是默默开到部署账号去。
+    account_id = account_id or str(ctx.get("account_id") or "").strip()
+
     # Honor user-edited subject. support_logic.build_subject reads from
     # ctx["intent_summary"] first, so overriding that is enough — and we
     # avoid changing build_subject's signature for one platform.
@@ -235,7 +260,8 @@ def _confirm(incident_id: str, severity: str, language: str, extra: str,
             args=(card_message_id, ctx, incident_id, severity, language,
                   extra, operator_name, locale),
             kwargs={"service_text": service_text, "issue_type": issue_type,
-                    "category_text": category_text},
+                    "category_text": category_text,
+                    "account_id": account_id},
             daemon=True,
         ).start()
     else:
@@ -245,14 +271,14 @@ def _confirm(incident_id: str, severity: str, language: str, extra: str,
             ctx, platform=PLATFORM, severity=severity, language=language,
             extra=extra, operator_name=operator_name,
             service_text=service_text, issue_type=issue_type,
-            category_text=category_text,
+            category_text=category_text, account_id=account_id,
         )
         subject_for_display = support_logic.build_subject(ctx, PLATFORM)
         return _build_card_response(
             i18n.t("support.toast.created", locale),
             _result_card(result, severity, language, incident_id,
                          operator_name, subject=subject_for_display,
-                         locale=locale))
+                         locale=locale, account_id=account_id))
 
     return _build_card_response(
         i18n.t("support.toast.creating", locale),
@@ -264,7 +290,8 @@ def _create_case_worker(card_message_id: str, ctx: dict, incident_id: str,
                         operator_name: str,
                         locale: str = "zh",
                         service_text: str = "", issue_type: str = "",
-                        category_text: str = "") -> None:
+                        category_text: str = "",
+                        account_id: str = "") -> None:
     """Background thread: call CreateCase, then patch the original card."""
     locale = _normalize_locale(locale)
     try:
@@ -272,14 +299,14 @@ def _create_case_worker(card_message_id: str, ctx: dict, incident_id: str,
             ctx, platform=PLATFORM, severity=severity, language=language,
             extra=extra, operator_name=operator_name,
             service_text=service_text, issue_type=issue_type,
-            category_text=category_text,
+            category_text=category_text, account_id=account_id,
         )
         # Show the same subject we used on the API call back to the user
         # so the success card matches what was sent to AWS Support.
         subject_for_display = support_logic.build_subject(ctx, PLATFORM)
         result_card = _result_card(result, severity, language, incident_id,
                                    operator_name, subject=subject_for_display,
-                                   locale=locale)
+                                   locale=locale, account_id=account_id)
     except Exception as e:
         logger.exception("create_case worker crashed")
         result_card = _info_card(
@@ -345,7 +372,8 @@ def _form_card(incident_id: str,
                language: str = DEFAULT_LANGUAGE,
                severity: str = DEFAULT_SEVERITY,
                subject: str = "",
-               locale: str = "zh") -> dict:
+               locale: str = "zh",
+               account_id: str = "") -> dict:
     """Feishu v2 form card with subject + language + severity + multiline notes.
 
     `subject` is pre-filled from the investigation's intent_summary. The
@@ -468,6 +496,9 @@ def _form_card(incident_id: str,
                                     "value": {
                                         "action": "confirm_support",
                                         "incident_id": incident_id,
+                                        # 账号「盖章」：提交时只认这个，不查那一刻
+                                        # 的会话偏好（见模块 docstring）。
+                                        "case_account_id": account_id,
                                     },
                                 }]},
                            ]},
@@ -500,8 +531,12 @@ def _form_card(incident_id: str,
                            }]},
                       ]}
                  ]},
+                # 落在哪个账号 —— 这是本产品唯一的写操作，必须在**提交之前**说清楚。
                 {"tag": "markdown",
-                 "content": i18n.t("support.form.account_note", locale)},
+                 "content": (i18n.t("support.form.account_note_target", locale,
+                                    account=account_id)
+                             if (account_id or "").strip()
+                             else i18n.t("support.form.account_note", locale))},
             ],
         },
     }
@@ -534,29 +569,33 @@ def _pending_card(severity: str, language: str,
 def _result_card(result: support_logic.CaseResult, severity: str, language: str,
                  incident_id: str, operator_name: str,
                  subject: str = "",
-                 locale: str = "zh") -> dict:
+                 locale: str = "zh", account_id: str = "") -> dict:
     """Render either a success or failure card from the CaseResult dataclass."""
     locale = _normalize_locale(locale)
     if result.ok:
         return _success_card(result.display_id, result.case_url, severity,
                              language, incident_id, operator_name,
                              classification=result.classification,
-                             subject=subject, locale=locale)
+                             subject=subject, locale=locale,
+                             account_id=account_id)
     code = result.error_code or "Error"
-    if code == "SubscriptionRequiredException":
-        hint = i18n.t("case.create.fail_subscription", locale)
-    else:
-        hint = (result.error_message or "")[:300]
+    # 失败文案统一走 `support_logic.failure_hint`（跨账号拿不到凭证 / 目标账号缺
+    # support 写权限 / 缺只读权限 / 没有 Support 计划，四种成因各有各的出路）。
+    # 别在这里再维护一条 if 链 —— 各渲染点各写一份的时候，漏掉的正是跨账号那两种。
+    hint = support_logic.failure_hint(result, locale)
+    # `_info_card` 只有一段正文，没法 `*_account_banner(...)` 展开 —— 把账号那行
+    # 拼在正文最前面，效果与其他卡一致（空账号时一字不加）。
+    banner = [e["content"] for e in case_flow._account_banner(account_id, locale)]
     return _info_card(
         i18n.t("support.failure.title", locale, code=code),
-        hint, "red")
+        "\n\n".join([*banner, hint]), "red")
 
 
 def _success_card(case_id: str, case_url: str, severity: str, language: str,
                   incident_id: str, operator_name: str,
                   classification: dict | None = None,
                   subject: str = "",
-                  locale: str = "zh") -> dict:
+                  locale: str = "zh", account_id: str = "") -> dict:
     locale = _normalize_locale(locale)
     cls = classification or {}
     service = cls.get("serviceCode", "")
@@ -601,6 +640,9 @@ def _success_card(case_id: str, case_url: str, severity: str, language: str,
         },
         "body": {
             "elements": [
+                # 跨账号时把账号号念出来：控制台链接不带账号参数，用户登错账号点
+                # 进去是看不到这张工单的。
+                *case_flow._account_banner(account_id, locale),
                 {"tag": "markdown",
                  "content": (i18n.t("support.success.case_id_block", locale,
                                     case_id=case_id)

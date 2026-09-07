@@ -300,6 +300,16 @@ export async function visibleTree(eff, { disabledModules = null } = {}) {
   }
   // 祖先补全：若某节点可见(如被授权的 deep-dive 场景)，其父/祖先容器也应可见，
   // 否则下面的父过滤会把它剔除(表现为"授权了子项却看不到")。模块开关关闭的 tab 不补。
+  //
+  // 🔴 **未配置数据源的祖先也不补**（2026-09-07）。少了这一条，`requiresEnv`
+  //    写在 **tab** 上就是**空转**：上面那轮已经按 requiresEnv 把 tab 排除了，
+  //    可它的子页各自没有声明依赖 → 子页可见 → 这里又把 tab 补回来。实测形态是
+  //    一键部署（方式A）里 `nav:inspection` 声明了 `requiresEnv: INSPECTION_TABLE`
+  //    却照旧出现在侧栏，点进去「加载失败 (ddb_error)」。
+  //    补进来之后，被挡的 tab 会让它整棵子树被下面那道"父不可见则剔除后代"带走 ——
+  //    这正是想要的语义：**没有那个后端就整块不出现**，而不是"tab 没了、子页还在"。
+  //    ⚠️ 不要改成"把子页也各自标一遍 requiresEnv"：8 个子页抄 8 遍，加第 9 个子页
+  //       的人不会知道要抄，症状又变回"整块该消失但露出一页"。
   const byKey = new Map(nodes.map((n) => [n.key, n]));
   for (const key of [...visibleKeys]) {
     let cur = byKey.get(key);
@@ -308,6 +318,7 @@ export async function visibleTree(eff, { disabledModules = null } = {}) {
       if (!parent) break;
       const rootTab = rootTabOf(parent.key);
       if (rootTab && disabled.includes(rootTab)) break; // 模块被关 → 不补该路径
+      if (!envConfigured(parent.requiresEnv)) break;    // 数据源没配 → 不补该路径
       visibleKeys.add(parent.key);
       cur = parent;
     }

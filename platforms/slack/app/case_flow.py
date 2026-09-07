@@ -29,6 +29,16 @@ locale rides through as the `locale` parameter on every entry point;
 button-action callbacks read it back from the convo row in DDB. Slack's
 default user-facing locale here is "en" because the Slack workspace
 this bot ships into is English by default — feishu defaults to "zh".
+
+多账号（2026-09-07）：每个入口点都收一个 `account_id`（空 = 部署账号 = 历史
+行为），一路透传给 `core.case_management` / `core.support_logic` /
+`core.case_analyze`；每条消息的按钮 `value` 与每个 modal 的 `private_metadata`
+都把它「盖章」成 `case_account_id` 带回来。按钮点回来时**只认卡上那个章**，
+不查当下会话选的账号 —— 用户可能在点之前又切了账号，而工单只在原账号里存在，
+拿当下的偏好去 AddCommunication / ResolveCase 就是往另一个账号里写。
+本次改动之前渲染的老消息没有这个字段 → 空 = 部署账号，而那正是它们当年唯一
+可能的归属，所以缺省值天然正确。与飞书侧
+`platforms/feishu/app/case_flow.py` 逐项对位。
 """
 from __future__ import annotations
 
@@ -41,6 +51,7 @@ from core import case_classifier
 from core import case_management
 from core import ddb_state
 from core import i18n
+from core import im_accounts
 from core import support_logic
 from core import webhook_dispatch  # noqa: F401 — reserved for future skill paths
 from core.case_management import CaseSummary, Communication
@@ -55,6 +66,7 @@ from core.support_logic import (
     severity_labels,
 )
 
+from platforms.common import account_picker
 from platforms.slack.app import blocks
 
 logger = logging.getLogger(__name__)
@@ -77,21 +89,68 @@ _FILTER_BUTTON_SLUGS = ("recent", "pending_customer", "unresolved",
                         "work_in_progress", "resolved")
 
 
+def _account_banner_blocks(account_id: str, locale: str) -> list[dict]:
+    """消息顶上那条「🏷️ Account: 123456789012」。**总是**报账号（2026-09-07 起）。
+
+    返回 0 或 1 个元素的列表，好让调用方 `*_account_banner_blocks(...)` 直接
+    展开 —— 与飞书侧 `_account_banner` 同一套语义（同两个 i18n key、同一条"两个号
+    都拿不到就整条不显示"的规矩），只是渲染成 Slack 的 context 块。为什么从"只在成员
+    账号时出现"改成"总是出现"，见飞书那份 docstring：开案例是唯一的写操作，而"没有
+    横幅"原来同时代表"开在部署账号"和"目标账号丢了"两件事。
+    """
+    acct = (account_id or "").strip()
+    deploy = im_accounts.deploy_account_id()
+    if not acct or acct == deploy:
+        if not deploy:
+            return []
+        return [blocks.context(i18n.t("case.account_banner_deploy", locale,
+                                      account=deploy))]
+    return [blocks.context(i18n.t("case.account_banner", locale,
+                                  account=acct))]
+
+
 # ===========================================================================
 # Entry points (called from main.py on natural-language commands)
 # ===========================================================================
 def start_create(client, channel_id: str, raw_text: str,
-                 user_id: str, thread_ts: str, locale: str = "en") -> None:
+                 user_id: str, thread_ts: str, locale: str = "en",
+                 account_id: str = "") -> None:
     """Open the create-case modal. We need a trigger_id, but @mentions
     don't supply one — fall back to posting a button into the thread that
-    the user clicks to open the modal."""
+    the user clicks to open the modal.
+
+    `account_id`（空 = 部署账号）：工单开在哪个账号下，由 `/account` 决定。
+    发这颗按钮**之前**先探一次那个账号能不能开工单
+    （`support_logic.case_capability`，0 token 的一次只读调用）—— 让客户点开
+    表单、填完整张表才发现"这个账号是 Basic 计划"是最差的体验。与飞书侧
+    `platforms/feishu/app/case_flow.py::start_create` 同一套判据。
+    """
     locale = _normalize_locale(locale)
+    cap = support_logic.case_capability(account_id)
+    if not cap.get("ok"):
+        # 不发按钮：这个账号这条路从头到尾不通，给出确切原因和出路。失败文案统一
+        # 走 `support_logic.failure_hint`，别在这里再维护一条 if 链。
+        client.chat_postMessage(
+            channel=channel_id, thread_ts=thread_ts or None,
+            text=i18n.t("case.create.fail_text_short", locale),
+            blocks=[blocks.section(
+                i18n.t("case.create.fail_block", locale,
+                       code=cap.get("code") or "Unavailable",
+                       hint=blocks.escape_mrkdwn(support_logic.failure_hint(
+                           support_logic.CaseResult(
+                               ok=False, error_code=cap.get("code") or ""),
+                           locale))))],
+        )
+        return
     initial_subject = _summarize_subject(raw_text)
     pm = _json.dumps({
         "channel_id": channel_id,
         "thread_ts": thread_ts,
         "initial_subject": initial_subject,
         "locale": locale,
+        # 账号「章」：这颗按钮点回来时才真正打开表单，那时会话里选的账号可能已经
+        # 换了，但用户点的是**这条**消息 —— 只认这个章。
+        "case_account_id": account_id,
     }, ensure_ascii=False)
 
     # @mentions don't carry a trigger_id, so the modal can't open
@@ -114,11 +173,13 @@ def start_create(client, channel_id: str, raw_text: str,
 
 def start_list(client, channel_id: str, thread_ts: str,
                status_filter: str = "recent",
-               locale: str = "en") -> None:
+               locale: str = "en", account_id: str = "") -> None:
     locale = _normalize_locale(locale)
     cases = case_management.list_recent_cases(after_days=90, max_items=5,
-                                              status_filter=status_filter)
-    blocks_out = _list_blocks(cases, status_filter, locale)
+                                              status_filter=status_filter,
+                                              account_id=account_id)
+    blocks_out = _list_blocks(cases, status_filter, locale,
+                              account_id=account_id)
     fallback = _filter_label(status_filter, locale) \
         if status_filter in _FILTER_BUTTON_SLUGS \
         else i18n.t("case.list.title_simple", locale)
@@ -131,49 +192,58 @@ def start_list(client, channel_id: str, thread_ts: str,
 
 def start_view(client, channel_id: str, thread_ts: str,
                display_id: str, internal_id: str = "",
-               locale: str = "en") -> None:
+               locale: str = "en", account_id: str = "") -> None:
     locale = _normalize_locale(locale)
     if not display_id and not internal_id:
-        start_list(client, channel_id, thread_ts, locale=locale)
+        start_list(client, channel_id, thread_ts, locale=locale,
+                   account_id=account_id)
         return
     summary = case_management.describe_case(display_id,
-                                            internal_id=internal_id or None)
+                                            internal_id=internal_id or None,
+                                            account_id=account_id)
     if not summary:
+        # 「找不到」在跨账号时**必须把账号号念出来** —— 同号工单可以存在于另一个
+        # 账号里，不写清用户会以为工单被删了。
         client.chat_postMessage(
             channel=channel_id, thread_ts=thread_ts or None,
             text=i18n.t("case.view.not_found_text_short", locale),
-            blocks=[blocks.section(
-                i18n.t("case.view.not_found_block_short", locale,
-                       display_id=display_id))],
+            blocks=[*_account_banner_blocks(account_id, locale),
+                    blocks.section(
+                        i18n.t("case.view.not_found_block_short", locale,
+                               display_id=display_id))],
         )
         return
     comms = case_management.list_communications(
         display_id, max_items=5,
-        internal_id=summary.internal_id or internal_id or None)
+        internal_id=summary.internal_id or internal_id or None,
+        account_id=account_id)
     client.chat_postMessage(
         channel=channel_id, thread_ts=thread_ts or None,
         text=i18n.t("case.view.title_short", locale, display_id=display_id),
-        blocks=_view_blocks(summary, comms, locale),
+        blocks=_view_blocks(summary, comms, locale, account_id=account_id),
     )
 
 
 def start_reply(client, channel_id: str, thread_ts: str,
                 display_id: str, raw_text: str, user_id: str,
                 internal_id: str = "",
-                locale: str = "en") -> None:
+                locale: str = "en", account_id: str = "") -> None:
     locale = _normalize_locale(locale)
     if not display_id and not internal_id:
-        start_list(client, channel_id, thread_ts, locale=locale)
+        start_list(client, channel_id, thread_ts, locale=locale,
+                   account_id=account_id)
         return
     body = _extract_reply_body(raw_text, display_id) if display_id else ""
     if body and len(body) >= 4:
         ok = case_management.add_communication(display_id, body,
-                                               internal_id=internal_id or None)
+                                               internal_id=internal_id or None,
+                                               account_id=account_id)
         client.chat_postMessage(
             channel=channel_id, thread_ts=thread_ts or None,
             text=(i18n.t("case.reply.success_text_short", locale) if ok
                   else i18n.t("case.reply.fail_text_short", locale)),
-            blocks=_reply_result_blocks(display_id, body, ok, locale),
+            blocks=_reply_result_blocks(display_id, body, ok, locale,
+                                        account_id=account_id),
         )
         return
     # Need a modal — but again no trigger_id from @mention. Post a button.
@@ -183,6 +253,9 @@ def start_reply(client, channel_id: str, thread_ts: str,
         "display_id": display_id,
         "internal_id": internal_id,
         "locale": locale,
+        # 账号「章」—— `internal_id` 是**账号内**唯一的（见
+        # `core/case_management.py` 模块 docstring 口径 1），两者必须成对带回来。
+        "case_account_id": account_id,
     }, ensure_ascii=False)
     client.chat_postMessage(
         channel=channel_id, thread_ts=thread_ts or None,
@@ -202,13 +275,15 @@ def start_reply(client, channel_id: str, thread_ts: str,
 
 
 def start_analyze(client, channel_id: str, thread_ts: str,
-                   display_id: str, locale: str = "en") -> None:
+                   display_id: str, locale: str = "en",
+                   account_id: str = "") -> None:
     """LLM-driven case analysis: fetch case + comms → Bedrock summary →
     render insight blocks. Posts a "Analyzing…" placeholder first to
     cover the 5-15s round-trip."""
     locale = _normalize_locale(locale)
     if not display_id:
-        start_list(client, channel_id, thread_ts, locale=locale)
+        start_list(client, channel_id, thread_ts, locale=locale,
+                   account_id=account_id)
         return
 
     # Placeholder while we wait for Bedrock
@@ -222,15 +297,17 @@ def start_analyze(client, channel_id: str, thread_ts: str,
         logger.warning("case_analyze: starting placeholder send failed "
                        "(non-fatal): %s", e)
 
-    result = case_analyze.analyze(display_id, locale=locale)
+    result = case_analyze.analyze(display_id, locale=locale,
+                                  account_id=account_id)
 
     if result.error == "case_not_found":
         client.chat_postMessage(
             channel=channel_id, thread_ts=thread_ts or None,
             text=i18n.t("case.view.not_found_text_short", locale),
-            blocks=[blocks.section(
-                i18n.t("case.analyze.error.case_not_found", locale,
-                       display_id=display_id))],
+            blocks=[*_account_banner_blocks(account_id, locale),
+                    blocks.section(
+                        i18n.t("case.analyze.error.case_not_found", locale,
+                               display_id=display_id))],
         )
         return
     if result.error:
@@ -246,16 +323,17 @@ def start_analyze(client, channel_id: str, thread_ts: str,
     client.chat_postMessage(
         channel=channel_id, thread_ts=thread_ts or None,
         text=i18n.t("case.analyze.title", locale, display_id=display_id),
-        blocks=_analyze_blocks(result, locale=locale),
+        blocks=_analyze_blocks(result, locale=locale, account_id=account_id),
     )
 
 
 def start_resolve(client, channel_id: str, thread_ts: str,
                   display_id: str, internal_id: str = "",
-                  locale: str = "en") -> None:
+                  locale: str = "en", account_id: str = "") -> None:
     locale = _normalize_locale(locale)
     if not display_id and not internal_id:
-        start_list(client, channel_id, thread_ts, locale=locale)
+        start_list(client, channel_id, thread_ts, locale=locale,
+                   account_id=account_id)
         return
     pm = _json.dumps({
         "display_id": display_id,
@@ -263,12 +341,15 @@ def start_resolve(client, channel_id: str, thread_ts: str,
         "channel_id": channel_id,
         "thread_ts": thread_ts,
         "locale": locale,
+        # 账号「章」—— 关工单是**写**操作，关错账号就是关了别人的工单。
+        "case_account_id": account_id,
     }, ensure_ascii=False)
     client.chat_postMessage(
         channel=channel_id, thread_ts=thread_ts or None,
         text=i18n.t("case.resolve.opener.fallback_text", locale,
                     display_id=display_id),
         blocks=[
+            *_account_banner_blocks(account_id, locale),
             blocks.section(i18n.t("case.resolve.opener.title", locale,
                                   display_id=display_id)),
             blocks.actions(
@@ -292,6 +373,19 @@ def _locale_from_action(action_value: str) -> str:
     except Exception:
         return "en"
     return _normalize_locale(v.get("locale"))
+
+
+def _account_from_action(action_value: str) -> str:
+    """Pull the account「章」(`case_account_id`) out of the JSON action payload.
+
+    空 = 部署账号 —— 也正是本次改动之前所有已发出消息的情况，所以老按钮点回来
+    仍然落在它们当年唯一可能的那个账号上。见模块 docstring 的多账号一节。
+    """
+    try:
+        v = _json.loads(action_value or "{}")
+    except Exception:
+        return ""
+    return str(v.get("case_account_id") or "")
 
 
 def handle_action(action_id: str, body: dict, client) -> None:
@@ -319,6 +413,12 @@ def handle_action(action_id: str, body: dict, client) -> None:
     # Locale priority: per-action JSON value (preferred — preserves
     # whichever locale we rendered the card in) > thread/dm lock > en.
     locale = _locale_from_action(action_value)
+    # 按钮点回来时**不查当前会话选的账号**，只认按钮自己带的那个（渲染时盖的章）。
+    # 两个理由：① 用户可能在点按钮之前又切了账号，那时"当前账号"和这张工单不是
+    # 一回事，拿它去 AddCommunication / ResolveCase 就是往另一个账号里写；② 本次
+    # 改动之前渲染的老消息没有这个字段 → 空 = 部署账号，而那正是它们当年唯一
+    # 可能的归属，所以缺省值天然正确。
+    account_id = _account_from_action(action_value)
 
     if base_action == "case_create_open_form":
         # Opens the create modal using the trigger_id from this click.
@@ -331,6 +431,7 @@ def handle_action(action_id: str, body: dict, client) -> None:
             thread_ts=v.get("thread_ts", thread_ts),
             initial_subject=v.get("initial_subject", ""),
             locale=locale,
+            account_id=account_id,
         )
         try:
             client.views_open(trigger_id=trigger_id, view=view)
@@ -351,6 +452,7 @@ def handle_action(action_id: str, body: dict, client) -> None:
             subject=v.get("subject", ""),
             body_text=v.get("body", ""),
             locale=locale,
+            account_id=account_id,
         )
         return
 
@@ -362,11 +464,12 @@ def handle_action(action_id: str, body: dict, client) -> None:
         start_view(client, channel_id, thread_ts,
                    display_id=v.get("display_id", ""),
                    internal_id=v.get("internal_id", ""),
-                   locale=locale)
+                   locale=locale, account_id=account_id)
         return
 
     if base_action == "case_list_open":
-        start_list(client, channel_id, thread_ts, locale=locale)
+        start_list(client, channel_id, thread_ts, locale=locale,
+                   account_id=account_id)
         return
 
     # action_id is `case_list_filter:<slug>` (slug is the filter value);
@@ -379,7 +482,7 @@ def handle_action(action_id: str, body: dict, client) -> None:
         flt = v.get("filter") or (
             action_id.split(":", 1)[1] if ":" in action_id else "recent")
         start_list(client, channel_id, thread_ts, status_filter=flt,
-                   locale=locale)
+                   locale=locale, account_id=account_id)
         return
 
     if base_action in ("case_reply_form", "case_reply_open_form"):
@@ -393,6 +496,7 @@ def handle_action(action_id: str, body: dict, client) -> None:
             channel_id=v.get("channel_id", channel_id),
             thread_ts=v.get("thread_ts", thread_ts),
             locale=locale,
+            account_id=account_id,
         )
         try:
             client.views_open(trigger_id=trigger_id, view=view)
@@ -409,7 +513,7 @@ def handle_action(action_id: str, body: dict, client) -> None:
         start_resolve(client, channel_id, thread_ts,
                       display_id=v.get("display_id", ""),
                       internal_id=v.get("internal_id", ""),
-                      locale=locale)
+                      locale=locale, account_id=account_id)
         return
 
     if base_action == "case_resolve_yes":
@@ -422,7 +526,7 @@ def handle_action(action_id: str, body: dict, client) -> None:
                     thread_ts=v.get("thread_ts", thread_ts),
                     display_id=v.get("display_id", ""),
                     internal_id=v.get("internal_id", ""),
-                    locale=locale)
+                    locale=locale, account_id=account_id)
         return
 
     if base_action == "case_resolve_no":
@@ -492,6 +596,25 @@ def _on_create_submit(ack, body: dict, view: dict, client) -> None:
         pm = {}
     channel_id = pm.get("channel_id", "")
     thread_ts = pm.get("thread_ts", "")
+    # 账号「章」：开表单那一刻定下来的目标账号（空 = 部署账号）。这里**不**去查
+    # 会话当前选的账号 —— 用户可能在填表期间又切了账号，而表单上那句"Case 将开在
+    # 账号 X 下"已经写死了承诺，必须兑现它。
+    account_id = pm.get("case_account_id", "") or ""
+    # 账号下拉（2026-09-07）：客户在 modal 里直接选的目标账号**优先于**那个章。
+    # 下拉没渲染 / 老 modal 没这个 block 时回传为空 → 仍用章（向后兼容）。
+    # 选了一个不在允许集里的号码 → **拒绝**并把错误挂在账号那一栏,不回落到部署
+    # 账号：回落会把"这个账号不让开"变成"已在另一个账号开好了"。
+    picked_account = select("account_block", "account_select")
+    resolved = account_picker.resolve_choice(
+        picked_account, stamped=account_id,
+        deploy=im_accounts.deploy_account_id())
+    if resolved is None:
+        ack(response_action="errors",
+            errors={"account_block":
+                    i18n.t("case.create.account_refused", locale,
+                           account=picked_account)})
+        return
+    account_id = resolved
 
     if not subject:
         ack(response_action="errors",
@@ -558,7 +681,7 @@ def _on_create_submit(ack, body: dict, view: dict, client) -> None:
         args=(client, channel_id, thread_ts, ctx, severity, language, extra,
               subject, body_text, dispatch_choice == "with_dispatch", locale),
         kwargs={"service_text": service_text, "issue_type": issue_type,
-                "category_text": category_text},
+                "category_text": category_text, "account_id": account_id},
         daemon=True,
     ).start()
 
@@ -569,26 +692,28 @@ def _create_case_worker(client, channel_id: str, thread_ts: str, ctx: dict,
                         dispatch_after: bool,
                         locale: str = "en", *,
                         service_text: str = "", issue_type: str = "",
-                        category_text: str = "") -> None:
+                        category_text: str = "",
+                        account_id: str = "") -> None:
     try:
         result = support_logic.create_case(
             ctx, platform=PLATFORM, severity=severity, language=language,
             extra=extra, operator_name="",
             service_text=service_text, issue_type=issue_type,
-            category_text=category_text,
+            category_text=category_text, account_id=account_id,
         )
         result_blocks = _create_result_blocks(
             result, severity, language, subject, body_text, dispatch_after,
-            locale=locale,
+            locale=locale, account_id=account_id,
         )
         result_text = (i18n.t("case.create.success_text_short", locale)
                        if result.ok
                        else i18n.t("case.create.fail_text_short", locale))
     except Exception as e:
         logger.exception("create_case worker crashed")  # full detail → CloudWatch only
-        result_blocks = [blocks.section(
-            i18n.t("case.create.internal_error_block", locale,
-                   kind=type(e).__name__))]
+        result_blocks = [*_account_banner_blocks(account_id, locale),
+                         blocks.section(
+                             i18n.t("case.create.internal_error_block", locale,
+                                    kind=type(e).__name__))]
         result_text = i18n.t("case.create.fail_text_short", locale)
 
     try:
@@ -604,7 +729,7 @@ def _create_case_worker(client, channel_id: str, thread_ts: str, ctx: dict,
             _dispatch_for_case(client, channel_id, thread_ts,
                                user_id="", display_id=result.display_id,
                                subject=subject, body_text=body_text,
-                               locale=locale)
+                               locale=locale, account_id=account_id)
         except Exception as e:
             logger.warning("inline dispatch after create failed: %s", e)
 
@@ -625,6 +750,9 @@ def _on_reply_submit(ack, body: dict, view: dict, client) -> None:
     internal_id = pm.get("internal_id", "")
     channel_id = pm.get("channel_id", "")
     thread_ts = pm.get("thread_ts", "")
+    # 账号「章」—— `internal_id` 只在这个账号里有效（见
+    # `core/case_management.py` 模块 docstring 口径 1），两者必须成对使用。
+    account_id = pm.get("case_account_id", "") or ""
 
     if not body_text:
         ack(response_action="errors",
@@ -648,17 +776,18 @@ def _on_reply_submit(ack, body: dict, view: dict, client) -> None:
     threading.Thread(
         target=_reply_worker,
         args=(client, channel_id, thread_ts, display_id, internal_id,
-              body_text, locale),
+              body_text, locale, account_id),
         daemon=True,
     ).start()
 
 
 def _reply_worker(client, channel_id: str, thread_ts: str, display_id: str,
                   internal_id: str, body_text: str,
-                  locale: str = "en") -> None:
+                  locale: str = "en", account_id: str = "") -> None:
     try:
         ok = case_management.add_communication(display_id, body_text,
-                                               internal_id=internal_id or None)
+                                               internal_id=internal_id or None,
+                                               account_id=account_id)
     except Exception as e:
         logger.exception("reply worker crashed")
         ok = False
@@ -667,24 +796,29 @@ def _reply_worker(client, channel_id: str, thread_ts: str, display_id: str,
             channel=channel_id, thread_ts=thread_ts or None,
             text=(i18n.t("case.reply.success_text_short", locale) if ok
                   else i18n.t("case.reply.fail_text_short", locale)),
-            blocks=_reply_result_blocks(display_id, body_text, ok, locale))
+            blocks=_reply_result_blocks(display_id, body_text, ok, locale,
+                                        account_id=account_id))
     except Exception as e:
         logger.error("post reply result failed: %s", e)
 
 
 def _do_resolve(client, channel_id: str, thread_ts: str,
                 display_id: str, internal_id: str,
-                locale: str = "en") -> None:
+                locale: str = "en", account_id: str = "") -> None:
     if not display_id and not internal_id:
         return
+    # 去重键带上账号：不同账号可以有相同的 displayId（`caseId` 虽然嵌了账号号，
+    # 但走 displayId 那条路时这里只有 displayId），不带账号会把 B 账号的同号工单
+    # 误判成"正在处理中"而拒掉。
     if not support_logic.claim_inflight(
-            f"slack_resolve:{internal_id or display_id}"):
+            f"slack_resolve:{account_id}:{internal_id or display_id}"):
         client.chat_postMessage(
             channel=channel_id, thread_ts=thread_ts or None,
             text=i18n.t("case.toast.processing_short", locale))
         return
     final = case_management.resolve_case(display_id,
-                                         internal_id=internal_id or None)
+                                         internal_id=internal_id or None,
+                                         account_id=account_id)
     if final:
         case_url = case_management._case_console_url(display_id)
         client.chat_postMessage(
@@ -692,6 +826,7 @@ def _do_resolve(client, channel_id: str, thread_ts: str,
             text=i18n.t("case.resolve.success_text_short", locale,
                         display_id=display_id),
             blocks=[
+                *_account_banner_blocks(account_id, locale),
                 blocks.section(
                     i18n.t("case.resolve.success_block_short", locale,
                            display_id=display_id, status=final)),
@@ -705,9 +840,10 @@ def _do_resolve(client, channel_id: str, thread_ts: str,
         client.chat_postMessage(
             channel=channel_id, thread_ts=thread_ts or None,
             text=i18n.t("case.resolve.fail_text_short", locale),
-            blocks=[blocks.section(
-                i18n.t("case.resolve.fail_block_short", locale,
-                       display_id=display_id))],
+            blocks=[*_account_banner_blocks(account_id, locale),
+                    blocks.section(
+                        i18n.t("case.resolve.fail_block_short", locale,
+                               display_id=display_id))],
         )
 
 
@@ -717,7 +853,7 @@ def _do_resolve(client, channel_id: str, thread_ts: str,
 def _dispatch_for_case(client, channel_id: str, thread_ts: str,
                        user_id: str, display_id: str,
                        subject: str, body_text: str,
-                       locale: str = "en") -> None:
+                       locale: str = "en", account_id: str = "") -> None:
     """「开案例 + 起调查」的调查那一半。飞书侧的对位实现是
     `platforms/feishu/app/case_flow.py::_dispatch_for_case`，两边必须对等。
 
@@ -731,11 +867,21 @@ def _dispatch_for_case(client, channel_id: str, thread_ts: str,
     `incident_id` 仍然是 `slack-case-<display_id>`：report_handler 的
     `_extract_case_display_id()` 靠这个形状认出「这次调查是某个案例带起来的」，从而在
     报告卡上给出「同步到案例」按钮。**别改成 `slack-<event_id>`**。
+
+    `account_id`（空 = 部署账号）：既是调查目标账号（`start_investigation`），也是
+    报告卡上那颗「同步到案例」按钮要写回的工单所在账号（`link_im_investigation`）。
     """
     if not channel_id or not display_id:
         return
+    # 幂等键带上账号：不同账号可以有相同的 displayId，不带账号会把 B 账号那次
+    # 派发误判成"已经在派了"而静默丢掉。
+    # ⚠️ 下面那道 `get_im_task(incident_id)` 幂等**没法**这样修：`incident_id` 的形状
+    #   （`slack-case-<display_id>`）是 report_handler `_extract_case_display_id()`
+    #   的解析契约，加账号段会让报告卡丢掉「同步到案例」按钮。已知取舍：两个账号里
+    #   撞到同一个 displayId 且都要起调查时，第二次会被判成"已派发过"。撞号概率极低，
+    #   而弄坏报告回投是必然损失。
     if not support_logic.claim_inflight(
-            f"slack_dispatch_for_case:{display_id}"):
+            f"slack_dispatch_for_case:{account_id}:{display_id}"):
         if user_id:
             client.chat_postEphemeral(
                 channel=channel_id, user=user_id,
@@ -768,6 +914,7 @@ def _dispatch_for_case(client, channel_id: str, thread_ts: str,
     raw_result = devops_agent.start_investigation(
         title=title, description=user_text, priority="MEDIUM",
         source=f"notiops-im-{PLATFORM}-case",
+        account_id=account_id or None,
     )
     if raw_result.get("error"):
         logger.error("Investigation dispatch for case %s failed: %s",
@@ -789,8 +936,12 @@ def _dispatch_for_case(client, channel_id: str, thread_ts: str,
     try:
         resp = client.chat_postMessage(
             channel=channel_id, thread_ts=thread_ts or None, text=body,
-            blocks=im_blocks.dispatch_blocks(body, locale, deep_link=deep,
-                                             home=home, state="dispatched"))
+            # 落款带上账号：这条调查是从一张**已经属于某个账号**的工单发起的，
+            # 而 `raw_result["account_id"]` 已经解析成具体 12 位数字。
+            blocks=im_blocks.dispatch_blocks(
+                body, locale, deep_link=deep, home=home, state="dispatched",
+                account=str(raw_result.get("account_id") or ""),
+                deploy=im_accounts.deploy_account_id()))
         card_ts = im_blocks.ts_of(resp)
     except Exception as e:                        # noqa: BLE001
         logger.error("case dispatch blocks post failed: %s", type(e).__name__)
@@ -829,6 +980,12 @@ def _dispatch_for_case(client, channel_id: str, thread_ts: str,
             incident_id, task_id, platform=PLATFORM, chat_id=channel_id,
             root_message_id=card_ts or (thread_ts or ""), locale=locale,
             user_id=user_id, raw_text=user_text[:1000],
+            # 报告卡上那颗「同步到案例」按钮要写的是**这个**账号的工单。
+            # ⚠️ 这里存**请求值**（`account_id`，空 = 部署账号），不存
+            #   `raw_result["account_id"]` —— 后者是 `start_investigation` 解析后
+            #   的结果，单账号客户那里也会是一串部署账号号，于是报告卡上会凭空
+            #   多出一条「Account: …」。全线口径统一：空字符串才代表"没选成员账号"。
+            account_id=account_id or "",
         )
     except Exception as e:                        # noqa: BLE001
         logger.warning("link_im_investigation for case dispatch failed: %s",
@@ -940,8 +1097,21 @@ def picked_service_code(dropdown: str, free_text: str) -> str:
 
 
 def _build_create_view(*, channel_id: str, thread_ts: str,
-                       initial_subject: str, locale: str = "en") -> dict:
+                       initial_subject: str, locale: str = "en",
+                       account_id: str = "") -> dict:
+    """开案例 modal。`account_id`（空 = 部署账号）= 打开 modal 那一刻的会话账号,
+    既是账号下拉的默认选中项,也盖进 `private_metadata` 当兜底章。
+
+    账号下拉与飞书那份共用 `platforms.common.account_picker`（选项 / 默认项 / 回传值
+    校验三件事都在那里）—— 两端各写一份的症状是"同一个部署里飞书能开到成员账号、
+    Slack 只能开到部署账号",而谁也不会同时看两端。
+
+    ⚠️ 这里解析部署账号（一次 STS,已被 `im_accounts` 容器级缓存）是可以的：modal
+    构造是**一次性**的用户交互,不是 `LiveCard.flush` 那种每几秒一轮的渲染循环。
+    """
     sev_labels = severity_labels(locale)
+    deploy = im_accounts.deploy_account_id()
+    account_options = account_picker.options(locale, deploy=deploy)
     severity_options = [(c, sev_labels[c]) for c in SEVERITY_CODES]
     language_options = [(c, LANGUAGE_LABELS[c]) for c in LANGUAGE_CODES]
     # Two options as a Slack static_select. Slack modals only allow ONE
@@ -961,6 +1131,9 @@ def _build_create_view(*, channel_id: str, thread_ts: str,
         "channel_id": channel_id,
         "thread_ts": thread_ts,
         "locale": locale,
+        # 账号「章」：提交时 `_on_create_submit` 只认这个，不查会话当前偏好 ——
+        # 表单上那句"Case 将开在账号 X 下"是承诺，必须兑现。
+        "case_account_id": account_id,
     }, ensure_ascii=False)
 
     return blocks.modal(
@@ -970,6 +1143,17 @@ def _build_create_view(*, channel_id: str, thread_ts: str,
         close=i18n.t("case.create.modal.cancel_short", locale)[:24],
         private_metadata=pm,
         blocks=[
+            # 账号放**第一项**：这张表里只有它决定"这次写操作落在谁的账号上"。
+            # 空列表（单账号部署 / 注册表里没有别的启用账号）时整块不出现,
+            # 行为与加下拉之前逐字相同。
+            *([blocks.static_select(
+                i18n.t("case.create.account_label", locale),
+                "account_select",
+                options=account_options,
+                initial_value=(account_id or "").strip() or deploy,
+                block_id="account_block",
+                placeholder=i18n.t("case.create.account_placeholder", locale),
+            )] if account_options else []),
             blocks.text_input(
                 i18n.t("case.create.subject_label_short", locale),
                 "subject", block_id="subject_block",
@@ -1017,19 +1201,33 @@ def _build_create_view(*, channel_id: str, thread_ts: str,
             blocks.context(
                 i18n.t("case.create.modal.context_hint", locale)
             ),
+            # 落在哪个账号 —— 这是本产品唯一的写操作，必须在**提交之前**说清楚。
+            # 单独一条 context 块（不塞进 `context_hint`）：那条 key 是"两种模式
+            # 有什么区别"的说明，账号归属是另一件事，而且只有它随会话变。
+            # 有下拉时换一句：那时归属由客户刚点的那一项决定,沿用 `..._target`
+            # 会出现"说明写着 A、下拉里选了 B"的自相矛盾 modal。
+            blocks.context(
+                i18n.t("case.create.account_note_picker", locale)
+                if account_options
+                else (i18n.t("case.create.account_note_target", locale,
+                             account=account_id)
+                      if (account_id or "").strip()
+                      else i18n.t("case.create.account_note", locale))),
         ],
     )
 
 
 def _build_reply_view(*, display_id: str, internal_id: str,
                       channel_id: str, thread_ts: str,
-                      locale: str = "en") -> dict:
+                      locale: str = "en", account_id: str = "") -> dict:
     pm = _json.dumps({
         "display_id": display_id,
         "internal_id": internal_id,
         "channel_id": channel_id,
         "thread_ts": thread_ts,
         "locale": locale,
+        # 账号「章」—— 与 `internal_id` 成对，见 `_on_reply_submit`。
+        "case_account_id": account_id,
     }, ensure_ascii=False)
     title = i18n.t("case.reply.modal.title_short", locale,
                    display_id=display_id[:18])
@@ -1040,6 +1238,7 @@ def _build_reply_view(*, display_id: str, internal_id: str,
         close=i18n.t("case.create.modal.cancel_short", locale)[:24],
         private_metadata=pm,
         blocks=[
+            *_account_banner_blocks(account_id, locale),
             blocks.section(i18n.t("case.reply.intro_short", locale)),
             blocks.text_input(
                 i18n.t("case.reply.body_label_short", locale),
@@ -1055,7 +1254,7 @@ def _build_reply_view(*, display_id: str, internal_id: str,
 # List / view / result block builders
 # ===========================================================================
 def _list_blocks(cases: list[CaseSummary], status_filter: str,
-                 locale: str = "en") -> list[dict]:
+                 locale: str = "en", account_id: str = "") -> list[dict]:
     label = _filter_label(status_filter, locale) \
         if status_filter in _FILTER_BUTTON_SLUGS \
         else _filter_label("recent", locale)
@@ -1068,8 +1267,9 @@ def _list_blocks(cases: list[CaseSummary], status_filter: str,
         return [
             blocks.header(i18n.t("case.list.title_with_label", locale,
                                  label=label)),
+            *_account_banner_blocks(account_id, locale),
             blocks.section(empty_msg),
-            *_filter_quick_buttons(status_filter, locale),
+            *_filter_quick_buttons(status_filter, locale, account_id),
             blocks.actions(blocks.button(
                 i18n.t("case.list.console_btn_short", locale),
                 "open_console_list",
@@ -1078,6 +1278,7 @@ def _list_blocks(cases: list[CaseSummary], status_filter: str,
     out: list[dict] = [
         blocks.header(i18n.t("case.list.title_with_label", locale,
                              label=label)),
+        *_account_banner_blocks(account_id, locale),
         blocks.context(i18n.t("case.list.subtotal_simple", locale,
                               count=len(cases))),
     ]
@@ -1105,9 +1306,12 @@ def _list_blocks(cases: list[CaseSummary], status_filter: str,
         if c.recent_communication:
             body_md += f"\n> {blocks.escape_mrkdwn(c.recent_communication)}"
         out.append(blocks.section(body_md))
+        # `internal_id` 与 `case_account_id` 必须成对盖章：caseId 只在它自己的
+        # 账号里查得到（见 `core/case_management.py` 口径 1）。
         action_val = _json.dumps({"display_id": c.display_id,
                                   "internal_id": c.internal_id,
-                                  "locale": locale},
+                                  "locale": locale,
+                                  "case_account_id": account_id},
                                  ensure_ascii=False)
         # Slack rejects messages where two action_ids collide. Suffix
         # each per-row button with the display_id to keep them unique
@@ -1128,7 +1332,7 @@ def _list_blocks(cases: list[CaseSummary], status_filter: str,
                 value=action_val, style="danger"))
         out.append(blocks.actions(*row))
     out.append(blocks.divider())
-    out.extend(_filter_quick_buttons(status_filter, locale))
+    out.extend(_filter_quick_buttons(status_filter, locale, account_id))
     out.append(blocks.context(
         i18n.t("case.list.console_hint_short", locale)))
     out.append(blocks.actions(
@@ -1139,7 +1343,8 @@ def _list_blocks(cases: list[CaseSummary], status_filter: str,
     return out
 
 
-def _filter_quick_buttons(current: str, locale: str = "en") -> list[dict]:
+def _filter_quick_buttons(current: str, locale: str = "en",
+                          account_id: str = "") -> list[dict]:
     btns = []
     for slug in _FILTER_BUTTON_SLUGS:
         if slug == current:
@@ -1150,7 +1355,9 @@ def _filter_quick_buttons(current: str, locale: str = "en") -> list[dict]:
         # via regex prefix and reads the filter from `value`.
         btns.append(blocks.button(
             label, f"case_list_filter:{slug}",
-            value=_json.dumps({"filter": slug, "locale": locale})))
+            value=_json.dumps({"filter": slug, "locale": locale,
+                               # 换 filter 不该换账号 —— 章带着走。
+                               "case_account_id": account_id})))
     if not btns:
         return []
     return [blocks.context(i18n.t("case.list.quick_filter_short", locale)),
@@ -1159,7 +1366,7 @@ def _filter_quick_buttons(current: str, locale: str = "en") -> list[dict]:
 
 def _view_blocks(c: CaseSummary,
                  comms: list[Communication],
-                 locale: str = "en") -> list[dict]:
+                 locale: str = "en", account_id: str = "") -> list[dict]:
     sev_label = severity_label(c.severity, locale)
     subject = (blocks.escape_mrkdwn(c.subject)
                or i18n.t("case.view.no_subject", locale))
@@ -1176,6 +1383,7 @@ def _view_blocks(c: CaseSummary,
     out: list[dict] = [
         blocks.header(i18n.t("case.view.title_short", locale,
                              display_id=c.display_id)),
+        *_account_banner_blocks(account_id, locale),
         blocks.section(head),
         blocks.divider(),
     ]
@@ -1200,7 +1408,8 @@ def _view_blocks(c: CaseSummary,
     is_resolved = c.status.startswith("resolved") or c.status == "closed"
     action_val = _json.dumps({"display_id": c.display_id,
                               "internal_id": c.internal_id,
-                              "locale": locale},
+                              "locale": locale,
+                              "case_account_id": account_id},
                              ensure_ascii=False)
     actions_row = [
         blocks.button(i18n.t("case.view.btn.add_reply_short", locale),
@@ -1220,7 +1429,7 @@ def _view_blocks(c: CaseSummary,
 
 
 def _analyze_blocks(result: case_analyze.AnalyzeResult,
-                     locale: str = "en") -> list[dict]:
+                     locale: str = "en", account_id: str = "") -> list[dict]:
     """LLM analysis card: header + meta + insight sections + 2 buttons.
 
     Caller (start_analyze) has already filtered error paths; here
@@ -1240,6 +1449,7 @@ def _analyze_blocks(result: case_analyze.AnalyzeResult,
     out: list[dict] = [
         blocks.header(i18n.t("case.analyze.title", locale,
                               display_id=c.display_id)),
+        *_account_banner_blocks(account_id, locale),
         blocks.section(head),
         blocks.divider(),
     ]
@@ -1278,7 +1488,8 @@ def _analyze_blocks(result: case_analyze.AnalyzeResult,
     out.append(blocks.divider())
     action_val = _json.dumps({"display_id": c.display_id,
                               "internal_id": c.internal_id,
-                              "locale": locale},
+                              "locale": locale,
+                              "case_account_id": account_id},
                              ensure_ascii=False)
     out.append(blocks.actions(
         blocks.button(i18n.t("case.analyze.btn.reply", locale),
@@ -1294,16 +1505,18 @@ def _create_result_blocks(result: support_logic.CaseResult,
                           severity: str, language: str,
                           subject: str, body_text: str,
                           dispatched: bool,
-                          locale: str = "en") -> list[dict]:
+                          locale: str = "en",
+                          account_id: str = "") -> list[dict]:
     if not result.ok:
         code = result.error_code or "Error"
-        if code == "SubscriptionRequiredException":
-            hint = i18n.t("case.create.fail_subscription", locale)
-        else:
-            hint = (result.error_message or "")[:300]
-        return [blocks.section(
-            i18n.t("case.create.fail_block", locale,
-                   code=code, hint=blocks.escape_mrkdwn(hint)))]
+        # 失败文案统一走 `support_logic.failure_hint`（跨账号 / 缺写权限 / 缺只读
+        # 权限 / 无 Support 计划四种成因各有各的出路），别在这里再维护一条 if 链 ——
+        # 五个渲染点各写一份的时候，漏掉的正是跨账号那两种。
+        hint = support_logic.failure_hint(result, locale)
+        return [*_account_banner_blocks(account_id, locale),
+                blocks.section(
+                    i18n.t("case.create.fail_block", locale,
+                           code=code, hint=blocks.escape_mrkdwn(hint)))]
     cls = result.classification or {}
     classification_block = ""
     if cls.get("serviceCode") or cls.get("categoryCode"):
@@ -1335,6 +1548,8 @@ def _create_result_blocks(result: support_logic.CaseResult,
 
     out: list[dict] = [
         blocks.header(i18n.t("case.create.success_text_short", locale)),
+        # 开在哪个账号 —— 控制台链接不带账号参数，不写清用户点进去看不到这张工单。
+        *_account_banner_blocks(account_id, locale),
         blocks.section(
             i18n.t("case.create.success_block", locale,
                    display_id=result.display_id,
@@ -1368,13 +1583,16 @@ def _create_result_blocks(result: support_logic.CaseResult,
 
 def _reply_result_blocks(display_id: str, body_text: str,
                          ok: bool,
-                         locale: str = "en") -> list[dict]:
+                         locale: str = "en",
+                         account_id: str = "") -> list[dict]:
     if not ok:
-        return [blocks.section(
-            i18n.t("case.reply.fail_block_short", locale,
-                   display_id=display_id))]
+        return [*_account_banner_blocks(account_id, locale),
+                blocks.section(
+                    i18n.t("case.reply.fail_block_short", locale,
+                           display_id=display_id))]
     case_url = case_management._case_console_url(display_id)
     return [
+        *_account_banner_blocks(account_id, locale),
         blocks.section(
             i18n.t("case.reply.success_block_short", locale,
                    display_id=display_id)),
@@ -1387,7 +1605,8 @@ def _reply_result_blocks(display_id: str, body_text: str,
                 i18n.t("case.reply.btn.detail_short", locale),
                 "case_view",
                 value=_json.dumps({"display_id": display_id,
-                                   "locale": locale})),
+                                   "locale": locale,
+                                   "case_account_id": account_id})),
         ),
     ]
 

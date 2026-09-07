@@ -415,7 +415,8 @@ def _bold(s: str) -> str:
 
 
 def _meta_lines(status: str, priority: str, detail_type: str, task_id: str,
-                title: str, linked_case_display_id: str, locale: str) -> str:
+                title: str, linked_case_display_id: str, locale: str,
+                account_id: str = "") -> str:
     """The report card's metadata block (title + event + status + task).
 
     `title` (D1) is the user's own question. It leads, because `task_id`
@@ -438,6 +439,12 @@ def _meta_lines(status: str, priority: str, detail_type: str, task_id: str,
     if linked_case_display_id:
         lines.append(_bold(i18n.t("report.header.linked_case", locale,
                                   case_display_id=linked_case_display_id)))
+    # 跨账号时把账号号念出来（空 = 部署账号 = 不加这行，单账号客户的卡片一字不变）。
+    # 这份报告查的是成员账号，而卡上所有链接（报告 / trace）都不带账号信息 —— 不写清
+    # 用户会以为读的是自己当前登录那个账号的数据。同 `case.account_banner` 一套口径。
+    if (account_id or "").strip():
+        lines.append(i18n.t("case.account_banner", locale,
+                            account=account_id.strip()))
     return "\n".join(lines)
 
 
@@ -454,7 +461,8 @@ def _escape_md(s: str) -> str:
 def _action_rows_spec(*, report_url: str, trace_url: str,
                       incident_id: str, linked_case_display_id: str,
                       next_steps: list[dict] | None,
-                      locale: str) -> list[list[dict]]:
+                      locale: str,
+                      case_account_id: str = "") -> list[list[dict]]:
     """Platform-neutral description of the card's button rows.
 
     Each button is one of:
@@ -512,7 +520,12 @@ def _action_rows_spec(*, report_url: str, trace_url: str,
                      "style": "primary",
                      "value": {"action": "case_sync_report",
                                "incident_id": incident_id,
-                               "case_display_id": linked_case_display_id}})
+                               "case_display_id": linked_case_display_id,
+                               # 账号「盖章」（2026-09-07 多账号）：这颗按钮可以几小时
+                               # 后才被点，那时会话里选的账号可能已经换了，而工单只在
+                               # 原账号里存在 —— 点回来时只认这个章，不查当下的偏好。
+                               # 空 = 部署账号 = 改动前的行为。
+                               "case_account_id": case_account_id}})
     elif incident_id:
         # No linked case yet → offer to open one. Mutually exclusive with
         # the sync button: creating a second case from one investigation
@@ -643,7 +656,7 @@ def _report_card_v2(*, status: str, priority: str, detail_type: str,
                     incident_id: str = "", linked_case_display_id: str = "",
                     truncated: bool = False,
                     next_steps: list[dict] | None = None,
-                    locale: str = "zh") -> dict:
+                    locale: str = "zh", case_account_id: str = "") -> dict:
     """The report card — **one** card carrying body + metadata + actions.
 
     Until 2026-09-05 this was two messages: 「📝 Report Summary」 (body)
@@ -661,14 +674,16 @@ def _report_card_v2(*, status: str, priority: str, detail_type: str,
         report_url=report_url, trace_url=trace_url,
         incident_id=incident_id,
         linked_case_display_id=linked_case_display_id,
-        next_steps=next_steps, locale=locale)
+        next_steps=next_steps, locale=locale,
+        case_account_id=case_account_id)
     blocks, table_trimmed = _summary_blocks(summary_md, locale)
 
     def build(body_blocks: list[dict], trunc: bool) -> dict:
         elements: list = [
             {"tag": "markdown",
              "content": _meta_lines(status, priority, detail_type, task_id,
-                                    title, linked_case_display_id, locale)},
+                                    title, linked_case_display_id, locale,
+                                    case_account_id)},
             {"tag": "hr"},
         ]
         elements.extend(body_blocks)
@@ -707,7 +722,7 @@ def _report_card_v1(*, status: str, priority: str, detail_type: str,
                     incident_id: str = "", linked_case_display_id: str = "",
                     truncated: bool = False,
                     next_steps: list[dict] | None = None,
-                    locale: str = "zh") -> dict:
+                    locale: str = "zh", case_account_id: str = "") -> dict:
     """v1-schema twin of `_report_card_v2`, used when v2 is rejected.
 
     Same content, same button order; pipe tables degrade to `column_set`
@@ -720,7 +735,8 @@ def _report_card_v1(*, status: str, priority: str, detail_type: str,
          "text": {"tag": "lark_md",
                   "content": _meta_lines(status, priority, detail_type,
                                          task_id, title,
-                                         linked_case_display_id, locale)}},
+                                         linked_case_display_id, locale,
+                                         case_account_id)}},
         {"tag": "hr"},
     ]
     body_elements = _md_to_card_elements(summary_md or "")
@@ -741,7 +757,8 @@ def _report_card_v1(*, status: str, priority: str, detail_type: str,
         report_url=report_url, trace_url=trace_url,
         incident_id=incident_id,
         linked_case_display_id=linked_case_display_id,
-        next_steps=next_steps, locale=locale)
+        next_steps=next_steps, locale=locale,
+        case_account_id=case_account_id)
     for idx, row in enumerate(rows):
         if idx == 1 and next_steps:
             elements.append({"tag": "div",
@@ -1403,7 +1420,8 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
                 linked_case_display_id: str = "",
                 next_steps: list[dict] | None = None,
                 locale: str = "zh", title: str = "",
-                report_truncated: bool = False) -> None:
+                report_truncated: bool = False,
+                case_account_id: str = "") -> None:
     """Send investigation results back to Feishu as **one** interactive card.
 
     `title` (D1) is the user's own question, rendered at the top so a chat
@@ -1425,6 +1443,11 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
 
     `next_steps` is retained for cards already in users' chat history; the
     report path stops generating them as of 2026-09-05 (0 token).
+
+    `case_account_id`（2026-09-07 多账号，空 = 部署账号）：这次调查查的是哪个 AWS
+    账号。两处用途 —— ① 元数据里把账号号念出来；② 盖进「📎 同步到 case」按钮的回调
+    值，让那条评论写进**对的**账号的工单。来源是 `report_handler` 从
+    `incident#` / `task#` 路由行里带出来的 `account_id`。
     """
     if not is_configured():
         logger.warning("Feishu not configured — skipping send_report")
@@ -1436,7 +1459,8 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
         summary_md=summary_md, title=title,
         incident_id=incident_id,
         linked_case_display_id=linked_case_display_id,
-        truncated=report_truncated, next_steps=next_steps, locale=locale)
+        truncated=report_truncated, next_steps=next_steps, locale=locale,
+        case_account_id=case_account_id)
     if _try_send_card(chat_id, root_message_id, _report_card_v2(**kwargs)):
         return
     # A v2 reject (bad table shape, size, schema drift) used to leave the

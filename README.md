@@ -91,8 +91,11 @@ write access.
   its title are the "still running" signal); when a deep investigation finishes, its report
   card is posted back to the conversation that started it. **Two agents to pick from**:
   `/agent devops` is the default (straight to the DevOps Agent, 0 tokens on the NotiOps side),
-  `/agent notiops` switches to the model-backed path (with a `/web on` web-search toggle; the
-  answer card's footer states how many tokens that turn cost)
+  `/agent notiops` switches to the model-backed path (with a `/web on` web-search toggle).
+  Every card's footer states three things in one line: **which path the turn took, which model
+  answered, and which AWS account the answer is about** — that last segment matters most in a
+  multi-account deployment, since `/account` is per-conversation: one person switches and
+  everyone in that group follows.
 
 ---
 
@@ -199,7 +202,7 @@ mode comparison and how to switch — see
 | Daily cost-anomaly scan (self-built baseline, runs 01:15 UTC every day) | ❌ the "Daily Anomaly Scan" card on the FinOps page is not rendered at all — you do not get an empty card | ✅ |
 | Bring your own CUR data source (4 dashboard sheets + ask about that bill in chat) | ✅ optional, see note ⁵ | ✅ optional, see note ⁵ |
 | **Cases and Skills** | | |
-| Full AWS Support case management | ✅ | ✅ |
+| Full AWS Support case management (multi-account: pick the target account right on the case form) | ✅ | ✅ |
 | 11 bundled Skills + your own | ✅ | ✅ |
 | Publish a Skill to DevOps Agent | ✅ see note ¹ | ✅ |
 | **Models** | | |
@@ -208,10 +211,11 @@ mode comparison and how to switch — see
 | **Proactive / IM** | | |
 | IM channels (Slack / Feishu) | ✅ one platform per stack, see note ⁴ | ✅ both at once |
 | Two agents in IM (`/agent devops`, the 0-token default \| `/agent notiops`, model-backed) + the `/web` toggle | ✅ | ✅ |
+| Pick which account you ask about, from IM (`/account`) | ✅ | ✅ |
 | Proactive push **to IM** (10 EventBridge sources) | ❌ | ✅ |
 | Scheduled inspection (high load / idle & cost / structural risk) | ❌ | ✅ |
 | Notification inbox (the same 10 sources, into the web inbox) | ✅ | ✅ |
-| Inspection dashboard (overview / high load / idle & cost / structural risk / inspection scope / thresholds & schedule) | ❌ the tab is still there, but Option A has no inspection backend, so opening it fails to load | ✅ |
+| Inspection dashboard (overview / high load / idle & cost / structural risk / inspection scope / thresholds & schedule) | ❌ Option A has no inspection backend, so the sidebar entry **does not appear at all** (rather than failing once you open it); calling the API directly tells you plainly that this needs Option B | ✅ |
 | **Scope** | | |
 | Multi-account (across an AWS Organization) | ✅ set `DeployMode=MultiAccount` + your organization id | ✅ `--multi-account` |
 | Upgrade | update the stack with the new template (~1 min) | re-run `./setup.sh` |

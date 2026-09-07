@@ -112,6 +112,46 @@ graph LR
     end
 ```
 
+### 偏好的作用范围：群 = 整群，私聊 = 每人（含 `/account` 问哪个账号）
+
+三条开关命令（`/agent` 换 agent、`/web` 联网、`/account` 换问哪个账号）与 Session
+**同一套作用范围**：**群里设一次对整群生效，私聊里只对你自己生效**。
+存储都在 `core/im_prefs.py` 的同一张表、同一套 key（`impref#<feature>#<scope>#<平台>:<id>`），
+30 天不用自动过期。
+
+```mermaid
+graph LR
+    subgraph Scope["/account 的解析顺序（每条消息都跑一遍）"]
+        P1["① 读偏好<br/>群→chat 作用域 / 私聊→user 作用域"]
+        P2["② 没设过 → 部署账号<br/>（不查注册表，0 次额外读）"]
+        P3["③ 设过 → 核对账号注册表<br/>（Web 上是否仍启用）"]
+        P4["④ 不在清单里 → 回落部署账号<br/>并说明原因（偏好行**不删**）"]
+        P1 --> P2
+        P1 --> P3
+        P3 --> P4
+    end
+```
+
+- **账号上车（新增 / 启用 / 停用）只在 Web 控制台**，IM 只**读**那份注册表
+  （`shared/queries/accounts.py` 的 GSI1 Query，写入方只有 Web BFF 的
+  `bff/web-chat/member_accounts.mjs`）。所以 Web 上一启用，IM **下一条消息**就能选到；
+  Web 上一停用，IM 那侧的选择下一条消息就自动回落。
+- **两侧各自选，互不影响** —— 共享的只有「哪些账号可选」这份清单。
+- **开案例也跟着 `/account` 走**（2026-09-07 起，`caps.case` → `case_flow.start_*` →
+  `core/support_logic.py` 全线透传 `account_id`，空串 = 部署账号）。跨账号凭证走
+  `core/aws_session.py`：`role_arn` **只信 config 表那一行**、assume 前过
+  `shared/account_scope.assert_role_belongs_to`、**拿不到就报错绝不回落到部署账号**。
+  写操作要求目标账号的角色带 `support:CreateCase` / `AddCommunicationToCase` /
+  `ResolveCase`（成员模板参数 `EnableSupportCaseWrite`，默认开）。
+  卡片会写明工单开在哪个账号下（工单号跨账号可撞号，控制台链接不带账号参数）。
+- **报告卡上的 🆘 升级开单 / 「📎 同步到 case」跟的是「这次调查查的那个账号」**，
+  不是点按钮那一刻会话里选的账号 —— 卡可能几小时后才被点。账号来源按优先级：
+  按钮 value 里的 `case_account_id`（发卡时盖的章）→ `support#<incident_id>` 行里的
+  `account_id`（`report_handler._persist_support_context` 写的，也兜住改动前发出的旧卡）。
+- 越权的拦截线**不在** IM 侧，而是随每一轮请求带给 agent 的账号闸门
+  （`core/im_accounts.allowed_accounts()`：只含「部署账号 + 已启用账号」，
+  **拿不到清单时返回拒绝用的哨兵值而不是放开**）。
+
 ## 钉钉交互方式
 
 > ⏳ **钉钉为 Phase 2（v1 默认不启用）**：适配代码 + sender 完整保留（`platforms/dingtalk/`），但 v1 `setup.sh` 不开放钉钉选项 → 钉钉 ECS task `desiredCount=0`，不启动、不计费。按 USER_GUIDE §9.5：启用后**对话 / 调查派发 / 报告回贴属 Phase 1 能力**，而**进度卡 / Push 主动观察 / case 管理属 Phase 2**（尚未 GA）。

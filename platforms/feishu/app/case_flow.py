@@ -49,6 +49,7 @@ from core import case_classifier
 from core import case_management
 from core import ddb_state
 from core import i18n
+from core import im_accounts
 from core import support_logic
 from core import webhook_dispatch  # noqa: F401 — reserved for future skill paths
 from core.case_management import CaseSummary, Communication
@@ -61,6 +62,7 @@ from core.support_logic import (
     severity_label, severity_labels,
 )
 
+from platforms.common import account_picker
 from platforms.feishu.app import feishu_utils
 
 logger = logging.getLogger(__name__)
@@ -125,23 +127,80 @@ def _bold(s: str) -> str:
     return _SINGLE_STAR_BOLD_RE.sub(r"**\1**", s)
 
 
+def _account_banner(account_id: str, locale: str) -> list[dict]:
+    """卡片顶上那条「🏷️ 账号: 123456789012」。**总是**报账号（2026-09-07 起）。
+
+    返回 0 或 1 个元素的列表，好让调用方 `*_account_banner(...)` 直接展开。
+    唯一返回空列表的情形是**两个号码都拿不到**（`deploy_account_id()` 底下那次 STS
+    失败）—— 与落款同一条规矩：编一句「账号: (部署账号)」是用一句没有信息量的话
+    冒充有信息量。
+
+    ⚠️ 这里原来是「空 `account_id`（= 部署账号）就不加这条，不给单账号客户的卡片加
+    噪音」。2026-09-07 反转，因为"没有横幅"同时对应两种完全不同的事实：开在部署账号
+    （正常），以及目标账号在回传路上丢了所以落到了部署账号（当天的那个 P0）。两者
+    长得一模一样，客户只能去控制台数工单才能分辨。开案例是本产品唯一的写操作，
+    它的收据上必须写清钱花在哪个账号。
+
+    ⚠️ 在渲染函数里解析部署账号是**这一处**的例外（§4.5 禁的是 `LiveCard.flush`
+    那种每几秒一轮的渲染循环）：案例卡都是一次性的用户交互，且
+    `im_accounts.deploy_account_id()` 有容器级缓存（只缓存非空），一个执行环境最多
+    一次 STS。
+    """
+    acct = (account_id or "").strip()
+    deploy = im_accounts.deploy_account_id()
+    if not acct or acct == deploy:
+        if not deploy:
+            return []
+        return [{"tag": "markdown",
+                 "content": i18n.t("case.account_banner_deploy", locale,
+                                   account=deploy)}]
+    return [{"tag": "markdown",
+             "content": i18n.t("case.account_banner", locale, account=acct)}]
+
+
 # ===========================================================================
 # Entry points called from main.py (natural-language / slash dispatch)
 # ===========================================================================
-def start_create(chat_id: str, raw_text: str, locale: str = "zh") -> None:
+def start_create(chat_id: str, raw_text: str, locale: str = "zh",
+                 account_id: str = "") -> None:
     """Send the case-create form into the chat.
 
     Subject pre-fill is **deterministic** (0 token): strip the "开案例" /
     "create case" intent marker and use what's left. The user edits it in
     the form anyway, so a model round-trip buys nothing here.
+
+    `account_id`（空 = 部署账号）：工单开在哪个账号下,由 `/account` 决定。
+    发表单**之前**先探一次那个账号能不能开工单（`support_logic.case_capability`,
+    0 token 的一次只读调用）—— 让客户填完整张表才发现"这个账号是 Basic 计划"
+    是最差的体验。
     """
     if not chat_id:
         return
     locale = _normalize_locale(locale)
+    cap = support_logic.case_capability(account_id)
+    if not cap.get("ok"):
+        # 不发表单：这个账号这条路从头到尾不通,给出确切原因和出路。
+        feishu_utils.send_card(chat_id=chat_id, card=_info_card(
+            i18n.t("case.create.fail_title", locale,
+                   code=cap.get("code") or "Unavailable"),
+            support_logic.failure_hint(
+                support_logic.CaseResult(ok=False,
+                                        error_code=cap.get("code") or ""),
+                locale),
+            "red"))
+        return
     initial_subject = _summarize_subject(raw_text)
+    # 账号下拉的选项在**这里**解析（一次 GSI1 Query + 缓存过的部署账号号），不在卡片
+    # 构造函数里 —— 渲染函数不碰 AWS，见 `_create_form_card` 的说明。多账号部署里
+    # 客户可以直接在卡上改目标账号，不必先 `/account` 把整个群切过去。
+    deploy = im_accounts.deploy_account_id()
+    account_options = account_picker.options(locale, deploy=deploy)
     feishu_utils.send_card(chat_id=chat_id,
                            card=_create_form_card(subject=initial_subject,
-                                                  locale=locale))
+                                                  locale=locale,
+                                                  account_id=account_id,
+                                                  account_options=account_options,
+                                                  deploy_account_id=deploy))
 
 
 # Phrases users typically type to OPEN a case — when the input is just
@@ -232,9 +291,16 @@ def _filter_label(slug: str, locale: str) -> str:
     return i18n.t(key, locale)
 
 
-def _filter_quick_row(current: str, locale: str) -> dict:
+def _filter_quick_row(current: str, locale: str,
+                      account_id: str = "") -> dict:
     """Render a row of quick-filter buttons. The currently-active filter
-    is omitted so users can't click into the same view they're already in."""
+    is omitted so users can't click into the same view they're already in.
+
+    ⚠️ `account_id` 是**卡片自带的账号章**，和这张列表卡上每一行的按钮同一个来源
+    （`_list_card` 的 `action_val`）。2026-09-07 修：这里原来漏了它 —— 症状是
+    「在成员账号的列表卡上点一下『待客户回复』，换出来的是**部署账号**的工单列表」，
+    而卡片顶上那条账号横幅还写着成员账号（`handle()` 只认按钮上的章，见那里的注释）。
+    """
     buttons = []
     for slug in _FILTER_BUTTON_SLUGS:
         if slug == current:
@@ -242,26 +308,30 @@ def _filter_quick_row(current: str, locale: str) -> dict:
         label = i18n.t(f"case.list.filter_btn.{slug}", locale)
         buttons.append(_callback_button(
             label,
-            {"action": "case_list_filter", "case_filter": slug},
+            {"action": "case_list_filter", "case_filter": slug,
+             "case_account_id": account_id},
         ))
     return _action_row(buttons)
 
 
 def start_list(chat_id: str, status_filter: str = "recent",
-               locale: str = "zh") -> None:
+               locale: str = "zh", account_id: str = "") -> None:
     if not chat_id:
         return
     locale = _normalize_locale(locale)
     cases = case_management.list_recent_cases(
         after_days=90, max_items=5, status_filter=status_filter,
+        account_id=account_id,
     )
     feishu_utils.send_card(chat_id=chat_id,
                            card=_list_card(cases, status_filter=status_filter,
-                                           locale=locale))
+                                           locale=locale,
+                                           account_id=account_id))
 
 
 def start_view(chat_id: str, display_id: str,
-               internal_id: str = "", locale: str = "zh") -> None:
+               internal_id: str = "", locale: str = "zh",
+               account_id: str = "") -> None:
     if not chat_id:
         return
     locale = _normalize_locale(locale)
@@ -269,10 +339,11 @@ def start_view(chat_id: str, display_id: str,
         # Defensive — the router (`core.nl_router.parse_case_ref`) already
         # downgrades a case_view with no id to case_list, but callers can
         # still reach us directly.
-        start_list(chat_id, locale=locale)
+        start_list(chat_id, locale=locale, account_id=account_id)
         return
     summary = case_management.describe_case(display_id,
-                                            internal_id=internal_id or None)
+                                            internal_id=internal_id or None,
+                                            account_id=account_id)
     if not summary:
         feishu_utils.send_card(chat_id=chat_id, card=_info_card(
             i18n.t("case.view.not_found_title", locale),
@@ -281,48 +352,53 @@ def start_view(chat_id: str, display_id: str,
         ))
         return
     comms = case_management.list_communications(
-        display_id, max_items=5, internal_id=summary.internal_id or internal_id or None)
+        display_id, max_items=5,
+        internal_id=summary.internal_id or internal_id or None,
+        account_id=account_id)
     feishu_utils.send_card(chat_id=chat_id,
-                           card=_view_card(summary, comms, locale=locale))
+                           card=_view_card(summary, comms, locale=locale,
+                                           account_id=account_id))
 
 
 def start_reply(chat_id: str, display_id: str, raw_text: str,
-                internal_id: str = "", locale: str = "zh") -> None:
+                internal_id: str = "", locale: str = "zh",
+                account_id: str = "") -> None:
     if not chat_id:
         return
     locale = _normalize_locale(locale)
     if not display_id and not internal_id:
-        start_list(chat_id, locale=locale)
+        start_list(chat_id, locale=locale, account_id=account_id)
         return
     body = _extract_reply_body(raw_text, display_id) if display_id else ""
     if body and len(body) >= 4:
         _send_reply(chat_id, display_id, body, internal_id=internal_id,
-                    locale=locale)
+                    locale=locale, account_id=account_id)
         return
     feishu_utils.send_card(
         chat_id=chat_id,
         card=_reply_form_card(display_id, internal_id=internal_id,
-                              locale=locale),
+                              locale=locale, account_id=account_id),
     )
 
 
 def start_resolve(chat_id: str, display_id: str,
-                  internal_id: str = "", locale: str = "zh") -> None:
+                  internal_id: str = "", locale: str = "zh",
+                  account_id: str = "") -> None:
     if not chat_id:
         return
     locale = _normalize_locale(locale)
     if not display_id and not internal_id:
-        start_list(chat_id, locale=locale)
+        start_list(chat_id, locale=locale, account_id=account_id)
         return
     feishu_utils.send_card(
         chat_id=chat_id,
         card=_resolve_confirm_card(display_id, internal_id=internal_id,
-                                   locale=locale),
+                                   locale=locale, account_id=account_id),
     )
 
 
 def start_analyze(chat_id: str, display_id: str,
-                  locale: str = "zh") -> None:
+                  locale: str = "zh", account_id: str = "") -> None:
     """LLM-driven case analysis: fetch case + comms → Bedrock summary →
     render insights card. Heavy lift (~5-15s including AWS Support
     describe + Bedrock invoke) — runs synchronously in the event handler
@@ -333,7 +409,7 @@ def start_analyze(chat_id: str, display_id: str,
         return
     locale = _normalize_locale(locale)
     if not display_id:
-        start_list(chat_id, locale=locale)
+        start_list(chat_id, locale=locale, account_id=account_id)
         return
 
     # Inline "starting" toast so the chat doesn't appear unresponsive
@@ -347,7 +423,8 @@ def start_analyze(chat_id: str, display_id: str,
     except Exception as e:
         logger.warning("case_analyze: starting-toast send failed (non-fatal): %s", e)
 
-    result = case_analyze.analyze(display_id, locale=locale)
+    result = case_analyze.analyze(display_id, locale=locale,
+                                  account_id=account_id)
 
     if result.error == "case_not_found":
         feishu_utils.send_card(chat_id=chat_id, card=_info_card(
@@ -367,7 +444,8 @@ def start_analyze(chat_id: str, display_id: str,
         return
 
     feishu_utils.send_card(chat_id=chat_id,
-                           card=_analyze_card(result, locale=locale))
+                           card=_analyze_card(result, locale=locale,
+                                              account_id=account_id))
 
 
 # ===========================================================================
@@ -379,15 +457,22 @@ def handle(action_tag: str, action_value: dict, event,
     locale = _normalize_locale(locale)
     chat_id = _extract_chat_id(event)
     message_id = _extract_message_id(event)
+    # 卡片按钮点回来时**不查当前会话选的账号**，只认卡片自己带的那个（渲染时盖的章）。
+    # 两个理由：① 用户可能在点按钮之前又切了账号，那时"当前账号"和卡上这张工单不是
+    # 一回事，拿它去 AddCommunication 就是往另一个账号里写；② 本次改动之前渲染的老卡
+    # 没有这个字段 → 空 = 部署账号，而那正是它们当年唯一可能的归属，所以缺省值天然正确。
+    account_id = action_value.get("case_account_id", "") or ""
 
     if action_tag == "case_create_submit":
         return _handle_create_submit(action_value, event, operator_name,
                                      card_message_id=message_id,
-                                     dispatch_after=False, locale=locale)
+                                     dispatch_after=False, locale=locale,
+                                     account_id=account_id)
     if action_tag == "case_create_submit_with_dispatch":
         return _handle_create_submit(action_value, event, operator_name,
                                      card_message_id=message_id,
-                                     dispatch_after=True, locale=locale)
+                                     dispatch_after=True, locale=locale,
+                                     account_id=account_id)
     if action_tag == "case_create_dispatch_after":
         # User clicked "Dispatch investigation" on the success card after
         # opening a case. We have the case context in the action_value
@@ -396,7 +481,8 @@ def handle(action_tag: str, action_value: dict, event,
         subject = action_value.get("subject", "")
         body = action_value.get("body", "")
         return _dispatch_investigation_for_case(chat_id, display_id, subject,
-                                                body, message_id, locale=locale)
+                                                body, message_id, locale=locale,
+                                                account_id=account_id)
     if action_tag == "case_create_cancel":
         return _build_card_response(
             i18n.t("case.create.cancel_toast", locale),
@@ -412,7 +498,7 @@ def handle(action_tag: str, action_value: dict, event,
         internal_id = action_value.get("case_internal_id", "")
         if chat_id and (display_id or internal_id):
             start_view(chat_id, display_id, internal_id=internal_id,
-                       locale=locale)
+                       locale=locale, account_id=account_id)
         return _toast(
             i18n.t("case.toast.loaded", locale, display_id=display_id)
             if display_id
@@ -420,7 +506,7 @@ def handle(action_tag: str, action_value: dict, event,
 
     if action_tag == "case_list_open":
         if chat_id:
-            start_list(chat_id, locale=locale)
+            start_list(chat_id, locale=locale, account_id=account_id)
         return _toast(i18n.t("case.toast.refreshed", locale))
 
     if action_tag == "case_list_filter":
@@ -428,7 +514,8 @@ def handle(action_tag: str, action_value: dict, event,
         # list card with the requested filter; original list stays put.
         new_filter = action_value.get("case_filter", "recent")
         if chat_id:
-            start_list(chat_id, status_filter=new_filter, locale=locale)
+            start_list(chat_id, status_filter=new_filter, locale=locale,
+                       account_id=account_id)
         return _toast(i18n.t("case.toast.switched_filter", locale,
                              filter=_filter_label(new_filter, locale)))
 
@@ -442,7 +529,7 @@ def handle(action_tag: str, action_value: dict, event,
             feishu_utils.send_card(
                 chat_id=chat_id,
                 card=_reply_form_card(display_id, internal_id=internal_id,
-                                      locale=locale),
+                                      locale=locale, account_id=account_id),
             )
         return _toast(
             i18n.t("case.toast.opened_reply_form", locale,
@@ -458,7 +545,8 @@ def handle(action_tag: str, action_value: dict, event,
         if (not display_id and not internal_id) or not body:
             return _toast(i18n.t("case.toast.missing_id_or_body", locale))
         return _handle_reply_submit(display_id, body, message_id,
-                                    internal_id=internal_id, locale=locale)
+                                    internal_id=internal_id, locale=locale,
+                                    account_id=account_id)
 
     if action_tag == "case_resolve_confirm":
         # Same as reply_form: send a NEW confirm card so the list survives.
@@ -468,7 +556,8 @@ def handle(action_tag: str, action_value: dict, event,
             feishu_utils.send_card(
                 chat_id=chat_id,
                 card=_resolve_confirm_card(display_id, internal_id=internal_id,
-                                           locale=locale),
+                                           locale=locale,
+                                           account_id=account_id),
             )
         return _toast(
             i18n.t("case.toast.confirm_close", locale, display_id=display_id)
@@ -479,7 +568,7 @@ def handle(action_tag: str, action_value: dict, event,
         display_id = action_value.get("case_display_id", "")
         internal_id = action_value.get("case_internal_id", "")
         return _handle_resolve(display_id, message_id, internal_id=internal_id,
-                               locale=locale)
+                               locale=locale, account_id=account_id)
 
     if action_tag == "case_resolve_no":
         return _build_card_response(
@@ -501,7 +590,8 @@ def handle(action_tag: str, action_value: dict, event,
         sync_locale = _locale_from_event(incident_id=incident_id,
                                          fallback=locale)
         return _handle_sync_report(chat_id, display_id, incident_id,
-                                   locale=sync_locale)
+                                   locale=sync_locale,
+                                   account_id=account_id)
 
     return _toast(i18n.t("case.toast.unknown_action", locale))
 
@@ -513,7 +603,8 @@ def handle(action_tag: str, action_value: dict, event,
 def _handle_create_submit(action_value: dict, event, operator_name: str,
                           card_message_id: str,
                           dispatch_after: bool,
-                          locale: str = "zh"
+                          locale: str = "zh",
+                          account_id: str = ""
                           ) -> P2CardActionTriggerResponse:
     locale = _normalize_locale(locale)
     form = _extract_form_values(event)
@@ -532,6 +623,19 @@ def _handle_create_submit(action_value: dict, event, operator_name: str,
     if issue_type not in ISSUE_TYPE_CODES:
         issue_type = DEFAULT_ISSUE_TYPE
     chat_id = _extract_chat_id(event)
+
+    # 账号下拉（2026-09-07）：客户在卡上直接选的目标账号**优先于**渲染时盖的章。
+    # 下拉没渲染 / 老卡片没这个字段时 `picked` 为空 → 仍用那个章（向后兼容）。
+    # 选了一个不在允许集里的号码 → **拒绝**，不回落到部署账号：回落会把"这个账号
+    # 不让开"变成"已在另一个账号开好了"，而客户看到的是"提交成功"。
+    picked_account = (form.get("account_select") or "").strip()
+    resolved = account_picker.resolve_choice(
+        picked_account, stamped=account_id,
+        deploy=im_accounts.deploy_account_id())
+    if resolved is None:
+        return _toast(i18n.t("case.create.account_refused", locale,
+                             account=picked_account))
+    account_id = resolved
 
     if not subject or not body:
         return _toast(i18n.t("case.create.toast.subject_required", locale))
@@ -562,7 +666,8 @@ def _handle_create_submit(action_value: dict, event, operator_name: str,
             args=(card_message_id, ctx, severity, language, operator_name,
                   chat_id, dispatch_after, extra, locale),
             kwargs={"service_text": service_text, "issue_type": issue_type,
-                    "category_text": category_text},
+                    "category_text": category_text,
+                    "account_id": account_id},
             daemon=True,
         ).start()
         msg = i18n.t(
@@ -576,16 +681,18 @@ def _handle_create_submit(action_value: dict, event, operator_name: str,
         ctx, platform=PLATFORM, severity=severity, language=language,
         extra=extra, operator_name=operator_name,
         service_text=service_text, issue_type=issue_type,
-        category_text=category_text,
+        category_text=category_text, account_id=account_id,
     )
     if dispatch_after and result.ok and chat_id:
         _dispatch_investigation_inline(chat_id, result.display_id, subject, body,
-                                       operator_name, locale=locale)
+                                       operator_name, locale=locale,
+                                       account_id=account_id)
     return _build_card_response(
         i18n.t("case.create.toast.created", locale),
         _create_result_card(result, severity, language, operator_name,
                             subject=subject, body=body,
-                            dispatched=dispatch_after, locale=locale))
+                            dispatched=dispatch_after, locale=locale,
+                            account_id=account_id))
 
 
 def _create_worker(card_message_id: str, ctx: dict,
@@ -593,24 +700,26 @@ def _create_worker(card_message_id: str, ctx: dict,
                    chat_id: str, dispatch_after: bool, extra: str,
                    locale: str = "zh", *,
                    service_text: str = "", issue_type: str = "",
-                   category_text: str = "") -> None:
+                   category_text: str = "", account_id: str = "") -> None:
     locale = _normalize_locale(locale)
     try:
         result = support_logic.create_case(
             ctx, platform=PLATFORM, severity=severity, language=language,
             extra=extra, operator_name=operator_name,
             service_text=service_text, issue_type=issue_type,
-            category_text=category_text,
+            category_text=category_text, account_id=account_id,
         )
         # Body / subject for the result card
         subject = ctx.get("intent_summary", "")
         body = ctx.get("raw_text", "")
         if dispatch_after and result.ok and chat_id:
             _dispatch_investigation_inline(chat_id, result.display_id, subject,
-                                           body, operator_name, locale=locale)
+                                           body, operator_name, locale=locale,
+                                           account_id=account_id)
         new_card = _create_result_card(result, severity, language, operator_name,
                                        subject=subject, body=body,
-                                       dispatched=dispatch_after, locale=locale)
+                                       dispatched=dispatch_after, locale=locale,
+                                       account_id=account_id)
     except Exception as e:
         logger.exception("case create worker crashed")
         new_card = _info_card(
@@ -657,7 +766,7 @@ def _create_worker(card_message_id: str, ctx: dict,
 #    这次是飞书补齐对等，不是新发明。
 # ---------------------------------------------------------------------------
 def _handle_sync_report(chat_id: str, display_id: str, incident_id: str,
-                        locale: str = "zh"
+                        locale: str = "zh", account_id: str = ""
                         ) -> P2CardActionTriggerResponse:
     locale = _normalize_locale(locale)
     if not display_id or not incident_id:
@@ -674,10 +783,20 @@ def _handle_sync_report(chat_id: str, display_id: str, incident_id: str,
     if not ctx:
         return _toast(i18n.t("case.toast.report_expired", locale))
 
+    # 账号来源有两个，卡片上的「章」优先：
+    #   ① 报告卡按钮里的 `case_account_id`（`handle()` 已经取好传进来了）；
+    #   ② 这一行 `support#<incident_id>` 里的 `account_id`（`report_handler
+    #      ._persist_support_context` 写的）—— 兜的是**本次改动之前**发出的旧报告卡，
+    #      它们没有那个章。
+    # 两处都空 = 部署账号 = 改动前的行为。两者本来同源（都来自 `incident#` / `task#`
+    # 路由行），所以不会互相矛盾；真矛盾时以卡片为准 —— 用户点的就是那张卡。
+    account_id = ((account_id or "").strip()
+                  or str(ctx.get("account_id") or "").strip())
+
     if chat_id:
         threading.Thread(
             target=_sync_report_worker,
-            args=(chat_id, display_id, ctx, locale),
+            args=(chat_id, display_id, ctx, locale, account_id),
             daemon=True,
         ).start()
         return _toast(i18n.t("case.pending.sync", locale,
@@ -686,21 +805,25 @@ def _handle_sync_report(chat_id: str, display_id: str, incident_id: str,
     # 卡片回调里拿不到 chat_id（正常点击不会走到这里）。此时唯一还能说话的通道是
     # trigger 响应本身 —— 同步做完直接把结果卡回过去，宁可慢几秒也不能没反馈。
     body = _build_sync_body(ctx)
-    ok = case_management.add_communication(display_id, body)
+    ok = case_management.add_communication(display_id, body,
+                                           account_id=account_id)
     return _build_card_response(
         i18n.t("case.toast.synced", locale) if ok
         else i18n.t("case.toast.sync_failed", locale),
-        _sync_result_card(display_id, ok, locale=locale),
+        _sync_result_card(display_id, ok, locale=locale,
+                          account_id=account_id),
     )
 
 
 def _sync_report_worker(chat_id: str, display_id: str, ctx: dict,
-                        locale: str = "zh") -> None:
+                        locale: str = "zh", account_id: str = "") -> None:
     locale = _normalize_locale(locale)
     try:
         body = _build_sync_body(ctx)
-        ok = case_management.add_communication(display_id, body)
-        new_card = _sync_result_card(display_id, ok, locale=locale)
+        ok = case_management.add_communication(display_id, body,
+                                               account_id=account_id)
+        new_card = _sync_result_card(display_id, ok, locale=locale,
+                                     account_id=account_id)
         fallback = i18n.t("case.sync.success_title" if ok
                           else "case.sync.fail_title", locale)
     except Exception as e:
@@ -777,7 +900,8 @@ def _build_sync_body(ctx: dict) -> str:
     return body
 
 
-def _sync_result_card(display_id: str, ok: bool, locale: str = "zh") -> dict:
+def _sync_result_card(display_id: str, ok: bool, locale: str = "zh",
+                      account_id: str = "") -> dict:
     locale = _normalize_locale(locale)
     if not ok:
         return _info_card(
@@ -793,6 +917,7 @@ def _sync_result_card(display_id: str, ok: bool, locale: str = "zh") -> dict:
                              "content": i18n.t("case.sync.success_title", locale)},
                    "template": "green"},
         "body": {"elements": [
+            *_account_banner(account_id, locale),
             {"tag": "markdown",
              "content": i18n.t("case.sync.success_body", locale,
                                display_id=display_id)},
@@ -801,7 +926,8 @@ def _sync_result_card(display_id: str, ok: bool, locale: str = "zh") -> dict:
                                  case_url, primary=True),
                 _callback_button(i18n.t("case.sync.btn.detail", locale),
                                  {"action": "case_view",
-                                  "case_display_id": display_id}),
+                                  "case_display_id": display_id,
+                                  "case_account_id": account_id}),
             ]),
         ]},
     }
@@ -813,13 +939,15 @@ def _sync_result_card(display_id: str, ok: bool, locale: str = "zh") -> dict:
 def _dispatch_investigation_inline(chat_id: str, display_id: str,
                                    subject: str, body: str,
                                    operator_name: str,
-                                   locale: str = "zh") -> None:
+                                   locale: str = "zh",
+                                   account_id: str = "") -> None:
     """Fire-and-forget dispatch from inside the create flow. Logs but doesn't
     surface errors here — the success card mentions the investigation kicked
     off; failure is recoverable by the user clicking the button on the
     success card again."""
     try:
-        _dispatch_for_case(chat_id, display_id, subject, body, locale=locale)
+        _dispatch_for_case(chat_id, display_id, subject, body, locale=locale,
+                           account_id=account_id)
     except Exception as e:
         logger.error("Inline investigation dispatch failed: %s", e)
 
@@ -827,7 +955,8 @@ def _dispatch_investigation_inline(chat_id: str, display_id: str,
 def _dispatch_investigation_for_case(chat_id: str, display_id: str,
                                      subject: str, body: str,
                                      card_message_id: str,
-                                     locale: str = "zh"
+                                     locale: str = "zh",
+                                     account_id: str = ""
                                      ) -> P2CardActionTriggerResponse:
     """Action handler for the 'Dispatch investigation' button on the success
     card. Synchronous-style: returns either a confirmation or a follow-up card.
@@ -840,7 +969,7 @@ def _dispatch_investigation_for_case(chat_id: str, display_id: str,
         return _toast(i18n.t("case.toast.processing", locale))
 
     result = _dispatch_for_case(chat_id, display_id, subject, body,
-                                locale=locale)
+                                locale=locale, account_id=account_id)
     if result.get("ok"):
         return _toast(i18n.t("case.toast.dispatch_started", locale))
     return _toast(i18n.t("case.toast.dispatch_failed", locale,
@@ -849,7 +978,7 @@ def _dispatch_investigation_for_case(chat_id: str, display_id: str,
 
 def _dispatch_for_case(chat_id: str, display_id: str,
                        subject: str, body: str,
-                       locale: str = "zh") -> dict:
+                       locale: str = "zh", account_id: str = "") -> dict:
     """Shared dispatch implementation used by both the form's
     'create + dispatch' path and the success card's 'dispatch after' button.
 
@@ -873,6 +1002,11 @@ def _dispatch_for_case(chat_id: str, display_id: str,
     `incident_id` 仍然是 `feishu-case-<display_id>`：report_handler 的
     `_extract_case_display_id()` 靠这个形状认出「这次调查是某个案例带起来的」，
     从而在报告卡上给出「同步到案例」按钮。**别改成 `feishu-<event_id>`**。
+
+    `account_id`（2026-09-07 多账号）：案例开在哪个账号，调查就得**查同一个账号**，
+    否则「案例 + 并行调查」这套组合会得出一份关于别人账号的报告。这里把它透传给
+    `devops_agent.start_investigation(account_id=...)`（空 = 部署账号，历史行为），
+    并且落进 `put_im_task` 的 `account_id` —— 进度卡与最终报告都跟着同一个账号。
     """
     locale = _normalize_locale(locale)
     from core import devops_agent
@@ -907,6 +1041,7 @@ def _dispatch_for_case(chat_id: str, display_id: str,
     raw_result = devops_agent.start_investigation(
         title=title, description=user_text, priority="MEDIUM",
         source=f"notiops-im-{PLATFORM}-case",
+        account_id=account_id or None,
     )
     if raw_result.get("error"):
         err = str(raw_result.get("message") or raw_result["error"])
@@ -928,8 +1063,12 @@ def _dispatch_for_case(chat_id: str, display_id: str,
     try:
         resp = feishu_utils.send_card(
             chat_id,
+            # 落款带上账号：这条调查是从一张**已经属于某个账号**的工单发起的，
+            # 而 `raw_result["account_id"]` 已经解析成具体 12 位数字。
             im_cards.dispatch_card(body_text, locale, deep_link=deep, home=home,
-                                   state="dispatched"))
+                                   state="dispatched",
+                                   account=str(raw_result.get("account_id") or ""),
+                                   deploy=im_accounts.deploy_account_id()))
         card_message_id = im_cards.message_id_of(resp)
     except Exception as e:
         logger.error("case dispatch card send failed: %s", type(e).__name__)
@@ -963,6 +1102,12 @@ def _dispatch_for_case(chat_id: str, display_id: str,
             incident_id, task_id, platform=PLATFORM, chat_id=chat_id,
             root_message_id=card_message_id, locale=locale,
             raw_text=user_text[:1000],
+            # 报告卡上那颗「📎 同步到 case」按钮要写的是**这个**账号的工单。
+            # ⚠️ 这里存**请求值**（`account_id`，空 = 部署账号），不存
+            #   `raw_result["account_id"]` —— 后者是 `start_investigation` 解析后的
+            #   结果，单账号客户那里也会是一串部署账号号，于是报告卡上会凭空多出
+            #   一条「🏷️ 账号: …」。全线口径统一：空字符串才代表"没选成员账号"。
+            account_id=account_id or "",
         )
     except Exception as e:
         logger.warning("link_im_investigation for case dispatch failed: %s", e)
@@ -975,7 +1120,8 @@ def _dispatch_for_case(chat_id: str, display_id: str,
 def _handle_reply_submit(display_id: str, body: str,
                          card_message_id: str,
                          internal_id: str = "",
-                         locale: str = "zh"
+                         locale: str = "zh",
+                         account_id: str = ""
                          ) -> P2CardActionTriggerResponse:
     locale = _normalize_locale(locale)
     key = f"reply:{internal_id or display_id}:{card_message_id}"
@@ -985,7 +1131,8 @@ def _handle_reply_submit(display_id: str, body: str,
     if card_message_id:
         threading.Thread(
             target=_reply_worker,
-            args=(card_message_id, display_id, body, internal_id, locale),
+            args=(card_message_id, display_id, body, internal_id, locale,
+                  account_id),
             daemon=True,
         ).start()
         return _build_card_response(
@@ -994,33 +1141,41 @@ def _handle_reply_submit(display_id: str, body: str,
                                  locale=locale))
 
     ok = case_management.add_communication(display_id, body,
-                                           internal_id=internal_id or None)
+                                           internal_id=internal_id or None,
+                                           account_id=account_id)
     return _build_card_response(
         i18n.t("case.toast.sent", locale) if ok
         else i18n.t("case.toast.send_failed", locale),
-        _reply_result_card(display_id, body, ok, locale=locale),
+        _reply_result_card(display_id, body, ok, locale=locale,
+                           account_id=account_id),
     )
 
 
 def _send_reply(chat_id: str, display_id: str, body: str,
-                internal_id: str = "", locale: str = "zh") -> None:
+                internal_id: str = "", locale: str = "zh",
+                account_id: str = "") -> None:
     """Inline-send path used when the user passes the reply body in the
     same message (e.g. '回复 12345 已重启'). No card form interaction."""
     locale = _normalize_locale(locale)
     ok = case_management.add_communication(display_id, body,
-                                           internal_id=internal_id or None)
+                                           internal_id=internal_id or None,
+                                           account_id=account_id)
     feishu_utils.send_card(chat_id=chat_id,
                            card=_reply_result_card(display_id, body, ok,
-                                                   locale=locale))
+                                                   locale=locale,
+                                                   account_id=account_id))
 
 
 def _reply_worker(card_message_id: str, display_id: str, body: str,
-                  internal_id: str, locale: str = "zh") -> None:
+                  internal_id: str, locale: str = "zh",
+                  account_id: str = "") -> None:
     locale = _normalize_locale(locale)
     try:
         ok = case_management.add_communication(display_id, body,
-                                               internal_id=internal_id or None)
-        new_card = _reply_result_card(display_id, body, ok, locale=locale)
+                                               internal_id=internal_id or None,
+                                               account_id=account_id)
+        new_card = _reply_result_card(display_id, body, ok, locale=locale,
+                                      account_id=account_id)
     except Exception as e:
         logger.exception("reply worker crashed")
         new_card = _info_card(
@@ -1037,7 +1192,8 @@ def _reply_worker(card_message_id: str, display_id: str, body: str,
 def _handle_resolve(display_id: str,
                     card_message_id: str,
                     internal_id: str = "",
-                    locale: str = "zh"
+                    locale: str = "zh",
+                    account_id: str = ""
                     ) -> P2CardActionTriggerResponse:
     locale = _normalize_locale(locale)
     if not display_id and not internal_id:
@@ -1049,7 +1205,8 @@ def _handle_resolve(display_id: str,
     if card_message_id:
         threading.Thread(
             target=_resolve_worker,
-            args=(card_message_id, display_id, internal_id, locale),
+            args=(card_message_id, display_id, internal_id, locale,
+                  account_id),
             daemon=True,
         ).start()
         return _build_card_response(
@@ -1058,20 +1215,25 @@ def _handle_resolve(display_id: str,
                                  locale=locale))
 
     final = case_management.resolve_case(display_id,
-                                         internal_id=internal_id or None)
+                                         internal_id=internal_id or None,
+                                         account_id=account_id)
     return _build_card_response(
         i18n.t("case.toast.closed", locale) if final
         else i18n.t("case.toast.close_failed", locale),
-        _resolve_result_card(display_id, final, locale=locale))
+        _resolve_result_card(display_id, final, locale=locale,
+                             account_id=account_id))
 
 
 def _resolve_worker(card_message_id: str, display_id: str,
-                    internal_id: str, locale: str = "zh") -> None:
+                    internal_id: str, locale: str = "zh",
+                    account_id: str = "") -> None:
     locale = _normalize_locale(locale)
     try:
         final = case_management.resolve_case(display_id,
-                                             internal_id=internal_id or None)
-        new_card = _resolve_result_card(display_id, final, locale=locale)
+                                             internal_id=internal_id or None,
+                                             account_id=account_id)
+        new_card = _resolve_result_card(display_id, final, locale=locale,
+                                        account_id=account_id)
     except Exception as e:
         logger.exception("resolve worker crashed")
         new_card = _info_card(
@@ -1227,8 +1389,51 @@ def service_and_type_elements(locale: str) -> list[dict]:
     ]
 
 
-def _create_form_card(subject: str = "", locale: str = "zh") -> dict:
+def _create_form_card(subject: str = "", locale: str = "zh",
+                      account_id: str = "",
+                      account_options: list[tuple[str, str]] | None = None,
+                      deploy_account_id: str = "") -> dict:
+    """开案例表单卡。
+
+    `account_id`（空 = 部署账号）：渲染这一刻的会话账号，即下拉的**默认选中项**，
+    同时盖到每一颗按钮的 `case_account_id` 上。
+
+    ⚠️ **盖章这件事不是可选的**（2026-09-07 现网 bug 的成因）：`handle()` 只从
+    `action_value["case_account_id"]` 取账号（见那里的注释，理由是正确的），所以任何
+    一颗按钮漏了这个键 = 那颗按钮走部署账号。当时的症状是「`/account <成员账号>` 之后
+    开案例，卡上写着成员账号，案例和调查都落在部署账号」—— 卡片显示的和实际执行的
+    不是一回事，而这种错只能靠事后去看工单开在哪才发现。下面三处 `**_stamp` 就是
+    这一条：新加按钮时照抄它，不要再手写一个只有 `action` 的 value。
+
+    `account_options` / `deploy_account_id`：账号下拉的选项与部署账号号，由
+    `start_create` 传进来。**渲染函数自己不解析账号** —— 与
+    `platforms/common/im_footer.py` 同一条纪律（org 模式下解析部署账号底下是一次 STS）。
+    `None` / 空列表 = 不渲染下拉，行为与加下拉之前逐字相同。
+    """
     locale = _normalize_locale(locale)
+    opts = account_options or []
+    # 每一颗按钮都要带的账号章。用 `**_stamp` 展开而不是逐个手写，正是为了让
+    # "漏一颗"这件事在 code review 里看得见。
+    _stamp = {"case_account_id": account_id}
+    account_elements: list[dict] = []
+    if opts:
+        account_elements = [
+            {"tag": "markdown",
+             "content": i18n.t("case.create.account_label", locale)},
+            {"tag": "select_static",
+             "name": "account_select",
+             "placeholder": {"tag": "plain_text",
+                             "content": i18n.t(
+                                 "case.create.account_placeholder", locale)},
+             # ⚠️ 飞书 `initial_index` 是 **1-based**（同 `issue_type_select`）。
+             "initial_index": account_picker.initial_index(
+                 opts, account_id, deploy=deploy_account_id),
+             "options": [{"text": {"tag": "plain_text", "content": lbl},
+                          "value": acct} for acct, lbl in opts],
+             "type": "default",
+             "width": "fill",
+             "required": True},
+        ]
     # Language picker labels are deliberately bilingual / native form
     # (Chinese / 中文, Japanese / 日本語) — they're the language the AWS
     # support engineer should reply in, not the bot UI locale. So we
@@ -1259,6 +1464,9 @@ def _create_form_card(subject: str = "", locale: str = "zh") -> dict:
                 {"tag": "form",
                  "name": "case_create_form",
                  "elements": [
+                     # 账号放**第一项**：这张表里只有它决定"这次写操作落在谁的账号
+                     # 上"，其余各项都只影响工单内容。空列表时整组不出现。
+                     *account_elements,
                      {"tag": "markdown",
                       "content": i18n.t("case.create.subject_label", locale)},
                      {"tag": "input",
@@ -1340,7 +1548,8 @@ def _create_form_card(subject: str = "", locale: str = "zh") -> dict:
                                 "type": "primary",
                                 "form_action_type": "submit",
                                 "behaviors": [{"type": "callback",
-                                               "value": {"action": "case_create_submit"}}]},
+                                               "value": {"action": "case_create_submit",
+                                                         **_stamp}}]},
                            ]},
                           {"tag": "column", "width": "weighted", "weight": 1,
                            "elements": [
@@ -1353,7 +1562,8 @@ def _create_form_card(subject: str = "", locale: str = "zh") -> dict:
                                 "type": "primary",
                                 "form_action_type": "submit",
                                 "behaviors": [{"type": "callback",
-                                               "value": {"action": "case_create_submit_with_dispatch"}}]},
+                                               "value": {"action": "case_create_submit_with_dispatch",
+                                                         **_stamp}}]},
                            ]},
                       ]},
                      {"tag": "markdown",
@@ -1384,12 +1594,22 @@ def _create_form_card(subject: str = "", locale: str = "zh") -> dict:
                                              "case.create.btn.cancel", locale)},
                                 "type": "default",
                                 "behaviors": [{"type": "callback",
-                                               "value": {"action": "case_create_cancel"}}]},
+                                               "value": {"action": "case_create_cancel",
+                                                         **_stamp}}]},
                            ]},
                       ]},
                  ]},
+                # 落在哪个账号 —— 这是本产品唯一的写操作，必须在**提交之前**说清楚。
+                # 有下拉时换一句：那时归属由客户刚点的那一项决定，沿用
+                # `..._target` 会出现"说明写着 A、下拉里选了 B"的自相矛盾卡片。
                 {"tag": "markdown",
-                 "content": i18n.t("case.create.account_note", locale)},
+                 "content": (
+                     i18n.t("case.create.account_note_picker", locale)
+                     if opts
+                     else (i18n.t("case.create.account_note_target", locale,
+                                  account=account_id)
+                           if (account_id or "").strip()
+                           else i18n.t("case.create.account_note", locale)))},
             ],
         },
     }
@@ -1399,7 +1619,7 @@ def _create_result_card(result: support_logic.CaseResult, severity: str,
                         language: str, operator_name: str,
                         subject: str = "", body: str = "",
                         dispatched: bool = False,
-                        locale: str = "zh") -> dict:
+                        locale: str = "zh", account_id: str = "") -> dict:
     locale = _normalize_locale(locale)
     if result.ok:
         cls = result.classification or {}
@@ -1433,6 +1653,7 @@ def _create_result_card(result: support_logic.CaseResult, severity: str,
         sev_label = severity_label(severity, locale)
         lang_label = LANGUAGE_LABELS.get(language, language)
         elements: list[dict] = [
+            *_account_banner(account_id, locale),
             {"tag": "markdown",
              "content": (
                  i18n.t("case.create.case_id_block", locale,
@@ -1467,7 +1688,8 @@ def _create_result_card(result: support_logic.CaseResult, severity: str,
             _open_url_button(i18n.t("case.create.btn.open_case", locale),
                              result.case_url, primary=True),
             _callback_button(i18n.t("case.create.btn.my_cases", locale),
-                             {"action": "case_list_open"}),
+                             {"action": "case_list_open",
+                              "case_account_id": account_id}),
         ]))
         return {
             "schema": "2.0",
@@ -1479,17 +1701,16 @@ def _create_result_card(result: support_logic.CaseResult, severity: str,
             "body": {"elements": elements},
         }
     code = result.error_code or "Error"
-    if code == "SubscriptionRequiredException":
-        hint = i18n.t("case.create.fail_subscription", locale)
-    else:
-        hint = (result.error_message or "")[:300]
+    # 失败文案统一走 `support_logic.failure_hint`（跨账号 / 缺写权限 / 缺只读权限 /
+    # 无 Support 计划四种成因各有各的出路），别在这里再维护一条 if 链 —— 五个渲染点
+    # 各写一份的时候，漏掉的正是跨账号那两种。
     return _info_card(
         i18n.t("case.create.fail_title", locale, code=code),
-        hint, "red")
+        support_logic.failure_hint(result, locale), "red")
 
 
 def _list_card(cases: list[CaseSummary], status_filter: str = "recent",
-               locale: str = "zh") -> dict:
+               locale: str = "zh", account_id: str = "") -> dict:
     locale = _normalize_locale(locale)
     console_url = case_management.SUPPORT_CONSOLE_LIST_URL
     label = _filter_label(status_filter, locale)
@@ -1506,18 +1727,20 @@ def _list_card(cases: list[CaseSummary], status_filter: str = "recent",
                                      label=label)},
                        "template": "grey"},
             "body": {"elements": [
+                *_account_banner(account_id, locale),
                 {"tag": "markdown", "content": empty_msg},
-                _filter_quick_row(status_filter, locale),
+                _filter_quick_row(status_filter, locale, account_id),
                 _action_row([_open_url_button(
                     i18n.t("case.list.btn.console_all", locale),
                     console_url, primary=True)]),
             ]},
         }
-    elements: list[dict] = [{
-        "tag": "markdown",
-        "content": _bold(i18n.t("case.list.subtotal", locale,
-                                label=label, count=len(cases))),
-    }]
+    elements: list[dict] = [
+        *_account_banner(account_id, locale),
+        {"tag": "markdown",
+         "content": _bold(i18n.t("case.list.subtotal", locale,
+                                 label=label, count=len(cases)))},
+    ]
     for c in cases:
         elements.append({"tag": "hr"})
         sev_emoji = {"critical": "🟣", "urgent": "🔴", "high": "🟠",
@@ -1546,7 +1769,10 @@ def _list_card(cases: list[CaseSummary], status_filter: str = "recent",
             body_md += f"\n\n> {_escape_md(c.recent_communication)}"
         elements.append({"tag": "markdown", "content": body_md})
         action_val = {"case_display_id": c.display_id,
-                      "case_internal_id": c.internal_id}
+                      "case_internal_id": c.internal_id,
+                      # 卡片自带账号「盖章」：按钮点回来时只认这个，不查那一刻的会话
+                      # 偏好（用户可能已经切了账号，而 `internal_id` 只在原账号有效）。
+                      "case_account_id": account_id}
         # Hide the close button for already-resolved cases (idempotent on
         # the API side, but it's noisy in the UI).
         actions = [
@@ -1572,7 +1798,7 @@ def _list_card(cases: list[CaseSummary], status_filter: str = "recent",
         "tag": "markdown",
         "content": i18n.t("case.list.quick_filter_header", locale),
     })
-    elements.append(_filter_quick_row(status_filter, locale))
+    elements.append(_filter_quick_row(status_filter, locale, account_id))
     elements.append({
         "tag": "markdown",
         "content": i18n.t("case.list.see_more_hint", locale),
@@ -1592,7 +1818,7 @@ def _list_card(cases: list[CaseSummary], status_filter: str = "recent",
 
 
 def _view_card(c: CaseSummary, comms: list[Communication],
-               locale: str = "zh") -> dict:
+               locale: str = "zh", account_id: str = "") -> dict:
     """Detail card: case meta + recent communications + action buttons."""
     locale = _normalize_locale(locale)
     sev_label = severity_label(c.severity, locale)
@@ -1607,7 +1833,8 @@ def _view_card(c: CaseSummary, comms: list[Communication],
         created=_short_date(c.created_at),
         submitter=c.submitted_by or i18n.t("case.list.unknown_submitter", locale),
     )
-    elements: list[dict] = [{"tag": "markdown", "content": head_md},
+    elements: list[dict] = [*_account_banner(account_id, locale),
+                            {"tag": "markdown", "content": head_md},
                             {"tag": "hr"}]
     if not comms:
         elements.append({"tag": "markdown",
@@ -1632,7 +1859,8 @@ def _view_card(c: CaseSummary, comms: list[Communication],
     elements.append({"tag": "hr"})
     is_resolved = c.status.startswith("resolved") or c.status == "closed"
     action_val = {"case_display_id": c.display_id,
-                  "case_internal_id": c.internal_id}
+                  "case_internal_id": c.internal_id,
+                  "case_account_id": account_id}
     actions = [
         _callback_button(i18n.t("case.view.btn.add_reply", locale),
                          {"action": "case_reply_form", **action_val},
@@ -1659,11 +1887,12 @@ def _view_card(c: CaseSummary, comms: list[Communication],
 
 
 def _reply_form_card(display_id: str, internal_id: str = "",
-                     locale: str = "zh") -> dict:
+                     locale: str = "zh", account_id: str = "") -> dict:
     locale = _normalize_locale(locale)
     submit_value = {"action": "case_reply_submit",
                     "case_display_id": display_id,
-                    "case_internal_id": internal_id}
+                    "case_internal_id": internal_id,
+                    "case_account_id": account_id}
     return {
         "schema": "2.0",
         "config": card_config(streaming_mode=False),
@@ -1672,6 +1901,7 @@ def _reply_form_card(display_id: str, internal_id: str = "",
                                                display_id=display_id)},
                    "template": "blue"},
         "body": {"elements": [
+            *_account_banner(account_id, locale),
             {"tag": "markdown",
              "content": i18n.t("case.reply.intro", locale)},
             {"tag": "form",
@@ -1719,7 +1949,7 @@ def _reply_form_card(display_id: str, internal_id: str = "",
 
 
 def _reply_result_card(display_id: str, body: str, ok: bool,
-                       locale: str = "zh") -> dict:
+                       locale: str = "zh", account_id: str = "") -> dict:
     locale = _normalize_locale(locale)
     if not ok:
         return _info_card(
@@ -1736,6 +1966,7 @@ def _reply_result_card(display_id: str, body: str, ok: bool,
                                                locale)},
                    "template": "green"},
         "body": {"elements": [
+            *_account_banner(account_id, locale),
             {"tag": "markdown",
              "content": i18n.t("case.reply.success_intro", locale,
                                display_id=display_id)},
@@ -1746,17 +1977,19 @@ def _reply_result_card(display_id: str, body: str, ok: bool,
                                  case_url),
                 _callback_button(i18n.t("case.reply.btn.detail", locale),
                                  {"action": "case_view",
-                                  "case_display_id": display_id}),
+                                  "case_display_id": display_id,
+                                  "case_account_id": account_id}),
             ]),
         ]},
     }
 
 
 def _resolve_confirm_card(display_id: str, internal_id: str = "",
-                          locale: str = "zh") -> dict:
+                          locale: str = "zh", account_id: str = "") -> dict:
     locale = _normalize_locale(locale)
     action_val = {"case_display_id": display_id,
-                  "case_internal_id": internal_id}
+                  "case_internal_id": internal_id,
+                  "case_account_id": account_id}
     return {
         "schema": "2.0",
         "config": card_config(streaming_mode=False),
@@ -1765,6 +1998,7 @@ def _resolve_confirm_card(display_id: str, internal_id: str = "",
                                                locale)},
                    "template": "orange"},
         "body": {"elements": [
+            *_account_banner(account_id, locale),
             {"tag": "markdown",
              "content": i18n.t("case.resolve.confirm_body", locale,
                                display_id=display_id)},
@@ -1780,7 +2014,7 @@ def _resolve_confirm_card(display_id: str, internal_id: str = "",
 
 
 def _resolve_result_card(display_id: str, final_status: str,
-                         locale: str = "zh") -> dict:
+                         locale: str = "zh", account_id: str = "") -> dict:
     locale = _normalize_locale(locale)
     if not final_status:
         return _info_card(
@@ -1796,6 +2030,7 @@ def _resolve_result_card(display_id: str, final_status: str,
                                                locale)},
                    "template": "green"},
         "body": {"elements": [
+            *_account_banner(account_id, locale),
             {"tag": "markdown",
              "content": i18n.t("case.resolve.success_body", locale,
                                display_id=display_id, status=final_status)},
@@ -1847,7 +2082,7 @@ def _pending_simple_card(text: str, locale: str = "zh") -> dict:
 
 
 def _analyze_card(result: case_analyze.AnalyzeResult,
-                  locale: str = "zh") -> dict:
+                  locale: str = "zh", account_id: str = "") -> dict:
     """LLM case-analysis card: meta header + 4-6 insight sections + 3
     action buttons (reply / view full / dispatch investigation).
 
@@ -1866,7 +2101,8 @@ def _analyze_card(result: case_analyze.AnalyzeResult,
         status=c.status or "—",
         comm_count=result.comm_count,
     )
-    elements: list[dict] = [{"tag": "markdown", "content": head_md},
+    elements: list[dict] = [*_account_banner(account_id, locale),
+                            {"tag": "markdown", "content": head_md},
                             {"tag": "hr"}]
 
     def _section(header_key: str, body_md: str) -> None:
@@ -1903,7 +2139,8 @@ def _analyze_card(result: case_analyze.AnalyzeResult,
 
     elements.append({"tag": "hr"})
     action_val = {"case_display_id": c.display_id,
-                  "case_internal_id": c.internal_id}
+                  "case_internal_id": c.internal_id,
+                  "case_account_id": account_id}
     actions = [
         _callback_button(i18n.t("case.analyze.btn.reply", locale),
                          {"action": "case_reply_form", **action_val},

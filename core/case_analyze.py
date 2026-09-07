@@ -183,16 +183,21 @@ def _system_prompt_for_locale(locale: str) -> str:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-def analyze(display_id: str, *, locale: str = "en") -> AnalyzeResult:
+def analyze(display_id: str, *, locale: str = "en",
+            account_id: str = "") -> AnalyzeResult:
     """End-to-end: fetch case + comms → call Bedrock → parse → return.
 
     Failure modes are signalled via `result.error` (non-empty string) so
     callers can render a graceful "couldn't analyze" message instead of
     raising. Logs the actual exception for ops.
+
+    `account_id`（空 = 部署账号）：工单在哪个账号下。跨账号取不到凭证时
+    `describe_case` 返回 None → 这里报 `case_not_found`，**不会**去部署账号里
+    找同号工单（那会分析出一个完全无关的案例）。
     """
     locale = locale if locale in {"zh", "en"} else "en"
 
-    case = case_management.describe_case(display_id)
+    case = case_management.describe_case(display_id, account_id=account_id)
     if case is None:
         return AnalyzeResult(error="case_not_found")
 
@@ -200,6 +205,7 @@ def analyze(display_id: str, *, locale: str = "en") -> AnalyzeResult:
         display_id,
         max_items=_MAX_COMMS,
         internal_id=case.internal_id,
+        account_id=account_id,
     )
 
     prompt_payload = _format_for_prompt(case, comms)

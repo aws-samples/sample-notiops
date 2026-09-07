@@ -382,9 +382,34 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
 
   // STS AssumeRole —— create_investigation 需要 assume 目标账号的 Trigger Role
   // （本账号也要自 assume）。
+  //
+  // ⚠️ 账号维度是 `*` 而**不是** `cdk.Aws.ACCOUNT_ID`：IM 侧多账号（`/account <id>`）
+  // 要 assume 的是**成员账号**里那个 `notiops-agent-trigger-<acct>-m<sys>` 角色
+  // （由 member-devops-agent.yaml 建）。写死部署账号的症状：Web 上把成员账号启用了、
+  // IM 上 `/account` 也能切过去，但一发起调查就 AccessDenied —— 而同一个账号在 web
+  // 端完全正常（web 走 web-chat-core.ts 里那份账号维度已经是 `*` 的授权）。
+  // 与 [web-chat-core.ts](./web-chat-core.ts) 里 BFF 那条**逐字一致**（两边漂了就是
+  // 「web 能问、IM 不能问」这种最难查的不对称）。
+  //
+  // 收窄的部分仍在角色名上：只允许 `notiops-agent-trigger-*` 这一族。
+  // **不要**图省事写成 `Resource: "*"` —— 那等于允许 assume 任意账号的任意角色，
+  // 而真正的越权拦截线（哪些账号可问）在 `allowed_accounts` + 目标角色自己的信任策略上，
+  // 这条 IAM 语句是第二道防线，不是唯一那道。
   imRole.addToPrincipalPolicy(new iam.PolicyStatement({
     actions: ["sts:AssumeRole"],
-    resources: [`arn:aws:iam::${cdk.Aws.ACCOUNT_ID}:role/notiops-agent-trigger-*`],
+    resources: [
+      "arn:aws:iam::*:role/notiops-agent-trigger-*",
+      // 案例多账号（2026-09-07）：`/account` 切到成员账号后开 / 回复 / 关工单，走的是
+      // 成员账号的**采集角色** `notiops-idle-detection-role[-<系统账号>]`
+      // （由 member-account-onboarding.yaml 建，`EnableSupportCaseWrite=true` 时
+      // 带那三条 support 写权限）。
+      //
+      // ⚠️ 这是与上面 Trigger Role **不同的一族角色**，别以为一条通配盖住了两者：
+      // 少了这条的症状是「Web 上跨账号能开工单、IM 上同一个账号 AssumeRole 就 AccessDenied」
+      // —— 又一个只在一个入口上出现的不对称。与 web-chat-core.ts 里 BFF 那条对齐
+      // （那边是 `notiops-idle-detection-role*`，同一族）。
+      "arn:aws:iam::*:role/notiops-idle-detection-role*",
+    ],
   }));
 
   // DevOps Agent —— progress Lambda 读 journal 增量刷卡片；worker 发起调查 + 直连对话。

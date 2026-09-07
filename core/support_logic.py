@@ -21,6 +21,7 @@ so without this guard we'd open duplicate cases.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -34,7 +35,64 @@ from . import i18n
 
 logger = logging.getLogger(__name__)
 
-_support = boto3.client("support", region_name="us-east-1")
+#: AWS Support 是**全局服务**，endpoint 固定在 us-east-1（跟部署 region 无关）。
+#: 跨账号那条路也一样：assume 完成员账号的角色，仍然打 us-east-1。
+SUPPORT_REGION = "us-east-1"
+
+#: 部署账号的 Support client。
+#:
+#: ⚠️ **保留这个模块级属性**，不要改成"每次都新建"：
+#:   1. `tests/test_im_case_panel_fields.py` 用 `monkeypatch.setattr(support_logic,
+#:      "_support", fake)` 打桩，而 `support_client()` 是**在调用时**读这个全局的，
+#:      所以打桩照旧生效（`core/case_management.py` 同理）；
+#:   2. 部署账号的凭证不过期，复用一个 client 省掉每轮的握手。
+#: 跨账号**不**缓存 client —— 临时凭证有时效，见 `core/aws_session.py` 不变量 #4。
+_support = boto3.client("support", region_name=SUPPORT_REGION)
+
+#: 跨账号拿不到凭证时的统一错误码。调用方（IM 的案例流程）把它翻成
+#: `failure_hint()` 里那句话；**绝不许**回落到部署账号的 client ——
+#: 那等于把工单开到另一个账号里，而用户看到的是"提交成功"。
+CROSS_ACCOUNT_ERROR_CODE = "CrossAccountUnavailable"
+
+#: 目标账号的角色没有 Support **写**权限时的统一错误码。
+#: 对应成员账号 onboarding 模板参数 `EnableSupportCaseWrite=false`
+#: （见 `infra/member-account-onboarding.yaml`）。单独一个码而不是直接抛
+#: `AccessDeniedException`：后者会让客户以为是 NotiOps 坏了，而这其实是
+#: 客户自己在成员账号里**选择关掉**的一项授权，出路很明确（重跑 onboarding 打开它）。
+WRITE_NOT_GRANTED_ERROR_CODE = "CaseWriteNotGranted"
+
+#: 探针（`case_capability`）阶段就被拒 = 那个账号的角色连 Support **只读**都没有。
+#: 与 `WRITE_NOT_GRANTED_ERROR_CODE` 是两回事，出路也不同（前者是角色根本没挂
+#: ReadOnlyAccess / 被 SCP 拦了，后者只是那一项写授权关着），所以给两个码两句话。
+SUPPORT_READ_DENIED_ERROR_CODE = "SupportReadDenied"
+
+#: AWS 各服务对"没权限"用的几种码（Support API 实测返回 AccessDeniedException，
+#: 其余几个是别的服务/别的失败路径上见过的，一起认，别漏判成"未知错误"）。
+_DENIED_CODES = ("AccessDenied", "AccessDeniedException",
+                 "UnauthorizedOperation", "UnrecognizedClientException")
+
+
+def support_client(account_id: str | None = None):
+    """Support client（多账号）。
+
+    Args:
+        account_id: 目标账号号。空 / 等于部署账号 = 用部署账号本地凭证（历史行为）。
+
+    Returns:
+        boto3 support client；或 `None` = **拒绝**（没上车 / Web 上停用了 /
+        `LOCKED_ACCOUNT_ID` 闸门 / AssumeRole 失败）。
+
+    ⚠️ 拿到 `None` 的调用方必须报错给用户，**不许**退回 `_support`。
+       这是 `core/aws_session.py` 的不变量 #3，也是 Web 侧 2026-08-05 那个
+       「跨账号建案误落部署账号」（`acea5ac`）的同一条教训。
+    """
+    from . import aws_session
+    if aws_session.is_local(account_id):
+        return _support
+    sess = aws_session.get_session(str(account_id).strip())
+    if sess is None:
+        return None
+    return sess.client("support", region_name=SUPPORT_REGION)
 
 # AWS Support API severity codes (lowercase) — confirmed against
 # describe-severity-levels in Business plan.
@@ -144,6 +202,94 @@ class CaseResult:
     error_code: str = ""
     error_message: str = ""
     classification: dict | None = None
+
+
+def failure_hint(result: "CaseResult", locale: str = "zh") -> str:
+    """建案失败时结果卡上那句人话。**五个渲染点共用这一份**。
+
+    为什么集中在这里：飞书 / Slack / 钉钉的案例面板 + 飞书 / Slack 的报告升级路径
+    一共五处渲染 `CaseResult`，各写一条 `if code == ...` 的话，加一个错误码就得改五处，
+    漏一处的表现是"客户看到一串 AWS 原始错误码"。
+
+    未知错误码就回落到 AWS 的原始 message（截断）—— 那比一句笼统的"失败了"有用。
+    """
+    code = (result.error_code or "").strip()
+    if code == "SubscriptionRequiredException":
+        return i18n.t("case.create.fail_subscription", locale)
+    if code == CROSS_ACCOUNT_ERROR_CODE:
+        return i18n.t("case.create.fail_cross_account", locale)
+    if code == WRITE_NOT_GRANTED_ERROR_CODE:
+        return i18n.t("case.create.fail_write_not_granted", locale)
+    if code == SUPPORT_READ_DENIED_ERROR_CODE:
+        return i18n.t("case.create.fail_support_read_denied", locale)
+    return (result.error_message or "")[:300]
+
+
+#: `case_capability` 的结论缓存（进程内，account -> (时间戳, 结论)）。
+#: 与 web 侧 `agent-build/.../core/support_cases.py` 同一个 TTL。
+_CAP_TTL_SEC = 900
+_cap_cache: dict[str, tuple[float, dict]] = {}
+
+
+def case_capability(account_id: str = "", *, use_cache: bool = True) -> dict:
+    """这个账号**现在**能不能开 support case —— 在弹面板之前先探一次。
+
+    返回 `{"ok": True}` 或 `{"ok": False, "reason": ..., "code": ...}`；
+    `reason` ∈ `cross_account_unavailable` | `support_plan_required` | `access_denied`。
+    `code` 是给结果卡用的错误码（可直接喂 `failure_hint`）。
+
+    为什么探：IM 的案例面板要用户挑严重级别、服务、类别、正文。这些全填完点提交，
+    才因为"这个成员账号是 Basic 计划"被拒，是最差的体验。探针用
+    `describe_severity_levels` —— Support API 里最便宜的只读调用，与建案受同一个
+    支持计划闸门。
+
+    ⚠️ **探针探不出"缺写权限"**：`DescribeSeverityLevels` 属只读，`ReadOnlyAccess`
+       就给了。所以成员账号把 `EnableSupportCaseWrite` 关掉时这里仍然返回 ok，
+       真正的拒绝发生在 `create_case`，由那里翻成
+       `WRITE_NOT_GRANTED_ERROR_CODE` 明说是哪一项授权、怎么打开。
+       这是有意的取舍：唯一能提前测出写权限的办法是真开一个工单，
+       或者依赖成员账号的 `iam:SimulatePrincipalPolicy`（多一个 IAM 依赖、
+       还测不到 SCP），代价都比"最后一步给一句准确的话"大。
+
+    拿不准时（限流、网络抖动、未知错误码）**一律返回 ok** —— 宁可让客户走到真正建案
+    那一步看到确切报错，也不要因为一次抖动就断言"你开不了工单"。
+    """
+    key = str(account_id or "").strip() or "_local"
+    now = time.monotonic()
+    if use_cache:
+        hit = _cap_cache.get(key)
+        if hit and now - hit[0] < _CAP_TTL_SEC:
+            return dict(hit[1])
+
+    client = support_client(account_id)
+    if client is None:
+        # 不缓存：账号随时可能在 Web 上被启用/上车。
+        return {"ok": False, "reason": "cross_account_unavailable",
+                "code": CROSS_ACCOUNT_ERROR_CODE}
+
+    try:
+        client.describe_severity_levels()
+        verdict = {"ok": True}
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code == "SubscriptionRequiredException":
+            verdict = {"ok": False, "reason": "support_plan_required",
+                       "code": code}
+        elif code in _DENIED_CODES:
+            verdict = {"ok": False, "reason": "access_denied",
+                       "code": SUPPORT_READ_DENIED_ERROR_CODE,
+                       "aws_code": code}
+        else:
+            logger.info("case_capability inconclusive (%s) — treating as available",
+                        code or type(e).__name__)
+            return {"ok": True, "probe_error": code}
+    except Exception as e:  # noqa: BLE001
+        logger.info("case_capability probe failed (%s) — treating as available",
+                    type(e).__name__)
+        return {"ok": True, "probe_error": type(e).__name__}
+
+    _cap_cache[key] = (now, dict(verdict))
+    return verdict
 
 
 def claim_inflight(key: str) -> bool:
@@ -327,7 +473,7 @@ def apply_case_overrides(classification: dict, *, service_text: str = "",
 def create_case(ctx: dict, *, platform: str, severity: str, language: str,
                 extra: str, operator_name: str,
                 service_text: str = "", issue_type: str = "",
-                category_text: str = "") -> CaseResult:
+                category_text: str = "", account_id: str = "") -> CaseResult:
     """Classify the investigation and call support:CreateCase.
 
     Pure logic — no card rendering, no Feishu/Slack SDK calls.
@@ -336,12 +482,29 @@ def create_case(ctx: dict, *, platform: str, severity: str, language: str,
     `service_text` / `issue_type` / `category_text` 是**面板里用户填的**（IM 端
     2026-09-03 补服务与类型、2026-09-04 补类别，与 web 端案例面板对齐）。全部留空
     = 完全交给分类器，即历史行为。
+
+    `account_id`（2026-09-07，案例多账号）：工单开在**哪个账号**下。空 = 部署账号
+    （历史行为）。非空且拿不到那个账号的凭证时返回
+    `CaseResult(ok=False, error_code=CROSS_ACCOUNT_ERROR_CODE)` ——
+    **绝不**悄悄开到部署账号去。
+
+    ⚠️ 客户端拿到的 `caseId` 是**账号内**唯一的，跨账号看不到；所以后续的
+    `describe_case` / `add_communication` / `resolve_case` 必须带同一个 `account_id`
+    （卡片按钮里会把它随 `action_value` 一起带上，见两个 `case_flow.py`）。
     """
     if severity not in SEVERITY_CODES:
         return CaseResult(ok=False, error_code="InvalidSeverity",
                           error_message=f"unknown severity: {severity}")
     if language not in LANGUAGE_CODES:
         language = DEFAULT_LANGUAGE
+
+    client = support_client(account_id)
+    if client is None:
+        # 分类器还没跑，所以这里没有 classification —— 有意的：跨账号拿不到凭证时
+        # 连那次（全 IM 最贵的一次输入）都不该烧。
+        logger.warning("create_case refused: no credentials for target account")
+        return CaseResult(ok=False, error_code=CROSS_ACCOUNT_ERROR_CODE,
+                          error_message="cross-account credentials unavailable")
 
     subject = build_subject(ctx, platform)
     body = build_body(ctx, severity, extra, operator_name, platform)
@@ -358,7 +521,7 @@ def create_case(ctx: dict, *, platform: str, severity: str, language: str,
                                           category_text=category_text)
 
     try:
-        resp = _support.create_case(
+        resp = client.create_case(
             subject=subject,
             serviceCode=classification["serviceCode"],
             categoryCode=classification["categoryCode"],
@@ -370,7 +533,7 @@ def create_case(ctx: dict, *, platform: str, severity: str, language: str,
         internal_id = resp.get("caseId", "")
         display_id = internal_id
         try:
-            d = _support.describe_cases(
+            d = client.describe_cases(
                 caseIdList=[internal_id],
                 includeCommunications=False,
             )
@@ -396,6 +559,14 @@ def create_case(ctx: dict, *, platform: str, severity: str, language: str,
         code = err.get("Code", "")
         msg = err.get("Message", str(e))
         logger.error("CreateCase failed (%s): %s", code, msg)
+        if code in _DENIED_CODES:
+            # 没权限建案 = 那个账号的 NotiOps 角色缺 `support:CreateCase`。换成自己的码，
+            # 结果卡才能说出"是哪一项授权、在哪打开"，而不是甩一句 AccessDeniedException
+            # 让客户以为 NotiOps 坏了。原始码保留在 message 里便于排查。
+            return CaseResult(ok=False,
+                              error_code=WRITE_NOT_GRANTED_ERROR_CODE,
+                              error_message=f"{code}: {msg}",
+                              classification=classification)
         return CaseResult(ok=False, error_code=code, error_message=msg,
                           classification=classification)
     except Exception as e:

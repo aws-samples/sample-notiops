@@ -746,6 +746,20 @@ def _err_code(exc: Exception) -> str:
     return type(exc).__name__
 
 
+#: 「客户自己拿主意」的成员账号模板参数 —— 升级时**保留客户当前值**，不许被模板
+#: Default 盖回去。
+#:
+#: 🔴 为什么需要这份清单：`update_stack_set` 传的是一份**完整**参数列表，列表里没有的
+#: 参数**回落到模板 Default**（不是"保持原值"）。所以一个把 `EnableSupportCaseWrite`
+#: 改成 `false` 的客户，只要我们下次升级（改了模板 / 改了 handler / 换了 ReleaseTag）
+#: 就会被静默改回 `true` —— 客户做过的安全决定被产品升级悄悄推翻，而现场没有任何提示。
+#:
+#: 也**不能**图省事用 `UsePreviousValue=True`：从老模板升上来的那一次，这个参数在既有
+#: StackSet 里压根不存在，CFN 直接 ValidationError（"has no previous value"），
+#: 于是第一次升级就整块失败。所以只能先 describe 再按「存在才继承」处理。
+_PRESERVE_MEMBER_PARAMS = ("EnableSupportCaseWrite",)
+
+
 def _stackset_upsert(cfn, name: str, template: str, params: dict, description: str,
                      auto_deployment: bool) -> str:
     """建或更新一个 service-managed StackSet。已存在就更新（升级时把新版模板滚到
@@ -754,14 +768,23 @@ def _stackset_upsert(cfn, name: str, template: str, params: dict, description: s
     更新失败**不抛**：最常见的原因是「有 operation 正在跑」，而那不该让客户整个栈
     更新回滚 —— 与 setup.sh 同一取舍（那边也是打一条 ⚠ 就继续）。
     """
-    parameters = [{"ParameterKey": k, "ParameterValue": v} for k, v in sorted(params.items())]
     try:
-        cfn.describe_stack_set(StackSetName=name)
+        desc = cfn.describe_stack_set(StackSetName=name)
         exists = True
     except ClientError as exc:
         if _err_code(exc) not in ("StackSetNotFoundException", "ValidationError"):
             raise
+        desc = {}
         exists = False
+
+    params = dict(params)
+    if exists:
+        current = {p.get("ParameterKey"): p.get("ParameterValue")
+                   for p in desc.get("StackSet", {}).get("Parameters", [])}
+        for key in _PRESERVE_MEMBER_PARAMS:
+            if key in current:
+                params[key] = current[key]
+    parameters = [{"ParameterKey": k, "ParameterValue": v} for k, v in sorted(params.items())]
 
     if not exists:
         auto = ({"Enabled": True, "RetainStacksOnAccountRemoval": False}

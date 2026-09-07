@@ -48,7 +48,16 @@ import {
   serviceCatalog as ruleServiceCatalog,
 } from "./inspection_rule_limits.mjs";
 
-const TABLE = process.env.INSPECTION_TABLE || "notiops-inspection";
+/* 🔴 **不许加 `|| "notiops-inspection"` 兜底。** 空串是一个有意义的值：
+   「这条部署路径（方式 A / 一键部署）上没有巡检后端」。兜底会把空串填回成表名，
+   于是每个端点都去 Query 一张不存在的表，前端拿到的是
+   「加载失败 (ddb_error)」—— 一句既不说明原因也不给出路的话。
+   见 `infra/lib/constructs/web-chat-core.ts` 的 `INSPECTION_TABLE`。 */
+const TABLE = process.env.INSPECTION_TABLE || "";
+
+/** 这套部署里有没有巡检后端。`false` = 方式 A（一键部署）的最小底座。 */
+export const inspectionConfigured = () =>
+  String(process.env.INSPECTION_TABLE || "").trim() !== "";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },

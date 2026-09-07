@@ -193,6 +193,8 @@
 
     { "key": "nav:inspection", "level": "tab", "viewState": "inspection",
       "title_zh": "巡检", "title_en": "Inspection",
+      "requiresEnv": "INSPECTION_TABLE",
+      "_note_env": "requiresEnv（2026-09-07）：方式A（一键部署）的最小底座不含 notiops-inspection 表与那一族 Lambda，web-chat-core.ts 在那条路上把 INSPECTION_TABLE 注成空串，于是整个 tab 从 /capabilities 树里摘掉。以前没有这道闸门，方式A 上这个 tab 恒可见、点进去是「加载失败 (ddb_error)」。SHALL NOT 把 inspection.mjs 里那个 `|| \"notiops-inspection\"` 兜底加回去 —— 那会把空串填回成表名，闸门空转。",
       "_note": "tab 只挂「总览 + 明细 + 序列」三条：它们是任何子页都要用的公共读取。列表按 kind 分权到子页（见下），SHALL NOT 把 /inspection/findings$ 放回这里 —— tab 级 route 会遮蔽子页的 queryMatch（matchRoute 按节点顺序取首个命中），从而绕过按页分权。",
       "routes": [
         { "method": "GET", "pattern": "/inspection/overview$" },

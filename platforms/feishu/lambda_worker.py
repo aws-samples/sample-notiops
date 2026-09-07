@@ -28,6 +28,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 from core import bedrock_credentials
 from core import ddb_state
 from core import i18n
+from core import im_accounts
 from core import locale_resolver
 from platforms.common import lambda_deadline, quoted_context, router
 from platforms.common.im_types import ImMessage
@@ -114,7 +115,12 @@ def _normalize_message(event: P2ImMessageReceiveV1) -> ImMessage | None:
         root_message_id=root_id or msg.message_id or "",
         is_direct=is_dm,
         mentioned=mentioned,
-        account_id="",
+        # 「这个会话在问哪个 AWS 账号」—— 空 = 部署账号。`resolve()` 在没设过偏好时
+        # 只花一次 GetItem 就短路返回（绝大多数消息走这条），设过才多一次注册表校验。
+        # 校验就放在这里、只放这一次：下游能力拿到的 `account_id` 已经是"Web 上确实
+        # 启用着"的账号，不需要各自再校验一遍（见 `core/im_accounts.py`）。
+        account_id=im_accounts.resolve(
+            platform=PLATFORM, chat_id=chat_id, user_id=user_id, is_dm=is_dm),
         locale=pre_locale,
         quoted_message_id=parent_id,
     )
@@ -184,6 +190,25 @@ def _handle_message(event_dict: dict) -> None:
     )
 
 
+def _resolve_account_either_scope(chat_id: str, user_id: str) -> str:
+    """卡片回调专用：先按**群**归属找账号偏好，找不到再按**私聊**找。
+
+    为什么不能只传一个 `is_dm`：卡片回调事件里**没有** chat_type（见 `_action_message`
+    的 docstring），而偏好的归属规则是"群按 chat、私聊按 user"（`core.im_prefs._resolve`）。
+    只传 `is_dm=True` 的症状是：在一个已经 `/account <某账号>` 的群里点「转深度调查」，
+    调查却发到**部署账号** —— 与用户上一秒刚问的那个账号不一致，而界面上看不出来。
+
+    代价是最坏两次 GetItem，只发生在**点按钮**这条低频路径上。
+    """
+    if chat_id:
+        acct = im_accounts.resolve(platform=PLATFORM, chat_id=chat_id,
+                                   user_id=user_id, is_dm=False)
+        if acct:
+            return acct
+    return im_accounts.resolve(platform=PLATFORM, chat_id="",
+                               user_id=user_id, is_dm=True)
+
+
 def _action_message(event: P2CardActionTrigger, action_value: dict) -> ImMessage:
     """卡片回调 → `ImMessage`，供 `im_*` 那三个 0-token 兜底按钮复用 `FeishuCaps`。
 
@@ -207,7 +232,9 @@ def _action_message(event: P2CardActionTrigger, action_value: dict) -> ImMessage
         chat_id=chat_id, user_id=user_id,
         text=text, raw_text=text,
         message_id=card_message_id, root_message_id=card_message_id,
-        is_direct=True, mentioned=True, account_id="", locale=pre_locale,
+        is_direct=True, mentioned=True,
+        account_id=_resolve_account_either_scope(chat_id, user_id),
+        locale=pre_locale,
     )
 
 

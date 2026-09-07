@@ -329,7 +329,8 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
                 linked_case_display_id: str = "",
                 next_steps: list[dict] | None = None,
                 locale: str = "en", title: str = "",
-                report_truncated: bool = False) -> None:
+                report_truncated: bool = False,
+                case_account_id: str = "") -> None:
     """Post the investigation result as **one** Slack message.
 
     Until 2026-09-05 this posted two messages — body, then a separate
@@ -342,6 +343,11 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
 
     ⚠️ **没有 `console_url` 参数**(控制台深链不上报告卡)——理由见下面
     `action_row` 处的注释。别看见调用方手里有这个值就补回参数。
+
+    `case_account_id`（2026-09-07 多账号，空 = 部署账号）：这次调查查的是哪个 AWS
+    账号。① 元数据里把账号号念出来；② 盖进「📎 同步到 case」按钮的 value，让那条
+    评论写进**对的**账号的工单（按钮可以几小时后才被点，那时会话里选的账号可能已经
+    换了，而工单只在原账号里存在）。与 `feishu_sender.send_report` 同一套口径。
     """
     if not is_configured():
         logger.warning("Slack not configured — skipping send_report")
@@ -366,6 +372,10 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
         meta_lines.append(
             i18n.t("report.header.linked_case", locale,
                    case_display_id=linked_case_display_id))
+    # 跨账号时把账号号念出来。空 = 部署账号 = 不加这行（单账号客户的消息一字不变）。
+    if (case_account_id or "").strip():
+        meta_lines.append(i18n.t("case.account_banner", locale,
+                                 account=case_account_id.strip()))
 
     head: list = [
         _header(i18n.t("report.header.title", locale, emoji=emoji)),
@@ -424,7 +434,9 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
                            case_display_id=linked_case_display_id),
                     "case_sync_report",
                     value={"incident_id": incident_id,
-                           "case_display_id": linked_case_display_id},
+                           "case_display_id": linked_case_display_id,
+                           # 账号「盖章」：点回来时只认这个，不查那一刻的会话偏好。
+                           "case_account_id": case_account_id},
                     style="primary"))
     elif incident_id:
         action_row.append(

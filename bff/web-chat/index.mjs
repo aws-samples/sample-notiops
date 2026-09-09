@@ -48,6 +48,7 @@ import { apiListRoles, apiSaveRole, apiDeleteRole, apiListUsers, apiPutUser, api
 import { isAccountVisible, filterVisibleAccounts, visibleAccountSet, listVisibility, getVisibility, putVisibility, deleteVisibility } from "./account_visibility.mjs";
 import { listMemberAccounts, onboardAccount, onboardStatus, setAccountEnabled, offboardAccount, associateDevopsAgent, devopsAgentAssocStatus, generateLaunchStackUrl, manualPayloadSave, testDaConnection, inspectionCrossAccountStatus, verifyAndRegisterCollectionRole, generateCollectionStackUrl, oneClickOnboardAvailable, associateInspectionSource } from "./member_accounts.mjs";
 import { apiGetNotificationConfig, apiPutNotificationConfig, apiTestNotificationSend } from "./feishu_config.mjs";
+import { apiGetDingtalkConfig, apiPutDingtalkConfig, apiTestDingtalkSend } from "./dingtalk_config.mjs";
 import { apiGetLlmConfig, apiPutLlmConfig, apiGetCandidates, apiPutBedrockKey, apiTestLlmModel, apiListLlmAudit, apiRollbackLlmConfig, apiGetModels, apiGetBackendTasks, apiPutBackendTasks, apiGetLlmStatus, resolveForStream } from "./llm_config.mjs";
 
 const enc = new TextEncoder();
@@ -353,16 +354,33 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
       catch (e) { return json(500, { error: String(e?.message || e) }); }
     }
 
-    // ── Admin: 飞书机器人通知配置（Secrets Manager 单 secret;门禁同 /admin/.+ = nav:admin）──
+    // ── Admin: IM 机器人配置（每个平台一个 Secrets Manager secret;门禁同 /admin/.+ = nav:admin）──
+    // 一条路由三个平台：**GET 一次拿回全部**，PUT / test 按 `body.platform` 分发。
+    // 为什么不给钉钉另开一组 `/admin/dingtalk-config` 路由：前端那一页是「集成 IM」，
+    // 一次要把所有平台的状态都画出来（哪个配好了、哪个还空着）。分成两条路由等于前端
+    // 每加一个平台就多一次请求、多一处 loading/错误分支,而这一页最贵的 bug 是
+    // **界面骗人**（半边加载失败却显示"未配置"）。
+    // 平台专属的字段集与校验各自留在 feishu_config.mjs / dingtalk_config.mjs 里。
     if (method === "POST" && path.endsWith("/admin/notification-config/test")) {
-      const r = await apiTestNotificationSend(authBody);
+      const r = authBody?.platform === "dingtalk"
+        ? await apiTestDingtalkSend(authBody)
+        : await apiTestNotificationSend(authBody);
       return r.error ? json(r.status || 400, { message: r.error }) : json(200, r);
     }
     if (method === "GET" && path.endsWith("/admin/notification-config")) {
-      return json(200, await apiGetNotificationConfig());
+      // 两个平台各读自己的 secret，互不阻塞。
+      // ⚠️ 用 all（不是 allSettled）是有意的：一个平台读失败就整页 500，而不是画出一个
+      // "钉钉未配置"的假象 —— 后者会让客户去重填一份已经填好的凭证。
+      const [feishu, dingtalk] = await Promise.all([
+        apiGetNotificationConfig(),
+        apiGetDingtalkConfig(),
+      ]);
+      return json(200, { ...feishu, ...dingtalk });
     }
     if (method === "PUT" && path.endsWith("/admin/notification-config")) {
-      const r = await apiPutNotificationConfig(authBody);
+      const r = authBody?.platform === "dingtalk"
+        ? await apiPutDingtalkConfig(authBody)
+        : await apiPutNotificationConfig(authBody);
       return r.error ? json(r.status || 400, { message: r.error }) : json(200, r);
     }
 

@@ -50,6 +50,26 @@ def _max_wait_sec() -> int:
         return 840
 
 
+# 「一个真事件都没来」的容忍窗（秒）。**这不是第二个超时**，它只在**首个实质事件之前**
+# 生效，专治一种已实证的现网故障：某个 `executionId` 在服务端被弄死之后，之后每一次
+# `SendMessage` 都只回 `responseCreated` + 每 ~15s 一个 `heartbeat`，永远不出内容。
+#
+# 2026-09-08 现网 A/B 实证（同一句 `hi`）：
+#   · 卡死的 execution：`responseCreated`@1.3s，然后 16/31/46/61/76s 全是 heartbeat，无内容
+#   · 全新建的 execution：`responseInProgress`@6.1s → 首个内容块@9.9s → 完成@10.2s
+# 所以「120s 内连 `responseInProgress` 都没有」= 这条 execution 已经不能用了。判定之后
+# 换新对话重试一次（见 `run_devops_chat`），而不是像以前那样干等 ~300s 直到上游掐流。
+#
+# ⚠️ 只在首个实质事件**之前**判：agent 真干活时可能有很长的单个工具调用（此时事件流也会
+# 安静），那种安静不许被当成卡死 —— 那之后仍然只受 `_max_wait_sec()` 墙钟约束。
+def _stall_sec() -> int:
+    raw = os.environ.get("NOTIOPS_DEVOPS_CHAT_STALL_SEC", "")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 120
+
+
 # ---------------------------------------------------------------------------
 # 块类型判定 —— 2026-08-27 对现网 SendMessage 事件流做形状实证得到的表
 # ---------------------------------------------------------------------------
@@ -275,16 +295,21 @@ def _new_block() -> dict:
 
 
 def consume_events(events, sink: Sink, en: bool = False,
-                   max_wait_sec: int | None = None) -> dict:
+                   max_wait_sec: int | None = None,
+                   stall_sec: int | None = None) -> dict:
     """消费 SendMessage 的事件流并实时喂给 `sink`。
 
     **本函数是这个功能的风险中心**，故独立可测：逐 delta 转发（不缓冲）、正文/过程分流、
     stop 的累积文本不许重复追加。
 
-    返回 ``{"completed": bool, "failed": dict|None, "timed_out": bool}``。
+    返回 ``{"completed": bool, "failed": dict|None, "timed_out": bool,
+    "stalled": bool}``。``stalled`` = 首个实质事件迟迟不来（只有心跳），判定这条
+    `executionId` 已卡死，见 `_stall_sec()`。
     """
     if max_wait_sec is None:
         max_wait_sec = _max_wait_sec()
+    if stall_sec is None:
+        stall_sec = _stall_sec()
 
     def dv(zh: str, en_str: str) -> str:
         return en_str if en else zh
@@ -316,7 +341,8 @@ def consume_events(events, sink: Sink, en: bool = False,
             sink.gap()
             sink.say(render_user_prompt(ask, en))
 
-    completed, failed, timed_out = False, None, False
+    completed, failed, timed_out, stalled = False, None, False, False
+    progressed = False   # 见过"实质"事件了吗？（`responseCreated` / 心跳都不算）
     t0 = time.monotonic()
     for ev in (events or []):
         if not isinstance(ev, dict):
@@ -326,7 +352,15 @@ def consume_events(events, sink: Sink, en: bool = False,
             timed_out = True
             flush_pending_asks()
             break
-        if ev.get("heartbeat"):
+        # 卡死判定：只在**还没有任何实质事件**时生效（见 `_stall_sec()` 的实证）。
+        if not progressed and time.monotonic() - t0 > stall_sec:
+            stalled = True
+            break
+        # ⚠️ 这两处按 **key 是否存在** 判，不用真假值：心跳的 payload 常常就是 `{}`（空 dict
+        # 是 falsy），拿 `ev.get(...)` 判会把每一个心跳都当成"有进展"，卡死判定就永远不触发。
+        if not ("responseCreated" in ev or "heartbeat" in ev):
+            progressed = True
+        if "heartbeat" in ev:
             continue
         if ev.get("responseCreated") or ev.get("responseInProgress"):
             sink.progress(dv("DevOps Agent 正在思考…", "DevOps Agent is thinking…"))
@@ -420,12 +454,18 @@ def consume_events(events, sink: Sink, en: bool = False,
         if ev.get("responseFailed"):
             failed = ev["responseFailed"] or {}
             break
-    return {"completed": completed, "failed": failed, "timed_out": timed_out}
+    if stalled:
+        logger.warning("devops_chat stalled: no substantive event within %ss "
+                       "(heartbeats only) — treating the execution as wedged",
+                       stall_sec)
+    return {"completed": completed, "failed": failed, "timed_out": timed_out,
+            "stalled": stalled}
 
 
 def run_devops_chat(text: str, *, locale: str = "en", account_id: str | None = None,
                     session: dict | None = None, skill_prompt: str = "",
-                    emit=None, max_wait_sec: int | None = None) -> dict:
+                    emit=None, max_wait_sec: int | None = None,
+                    stall_sec: int | None = None) -> dict:
     """一轮「DevOps 对话」。**NotiOps 侧 0 token**（不经 Bedrock / agent runtime）。
 
     Args:
@@ -439,15 +479,22 @@ def run_devops_chat(text: str, *, locale: str = "en", account_id: str | None = N
         system prompt，"让 skill 生效"只能靠内联）。
       emit: 可选 ``(kind, payload)`` 回调 —— "text" / "step" / "progress"。
       max_wait_sec: 覆盖默认墙钟上限（测试用）。
+      stall_sec: 覆盖"只有心跳"的容忍窗（测试用），见 `_stall_sec()`。
 
     Returns:
-      ``{"reply", "steps", "session", "console_home", "ok", "usage"}``。
+      ``{"reply", "steps", "session", "console_home", "ok", "usage", "reset_session"}``。
       ``session`` 是**要落库的**新状态（调用方写回 `imchat#`）；``usage`` 恒为
       ``{"totalTokens": 0, "direct": True}`` —— 0 token 必须可见，不能像 Web 早期那样
       悄悄吞掉（客户会以为功能坏了）。
+
+      ⚠️ ``reset_session=True`` 时 ``session`` 是空的，调用方**必须删掉** `imchat#` 那行
+      （`ddb_state.clear_im_chat_session`），而不是"没东西就不写"—— 那行里存的正是刚被
+      判定为不可用的 `executionId`，留着它下一轮会原样复用、原样再坏一次（这就是现网
+      「一个群聊坏掉之后永久坏掉」的根因）。
     """
     en = (locale or "en") == "en"
     wait = _max_wait_sec() if max_wait_sec is None else max_wait_sec
+    stall = _stall_sec() if stall_sec is None else stall_sec
 
     def dv(zh: str, en_str: str) -> str:
         return en_str if en else zh
@@ -455,9 +502,11 @@ def run_devops_chat(text: str, *, locale: str = "en", account_id: str | None = N
     sink = Sink(emit=emit)
     usage = {"totalTokens": 0, "cycles": 0, "direct": True}
 
-    def done(ok: bool, sess: dict | None = None, home: str = "") -> dict:
+    def done(ok: bool, sess: dict | None = None, home: str = "",
+             reset_session: bool = False) -> dict:
         return {"reply": sink.reply, "steps": sink.steps, "session": sess or {},
-                "console_home": home, "ok": ok, "usage": usage}
+                "console_home": home, "ok": ok, "usage": usage,
+                "reset_session": reset_session}
 
     content = str(text or "")
     if skill_prompt:
@@ -528,20 +577,46 @@ def run_devops_chat(text: str, *, locale: str = "en", account_id: str | None = N
     # 真正开始对话之前已经写进正文的内容（目前只可能是 skill 读失败提示，由调用方写入）。
     prelude = sink.reply
 
+    # 整轮**最多**换一次新对话重试。以前只有"send_message 抛异常"这一个触发源，而现网
+    # 最常见的坏法根本不抛异常：事件流正常返回，但里面是 `responseFailed`、或者只有心跳
+    # （见 `_stall_sec()`）。于是自愈永远不触发、坏掉的 `executionId` 每轮又被原样存回
+    # DDB —— 一个群聊坏一次就永久坏。这里把两个触发源合并到同一条自愈路径上。
+    retried = False
+
+    def can_reopen() -> bool:
+        """能否透明换新对话重试：旧 execution 是**复用**来的、还没重试过、且这一轮
+        **一个字都还没吐**（吐过就不能重来，用户会看到两遍开头）。
+        与 `prelude` 比而不是 `not sink.reply`：调用方写的 skill 提示也在 reply 里。"""
+        return reused and not retried and sink.reply == prelude
+
     def stream_once(exid: str) -> dict:
         sink.progress(dv("已发送，DevOps Agent 正在处理…",
                          "Sent — DevOps Agent is working…"))
         resp = client.send_message(agentSpaceId=space, executionId=exid,
                                    content=content)
-        return consume_events(resp.get("events"), sink, en=en, max_wait_sec=wait)
+        return consume_events(resp.get("events"), sink, en=en, max_wait_sec=wait,
+                              stall_sec=stall)
+
+    def reopen_and_retry(why: str) -> dict:
+        """丢掉旧 execution，开一个全新的再问一次。
+
+        **会丢多轮上下文，这是对的取舍**：在一条已经不可用的 execution 上再问一万次也
+        只有心跳。如实告知（`sink.step`）而不是假装无事发生。
+        """
+        nonlocal retried, execution_id
+        retried = True
+        logger.warning("devops_chat reopening a new chat (%s)", why)
+        sink.step(dv("上一轮对话已失效，正在新建对话重试（不带之前的上下文）…",
+                     "The previous chat is no longer usable — starting a new one "
+                     "and retrying (without the earlier context)…"))
+        execution_id = new_chat()
+        return stream_once(execution_id)
 
     try:
         res = stream_once(execution_id)
     except Exception as e:
         # 复用的 execution_id 过期/失效 → 重开一个新对话重试一次（**仅在还没吐过正文时**）。
-        # 与 `prelude` 比而不是 `not sink.reply`：调用方写的 skill 提示也在 reply 里。
-        stale = (reused and sink.reply == prelude
-                 and bool(_STALE_RE.search(type(e).__name__ or "")))
+        stale = can_reopen() and bool(_STALE_RE.search(type(e).__name__ or ""))
         logger.warning("devops_chat send_message_failed: %s %s", _safe_err(e),
                        "stale_execution_retry" if stale else "")
         if not stale:
@@ -550,28 +625,47 @@ def run_devops_chat(text: str, *, locale: str = "en", account_id: str | None = N
                 f"⚠️ The DevOps Agent conversation was interrupted ({_safe_err(e)}). "
                 f"Please retry."))
             return done(False, new_state(execution_id), home)
-        sink.step(dv("上一轮对话已过期，正在新建对话重试…",
-                     "The previous chat expired — starting a new one and retrying…"))
         try:
-            execution_id = new_chat()
-            res = stream_once(execution_id)
+            res = reopen_and_retry("send_message_" + _safe_err(e))
         except Exception as e2:
             logger.warning("devops_chat send_message_retry_failed: %s", _safe_err(e2))
             sink.say(dv(
                 f"⚠️ 与 DevOps Agent 的对话失败（{_safe_err(e2)}）。请稍后重试。",
                 f"⚠️ The DevOps Agent conversation failed ({_safe_err(e2)}). "
                 f"Please retry later."))
-            return done(False, home=home)
+            # 旧 execution 已确认不可用 → 必须让调用方**删掉**会话行，否则下一轮还用它。
+            return done(False, home=home, reset_session=True)
 
-    if res["failed"]:
-        # 只展示错误**码**，不展示服务端原始 message（docs/LOGGING_STANDARD.md）。
-        code = str((res["failed"] or {}).get("errorCode") or "unknown")
-        logger.warning("devops_chat response_failed code=%s", code)
-        sink.say(dv(f"\n\n⚠️ DevOps Agent 未能完成本次回答（{code}）。",
-                    f"\n\n⚠️ DevOps Agent could not complete this answer ({code})."))
+    # 事件流本身没抛，但上游把这一轮判失败 / 或者从头到尾只有心跳 —— 同样说明这条
+    # execution 已经不能用了。它是复用来的就换新对话重试一次（对用户是透明的）。
+    if (res["failed"] or res["stalled"]) and can_reopen():
+        try:
+            res = reopen_and_retry("response_failed" if res["failed"] else "stalled")
+        except Exception as e:
+            # 连新对话都建不出来 → 保留原来的失败结论，走下面的文案（不吞异常类型）。
+            logger.warning("devops_chat reopen_failed: %s", _safe_err(e))
+
+    if res["failed"] or res["stalled"]:
+        if res["failed"]:
+            # 只展示错误**码**，不展示服务端原始 message（docs/LOGGING_STANDARD.md）。
+            code = str((res["failed"] or {}).get("errorCode") or "unknown")
+            logger.warning("devops_chat response_failed code=%s", code)
+            sink.say(dv(f"\n\n⚠️ DevOps Agent 未能完成本次回答（{code}）。",
+                        f"\n\n⚠️ DevOps Agent could not complete this answer ({code})."))
+        else:
+            sink.say(dv(
+                f"\n\n⚠️ DevOps Agent 在 {stall} 秒内没有任何响应，本轮判定为卡住。",
+                f"\n\n⚠️ DevOps Agent sent nothing but heartbeats for {stall}s — "
+                f"treating this turn as stuck."))
+        # ⚠️ 这句是**契约**：坏掉的会话已经被丢弃，所以"再问一次"真的有意义。以前这里
+        # 只报错、却把坏掉的 executionId 存回库，用户重问一百次得到的是同一个错误。
+        sink.say(dv("\n\n已丢弃这个会话的对话上下文，**直接再问一次**即可"
+                    "（会从一段新对话开始，不带之前的上下文）。",
+                    "\n\nThe stored conversation has been discarded — **just ask "
+                    "again** (it will start a fresh chat without the earlier context)."))
         if home:
-            sink.say(dv(f"可到后台查看详情：{home}",
-                        f" See details in the console: {home}"))
+            sink.say(dv(f"\n\n可到后台查看详情：{home}",
+                        f"\n\nSee details in the console: {home}"))
     elif res["timed_out"]:
         sink.say(dv(f"\n\n⏳ 本轮等待超过 {wait} 秒，先返回已生成的部分。",
                     f"\n\n⏳ This turn exceeded {wait}s, returning what was "
@@ -604,4 +698,8 @@ def run_devops_chat(text: str, *, locale: str = "en", account_id: str | None = N
             # 探测失败不影响答案（老 botocore 可能没这个 API）
             logger.warning("devops_chat list_pending_failed: %s", _safe_err(e))
 
+    if res["failed"] or res["stalled"]:
+        # **绝不**把这个 executionId 存回去。`ok=False` 只是如实标注结论（IM 三家都照发
+        # `reply`，不看 `ok`）；真正治病的是 `reset_session`。
+        return done(False, home=home, reset_session=True)
     return done(True, new_state(execution_id), home)

@@ -33,7 +33,7 @@
  * DevOps Agent 侧的真实用量只落 CloudWatch（客户在自己的 DevOps Agent 账单里看）。
  */
 
-import { getDevopsChatSession, setDevopsChatSession } from "./store.mjs";
+import { getDevopsChatSession, setDevopsChatSession, clearDevopsChatSession } from "./store.mjs";
 // 复用「深度调查（直连）」里已经过现网验证的三个小工具（client 构造 / 后台链接 / 安全日志），
 // 避免同一逻辑两份实现漂移。那边只是把它们加了 export，行为一行未改。
 import { clientFor, operatorUrls, safeErr } from "./devops_investigate.mjs";
@@ -43,6 +43,22 @@ import { clientFor, operatorUrls, safeErr } from "./devops_investigate.mjs";
 const MAX_WAIT_SEC = (() => {
   const n = parseInt(process.env.NOTIOPS_DEVOPS_CHAT_MAX_WAIT_SEC ?? "", 10);
   return Number.isFinite(n) ? n : 840;
+})();
+
+/** 「一个真事件都没来」的容忍窗（秒）。**这不是第二个超时**，它只在**首个实质事件之前**
+ *  生效，专治一种已实证的现网故障：某个 `executionId` 在服务端被弄死之后，之后每一次
+ *  `SendMessage` 都只回 `responseCreated` + 每 ~15s 一个 `heartbeat`，永远不出内容。
+ *
+ *  2026-09-08 现网 A/B 实证（同一句 `hi`，IM 侧同一个 Agent Space）：
+ *    · 卡死的 execution：`responseCreated`@1.3s，然后 16/31/46/61/76s 全是 heartbeat，无内容
+ *    · 全新建的 execution：`responseInProgress`@6.1s → 首个内容块@9.9s → 完成@10.2s
+ *
+ *  ⚠️ 只在首个实质事件**之前**判：agent 真干活时可能有很长的单个工具调用（那时事件流也会
+ *  安静），那种安静不许被当成卡死 —— 那之后仍然只受 `MAX_WAIT_SEC` 墙钟约束。
+ *  与 `core/devops_chat.py::_stall_sec()` 同一口径、同一个环境变量名。 */
+const STALL_SEC = (() => {
+  const n = parseInt(process.env.NOTIOPS_DEVOPS_CHAT_STALL_SEC ?? "", 10);
+  return Number.isFinite(n) ? n : 120;
 })();
 
 /** 块类型判定。`contentBlockStart.type` 是**自由字符串**（服务端未给枚举），所以按"已实证类型表
@@ -192,10 +208,11 @@ export function makeSink({ emit }) {
  *
  * @param {AsyncIterable} events   SendMessageResponse.events
  * @param {object} sink            makeSink() 的返回值
- * @param {{ en?: boolean, maxWaitSec?: number }} opts
- * @returns {Promise<{completed: boolean, failed: object|null, timedOut: boolean}>}
+ * @param {{ en?: boolean, maxWaitSec?: number, stallSec?: number }} opts
+ * @returns {Promise<{completed: boolean, failed: object|null, timedOut: boolean, stalled: boolean}>}
+ *   `stalled` = 首个实质事件迟迟不来（只有心跳），判定这条 `executionId` 已卡死，见 STALL_SEC。
  */
-export async function consumeEvents(events, sink, { en = false, maxWaitSec = MAX_WAIT_SEC } = {}) {
+export async function consumeEvents(events, sink, { en = false, maxWaitSec = MAX_WAIT_SEC, stallSec = STALL_SEC } = {}) {
   const dv = (zh, enStr) => (en ? enStr : zh);
   const blocks = new Map();   // index -> { type, kind, buf, json, emittedAny, dup }
   // ⚠️ 文字与 JSON **分开存**：同一个块里两者都会来（实测 `tool_summary` = 一句人话
@@ -225,12 +242,19 @@ export async function consumeEvents(events, sink, { en = false, maxWaitSec = MAX
     }
   };
 
-  let completed = false, failed = null, timedOut = false;
+  let completed = false, failed = null, timedOut = false, stalled = false;
+  let progressed = false;   // 见过"实质"事件了吗？（`responseCreated` / 心跳都不算）
   const t0 = Date.now();
   for await (const ev of events || []) {
     // 墙钟兜底：Lambda 被平台掐掉的话客户端只会看到截断，主动收尾至少能给一句出路。
     if (Date.now() - t0 > maxWaitSec * 1000) { timedOut = true; flushPendingAsks(); break; }
-    if (ev.heartbeat) continue;                       // 保活帧（BFF 自己也每 10s 发 `: ka`）
+    // 卡死判定：只在**还没有任何实质事件**时生效（见 STALL_SEC 的实证）。
+    if (!progressed && Date.now() - t0 > stallSec * 1000) { stalled = true; break; }
+    // ⚠️ 按 **key 是否存在** 判，与 `core/devops_chat.py` 同口径：心跳的 payload 常常是空对象，
+    // Python 那边空 dict 是 falsy，用真假值判会让卡死判定永远不触发。这里写成一样的形状，
+    // 免得两份实现"看着一样、行为不一样"。
+    if (!("responseCreated" in ev || "heartbeat" in ev)) progressed = true;
+    if ("heartbeat" in ev) continue;                  // 保活帧（BFF 自己也每 10s 发 `: ka`）
     if (ev.responseCreated || ev.responseInProgress) {
       sink.progress(dv("DevOps Agent 正在思考…", "DevOps Agent is thinking…"));
       continue;
@@ -311,7 +335,10 @@ export async function consumeEvents(events, sink, { en = false, maxWaitSec = MAX
     }
     if (ev.responseFailed) { failed = ev.responseFailed; break; }
   }
-  return { completed, failed, timedOut };
+  if (stalled) {
+    console.warn(`[devops-chat] stalled: no substantive event within ${stallSec}s (heartbeats only) — treating the execution as wedged`);
+  }
+  return { completed, failed, timedOut, stalled };
 }
 
 /**
@@ -420,14 +447,34 @@ export async function runDevopsChat({ text, locale, accountId, conversationId, s
     }
   }
 
-  /** 发一轮消息并把事件流实时转成 SSE。返回 { completed, failed, timedOut }。 */
+  /** 发一轮消息并把事件流实时转成 SSE。返回 { completed, failed, timedOut, stalled }。 */
   const streamOnce = async (execId) => {
     const { SendMessageCommand } = await import("@aws-sdk/client-devops-agent");
     progress(dv("已发送，DevOps Agent 正在处理…", "Sent — DevOps Agent is working…"));
     const resp = await client.send(new SendMessageCommand({
       agentSpaceId: space, executionId: execId, content,
     }));
-    return consumeEvents(resp?.events, sink, { en, maxWaitSec: MAX_WAIT_SEC });
+    return consumeEvents(resp?.events, sink, { en, maxWaitSec: MAX_WAIT_SEC, stallSec: STALL_SEC });
+  };
+
+  // 整轮**最多**换一次新对话重试。以前只有"send 抛异常"这一个触发源，而现网最常见的坏法
+  // 根本不抛异常：事件流正常返回，但里面是 `responseFailed`、或者只有心跳（见 STALL_SEC）。
+  // 于是自愈永远不触发、坏掉的 `executionId` 一直躺在会话行里 —— 一个会话坏一次就永久坏。
+  let retried = false;
+  /** 能否透明换新对话重试：旧 execution 是**复用**来的、还没重试过、且这一轮**一个字都还没吐**。
+   *  与 `prelude` 比而不是 `!sink.reply`：skill 读失败那句 ⚠️ 提示也在 reply 里，
+   *  拿它当"已经答过话了"会把这次重试白白吃掉。 */
+  const canReopen = () => reused && !retried && sink.reply === prelude;
+  /** 丢掉旧 execution，开一个全新的再问一次。**会丢多轮上下文，这是对的取舍**：
+   *  在一条已经不可用的 execution 上再问一万次也只有心跳。如实告知，不假装无事发生。
+   *  （`newChat()` 自己会把新 executionId 落库，所以这里不需要再写一次。） */
+  const reopenAndRetry = async (why) => {
+    retried = true;
+    console.warn("[devops-chat] reopening a new chat", why);
+    step(dv("上一轮对话已失效，正在新建对话重试（不带之前的上下文）…",
+            "The previous chat is no longer usable — starting a new one and retrying (without the earlier context)…"));
+    executionId = await newChat();
+    return streamOnce(executionId);
   };
 
   let res;
@@ -435,9 +482,7 @@ export async function runDevopsChat({ text, locale, accountId, conversationId, s
     res = await streamOnce(executionId);
   } catch (e) {
     // 复用的 executionId 过期/失效 → 重开一个新对话重试一次（**仅在还没吐过正文时**，否则会重复输出）。
-    // 与 `prelude` 比而不是 `!sink.reply`：skill 读失败那句 ⚠️ 提示也在 reply 里，
-    // 拿它当"已经答过话了"会把这次重试白白吃掉。
-    const stale = reused && sink.reply === prelude && STALE_RE.test(String(e?.name || ""));
+    const stale = canReopen() && STALE_RE.test(String(e?.name || ""));
     console.warn("[devops-chat] send_message_failed", safeErr(e), stale ? "stale_execution_retry" : "");
     if (!stale) {
       say(dv(
@@ -446,26 +491,49 @@ export async function runDevopsChat({ text, locale, accountId, conversationId, s
       finishUsage();
       return sink.reply;
     }
-    step(dv("上一轮对话已过期，正在新建对话重试…", "The previous chat expired — starting a new one and retrying…"));
     try {
-      executionId = await newChat();
-      res = await streamOnce(executionId);
+      res = await reopenAndRetry(`send_message_${safeErr(e)}`);
     } catch (e2) {
       console.warn("[devops-chat] send_message_retry_failed", safeErr(e2));
       say(dv(
         `\n⚠️ 与 DevOps Agent 的对话失败（${safeErr(e2)}）。请稍后重试。\n`,
         `\n⚠️ The DevOps Agent conversation failed (${safeErr(e2)}). Please retry later.\n`));
+      // 旧 execution 已确认不可用 → 删掉会话行，否则下一轮还会复用它。
+      await clearDevopsChatSession(conversationId)
+        .catch((e3) => console.warn("[devops-chat] clear_session_failed", safeErr(e3)));
       finishUsage();
       return sink.reply;
     }
   }
 
-  if (res.failed) {
-    // 只展示错误**码**，不展示服务端原始 message（docs/LOGGING_STANDARD.md）。
-    const code = String(res.failed.errorCode || "unknown");
-    console.warn("[devops-chat] response_failed", `code=${code}`);
-    say(dv(`\n\n⚠️ DevOps Agent 未能完成本次回答（${code}）。`, `\n\n⚠️ DevOps Agent could not complete this answer (${code}).`));
-    if (home) say(dv(`可到后台查看详情：${home}\n`, ` See details in the console: ${home}\n`));
+  // 事件流本身没抛，但上游把这一轮判失败 / 或者从头到尾只有心跳 —— 同样说明这条 execution
+  // 已经不能用了。它是复用来的就换新对话重试一次（对用户是透明的）。
+  if ((res.failed || res.stalled) && canReopen()) {
+    try {
+      res = await reopenAndRetry(res.failed ? "response_failed" : "stalled");
+    } catch (e) {
+      // 连新对话都建不出来 → 保留原来的失败结论，走下面的文案（不吞异常类型）。
+      console.warn("[devops-chat] reopen_failed", safeErr(e));
+    }
+  }
+
+  if (res.failed || res.stalled) {
+    if (res.failed) {
+      // 只展示错误**码**，不展示服务端原始 message（docs/LOGGING_STANDARD.md）。
+      const code = String(res.failed.errorCode || "unknown");
+      console.warn("[devops-chat] response_failed", `code=${code}`);
+      say(dv(`\n\n⚠️ DevOps Agent 未能完成本次回答（${code}）。`, `\n\n⚠️ DevOps Agent could not complete this answer (${code}).`));
+    } else {
+      say(dv(`\n\n⚠️ DevOps Agent 在 ${STALL_SEC} 秒内没有任何响应，本轮判定为卡住。`,
+              `\n\n⚠️ DevOps Agent sent nothing but heartbeats for ${STALL_SEC}s — treating this turn as stuck.`));
+    }
+    // ⚠️ 这句是**契约**：坏掉的会话已经被丢弃，所以"再问一次"真的有意义。以前这里只报错、
+    // 却把坏掉的 executionId 留在会话行里，用户重问一百次得到的是同一个错误。
+    await clearDevopsChatSession(conversationId)
+      .catch((e) => console.warn("[devops-chat] clear_session_failed", safeErr(e)));
+    say(dv("\n\n已丢弃这个会话的对话上下文，**直接再问一次**即可（会从一段新对话开始，不带之前的上下文）。",
+            "\n\nThe stored conversation has been discarded — **just ask again** (it will start a fresh chat without the earlier context)."));
+    if (home) say(dv(`\n\n可到后台查看详情：${home}\n`, `\n\nSee details in the console: ${home}\n`));
   } else if (res.timedOut) {
     say(dv(`\n\n⏳ 本轮等待超过 ${MAX_WAIT_SEC} 秒，先返回已生成的部分。`, `\n\n⏳ This turn exceeded ${MAX_WAIT_SEC}s, returning what was generated so far.`));
     if (home) say(dv(`完整对话可在 DevOps Agent 后台继续查看：${home}\n`, ` You can continue in the DevOps Agent console: ${home}\n`));

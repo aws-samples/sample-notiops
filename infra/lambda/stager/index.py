@@ -210,6 +210,66 @@ def _empty_bucket(bucket: str, keep: set[str] | None = None) -> int:
     return deleted
 
 
+def _abort_multipart_uploads(bucket: str) -> int:
+    """中止桶里所有**未完成的分片上传**。返回中止数。
+
+    为什么单独一步：未完成的分片上传**不是对象**，`list_object_versions` 看不见它们，
+    但 `DeleteBucket` 会因为它们报「BucketNotEmpty」。而这个桶恰恰最容易留下分片 ——
+    agent zip 现网 144 MiB，走的就是 8MB 分片的 `upload_fileobj`（见 `_XFER`），
+    上传中途被打断（回滚 / 超时 / 函数被 CFN 取消）就留一堆分片在那儿。
+    """
+    aborted = 0
+    try:
+        for page in s3.get_paginator("list_multipart_uploads").paginate(Bucket=bucket):
+            for up in page.get("Uploads") or []:
+                try:
+                    s3.abort_multipart_upload(Bucket=bucket, Key=up["Key"],
+                                              UploadId=up["UploadId"])
+                    aborted += 1
+                except Exception as exc:  # noqa: BLE001
+                    if not _ignore_missing(exc):
+                        raise
+    except Exception as exc:  # noqa: BLE001
+        if not _ignore_missing(exc):
+            raise
+    if aborted:
+        print(f"aborted {aborted} multipart upload(s) in s3://{bucket}")
+    return aborted
+
+
+def _drain_bucket(bucket: str, keep: set[str] | None = None, passes: int = 8) -> int:
+    """把桶清到**真的空**：反复「中止分片 + 删全部版本」直到连续两轮什么都没剩。
+
+    🔴 为什么不能只清一遍（2026-09-07 现网实测的账，秒级时间戳）：
+
+        16:58:59.168  Phase=OrgSetup 报错 → CFN 开始回滚，取消其余资源
+        16:59:02      **被取消的** Artifacts 那次调用在后台跑完，144 MiB 的
+                      agent-code.zip 这一刻才落进 staging 桶
+        16:59:02.024  Artifacts 的 Delete 开始 —— 清桶，没看见上面那个对象
+        16:59:03.835  Delete 回 SUCCESS
+        16:59:11.180  StagingBucket DELETE_FAILED（桶非空）→ 栈停在 ROLLBACK_FAILED
+
+    CFN「取消」一个自定义资源只是**不再等它的响应**，Lambda 那次调用照跑到底。所以清桶
+    这件事和一个还在写的进程赛跑，清一遍必然可能落空。连续两轮空才收手，等的就是那个
+    还在收尾的写进程。上界 `passes` 轮 × 5s，远小于 Lambda 的 900s 超时。
+
+    清不干净**不抛**：回滚路径上抛异常只会把栈从 ROLLBACK_FAILED 换成另一种卡死，
+    而桶删不掉客户在控制台上看得见、也删得掉。抛不抛都要人工收尾，但不抛至少让
+    CFN 把该报的那个「桶非空」原因报出来。
+    """
+    total, clean_rounds = 0, 0
+    for attempt in range(passes):
+        moved = _abort_multipart_uploads(bucket) + _empty_bucket(bucket, keep)
+        total += moved
+        clean_rounds = clean_rounds + 1 if moved == 0 else 0
+        if clean_rounds >= 2:
+            return total
+        if attempt < passes - 1:
+            time.sleep(5)
+    print(f"⚠ s3://{bucket} still had objects after {passes} drain passes")
+    return total
+
+
 def _delete_bucket(bucket: str) -> None:
     """删桶，`OperationAborted` 要原地重试。
 
@@ -716,13 +776,19 @@ def _teardown_site(props) -> dict:
 _STACKSETS_SERVICE_PRINCIPAL = "member.org.stacksets.cloudformation.amazonaws.com"
 
 
-def _enable_stacksets_trusted_access() -> str:
+def _enable_stacksets_trusted_access(call_as: str = "SELF") -> str:
     """打开 Organizations 对 StackSets 的信任访问（幂等）。
 
-    **失败不抛**：委派管理员（delegated administrator）账号没有 organizations:*
-    的写权限，但那种账号本来就是「管理账号已经打开过」才可能存在的。真的没打开时，
-    下一步 CreateStackSet 会带着 CFN 自己的报错失败，比在这里猜错要清楚。
+    `call_as == "DELEGATED_ADMIN"` 时**直接跳过**：`enable_aws_service_access` 是管理账号
+    专属 API，委派管理员调它必然 AccessDenied。而能成为委派管理员的前提就是管理账号已经
+    打开过信任访问 —— PreflightFn 也已经用 `describe_organizations_access(CallAs=…)`
+    验证过状态，这里再试一次只会往日志里刷一条误导人的 AccessDenied。
+
+    管理账号路径下**失败也不抛**：真的没打开时，下一步 CreateStackSet 会带着 CFN 自己的
+    报错失败，比在这里猜错要清楚。
     """
+    if call_as == "DELEGATED_ADMIN":
+        return "skipped (delegated administrator; only the management account can enable it)"
     org = boto3.client("organizations")
     try:
         for page in org.get_paginator("list_aws_service_access_for_organization").paginate():
@@ -746,6 +812,11 @@ def _err_code(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def _region() -> str:
+    """本函数所在区。只用来把可执行的 `--region` 拼进给客户看的错误信息里。"""
+    return boto3.Session().region_name or "us-east-1"
+
+
 #: 「客户自己拿主意」的成员账号模板参数 —— 升级时**保留客户当前值**，不许被模板
 #: Default 盖回去。
 #:
@@ -761,15 +832,20 @@ _PRESERVE_MEMBER_PARAMS = ("EnableSupportCaseWrite",)
 
 
 def _stackset_upsert(cfn, name: str, template: str, params: dict, description: str,
-                     auto_deployment: bool) -> str:
+                     auto_deployment: bool, call_as: str = "SELF") -> str:
     """建或更新一个 service-managed StackSet。已存在就更新（升级时把新版模板滚到
     全部既有实例，成员账号的新增只读权限就是这么下去的）。
+
+    `call_as` 由 PreflightFn 判定后经资源属性传进来：`SELF`（组织管理账号）或
+    `DELEGATED_ADMIN`（已注册的 StackSets 委派管理员）。**每一个** StackSet 调用都要带上
+    它 —— 漏一个就会在那一个调用上报 AccessDenied 或「StackSet 不存在」（委派管理员看不见
+    不带 CallAs 的那个命名空间）。
 
     更新失败**不抛**：最常见的原因是「有 operation 正在跑」，而那不该让客户整个栈
     更新回滚 —— 与 setup.sh 同一取舍（那边也是打一条 ⚠ 就继续）。
     """
     try:
-        desc = cfn.describe_stack_set(StackSetName=name)
+        desc = cfn.describe_stack_set(StackSetName=name, CallAs=call_as)
         exists = True
     except ClientError as exc:
         if _err_code(exc) not in ("StackSetNotFoundException", "ValidationError"):
@@ -793,19 +869,44 @@ def _stackset_upsert(cfn, name: str, template: str, params: dict, description: s
             cfn.create_stack_set(
                 StackSetName=name, Description=description, TemplateBody=template,
                 Parameters=parameters, Capabilities=["CAPABILITY_NAMED_IAM"],
-                PermissionModel="SERVICE_MANAGED", AutoDeployment=auto,
+                PermissionModel="SERVICE_MANAGED", AutoDeployment=auto, CallAs=call_as,
             )
         except ClientError as exc:
             code = _err_code(exc)
             # 这里失败**必须**让栈失败（选了多账号却没建成，静默降级=客户以为跨账号能用）。
-            # 但错误得说人话：绝大多数是"这个账号不是管理账号 / 委派管理员"，原始
-            # AccessDenied 完全看不出该去改什么。
-            if code in ("AccessDenied", "AccessDeniedException", "ValidationError"):
+            # 但错误得说人话，而且**两种成因要分开说**——它们的处置完全不同，而原始
+            # AccessDenied / ValidationError 都看不出该去改什么：
+            #   · AccessDenied* → 这个账号既不是组织管理账号、也不是已注册的 StackSets
+            #     委派管理员（PreflightFn 本该先拦住；走到这里说明那个阶段被跳过了，比如
+            #     手工重放这一个自定义资源），或者 CallAs 传错了；
+            #   · ValidationError → 绝大多数是 "You must enable organizations access to
+            #     operate a service managed stack set"，也就是 CFN 侧的
+            #     `activate-organizations-access` 没开 —— 与「账号不对」毫无关系。
+            #     2026-09-07 之前这两种成因共用一句「你不是管理账号」，把后一种成因的
+            #     客户引到完全错的方向（去换账号，换了照样失败）。
+            if code in ("AccessDenied", "AccessDeniedException"):
                 raise RuntimeError(
-                    f"cannot create StackSet {name} ({code}). DeployMode=MultiAccount requires this "
-                    "account to be the AWS Organizations management account or a CloudFormation "
-                    "StackSets delegated administrator. Redeploy with DeployMode=SingleAccount, or "
-                    "run this template from an account that qualifies."
+                    f"cannot create StackSet {name} ({code}, CallAs={call_as}). "
+                    "DeployMode=MultiAccount needs this account to be either the AWS "
+                    "Organizations management account or a registered CloudFormation StackSets "
+                    "delegated administrator. To register it, run this from the MANAGEMENT "
+                    "account and update the stack again:\n"
+                    "  aws organizations register-delegated-administrator --service-principal "
+                    f"{_STACKSETS_SERVICE_PRINCIPAL} --account-id <this account>\n"
+                    "Or redeploy with DeployMode=SingleAccount."
+                ) from exc
+            if code == "ValidationError":
+                raise RuntimeError(
+                    f"cannot create StackSet {name} (ValidationError, CallAs={call_as}). The "
+                    "usual cause is that trusted access between CloudFormation StackSets and AWS "
+                    "Organizations was never activated on the CloudFormation side. Run these from "
+                    "the MANAGEMENT account (a delegated administrator cannot), then update the "
+                    "stack:\n"
+                    f"  aws cloudformation activate-organizations-access --region {_region()}\n"
+                    "  aws organizations enable-aws-service-access --service-principal "
+                    f"{_STACKSETS_SERVICE_PRINCIPAL}\n"
+                    "If that is already ENABLED, then this account is neither the management "
+                    "account nor a registered StackSets delegated administrator."
                 ) from exc
             raise
         return "created"
@@ -817,6 +918,7 @@ def _stackset_upsert(cfn, name: str, template: str, params: dict, description: s
             OperationPreferences={"RegionConcurrencyType": "PARALLEL",
                                   "FailureTolerancePercentage": 100,
                                   "MaxConcurrentPercentage": 100},
+            CallAs=call_as,
         )
         return "updated"
     except ClientError as exc:
@@ -826,7 +928,16 @@ def _stackset_upsert(cfn, name: str, template: str, params: dict, description: s
 
 
 def _org_setup(props: dict) -> dict:
-    report = {"TrustedAccess": _enable_stacksets_trusted_access()}
+    # PreflightFn 判定后经模板的 Fn::GetAtt 传进来。缺省 SELF：老模板 / 手工重放这一个
+    # 自定义资源时行为与从前逐字一致（管理账号路径不回归）。
+    call_as = (props.get("StackSetCallAs") or "SELF").strip().upper()
+    if call_as not in ("SELF", "DELEGATED_ADMIN"):
+        raise RuntimeError(
+            f"StackSetCallAs must be SELF or DELEGATED_ADMIN, got {call_as!r}. It comes from "
+            "the multi-account PreflightFn; a bad value means the template wiring is broken."
+        )
+    report = {"CallAs": call_as,
+              "TrustedAccess": _enable_stacksets_trusted_access(call_as)}
     cfn = boto3.client("cloudformation")
     common = {"SystemAccountId": props["SystemAccountId"],
               "OrganizationId": props["OrganizationId"]}
@@ -837,14 +948,14 @@ def _org_setup(props: dict) -> dict:
         # （member-account-onboarding.yaml 里它们都是可选的），只要那个跨账号只读角色。
         {**common, "PrimaryRegion": props["PrimaryRegion"]},
         "NotiOps member account onboarding (cross-account read-only role)",
-        auto_deployment=True,
+        auto_deployment=True, call_as=call_as,
     )
     report["DevOpsAgentStackSet"] = _stackset_upsert(
         cfn, props["DevOpsStackSetName"], props["DevOpsTemplateBody"], common,
         "NotiOps member DevOps Agent onboarding (agent space + trigger role)",
         # 不自动下发：成员账号的 Agent Space 有独立成本与配置，按账号在 Admin
         # 「账户」页第二步一键关联时才建实例。
-        auto_deployment=False,
+        auto_deployment=False, call_as=call_as,
     )
     return report
 
@@ -1160,7 +1271,16 @@ def handler(event, context):
                 #     自定义资源 Delete 失败 → **整个栈删不掉**。
                 data = {"LeftInPlace": "da# row (the config table itself follows TeardownMode)"}
             else:
-                data = {"StagingObjectsDeleted": str(_empty_bucket(props["StagingBucket"]))}
+                # Artifacts / StagingCleanup 都落这里。两个都清 staging 桶，而且**都要**：
+                # Artifacts 的那一次和还在收尾的上传赛跑（`_drain_bucket` 的注释里有实测
+                # 时间线），StagingCleanup 排在它之后，是最后一道闸。
+                data = {"StagingObjectsDeleted": str(_drain_bucket(props["StagingBucket"]))}
+        elif phase == "StagingCleanup":
+            # Create/Update 什么都不做 —— 这个自定义资源**只为 Delete 而存在**：
+            # 它排在 Artifacts 与 staging 桶之间，于是删栈顺序是
+            # Artifacts.Delete → StagingCleanup.Delete → DeleteBucket，
+            # 让「清桶」有第二次机会跑在删桶之前。
+            data = {"NoOp": "this resource only does work on stack delete"}
         elif phase == "Artifacts":
             data = _artifacts_upsert(props)
         elif phase == "WebSearch":

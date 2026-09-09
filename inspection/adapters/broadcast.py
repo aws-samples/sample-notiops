@@ -52,10 +52,13 @@ _SENDERS: dict[str, Any] = {}
 def load_sender(platform: str) -> Any:
     """`platform` → sender 模块（惰性 + 缓存）。认不出/导入失败返回 `None`。
 
-    ⚠️ 三个分支都写**完整路径** `from shared.report_delivery import X`。
-    `shared/report_delivery/push_handler.py:312` 那份写的是裸模块名
-    `import dingtalk_sender`，于是 ImportError 被 `except ImportError` 吞掉
-    → 钉钉推送永远拿不到 sender 且零报错。抄那段的时候不要把这个一起抄走。
+    ⚠️ 三个分支都写**完整路径** `from shared.report_delivery import X`。裸模块名
+    （`import dingtalk_sender`）在这个 Lambda 里解析不到（asset 根是仓库根，
+    `sys.path[0]` = `/var/task`），而 `ModuleNotFoundError` 是 `ImportError` 的子类
+    ⇒ 下面那个 `except` 会把它降级成一句 warning，那个平台的推送**静默不投递**。
+    `shared/report_delivery/push_handler.py` 曾经就是裸模块名（钉钉那一支），
+    2026-09-09 修成完整路径 —— 判据由 `tests/test_report_delivery.py` 的
+    `test_load_sender_really_imports` 钉住（真跑 import，不是 grep 源码）。
     """
     key = (platform or "").strip().lower()
     if not key:

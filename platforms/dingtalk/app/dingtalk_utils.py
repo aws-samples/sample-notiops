@@ -1,16 +1,28 @@
 """DingTalk adapter helpers — token cache + text-shaping utilities.
 
+⚠️ This module belongs to the LEGACY Fargate/Stream-Mode shape
+(`platforms/dingtalk/app/`). The live path is the Lambda webhook one —
+see `platforms/dingtalk/README.md` and `platforms/dingtalk/sender.py`,
+which re-implements outbound delivery with stdlib only. Nothing under
+`platforms/dingtalk/*.py` (the Lambda layer) imports this file.
+
 Mirrors the role of `platforms/feishu/app/feishu_utils.py` but
 INTENTIONALLY does NOT wrap the inbound reply path. The reply path
 in Stream Mode goes through the `dingtalk-stream` SDK's
 `ChatbotHandler.reply_text` / `reply_markdown` /
 `reply_markdown_card` / `reply_markdown_button` family — those use
 the per-message `incoming_message.session_webhook` URL that the
-platform hands to the bot for ~5 minutes after each inbound. There's
-NO need for us to mint an access_token + call
-`/v1.0/robot/groupMessages/send` ourselves; that path is for
-self-hosted custom-bot webhook robots, a different class of robot
-than what we deploy.
+platform hands to the bot after each inbound.
+
+That URL is good for **~90 minutes**, not ~5 minutes as an earlier
+version of this docstring claimed: the official sample envelope has
+`sessionWebhookExpiredTime - createAt = 5,402,586 ms ≈ 90.04 min`.
+The distinction is architectural, not cosmetic — 90 min > Lambda's
+15-min ceiling, which is exactly why the Lambda path never needs an
+access_token for in-conversation replies.
+
+So for in-conversation replies there is NO need for us to mint an
+access_token ourselves.
 
 What stays in this module:
 
@@ -24,12 +36,20 @@ What stays in this module:
      push delivery path; left here as a single source of truth so
      the lambda/dingtalk_sender Phase 2 wiring can import it.
 
-The earlier Phase 1 version of this file mistakenly wrapped
-`send_text`, `send_markdown` and pointed them at
-`/v1.0/robot/groupMessages/send`. That route requires a separately-
-configured robot (orgWideRobot / outgoing-only) and ignores the
-session_webhook contract. Removed in Phase 1.6 before any deploy
-exposed the bug.
+The earlier Phase 1 version of this file wrapped `send_text` /
+`send_markdown` and pointed them at `/v1.0/robot/groupMessages/send`
+for **in-conversation** replies. That was the wrong route for that
+job — it ignores the session_webhook contract and cannot @ anybody.
+Removed in Phase 1.6.
+
+⚠️ An earlier version of this note went further and claimed that route
+"requires a separately-configured robot (orgWideRobot / outgoing-only)".
+That is **wrong** and has been corrected: `groupMessages/send` is the
+documented route for enterprise-internal application robots; the only
+prerequisite is ticking the "send message as enterprise robot" scope in
+the DingTalk developer console. It is what `sender.send_group()` uses
+for out-of-conversation delivery (report write-back, push), where no
+session_webhook exists.
 """
 from __future__ import annotations
 

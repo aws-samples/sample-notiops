@@ -1,5 +1,11 @@
 """
-Conversational AWS Support case flow for DingTalk.
+Conversational AWS Support case flow for DingTalk — ⚠️ LEGACY.
+
+**新路径见 `platforms/dingtalk/caps.py`**（十条能力）+
+`platforms/dingtalk/case_text.py`（案例的纯文本交互，propose → 回「确认」→ execute，
+**带多账号**）。本文件属于旧的 Fargate / Stream 模式形态（`platforms/dingtalk/app/`，
+由已退役的 `infra/lib/bot-stack.ts` 部署），只作为回滚路径留着 —— 形态说明见
+`platforms/dingtalk/README.md`。Lambda 那条路**一行都不复用本文件**。
 
 Compensation for DingTalk's lack of native modal forms. The flow is
 driven entirely by chat turns:
@@ -30,15 +36,13 @@ their own modal-driven case flows that look nothing like this.
 The only thing both share is calling into core/case_management +
 core/support_logic; the platform-specific bit is the UX shape.
 
-多账号（2026-09-07）：**本文件有意保持单账号**，工单一律开在部署账号下。
-理由不是"不想做"，而是这条路在两条部署路径里都到不了：钉钉走的是 M2 已退役的
-`infra/lib/bot-stack.ts`（Fargate 长连接容器，`infra/bin/app.ts` 不再实例化它），
-而 IM Lambda webhook 只接了飞书 / Slack；钉钉也没有 `platforms/dingtalk/caps.py`。
-写一份连不上现网、跑不到测试的账号透传，只会给以后的人留一份"看着像支持了"的
-假象。⚠️ 真要把钉钉接回 Lambda 那条路时，必须照 `platforms/feishu/app/case_flow.py`
-把 `account_id` 逐个入口透传下去（`create_case` / `describe_case` /
-`add_communication` / `resolve_case` / `case_analyze.analyze` 都已经收这个参数），
-并且把账号号渲染进回复文本 —— 控制台链接不带账号参数。
+多账号：**本文件有意保持单账号**，工单一律开在部署账号下 —— 因为它是回滚路径，
+`infra/bin/app.ts` 不再实例化 `bot-stack.ts`，这条路在两条部署路径里都到不了。
+多账号在**新路径**里已经做了：`platforms/dingtalk/case_text.py` 把 `account_id`
+逐个入口透传（`create_case` / `describe_case` / `add_communication` /
+`resolve_case` / `case_analyze.analyze`），并把账号号渲染进回复文本。
+⚠️ 所以要改案例的多账号行为，改 `case_text.py`，**不要改这里** —— 改这里既跑不到
+现网也跑不到测试，只会留下一份"看着像支持了"的假象。
 """
 from __future__ import annotations
 

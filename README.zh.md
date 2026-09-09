@@ -13,7 +13,7 @@
 分析的事件调查、成本 / FinOps 分析、资源健康巡检,以及完整的 AWS Support 工单管理
 —— 全程在网页里完成,无需切到 AWS 控制台。
 
-同一个助手也能**接入团队已在用的聊天工具(Slack / 飞书)**:在告警群里 `@` 机器人
+同一个助手也能**接入团队已在用的聊天工具(Slack / 飞书 / 钉钉)**:在告警群里 `@` 机器人
 即可发起调查,并直接在告警落地的地方读报告。除了即时提问,它还能对 10 类 AWS 信号源
 做**主动推送**(CloudWatch、AWS Health、Backup、GuardDuty、成本异常、Trusted Advisor、
 EC2 Spot 中断预警、Auto Scaling 启动失败、RDS、Config),每类可独立开关。
@@ -63,7 +63,7 @@ on-call 工程师使用,而无需授予写权限。
   合规与成本管控),凭证可用 IAM 或 Bedrock API Key
 - 🌍 **双语**:中 / 英自动识别 + 显式切换
 - 🛡 **只读承诺**:硬边界是只读 IAM 角色;之上按入口纵深防御 —— 网页端工具层只读 + 命令级 denylist + 只读 system prompt,IM 端 DevOps Agent 只读 agent + 强变更措辞正则二道门 —— 助手绝不改动你的云
-- 💬 **IM 渠道**:Slack / 飞书 全功能 —— 提问后**立刻**回一张卡片,过程 / 思考 / 答案都刷在**同一张卡**上(标题里的秒数就是"还在跑"的信号);深度调查跑完后报告卡自动回贴到发起它的那个会话。**两个 agent 可选**:默认 `/agent devops`(直连 DevOps Agent,NotiOps 侧 0 token),`/agent notiops` 切到走模型的那条路(带 `/web on` 联网开关)。每张卡最下面一行落款说清这一轮的三件事:**走的哪条路 / 哪个模型答的 / 问的哪个 AWS 账号** —— 多账号部署里最后这一段尤其要紧,`/account` 是按会话生效的,群里任何人切一次后面所有人都跟着换
+- 💬 **IM 渠道**:Slack / 飞书 / 钉钉 全功能 —— 提问后**立刻**回一张卡片,过程 / 思考 / 答案都刷在**同一张卡**上(标题里的秒数就是"还在跑"的信号);深度调查跑完后报告卡自动回贴到发起它的那个会话。**两个 agent 可选**:默认 `/agent devops`(直连 DevOps Agent,NotiOps 侧 0 token),`/agent notiops` 切到走模型的那条路(带 `/web on` 联网开关)。每张卡最下面一行落款说清这一轮的三件事:**走的哪条路 / 哪个模型答的 / 问的哪个 AWS 账号** —— 多账号部署里最后这一段尤其要紧,`/account` 是按会话生效的,群里任何人切一次后面所有人都跟着换
 
 ---
 
@@ -84,13 +84,16 @@ on-call 工程师使用,而无需授予写权限。
 
 开栈时有三个可选参数值得知道:
 
-- **安装选项**(`InstallOption`,默认 `web`)—— 下拉三选一:`web` / `web+feishu` /
-  `web+slack`。**三个都装 Web Chat**,后两个再加**一个** IM 机器人(群里 @ 它或私聊它;
+- **安装选项**(`InstallOption`,默认 `web`)—— 下拉四选一:`web` / `web+feishu` /
+  `web+slack` / `web+dingtalk`。**四个都装 Web Chat**,后三个再加**一个** IM 机器人(群里 @ 它或私聊它;
   部署完还要在 IM 平台侧填一次请求地址、把凭证写进 Secrets Manager)。部署完也能 update
   栈换成另一个值。
 - **深度调查**(AWS DevOps Agent,默认开,闲置不计费,区域不支持时自动跳过而不是让栈失败)。
 - **部署模式**(默认单账号;选多账号并填组织 id,就能跨组织内其它账号做只读排查 ——
-  需要从组织管理账号或 StackSets 委派管理员账号部署)。
+  部署身份要么是 **AWS Organizations 管理账号**,要么是一个已注册的 **CloudFormation
+  StackSets 委派管理员**成员账号(自动探测,不用多填参数),详见
+  [docs/DEPLOYMENT_ONECLICK.md §2.6.1](docs/DEPLOYMENT_ONECLICK.md#261-硬性前置管理账号或-stacksets-委派管理员);
+  两种都不是时栈会在第一分钟内失败,并在失败原因里给出注册命令与管理账号号)。
 
 ⚠️ 一键部署装的是 **Web Chat + 可选一个 IM 机器人**,**不含**定时巡检与主动推送、
 巡检看板里的数据与阈值配置、CUR/Athena FinOps,一个栈也只能装一个 IM 平台 ——
@@ -108,7 +111,7 @@ cd sample-notiops
 
 # 2. 部署(CDK,一条命令;首次运行为交互式)
 ./setup.sh
-# 首次运行:确认 AWS 账号 → 选区域 → 选 IM 平台(Slack / 飞书,可多选)→
+# 首次运行:确认 AWS 账号 → 选区域 → 选 IM 平台(Slack / 飞书 / 钉钉,可多选)→
 # 逐个粘贴凭证(直接写入 Secrets Manager,绝不落盘)→ CDK bootstrap → synth →
 # 构建依赖 Layer(pip,无需容器)→ cdk deploy --all。重复运行只增量更新。
 ```
@@ -122,9 +125,18 @@ cd sample-notiops
 - **单账号(默认)** —— `./setup.sh`。NotiOps 只在部署账号内运行。最小权限、
   最快跑通,适合绝大多数试用与单账号用户。
 - **多账号** —— `./setup.sh --multi-account`。在 AWS Organizations 内增加跨成员
-  账号的巡检 / 调查 / 事件转发。在**组织管理账号**,或已注册为
-  **CloudFormation StackSets 委派管理员**的成员账号上运行即可(**不必**是管理
-  账号)。成员账号资源经 StackSets 自动下发。
+  账号的巡检 / 调查 / 事件转发。成员账号资源经 StackSets 自动下发。
+  **两种部署身份都行**:组织管理账号(payer),或一个已注册成 **CloudFormation StackSets
+  委派管理员**的成员账号 —— 脚本自动探测,不用加开关;不合格时会把管理账号要跑的那条
+  `aws organizations register-delegated-administrator` 原样打出来。
+  跑之前先对一下:`aws organizations describe-organization --query
+  'Organization.MasterAccountId' --output text` 等于
+  `aws sts get-caller-identity --query Account --output text` ⇒ 这是管理账号;不等就再查
+  `aws organizations list-delegated-administrators --service-principal
+  member.org.stacksets.cloudformation.amazonaws.com --query 'DelegatedAdministrators[].Id'
+  --output text`(**必须带 `--service-principal`**:不带会列出别的服务的委派管理员,
+  那些账号操作不了 StackSet)。
+  ⚠️ 委派管理员**对全组织有完整部署权限,管理账号无法把它收窄到某个 OU**,一个组织最多 5 个。
 
 完整的部署到你自己 AWS 账号的步骤(含模式对比与如何切换)见
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
@@ -162,7 +174,7 @@ cd sample-notiops
 | 多模型切换 + 模型目录管理 | ✅ | ✅ |
 | 用 Bedrock API Key 作为凭证 | ✅ | ✅ |
 | **主动化 / IM** | | |
-| IM 渠道(Slack / 飞书) | ✅ 一个栈一个平台,见下方注 ⁴ | ✅ 两个可同时开 |
+| IM 渠道(Slack / 飞书 / 钉钉) | ✅ 一个栈一个平台,见下方注 ⁴ | ✅ 三个可同时开 |
 | IM 里两个 agent 可选(`/agent devops` 默认 0 token \| `/agent notiops` 走模型)+ `/web` 联网开关 | ✅ | ✅ |
 | IM 里换「问哪个账号」(`/account`) | ✅ | ✅ |
 | 主动推送**到 IM**(10 类 EventBridge 信号源) | ❌ | ✅ |
@@ -170,7 +182,7 @@ cd sample-notiops
 | 通知收件箱(同样这 10 类信号源,进 Web 收件箱) | ✅ | ✅ |
 | 巡检看板(巡检总览 / 高负载 / 闲置与成本 / 结构性风险 / 巡检范围 / 阈值与定时) | ❌ 方式 A 没有巡检后端,所以侧栏里**根本不出现**这个入口(不是"点进去报错");直接打 API 会明确告诉你需要方式 B | ✅ |
 | **范围** | | |
-| 多账号(AWS Organizations 跨账号) | ✅ 开栈时选 `DeployMode=MultiAccount` + 填组织 id | ✅ `--multi-account` |
+| 多账号(AWS Organizations 跨账号)—— 两条路径都接受**管理账号**或**已注册的 StackSets 委派管理员**成员账号(自动探测);⚠️ CFN 从不把 StackSet 下发到管理账号本身,要巡检它得手工部一次成员模板 | ✅ 开栈时选 `DeployMode=MultiAccount` + 填组织 id | ✅ `--multi-account` |
 | 升级 | 换新版模板 update 栈(~1 分钟) | 重跑 `./setup.sh` |
 
 > ¹ **所有 DevOps Agent 相关能力(深度调查、深度调查(直连)、DevOps 对话、把 Skill 发布到
@@ -202,12 +214,20 @@ cd sample-notiops
 > 已经抽取出来的记录会随 strategy 一起删除。
 
 > ⁴ **方式 A 的 IM 是开栈时的一个下拉选项**(`InstallOption`:`web` / `web+feishu` /
-> `web+slack`,默认只装 web)。装出来的机器人和网页用的是**同一个只读后端**,群里 @ 它、
+> `web+slack` / `web+dingtalk`,默认只装 web)。装出来的机器人和网页用的是**同一个只读后端**,群里 @ 它、
 > 或者私聊它就能问;命中「查资源 / 发起调查 / 看进度 / 切模型 / 切语言」这些是确定性路由,
 > **不花 token**。两处差别:① 一个栈只能装**一个**平台(两个都要走方式 B);② 部署完还有
 > 两步在你手上 —— 凭证写进 Secrets Manager、请求地址填回 IM 平台(顺序不能反,栈输出
 > `ImNextSteps` 会提醒你),步骤见 [docs/IM_WEBHOOK_SETUP.md](docs/IM_WEBHOOK_SETUP.md)。
 > 注意这只是**问答**;把每日巡检报告和告警**主动推**到群里那一路仍然只有方式 B 有。
+>
+> ⚠️ **本版本支持的 IM 是飞书 / Lark、Slack、钉钉**(钉钉 2026-09-08 起,两条路径都支持)。
+> 钉钉有三处**平台能力**差异,我们写出来而不是靠"没提到"暗示:① 卡片按钮**只能是链接**
+> (所以需要确认的操作 —— 开案例、启动调查 —— 在钉钉里**用回复关键词**完成);② 已发出
+> 的消息**改不了**(长任务**追加**一两条进度消息,不像飞书那样刷同一张卡);③ 钉钉保存
+> 回调地址时**不做任何校验**(地址填错不会当场报错,症状只是机器人一句话不回)。
+> **Microsoft Teams 仍然不可用** —— `platforms/teams/` 只有目录没有实现,列为 to-do。
+> 平台对照表在 [docs/IM_WEBHOOK_SETUP.md](docs/IM_WEBHOOK_SETUP.md) 顶部。
 
 > ⁵ **接自己的 CUR 数据源是可选的,两条路径一样。** 上面那行「CUR + Athena 账单明细下钻」
 > 说的是**本部署账号自己的**账单(方式 B 自动建);这一行说的是**另一份 CUR 表**(比如你负责的
@@ -295,7 +315,7 @@ cd sample-notiops
 ## 架构(高层)
 
 ```
-网页控制台(浏览器)          客户 IM(Slack / 飞书)
+网页控制台(浏览器)       客户 IM(Slack / 飞书 / 钉钉)
         │                            │
         └──────────────┬─────────────┘
                        ▼

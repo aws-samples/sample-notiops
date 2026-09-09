@@ -116,8 +116,8 @@ notiops-webchat.template.json
 | **CORS allowed origins** | `*` | 接口本身已经是 `AWS_IAM`（SigV4）鉴权，`*` 不构成越权。想再收一层，可以在第一次部署完之后 update 栈、把它设成 `ChatUrl` 那个地址。 |
 | **IM chat/channel allow list (optional)** | 空 | 只有装了 IM 才有意义（[§2.11](#211-加装-im-机器人飞书lark-或-slack)），只装 web 可以完全不管。填逗号分隔的飞书 chat id（`oc_...`）或 Slack channel id（`C...`），**不能有空格**；留空 = 不限制，机器人被拉进的任何群都答。它是 IM 入口的一道纵深防御（[§8](#8-安全说明值得知道的几条) 里的第 ③ 道）：即使验签被绕过，来自清单外会话的消息也会在**任何模型调用之前**被丢弃。**正常节奏是先留空部署 → 建群拿到 chat id → 再 update 栈填进去**，所以它归在 `Security` 组、不在必填项里。与 `setup.sh` 路径的 `-c imAllowedChatIds=…` 等价。 |
 | **On stack delete** | `KeepData` | 决定删栈时你的数据怎么办。见 [§6 删除](#6-删除这个栈)——**改这个值有个坑，删栈前先读那一节**。 |
-| **Deployment mode** | `SingleAccount` | 想让它同时看组织里**其它**账号，就选 `MultiAccount` 并填下面的 org id。有前置条件，见 [§2.6](#26-可选多账号组织内跨账号)。 |
-| **AWS Organizations id (MultiAccount only)** | 空 | 只有选了 `MultiAccount` 才填（`o-` 开头）。**只填一半不生效**（选了 MultiAccount 但 org id 留空 = 仍是单账号），Outputs 的 `DeployModeStatus` 会告诉你。 |
+| **Deployment mode** | `SingleAccount` | 想让它同时看组织里**其它**账号，就选 `MultiAccount` 并填下面的 org id。`MultiAccount` 要求这个账号是 **AWS Organizations 管理账号**，或是一个已注册的 **StackSets 委派管理员**成员账号（自动探测，不用填参数）—— 选之前先跑 [§2.6.1](#261-硬性前置管理账号或-stacksets-委派管理员) 那几条命令确认一下。不满足的话栈会在第一分钟内失败并告诉你怎么办。 |
+| **AWS Organizations id (MultiAccount only)** | 空 | 只有选了 `MultiAccount` 才填（`o-` 开头）。**只填一半不生效**（选了 MultiAccount 但 org id 留空 = 仍是单账号），Outputs 的 `DeployModeStatus` 会告诉你。填**错**一个合法但不属于本账号的 org id 会被栈里的前置检查当场拦下（否则它会被烧进成员账号信任策略，之后每个账号接入都 AccessDenied 而看不出原因）。 |
 | **Enable AWS DevOps Agent features (deep investigation, DevOps Chat)?** | `Yes` | 一个开关管**四样**能力，见 [§2.7](#27-深度调查aws-devops-agent)。闲置不计费，所以默认开着；不想要就选 `No`（那四样会置灰）。 |
 | **Artifact base URL override** / **Artifact mirror bucket name (s3:// only)** | 空 | 只有拿不到 GitHub 时才填，见 [§7](#7-无公网出口用私有-s3-镜像)。 |
 
@@ -180,14 +180,89 @@ notiops-webchat.template.json
 
 默认的 `SingleAccount` 只看部署它的这个账号。想让它同时看组织里其它账号，开栈时把 **Deployment mode** 选成 `MultiAccount` 并填 **AWS Organizations id**。
 
-**前置条件（不满足就别选）**：
+#### 2.6.1 硬性前置：管理账号，或 StackSets 委派管理员
 
-1. 你部署的这个账号是**组织管理账号**，或者是 **StackSets 的委派管理员**（delegated administrator）。这是硬性的 —— 建成员账号 StackSet 需要这个身份。
-2. 你知道自己的 org id（`o-` 开头）。控制台 **AWS Organizations** 首页就有，或 `aws organizations describe-organization --query Organization.Id`。
+> `MultiAccount` 接受**两种**部署身份，二者之一即可：
+> 1. **AWS Organizations 管理账号（payer）**；
+> 2. 一个已在管理账号里注册成 **CloudFormation StackSets 委派管理员**的成员账号（linked account）—— 怎么注册见下面 [2.6.2](#262-从成员账号部署注册-stacksets-委派管理员)。
+>
+> **不用填任何参数来区分这两种身份** —— 栈会自己探测。两种都不是的话，栈会在**第一分钟内**失败，并在失败原因里给出注册命令与管理账号号（不会先建一百多个资源再全量回滚）。
+
+**开栈前先跑这两条**，几秒就能判断这个账号够不够格：
+
+```bash
+aws organizations describe-organization \
+  --query 'Organization.[Id,MasterAccountId]' --output text
+aws sts get-caller-identity --query Account --output text
+```
+
+- 第一条的**第二列**（`MasterAccountId`）== 第二条的输出 ⇒ 这就是管理账号，可以选 `MultiAccount`。
+- 两者**不等** ⇒ 这是成员账号。那就再跑一条，看它是否已经是 StackSets 的委派管理员：
+
+  ```bash
+  aws organizations list-delegated-administrators \
+    --service-principal member.org.stacksets.cloudformation.amazonaws.com \
+    --query 'DelegatedAdministrators[].Id' --output text
+  ```
+
+  输出里**有**本账号号 ⇒ 可以选 `MultiAccount`。没有 ⇒ 三条路：按 [2.6.2](#262-从成员账号部署注册-stacksets-委派管理员) 注册一下、把模板开到管理账号里去、或者本次选 `SingleAccount`（Web / IM / 深度调查 / 开案例全都照常，只是只看这一个账号）。
+  ⚠️ 这条命令**必须带 `--service-principal`**。不带的话你会看到组织里**所有**服务（GuardDuty / Config / Security Hub …）的委派管理员，那些账号也拿得到 Organizations 只读权限，但它们**不能**操作 StackSet —— 照着那份清单判断会得到"应该行"然后在建 StackSet 时才 `AccessDenied`。
+- 第一条报 `AWSOrganizationsNotInUseException` ⇒ 这个账号根本不在任何组织里，只能 `SingleAccount`。
+- 第一条报 `AccessDeniedException` ⇒ 基本是 SCP 拦了 `organizations:DescribeOrganization`；不解掉的话栈里的检查也读不到，同样过不去。
+
+> 🔴 **一条与身份无关的硬限制**：CloudFormation **从不**把 service-managed StackSet 下发到**组织管理账号本身** —— 即使把它所在的 OU 设成目标，`CreateStackInstances` 也会返回 SUCCEEDED 而什么都不建（一次静默的假成功）。所以「让 NotiOps 巡检管理账号自己」这件事不能靠 StackSet：要手工把 [`infra/member-account-onboarding.yaml`](../infra/member-account-onboarding.yaml) 在管理账号里部一次，再在 Web 的**管理 → 账户**页用「手动接入账号」把它登记进来。这一点在两种部署身份下都一样。
+
+**org id 填第一条输出的第一列**（`o-` 开头）。填错的后果特别不直观：它会被烧进成员账号信任策略的 `aws:PrincipalOrgID`，之后每个成员账号接入都 `AccessDenied`，而现场完全看不出是 id 抄错了。所以栈里的检查会**顺手核对**你填的 id 与本账号真实所在组织是否一致，不一致就直接报错并把正确值告诉你。
 
 **两个都要填。** 只选了 `MultiAccount` 但 org id 留空，栈会**照样开成功、但仍是单账号** —— 这是故意的：org id 是跨账号信任策略里 `aws:PrincipalOrgID` 那道收口条件，没有它，成员账号里的角色就只是"信任系统账号 root"而没有组织边界，不如干脆不开。Outputs 的 `DeployModeStatus` 会把这件事说出来。
 
-**多了什么**：栈会在你这个账号里建两个 StackSet（`notiops-member-onboarding`、`notiops-member-devops-agent`），并打开 Organizations 对 StackSets 的信任访问。之后在 Web 界面的**管理 → 账户**页把成员账号一个个接进来（每个成员账号里会创建一个跨账号**只读**角色 + 一个深度调查触发角色）。接进来之后，你就能在聊天界面切换账号做只读排查、深度调查、开案例。
+#### 2.6.2 从成员账号部署：注册 StackSets 委派管理员
+
+很多组织的管理账号是"净空"的（不落业务负载、变更走单独审批）。这种情况下把 NotiOps 开在一个成员账号里、只把**下发成员账号角色**这件事委派给它，比把整套 Web/IM 底座塞进管理账号更现实。
+
+**一次性动作，在管理账号里跑**（`<成员账号号>` 换成你打算用来部署 NotiOps 的那个账号）：
+
+```bash
+aws organizations register-delegated-administrator \
+  --service-principal member.org.stacksets.cloudformation.amazonaws.com \
+  --account-id <成员账号号>
+```
+
+验证（同样在管理账号里，也可以在那个成员账号里跑）：
+
+```bash
+aws organizations list-delegated-administrators \
+  --service-principal member.org.stacksets.cloudformation.amazonaws.com \
+  --query 'DelegatedAdministrators[].[Id,Status]' --output text
+```
+
+反向操作是 `aws organizations deregister-delegated-administrator`（同样两个参数）。
+
+注册完，直接在那个成员账号里开这个模板、选 `MultiAccount` 即可，**没有额外参数**：栈里的前置检查会依次做 `DescribeOrganization` → `ListDelegatedAdministrators`（按上面那个 service principal 过滤），认出这条身份之后，把 `CallAs=DELEGATED_ADMIN` 一路带到所有 StackSets 调用（建/更新两个 StackSet、下发实例，以及运行期 Web 管理页背后 BFF 的那 9 个 StackSets 调用）。
+
+**开这条路之前，客户要知道的四件事：**
+
+1. ⚠️ **委派管理员对全组织有完整部署权限。** AWS 明确说明：管理账号**无法**把委派管理员的权限收窄到某几个 OU 或某几类操作。也就是说，这个成员账号一旦被注册，就能往组织里**任何**账号下发 StackSet（不只是 NotiOps 这两个）。这是 AWS StackSets 的模型，不是 NotiOps 的实现选择。
+2. **可信访问必须先由管理账号开好。** 注册委派管理员本身就要求它已经开着；而 `enable-aws-service-access` 与 `activate-organizations-access` 这两个 API **只有管理账号能调**。所以委派管理员这条路上，栈**不会**替你去开（也开不了），只会用 `describe-organizations-access --call-as DELEGATED_ADMIN` **验一遍**，没开就失败并把那两条命令给出来，让你回管理账号跑。见 [§2.6.3](#263-信任访问两半都得开)。
+3. **一个组织最多 5 个委派管理员**（AWS 的硬限制，跨所有服务合计）。
+4. **StackSet 实体存放在管理账号里**，即使它是由委派管理员创建的。所以在管理账号的 CloudFormation 控制台里能看到 `notiops-member-onboarding` / `notiops-member-devops-agent`，而在**部署账号**的控制台里看不到（要看得加 `--call-as DELEGATED_ADMIN`）。`teardown.sh` / `TeardownMode` 也同样带这个参数，不会因此漏删。
+
+#### 2.6.3 信任访问：两半都得开
+
+service-managed StackSet 要求 CloudFormation 与 Organizations 之间的**信任访问**是打开的，而这件事**有两半**，缺一不可：
+
+| 哪一半 | 命令 | 缺了的症状 |
+|---|---|---|
+| Organizations 侧 | `aws organizations enable-aws-service-access --service-principal member.org.stacksets.cloudformation.amazonaws.com` | — |
+| CloudFormation 侧 | `aws cloudformation activate-organizations-access --region <你的区域>` | `CreateStackSet` 报 `ValidationError: You must enable organizations access to operate a service managed stack set` |
+
+**在管理账号里部署时，栈会替你把两半都打开**（前置检查阶段做，只在选了 `MultiAccount` 时才有这段），然后用 `describe-organizations-access` **验一遍**状态确实是 `ENABLED` 才继续。所以正常情况下你什么都不用做。
+
+**从委派管理员（成员账号）部署时，栈只验、不开** —— 上面那两条命令都是管理账号专属的，在成员账号里重试一万次也开不了。这里刻意选了"跳过"而不是"调了忽略错误"：后者会在部署日志里留下一条 `AccessDenied`，让现场以为脚本已经帮它开好了，而真没开时唯一正确的动作是**回管理账号**跑那两条命令。验的时候会带上 `--call-as DELEGATED_ADMIN`（不带的话 CloudFormation 按 `SELF` 解释，读到的是**本账号**命名空间的状态，而这条路上本账号根本没有那个开关 ⇒ 永远 `DISABLED` ⇒ 一个完全合格的环境被判不合格）。
+
+真被 SCP 之类的东西拦住，失败原因里会把上面那两条命令原样给出来（带上你的区域），在管理账号跑完再 update 一次栈即可。这里最误导人的一点是：**Organizations 那半的清单里往往已经有那个 service principal 了**，看起来"已经开了"，但 CloudFormation 那半仍是 `DISABLED`，而 AWS 报的 `ValidationError` 完全不提该去调 `activate-organizations-access`。
+
+**多了什么**：栈会建两个 StackSet（`notiops-member-onboarding`、`notiops-member-devops-agent`），并（管理账号部署时）打开 Organizations 对 StackSets 的信任访问。⚠️ service-managed StackSet **一律存放在组织管理账号里**，即使是委派管理员创建的 —— 所以从成员账号部署时，这两个 StackSet 不会出现在部署账号的 CloudFormation 控制台里。之后在 Web 界面的**管理 → 账户**页把成员账号一个个接进来（每个成员账号里会创建一个跨账号**只读**角色 + 一个深度调查触发角色）。接进来之后，你就能在聊天界面切换账号做只读排查、深度调查、开案例。
 
 **这条路径**仍然**没有**：成员账号的 CloudWatch OAM Sink、跨账号 Health / 调查事件回流、跨账号定时巡检。那三样要 `setup.sh`。
 
@@ -296,7 +371,7 @@ notiops-webchat.template.json
 
 > ⚠️ **顺序不能反**：先写凭证，再填请求地址。飞书/Slack 在你保存请求地址时会**立刻**发一次校验请求，那时凭证还没有的话入口函数会直接失败，而 IM 平台上显示的是「校验失败」—— 看起来像地址填错了。
 
-**每一步点哪里、填什么，见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md)**（飞书 §1、Slack §2；那份文档两条部署路径通用，secret 名字和请求地址的用法完全一样）。
+**每一步点哪里、填什么，见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md)**（飞书 §1、Slack §2、钉钉 §3；那份文档两条部署路径通用，secret 名字和请求地址的用法完全一样）。
 
 **装完之后想改**：update 栈、把 **What to install** 换成另一个值即可。
 
@@ -331,7 +406,7 @@ notiops-webchat.template.json
 
 ## 3. 这个栈建了什么
 
-默认参数下 **68 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 5 个；选上多账号多 3 个；**选带 IM 的安装选项多 16 个**）：
+默认参数下 **69 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 5 个；选上多账号多 8 个；**选带 IM 的安装选项多 16 个**）：
 
 | 类别 | 资源 |
 |---|---|
@@ -340,12 +415,12 @@ notiops-webchat.template.json
 | Agent | 1 个 Bedrock AgentCore Runtime + 1 个 AgentCore Memory（会话记忆，见 [§2.10](#210-会话记忆agentcore-memory)） |
 | 登录 | Cognito User Pool + Client + Identity Pool + 8 个用户组（角色） |
 | 数据 | DynamoDB `notiops-config`、`notiops-web-chat`；1 个数据桶（报告等） |
-| 部署辅助 | 1 个 staging 桶（放搬进来的产物）+ 1 个内联的部署 Lambda + 2 个自定义资源 |
+| 部署辅助 | 1 个 staging 桶（放搬进来的产物）+ 1 个内联的部署 Lambda + 3 个自定义资源（搬产物 / 写前端配置 / **删栈时把 staging 桶清到真的空**） |
 | 权限 | 6 个 IAM 角色 + 5 个内联策略（其中 AgentCore Memory 的执行角色**一条策略都没有** —— 它只是给服务用来信任的壳） |
 | 「通知」收件箱（见 [§2.9](#29-通知收件箱)） | **10 条 EventBridge 规则**（5 条 ENABLED / 5 条 DISABLED）+ 1 个 Lambda + 它的日志组 + 1 个角色（+ 策略）+ 1 条 Lambda 调用许可 = 15 个 |
 | 深度调查（默认开） | 1 个 DevOps Agent Agent Space（**含自动开好的 Operator App**）+ 1 个只读关联 + 1 个被 DevOps Agent 假设的角色（+ 它的策略）+ 1 个 Operator App 角色 = 5 个 |
 | 联网搜索（仅 us-east-1） | 1 个自定义资源（去建 AgentCore Gateway）+ 1 个 Gateway 服务角色 + 1 个内联策略 |
-| 多账号（可选） | 1 个自定义资源（去建两个成员账号 StackSet）+ 2 个内联策略 |
+| 多账号（可选） | 2 个自定义资源（① 资格前置检查 ② 去建两个成员账号 StackSet）+ 前置检查自己的 Lambda / 角色 / 策略 / 日志组 + 2 个内联策略 = 8 个 |
 | IM 机器人（可选，见 [§2.11](#211-加装-im-机器人飞书lark-或-slack)） | 3 个 Lambda（入口 / 干活 / 进度刷新）+ 3 个日志组 + 1 个 **API Gateway HTTP API**（公网入口，见下；连它的路由 / 集成 / 阶段一共 4 个资源）+ 3 条调用许可（HTTP API→入口、保活规则→入口、进度规则→进度刷新）+ 1 个依赖层 + 2 张 DynamoDB 表（群会话、用量）+ 2 条 EventBridge 规则（每分钟刷调查进度、每 4 分钟保活入口）+ 1 个角色（+ 策略）= 20 个 |
 
 **成本量级**（空闲时）：CloudFront + S3 + DynamoDB 按量、Lambda 不调用不计费、AgentCore Runtime 空闲不计费 —— 不用的时候基本只有几毛钱的存储。真正花钱的是**提问时的 Bedrock token**。staging 桶里每个 release 约 **165 MB**（装了 IM 再多 ~28 MB；S3 标准存储 ≈ $0.004/月），升级不会自动清掉旧版本，见 [§5](#5-升级到新版本)。IM 那套同理**空闲零成本**（三个 Lambda 不调用不计费，两张表按量，每分钟那条进度规则只在有调查在跑时才真的做事）。
@@ -364,9 +439,14 @@ Events 页，找第一条 `CREATE_FAILED`（不是最后一条）。常见的两
 |---|---|
 | `StagerArtifacts` 失败，日志里有超时/连不上 | 这个账号出不了公网、拉不到 GitHub。走 [§7](#7-无公网出口用私有-s3-镜像)。 |
 | `AgentRuntime` 失败 | 该区域可能不支持 Bedrock AgentCore。换 us-east-1 / us-west-2。 |
-| `StagerOrgSetup` 失败，提到 `management account or a delegated administrator` | 你选了 `MultiAccount`，但这个账号既不是组织管理账号也不是 StackSets 委派管理员。改回 `SingleAccount` 重开，或者换个够格的账号。见 [§2.6](#26-可选多账号组织内跨账号)。 |
+| `StagerPreflight` 失败，提到 `needs this account to be either the AWS Organizations management account or a registered ... delegated administrator` | 你选了 `MultiAccount`，但这个账号既不是管理账号、也**还没**注册成 StackSets 委派管理员。失败原因里已经把三条出路和那条注册命令原样给出来了（管理账号号也在里面）。想从这个成员账号部署就按 [§2.6.2](#262-从成员账号部署注册-stacksets-委派管理员) 注册一次再 update 栈。 |
+| `StagerPreflight` 失败，提到 `OrganizationId` 不匹配 | org id 抄错了。失败原因里带着**正确**的那个，照着改再开。 |
+| `StagerPreflight` 失败，提到 `activate-organizations-access` | 信任访问只开了一半，而且 SCP 拦住了栈自己去开。把失败原因里那两条命令在管理账号跑一遍，再 update 栈。见 [§2.6.3](#263-信任访问两半都得开)。 |
+| `StagerOrgSetup` 失败，提到 `management account` 或 `activate-organizations-access` | 同上三条。这是 `MultiAccount` 的第二道闸（前置检查之后才写组织），能走到这里说明前置检查通过了但真正建 StackSet 时还是被拒。 |
 
-详细日志在 CloudWatch 日志组 `/aws/lambda/notiops-stager`（把 `notiops` 换成你的栈名）。
+详细日志在 CloudWatch 日志组 `/aws/lambda/notiops-stager` 与 `/aws/lambda/notiops-preflight`（把 `notiops` 换成你的栈名）。
+
+> 🩹 **栈停在 `ROLLBACK_FAILED`、`StagingBucket` 报 `DELETE_FAILED`（v1.0.25 及更早）**：回滚时那个**已被取消**的下载 Lambda 还在后台跑，清桶清完之后它又把 144 MiB 的 agent zip 写了进去，于是桶删不掉、栈也删不掉。手动收尾：控制台 → S3 → 那个 `<栈名>-staging-…` 桶 → **Empty**（顺手在「未完成的分段上传」里也清一遍），然后重新 Delete 栈。之后的版本会自己收拾（清桶改成"连续两轮空才收手"，并且额外排了一道在删桶之前必过的闸）。
 
 ### 4.2 ⚠️ 失败重试前，必须先删掉三个"留下来的"资源
 
@@ -385,7 +465,25 @@ Events 页，找第一条 `CREATE_FAILED`（不是最后一条）。常见的两
 3. 再重新开栈
 ```
 
+第 2 步用命令行更快（把区域和账号 id 换成你的）：
+
+```bash
+REGION=us-east-1
+ACCT=$(aws sts get-caller-identity --query Account --output text)
+
+aws dynamodb delete-table --table-name notiops-config   --region "$REGION"
+aws dynamodb delete-table --table-name notiops-web-chat --region "$REGION"
+aws s3 rm "s3://notiops-data-$ACCT-$REGION" --recursive   # 先清空
+aws s3 rb "s3://notiops-data-$ACCT-$REGION"
+```
+
+（表名前缀跟着栈名走：栈名不叫 `notiops` 就把上面的 `notiops-` 换成你的栈名。）
+
+⚠️ 这一步**故意没有做成自动检测**：一次全新安装里"表还不存在"是正常的，把"已存在"当成错误去拦，会把每一次头一回部署都拦下来。
+
 （如果第一次部署已经用过、里面有你想留的数据，就**不要**删表/桶 —— 重开栈时它们会被复用。）
+
+> 💡 多账号部署失败时**还会留下**成员账号 StackSet（`notiops-member-onboarding` / `notiops-member-devops-agent`）和 Organizations 的信任访问。这两样是**故意留的**（理由见 [§6.4](#64-会留下的东西孤儿要不要管)），而且**不影响重试** —— 重开栈会复用同名 StackSet。
 
 ### 4.3 页面打开是白屏 / 404
 
@@ -554,7 +652,7 @@ aws s3 cp im-layer.zip   s3://my-mirror/notiops/v1.2.3/
    不匹配就删掉已上传的对象并让栈失败。不接受这个前提的话，请走 [§7](#7-无公网出口用私有-s3-镜像) 的私有镜像，或走 `setup.sh`。
 4. **管理员密码我们碰不到**：临时密码由 Cognito 生成并直接发给你。部署流程不传、不读、不打印、不放进 Outputs。
 5. **你自己的凭证做的所有动作**：整条链路上没有我们的账号、我们的桶、我们的角色。
-6. **装了 IM 就多一个公网入口**（[§2.11](#211-加装-im-机器人飞书lark-或-slack)）——那个 **API Gateway HTTP API** 必须是**未鉴权**的，因为飞书/Slack 不会给你签 SigV4（2026-09-01 之前这里是 Lambda Function URL，为什么换、以及被否掉的两个替代方案，见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §4.1）。五道边界：① **验签**（飞书用 Encrypt Key + Verification Token，Slack 用 signing secret，缺钥匙就冷启动失败，不存在"没配好也能进"）；② **两层限流** —— HTTP API 阶段级 50 req/s、突发 100（超出的请求由 API Gateway 直接 429，**不进 Lambda**），入口函数上再叠**并发上限 10**，这是公网未鉴权入口的花费天花板；③ 可选的**群允许清单**（只让指定群里的消息生效，见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §3）；④ **幂等去重**（同一个事件重复投递只处理一次）；⑤ 到了后端仍然是**同一个只读 agent**，没有任何写权限 —— 即使有人伪造了一条消息，最坏结果也是读到只读信息。凭证一律放 Secrets Manager，不进环境变量、不打印在日志里。还剩下的风险如实列在 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §4.3。
+6. **装了 IM 就多一个公网入口**（[§2.11](#211-加装-im-机器人飞书lark-或-slack)）——那个 **API Gateway HTTP API** 必须是**未鉴权**的，因为飞书/Slack 不会给你签 SigV4（2026-09-01 之前这里是 Lambda Function URL，为什么换、以及被否掉的两个替代方案，见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §5.1）。五道边界：① **验签**（飞书用 Encrypt Key + Verification Token，Slack 用 signing secret，缺钥匙就冷启动失败，不存在"没配好也能进"）；② **两层限流** —— HTTP API 阶段级 50 req/s、突发 100（超出的请求由 API Gateway 直接 429，**不进 Lambda**），入口函数上再叠**并发上限 10**，这是公网未鉴权入口的花费天花板；③ 可选的**群允许清单**（只让指定群里的消息生效，见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §4）；④ **幂等去重**（同一个事件重复投递只处理一次）；⑤ 到了后端仍然是**同一个只读 agent**，没有任何写权限 —— 即使有人伪造了一条消息，最坏结果也是读到只读信息。凭证一律放 Secrets Manager，不进环境变量、不打印在日志里。还剩下的风险如实列在 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §5.3。
 
 ---
 

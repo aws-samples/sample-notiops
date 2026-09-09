@@ -168,6 +168,17 @@ export interface MemberAccountRec {
    */
   outOfOrg?: boolean;
   /**
+   * 这个账号是组织**管理账号**（只有「从委派管理员账号部署」的形态下才会出现这一行 ——
+   * 管理账号自部署时部署账号本身就被排除在列表外）。
+   *
+   * 🔴 UI SHALL 不渲染一键接入按钮：**CloudFormation 不会把 stack 部署到管理账号**，
+   * 即使它在被 target 的 OU 里（AWS 官方限制）。渲染的后果不是报错而是**假成功** ——
+   * `CreateStackInstances` 返回成功、操作变 SUCCEEDED、账号被翻成「已接入」，
+   * 而那个账号里什么都没建，之后每一次跨账号提问都 AssumeRole 失败。
+   * 唯一出路是在管理账号里手工部一次 `member-account-onboarding.yaml` + 手动接入登记。
+   */
+  isOrgManagementAccount?: boolean;
+  /**
    * 接入方式：`"manual"` = 客户自己部署 CFN；`""` = 一键接入（或老记录）。
    *
    * 🔴 UI SHALL 显示它，因为**下线的回收范围按它分岔**：
@@ -297,13 +308,34 @@ export async function deleteAccountAccess(kind: "user" | "group", id: string): P
   return req("DELETE", `/admin/account-access/${kind}/${encodeURIComponent(id)}`);
 }
 
-// ── 飞书机器人通知配置（Admin「通知」板块;存 Secrets Manager,与老管理前端解耦）──
+// ── IM 机器人配置（Admin「集成 IM」板块;每平台一个 Secrets Manager secret,与老管理前端解耦）──
 export interface FeishuConfig { app_id: string; app_secret: string; verification_token?: string; encrypt_key?: string; notify_chat_ids: string }
-/** GET 额外回带一个**只读**字段 `webhook_url`：IM 入口的 webhook 地址，后端按名字查
- *  HTTP API 得到（bff/web-chat/feishu_config.mjs）。它不是凭证、不脱敏，给抽屉第 3 步
- *  显示 + 一键复制用。**没装 IM / 查不到时是空串**，界面据此退回"去 Outputs 里找"。
- *  故意不放进 `FeishuConfig` —— PUT 不接受这个字段，写进去会让它看着像可改的。 */
-export async function fetchNotificationConfig(): Promise<{ feishu: FeishuConfig & { webhook_url?: string } }> {
+/** 钉钉的字段集**比飞书少**：没有 verification_token / encrypt_key（钉钉验签用的就是
+ *  app_secret），也没有 notify_chat_ids（钉钉的主动推送只有一个自定义机器人地址，
+ *  见 shared/report_delivery/dingtalk_sender.py 的 SINGLE_SINK_PLATFORMS）。
+ *
+ *  ⚠️ `push_webhook_url` 与下面那个只读的 `webhook_url` **不是一回事**，方向正好相反：
+ *     · `push_webhook_url` = 客户那个**自定义机器人**的推送地址，**它本身就是凭证**
+ *       （谁拿到都能往那个群发消息）→ GET 回来是脱敏形态，回传脱敏值 = 不改。
+ *     · `webhook_url`（下面）= NotiOps 的**入站**回调地址，公开、只读、不脱敏。
+ *     后端刻意把 secret 里的 `webhook_url` 改名成 `push_webhook_url` 对外，就是为了这两个
+ *     不同名（见 bff/web-chat/dingtalk_config.mjs 文件头「命名陷阱」）。 */
+export interface DingtalkConfig { app_key: string; app_secret: string; push_webhook_url?: string }
+/** GET 额外回带一个**只读**字段 `webhook_url`：该平台 IM 入口的回调地址，后端按名字查
+ *  HTTP API 得到（bff/web-chat/{feishu,dingtalk}_config.mjs）。它不是凭证、不脱敏，给抽屉
+ *  第 3 步显示 + 一键复制用。**没装 IM / 查不到时是空串**，界面据此退回"去 Outputs 里找"。
+ *  故意不放进 `FeishuConfig` / `DingtalkConfig` —— PUT 不接受这个字段，写进去会让它看着像可改的。
+ *
+ *  一次 GET 回全部平台（不是每个平台一次请求）：这一页要同时画出"哪个配好了、哪个还空着"，
+ *  拆成多次请求就多出一堆半成功状态，而这一页最贵的 bug 恰好是**界面骗人**。
+ *
+ *  `dingtalk` 标成**可选**是诚实的:前端资产与 BFF Lambda 虽然在同一个栈里更新，但客户
+ *  浏览器可能拿到的是缓存下来的旧前端（或反过来:新前端 + 还没更新完的 BFF）。缺这一段时
+ *  钉钉分页要退回"全部空着"，而不是白屏 —— 所以调用方必须给兜底。 */
+export async function fetchNotificationConfig(): Promise<{
+  feishu: FeishuConfig & { webhook_url?: string };
+  dingtalk?: DingtalkConfig & { webhook_url?: string };
+}> {
   return req("GET", "/admin/notification-config");
 }
 export async function putNotificationConfig(config: Partial<FeishuConfig>): Promise<{ message: string }> {
@@ -311,6 +343,16 @@ export async function putNotificationConfig(config: Partial<FeishuConfig>): Prom
 }
 export async function testNotificationSend(chatId: string): Promise<{ success: boolean; message: string }> {
   return req("POST", "/admin/notification-config/test", { platform: "feishu", chat_id: chatId });
+}
+export async function putDingtalkConfig(config: Partial<DingtalkConfig>): Promise<{ message: string }> {
+  return req("PUT", "/admin/notification-config", { platform: "dingtalk", config });
+}
+/** 钉钉的"测试"**不发到群里**：钉钉没有"往任意群发一条测试消息"的接口（机制 2 要
+ *  openConversationId、机制 3 要 staffId，两者都只能从回调报文里拿）。所以后端做的是
+ *  换一次 access_token 验凭证，外加"填了自定义机器人地址就顺手推一条"。
+ *  因此这个函数**没有 chatId 参数** —— 不是漏了。 */
+export async function testDingtalkSend(): Promise<{ success: boolean; message: string }> {
+  return req("POST", "/admin/notification-config/test", { platform: "dingtalk" });
 }
 
 // ── 跨 Payer 接入(组织外账号:Launch Stack + 手工回填 + 测试连接)──

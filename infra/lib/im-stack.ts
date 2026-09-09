@@ -26,9 +26,11 @@ export interface ImStackProps extends cdk.StackProps {
  * IM 侧 Lambda + Webhook 栈（IM 重构 / M1 + M3）—— **方式B（setup.sh / CDK）**。
  *
  * 取代 BotStack 里的 ECS Fargate 常驻容器：
- *   · ingress  —— API Gateway HTTP API 收飞书/Slack 事件，验签 + 解密后异步投 worker，秒回 ACK；
+ *   · ingress  —— API Gateway HTTP API 收飞书/Slack/钉钉事件，验签 + 解密后异步投 worker，秒回 ACK；
  *   · worker   —— 真正干活（确定性路由 → DevOps Agent 直连 / 发起调查 / 案例流程）；
- *   · progress —— EventBridge rate(1 minute) 扫 `imtask#` 行，PATCH 调查进度卡片。
+ *   · progress —— EventBridge rate(1 minute) 扫 `imtask#` 行，PATCH 调查进度卡片
+ *                （**只服务飞书 / Slack**：钉钉改不了已发消息，进度是追加式的，
+ *                 理由见 im-core.ts 里那个门上的注释）。
  *
  * ⚠️ 三个函数的**定义本身**在 [constructs/im-core.ts](constructs/im-core.ts)，方式A
  * （一键 CloudFormation，notiops-webchat-standalone-stack.ts）用的是同一个 construct。
@@ -54,7 +56,8 @@ export interface ImStackProps extends cdk.StackProps {
  *   1. 验签/解密 fail-fast（两把钥匙缺一即冷启动失败，见 lambda_ingress.py 文件头）；
  *   2. ingress 上 reservedConcurrentExecutions=10 + HTTP API 阶段级限流 —— 公网
  *      未鉴权入口的花费上限；
- *   3. ALLOWED_CHAT_IDS 群允许清单（worker 侧）；
+ *   3. 群允许清单（worker 侧）—— 每个平台的变量名不同：飞书 `ALLOWED_CHAT_IDS`、
+ *      Slack `ALLOWED_CHANNEL_IDS`、钉钉 `ALLOWED_CONVERSATION_IDS`；
  *   4. 幂等去重在 worker（ddb_state.put_new_event）。
  */
 export class ImStack extends cdk.Stack {
@@ -191,6 +194,10 @@ export class ImStack extends cdk.Stack {
       platforms: {
         feishu: enabledPlatforms.includes("feishu"),
         slack: enabledPlatforms.includes("slack"),
+        // 钉钉不需要往上面那个 `required` 层校验里加包 —— 它的 ingress/worker
+        // **只用标准库**（验签是 hmac + base64，出站是 urllib）。见
+        // `platforms/dingtalk/lambda_ingress.py` 文件头与 `shared/dingtalk_api.py`。
+        dingtalk: enabledPlatforms.includes("dingtalk"),
       },
       progressRuleName: "notiops-im-progress-tick",
       keepAliveRuleName: (role) => `notiops-im-keepalive-${role}`,
@@ -207,6 +214,13 @@ export class ImStack extends cdk.Stack {
       new cdk.CfnOutput(this, "SlackWebhookUrl", {
         value: im.slackWebhookUrl,
         description: "Slack App 的 Event Subscriptions / Interactivity / Slash Commands 三处都填这个",
+      });
+    }
+
+    if (im.dingtalkWebhookUrl) {
+      new cdk.CfnOutput(this, "DingtalkWebhookUrl", {
+        value: im.dingtalkWebhookUrl,
+        description: "钉钉开放平台「机器人 → 消息接收模式 → HTTP 模式」的请求网址填这个",
       });
     }
 

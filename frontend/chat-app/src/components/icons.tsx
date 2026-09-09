@@ -164,6 +164,28 @@ export const IconBell = ({ size = 18 }: P) => (
   <svg {...base(size)}><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></svg>
 );
 
+// ── 管理控制台左侧子导航 ──（角色用 IconSecurity、模块用 IconSliders、集成 IM 用 IconChatBubble）
+// 用户 — 单人
+export const IconUser = ({ size = 16 }: P) => (
+  <svg {...base(size)}><circle cx="12" cy="8" r="3.6" /><path d="M5 20c0-3.4 3.1-5.6 7-5.6s7 2.2 7 5.6" /></svg>
+);
+// 组映射 — 双人
+export const IconUsers = ({ size = 16 }: P) => (
+  <svg {...base(size)}><circle cx="9.5" cy="8.5" r="3.2" /><path d="M3.5 19.5c0-3.1 2.7-5 6-5s6 1.9 6 5" /><path d="M16.5 6.2a3.2 3.2 0 0 1 0 6.1" /><path d="M18 14.9c2 .6 3.5 2.1 3.5 4.6" /></svg>
+);
+// 账户 — 组织层级树（管理账号 + 成员账号）
+export const IconOrg = ({ size = 16 }: P) => (
+  <svg {...base(size)}><rect x="9" y="3" width="6" height="5" rx="1.3" /><rect x="3" y="16" width="6" height="5" rx="1.3" /><rect x="15" y="16" width="6" height="5" rx="1.3" /><path d="M12 8v4M6 16v-4h12v4" /></svg>
+);
+// 生命周期 — 日历 + 时钟（EOL 日期）
+export const IconCalendarClock = ({ size = 16 }: P) => (
+  <svg {...base(size)}><path d="M20 11V6.5A1.5 1.5 0 0 0 18.5 5h-13A1.5 1.5 0 0 0 4 6.5v12A1.5 1.5 0 0 0 5.5 20H11" /><path d="M4 9.5h16M8 5V3M16 5V3" /><circle cx="17" cy="17" r="4" /><path d="M17 15.2V17l1.4.9" /></svg>
+);
+// 模型 — 芯片（LLM 目录）
+export const IconChip = ({ size = 16 }: P) => (
+  <svg {...base(size)}><rect x="7" y="7" width="10" height="10" rx="2" /><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4" /></svg>
+);
+
 // ─────────────────────────────────────────────────────────────────────────
 // 预置 Skill 的主题图标（线性单色，跟随 currentColor）。按 skill_id 映射，见 skillIcon()。
 // 客户自建 skill 无匹配时回退 IconSkill。

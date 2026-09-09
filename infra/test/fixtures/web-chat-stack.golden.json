@@ -1529,8 +1529,10 @@
             "NOTIOPS_CROSS_ACCOUNT_ROLE": "notiops-idle-detection-role",
             "NOTIOPS_MEMBER_ROLE_NAME": "",
             "ORGANIZATION_ID": "",
+            "ORG_MANAGEMENT_ACCOUNT_ID": "",
             "REPORTS_CDN_DOMAIN": "reports.example.invalid",
             "SKILLS_BUCKET": "notiops-data-444455556666-us-east-1",
+            "STACKSET_CALL_AS": "",
             "WEB_CHAT_TABLE": {
               "Ref": "WebChatTable02103F86"
             }
@@ -1775,12 +1777,18 @@
                 "secretsmanager:UpdateSecret"
               ],
               "Effect": "Allow",
-              "Resource": "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-feishu*"
+              "Resource": [
+                "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-feishu*",
+                "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-dingtalk*"
+              ]
             },
             {
               "Action": "secretsmanager:CreateSecret",
               "Effect": "Allow",
-              "Resource": "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-feishu*"
+              "Resource": [
+                "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-feishu*",
+                "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-dingtalk*"
+              ]
             },
             {
               "Action": "apigateway:GET",

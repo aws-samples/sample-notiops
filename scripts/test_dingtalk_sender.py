@@ -9,6 +9,17 @@ relies on:
   * `send_report` POSTs a markdown payload to the webhook URL with
     the expected fields (msgtype="markdown", title, link bullet
     list, next-step bullets).
+    ⚠️ `send_report` no longer goes straight to the webhook: it first
+    tries **conversation-targeted** delivery (`dingtalk_api.send_group`
+    / `send_oto`, routed by `chat_id`) and only falls back to the
+    custom-bot webhook when that fails. So the webhook assertions here
+    pin `dingtalk_api` to "unavailable" via `_no_server_api()` — without
+    it, the token fetch inside `dingtalk_api` shows up as an extra
+    captured POST and "exactly one POST" reads as a regression when it
+    is really the (correct) two-step delivery. There is also a check
+    that a *successful* server-API delivery emits **no** webhook POST —
+    double-delivering the same report to two places is the failure this
+    ordering can produce.
   * `send_push_headsup` does the same with the alert title.
   * The 加签 signature is appended to the URL when a secret is
     configured, omitted otherwise.
@@ -81,6 +92,22 @@ def _mock_urlopen(captured: list):
     return _open
 
 
+def _no_server_api(ds):
+    """把「会话定向投递」钉成不可用 → `send_report` 走 webhook 兜底。
+
+    为什么要显式钉：`dingtalk_api` 自己会先去换 accessToken，那次请求同样被
+    `urlopen` 的 patch 捕获（patch 改的是 `urllib.request` 模块属性，全局生效），
+    于是 `captured` 里混进一条与本文件要断的 markdown 载荷无关的 POST。靠"换
+    token 反正会失败"来隐式得到兜底行为，是把测试架在一个偶然事实上。
+    """
+    return mock.patch.multiple(
+        ds.dingtalk_api,
+        load_route=mock.MagicMock(return_value={}),
+        send_group=mock.MagicMock(return_value=False),
+        send_oto=mock.MagicMock(return_value=False),
+    )
+
+
 def test_is_configured():
     print("test_is_configured")
     os.environ.pop("DINGTALK_PUSH_WEBHOOK_URL", None)
@@ -100,8 +127,9 @@ def test_send_report_posts_markdown():
     os.environ.pop("DINGTALK_PUSH_WEBHOOK_SECRET_ARN", None)
     ds = _import_sender()
     captured: list = []
-    with mock.patch("dingtalk_sender.urllib.request.urlopen",
-                     side_effect=_mock_urlopen(captured)):
+    with _no_server_api(ds), mock.patch(
+            "dingtalk_sender.urllib.request.urlopen",
+            side_effect=_mock_urlopen(captured)):
         ds.send_report(
             chat_id="cid_test", root_message_id="msg_test",
             status="COMPLETED", priority="P3",
@@ -116,7 +144,9 @@ def test_send_report_posts_markdown():
             ],
             locale="en",
         )
-    _check("exactly one POST", len(captured) == 1, f"got {len(captured)}")
+    _check("exactly one POST (webhook fallback only)",
+           len(captured) == 1, f"got {len(captured)}: "
+           + ", ".join(c["url"] for c in captured))
     if captured:
         req = captured[0]
         _check("URL is the bare webhook (no signature without secret)",
@@ -161,20 +191,56 @@ def test_send_report_signed_when_secret_set():
     os.environ["DINGTALK_PUSH_WEBHOOK_SECRET"] = "S" * 32
     ds = _import_sender()
     captured: list = []
-    with mock.patch("dingtalk_sender.urllib.request.urlopen",
-                     side_effect=_mock_urlopen(captured)):
+    with _no_server_api(ds), mock.patch(
+            "dingtalk_sender.urllib.request.urlopen",
+            side_effect=_mock_urlopen(captured)):
         ds.send_report(
             chat_id="cid", root_message_id="m",
             status="COMPLETED", priority="P4",
             detail_type="x", task_id="ta",
             summary_md="ok", html_url="", trace_url="", locale="zh",
         )
+    _check("exactly one POST when signed", len(captured) == 1,
+           f"got {len(captured)}")
     if captured:
         url = captured[0]["url"]
         _check("URL contains timestamp= when signed",
                "&timestamp=" in url, url)
         _check("URL contains sign= when signed",
                "&sign=" in url, url)
+
+
+def test_no_webhook_fallback_when_the_chat_delivery_works():
+    """服务端 API 投成功了就**到此为止** —— 再补一发 webhook 等于同一份报告
+    投两个地方（webhook 无视 `chat_id`，第二发会落到那个机器人所在的群）。
+    """
+    print("test_no_webhook_fallback_when_the_chat_delivery_works")
+    os.environ["DINGTALK_PUSH_WEBHOOK_URL"] = "https://example/webhook?access_token=t"
+    ds = _import_sender()
+    captured: list = []
+    # ⚠️ `patch.multiple` 只在用 `mock.DEFAULT` 时才把假对象交回来；显式传了
+    # MagicMock 的话 `as` 拿到的是空 dict，所以引用自己留一份。
+    send_group = mock.MagicMock(return_value=True)
+    with mock.patch.multiple(
+            ds.dingtalk_api,
+            load_route=mock.MagicMock(return_value={"is_direct": False,
+                                                    "robot_code": "rc"}),
+            send_group=send_group,
+            send_oto=mock.MagicMock(return_value=False),
+    ), mock.patch("dingtalk_sender.urllib.request.urlopen",
+                  side_effect=_mock_urlopen(captured)):
+        ds.send_report(
+            chat_id="cid_group", root_message_id="m",
+            status="COMPLETED", priority="P4",
+            detail_type="x", task_id="ta",
+            summary_md="ok", html_url="", trace_url="", locale="zh",
+        )
+        _check("routed to the group that asked",
+               send_group.call_count == 1,
+               f"call_count={send_group.call_count}")
+    _check("no webhook POST after a successful chat delivery",
+           len(captured) == 0,
+           ", ".join(c["url"] for c in captured))
 
 
 def test_send_push_headsup_posts_alert():
@@ -219,9 +285,12 @@ def test_unconfigured_skips_silently():
     os.environ.pop("DINGTALK_PUSH_WEBHOOK_URL", None)
     os.environ.pop("DINGTALK_PUSH_WEBHOOK_URL_ARN", None)
     ds = _import_sender()
-    with mock.patch("dingtalk_sender.urllib.request.urlopen",
-                     side_effect=AssertionError(
-                         "must NOT network when unconfigured")):
+    # 也要钉住 `dingtalk_api`：不钉的话它自己那次换 token 会先把 AssertionError
+    # 吃掉（它内部 try/except），下面那条"不许联网"就成了摆设。
+    with _no_server_api(ds), mock.patch(
+            "dingtalk_sender.urllib.request.urlopen",
+            side_effect=AssertionError(
+                "must NOT network when unconfigured")):
         ds.send_report(
             chat_id="cid", root_message_id="m",
             status="COMPLETED", priority="P4",
@@ -254,6 +323,7 @@ def main() -> int:
     test_is_configured()
     test_send_report_posts_markdown()
     test_send_report_signed_when_secret_set()
+    test_no_webhook_fallback_when_the_chat_delivery_works()
     test_send_push_headsup_posts_alert()
     test_reply_text_is_noop()
     test_unconfigured_skips_silently()

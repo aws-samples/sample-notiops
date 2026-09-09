@@ -137,7 +137,7 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 | 资源 | 说明 |
 |------|------|
 | ~~VPC (BotStack)~~ | ❌ 随 `BotStack` 一起退役(2026-09-03 / M2)。**现在整套系统没有 VPC** —— webhook 路径上的 Lambda 直接走 AWS API |
-| API Gateway HTTP API (ImStack) | IM webhook 的公网入口(每平台一个),`$default` catch-all + 未鉴权 + 平台签名校验;阶段级限流 50 rps / burst 100,ingress 侧 `reservedConcurrentExecutions=10`;详见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §4 |
+| API Gateway HTTP API (ImStack) | IM webhook 的公网入口(每平台一个),`$default` catch-all + 未鉴权 + 平台签名校验;阶段级限流 50 rps / burst 100,ingress 侧 `reservedConcurrentExecutions=10`;详见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §5 |
 
 > 后台 Lambda 与 IM 的 ingress / worker 都不入 VPC(直接走 AWS API),数据层是 DynamoDB,无需隔离子网托管数据库。
 

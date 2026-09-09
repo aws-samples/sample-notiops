@@ -118,8 +118,8 @@ Everything else has a safe default. For a first deployment, **leave them all alo
 | **CORS allowed origins** | `*` | The endpoint is already `AWS_IAM` (SigV4) authenticated, so `*` is not a privilege hole. For defense in depth, update the stack after the first deploy and set this to the `ChatUrl` output. |
 | **IM chat/channel allow list (optional)** | empty | Only meaningful once you installed IM ([§2.11](#211-add-an-im-bot-feishulark-or-slack)); with web only you can ignore it entirely. A comma-separated list of Feishu chat ids (`oc_...`) or Slack channel ids (`C...`), **no spaces**; empty means no restriction — the bot answers in every group it is invited to. It is one of the defense-in-depth boundaries on the IM entry point (boundary (c) in [§8](#8-security-notes-worth-knowing)): even if signature verification were bypassed, a message from a chat outside the list is dropped **before any model call**. **The normal rhythm is: deploy with it empty → create the group and take its chat id → then update the stack with that id**, which is why it sits in the `Security` group and not among the required parameters. Equivalent to `-c imAllowedChatIds=…` on the `setup.sh` path. |
 | **On stack delete** | `KeepData` | Decides what happens to your data when the stack is deleted. See [§6](#6-deleting-the-stack) — **there is a gotcha; read it before you delete**. |
-| **Deployment mode** | `SingleAccount` | Pick `MultiAccount` (and fill in the org id below) to let it also see **other** accounts in your organization. There are prerequisites — see [§2.6](#26-optional-multi-account-across-an-organization). |
-| **AWS Organizations id (MultiAccount only)** | empty | Only needed with `MultiAccount` (starts with `o-`). **Half a choice does nothing**: `MultiAccount` with an empty org id stays single-account, and the `DeployModeStatus` output says so. |
+| **Deployment mode** | `SingleAccount` | Pick `MultiAccount` (and fill in the org id below) to let it also see **other** accounts in your organization. `MultiAccount` requires this account to be the **AWS Organizations management account** or a registered **StackSets delegated administrator** member account (auto-detected, no parameter to set) — run the commands in [§2.6.1](#261-hard-prerequisite-management-account-or-a-stacksets-delegated-administrator) first to confirm. If the account doesn't qualify, the stack fails within the first minute and tells you what to do. |
+| **AWS Organizations id (MultiAccount only)** | empty | Only needed with `MultiAccount` (starts with `o-`). **Half a choice does nothing**: `MultiAccount` with an empty org id stays single-account, and the `DeployModeStatus` output says so. Getting the id **wrong** — a valid org id that isn't this account's — is caught by the in-stack preflight (otherwise it gets baked into the member trust policy and every account onboarding afterwards fails with AccessDenied, with nothing on screen pointing at the id). |
 | **Enable AWS DevOps Agent features (deep investigation, DevOps Chat)?** | `Yes` | One switch, **four** capabilities — see [§2.7](#27-deep-investigation-aws-devops-agent). An idle agent space costs nothing, which is why it defaults to on; pick `No` if you don't want it (all four are then greyed out). |
 | **Artifact base URL override** / **Artifact mirror bucket name (s3:// only)** | empty | Only when you can't reach GitHub — see [§7](#7-no-internet-egress-use-a-private-s3-mirror). |
 
@@ -181,14 +181,89 @@ After signing in, ask something like `list the EC2 instances in this account` to
 
 The default `SingleAccount` only ever looks at the account it runs in. To let it also see other accounts in your organization, set **Deployment mode** to `MultiAccount` and fill in the **AWS Organizations id**.
 
-**Prerequisites (don't pick it otherwise)**:
+#### 2.6.1 Hard prerequisite: management account, or a StackSets delegated administrator
 
-1. The account you're deploying into is the **organization management account**, or a **CloudFormation StackSets delegated administrator**. This is hard-required — creating the member StackSets needs that standing.
-2. You know your org id (starts with `o-`). It's on the **AWS Organizations** console home, or `aws organizations describe-organization --query Organization.Id`.
+> `MultiAccount` accepts **two** deploying identities — either one is enough:
+> 1. the **AWS Organizations management account (payer)**; or
+> 2. a member (linked) account that the management account has registered as a **CloudFormation StackSets delegated administrator** — how to register it is in [2.6.2](#262-deploying-from-a-member-account-register-a-stacksets-delegated-administrator).
+>
+> **No parameter distinguishes the two** — the stack detects it. If neither holds, the stack fails **within the first minute** and the failure reason hands you the register command and the management account id — it does not build a hundred resources first and then roll all of them back.
+
+**Run these before you create the stack.** A few seconds tells you whether this account qualifies:
+
+```bash
+aws organizations describe-organization \
+  --query 'Organization.[Id,MasterAccountId]' --output text
+aws sts get-caller-identity --query Account --output text
+```
+
+- Second **column** of the first command (`MasterAccountId`) == output of the second ⇒ this is the management account; `MultiAccount` is fine.
+- They **differ** ⇒ this is a member account. Run one more command to see whether it is already a StackSets delegated administrator:
+
+  ```bash
+  aws organizations list-delegated-administrators \
+    --service-principal member.org.stacksets.cloudformation.amazonaws.com \
+    --query 'DelegatedAdministrators[].Id' --output text
+  ```
+
+  This account's id **is** in the output ⇒ `MultiAccount` is fine. It is not ⇒ three ways forward: register it per [2.6.2](#262-deploying-from-a-member-account-register-a-stacksets-delegated-administrator), run this template **in the management account** instead, or pick `SingleAccount` for now (web / IM / deep investigation / case creation all work exactly the same; it just only sees this one account).
+  ⚠️ That command **must** pass `--service-principal`. Without it you get the delegated administrators of **every** service (GuardDuty / Config / Security Hub …). Those accounts also hold Organizations read-only permissions but **cannot** operate StackSets — judging from that list gives you a "should work" that turns into `AccessDenied` at StackSet creation time.
+- First command says `AWSOrganizationsNotInUseException` ⇒ this account is not in an organization at all; `SingleAccount` is the only option.
+- First command says `AccessDeniedException` ⇒ almost always a service control policy blocking `organizations:DescribeOrganization`. Until that is lifted, the stack's own check cannot read it either, so it will not get through.
+
+> 🔴 **One hard limit that has nothing to do with which identity you use**: CloudFormation **never** deploys a service-managed StackSet into the **organization management account itself** — even if you target the OU it sits in, `CreateStackInstances` returns SUCCEEDED and creates nothing (a silent fake success). So "let NotiOps inspect the management account itself" cannot go through a StackSet: deploy [`infra/member-account-onboarding.yaml`](../infra/member-account-onboarding.yaml) into the management account by hand, then register it from **Admin → Accounts** in the web UI with "onboard an account manually". This is the same under both deploying identities.
+
+**The org id is the first column** of the first command (starts with `o-`). Getting it wrong fails in a particularly unhelpful way: it gets baked into the member-account trust policy as `aws:PrincipalOrgID`, so every subsequent member-account onboarding returns `AccessDenied` with nothing on screen pointing at a mistyped id. That's why the stack's preflight **also cross-checks** the id you typed against the organization this account really belongs to, and refuses with the correct value if they differ.
 
 **Both fields are required.** Picking `MultiAccount` while leaving the org id empty still **deploys successfully but stays single-account** — deliberately: the org id is the `aws:PrincipalOrgID` condition that closes off the cross-account trust policy. Without it, the member-account role would merely trust the system account's root with no organization boundary, which is worse than not enabling it. The `DeployModeStatus` output spells this out.
 
-**What you additionally get**: the stack creates two StackSets in this account (`notiops-member-onboarding`, `notiops-member-devops-agent`) and enables Organizations trusted access for StackSets. You then onboard member accounts one at a time from **Admin → Accounts** in the web UI (each member account gets a cross-account **read-only** role plus a deep-investigation trigger role). After that you can switch accounts in the chat UI for read-only inspection, deep investigation, and case creation.
+#### 2.6.2 Deploying from a member account: register a StackSets delegated administrator
+
+In many organizations the management account is kept clean — no workloads, changes go through a separate approval path. There, running NotiOps in a member account and delegating only the *rolling out member-account roles* part to it is far more realistic than pushing the whole web/IM base stack into the management account.
+
+**One-time action, run in the management account** (replace `<member-account-id>` with the account you intend to deploy NotiOps into):
+
+```bash
+aws organizations register-delegated-administrator \
+  --service-principal member.org.stacksets.cloudformation.amazonaws.com \
+  --account-id <member-account-id>
+```
+
+Verify (from the management account, or from that member account):
+
+```bash
+aws organizations list-delegated-administrators \
+  --service-principal member.org.stacksets.cloudformation.amazonaws.com \
+  --query 'DelegatedAdministrators[].[Id,Status]' --output text
+```
+
+The reverse is `aws organizations deregister-delegated-administrator` (same two parameters).
+
+Once registered, create this template in that member account and pick `MultiAccount` — **no extra parameters**. The stack's preflight runs `DescribeOrganization` → `ListDelegatedAdministrators` (filtered by the service principal above), recognizes this identity, and then carries `CallAs=DELEGATED_ADMIN` through every StackSets call (creating/updating both StackSets, rolling out instances, and the nine runtime StackSets calls the BFF behind the web Admin page makes).
+
+**Four things to know before taking this path:**
+
+1. ⚠️ **A delegated administrator has full deployment permissions across the whole organization.** AWS states plainly that the management account **cannot** scope a delegated administrator down to specific OUs or operations. Once registered, this member account can deploy StackSets into **any** account in the organization — not just NotiOps' two. That is the AWS StackSets model, not a NotiOps implementation choice.
+2. **Trusted access must already be on, enabled by the management account.** Registering a delegated administrator requires it, and the two APIs that turn it on — `enable-aws-service-access` and `activate-organizations-access` — are **management-account only**. So on this path the stack does **not** try to enable it (it cannot); it only **verifies** with `describe-organizations-access --call-as DELEGATED_ADMIN`, and if it is off, it fails and hands you both commands to run in the management account. See [§2.6.3](#263-trusted-access-both-halves-are-required).
+3. **An organization allows at most 5 delegated administrators** (an AWS hard limit, counted across all services).
+4. **The StackSet entities live in the management account**, even when a delegated administrator created them. So `notiops-member-onboarding` / `notiops-member-devops-agent` show up in the management account's CloudFormation console and **not** in the deploying account's (to see them there you must pass `--call-as DELEGATED_ADMIN`). `teardown.sh` / `TeardownMode` pass that flag too, so nothing gets silently skipped at delete time.
+
+#### 2.6.3 Trusted access: both halves are required
+
+A service-managed StackSet requires **trusted access** between CloudFormation and Organizations, and that comes in **two halves** — neither is optional:
+
+| Half | Command | Symptom when missing |
+|---|---|---|
+| Organizations side | `aws organizations enable-aws-service-access --service-principal member.org.stacksets.cloudformation.amazonaws.com` | — |
+| CloudFormation side | `aws cloudformation activate-organizations-access --region <your region>` | `CreateStackSet` fails with `ValidationError: You must enable organizations access to operate a service managed stack set` |
+
+**When you deploy in the management account, the stack turns on both halves for you** (during the preflight phase, and only when `MultiAccount` is selected), then **verifies** with `describe-organizations-access` that the status really is `ENABLED` before continuing. So normally you do nothing.
+
+**When you deploy from a delegated administrator (member account), the stack only verifies — it does not try to enable.** Both commands above are management-account only; retrying them in a member account will never work. Skipping is deliberate rather than "call it and swallow the error": the latter leaves an `AccessDenied` in the deployment log and makes people believe the script already turned it on, when the only correct action is to go **back to the management account** and run those two commands. The verification passes `--call-as DELEGATED_ADMIN` (without it CloudFormation interprets the call as `SELF` and reads **this account's** namespace, where that switch does not exist on this path ⇒ always `DISABLED` ⇒ a perfectly qualified environment gets rejected).
+
+If something like an SCP does block the stack from doing it, the failure reason hands you both commands verbatim (with your region filled in) — run them in the management account and update the stack. The most misleading part here: **the Organizations half often already lists that service principal**, so it looks enabled, while the CloudFormation half is still `DISABLED` — and the `ValidationError` AWS returns says nothing about `activate-organizations-access`.
+
+**What you additionally get**: the stack creates two StackSets (`notiops-member-onboarding`, `notiops-member-devops-agent`) and — when deployed in the management account — enables Organizations trusted access for StackSets. ⚠️ Service-managed StackSets **always live in the organization management account**, even when a delegated administrator created them, so when you deploy from a member account these two will not appear in the deploying account's CloudFormation console. You then onboard member accounts one at a time from **Admin → Accounts** in the web UI (each member account gets a cross-account **read-only** role plus a deep-investigation trigger role). After that you can switch accounts in the chat UI for read-only inspection, deep investigation, and case creation.
 
 This path still does **not** include: member-account CloudWatch OAM Sinks, cross-account Health / investigation event forwarding, or cross-account scheduled inspection. Those three need `setup.sh`.
 
@@ -290,7 +365,7 @@ That **What to install** dropdown in the first parameter group:
 
 > ⚠️ **Don't reverse the order**: credentials first, request URL second. Feishu and Slack fire a verification request the **moment** you save the request URL; with no credentials yet the ingress function fails outright, and what you see on the IM platform is "verification failed" — which looks like a wrong URL.
 
-**Where to click and what to type is in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md)** (Feishu §1, Slack §2; that doc covers both deployment paths — the secret names and the use of the request URL are identical).
+**Where to click and what to type is in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md)** (Feishu §1, Slack §2, DingTalk §3; that doc covers both deployment paths — the secret names and the use of the request URL are identical).
 
 **Changing your mind later**: update the stack with a different **What to install** value.
 
@@ -325,7 +400,7 @@ This connects **someone else's CUR table** — a customer's, or several payers' 
 
 ## 3. What the stack creates
 
-**68 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 5 fewer with deep investigation off; 3 more if you pick multi-account; **16 more if you pick an install option with IM**):
+**69 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 5 fewer with deep investigation off; 8 more if you pick multi-account; **16 more if you pick an install option with IM**):
 
 | Category | Resources |
 |---|---|
@@ -334,12 +409,12 @@ This connects **someone else's CUR table** — a customer's, or several payers' 
 | Agent | 1 Bedrock AgentCore Runtime + 1 AgentCore Memory (session memory, see [§2.10](#210-session-memory-agentcore-memory)) |
 | Sign-in | Cognito User Pool + Client + Identity Pool + 8 groups (roles) |
 | Data | DynamoDB `notiops-config`, `notiops-web-chat`; 1 data bucket (reports etc.) |
-| Deployment helper | 1 staging bucket (for the staged artifacts) + 1 inline Lambda + 2 custom resources |
+| Deployment helper | 1 staging bucket (for the staged artifacts) + 1 inline Lambda + 3 custom resources (stage the artifacts / write the frontend config / **on delete, drain the staging bucket until it really is empty**) |
 | Permissions | 6 IAM roles + 5 inline policies (the AgentCore Memory execution role has **no policy at all** — it is just a shell for the service to trust) |
 | Notifications inbox (see [§2.9](#29-notifications-inbox)) | **10 EventBridge rules** (5 ENABLED / 5 DISABLED) + 1 Lambda + its log group + 1 role (plus its policy) + 1 Lambda invoke permission = 15 |
 | Deep investigation (on by default) | 1 DevOps Agent agent space (**with its operator app enabled automatically**) + 1 read-only association + 1 role assumed by DevOps Agent (plus its policy) + 1 operator app role = 5 |
 | Web search (us-east-1 only) | 1 custom resource (creates the AgentCore gateway) + 1 gateway service role + 1 inline policy |
-| Multi-account (optional) | 1 custom resource (creates the two member StackSets) + 2 inline policies |
+| Multi-account (optional) | 2 custom resources (① the eligibility preflight ② creates the two member StackSets) + the preflight's own Lambda / role / policy / log group + 2 inline policies = 8 |
 | IM bot (optional, see [§2.11](#211-add-an-im-bot-feishulark-or-slack)) | 3 Lambdas (ingress / worker / progress refresh) + 3 log groups + 1 **API Gateway HTTP API** (a public entry point, see below; 4 resources counting its route / integration / stage) + 3 invoke permissions (HTTP API -> ingress, keep-alive rule -> ingress, progress rule -> progress) + 1 dependency layer + 2 DynamoDB tables (group conversations, usage) + 2 EventBridge rules (refreshes investigation progress every minute, pings the ingress every 4 minutes) + 1 role (plus its policy) = 20 |
 
 **Cost, idle**: CloudFront, S3 and DynamoDB are pay-per-use, Lambda costs nothing when not invoked, and an idle AgentCore Runtime costs nothing — idle, this is cents of storage. The real cost is **Bedrock tokens when you ask questions**. Each installed release keeps ~**165 MB** in the staging bucket (~28 MB more with IM installed; ≈ $0.004/month in S3 Standard); upgrades don't purge old versions, see [§5](#5-upgrading). The IM set is likewise **free when idle** (three Lambdas that cost nothing uninvoked, two on-demand tables, and that per-minute progress rule only does real work while an investigation is running).
@@ -358,9 +433,14 @@ On the Events tab, find the **first** `CREATE_FAILED` (not the last). The two co
 |---|---|
 | `StagerArtifacts` failed, logs show a timeout / connection error | The account has no internet egress and can't reach GitHub. Go to [§7](#7-no-internet-egress-use-a-private-s3-mirror). |
 | `AgentRuntime` failed | The region may not support Bedrock AgentCore. Use us-east-1 / us-west-2. |
-| `StagerOrgSetup` failed, mentioning `management account or a delegated administrator` | You picked `MultiAccount`, but this account is neither the organization management account nor a StackSets delegated administrator. Redeploy with `SingleAccount`, or use an account that qualifies. See [§2.6](#26-optional-multi-account-across-an-organization). |
+| `StagerPreflight` failed, mentioning `needs this account to be either the AWS Organizations management account or a registered ... delegated administrator` | You picked `MultiAccount`, but this account is neither the management account nor a registered StackSets delegated administrator (yet). The failure reason already lists all three ways forward, the register command verbatim, and the management account id. To deploy from this member account, register it per [§2.6.2](#262-deploying-from-a-member-account-register-a-stacksets-delegated-administrator) and update the stack. |
+| `StagerPreflight` failed, mentioning an `OrganizationId` mismatch | You mistyped the org id. The failure reason carries the **correct** one; fix it and create the stack again. |
+| `StagerPreflight` failed, mentioning `activate-organizations-access` | Only one half of trusted access is on, and something (usually an SCP) stopped the stack from turning on the other. Run the two commands from the failure reason in the management account, then update the stack. See [§2.6.3](#263-trusted-access-both-halves-are-required). |
+| `StagerOrgSetup` failed, mentioning `management account` or `activate-organizations-access` | Same three causes. This is the second gate for `MultiAccount` (it runs after the preflight and is the step that actually writes to the organization), so reaching it means the preflight passed but creating the StackSet was still refused. |
 
-Detailed logs are in the CloudWatch log group `/aws/lambda/notiops-stager` (substitute your stack name).
+Detailed logs are in the CloudWatch log groups `/aws/lambda/notiops-stager` and `/aws/lambda/notiops-preflight` (substitute your stack name).
+
+> 🩹 **Stack stuck in `ROLLBACK_FAILED` with `StagingBucket` in `DELETE_FAILED` (v1.0.25 and earlier)**: during rollback the **already-cancelled** download Lambda kept running and wrote the 144 MiB agent zip into the bucket *after* the bucket had been emptied — so the bucket can't be deleted and neither can the stack. Finish it by hand: console → S3 → the `<stack-name>-staging-…` bucket → **Empty** (also clear anything under "Incomplete multipart uploads"), then delete the stack again. Later releases clean up after themselves (emptying now requires two consecutive clean passes, and there is an extra gate that must finish before the bucket is deleted).
 
 ### 4.2 ⚠️ Before retrying a failed deploy, delete three retained resources
 
@@ -378,7 +458,25 @@ This is the easiest place to get stuck. To protect data, three resources carry `
 3. Create the stack again
 ```
 
+Step 2 is quicker from the CLI (substitute your region and account id):
+
+```bash
+REGION=us-east-1
+ACCT=$(aws sts get-caller-identity --query Account --output text)
+
+aws dynamodb delete-table --table-name notiops-config   --region "$REGION"
+aws dynamodb delete-table --table-name notiops-web-chat --region "$REGION"
+aws s3 rm "s3://notiops-data-$ACCT-$REGION" --recursive   # empty it first
+aws s3 rb "s3://notiops-data-$ACCT-$REGION"
+```
+
+(The table-name prefix follows the stack name: if your stack isn't called `notiops`, replace the `notiops-` above with your stack name.)
+
+⚠️ This is **deliberately not auto-detected**: on a genuinely fresh install "the table doesn't exist yet" is the normal case, so treating "already exists" as an error would block every first-time deploy.
+
 (If a previous deployment already put data you want to keep in them, **don't** delete them — a new stack reuses them.)
+
+> 💡 A failed **multi-account** deploy also leaves behind the member StackSets (`notiops-member-onboarding` / `notiops-member-devops-agent`) and the Organizations trusted access. Both are **left on purpose** (rationale in [§6.4](#64-whats-left-behind-orphans-and-whether-to-care)) and they do **not** block a retry — a new stack reuses the same-named StackSets.
 
 ### 4.3 The page is blank / 404
 
@@ -548,7 +646,7 @@ Integrity still holds: every artifact's SHA256 in the template was computed over
 3. **Code enters your account from the public internet.** That is what this path is. Two controls: (a) artifacts come only from a fixed tag of the `aws-samples/sample-notiops` release; (b) each artifact's SHA256 is baked into the template and verified on arrival — a mismatch deletes the uploaded object and fails the stack. If that premise doesn't work for you, use the private mirror in [§7](#7-no-internet-egress-use-a-private-s3-mirror), or use `setup.sh`.
 4. **We never touch the admin password**: Cognito generates it and emails it to you. The deployment never passes, reads, prints or outputs it.
 5. **Everything is done by your own credentials**: no account of ours, no bucket of ours, no role of ours is anywhere in this path.
-6. **Installing IM adds one public entry point** ([§2.11](#211-add-an-im-bot-feishulark-or-slack)) — that **API Gateway HTTP API** has to be **unauthenticated**, because Feishu and Slack won't sign SigV4 for you (before 2026-09-01 this was a Lambda Function URL; why it changed, and the two alternatives that were ruled out, are in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §4.1). Five boundaries: (a) **signature verification** (Feishu with the Encrypt Key + Verification Token, Slack with the signing secret; a missing key fails the cold start, so "misconfigured but still reachable" doesn't exist); (b) **two throttling layers** — the HTTP API stage caps at 50 req/s with a burst of 100 (anything above that gets a 429 straight from API Gateway and **never reaches Lambda**), and the ingress function additionally carries a **concurrency cap of 10**: together, the spend ceiling on a public unauthenticated entry point; (c) an optional **chat allowlist** (only messages from named groups take effect — see [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §3); (d) **idempotent de-duplication** (a redelivered event is processed once); (e) behind it is still the **same read-only agent** with no write permission at all — even a forged message gets, at worst, read-only information back. Credentials always live in Secrets Manager: never in environment variables, never printed to logs. The risks that remain are listed plainly in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §4.3.
+6. **Installing IM adds one public entry point** ([§2.11](#211-add-an-im-bot-feishulark-or-slack)) — that **API Gateway HTTP API** has to be **unauthenticated**, because Feishu and Slack won't sign SigV4 for you (before 2026-09-01 this was a Lambda Function URL; why it changed, and the two alternatives that were ruled out, are in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §5.1). Five boundaries: (a) **signature verification** (Feishu with the Encrypt Key + Verification Token, Slack with the signing secret; a missing key fails the cold start, so "misconfigured but still reachable" doesn't exist); (b) **two throttling layers** — the HTTP API stage caps at 50 req/s with a burst of 100 (anything above that gets a 429 straight from API Gateway and **never reaches Lambda**), and the ingress function additionally carries a **concurrency cap of 10**: together, the spend ceiling on a public unauthenticated entry point; (c) an optional **chat allowlist** (only messages from named groups take effect — see [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §4); (d) **idempotent de-duplication** (a redelivered event is processed once); (e) behind it is still the **same read-only agent** with no write permission at all — even a forged message gets, at worst, read-only information back. Credentials always live in Secrets Manager: never in environment variables, never printed to logs. The risks that remain are listed plainly in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §5.3.
 
 ---
 

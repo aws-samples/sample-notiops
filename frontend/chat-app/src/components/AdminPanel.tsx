@@ -9,6 +9,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { useT, useLocale } from "../i18n";
 import FeishuGuideDrawer from "./FeishuGuideDrawer";
+import DingTalkGuideDrawer from "./DingTalkGuideDrawer";
+import {
+  IconSettings, IconSecurity, IconSliders, IconChatBubble,
+  IconUser, IconUsers, IconOrg, IconCalendarClock, IconChip,
+} from "./icons";
 import {
   fetchAllCapabilities, fetchRoles, saveRole, deleteRole,
   fetchUsers, putUser, createUser, deleteUser, fetchModules, putModules,
@@ -23,6 +28,7 @@ import {
   type InspectionCrossAccountStatus,
   fetchAccountAccess, putAccountAccess, deleteAccountAccess,
   fetchNotificationConfig, putNotificationConfig, testNotificationSend,
+  putDingtalkConfig, testDingtalkSend,
   generateLaunchStack, saveManualPayload, testDaConnection,
   fetchLlmConfig, putLlmConfig, fetchLlmCandidates, putBedrockKey, testLlmModel,
   fetchLlmAudit, rollbackLlmConfig, fetchBackendTasks,
@@ -100,6 +106,37 @@ function RoleChip({ t, name, checked, onChange }: { t: TFn; name: string; checke
   );
 }
 
+/* ── 左侧子导航（纵向排版）──
+ * 分组顺序 = 渲染顺序；每项的 icon 只出 SVG，**不贡献 textContent** ——
+ * AdminPanel.notif.test.tsx 拿 button.textContent 跟 admin.tab.<key> 的译文**精确相等**
+ * 来定位 tab，往按钮里加任何文字（角标、计数）都会打断它。
+ * （注：这里故意不把键名写成带引号的 t(…) 调用形式 —— lint_i18n 的
+ *   check_frontend_keys 用正则扫整个文件、不跳注释，写成调用形式它会当作
+ *   引用了一个不存在的键报错。）
+ */
+type NavGroup = "access" | "cloud" | "system";
+const NAV_GROUPS: { key: NavGroup; labelKey: string }[] = [
+  { key: "access", labelKey: "admin.nav.access" },
+  { key: "cloud", labelKey: "admin.nav.cloud" },
+  { key: "system", labelKey: "admin.nav.system" },
+];
+const NAV_ITEMS = [
+  { key: "roles", group: "access", icon: <IconSecurity size={16} /> },
+  { key: "users", group: "access", icon: <IconUser size={16} /> },
+  { key: "groups", group: "access", icon: <IconUsers size={16} /> },
+  { key: "accounts", group: "cloud", icon: <IconOrg size={16} /> },
+  { key: "lifecycle", group: "cloud", icon: <IconCalendarClock size={16} /> },
+  { key: "modules", group: "system", icon: <IconSliders size={16} /> },
+  { key: "notifications", group: "system", icon: <IconChatBubble size={16} /> },
+  { key: "models", group: "system", icon: <IconChip size={16} /> },
+] satisfies { key: Tab; group: NavGroup; icon: ReactNode }[];
+// 编译期兜底：往 `Tab` 加一个取值却忘了登记进 NAV_ITEMS，症状是「视图代码都在、
+// 左导航里却点不到」—— 不报错、不崩、只是那个 tab 永远打不开。用 satisfies 保住
+// 字面量类型，这里就能把它变成一个 tsc 错误。
+type NavKey = (typeof NAV_ITEMS)[number]["key"];
+const _navCoversAllTabs: Tab extends NavKey ? true : never = true;
+void _navCoversAllTabs;
+
 export default function AdminPanel() {
   const t = useT();
   const [tab, setTab] = useState<Tab>("roles");
@@ -109,50 +146,73 @@ export default function AdminPanel() {
   useEffect(() => { fetchAllCapabilities().then(setCaps).catch((e) => setErr(String(e?.message || e))); }, []);
 
   return (
-    <div className="admin-panel" style={{ padding: "18px 22px 40px", overflowY: "auto", height: "100%", maxWidth: 1080, margin: "0 auto", width: "100%", color: "var(--text)" }}>
-      <SectionHead title={t("admin.title")} sub={t("admin.subtitle")} />
-
-      {/* 分段 tab 切换（替代原侧栏风格按钮） */}
-      <div style={{ display: "inline-flex", gap: 4, padding: 4, ...box, background: "var(--page)", borderRadius: 10, marginBottom: 18 }}>
-        {(["roles", "users", "groups", "modules", "accounts", "lifecycle", "notifications", "models"] as Tab[]).map((k) => (
-          <button key={k} onClick={() => setTab(k)} style={{
-            padding: "6px 16px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 13,
-            fontWeight: tab === k ? 700 : 500,
-            background: tab === k ? "var(--card)" : "transparent",
-            color: tab === k ? "var(--text)" : "var(--muted)",
-            boxShadow: tab === k ? "0 1px 3px rgba(0,0,0,.14)" : "none",
-          }}>{t(`admin.tab.${k}`)}</button>
+    // 复用 NotificationsPanel 的 .notif2 / .notif-side / .notif-content 样式（团队一致，
+    // 与「通知」主题、「定制」以及四个看板浏览器同一种纵向两栏排版；移动端退化也白拿）。
+    <div className="admin-panel notif2" style={{ color: "var(--text)" }}>
+      {/* 左侧子导航（两层目录：分组 + 条目） */}
+      <div className="notif-side">
+        <div className="notif-side-head">
+          <div className="notif-side-title"><IconSettings size={17} /> {t("admin.title")}</div>
+        </div>
+        {NAV_GROUPS.map((g) => (
+          <div key={g.key}>
+            <div className="notif-side-group">{t(g.labelKey)}</div>
+            {NAV_ITEMS.filter((it) => it.group === g.key).map((it) => (
+              <button
+                key={it.key}
+                className={"notif-navitem" + (tab === it.key ? " active" : "")}
+                onClick={() => setTab(it.key)}
+              >
+                <span className="notif-navic">{it.icon}</span>
+                <span className="notif-navlabel">{t(`admin.tab.${it.key}`)}</span>
+              </button>
+            ))}
+          </div>
         ))}
       </div>
 
-      {err && <div style={{ ...errText, marginBottom: 12 }}>{t("admin.error")}: {err}</div>}
-      {tab === "roles" && <RolesView caps={caps} />}
-      {tab === "users" && <UsersView />}
-      {tab === "groups" && <GroupsView />}
-      {tab === "modules" && <ModulesView />}
-      {tab === "accounts" && <AccountsView />}
-      {tab === "lifecycle" && <LifecycleView />}
-      {tab === "notifications" && <NotificationsView />}
-      {tab === "models" && <ModelsView />}
+      {/* 右侧内容 */}
+      <div className="notif-content">
+        <div className="admin-pane">
+          {err && <div style={{ ...errText, marginBottom: 12 }}>{t("admin.error")}: {err}</div>}
+          {tab === "roles" && <RolesView caps={caps} />}
+          {tab === "users" && <UsersView />}
+          {tab === "groups" && <GroupsView />}
+          {tab === "modules" && <ModulesView />}
+          {tab === "accounts" && <AccountsView />}
+          {tab === "lifecycle" && <LifecycleView />}
+          {tab === "notifications" && <NotificationsView />}
+          {tab === "models" && <ModelsView />}
+        </div>
+      </div>
     </div>
   );
 }
 
-/* ───────────────── 通知（飞书机器人配置）─────────────────
- * 自 web-chat 原生实现（存 Secrets Manager notiops/im-bot-feishu），与老管理前端
- * (frontend-app /settings/notifications) 完全解耦 —— 老页面 sunset 时此板块不受影响。
- * 敏感字段(app_secret / encrypt_key / verification_token)后端脱敏为 ****后4位；
- * 保存时回传脱敏值 = 不修改（bff/web-chat/feishu_config.mjs 的 mergeIfMasked）。
+/* ───────────────── 通知（IM 机器人配置：飞书 / 钉钉）─────────────────
+ * 自 web-chat 原生实现（每平台一个 Secrets Manager secret：notiops/im-bot-feishu、
+ * notiops/im-bot-dingtalk），与老管理前端 (frontend-app /settings/notifications) 完全
+ * 解耦 —— 老页面 sunset 时此板块不受影响。
+ * 敏感字段(飞书 app_secret / encrypt_key / verification_token；钉钉 app_secret /
+ * 自定义机器人推送地址)后端脱敏为 ****后4位；保存时回传脱敏值 = 不修改
+ *（bff/web-chat/{feishu,dingtalk}_config.mjs 的 mergeIfMasked）。
  *
- * Encrypt Key / Verification Token 为什么必须在这里能填:webhook 模式下它们是**唯一**
- * 鉴权手段，IM 入口冷启动硬校验、缺一即起不来。以前只能让客户
- * `aws secretsmanager put-secret-value` 手改 JSON —— 只有浏览器的客户走不通那条路，
- * 「一键集成 IM」就断在这一步。四个凭证齐了，客户不碰 CLI 也能配完。
- * ⚠️ 这两个值和 app_secret 一样:不打日志、连长度都不打（docs/LOGGING_STANDARD.md）。 */
-type SecretKey = "app_secret" | "encrypt_key" | "verification_token";
+ * 这些凭证为什么必须在这里能填:webhook 模式下它们是**唯一**鉴权手段，IM 入口冷启动
+ * 硬校验、缺一即起不来。以前只能让客户 `aws secretsmanager put-secret-value` 手改
+ * JSON —— 只有浏览器的客户走不通那条路，「一键集成 IM」就断在这一步。
+ * ⚠️ 全部这些值都不打日志、连长度都不打（docs/LOGGING_STANDARD.md）。
+ *
+ * 两个平台**分成两个子组件**（FeishuNotifications / DingtalkNotifications），不是一个
+ * 带 platform 分支的表单:字段集、校验、以及「测试」能做到什么，三样都不一样（钉钉没有
+ * Encrypt Key / Verification Token，也没有「往任意群发测试消息」的接口）。后端同理分成
+ * 两个模块 —— 分支越多，这一页最贵的 bug（**界面骗人**）越藏得住。 */
+type SecretKey = "app_secret" | "encrypt_key" | "verification_token" | "push_webhook_url";
+/** 「用户是否真的动过这个框」。`Partial` 是因为两个平台的字段集不同 ——
+ *  各自只登记自己那几个键，没有的键就是 undefined（= 没动过）。 */
+type TouchedMap = Partial<Record<SecretKey, boolean>>;
 
 /**
- * 飞书三个密钥框。三件事都不是样式问题：
+ * 密钥框（飞书三个、钉钉两个共用）。三件事都不是样式问题：
  *
  * ① **没动过时 `type="text"`** —— 值是服务端给的脱敏串 `****后4位`，用 `password`
  *    会把后 4 位也画成圆点，旁边那句「仅显示后 4 位」就成了空话，客户也无从确认
@@ -165,13 +225,16 @@ type SecretKey = "app_secret" | "encrypt_key" | "verification_token";
  *    浏览器是否尊重 ②。**诚实的边界**：会正常派发 input 事件的密码管理器仍会把框标成
  *    touched，那种情况靠 ② 拦、靠 ① 让用户看得见值变了 —— 不是数学上的消除。
  */
-function SecretField({ label, k, value, onChange, touched, setTouched, hint, placeholder }: {
+function SecretField({ platform, label, k, value, onChange, touched, setTouched, hint, placeholder }: {
+  // 只进 input 的 `name`（`notiops-<platform>-<k>`）。两个平台都有 `app_secret`，
+  // 不带平台前缀的话浏览器会把飞书的密钥往钉钉那个框里自动填。
+  platform: "feishu" | "dingtalk";
   label: string;
   k: SecretKey;
   value: string;
   onChange: (v: string) => void;
-  touched: Record<SecretKey, boolean>;
-  setTouched: React.Dispatch<React.SetStateAction<Record<SecretKey, boolean>>>;
+  touched: TouchedMap;
+  setTouched: React.Dispatch<React.SetStateAction<TouchedMap>>;
   hint: string;
   placeholder: string;
 }) {
@@ -182,7 +245,7 @@ function SecretField({ label, k, value, onChange, touched, setTouched, hint, pla
       <input
         type={isMasked ? "text" : "password"}
         // 名字刻意不叫 password / secret：密码管理器按 name/id 猜字段。
-        name={`notiops-feishu-${k}`}
+        name={`notiops-${platform}-${k}`}
         autoComplete="new-password"
         autoCorrect="off"
         autoCapitalize="off"
@@ -204,7 +267,38 @@ function SecretField({ label, k, value, onChange, touched, setTouched, hint, pla
   );
 }
 
+/**
+ * 「集成 IM」页的外壳:标题 + 平台切换。
+ *
+ * ⚠️ 只挂**当前平台**那一个子组件（以及它自己的抽屉）。两个抽屉同时留在 DOM 里会撞
+ *    `imd-webhook-url` 这个固定 id，而且「详细步骤」会出现两份 —— 见 ImGuideDrawer 文件头。
+ */
 function NotificationsView() {
+  const t = useT();
+  const [platform, setPlatform] = useState<"feishu" | "dingtalk">("feishu");
+  return (
+    <div>
+      <SectionHead title={t("admin.notif.title")} />
+      {/* 两个平台名并排、没有可见标签，读屏软件只会念出两个专有名词 —— 给分页组一个
+          `平台 / Platform` 的可访问名字。 */}
+      <div role="group" aria-label={t("admin.notif.platform")}
+           style={{ display: "inline-flex", gap: 4, padding: 4, ...box, background: "var(--page)", borderRadius: 10, marginBottom: 16 }}>
+        {(["feishu", "dingtalk"] as const).map((p) => (
+          <button key={p} onClick={() => setPlatform(p)} style={{
+            padding: "5px 14px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 12.5,
+            fontWeight: platform === p ? 700 : 500,
+            background: platform === p ? "var(--card)" : "transparent",
+            color: platform === p ? "var(--text)" : "var(--muted)",
+            boxShadow: platform === p ? "0 1px 3px rgba(0,0,0,.14)" : "none",
+          }}>{t(`admin.notif.platform.${p}`)}</button>
+        ))}
+      </div>
+      {platform === "feishu" ? <FeishuNotifications /> : <DingtalkNotifications />}
+    </div>
+  );
+}
+
+function FeishuNotifications() {
   const t = useT();
   const [loading, setLoading] = useState(true);
   const [appId, setAppId] = useState("");
@@ -229,7 +323,7 @@ function NotificationsView() {
    *（`type=password` 会把 `****WXYZ` 的后 4 位也画成圆点，那句「仅显示后 4 位」就成了空话）；
    * 一动手输入立刻切回 `password`。
    */
-  const [touched, setTouched] = useState<Record<"app_secret" | "encrypt_key" | "verification_token", boolean>>({
+  const [touched, setTouched] = useState<TouchedMap>({
     app_secret: false, encrypt_key: false, verification_token: false,
   });
   /** 服务端给的脱敏原值，用于「没动过 → 原样回传」。 */
@@ -316,7 +410,7 @@ function NotificationsView() {
 
   return (
     <div>
-      <SectionHead title={t("admin.notif.title")} />
+      {/* 标题与平台切换在外壳 NotificationsView 里 —— 这里只画飞书那一份表单。 */}
       {loading ? <div style={{ color: "var(--muted)", fontSize: 13 }}>{t("admin.notif.loading")}</div> : (
         <div style={{ ...box, padding: 18, maxWidth: 640, display: "flex", flexDirection: "column", gap: 14 }}>
           <div>
@@ -324,15 +418,15 @@ function NotificationsView() {
             <input style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} value={appId}
               onChange={(e) => setAppId(e.target.value)} placeholder="cli_xxxx" />
           </div>
-          <SecretField label="App Secret" k="app_secret" value={appSecret} onChange={setAppSecret}
+          <SecretField platform="feishu" label="App Secret" k="app_secret" value={appSecret} onChange={setAppSecret}
             touched={touched} setTouched={setTouched} hint={t("admin.notif.secretHint")}
             placeholder={t("admin.notif.secretPh")} />
           {/* Encrypt Key / Verification Token —— webhook 模式的唯一鉴权手段，必填。
               与 App Secret 同样脱敏回显 + 一动手输入就变圆点，避免在客户共享屏幕时露出。 */}
-          <SecretField label="Encrypt Key" k="encrypt_key" value={encryptKey} onChange={setEncryptKey}
+          <SecretField platform="feishu" label="Encrypt Key" k="encrypt_key" value={encryptKey} onChange={setEncryptKey}
             touched={touched} setTouched={setTouched} hint={t("admin.notif.encryptHint")}
             placeholder={t("admin.notif.secretPh")} />
-          <SecretField label="Verification Token" k="verification_token" value={verifyToken} onChange={setVerifyToken}
+          <SecretField platform="feishu" label="Verification Token" k="verification_token" value={verifyToken} onChange={setVerifyToken}
             touched={touched} setTouched={setTouched} hint={t("admin.notif.tokenHint")}
             placeholder={t("admin.notif.secretPh")} />
           <div className="imx-steps-order">{t("admin.notif.keysRequired")}</div>
@@ -377,6 +471,135 @@ function NotificationsView() {
         </button>
       </div>
       <FeishuGuideDrawer open={guide} onClose={() => setGuide(false)} webhookUrl={webhookUrl} />
+    </div>
+  );
+}
+
+/**
+ * 钉钉分页。与飞书那份**刻意不合并**（理由见本节头），三处差异都在界面上说清:
+ *
+ *   ① 只有两个凭证:AppKey + AppSecret。钉钉的入站验签用的就是 AppSecret 本身
+ *      （`sign = base64(hmac_sha256(appSecret, f"{timestamp}\n{appSecret}"))`），
+ *      所以没有 Encrypt Key / Verification Token 那两个框 —— 客户照着飞书那套找不到
+ *      对应输入框时会以为页面漏了，`admin.notif.dt.keysRequired` 就是为这句话存在的。
+ *   ② 没有「推送群组 Chat ID」列表:群里 @机器人 的回复走钉钉回调里带的一次性会话地址
+ *      （sessionWebhook，有效期 ≈90 分钟），不需要登记群 id;主动推送另配一个自定义机器人
+ *      地址（那串地址**本身就是凭证**，所以按密钥框处理）。
+ *   ③ 「测试」不发到群里:钉钉没有「往任意群发一条测试消息」的接口。所以按钮叫「测试凭证」，
+ *      文案明说没配推送地址时什么都不会发出去 —— 不假装已发送（「不许静默降级」）。
+ */
+function DingtalkNotifications() {
+  const t = useT();
+  const [loading, setLoading] = useState(true);
+  const [appKey, setAppKey] = useState("");
+  const [appSecret, setAppSecret] = useState("");
+  /** 自定义机器人推送地址。**是凭证**（谁拿到都能往那个群发消息）→ 走 SecretField，
+   *  后端也只回显后 4 位（bff/web-chat/dingtalk_config.mjs 的 `push_webhook_url`）。 */
+  const [pushUrl, setPushUrl] = useState("");
+  /** 入站回调地址（后端只读回带；没装钉钉 / 查不到 = 空串 → 抽屉退回文字说明）。
+   *  ⚠️ 与上面那个 `pushUrl` 方向相反、绝不能混:这个是公开入口，那个是凭证。 */
+  const [webhookUrl, setWebhookUrl] = useState("");
+  const [touched, setTouched] = useState<TouchedMap>({ app_secret: false, push_webhook_url: false });
+  /** 服务端给的脱敏原值，用于「没动过 → 原样回传」。理由与飞书那份逐字相同。 */
+  const loaded = useRef({ app_secret: "", push_webhook_url: "" });
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [guide, setGuide] = useState(false);
+
+  // `silent` 的理由与飞书那份相同（首次加载时 loading 初值已是 true）。
+  const load = (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setLoading(true);
+    fetchNotificationConfig()
+      .then((r) => {
+        // 旧 BFF（还没部署钉钉那段）不回 `dingtalk` —— 退回"全部空着"，不能白屏。
+        const d = r.dingtalk ?? { app_key: "", app_secret: "", push_webhook_url: "", webhook_url: "" };
+        setAppKey(d.app_key || "");
+        setAppSecret(d.app_secret || "");
+        setPushUrl(d.push_webhook_url || "");
+        setWebhookUrl(d.webhook_url || "");
+        loaded.current = { app_secret: d.app_secret || "", push_webhook_url: d.push_webhook_url || "" };
+        setTouched({ app_secret: false, push_webhook_url: false });
+      })
+      .catch((e) => setMsg({ ok: false, text: String(e?.message || e) }))
+      .finally(() => setLoading(false));
+  };
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { load({ silent: true }); }, []);   // 判据同飞书那份（同步路径上没有 setState）
+
+  const save = async () => {
+    setSaving(true); setMsg(null);
+    try {
+      const keep = (k: keyof typeof loaded.current, cur: string) =>
+        touched[k] ? cur.trim() : loaded.current[k];
+      const r = await putDingtalkConfig({
+        app_key: appKey.trim(),
+        // trim:这两个值是从钉钉控制台**复制**来的，粘贴带尾随空格/换行是常事，
+        // 而后果是 sign 校验失败 —— 症状与"地址填错"一模一样（钉钉两边都不报错）。
+        app_secret: keep("app_secret", appSecret),
+        push_webhook_url: keep("push_webhook_url", pushUrl),
+      });
+      setMsg({ ok: true, text: r.message || t("admin.notif.saved") });
+      load();   // 重新拉取,让 secret 显示为脱敏形态
+    } catch (e) {
+      setMsg({ ok: false, text: String((e as Error)?.message || e) });
+    } finally { setSaving(false); }
+  };
+
+  const test = async () => {
+    setTesting(true); setMsg(null);
+    try {
+      const r = await testDingtalkSend();
+      setMsg({ ok: r.success, text: r.message });
+    } catch (e) {
+      setMsg({ ok: false, text: String((e as Error)?.message || e) });
+    } finally { setTesting(false); }
+  };
+
+  return (
+    <div>
+      {loading ? <div style={{ color: "var(--muted)", fontSize: 13 }}>{t("admin.notif.loading")}</div> : (
+        <div style={{ ...box, padding: 18, maxWidth: 640, display: "flex", flexDirection: "column", gap: 14 }}>
+          <div>
+            <FieldLabel>App Key</FieldLabel>
+            <input style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} value={appKey}
+              onChange={(e) => setAppKey(e.target.value)} placeholder="dingxxxxxxxx" />
+            <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>{t("admin.notif.dt.appKeyHint")}</div>
+          </div>
+          <SecretField platform="dingtalk" label="App Secret" k="app_secret" value={appSecret} onChange={setAppSecret}
+            touched={touched} setTouched={setTouched} hint={t("admin.notif.dt.secretHint")}
+            placeholder={t("admin.notif.secretPh")} />
+          {/* 自定义机器人推送地址 —— 出方向、可选。当密钥处理:它本身就是凭证。 */}
+          <SecretField platform="dingtalk" label={t("admin.notif.dt.pushUrl")} k="push_webhook_url"
+            value={pushUrl} onChange={setPushUrl}
+            touched={touched} setTouched={setTouched} hint={t("admin.notif.dt.pushUrlHint")}
+            placeholder={t("admin.notif.dt.pushUrlPh")} />
+          <div className="imx-steps-order">{t("admin.notif.dt.keysRequired")}</div>
+          <div style={{ color: "var(--muted)", fontSize: 11.5, lineHeight: 1.6 }}>{t("admin.notif.dt.noChatIds")}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <button style={btnPrimary} disabled={saving} onClick={save}>{saving ? t("admin.notif.saving") : t("admin.notif.save")}</button>
+            <button style={btnGhost} disabled={testing} onClick={test} title={t("admin.notif.dt.testTip")}>
+              {testing ? t("admin.notif.dt.testing") : t("admin.notif.dt.test")}
+            </button>
+            {msg && <span style={msg.ok ? okText : errText}>{msg.text}</span>}
+          </div>
+        </div>
+      )}
+
+      <div className="imx-steps">
+        <div className="imx-steps-title">{t("admin.notif.dt.steps.title")}</div>
+        <ol>
+          <li>{t("admin.notif.dt.steps.s1")}</li>
+          <li>{t("admin.notif.dt.steps.s2")}</li>
+          <li>{t("admin.notif.dt.steps.s3")}</li>
+          <li>{t("admin.notif.dt.steps.s4")}</li>
+        </ol>
+        <div className="imx-steps-order">{t("admin.notif.dt.steps.order")}</div>
+        <button className="imx-guide-link" onClick={() => setGuide(true)}>
+          {t("admin.notif.guideLink")} <span aria-hidden="true">→</span>
+        </button>
+      </div>
+      <DingTalkGuideDrawer open={guide} onClose={() => setGuide(false)} webhookUrl={webhookUrl} />
     </div>
   );
 }
@@ -2387,6 +2610,18 @@ export function AccountsView() {
                       {t("admin.accounts.outOfOrg")}
                     </span>
                   )}
+                  {/* 🔴 管理账号徽章。只在「从委派管理员账号部署」的形态下出现。
+                      徽章 + title 必须说清「为什么一键接入按钮不在」，否则运维
+                      会以为列表坏了 —— 这一行有账号、有区域、没有按钮。 */}
+                  {a.isOrgManagementAccount && (
+                    <span title={t("admin.accounts.mgmtAcctHint")}
+                      style={{ fontSize: 11, fontWeight: 600, padding: "2px 8px",
+                        borderRadius: 100, border: "1px solid var(--line)",
+                        color: "var(--muted)", cursor: "help",
+                        whiteSpace: "nowrap" }}>
+                      {t("admin.accounts.mgmtAcct")}
+                    </span>
+                  )}
                   {/* 🔴 「要重新部署栈」的徽章。这个账号采集照跑、花
                       GetMetricData，而判读永远为空 —— 而看板上「N 条未做根因
                       分析」与「DA 说这些没问题」长得一样。管理页是唯一能看出
@@ -2413,7 +2648,10 @@ export function AccountsView() {
                   接入」重新生成链接。
                   ⚠️ 不渲染而不是灰着 —— 灰着等于在界面上摆一个用户无法解决
                      的问题（本文件既有约定）。 */}
-              {oneClick && !a.outOfOrg && a.orgOnboardStatus !== "PROVISIONING" && a.orgOnboardStatus !== "OFFBOARDING" && !(a.onboarded && a.enabled) && (
+              {/* ⚠️ `!a.isOrgManagementAccount`：CFN 不会把 stack 部署到管理账号
+                  （AWS 官方限制）。渲染它的后果不是报错而是**假成功** —— 操作变
+                  SUCCEEDED、账号被翻成「已接入」，而那个账号里什么都没建。 */}
+              {oneClick && !a.outOfOrg && !a.isOrgManagementAccount && a.orgOnboardStatus !== "PROVISIONING" && a.orgOnboardStatus !== "OFFBOARDING" && !(a.onboarded && a.enabled) && (
                 <button onClick={() => { setTarget(a); setRegionsInput(a.regions?.join(",") || "us-east-1"); }}
                   style={{ fontSize: 12.5, fontWeight: 600, padding: "5px 14px", borderRadius: 8, border: "1px solid var(--orange)", background: "rgba(255,153,0,.10)", color: "var(--text)", cursor: "pointer" }}>
                   {a.orgOnboardStatus === "FAILED" ? t("admin.accounts.retryBtn") : t("admin.accounts.onboardBtn")}

@@ -86,7 +86,7 @@ write access.
   defense in depth per entry point — web: tool-level read-only + command denylist
   + read-only system prompt; IM: the read-only DevOps Agent + a mutation-wording
   regex second gate — the assistant never mutates your cloud
-- 💬 **IM channels**: Slack / Feishu full-feature — a card comes back **immediately** after you
+- 💬 **IM channels**: Slack / Feishu / DingTalk full-feature — a card comes back **immediately** after you
   ask, and progress / thinking / the answer all refresh **in that same card** (the seconds in
   its title are the "still running" signal); when a deep investigation finishes, its report
   card is posted back to the conversation that started it. **Two agents to pick from**:
@@ -118,8 +118,8 @@ installed on your machine.
 
 Three optional parameters are worth knowing about:
 
-- **What to install** (`InstallOption`, default `web`) — a three-way dropdown: `web` /
-  `web+feishu` / `web+slack`. **All three install Web Chat**; the latter two add **one** IM
+- **What to install** (`InstallOption`, default `web`) — a four-way dropdown: `web` /
+  `web+feishu` / `web+slack` / `web+dingtalk`. **All four install Web Chat**; the latter three add **one** IM
   bot (@-mention it in a group, or DM it — after deploying you still fill in a request URL on
   the IM platform and put the credentials into Secrets Manager). You can update the stack to
   a different value later.
@@ -127,8 +127,12 @@ Three optional parameters are worth knowing about:
   skipped instead of failing the stack in Regions that don't have it).
 - **Deployment mode** (single account by default; pick multi-account and supply your
   organization id to run read-only investigations across other accounts in the organization —
-  requires deploying from the organization management account or a StackSets delegated
-  administrator).
+  the deploying account must be either the **AWS Organizations management account** or a member
+  account registered as a **CloudFormation StackSets delegated administrator** (auto-detected,
+  nothing extra to fill in), see
+  [docs/DEPLOYMENT_ONECLICK.en.md §2.6.1](docs/DEPLOYMENT_ONECLICK.en.md#261-hard-prerequisite-management-account-or-a-stacksets-delegated-administrator).
+  If neither holds, the stack fails within the first minute and the failure reason hands you the
+  register command and the management account id).
 
 ⚠️ One-click deploys **Web Chat plus at most one IM bot**. It does **not** include scheduled
 inspections and proactive push, the data behind the inspection dashboard and its threshold
@@ -148,7 +152,7 @@ cd sample-notiops
 # 2. Deploy (CDK, one command; interactive on first run)
 ./setup.sh
 # First run: confirm AWS account → pick region → pick IM platforms
-# (Slack / Feishu, multi-select) → paste credentials for each (written
+# (Slack / Feishu / DingTalk, multi-select) → paste credentials for each (written
 # straight to Secrets Manager, never to disk) → CDK bootstrap → synth →
 # dependency Layer build (pip, no container) → cdk deploy --all. Re-runs
 # only patch deltas.
@@ -166,11 +170,24 @@ switching later requires a redeploy.
   account only. Least privilege, fastest path to a working install; right for
   most trials and single-account users.
 - **Multi-account** — `./setup.sh --multi-account`. Adds cross-member-account
-  inspection / investigation / event forwarding across an AWS Organization. Run
-  it in the **Organizations management account**, or in a member account
-  registered as a **CloudFormation StackSets delegated administrator** (you do
-  **not** have to be the management account). Member-account resources are
-  rolled out automatically via StackSets.
+  inspection / investigation / event forwarding across an AWS Organization.
+  Member-account resources are rolled out automatically via StackSets.
+  **Either deploying identity works**: the organization management account (payer),
+  or a member account registered as a **CloudFormation StackSets delegated
+  administrator** — the script auto-detects it, there is no flag to pass, and if the
+  account does not qualify it prints the `aws organizations
+  register-delegated-administrator` command for the management account to run.
+  Check first: `aws organizations describe-organization --query
+  'Organization.MasterAccountId' --output text` equals `aws sts
+  get-caller-identity --query Account --output text` ⇒ this is the management
+  account. If they differ, check `aws organizations list-delegated-administrators
+  --service-principal member.org.stacksets.cloudformation.amazonaws.com --query
+  'DelegatedAdministrators[].Id' --output text` (**`--service-principal` is
+  required** — without it you also get other services' delegated administrators,
+  which cannot operate StackSets).
+  ⚠️ A delegated administrator has **full deployment permissions across the whole
+  organization and cannot be scoped to specific OUs**; an organization allows at
+  most 5.
 
 For the full deployment walkthrough into your own AWS account — including the
 mode comparison and how to switch — see
@@ -209,7 +226,7 @@ mode comparison and how to switch — see
 | Multi-LLM switching + model catalogue | ✅ | ✅ |
 | Bedrock API key as the credential | ✅ | ✅ |
 | **Proactive / IM** | | |
-| IM channels (Slack / Feishu) | ✅ one platform per stack, see note ⁴ | ✅ both at once |
+| IM channels (Slack / Feishu / DingTalk) | ✅ one platform per stack, see note ⁴ | ✅ all three at once |
 | Two agents in IM (`/agent devops`, the 0-token default \| `/agent notiops`, model-backed) + the `/web` toggle | ✅ | ✅ |
 | Pick which account you ask about, from IM (`/account`) | ✅ | ✅ |
 | Proactive push **to IM** (10 EventBridge sources) | ❌ | ✅ |
@@ -217,7 +234,7 @@ mode comparison and how to switch — see
 | Notification inbox (the same 10 sources, into the web inbox) | ✅ | ✅ |
 | Inspection dashboard (overview / high load / idle & cost / structural risk / inspection scope / thresholds & schedule) | ❌ Option A has no inspection backend, so the sidebar entry **does not appear at all** (rather than failing once you open it); calling the API directly tells you plainly that this needs Option B | ✅ |
 | **Scope** | | |
-| Multi-account (across an AWS Organization) | ✅ set `DeployMode=MultiAccount` + your organization id | ✅ `--multi-account` |
+| Multi-account (across an AWS Organization) — both paths accept the **management account** or a registered **StackSets delegated administrator** member account (auto-detected); ⚠️ CloudFormation never rolls a StackSet into the management account itself, so inspecting it needs the member template deployed by hand | ✅ set `DeployMode=MultiAccount` + your organization id | ✅ `--multi-account` |
 | Upgrade | update the stack with the new template (~1 min) | re-run `./setup.sh` |
 
 > ¹ **Every DevOps Agent capability (deep investigation, deep investigation Direct, DevOps
@@ -258,7 +275,7 @@ mode comparison and how to switch — see
 > already-extracted records are deleted along with the strategies.
 
 > ⁴ **On Option A the IM bot is a dropdown on the parameters page** (`InstallOption`: `web` /
-> `web+feishu` / `web+slack`; the default installs web only). The bot and the web UI share the
+> `web+feishu` / `web+slack` / `web+dingtalk`; the default installs web only). The bot and the web UI share the
 > **same read-only backend**, so you can @-mention it in a group or DM it; anything that
 > matches "look at resources / start an investigation / check progress / switch model / switch
 > language" is deterministic routing and costs **no tokens**. Two differences: (1) one stack
@@ -267,6 +284,18 @@ mode comparison and how to switch — see
 > IM platform, in that order (the `ImNextSteps` stack output reminds you), as described in
 > [docs/IM_WEBHOOK_SETUP.en.md](docs/IM_WEBHOOK_SETUP.en.md). Note this is **request/response
 > only**; pushing daily inspection reports and alerts into a group is still Option B.
+>
+> ⚠️ **The IM platforms this release supports are Feishu / Lark, Slack and DingTalk**
+> (DingTalk since 2026-09-08, on both paths). DingTalk has three **platform-capability**
+> differences, which we state outright rather than imply by omission: (1) card buttons can only
+> be **links** (so actions that need confirmation — open a case, start an investigation — are
+> completed by **replying with a keyword**); (2) a sent message **cannot be edited** (long tasks
+> **append** one or two progress messages instead of refreshing a single card, as Feishu does);
+> (3) DingTalk **validates nothing** when you save the callback URL (a wrong address raises no
+> error on the spot — the only symptom is that the robot never says a word).
+> **Microsoft Teams is still unavailable** — `platforms/teams/` is a directory with no
+> implementation, and remains a known to-do. The platform table is at the top of
+> [docs/IM_WEBHOOK_SETUP.en.md](docs/IM_WEBHOOK_SETUP.en.md).
 
 > ⁵ **Bringing your own CUR data source is optional, and identical on both paths.** The
 > "CUR + Athena billing-detail drill-down" row above is about **this deploy account's own**
@@ -376,7 +405,7 @@ preserved, and one log group named like
 ## Architecture (high-level)
 
 ```
-Web console (browser)        Customer IM (Slack / Feishu)
+Web console (browser)     Customer IM (Slack / Feishu / DingTalk)
         │                              │
         └──────────────┬───────────────┘
                        ▼

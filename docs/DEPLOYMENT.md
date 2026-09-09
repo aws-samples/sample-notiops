@@ -90,17 +90,86 @@
 
 | | **单账号模式(默认)** | **多账号模式** `./setup.sh --multi-account` |
 |---|---|---|
-| **怎么触发** | 直接 `./setup.sh` | `./setup.sh --multi-account`,且需在**组织管理账号**,或已在管理账号注册为 **CloudFormation StackSets 委派管理员**的成员账号上运行 |
+| **怎么触发** | 直接 `./setup.sh` | `./setup.sh --multi-account`,在**组织管理账号(payer)**或**已注册的 StackSets 委派管理员**成员账号上运行 —— 见下面 |
 | **面向谁** | 只在**本账号**用 NotiOps(绝大多数试用 / 单账号客户) | 用 Organizations 管理一堆账号,想**跨成员账号**巡检 / 调查 / 转发事件 |
 | **跨账号闸门** | 锁定到部署账号(`LOCKED_ACCOUNT_ID` = 本账号);Web 控制台的多账号选择器只列本账号 | 解锁闸门(`LOCKED_ACCOUNT_ID` 置空,改用 `aws:PrincipalOrgID` 整组放行);控制台可接入 / 切换成员账号 |
 | **成员账号资源** | 不下发 | 经 **StackSets** 自动向成员账号下发只读 role + DevOps/PHD 事件转发 |
 | **影响的功能** | Web Chat 全部功能对**本账号**开箱即用 | 额外解锁:跨账号**闲置/成本巡检**、跨账号**故障调查**、跨账号 **PHD/DevOps 事件转发**、控制台「账户接入 (Organizations)」页 |
 
-**为什么不默认开多账号?** 多账号模式要求当前身份是 **Organizations 管理账号**(或其 **StackSets 委派管理员**)、要动 StackSets 并向成员账号下发资源 —— 对只想在单账号里试用的绝大多数用户是多余且更高权限的操作。默认单账号是最小权限、最快跑通的路径,所以**默认关**;需要时显式加 `--multi-account` 才启用。
+#### 硬性前置:管理账号,或 StackSets 委派管理员
 
-**已经单账号部署过、后来想要多账号怎么办?** 在 Organizations 管理账号(或 StackSets 委派管理员账号)重跑 `./setup.sh --multi-account` 即可(CDK 增量更新会重写闸门 + 补下发成员账号资源)。若你在 Web 控制台看到「当前部署未启用 Organizations 多账号模式。请在组织管理账号(或 StackSets 委派管理员账号)用 `./setup.sh --multi-account` 重新部署」——正是提示你当前是单账号部署,需要用管理账号(或委派管理员)加 `--multi-account` 重跑,**这一步无法在控制台里点开关切换**。
+> `--multi-account` 接受**两种**部署身份,二者之一即可:
+> 1. **AWS Organizations 管理账号(payer)**;
+> 2. 一个已在管理账号里注册成 **CloudFormation StackSets 委派管理员**的成员账号(linked account)。
+>
+> **不用加任何开关来区分** —— `setup.sh` 自己探测(`detect_stackset_call_as`),认出委派管理员后把
+> `CallAs=DELEGATED_ADMIN` 一路带到全部 StackSets 调用(建 / 更新两个 StackSet、下发实例,
+> 以及 `teardown.sh` 的盘点与删除),并把 `stackSetCallAs` / `orgManagementAccountId` 传进 CDK,
+> 让运行期 `bff/web-chat/member_accounts.mjs` 的一键接入也带上它。
 
-> 不确定选哪个?**先按默认单账号跑通**,验证 Web Chat 能用;之后确有跨账号需求再用管理账号(或委派管理员)重跑 `--multi-account`。两者不冲突,后者是前者的超集。
+跑 `--multi-account` 之前先对一下(几秒钟):
+
+```bash
+aws organizations describe-organization --query 'Organization.[Id,MasterAccountId]' --output text
+aws sts get-caller-identity --query Account --output text
+```
+
+第一条的**第二列**(`MasterAccountId`)等于第二条的输出 ⇒ 这是管理账号,可以跑。
+两者不等 ⇒ 这是成员账号,再查一下它是否已经是 StackSets 委派管理员:
+
+```bash
+aws organizations list-delegated-administrators \
+  --service-principal member.org.stacksets.cloudformation.amazonaws.com \
+  --query 'DelegatedAdministrators[].Id' --output text
+```
+
+输出里**有**本账号号 ⇒ 可以跑。没有 ⇒ 三条路:让管理账号注册一次(见下)、换到管理账号上跑、
+或者先用默认单账号模式(Web / IM / 深度调查 / 开案例全都照常,只是只看这一个账号)。
+⚠️ 这条命令**必须带 `--service-principal`**:不带会列出组织里**所有**服务
+(GuardDuty / Config / Security Hub …)的委派管理员,那些账号也有 Organizations 只读权限但
+**操作不了 StackSet**,照着那份清单判断会得到"应该行",然后在建 StackSet 时才 `AccessDenied`。
+第一条报 `AWSOrganizationsNotInUseException` ⇒ 这个账号根本不在组织里,只能单账号。
+
+**注册委派管理员(一次性动作,在管理账号里跑):**
+
+```bash
+aws organizations register-delegated-administrator \
+  --service-principal member.org.stacksets.cloudformation.amazonaws.com \
+  --account-id <要用来部署 NotiOps 的成员账号号>
+```
+
+反向是 `aws organizations deregister-delegated-administrator`(同样两个参数)。
+注册完直接在那个成员账号里重跑 `./setup.sh --multi-account`,**没有额外参数**。
+
+**开这条路之前要知道的四件事:**
+
+1. ⚠️ **委派管理员对全组织有完整部署权限。** AWS 明确说明:管理账号**无法**把它收窄到某几个 OU
+   或某几类操作 —— 一旦注册,这个成员账号就能往组织里**任何**账号下发 StackSet(不只是 NotiOps
+   这两个)。这是 AWS StackSets 的模型,不是 NotiOps 的实现选择。
+2. **可信访问必须先由管理账号开好。** `enable-aws-service-access` 与
+   `activate-organizations-access` 这两个 API **只有管理账号能调**,所以委派管理员这条路上
+   `setup.sh` **跳过**它们(不是"调了忽略错误" —— 后者会让现场以为脚本已经帮它开好了),
+   只用 `describe-organizations-access --call-as DELEGATED_ADMIN` 验一遍并在没开时把那两条
+   命令打出来,让你回管理账号跑。
+3. **一个组织最多 5 个委派管理员**(AWS 硬限制,跨所有服务合计)。
+4. **StackSet 实体存放在管理账号里**,即使是委派管理员创建的。所以在**部署账号**的
+   CloudFormation 控制台里看不到 `notiops-member-onboarding` / `notiops-member-devops-agent`
+   (要看得加 `--call-as DELEGATED_ADMIN`);`teardown.sh` 也一样带这个参数,不会因此漏删。
+
+> 🔴 **一条与身份无关的硬限制**:CloudFormation **从不**把 service-managed StackSet 下发到
+> **组织管理账号本身** —— 即使把它所在的 OU 设成目标,`CreateStackInstances` 也会返回 SUCCEEDED
+> 而什么都不建(静默的假成功)。所以「让 NotiOps 巡检管理账号自己」不能靠 StackSet:在管理账号里
+> 手工部一次 `infra/member-account-onboarding.yaml`,再用管理页「手动接入账号」登记。两种部署身份下都一样。
+
+不满足条件时 `setup.sh` **在 `cdk deploy` 之前就停下并 `exit 1`**(不静默降级成单账号),
+把上面那三条出路和注册命令原样打出来。一键部署那侧的对应说明见
+[DEPLOYMENT_ONECLICK.md §2.6.1](DEPLOYMENT_ONECLICK.md#261-硬性前置管理账号或-stacksets-委派管理员)。
+
+**为什么不默认开多账号?** 多账号模式要求当前身份是 **Organizations 管理账号或 StackSets 委派管理员**、要动 StackSets 并向成员账号下发资源 —— 对只想在单账号里试用的绝大多数用户是多余且更高权限的操作。默认单账号是最小权限、最快跑通的路径,所以**默认关**;需要时显式加 `--multi-account` 才启用。
+
+**已经单账号部署过、后来想要多账号怎么办?** 在管理账号(或已注册的委派管理员账号)重跑 `./setup.sh --multi-account` 即可(CDK 增量更新会重写闸门 + 补下发成员账号资源)。若你在 Web 控制台看到「当前部署未启用 Organizations 多账号模式,请用 `./setup.sh --multi-account` 在组织管理账号重新部署」——正是提示你当前是单账号部署,需要加 `--multi-account` 重跑,**这一步无法在控制台里点开关切换**。
+
+> 不确定选哪个?**先按默认单账号跑通**,验证 Web Chat 能用;之后确有跨账号需求再重跑 `--multi-account`。两者不冲突,后者是前者的超集。
 
 ### 0.2 验证
 
@@ -652,11 +721,11 @@ aws logs tail /aws/lambda/notiops-im-worker-feishu  --region $AWS_REGION --since
 
 5. **1-2 秒内**出一张 **🤔 思考中 · 已用时 N 秒** 卡片(这是判据 —— 立刻有卡)
 6. 同一张卡上正文、⚙️ 过程逐步刷新,标题秒数一直在涨(前 30 秒约 2 秒一刷,之后变慢,见
-   [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §6.2)
+   [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §7.2)
 7. 跑完(可能几分钟)卡片定版为答案 + 两颗按钮
 
 ⚠️ 「跑了几分钟才出答案」**不是**故障 —— 判据只有一条:**发完问题有没有立刻出那张思考卡**。
-用户可见口径在 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §6,别把它当回归报上来。
+用户可见口径在 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §7,别把它当回归报上来。
 
 如果失败 → §10 [Top 5 部署常见错误](#10-top-5-部署常见错误)。
 

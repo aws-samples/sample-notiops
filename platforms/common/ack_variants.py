@@ -53,10 +53,12 @@ SLACK_EMOJI_POOL: tuple[str, ...] = (
 
 SLACK_EMOJI_FALLBACK = "eyes"
 
-#: 「思考中」卡片的开场文案池。**每一条都必须自带那句"不用重复发问"**：它不是客套，
-#: 是这张卡唯一阻止用户重复发问的东西（重复发问会撞上 §3.22 的会话排队，把自己排到
-#: 自己后面）。`tests/test_im_ack_variants.py` 用断言钉住这条不变量 —— 加新文案时
-#: 漏了那句话，测试会挂，而不是等客户开始重复发问。
+#: 「思考中」卡片的**开场句**池 —— 只管语气，不管"答案会出现在哪"。
+#:
+#: ⚠️ 那句"不用重复发问"不在这里，在下面的 :data:`ACK_TAIL_KEYS`。它不是客套，是唯一
+#: 阻止用户重复发问的东西（重复发问会撞上 §3.22 的会话排队，把自己排到自己后面），
+#: 所以 `tests/test_im_ack_variants.py` 钉的是 :func:`ack_body` **拼出来的整句**，
+#: 不是单条 key —— 只看开场句永远看不到那句话。
 ACK_BODY_KEYS: tuple[str, ...] = (
     "im.chat.ack_body.1",
     "im.chat.ack_body.2",
@@ -78,6 +80,29 @@ ACK_BODY_KEYS_NOTIOPS: tuple[str, ...] = (
     "im.chat.ack_body.notiops.4",
     "im.chat.ack_body.notiops.5",
 )
+
+#: **去处句** —— "过程和结论会出现在哪"，按平台的**刷新能力**分两种，不按平台数量分。
+#:
+#: 2026-09-08 现网反馈原话：钉钉上那句「过程和结论会一起更新在这张卡片上」是**假的**。
+#: 钉钉的 webhook 回复拿不到消息 id（见 `platforms/dingtalk/caps.py` 文件头 §4.4），
+#: 发出去的消息改不了，进度是**另发新消息**（`platforms/dingtalk/append_progress.py`）。
+#: 一句永远不会发生的承诺比不承诺更糟：用户会盯着第一张卡等它变。
+#:
+#: 为什么是"一份尾句 × N 个平台"而不是"十条钉钉专属文案"：后者要多维护 20 条字符串，
+#: 而每条都得**自己记得**带上"不用重复发问" —— 那正是这个契约测试存在的原因。现在
+#: 平台差异只有这一处，加平台只加一行。
+#:
+#: `""` 是默认档（原地刷新的卡片：飞书 / Slack）。`platform` 传了不认识的值也落这一档 ——
+#: 宁可说"会更新在卡片上"再被平台打脸，也不要对能刷新的平台说"我另发一条"（那会让用户
+#: 忽略真正在刷新的那张卡）。
+ACK_TAIL_KEYS: dict[str, str] = {
+    "dingtalk": "im.chat.ack_tail.append",
+    "": "im.chat.ack_tail.card",
+}
+
+#: 开场句和去处句之间的连接。中文句号后面**不留空格**（CJK 排版没有句间空格，留了会
+#: 在钉钉/飞书上显示成一个突兀的缺口）；英文必须留，否则两句会粘成 `minutes.Progress`。
+_JOIN: dict[str, str] = {"zh": "", "en": " "}
 
 
 def _index(seed: str, n: int) -> int:
@@ -126,11 +151,37 @@ def ack_body_key(seed: str, agent: str = "devops") -> str:
     return keys[_index(seed, len(keys))]
 
 
-def ack_body(seed: str, locale: str, agent: str = "devops") -> str:
-    """「思考中」卡片的开场话。
+def ack_tail_key(platform: str = "") -> str:
+    """去处句的 i18n key。见 :data:`ACK_TAIL_KEYS`（不认识的平台落默认"卡片"那一档）。"""
+    return ACK_TAIL_KEYS.get(platform or "", ACK_TAIL_KEYS[""])
+
+
+def ack_body(seed: str, locale: str, agent: str = "devops", *,
+             platform: str = "") -> str:
+    """「思考中」那条消息的开场话 = 开场句（按种子轮换）+ 去处句（按平台）。
+
+    `platform` 建议**每个调用点都显式传**（`caps.PLATFORM`）：默认那一档说的是"会更新
+    在这张卡片上"，对一个不会刷新的平台来说是假话，而漏传不会报错。
 
     ⚠️ `i18n` 的 import 在函数体里 —— 见模块头「依赖纪律」。ingress 只用表情那两个
     函数，不该为 i18n 那张大表付 INIT 时间。
     """
     from core import i18n
-    return i18n.t(ack_body_key(seed, agent), locale)
+    opener = i18n.t(ack_body_key(seed, agent), locale)
+    tail = i18n.t(ack_tail_key(platform), locale)
+    return f"{opener}{_JOIN.get(locale, ' ')}{tail}"
+
+
+def queued_body(locale: str, *, platform: str = "") -> str:
+    """「排队中」那条消息的正文 —— 同一句话的"卡片"版 / "追加"版。
+
+    与 :func:`ack_body` 不同，这句**没有开场句轮换**（排队本身就是偶发事件，不存在
+    "每次都一样很生硬"的问题），所以是两条整句而不是拼接：卡片版承诺"这张卡片会自己
+    变成「思考中」"，追加版说"我会另发一条消息"。选错的代价同上：一个永远不会发生的承诺。
+    """
+    from core import i18n
+    # 「这个平台能不能原地刷新」只在 `ACK_TAIL_KEYS` 里记一次 —— 这里从那份判断派生，
+    # 不再写第二个 `platform == "dingtalk"`（写第二遍就会有一天只改一处）。
+    append = ack_tail_key(platform).endswith(".append")
+    return i18n.t("im.chat.queued_body.append" if append
+                  else "im.chat.queued_body", locale)

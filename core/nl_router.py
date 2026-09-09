@@ -204,6 +204,27 @@ ACCOUNT_CLEAR_WORDS: frozenset[str] = frozenset({
 })
 ACCOUNT_ARG_WORDS: frozenset[str] = ACCOUNT_LIST_WORDS | ACCOUNT_CLEAR_WORDS
 
+#: 「确认 / 取消」—— **不参与路由**，只是给平台层用的输入词表。
+#:
+#: 为什么放在这里而不是 `platforms/dingtalk/case_text.py`：钉钉的按钮只能跳 URL，没有
+#: 「按钮 → 回调服务器」这条路（见 `platforms/dingtalk/caps.py` 文件头第 4 条），所以危险动作
+#: （开案例、关案例）的二次确认只能让用户**回一句话**。而本模块是这个仓库里既有的
+#: "供消费方做输入匹配的词表"之家（`AGENT_ARG_WORDS` / `WEB_ON_WORDS` / …），
+#: 也是 `scripts/lint_i18n.py` 的 CJK 允许清单成员 —— 词表散落到 `platforms/` 下就得
+#: 给每个平台再加一条允许清单例外。
+#:
+#: ⚠️ `dispatch()` **不认这两个词表**：确认语只在"有待确认动作"时才有含义，判断待确认
+#: 状态要读 DynamoDB，那是平台层的事（见 `platforms/dingtalk/case_text.py`）。没有待确认
+#: 动作时一句「确认」应该照常落到模型，而不是被路由吃掉。
+CONFIRM_WORDS: frozenset[str] = frozenset({
+    "确认", "確認", "确定", "確定", "是", "好", "好的", "同意", "继续", "繼續",
+    "yes", "y", "ok", "okay", "confirm", "confirmed", "go", "proceed",
+})
+CANCEL_WORDS: frozenset[str] = frozenset({
+    "取消", "算了", "不", "不要", "不用", "放弃", "放棄", "撤销", "撤銷",
+    "no", "n", "cancel", "abort", "stop", "nevermind",
+})
+
 #: 12 位 AWS 账号 id。**故意在这里再写一次**，不从 `core.im_prefs.is_account_id` 导入：
 #: 本模块是纯函数、零 AWS 依赖（`im_prefs` 拉 boto3），依赖方向只能是
 #: platforms → core.nl_router。口径一致由 `tests/test_im_multi_account.py` 钉住。
@@ -262,9 +283,30 @@ _CASE_CMD_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
           "分析案例", "案例分析", "案例摘要", "总结案例", "總結案例"),
      "case_analyze"),
     # bare "case" / "cases" / "案例" / "工单" LAST — the specific verb+noun
-    # forms above win; this bare form falls to view-if-id / list-otherwise.
+    # forms above win; this bare form falls to view-if-id / create-if-described
+    # / list-otherwise (see `_CASE_BARE_LIST_WORDS`).
     (_cmd("case", "cases", "案例", "工单", "工單"), "case_bare"),
 )
+
+#: 裸 `case` / `案例` 后面**只跟这几个词**时仍然按"列出案例"处理 —— 它们是过滤词，
+#: 不是案例主题。`/case list` / `/案例 我的` / `/cases all` 都在这里。
+#:
+#: 为什么要有这张表：`/case <一段描述>` 现在会被当成"开案例"（见 `parse_command`），
+#: 而 `/case list` 这种写法要是也落到"开案例"，用户就会拿到一张主题写着「list」的
+#: 草稿 —— 那比看到列表糟得多。反过来漏收一个过滤词只是多看一次列表，代价轻。
+_CASE_BARE_LIST_WORDS = frozenset({
+    "list", "lists", "ls", "all", "my", "mine", "recent", "open", "opened",
+    "列表", "清单", "清單", "我的", "全部", "所有", "最近", "近期",
+})
+
+
+def _case_bare_is_a_subject(rest: str) -> bool:
+    """裸 `case` 后面那段是"要开案例的描述"，还是"列表的过滤词/客套"。"""
+    t = (rest or "").strip(_CASE_TRIM)
+    if not t or t.lower() in _CASE_BARE_LIST_WORDS:
+        return False
+    # 只有客套（`/case 帮我`）= 什么都没说 → 照旧列表。
+    return not _is_case_filler(t)
 
 # ≥6-digit case id, same shape as bedrock_intent._CASE_ID_RE (kept local so
 # nl_router has no hard dep on bedrock_intent internals).
@@ -327,8 +369,25 @@ def parse_command(text: str) -> Route:
         rest = (m.group("rest") or "").strip()
         case_id = _extract_case_id(rest)
         if canonical == "case_bare":
-            # bare "case <id>" → view; bare "case" (no id) → list.
-            canonical = "case_view" if case_id else "case_list"
+            # bare "case <id>" → view; bare "case <一段描述>" → create;
+            # bare "case" / "case list" / "case 帮我" → list.
+            #
+            # ⚠️ 「有描述就是要开案例」这一条是 2026-09-09 现网反馈修的真 bug：
+            # `/case 请提供 8 月份 ES 账单的 breakdown` 原来落 `case_list` ——
+            # 描述被**整段丢掉**，用户拿到一张最近案例列表，而他要的是开案例。不报错、
+            # 不掉指标，只是他的问题凭空消失了。NL 那条路（`parse_case_intent` 的
+            # 「开案例 …」）一直是对的，斜杠命令这条路缺了这一档。
+            # 安全性：`case_create` 只是**存草稿 + 让用户回「确认」**（`start_create`
+            # 先探一次目标账号能不能开工单，再等确认才真调 CreateCase），所以这里
+            # 判错的代价是一次可忽略的草稿，不是一个对外可见的 AWS 案例。
+            # ⚠️ id 优先级仍然在描述之前（`/case 123456 …` → view）：那串数字是**强
+            # 信号**，改成"描述赢"会把「看一下 123456」这种写法从查看变成开案例。
+            if case_id:
+                canonical = "case_view"
+            elif _case_bare_is_a_subject(rest):
+                canonical = "case_create"
+            else:
+                canonical = "case_list"
         # view/reply/resolve/analyze without an id → fall back to list so the
         # user can pick from recent cases first (mirrors bedrock_intent).
         if canonical in {"case_view", "case_reply", "case_resolve",
@@ -538,6 +597,254 @@ def parse_case_intent(text: str) -> Route:
             return Route(kind="case", form="nl",
                          case_command=canonical, case_id=case_id)
     return Route()
+
+
+# --- 案例主题预填（确定性、0 token）------------------------------------------
+# 把「开案例」这类**只表意图**的标记从原话里剪掉，剩下的就是主题。
+#
+# 为什么在这里：这段逻辑原本在 `platforms/feishu/app/case_flow.py` 和
+# `platforms/slack/app/case_flow.py` 里**逐字符各一份**（两份词表连顺序都一样），
+# 钉钉是第三个消费方 —— 再抄一遍就是三处漂移。本模块已经是"案例意图"的权威
+# （`_CASE_NL_PATTERNS`），且是纯函数、零 AWS 依赖，依赖方向 platforms → core 正确。
+#
+# ⚠️ 与 `_CASE_NL_PATTERNS` 里那条 create 正则**不是**同一件事，别合并：那条要
+# 「动词 + 名词」的精确度来决定"这句话是不是要开案例"（判假的代价是把普通问题变成
+# 一张表单）；这里是在**已经**判定要开案例之后剪前缀，宁可多剪也不能少剪，所以用
+# 的是宽松的子串匹配。
+#
+# ⚠️ 这里**必须**是正则而不是一串固定子串（2026-09-08 现网教训）：固定子串只覆盖它
+# 逐字写下的那几种拼法，而人真正会打的是「开 案例」「帮我开个案例」「please open a
+# case」—— 一个都不在表里，于是整句原话被当成主题，AWS Support 里开出一个 Subject
+# 写着「帮我开个案例」的**对外可见**案例。动词 × 名词之间容忍空格和量词，一次就把这
+# 一类拼法全收进来。
+_CASE_INTENT_RE = re.compile(
+    # 中文：动词 +（可选量词）+ 名词
+    r"(?:创建|新建|新开|开|提|报|提交|申请)"
+    r"\s*(?:一)?\s*(?:个|张|条|次)?\s*"
+    r"(?:支持案例|案例|工单|case|ticket)"
+    r"|(?:升级|上报)\s*(?:到)?\s*support"
+    # 英文：动词 + 冠词 + （可选修饰）+ 名词
+    r"|\b(?:create|open|new|file|raise|submit|log)\s+"
+    r"(?:a|an|the)?\s*(?:new\s+)?(?:aws\s+)?(?:support\s+)?(?:case|ticket)\b"
+    r"|\bsupport\s+(?:case|ticket)\b"
+    r"|\bescalate\s+to\s+support\b"
+    r"|\bask\s+support\b",
+    re.IGNORECASE,
+)
+
+#: 剪完只剩客套 = 用户其实什么都没说。「帮我开案例」剪掉标记后剩下的「帮我」不是主题。
+_CASE_FILLER_RE = re.compile(
+    r"^(?:\s*(?:帮我|帮忙|帮个忙|帮|请|麻烦|我想|我要|我需要|想|要|需要|能否|"
+    r"可以|可不可以|能不能|给我|替我|"
+    r"please|pls|plz|kindly|can\s+you|could\s+you|would\s+you|help\s+me|"
+    r"i\s+(?:want|need)\s+to|i'?d\s+like\s+to|let'?s)"
+    r"\s*[,，、。：:；;!！?？~～\-—]*)+$",
+    re.IGNORECASE,
+)
+
+#: 两头要削掉的标点/空白（含全角）。
+_CASE_TRIM = " \t\r\n,，、:：;；。.!！?？~～-—"
+
+#: 字面写法回归集 —— **不是**匹配用的（匹配只认 `_CASE_INTENT_RE`），
+#: 但每一条都必须被那条正则命中，单测钉住，免得以后改正则时把老写法漏掉。
+#: ⚠️ 这个名字被内部回归清单的契约行按名字引用,改名要连着一起改。
+#: (这里**故意不写**那份清单的文件名:本文件在开源发布白名单里,写了内部文档名
+#:  就是公网死链,`scripts/publish-to-github.sh` 的发布 gate 会直接判红。)
+CASE_INTENT_PHRASES: tuple[str, ...] = (
+    "创建案例", "创建 case", "创建case", "开案例", "开 案例", "开 case", "开case",
+    "开个案例", "开一个案例", "新建案例", "新建 case", "新建case",
+    "提工单", "开工单", "提交工单", "报工单",
+    "升级到 support", "升级到support", "升级 support",
+    "create case", "create a case", "open case", "open a case",
+    "new case", "file a case", "support ticket", "open a ticket",
+    "escalate to support", "ask support",
+)
+
+#: 主题上限。CreateCase 自己的上限远大于此；这里的 200 是"给人看的一行标题"。
+CASE_SUBJECT_MAX = 200
+
+
+def _is_case_filler(s: str) -> bool:
+    """这段话是不是"什么都没说"（空 / 只有标点 / 只有客套）。"""
+    t = s.strip(_CASE_TRIM)
+    return not t or bool(_CASE_FILLER_RE.match(t))
+
+
+def summarize_case_subject(raw_text: str) -> str:
+    """原话 → 案例主题预填。剪不出内容就回空串。**确定性、0 token。**
+
+    很多人打「@bot 开案例 EC2 CPU 一直 100%」，真正的主题是标记**后面**那段；
+    标记前面偶尔也有内容（「生产环境 开案例」），所以两头都留着拼起来 —— 但只是
+    客套（「帮我开案例」的「帮我」、「please open a case」的「please」）就一起丢掉。
+
+    剪完是空的 → 用户只说了「开案例」、没给主题。回空串让调用方去引导他补，
+    比把整段原话塞进 Subject 好。
+
+    🔴 飞书那边历史上有第四步「长输入交给 Bedrock 抽一句标题」，2026-09-01 起就是
+    死代码（调的符号已删，每次 AttributeError 被自己吞掉），2026-09-06 明确删除。
+    **不要"修活"** —— 主题是给用户改的预填值，值不上一次模型往返，理由见那次的
+    提交说明。
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return ""
+    m = _CASE_INTENT_RE.search(text)
+    if m:
+        head = text[:m.start()].strip(_CASE_TRIM)
+        tail = text[m.end():].strip(_CASE_TRIM)
+        # 标记**前面**那截多半只是客套（「帮我」「请」「please」）；真有内容
+        # （「生产环境 开案例」）才留着拼回去。
+        if _is_case_filler(head):
+            head = ""
+        text = f"{head} {tail}".strip() if head else tail
+    # 只剪掉第一处标记：后面再出现「case」大概率是问题本身（「开案例 创建 case 失败」）。
+    return "" if _is_case_filler(text) else text[:CASE_SUBJECT_MAX]
+
+
+# --- 案例模版（钉钉）的回填解析 ------------------------------------------------
+# 用户说一句「开案例」，我们回一张逐行的「标签: 值」模版让他复制→改→发回来。
+# 这里是**回来那一句**的解析：纯确定性、0 token、不抛。
+#
+# 为什么在这个模块：这些中文标签是**输入匹配**用的词表，与上面那几张意图词表
+# 同一个性质，而本模块已经在 `scripts/lint_i18n.py` 的 CJK 允许清单里；
+# `platforms/dingtalk/case_text.py` 不在（模版的**输出文案**在 `core/i18n.py`）。
+
+#: 模版每一行的标签 → 规范字段名。
+#: ⚠️ **顺序即优先级**：长的必须排在短的前面 —— 否则「问题描述: x」会先命中
+#: 「问题」，把「描述」两个字留在值里。
+_CASE_FORM_LABELS: tuple[tuple[str, str], ...] = (
+    ("问题描述", "description"),
+    ("問題描述", "description"),
+    ("问题详情", "description"),
+    ("描述", "description"),
+    ("问题", "description"),
+    ("問題", "description"),
+    ("description", "description"),
+    ("problem", "description"),
+    ("desc", "description"),
+    ("严重等级", "severity"),
+    ("嚴重等級", "severity"),
+    ("严重级别", "severity"),
+    ("严重程度", "severity"),
+    ("紧急程度", "severity"),
+    ("severity", "severity"),
+    ("priority", "severity"),
+    ("回复语言", "language"),
+    ("语言", "language"),
+    ("語言", "language"),
+    ("language", "language"),
+    ("lang", "language"),
+    ("案例类型", "issue_type"),
+    ("案例類型", "issue_type"),
+    ("工单类型", "issue_type"),
+    ("类型", "issue_type"),
+    ("類型", "issue_type"),
+    ("issue type", "issue_type"),
+    ("case type", "issue_type"),
+    ("issue_type", "issue_type"),
+    ("type", "issue_type"),
+    ("涉及服务", "service"),
+    ("相关服务", "service"),
+    ("涉及服務", "service"),
+    ("服务", "service"),
+    ("服務", "service"),
+    ("aws service", "service"),
+    ("service", "service"),
+    ("标题", "subject"),
+    ("標題", "subject"),
+    ("主题", "subject"),
+    ("subject", "subject"),
+    ("title", "subject"),
+)
+
+#: 标签与值之间的分隔符。`=` 也认 —— 有人会把模版改成 `severity=high` 那种写法。
+_CASE_FORM_SEPS = ":：=＝"
+
+#: 值后面括号里那一串是我们自己印的选项提示（`严重等级: 2  (1 低 / 2 中 …)`）。
+#: 用户不改那一项就会连提示一起发回来 —— 必须剪掉。
+#: **只对枚举字段剪**：问题描述 / 标题里的括号是用户自己的内容
+#: （`RDS (Aurora) 连不上`），剪了就丢内容。
+_CASE_FORM_HINT_RE = re.compile(r"[(（].*$", re.S)
+
+#: 枚举字段 = 值是从我们印的选项里挑一个（数字 / code / 标签都认，见调用方）。
+_CASE_FORM_ENUM_FIELDS = frozenset({"severity", "language", "issue_type",
+                                    "service"})
+
+#: 判定「这是一份填好的模版」至少要几个标签行。
+#: 1 个太松（「问题: 打不开」是日常问句），2 个起才是模版形状 —— 而模版有 6 行，
+#: 用户就算一项没改也有 6 个。调用方对「只有问题描述一行」另有兜底（看有没有
+#: 刚发过模版的会话标记）。
+CASE_FORM_MIN_LABELS = 2
+
+#: markdown 噪声：钉钉客户端复制回来的行可能带 `**`、`-`、`>`、`` ` ``。
+_CASE_FORM_NOISE = "#>*-•・ \t"
+
+
+def _case_form_probe(line: str) -> str:
+    """一行原文 → 用于**标签匹配**的规范形态（剪 markdown 噪声）。
+
+    只用来判标签和取值；折进正文的那些行用的是原文（见 `parse_case_form`）。
+    """
+    s = (line or "").strip().lstrip(_CASE_FORM_NOISE)
+    return s.replace("**", "").replace("`", "").strip()
+
+
+def _case_form_label(probe: str) -> tuple[str, str] | None:
+    """行首是不是某个标签 + 分隔符？是 → `(规范字段名, 值)`，否 → None。"""
+    low = probe.lower()
+    for label, canon in _CASE_FORM_LABELS:
+        if not low.startswith(label):
+            continue
+        rest = probe[len(label):].lstrip()
+        if not rest or rest[0] not in _CASE_FORM_SEPS:
+            continue
+        value = rest[1:].strip()
+        if canon in _CASE_FORM_ENUM_FIELDS:
+            value = _CASE_FORM_HINT_RE.sub("", value).strip()
+        return canon, value.strip("*` ").strip()
+    return None
+
+
+def parse_case_form(text: str, *, boilerplate: tuple = ()) -> dict:
+    """填好的案例模版 → `{"fields": {...}, "extra": [...], "labels": n}`。
+
+    **确定性、0 token、不抛。** 值一律回**原样字符串** —— 数字/code/中文标签
+    的归一化在调用方（`platforms/dingtalk/case_text.py`），因为可选项是运行时
+    才知道的（严重等级看 support plan、服务清单看目录）。
+
+    - 分隔符 `:`／`：`／`=`；`### 标题` 那种 markdown 噪声会被剪掉。
+    - 认不出标签的行：出现在**第一个标签之后**的折进 `extra`（调用方把它们接到
+      问题描述后面 —— 模版明写了「可以换行多写几段」）；第一个标签之前的丢掉
+      （那只可能是我们自己的标题/账号横幅，或者用户的一句「你好」）。
+    - `boilerplate` 是调用方自己渲染过的整行文案（模版的两行落款）。**只对
+      认不出标签的行生效** —— 用户一项没改时那些字段行与模版逐字相同，那些
+      必须照常当字段解析。
+    - 同一个字段出现第二次：当正文，不覆盖第一次（`错误类型: xxx` 这种行才
+      不会把「类型」字段冲掉）。
+    """
+    fields: dict[str, str] = {}
+    extra: list[str] = []
+    skip = {_norm_bp(b) for b in (boilerplate or ()) if (b or "").strip()}
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        probe = _case_form_probe(line)
+        if not probe:
+            continue
+        hit = _case_form_label(probe)
+        if hit and hit[0] not in fields:
+            fields[hit[0]] = hit[1]
+            continue
+        if not fields:            # 第一个标签之前的散行 → 丢
+            continue
+        if _norm_bp(probe) in skip:
+            continue
+        extra.append(line.strip())
+    return {"fields": fields, "extra": extra, "labels": len(fields)}
+
+
+def _norm_bp(s: str) -> str:
+    """落款比对用的归一化：剪 markdown 噪声 + 压空白。"""
+    return " ".join(_case_form_probe(s).split())
 
 
 # --- Model-switch NL signal (verb × "模型"/"model"). Like language, there is

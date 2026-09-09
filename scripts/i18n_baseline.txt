@@ -136,36 +136,8 @@ frontend/chat-app/src/i18n.ts: 'sidebar.earlier' 定义了但没有任何 t() �
 frontend/chat-app/src/i18n.ts: 'sidebar.expand' 定义了但没有任何 t() 引用 —— 改它不会生效，留着会让人以为那个功能还在
 frontend/chat-app/src/i18n.ts: 'sidebar.today' 定义了但没有任何 t() 引用 —— 改它不会生效，留着会让人以为那个功能还在
 frontend/chat-app/src/i18n.ts: 'topic.soon' 定义了但没有任何 t() 引用 —— 改它不会生效，留着会让人以为那个功能还在
-platforms/feishu/app/case_flow.py:CJK literal '创建 case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/case_flow.py:CJK literal '创建case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/case_flow.py:CJK literal '创建案例' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/case_flow.py:CJK literal '升级 support' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/case_flow.py:CJK literal '升级到 support' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/case_flow.py:CJK literal '升级到support' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/case_flow.py:CJK literal '开 case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/case_flow.py:CJK literal '开case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/case_flow.py:CJK literal '开工单' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/case_flow.py:CJK literal '开案例' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/case_flow.py:CJK literal '提工单' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/case_flow.py:CJK literal '新建 case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/case_flow.py:CJK literal '新建case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/feishu/app/case_flow.py:CJK literal '新建案例' — move to core/i18n.py and call i18n.t(...) with both zh and en values
 platforms/feishu/app/main.py:CJK literal 'DEFAULT_INVESTIGATION_ACCOUNT_ID 未配置,无法发起调查 incident_id=%s' — move to core/i18n.py and call i18n.t(...) with both zh and en values
 platforms/feishu/app/main.py:CJK literal '\\b(delete|remove|stop|terminate|destroy|drop|kill|reboot|restart|shutdown)\\s+(?:' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '创建 case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '创建case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '创建案例' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '升级 support' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '升级到 support' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '升级到support' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '开 case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '开case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '开工单' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '开案例' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '提工单' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '新建 case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '新建case' — move to core/i18n.py and call i18n.t(...) with both zh and en values
-platforms/slack/app/case_flow.py:CJK literal '新建案例' — move to core/i18n.py and call i18n.t(...) with both zh and en values
 platforms/slack/app/main.py:CJK literal 'DEFAULT_INVESTIGATION_ACCOUNT_ID 未配置,无法发起调查 incident_id=%s' — move to core/i18n.py and call i18n.t(...) with both zh and en values
 platforms/slack/app/main.py:CJK literal '\\b(delete|remove|stop|terminate|destroy|drop|kill|reboot|restart|shutdown)\\s+(?:' — move to core/i18n.py and call i18n.t(...) with both zh and en values
 scripts/backfill_investigation_gsi2.py:CJK literal ')，回填缺 GSI2PK 的 investigation 行' — move to core/i18n.py and call i18n.t(...) with both zh and en values

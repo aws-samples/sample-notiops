@@ -191,7 +191,7 @@ await t("墙钟超时会收尾并把已生成的正文留下（timedOut，不是
 await t("events 为空/undefined 不抛（SDK 没给流也别 500）", async () => {
   const r = recorder();
   const res = await consumeEvents(undefined, r.sink);
-  assert.deepEqual(res, { completed: false, failed: null, timedOut: false });
+  assert.deepEqual(res, { completed: false, failed: null, timedOut: false, stalled: false });
 });
 
 console.log("devops_chat: 现网实测形状（2026-08-27 三个显示 bug 的回归）");
@@ -325,8 +325,11 @@ await t("过期 executionId 只在还没吐字时重试一次（否则会重复�
   // 判据从 `!sink.reply` 改成"与 prelude 相比没变"：/skill 读失败时我们会先往气泡里写一句
   // ⚠️ 提示，那之后 sink.reply 就不为空了 —— 沿用 `!sink.reply` 会把这唯一一次合法重试
   // 也一起废掉（客户拿到的是"会话过期"而不是答案）。
+  // 2026-09-09：这三个条件被抽成了 `canReopen()`（因为现在有两个触发源 —— 抛异常，以及
+  // 事件流里的 `responseFailed`/只有心跳），判据随之搬到 canReopen 上，语义一字未改。
   assert.match(SRC, /const prelude = sink\.reply;/);
-  assert.match(SRC, /const stale = reused && sink\.reply === prelude && STALE_RE\.test/);
+  assert.match(SRC, /const canReopen = \(\) => reused && !retried && sink\.reply === prelude;/);
+  assert.match(SRC, /const stale = canReopen\(\) && STALE_RE\.test/);
 });
 
 await t("BFF 三条 DevOps 路径互斥，且老客户端不传字段时永不进新分支", () => {
@@ -351,6 +354,65 @@ await t("BFF 三条 DevOps 路径互斥，且老客户端不传字段时永不�
   // 这里硬编码任何模型名/来源名。
   assert.match(idx, /via: objDevops && !escalateFallback \? "devops-agent" :/);
   assert.match(idx, /via: objDevops && !escalateFallback \? "devops-agent" : \(agentVia \|\| undefined\)/);
+});
+
+/* ─────────── 卡死的 execution：判得出来、且不许把坏 id 留在库里 ───────────
+ * 2026-09-08 现网（IM 侧先发现，Web 走的是同一份逻辑的 JS 孪生实现）：某个 executionId 被
+ * 上游弄死之后，之后每次 SendMessage 都只回 `responseCreated` + 每 ~15s 一个 `heartbeat`，
+ * 永远不出内容。而坏 id 一直躺在会话行里 → 一个会话坏一次就永久坏。
+ */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+await t("只有心跳 → 判定这条 execution 卡死（stalled），且不谎报成超时", async () => {
+  const r = recorder();
+  async function* wedged() {
+    yield { responseCreated: {} };
+    for (let i = 0; i < 5; i++) { await sleep(20); yield { heartbeat: {} }; }
+  }
+  const res = await consumeEvents(wedged(), r.sink, { stallSec: 0.05 });
+  assert.equal(res.stalled, true);
+  assert.equal(res.completed, false);
+  assert.equal(res.failed, null);
+  // 卡死 ≠ 墙钟超时：超时那句文案是"先返回已生成的部分"，可这里一个字都没有。
+  assert.equal(res.timedOut, false);
+  assert.equal(r.sink.reply, "");
+});
+
+await t("心跳 payload 是空对象也要能判出卡死（按 key 判，不按真假值）", async () => {
+  // Python 孪生实现里空 dict 是 falsy —— 一旦按真假值判，每个心跳都算"有进展"，
+  // 卡死判定在现网永远不会触发。两边都必须按 key 判，这里把 JS 侧钉住。
+  assert.match(SRC, /!\("responseCreated" in ev \|\| "heartbeat" in ev\)/);
+  assert.match(SRC, /if \("heartbeat" in ev\) continue;/);
+});
+
+await t("真干活时的长时间安静不算卡死（否则会掐掉正常的深度调查）", async () => {
+  const r = recorder();
+  async function* busy() {
+    yield { responseCreated: {} };
+    yield { contentBlockStart: { index: 0, type: "tool_summary" } };   // 实质事件
+    for (let i = 0; i < 5; i++) { await sleep(20); yield { heartbeat: {} }; }
+    yield { contentBlockStart: { index: 1, type: "text" } };
+    yield textDelta(1, "查完了。");
+    yield { responseCompleted: {} };
+  }
+  const res = await consumeEvents(busy(), r.sink, { stallSec: 0.05 });
+  assert.equal(res.stalled, false);
+  assert.equal(res.completed, true);
+  assert.equal(r.sink.reply, "查完了。");
+});
+
+await t("失败/卡死的一轮必须删掉会话行，并承诺「再问一次」真的有用", async () => {
+  // 源码断言：这一段要跑通得连 AWS（CreateChat/SendMessage）。这里要防的是"改回去"——
+  // 判失败之后仍然把坏 executionId 留在 dachat 行里，用户重问一百次得到同一个错误。
+  assert.match(SRC, /import \{ getDevopsChatSession, setDevopsChatSession, clearDevopsChatSession \}/);
+  assert.match(SRC, /if \(res\.failed \|\| res\.stalled\) \{/);
+  assert.match(SRC, /await clearDevopsChatSession\(conversationId\)/);
+  // 自愈的触发源必须包含"事件流没抛异常但这一轮判失败/只有心跳"这两种 —— 修复前只有 except。
+  assert.match(SRC, /if \(\(res\.failed \|\| res\.stalled\) && canReopen\(\)\)/);
+  // 只在还没吐字、且是复用来的 execution 上重试（吐过再重来 = 用户看到两遍开头）。
+  assert.match(SRC, /const canReopen = \(\) => reused && !retried && sink\.reply === prelude;/);
+  assert.ok(SRC.includes("直接再问一次"), "中文文案必须明确说「直接再问一次」");
+  assert.ok(SRC.includes("just ask again"), "英文文案必须明确说 just ask again");
 });
 
 console.log(fails ? `\nFAILED: ${fails}` : `\nPASSED: ${ok} ok, 0 failed`);

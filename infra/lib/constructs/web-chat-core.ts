@@ -105,6 +105,25 @@ export interface WebChatCoreProps {
     organizationId: string;
     /** 「客户选了多账号」那个 `CfnCondition` 的逻辑 ID。 */
     conditionLogicalId: string;
+    /**
+     * service-managed StackSet 调用要带的 `CallAs`：`SELF`（组织管理账号自部署）或
+     * `DELEGATED_ADMIN`（从 linked account 部署，且该账号已注册为 StackSets 委派管理员）。
+     *
+     * 这里传的是 **CFN token**（PreflightFn 那个自定义资源的 `Fn::GetAtt CallAs`）——
+     * synth 期无从得知客户用的是哪种账号，只有部署期的 preflight 探测得出来。
+     * setup.sh 路径不传这个，走下面的 `-c stackSetCallAs=`（脚本部署前自己探测）。
+     */
+    stackSetCallAs?: string;
+    /**
+     * 组织管理账号号。同样是 **CFN token**（PreflightFn 的 `Fn::GetAtt ManagementAccountId`）。
+     *
+     * BFF 运行时要它来拦「把管理账号作为一键接入目标」：CFN 不会把 stack 部署到管理账号，
+     * 那个调用会**返回成功**而目标账号里什么都不建（见 `member_accounts.mjs` 的
+     * `assertStackSetTargetable`）。管理账号自部署时这条路走不到（部署账号本身被排除），
+     * 只有委派管理员部署时管理账号才会出现在列表里。
+     * setup.sh 路径走 `-c orgManagementAccountId=`。
+     */
+    orgManagementAccountId?: string;
   };
 
   /**
@@ -181,6 +200,20 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   // 「这份部署有可能是多账号」——静态模板里恒为真（选没选由部署期条件决定），
   // CDK 路径下等于 orgMode。只用来决定**授权**给不给（见下方 IAM 段的理由）。
   const mayBeOrgMode = orgMode || props.multiAccount !== undefined;
+
+  // service-managed StackSet 的 `CallAs`。一键部署由 PreflightFn 部署期探测后经
+  // `props.multiAccount.stackSetCallAs`（GetAtt token）传进来；setup.sh 路径在 `cdk deploy`
+  // **之前**自己探测，经 `-c stackSetCallAs=` 传进来。两条路径都缺省 `SELF`，也就是
+  // 「组织管理账号自部署」—— 本改动之前唯一支持的形态，所以缺省值保证不回归。
+  const stackSetCallAs =
+    props.multiAccount?.stackSetCallAs
+    ?? ((scope.node.tryGetContext("stackSetCallAs") as string | undefined)?.trim() || "SELF");
+  // 组织管理账号号。同上两条路径；缺省空串 = 不拦（与本改动前逐字一致）。
+  // ⚠️ 缺省**必须**是空串而不是 `stack.account`：单账号 / 老部署里拿部署账号去当管理账号，
+  //    会把「部署账号自己」误判成不可一键接入 —— 而它本来就不在列表里，纯属自找的假警报。
+  const orgManagementAccountId =
+    props.multiAccount?.orgManagementAccountId
+    ?? ((scope.node.tryGetContext("orgManagementAccountId") as string | undefined)?.trim() || "");
 
   // ─── DynamoDB：会话/消息单表（§4.3）───
   const table = new dynamodb.Table(scope, "WebChatTable", {
@@ -274,6 +307,15 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       MEMBER_ONBOARDING_STACKSET_NAME: orgSwitch("notiops-member-onboarding", ""),
       NOTIOPS_MEMBER_ROLE_NAME: orgSwitch(`notiops-idle-detection-role-${stack.account}`, ""),
       MEMBER_DA_STACKSET_NAME: orgSwitch("notiops-member-devops-agent", ""),
+      // 一键接入要带的 `CallAs`（SELF / DELEGATED_ADMIN）。**每一个** StackSet 调用都得带，
+      // 漏一处就在那一处 AccessDenied 或「StackSet 不存在」（委派管理员看不见不带 CallAs
+      // 的那个命名空间）。单账号留空 —— 那条路径根本不调 StackSet。
+      STACKSET_CALL_AS: orgSwitch(stackSetCallAs, ""),
+      // 组织管理账号号。BFF 用它拦「一键接入管理账号」—— CFN 不会把 stack 部署到管理账号，
+      // 那个调用会**返回成功**而目标账号里什么都不建（假成功比报错难查得多）。
+      // 只有委派管理员部署时管理账号才会出现在列表里；管理账号自部署时它就是部署账号、
+      // 本来就被排除，所以那条路径下这个值只是冗余的一致性信息。
+      ORG_MANAGEMENT_ACCOUNT_ID: orgSwitch(orgManagementAccountId, ""),
       ORGANIZATION_ID: orgSwitch(props.multiAccount?.organizationId ?? organizationId, ""),
       // Skills 存共享数据桶的 skills/ 前缀（与 IM 端共享）；缺省时 BFF skills 路由会报未配置
       SKILLS_BUCKET: props.skillsBucketName ?? "",
@@ -523,24 +565,34 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
     }),
   );
 
-  // Admin「通知」板块：读写飞书机器人配置（Secrets Manager 单 secret）。
-  // 按**字面名**限定到 notiops/im-bot-feishu*（Secrets Manager ARN 带随机后缀故加 *），
+  // Admin「通知」板块：读写 IM 机器人配置（每个平台一个 Secrets Manager secret）。
+  // 按**字面名**限定到 notiops/im-bot-*（Secrets Manager ARN 带随机后缀故加 *），
   // 不做跨栈 CFN import —— 老管理前端未来 sunset 时本栈零依赖、零影响。
   // CreateSecret 用于 secret 尚不存在的首次配置场景（如未部署过 IM bot 栈）。
+  //
+  // ⚠️ 加平台必须在这两条里各补一行（飞书 = bff/web-chat/feishu_config.mjs，
+  //    钉钉 = dingtalk_config.mjs）。漏了的症状**不是 403 页面**：GET 那条路整页 500
+  //    （index.mjs 里刻意用 Promise.all 而不是 allSettled —— 宁可整页报错，也不要画出一个
+  //    "该平台未配置"的假象让客户去重填一份已经填好的凭证）。
+  // 逐个字面名列出、不用 `notiops/im-bot-*` 一条通配盖住：将来若有别的组件也叫
+  // `notiops/im-bot-...`，通配会把它一起交给 BFF 改写。
+  const imBotSecretArns = ["feishu", "dingtalk"].map(
+    (p) => `arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:notiops/im-bot-${p}*`,
+  );
   bff.addToRolePolicy(
     new iam.PolicyStatement({
       actions: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:UpdateSecret"],
-      resources: [`arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:notiops/im-bot-feishu*`],
+      resources: imBotSecretArns,
     }),
   );
   bff.addToRolePolicy(
     new iam.PolicyStatement({
       actions: ["secretsmanager:CreateSecret"],
-      resources: [`arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:notiops/im-bot-feishu*`],
+      resources: imBotSecretArns,
     }),
   );
 
-  // Admin「集成 IM」抽屉里显示飞书 webhook 地址：按名字查 IM 入口 HTTP API
+  // Admin「集成 IM」抽屉里显示各平台的 webhook 地址：按名字查 IM 入口 HTTP API
   //（IM_INGRESS_API_NAME_PREFIX，见上面 env 那段）。
   // `apigateway:GET` 是 API Gateway 控制面的**只读**动作（对应 GetApis），改不了任何东西。
   // ⚠️ 资源 ARN 的形状是 `arn:aws:apigateway:<region>::/apis` —— **账号段是空的**，
@@ -1167,22 +1219,9 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
     }),
   );
 
-  // Admin「通知」板块：读写飞书机器人配置（Secrets Manager 单 secret）。
-  // 按**字面名**限定到 notiops/im-bot-feishu*（Secrets Manager ARN 带随机后缀故加 *），
-  // 不做跨栈 CFN import —— 老管理前端未来 sunset 时本栈零依赖、零影响。
-  // CreateSecret 用于 secret 尚不存在的首次配置场景（如未部署过 IM bot 栈）。
-  bff.addToRolePolicy(
-    new iam.PolicyStatement({
-      actions: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:UpdateSecret"],
-      resources: [`arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:notiops/im-bot-feishu*`],
-    }),
-  );
-  bff.addToRolePolicy(
-    new iam.PolicyStatement({
-      actions: ["secretsmanager:CreateSecret"],
-      resources: [`arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:notiops/im-bot-feishu*`],
-    }),
-  );
+  // （IM 机器人配置的 Secrets Manager 权限在上面 `imBotSecretArns` 那两条 ——
+  //   这里原来有一份**逐字重复**的拷贝，同一个角色加了两遍同样的语句。2026-09-08 删掉：
+  //   两份并存的真实风险是加平台时只改一处，而 IAM 漏权的症状是整页 500，不是 403。）
 
   // BFF 读 AWS Health Dashboard（通知主题重点区块，实时查）。Health API 只读，
   // 不支持资源级限定（只能 *）；需账号有 Business+/Enterprise Support 计划。

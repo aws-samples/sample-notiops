@@ -369,6 +369,35 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "⚠️ 调查失败 · 用时 {seconds} 秒",
         "en": "⚠️ Investigation failed · {seconds}s",
     },
+    # ⚠️ 上面三条**不带秒表**的那一份 —— 给不会原地刷新的平台（钉钉）用，理由与
+    # `im.chat.thinking_title.noclock` 逐字相同：那条消息发出去就定格，而这条路径
+    # （`platforms/common/inv_status.py` 的状态回读）压根没有 `elapsed` 可传 ⇒ 渲染
+    # 出来是「调查中 · 已用时 0 秒」/「调查已完成 · 用时 0 秒」。0 秒不是"少给信息"，
+    # 是**假信息**：一次跑了 6 分钟的调查在用户眼里成了 0 秒。
+    # 2026-09-09 现网原话：「在钉钉里，『已用时 0 秒』这个就不需要了」。
+    # 消费方只有 `platforms/dingtalk/dt_messages._DISPATCH_TITLES_NOCLOCK`；飞书 /
+    # Slack 的进度卡每分钟被 PATCH 一次，那两家的秒数是真话，**不许**用这三条。
+    # ⚠️ 这三条同样**不许带方向词**（「见下方」/「见上方」/「below」…）—— 口径与下面
+    # 报告文案那条注释一致。理由更硬：这条消息发出去就定格，方向指错了永远改不回来。
+    "progress.investigating.noclock": {
+        "zh": "🔍 调查中",
+        "en": "🔍 Investigating",
+    },
+    # ⚠️ 这一条比"去掉秒表"还多丢一句：`progress.completed` 结尾的「· 报告见下方」在
+    # 这条路上**也是假话**。三条 noclock 的唯一消费方是钉钉的 `dispatch_text`，而
+    # `dispatch_text` 只有两个调用点（`platforms/dingtalk/caps.py` 的 267 / 342），
+    # `done` / `failed` 只可能来自 342 那个**状态回读** —— 它的正文是
+    # `inv_status.body()`（标题 + 状态 + 最近几条过程行），底下没有报告，只有一个控制台
+    # 链接。报告是调查完成时由 `shared/report_delivery/dingtalk_sender.py` **另发**的一条
+    # 推送，不在这条消息"下方"。所以这里只说"完成了"。
+    "progress.completed.noclock": {
+        "zh": "✅ 调查已完成",
+        "en": "✅ Investigation completed",
+    },
+    "progress.failed.noclock": {
+        "zh": "⚠️ 调查失败",
+        "en": "⚠️ Investigation failed",
+    },
     "progress.summary": {
         "zh": "📊 进度概要",
         "en": "📊 Progress summary",
@@ -3397,94 +3426,102 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "🤔 思考中 · 已用时 {seconds} 秒",
         "en": "🤔 Thinking · {seconds}s elapsed",
     },
+    # ⚠️ 不带秒表的那一份 —— 给**不会原地刷新**的平台用（钉钉，见
+    # `platforms/dingtalk/dt_messages._ANSWER_TITLES_NOCLOCK`）。一条永远不会重绘的消息上写
+    # 「已用时 0 秒」，用户看到的就是一个卡死在 0 的计时器：它不是"信息少一点"，
+    # 是**假信息**（2026-09-08 现网反馈原话：「如果不会自动刷新，也没有意义」）。
+    # 追加式进度的第二、三条消息有真实秒数，那几条照样用上面带秒表的那一份。
+    "im.chat.thinking_title.noclock": {
+        "zh": "🤔 思考中",
+        "en": "🤔 Thinking",
+    },
     # 开场话有 5 种说法，按消息 id 确定性选一条 —— 见 platforms/common/ack_variants.py
     # （那里也解释了为什么是"确定性"而不是 random，以及为什么「NotiOps」那三个字不在
     # 我们手里）。客户反馈原话：「机制很好，但文案生硬」—— 每问一次就一字不差地重复
     # 同一句，问到第十次就像在跟一台自动应答机说话。
     #
-    # ⚠️ 五条都**必须**留着那句「不用重复发问 / no need to ask again」和「这张卡片 /
-    # this card」。这不是客套：它是唯一拦住用户重复发问的东西，而重复发问会撞上 §3.22
-    # 的会话排队 —— 把自己排到自己后面，越急越慢。`tests/test_im_ack_variants.py` 用
-    # 断言钉住这条不变量，加第六条时漏了那句话测试会挂。
+    # ── 一条开场话 = 开场句（5 种说法 × 2 个 agent）+ 去处句（按平台 2 种）─────────
+    # 2026-09-08 现网反馈：钉钉上"过程和结论会更新在这张卡片上"是**假的** —— 钉钉拿不到
+    # 消息 id，没法原地刷新，答案是**另发一条新消息**（见 platforms/dingtalk/caps.py
+    # 文件头）。原来那句承诺写在 10 条文案里各写一遍，于是"哪个平台说哪句话"这件事
+    # 无处可改。现在拆开：开场句只管语气（这才是"新鲜感"的来源），去处句
+    # `im.chat.ack_tail.*` 只管"答案会出现在哪"，由
+    # `platforms/common/ack_variants.ack_body(platform=...)` 拼起来。
+    #
+    # ⚠️ 拼出来的整句**必须**留着那句「不用重复发问 / no need to ask again」——
+    # 它不是客套：它是唯一拦住用户重复发问的东西，而重复发问会撞上 §3.22 的会话排队
+    # （把自己排到自己后面，越急越慢）。那句话现在只在**去处句**里，所以
+    # `tests/test_im_ack_variants.py` 断言的是**拼接结果**，不是单条 key。
     #
     # ⚠️ 也别在这里引入 `{占位符}`：`t()` 的 `format()` 包在 `except KeyError` 里，
-    # 少传一个 kwarg 不会报错，会把 `{opener}` 原样发给客户。宁可 5 份尾句重复。
+    # 少传一个 kwarg 不会报错，会把 `{opener}` 原样发给客户。
     "im.chat.ack_body.1": {
-        "zh": "已收到，正在让 DevOps Agent 分析。复杂问题可能要跑几分钟，"
-              "过程和结论都会**更新到这张卡片**上，不用重复发问。",
+        "zh": "已收到，正在让 DevOps Agent 分析。复杂问题可能要跑几分钟。",
         "en": "Got it — the DevOps Agent is working on this. Complex questions "
-              "can take a few minutes; progress and the answer will both "
-              "**update in this card**, so no need to ask again.",
+              "can take a few minutes.",
     },
     "im.chat.ack_body.2": {
-        "zh": "收到，DevOps Agent 已经开始查了。复杂一点的问题要跑几分钟，"
-              "查到哪一步、结论是什么，都会**写在这张卡片**里，不用重复发问。",
+        "zh": "收到，DevOps Agent 已经开始查了。复杂一点的问题要跑几分钟。",
         "en": "On it — the DevOps Agent has started digging. Anything "
-              "non-trivial takes a few minutes; each step and the final answer "
-              "land **in this card**, so no need to ask again.",
+              "non-trivial takes a few minutes.",
     },
     "im.chat.ack_body.3": {
-        "zh": "这个问题交给 DevOps Agent 了，正在翻数据。可能要等几分钟，"
-              "中间的进展和最后的结论都会**刷到这张卡片**上，不用重复发问。",
+        "zh": "这个问题交给 DevOps Agent 了，正在翻数据。可能要等几分钟。",
         "en": "Handed this to the DevOps Agent — it is pulling the data now. "
-              "This can take a few minutes; progress and the final answer both "
-              "refresh **in this card**, so no need to ask again.",
+              "This can take a few minutes.",
     },
     "im.chat.ack_body.4": {
-        "zh": "好，DevOps Agent 接手了。查得细的时候会慢一点，"
-              "但每一步都会**同步到这张卡片**，结论也在这里，不用重复发问。",
+        "zh": "好，DevOps Agent 接手了。查得细的时候会慢一点，可能要几分钟。",
         "en": "Sure — the DevOps Agent has picked this up. A thorough look "
-              "takes a bit longer, but every step syncs **into this card** and "
-              "the answer lands here too, so no need to ask again.",
+              "takes a bit longer, maybe a few minutes.",
     },
     "im.chat.ack_body.5": {
-        "zh": "收到了，正在查。DevOps Agent 挖得深一些需要几分钟，"
-              "过程和结论会一起**更新在这张卡片**上，不用重复发问。",
+        "zh": "收到了，正在查。DevOps Agent 挖得深一些需要几分钟。",
         "en": "Got it, looking into this now. A deeper dig by the DevOps Agent "
-              "needs a few minutes; progress and conclusion both **update in "
-              "this card**, so no need to ask again.",
+              "needs a few minutes.",
     },
-    # 同样 5 条，给 `/agent notiops` 那条路 —— 只换了 agent 的名字，其余口径（那句
-    # 「不用重复发问」「这张卡片」、不带 `{占位符}`）与上面 5 条**逐字同规矩**，
-    # `tests/test_im_ack_variants.py` 对两套 key 都跑同一批断言。
+    # 同样 5 条，给 `/agent notiops` 那条路 —— 只换了 agent 的名字。
     #
     # 为什么不共用一套中性文案：默认那条路是"直连你自己的 DevOps Agent"，这条是"我们
     # 的 NotiOps Agent 在花你的 token"。把名字含糊掉，用户就分不清这一轮到底谁在答、
     # 花没花钱 —— 而这正是 `/agent` 这个开关存在的意义。
     "im.chat.ack_body.notiops.1": {
-        "zh": "已收到，正在让 NotiOps Agent 分析。复杂问题可能要跑几分钟，"
-              "过程和结论都会**更新到这张卡片**上，不用重复发问。",
+        "zh": "已收到，正在让 NotiOps Agent 分析。复杂问题可能要跑几分钟。",
         "en": "Got it — the NotiOps Agent is working on this. Complex questions "
-              "can take a few minutes; progress and the answer will both "
-              "**update in this card**, so no need to ask again.",
+              "can take a few minutes.",
     },
     "im.chat.ack_body.notiops.2": {
-        "zh": "收到，NotiOps Agent 已经开始查了。复杂一点的问题要跑几分钟，"
-              "查到哪一步、结论是什么，都会**写在这张卡片**里，不用重复发问。",
+        "zh": "收到，NotiOps Agent 已经开始查了。复杂一点的问题要跑几分钟。",
         "en": "On it — the NotiOps Agent has started digging. Anything "
-              "non-trivial takes a few minutes; each step and the final answer "
-              "land **in this card**, so no need to ask again.",
+              "non-trivial takes a few minutes.",
     },
     "im.chat.ack_body.notiops.3": {
-        "zh": "这个问题交给 NotiOps Agent 了，正在翻数据。可能要等几分钟，"
-              "中间的进展和最后的结论都会**刷到这张卡片**上，不用重复发问。",
+        "zh": "这个问题交给 NotiOps Agent 了，正在翻数据。可能要等几分钟。",
         "en": "Handed this to the NotiOps Agent — it is pulling the data now. "
-              "This can take a few minutes; progress and the final answer both "
-              "refresh **in this card**, so no need to ask again.",
+              "This can take a few minutes.",
     },
     "im.chat.ack_body.notiops.4": {
-        "zh": "好，NotiOps Agent 接手了。查得细的时候会慢一点，"
-              "但每一步都会**同步到这张卡片**，结论也在这里，不用重复发问。",
+        "zh": "好，NotiOps Agent 接手了。查得细的时候会慢一点，可能要几分钟。",
         "en": "Sure — the NotiOps Agent has picked this up. A thorough look "
-              "takes a bit longer, but every step syncs **into this card** and "
-              "the answer lands here too, so no need to ask again.",
+              "takes a bit longer, maybe a few minutes.",
     },
     "im.chat.ack_body.notiops.5": {
-        "zh": "收到了，正在查。NotiOps Agent 挖得深一些需要几分钟，"
-              "过程和结论会一起**更新在这张卡片**上，不用重复发问。",
+        "zh": "收到了，正在查。NotiOps Agent 挖得深一些需要几分钟。",
         "en": "Got it, looking into this now. A deeper dig by the NotiOps Agent "
-              "needs a few minutes; progress and conclusion both **update in "
-              "this card**, so no need to ask again.",
+              "needs a few minutes.",
+    },
+    # 去处句 —— 飞书 / Slack：同一张卡原地刷新。
+    "im.chat.ack_tail.card": {
+        "zh": "过程和结论都会**更新到这张卡片**上，不用重复发问。",
+        "en": "Progress and the answer both **update in this card**, so no need "
+              "to ask again.",
+    },
+    # 去处句 —— 钉钉：追加式（拿不到消息 id，改不了已发出的消息）。文案里不点平台
+    # 名字：判断"要不要用这一份"的是调用方，不是文案。
+    "im.chat.ack_tail.append": {
+        "zh": "过程和结论会**另发新消息**贴出来，不用重复发问。",
+        "en": "Progress and the answer arrive as **new messages** here, so no "
+              "need to ask again.",
     },
     "im.chat.steps_title": {
         "zh": "**过程**",
@@ -3524,6 +3561,11 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "⏳ 排队中 · 已等 {seconds} 秒",
         "en": "⏳ Queued · waiting {seconds}s",
     },
+    #: 不带秒表的那一份，理由同 `im.chat.thinking_title.noclock`。
+    "im.chat.queued_title.noclock": {
+        "zh": "⏳ 排队中",
+        "en": "⏳ Queued",
+    },
     "im.chat.queued_body": {
         "zh": "已收到。这个会话里前一个问题**还在跑**（同一个会话一次只跑一个，"
               "并发会互相拖慢），你排在它后面。轮到你时这张卡片会自己变成"
@@ -3532,6 +3574,18 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
               "running** — one at a time per conversation, since running them "
               "concurrently makes both slower. This card will switch to "
               "'Thinking' when your turn starts, so no need to ask again.",
+    },
+    # 同一句话的「追加式」版本 —— 给不会原地刷新的平台（钉钉）。选哪一份由
+    # `platforms/common/ack_variants.queued_body(platform=...)` 决定，三端共用那个入口。
+    # 上面那一份承诺"这张卡片会自己变成「思考中」"，在钉钉上是**不会发生的事**。
+    "im.chat.queued_body.append": {
+        "zh": "已收到。这个会话里前一个问题**还在跑**（同一个会话一次只跑一个，"
+              "并发会互相拖慢），你排在它后面。轮到你时我会**另发一条消息**说"
+              "「思考中」，不用重复发问。",
+        "en": "Got it. The previous question in this conversation is **still "
+              "running** — one at a time per conversation, since running them "
+              "concurrently makes both slower. When your turn starts I will send "
+              "**a new message** saying 'Thinking', so no need to ask again.",
     },
     "im.chat.queue_timeout": {
         "zh": "⚠️ 这个会话里前一个问题跑得比预期久，你这个问题**没能开始**。"
@@ -3633,6 +3687,168 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
               "conversation, it may have been recalled, or it may contain only "
               "images/files with no text). I'll answer based on your message alone "
               "— paste the key content here if it matters.",
+    },
+
+    # ── 钉钉专属（`im.dt.*`）────────────────────────────────────────────────
+    # 只有这几条：钉钉的差异不在「文案」，而在「没有按钮回调」。飞书/Slack 靠卡片
+    # 按钮完成的「确认 → 执行」，钉钉只能靠**用户回一句话**，所以需要一批
+    # 别的平台完全没有的提示文案。凡是两家已经有的（`case.*` / `progress.*` /
+    # `im.chat.*`）一律**复用原 key**，不在这里重写一份 —— 三边文案漂移是 IM 侧
+    # 最容易复发的一类 bug。差异清单见 `platforms/dingtalk/caps.py` 的文件头。
+    # ⚠️ 这条**不能带 `{seconds}`**：它是 `platforms/dingtalk/append_progress.py`
+    # 的 `ack` —— 一个**发一次就定死**的字符串，追加式进度靠"改标题"而不是"改正文"
+    # 来体现用时（标题走 `im.chat.thinking_title`，那条才有 `{seconds}`）。正文里写
+    # 死一个秒数会在 120s / 360s 的两次追加里显示同一个过时数字，比不显示更糟。
+    "im.dt.progress.still_running": {
+        "zh": "⏳ 还在查。查完会在这个会话里直接给结果，不用重复发问。",
+        "en": "⏳ Still working. The answer will land in this conversation — no "
+              "need to ask again.",
+    },
+    # 深度调查的诚实声明。飞书/Slack 的调查卡会**原地刷新**成进度条；钉钉的消息发出
+    # 去就改不了了（§4.4），所以必须说清"这里不会自己更新"，否则用户会盯着一条静态
+    # 消息等半小时。报告投递是另一条路（`shared/report_delivery`），那条**能**回来。
+    "im.dt.investigate.no_live_progress": {
+        "zh": "\n\nℹ️ 钉钉的消息发出后无法原地刷新，所以**这条不会自动更新**。"
+              "报告跑完会自动投回这个会话；想看中间进展就再问一次"
+              "「调查进展」。",
+        "en": "\n\nℹ️ DingTalk messages can't be edited after sending, so **this "
+              "one won't update itself**. The finished report will be delivered "
+              "back to this conversation; ask again for progress any time.",
+    },
+    "im.dt.investigate.snapshot_only": {
+        "zh": "\n\nℹ️ 以上是此刻的快照，不会自动刷新 —— 再问一次就是最新的。",
+        "en": "\n\nℹ️ That's a snapshot from just now and won't refresh — ask "
+              "again for the latest.",
+    },
+    # 开案例的「草稿 → 确认」两段式。钉钉没有表单弹窗，所以草稿就是一条消息，
+    # 确认就是用户回一句「确认」。
+    "im.dt.case.draft_title": {
+        "zh": "确认开 AWS Support 案例",
+        "en": "Confirm: open an AWS Support case",
+    },
+    "im.dt.case.draft_body": {
+        "zh": "**主题** · {subject}\n"
+              "**严重等级** · {severity}\n"
+              "**语言** · {language}\n\n"
+              "**问题描述**\n{body}",
+        "en": "**Subject** · {subject}\n"
+              "**Severity** · {severity}\n"
+              "**Language** · {language}\n\n"
+              "**Problem**\n{body}",
+    },
+    # ⚠️ 例句里**必须**是 `开案例 <描述>` 而不是 `/案例 <描述>`：`案例` 是
+    # `core.nl_router._CASE_CMD_PATTERNS` 里的 bare 形式，后面没有 ≥6 位案例号就落到
+    # `case_list`（列最近的案例），**不会**开案例。三处 `im.dt.case.*` 例句同此口径。
+    "im.dt.case.draft_hint": {
+        "zh": "回复 **确认** 就按上面开案例，回复 **取消** 放弃。30 分钟内有效。\n"
+              "想改参数就重发一次，例如："
+              "`开案例 RDS 连接数暴涨 severity=high language=en`。",
+        "en": "Reply **confirm** to open it as shown, or **cancel** to drop it. "
+              "Valid for 30 minutes.\nTo change anything, just send it again, e.g. "
+              "`open case RDS connections spiking severity=high language=en`.",
+    },
+    # 确认到了但草稿已经过期（30 分钟 TTL）。**必须说清是过期**，不能静默当没听见 ——
+    # 用户会以为案例已经开了。
+    "im.dt.case.draft_expired": {
+        "zh": "⚠️ 没有待确认的操作（可能已超过 30 分钟）。请重新发起，例如 "
+              "`开案例 <一句话描述>`。",
+        "en": "⚠️ Nothing pending to confirm (it may have expired after 30 "
+              "minutes). Start again, e.g. `open case <one-line description>`.",
+    },
+    "im.dt.case.cancelled": {
+        "zh": "已取消，什么都没做。",
+        "en": "Cancelled — nothing was done.",
+    },
+    # ⚠️ 这几行是**动词+名词一个词**的形式（`查看案例` / `关闭案例`…），不是
+    # 「`/案例` + 子命令词」——后者根本不解析子命令：`/案例 关闭 1234567890` 落到
+    # bare `案例` 上，带了案例号就当**查看**，`关闭` 那个词被丢掉；`/案例 回复 <号> <正文>`
+    # 同样退化成查看，正文一起丢。真正的判据是 `core.nl_router._CASE_CMD_PATTERNS`。
+    "im.dt.case.usage": {
+        "zh": "用法：\n"
+              "· `/案例` —— 列出最近的案例（`/案例 <案例号>` 看详情）\n"
+              "· `开案例 <一句话描述>` —— 开一个新案例（会先给你确认）\n"
+              "· `/查看案例 <案例号>` / `/分析案例 <案例号>`\n"
+              "· `/回复案例 <案例号> <内容>` / `/关闭案例 <案例号>`\n\n"
+              "开案例前可以用 `/account <12 位账号>` 切换目标账号。",
+        "en": "Usage:\n"
+              "· `/case` — list recent cases (`/case <case-id>` for details)\n"
+              "· `open case <one-line description>` — open a new case (you'll confirm first)\n"
+              "· `/view-case <case-id>` / `/analyze-case <case-id>`\n"
+              "· `/reply-case <case-id> <text>` / `/close-case <case-id>`\n\n"
+              "Use `/account <12-digit account>` first to pick the target account.",
+    },
+    # ⚠️ 这里曾经有一条 `im.dt.case.need_description`（"还差一句问题描述，照抄这个例句
+    # 再发一次"）。2026-09-09 **删掉**了：只说「开案例」现在回的是下面那张**案例模版**
+    # （`im.dt.case.form.*`），用户改完整段发回来即可，不再需要"照抄一句话重发"这条
+    # 引导。**别把它加回来** —— 两条同时存在的话，同一个入口会随改动漂移成两种回法。
+    # 用户只给了意图时**依然不许建草稿**（那会在 AWS Support 里留下一个标题和正文都写着
+    # 「开案例」的对外可见案例）；那道闸门现在钉在 `tests/test_im_case_subject_guard.py`。
+    # 用户写了 `severity=huge` 这种认不出的值。**说出来**：静默套用默认值会让
+    # 「我明明选了 urgent」变成一个查不出来的 bug。
+    # ⚠️ 占位符叫 `{field}` 而**不是** `{key}`：`i18n.t(key, locale, **kwargs)` 的第一个
+    # 形参就叫 `key`，写成 `t(..., key=...)` 会 `TypeError: got multiple values for
+    # argument 'key'` —— 这条曾经真的把钉钉的开案例整条打挂（2026-09-09 修）。
+    "im.dt.case.override_ignored": {
+        "zh": "\n\n⚠️ 认不出 `{field}={value}`，这一项用了默认值。",
+        "en": "\n\n⚠️ Couldn't recognize `{field}={value}` — used the default for it.",
+    },
+    # --- 案例模版（复制 → 改 → 发回来）---------------------------------------
+    # 钉钉没有表单弹窗，所以「表单」退化成一张**可复制的纯文本模版**：用户说
+    # 「开案例」→ 回这张模版 → 他改完整段发回来 → 我们解析（`nl_router.parse_case_form`）
+    # → 照旧走确认卡 → 回「确认」才真开单。**全程 0 token**。
+    #
+    # ⚠️ 下面 `label.*` 那六个标签必须能被 `core.nl_router._CASE_FORM_LABELS` 认回来
+    # （那是回填解析的词表）。改了这里就要改那边 ——
+    # `tests/test_dingtalk_case_form.py::test_every_rendered_label_parses_back`
+    # 会逐个把渲染出来的标签喂回解析器，对不上就红。
+    "im.dt.case.form.title": {
+        "zh": "📋 开案例模版",
+        "en": "📋 Case template",
+    },
+    "im.dt.case.form.instruction": {
+        "zh": "复制整段,改完发回来。只有「问题描述」必填,其余根据实际情况进行修改即可。",
+        "en": "Copy the whole block, edit it, send it back. Only "
+              "\"Description\" is required — adjust the rest as needed.",
+    },
+    "im.dt.case.form.label.description": {"zh": "问题描述", "en": "Description"},
+    "im.dt.case.form.label.severity": {"zh": "严重等级", "en": "Severity"},
+    "im.dt.case.form.label.language": {"zh": "语言", "en": "Language"},
+    "im.dt.case.form.label.issue_type": {"zh": "案例类型", "en": "Case type"},
+    "im.dt.case.form.label.service": {"zh": "涉及服务", "en": "Service"},
+    "im.dt.case.form.label.subject": {"zh": "标题", "en": "Subject"},
+    # 语言选项的短名。**故意不用 `LANGUAGE_LABELS`**：那份是 `Chinese / 中文` 这种
+    # 带 ` / ` 的双语标签，而选项之间的分隔符也是 ` / ` —— 拼在一行里数不清哪个
+    # 数字对哪个语言。四个都是本地名（endonym），所以 zh / en 两栏一样。
+    "im.dt.case.form.lang.zh": {"zh": "中文", "en": "中文"},
+    "im.dt.case.form.lang.en": {"zh": "English", "en": "English"},
+    "im.dt.case.form.lang.ja": {"zh": "日本語", "en": "日本語"},
+    "im.dt.case.form.lang.ko": {"zh": "한국어", "en": "한국어"},
+    # 「涉及服务」的 0 号选项 = 不填，让 `core.case_classifier` 自己判。
+    "im.dt.case.form.service_auto": {"zh": "自动判断", "en": "auto-detect"},
+    "im.dt.case.form.service_freeform": {
+        "zh": "清单外直接写名字,如 bedrock / msk / glue",
+        "en": "not listed? just type the name, e.g. bedrock / msk / glue",
+    },
+    # 「标题」留这个词 = 按问题描述自动生成（`nl_router.summarize_case_subject`）。
+    "im.dt.case.form.subject_auto": {"zh": "自动", "en": "auto"},
+    "im.dt.case.form.subject_hint": {
+        "zh": "留「自动」= 按你的描述生成",
+        "en": "leave \"auto\" = generated from your description",
+    },
+    "im.dt.case.form.footer": {
+        "zh": "问题描述可以换行多写几段,都会进案例正文。\n\n"
+              "发回来后我先给你一张确认卡,回「确认」才真的开工单。",
+        "en": "The description can span several lines — all of it goes into the "
+              "case body.\n\n"
+              "Once you send it back I'll show a confirmation card; nothing is "
+              "filed until you reply \"confirm\".",
+    },
+    # 模版收回来了，但「问题描述」还是空的 —— 那一项是唯一必填项。**不建草稿**，
+    # 把模版原样再发一遍（前面加这一句），用户接着改就行。
+    "im.dt.case.form.need_description": {
+        "zh": "⚠️ 模版收到了,但「问题描述」是空的 —— 这一项必填。补上再发一次:",
+        "en": "⚠️ Got the template, but \"Description\" is empty — that one is "
+              "required. Fill it in and send it again:",
     },
 }
 

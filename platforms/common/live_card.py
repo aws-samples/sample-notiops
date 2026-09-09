@@ -132,6 +132,31 @@ def sources_md(sources, locale: str) -> str:
     return i18n.t("im.chat.sources_title", locale) + "\n\n" + "\n".join(items)
 
 
+def console_link(deep_link: str, home: str) -> tuple[str, str]:
+    """深度调查消息底部那个链接 → `(url, label_i18n_key)`。**三个平台共用这一份。**
+
+    为什么要一个共享函数，而不是各家写 `"…open_link" if deep_link else "…open_home"`：
+    那个写法**判错了**。`core.devops_agent.operator_urls()` 在拿不到 `task_id` 时
+    （用户贴的是 `exe-…` 执行 id，`describe_investigation` 就只有 execution_id）
+    让 `deep_link` **回落成 `home`** —— 于是 `deep_link` 非空、标签选成
+    「🔬 查看本次调查」，而 href 其实是 Operator App 首页。用户点进去看到的是一个
+    与本次调查无关的列表页，还以为是自己找错了。
+
+    钉钉上这条错标签**永远改不了**（消息发出去拿不到 id，见
+    `platforms/dingtalk/caps.py` §4.4），所以判据钉在这里而不是各家渲染函数里。
+
+    ⚠️ 不在 `operator_urls()` 里改（让它返回空 `deep_link`）是有意的：那个函数在
+    `agent-build/**` 下有一份**独立副本**（跑在 AgentCore Runtime 里），改它就要连
+    agent 一起重部署，还会立刻产生两份漂移。标签是**消费方**的判断，放在消费方。
+    """
+    url = deep_link or home
+    if not url:
+        return "", ""
+    is_deep = bool(deep_link) and deep_link != home
+    return url, ("progress.btn.open_link" if is_deep
+                 else "progress.btn.open_home")
+
+
 class LiveCard:
     """一条消息的实时刷新器。**永不抛异常** —— 它只是个显示层。
 

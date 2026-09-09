@@ -193,9 +193,9 @@ def dispatch_card(body: str, locale: str, *, deep_link: str = "",
          "content": usage_footer(locale, account=account, deploy=deploy)},
     ]
     actions: list[dict] = []
-    link = deep_link or home
+    # 标签必须与 href 对上 —— 判断在 `live_card.console_link()`（三家共用），见那边注释。
+    link, label = live_card.console_link(deep_link, home)
     if link:
-        label = ("progress.btn.open_link" if deep_link else "progress.btn.open_home")
         actions.append(_url_btn(i18n.t(label, locale), link))
     if actions:
         elements.append({"tag": "action", "actions": actions})

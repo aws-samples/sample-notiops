@@ -308,7 +308,21 @@ def _load_sender(platform: str):
         elif platform == "slack":
             from shared.report_delivery import slack_sender as sender  # type: ignore
         elif platform == "dingtalk":
-            import dingtalk_sender as sender  # type: ignore  # later phase
+            # ⚠️ 三条分支必须都写**完整包路径**。这个 Lambda 的 handler 是
+            # `shared.report_delivery.push_handler.lambda_handler`，asset 根目录是仓库
+            # 根（`infra/lib/notiops-backend-stack.ts` 的 PushHandlerLambda），所以
+            # `sys.path[0]` 是 `/var/task` —— `import dingtalk_sender` 这种裸模块名
+            # **解析不到**（它在 `shared/report_delivery/` 下面）。而
+            # `ModuleNotFoundError` 是 `ImportError` 的子类，下面那个 except 会把它
+            # 降级成一句 warning ⇒ `PUSH_TARGET_PLATFORM=dingtalk` 时**实时事件推送
+            # 的 heads-up 卡**（CloudWatch 告警 / Backup / GuardDuty / 成本异常 /
+            # Trusted Advisor）静默不发，日志里只有一行没人看的 warning，而后面的
+            # DevOps Agent 派发照跑 —— 症状是"报告来了但没人提前打招呼"。
+            # 2026-09-09 的钉钉专项扫描抓到的就是这一条。
+            # 另外两条投递路径不受影响、也别拿它们来验证这个修复：
+            # 巡检广播走 `inspection/adapters/broadcast.py::load_sender`，定时/调查
+            # 报告走 `report_handler._load_sender` —— 那两份一直写的是完整路径。
+            from shared.report_delivery import dingtalk_sender as sender  # type: ignore
     except ImportError as e:
         logger.warning("No sender module for platform=%s: %s", platform, e)
         sender = None

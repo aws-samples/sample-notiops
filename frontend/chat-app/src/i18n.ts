@@ -610,6 +610,10 @@ export const STRINGS: Dict = {
   "admin.tab.lifecycle": { zh: "生命周期", en: "Lifecycle" },
   "admin.tab.notifications": { zh: "集成 IM", en: "IM Integration" },
   "admin.tab.models": { zh: "模型", en: "Models" },
+  // 左侧子导航的分组标题（纵向排版，与「通知」/「定制」一致）
+  "admin.nav.access": { zh: "访问控制", en: "Access control" },
+  "admin.nav.cloud": { zh: "云环境", en: "Cloud environment" },
+  "admin.nav.system": { zh: "系统", en: "System" },
   // ── 模型目录（LLM provider / 候选模型 / 凭证 / 后端任务）──
   "admin.models.title": { zh: "模型目录", en: "Model catalogue" },
   "admin.models.sub": { zh: "勾选的模型就是所有用户在对话里能选到的全部候选;Provider 与凭证不对普通用户开放。保存后长驻实例会在下一条消息生效。", en: "The models you enable here are the only ones users can pick in chat; provider and credentials are never exposed to them. Long-running instances pick up changes on the next message." },
@@ -739,7 +743,9 @@ export const STRINGS: Dict = {
   "admin.models.audit": { zh: "变更记录", en: "Change history" },
   "admin.models.auditEmpty": { zh: "暂无变更记录。", en: "No changes recorded yet." },
   "admin.models.rollback": { zh: "回滚到此前", en: "Roll back to before" },
-  "admin.notif.title": { zh: "飞书机器人", en: "Feishu Bot" },
+  // 这一页从「只有飞书」变成「按平台分页」（2026-09-08 加钉钉），所以标题不再写平台名 ——
+  // 写死「飞书机器人」会让切到钉钉分页的客户以为自己填错了地方。
+  "admin.notif.title": { zh: "IM 机器人", en: "IM Bots" },
   "admin.notif.loading": { zh: "加载中…", en: "Loading…" },
   "admin.notif.secretPh": { zh: "留空或保持 **** 不变则不修改", en: "Leave masked (****) to keep unchanged" },
   "admin.notif.secretHint": { zh: "仅显示后 4 位;输入新值将覆盖。", en: "Only last 4 chars shown; enter a new value to replace." },
@@ -775,6 +781,37 @@ export const STRINGS: Dict = {
   // 空串的三种原因（没装 IM / 名字对不上 / 查询无权限）对客户是同一个动作：去 Outputs 里看。
   // 所以不分开报 —— 分开报要么泄露内部细节,要么让客户面对一个他解决不了的区分。
   "admin.notif.url.missing": { zh: "取不到地址。请到 CloudFormation 控制台 → 你的栈 → Outputs → FeishuWebhookUrl 里复制(只装了 web 的栈没有这一项)。", en: "Could not retrieve the URL. Copy it from the CloudFormation console → your stack → Outputs → FeishuWebhookUrl (a web-only stack has no such output)." },
+
+  /* ── 钉钉 DingTalk（与飞书同一页,顶部切平台）──
+   * 钉钉与飞书有三处**能力差异**,文案里必须说清 ——「不许静默降级」:
+   *   ① 没有 Encrypt Key / Verification Token:验签用的就是 AppSecret 本身,只有一个 Secret 要填;
+   *   ② 保存回调地址时**没有** URL challenge:填错了钉钉不报错,机器人只是永远不回话;
+   *   ③ 没有「往任意群发一条测试消息」的接口:群 id(openConversationId)只能从机器人收到的
+   *      回调里拿。所以「测试」= 验凭证(换一次 access token) + 可选地往自定义机器人推一条。
+   * 这三条都在钉钉开放平台上逐条核实过,后端那一半在 bff/web-chat/dingtalk_config.mjs。 */
+  "admin.notif.platform": { zh: "平台", en: "Platform" },
+  "admin.notif.platform.feishu": { zh: "飞书 / Lark", en: "Feishu / Lark" },
+  "admin.notif.platform.dingtalk": { zh: "钉钉 DingTalk", en: "DingTalk" },
+  "admin.notif.dt.appKeyHint": { zh: "钉钉开放平台 →「应用开发 → 企业内部应用 → 你的应用 → 凭证与基础信息」里的 AppKey。不是凭证(单独拿它换不到 token),所以明文显示,方便你核对填的是哪个应用。", en: "The AppKey from DingTalk Open Platform → App development → Internal app → your app → Credentials & Basic Info. It is not a secret on its own (a token needs both key and secret), so it is shown in full to let you confirm which app you configured." },
+  "admin.notif.dt.secretHint": { zh: "与 AppKey 同一页的 AppSecret。钉钉用它同时做两件事:换 access token、以及校验入站请求的 sign 头 —— 不像 Slack 另有一个签名密钥。仅显示后 4 位。", en: "The AppSecret from that same page. DingTalk uses it for two things at once: fetching access tokens and verifying the inbound `sign` header — unlike Slack there is no separate signing secret. Only last 4 chars shown." },
+  "admin.notif.dt.pushUrl": { zh: "自定义机器人推送地址(可选)", en: "Custom-robot push URL (optional)" },
+  "admin.notif.dt.pushUrlHint": { zh: "只给出方向用:巡检广播、主动通知。群里 @机器人 的问答**不需要**它。形如 https://oapi.dingtalk.com/robot/send?access_token=… —— 这串本身就是凭证(谁拿到都能往那个群发消息),所以只显示后 4 位、只接受这一个地址形态。", en: "Outbound only: inspection broadcasts and proactive notifications. In-chat Q&A does NOT need it. Looks like https://oapi.dingtalk.com/robot/send?access_token=… — that URL IS a credential (anyone holding it can post to that group), so only the last 4 chars are shown and only this exact shape is accepted." },
+  "admin.notif.dt.pushUrlPh": { zh: "留空则不启用主动推送", en: "Leave empty to disable proactive push" },
+  "admin.notif.dt.keysRequired": { zh: "AppKey / AppSecret 是必填项:缺任一,IM 入口会在冷启动时直接失败。钉钉**没有** URL 校验这一步 —— 顺序反了不会当场报错,机器人只是不回话,所以务必先在这里保存,再去钉钉填消息接收地址。", en: "AppKey and AppSecret are both required: if either is empty the IM entry point fails at cold start. DingTalk has NO URL challenge — getting the order wrong raises no error, the robot simply stays silent, so save them here BEFORE setting the callback URL in DingTalk." },
+  "admin.notif.dt.noChatIds": { zh: "钉钉这里没有「推送群组」列表:群里 @机器人 的回复走钉钉回调里带的一次性会话地址(sessionWebhook),不需要登记群 id;主动推送用上面那个自定义机器人地址。", en: "There is no \"target group chats\" list for DingTalk: replies to an @mention use the one-time session webhook carried in DingTalk's own callback, so no chat id needs registering; proactive pushes use the custom-robot URL above." },
+  "admin.notif.dt.test": { zh: "测试凭证", en: "Test credentials" },
+  "admin.notif.dt.testing": { zh: "校验中…", en: "Checking…" },
+  "admin.notif.dt.testTip": { zh: "用 AppKey / AppSecret 换一次 access token(凭证是否正确的权威判据);填了推送地址的话再往那个群发一条", en: "Fetches one access token with the AppKey/AppSecret (the authoritative check); if a push URL is set, also posts one message to that group" },
+  "admin.notif.dt.steps.title": { zh: "在钉钉开放平台要做的四步", en: "Four steps in the DingTalk console" },
+  "admin.notif.dt.steps.s1": { zh: "创建企业内部应用,在「机器人」页开启机器人能力并发布。", en: "Create an internal app, enable the Bot capability on its Robot page, and publish it." },
+  "admin.notif.dt.steps.s2": { zh: "「凭证与基础信息」里复制 AppKey / AppSecret,回到上面保存。", en: "Copy the AppKey and AppSecret from Credentials & Basic Info, then save them above." },
+  "admin.notif.dt.steps.s3": { zh: "机器人 → 消息接收模式:选「HTTP 模式」,消息接收地址填栈输出的 DingtalkWebhookUrl。", en: "Robot → Message receiving mode: pick HTTP mode and set the callback URL to the stack output DingtalkWebhookUrl." },
+  "admin.notif.dt.steps.s4": { zh: "把机器人加进群(群设置 → 智能群助手 → 添加机器人),然后 @机器人 试一句。", en: "Add the robot to a group (Group settings → Group assistant → Add robot), then @mention it once to verify." },
+  "admin.notif.dt.steps.order": { zh: "顺序同样是硬的,但症状更隐蔽:钉钉保存消息接收地址时不做任何校验,填错或没填凭证都不报错 —— 机器人只是安静地不回话。", en: "The order matters here too, but the failure is quieter: DingTalk validates nothing when you save the callback URL, so a wrong URL or missing credentials raise no error — the robot just silently never replies." },
+  "admin.notif.dt.guideTitle": { zh: "配置钉钉机器人", en: "Set up the DingTalk bot" },
+  "admin.notif.dt.guideSub": { zh: "本页保存 AppKey / AppSecret,钉钉控制台开 HTTP 模式并填消息接收地址。两边都做完才通。", en: "AppKey and AppSecret are saved on this page; HTTP mode and the callback URL are set in the DingTalk console. It only works once both are done." },
+  "admin.notif.dt.url.label": { zh: "钉钉消息接收地址(Webhook)", en: "DingTalk callback URL (webhook)" },
+  "admin.notif.dt.url.missing": { zh: "取不到地址。请到 CloudFormation 控制台 → 你的栈 → Outputs → DingtalkWebhookUrl 里复制(没装钉钉的栈没有这一项)。", en: "Could not retrieve the URL. Copy it from the CloudFormation console → your stack → Outputs → DingtalkWebhookUrl (a stack deployed without DingTalk has no such output)." },
   // 🔴 原名「添加组织外账号(跨 Payer)」对一大类客户是**错的**：
   //    partner-resold 客户手里没有 payer 账号、系统部署在某个 linked account
   //    上，他要加的 456 与部署账号 123 **在同一个组织里** —— 只是他没有管理
@@ -1071,6 +1108,23 @@ export const STRINGS: Dict = {
       + "cannot reach it, so those buttons are hidden. To change what is deployed "
       + "there, edit the stack in that account's own CloudFormation console.",
   },
+  // 🔴 组织管理账号：只有「从 StackSets 委派管理员账号部署」时这一行才会出现。
+  //    CloudFormation **不会**把 stack 部署到管理账号（即使它在被 target 的 OU 里），
+  //    所以一键接入按钮对它不渲染 —— 而不渲染必须解释，否则运维看到的是
+  //    「这一行有账号、有区域、没有按钮」，会当成界面坏了。
+  "admin.accounts.mgmtAcct": { zh: "管理账号", en: "Management account" },
+  "admin.accounts.mgmtAcctHint": {
+    zh: "这是本组织的 AWS Organizations 管理账号。CloudFormation StackSets 不会把栈部署到"
+      + "管理账号（即使它在下发范围里），所以一键接入对它不可用，那个按钮不显示。"
+      + "要让 NotiOps 查这个账号：在管理账号里手工部署一次 member-account-onboarding.yaml"
+      + "（参数与本部署一致），然后用下方「手动接入账号」登记它。",
+    en: "This is the AWS Organizations management account. CloudFormation StackSets never "
+      + "deploys a stack to the management account (even when it is in the target scope), "
+      + "so one-click onboarding is unavailable and that button is hidden. To let NotiOps "
+      + "query this account, deploy member-account-onboarding.yaml manually in the "
+      + "management account (same parameters as this deployment), then register it with "
+      + "\"Manual onboarding\" below.",
+  },
   // ⚠️ 提示里必须给**具体步骤**，因为 CloudFormation 的 quick-create 链接
   //    只支持「创建」（官方文档确认没有更新栈的形式），我们给不了一键链接。
   //    也必须覆盖两种读法：旧模板没有那个输出 / 新模板但回填时留空了。
@@ -1110,11 +1164,13 @@ export const STRINGS: Dict = {
     zh: "还没有接入任何账号。用下面的「手动接入账号」加第一个。",
     en: "No accounts onboarded yet. Use Manual onboarding below to add the first one." },
   "admin.accounts.onboardDescRegistered": {
-    zh: "已接入的账号（一键接入与手动接入都列在这里）。一键接入需要组织管理账号"
-      + "权限并以多账号模式部署，当前不可用 —— 用下面的「手动接入账号」逐个加。",
+    zh: "已接入的账号（一键接入与手动接入都列在这里）。一键接入需要以多账号模式"
+      + "部署（组织管理账号，或已注册的 StackSets 委派管理员成员账号），当前不"
+      + "可用 —— 用下面的「手动接入账号」逐个加。",
     en: "Onboarded accounts (both one-click and manual are listed here). One-click "
-      + "onboarding needs management-account permissions and a multi-account "
-      + "deployment, which is not available here - use \"Manual onboarding\" below.",
+      + "onboarding needs a multi-account deployment (the organization management "
+      + "account, or a registered StackSets delegated administrator), which is not "
+      + "available here - use \"Manual onboarding\" below.",
   },
   // 🔴 这个键漏加过一次，页面上直接印出 "admin.accounts.noOneClick" 原文。
   //    `t()` 找不到键就返回键名本身 —— 不抛、不告警，而 scripts/lint_i18n.py
@@ -1130,17 +1186,19 @@ export const STRINGS: Dict = {
     //    infra/member-account-onboarding.yaml」—— 那句**现在是错的**：
     //    采集角色已经合并进 member-devops-agent.yaml，手动接入只部署一个栈，
     //    而且那条路有 UI 入口（下面那个折叠区），不需要人去翻仓库里的 yaml。
-    zh: "一键接入不可用 —— 它要 CloudFormation StackSets，只有组织管理账号"
-      + "（或 StackSets 委派管理员）以多账号模式部署才有。"
-      + "要启用：在组织管理账号上重新部署一次 `./setup.sh --multi-account`。\n"
+    zh: "一键接入不可用 —— 它要 CloudFormation StackSets，只有以**多账号模式**"
+      + "部署才有：要么在**组织管理账号**上，要么在管理账号已注册为 StackSets "
+      + "委派管理员的成员账号上。要启用：在这两类账号之一上重新部署一次 "
+      + "`./setup.sh --multi-account`。\n"
       + "不想动部署的话用下面的「手动接入账号」：生成一条 CloudFormation 链接，"
       + "让账号所有者在自己账号里点一下部署，回填两个值即可 —— "
       + "不需要任何组织权限，也不需要重新部署。",
     en: "One-click onboarding is unavailable - it needs CloudFormation StackSets, "
-      + "which requires a multi-account deployment from the organization "
-      + "management account (or a StackSets delegated admin). "
-      + "To enable it, redeploy with `./setup.sh --multi-account` from the "
-      + "management account.\n"
+      + "which requires a multi-account deployment either from the organization "
+      + "management account or from a member account the management account has "
+      + "registered as a StackSets delegated administrator. "
+      + "To enable it, redeploy with `./setup.sh --multi-account` from one of "
+      + "those accounts.\n"
       + "If you would rather not touch the deployment, use \"Manual onboarding\" "
       + "below: we generate a CloudFormation link, the account owner deploys it in "
       + "their own account, and you paste two values back - no organization "
@@ -1267,7 +1325,8 @@ export const STRINGS: Dict = {
   "admin.users.bulkRemove": { zh: "批量移除", en: "Remove from selected" },
   "admin.users.bulkDone": { zh: "批量完成（{n} 个用户）", en: "Done ({n} users)" },
   "admin.users.selectAll": { zh: "全选（当前筛选）", en: "Select all (filtered)" },
-  "admin.subtitle": { zh: "管理角色、用户、组映射与模块开关", en: "Manage roles, users, group mapping and module toggles" },
+  // 注：原来的 admin.subtitle（「管理角色、用户、组映射与模块开关」）随横向 tab 一起下线 ——
+  // 纵向排版下左侧子导航已经把所有分节列全了，再放一句总述纯属重复；每个分节自带 SectionHead。
   "admin.title": { zh: "管理控制台", en: "Admin Console" },
   "admin.roles.listTitle": { zh: "角色", en: "Roles" },
   "admin.roles.pick": { zh: "从左侧选择一个角色来编辑权限", en: "Select a role on the left to edit its permissions" },

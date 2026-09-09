@@ -14,6 +14,18 @@ Slack 的 `mrkdwn` 子集更小：上面三条同样不认，另外粗体只认*
 （`**x**` 会把星号显示给用户看，见 `platforms/slack/app/blocks.to_mrkdwn`），
 链接必须是 `<url|text>` 而不是 `[text](url)`。
 
+钉钉（2026-09-08 现网截图）跟飞书**同病**，此前这个模块里写反了：
+
+    ✅ `#`~`######` ATX 标题（这一条它比飞书强，所以保留不降级）
+    ✅ `**粗体**` / `*斜体*` / `[text](url)` / 列表 / 反引号
+    ❌ GFM 表格
+    ❌ 段落内的软换行（单个 `\\n`）—— 跟飞书一样糊成一行。`/help` 的八行菜单
+       在现网被渲染成**一整段**，这就是这条口径的来源
+    ❌ 紧凑列表里的换行 —— 比飞书还差一档：飞书的 `- a\\n- b` 是两项，钉钉会糊成
+       一项（现网「过程」那一段的两个步骤被连成一条）
+    ❌ `_下划线斜体_` —— 官方只列 `*斜体*`，下划线**原样显示给用户**
+       （`help.footer` 的 `_其它任何问题…_` 在现网带着两个下划线）
+
 网页控制台不受影响 —— `frontend/chat-app` 用的是 `react-markdown` + `remark-gfm`，
 标题和表格都渲染得了。**这是纯渲染层问题，不要去改 agent 的输出。**
 
@@ -22,14 +34,21 @@ Slack 的 `mrkdwn` 子集更小：上面三条同样不认，另外粗体只认*
 Slack 还要单星粗体 + `<url|text>`）。各写一遍就会漂移，而 IM 侧历史上最容易复发的
 bug 正是"两处各写一遍卡片" —— 见 `platforms/feishu/im_cards.py` 文件头。
 
-── 三条降级口径 ───────────────────────────────────────────────────────────────────
+── 四条降级口径 ───────────────────────────────────────────────────────────────────
  1. **ATX 标题 → 独立一行的粗体**，前后各留一个空行。不退化成"删掉 `#`"：标题的层级
     信息本来就只剩"这是一个小节名"，粗体是这个子集里唯一能表达它的东西。
  2. **GFM 表格 → 每行一个列表项**，第一列做粗体标题，其余列用**表头自己的文字**做标签：
     `| 实例 | GPU | 显存 |` + `| g6 | L4 | 24GB |` → `- **g6** — GPU: L4 · 显存: 24GB`。
     为什么不退成等宽代码块对齐：CJK 是双宽，手机上还会二次折行，对齐一定崩。
- 3. **段落内软换行 → 空行**（只有飞书要）。只在两行**都不是**列表/引用/表格/分割线时插，
-    否则会把紧凑列表撑成松散列表。代价是偶尔多一个空行，比糊成一行强得多。
+ 3. **段落内软换行 → 空行**（飞书**和钉钉**都要，Slack 不要）。飞书只在两行**都不是**
+    列表/引用/表格/分割线时插，否则会把紧凑列表撑成松散列表。代价是偶尔多一个空行，
+    比糊成一行强得多。
+ 4. **紧凑列表 → 松散列表**（只有钉钉要，`keep_tight=False`）。钉钉连**列表项之间**的
+    `\\n` 都吃 —— 现网「过程」那一段的两行被渲染成
+    `↳ Calling ec2.describe_instances to gather more informationDone`，两个步骤糊成
+    一条。所以钉钉那边口径 3 不留列表这个例外：每一项之间都插空行。代价是列表变松散
+    （行距变大），换来的是"两步不会被读成一步"。
+ 5. **`_斜体_` → `*斜体*`**（只有钉钉要）。见下面 `italic_to_star`。
 
 代码块（``` / ~~~ 围栏）内的内容**一律不动** —— 里面的 `#` 和 `|` 是内容，不是语法。
 """
@@ -37,7 +56,8 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["to_feishu", "to_slack", "bold_to_mrkdwn"]
+__all__ = ["to_feishu", "to_slack", "to_dingtalk", "bold_to_mrkdwn",
+           "star_to_bold", "italic_to_star"]
 
 #: 代码围栏。进出围栏之间的行原样保留。
 _FENCE_RE = re.compile(r"^\s{0,3}(?:```|~~~)")
@@ -48,9 +68,25 @@ _ATX_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
 #: 块级行（软换行硬化时**不碰**它们，见口径 3）。
 _BLOCK_RE = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s|>|\||#{1,6}\s|-{3,}$|\*{3,}$|_{3,}$)")
 
+#: 单星粗体（Slack mrkdwn 的写法）。`(?<!\*)` / `(?!\*)` 两道零宽断言保证不碰
+#: 已经是 `**x**` 的地方 —— 否则 `**x**` 会变成 `****x****`。
+_SINGLE_STAR_BOLD_RE = re.compile(r"(?<!\*)\*([^*\n]+?)\*(?!\*)")
+
 #: markdown 链接 → Slack 的 `<url|text>`。`!` 开头的图片不动（Slack 不支持内联图片，
 #: 转成 `<url|alt>` 会把一张图变成一条看不出是图的链接，反而更糊）。
 _LINK_RE = re.compile(r"(?<!!)\[([^\]\n]+)\]\(\s*<?([^()\s]+)>?\s*\)")
+
+#: `_斜体_`（Slack mrkdwn 的斜体写法，共享 i18n 文案里 50 多处这么写）。钉钉不认，
+#: 要换成 `*斜体*`。四道断言把**标识符**挡在外面：
+#:   · `(?<![\w`])` / `(?![\w`])` —— 两侧不许紧贴单词字符或反引号。`\w` **包含下划线**，
+#:     所以 `snake_case`、`__strong__`、`___` 全都命中不了（这是白捡的，别去掉）；
+#:   · `(?!\s)` / `(?<!\s)` —— 内容不许以空白开头或结尾（CommonMark 的 flanking 规则，
+#:     也是 `a _ b _ c` 这种散文里的减号式下划线不该被吃掉的理由）。
+_US_ITALIC_RE = re.compile(r"(?<![\w`])_(?!\s)([^_\n]+?)(?<!\s)_(?![\w`])")
+
+#: inline 代码段（`` `x` ``）。斜体转换只在代码段**外**做 —— 代码里的 `_` 是标识符
+#: 的一部分，而上面那两道 `\w` 断言只挡得住紧贴的情况，挡不住 `` `foo _bar_ baz` ``。
+_CODE_SPAN_RE = re.compile(r"(`+[^`\n]*`+)")
 
 
 def bold_to_mrkdwn(s: str) -> str:
@@ -61,6 +97,33 @@ def bold_to_mrkdwn(s: str) -> str:
     同一条规则两处各写一遍就会漂移。
     """
     return (s or "").replace("**", "*")
+
+
+def star_to_bold(s: str) -> str:
+    """`*x*` → `**x**` —— `bold_to_mrkdwn` 的逆向，给**标准 markdown** 的渲染端用。
+
+    为什么需要它：`core/i18n.py` 里有一批案例文案是 Slack 口味的单星粗体
+    （`'❌ *回复失败*\\n…'`）。飞书和钉钉的 markdown 都按标准解析 —— 单星是**斜体**，
+    于是"回复失败"会变成一行小斜体字，看着像备注而不是错误。
+
+    只升级粗体，不动别的：markdown 的 `_x_` 斜体在三家都能渲染，没有要转的。
+    已经是 `**x**` 的地方不会被二次加星（见 `_SINGLE_STAR_BOLD_RE` 的断言）。
+    `platforms/feishu/app/case_flow._bold` 委托到这里 —— 同一条规则两处各写一遍就会漂移。
+    """
+    return _SINGLE_STAR_BOLD_RE.sub(r"**\1**", s or "")
+
+
+def italic_to_star(s: str) -> str:
+    """`_x_` → `*x*` —— **钉钉专用**（钉钉不认下划线强调，见文件头口径 4）。
+
+    ⚠️ 别把这个加进 `to_feishu` / `to_slack`：飞书按标准 markdown 解析，`_x_` 本来就是斜体；
+    Slack 的斜体**只认** `_x_`，转成 `*x*` 会变成粗体。
+    ⚠️ 也别在 `to_dingtalk` 里跟 `star_to_bold` 一起用：那个会把这里刚产出的 `*斜体*`
+    再升成 `**粗体**`，等于把斜体文案全变粗体。
+    """
+    return "".join(
+        p if i % 2 else _US_ITALIC_RE.sub(r"*\1*", p)
+        for i, p in enumerate(_CODE_SPAN_RE.split(s or "")))
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +191,13 @@ def _table_to_bullets(header: list[str], rows: list[list[str]]) -> list[str]:
 # ---------------------------------------------------------------------------
 # 两个平台共用的结构降级
 # ---------------------------------------------------------------------------
-def _degrade(md: str) -> str:
-    """标题 → 粗体行，GFM 表格 → 列表。代码围栏内原样。"""
+def _degrade(md: str, *, keep_headings: bool = False) -> str:
+    """标题 → 粗体行，GFM 表格 → 列表。代码围栏内原样。
+
+    `keep_headings=True`（钉钉专用）：**保留** `#`~`######` 原样 —— 钉钉的 markdown
+    子集自己就渲染 ATX 标题，降级成粗体反而丢掉层级。表格照样降级（钉钉不认表格）。
+    默认 False = 飞书 / Slack 的既有行为，逐字不变。
+    """
     lines = (md or "").split("\n")
     out: list[str] = []
     i, in_fence = 0, False
@@ -159,7 +227,7 @@ def _degrade(md: str) -> str:
                 out.append("")
             i = j
             continue
-        m = _ATX_RE.match(ln)
+        m = None if keep_headings else _ATX_RE.match(ln)
         if m:
             text = m.group(2).strip()
             if out and out[-1].strip():
@@ -173,8 +241,14 @@ def _degrade(md: str) -> str:
     return "\n".join(out)
 
 
-def _harden_breaks(md: str) -> str:
-    """段落内的软换行 → 空行（见口径 3）。飞书专用。"""
+def _harden_breaks(md: str, *, keep_tight: bool = True) -> str:
+    """段落内的软换行 → 空行（见口径 3）。飞书 + 钉钉共用，Slack 不用。
+
+    `keep_tight=True`（飞书）：列表/引用/表格/分割线那几行**不动** —— 飞书自己认紧凑
+    列表，插空行只会把它撑成松散列表，白丢行距。
+    `keep_tight=False`（钉钉）：连列表项之间也插 —— 钉钉把 `- a\\n- b` 糊成一项
+    （见口径 4）。松散列表在钉钉上仍然是列表，只是行距大一点。
+    """
     lines = md.split("\n")
     out: list[str] = []
     in_fence = False
@@ -188,8 +262,7 @@ def _harden_breaks(md: str) -> str:
         nxt = lines[k + 1]
         if not ln.strip() or not nxt.strip():
             continue
-        # 当前行是列表/引用/表格/分割线 → 不动（否则紧凑列表被撑成松散列表）。
-        if _BLOCK_RE.match(ln):
+        if keep_tight and _BLOCK_RE.match(ln):
             continue
         out.append("")
     return "\n".join(out)
@@ -231,3 +304,23 @@ def to_slack(md: str) -> str:
     s = _degrade(md or "")
     return _map_outside_fences(
         s, lambda ln: bold_to_mrkdwn(_LINK_RE.sub(r"<\2|\1>", ln)))
+
+
+def to_dingtalk(md: str) -> str:
+    """钉钉机器人 markdown 消息能渲染的形式。
+
+    与另外两家的差别：`#`~`######` 标题钉钉自己认（所以**保留**，这是它唯一比飞书强的
+    地方），GFM 表格不认（所以照降级），`[text](url)` / `**粗**` 原样可用（不需要 Slack
+    那两条转换）。
+
+    ⚠️ 但**软换行必须硬化**，比飞书还要硬一档：钉钉那边单个 `\\n` 被吃掉（连空格都不留），
+    而且**列表项之间也吃**。这个模块以前写的是"钉钉的 `\\n` 就是真换行"，**是错的** ——
+    2026-09-08 现网两笔账都记在这条假设上：`/help` 的八行菜单渲染成一整段，「过程」
+    那一段的两个步骤连成 `…gather more informationDone`。所以这里 `keep_tight=False`。
+    另外钉钉不认 `_下划线斜体_`（官方只列 `*斜体*`），下划线原样显示给用户，所以要转星号。
+
+    调用点同另外两家：渲染函数里（`platforms/dingtalk/dt_messages.py`），且必须在
+    `long_answer.clip()` **之前** —— 降级会改变长度，先 clip 再降级就可能又超上限。
+    """
+    s = _harden_breaks(_degrade(md or "", keep_headings=True), keep_tight=False)
+    return _map_outside_fences(s, italic_to_star)

@@ -892,7 +892,29 @@ export class NotiOpsBackendStack extends cdk.Stack {
       },
     });
 
-    // ─── Slack bot tokens (DingTalk retired) ───
+    // ─── 钉钉机器人凭证（Lambda webhook 形态）───
+    // 与飞书**逐字同构**：一个 secret、JSON 里两个字段、`generateStringKey: "placeholder"`
+    // 让 CFN 有个可生成的键而模板字段本身留空串。空串就是"客户还没填"的表现，
+    // `shared/dingtalk_api.py::load_credentials()` 会当场抛（不静默降级）。
+    //
+    // ⚠️ 与旧 Fargate 形态那两个 secret（`notiops/dingtalk-app-key` /
+    // `notiops/dingtalk-app-secret`，由已退役的 bot-stack.ts 读）**不是同一套**，
+    // 不要合并：那条路径读两个独立 secret，这条读一个 JSON。硬凑成一个函数就得在
+    // 里面判"到底哪种环境"，而那正是最容易静默取到空值的写法。
+    const dingtalkSecret = new secretsmanager.Secret(this, "DingtalkBotSecret", {
+      secretName: "notiops/im-bot-dingtalk",
+      description: "钉钉机器人凭证（app_key, app_secret；可选 card_template_id / webhook_url）",
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      generateSecretString: {
+        secretStringTemplate: JSON.stringify({
+          app_key: "",
+          app_secret: "",
+        }),
+        generateStringKey: "placeholder",
+      },
+    });
+
+    // ─── Slack bot tokens ───
     const slackBotTokenSecret = new secretsmanager.Secret(this, "SlackBotTokenSecret", {
       secretName: "notiops/slack-bot-token",
       description: "Slack bot token (xoxb-)",
@@ -985,6 +1007,13 @@ export class NotiOpsBackendStack extends cdk.Stack {
     // returns False (no env var) and the Lambda silently drops every
     // Slack-bound IM push.
     slackBotTokenSecret.grantRead(lambdaRole);
+
+    // 钉钉凭证：只读。同上一条的理由，但钉钉这条更容易漏 —— 报告回写走
+    // `shared/dingtalk_api.py`（access_token 换取用的就是 app_key/app_secret），
+    // 而那个模块在**回调 Lambda** 里跑。少这条 grant 的症状是：IM 侧调查正常跑完、
+    // 面板显示结束，报告却回落到自定义机器人 webhook（甚至完全投不出去），
+    // 日志里只有一行 `no credentials/token: ClientError`。
+    dingtalkSecret.grantRead(lambdaRole);
 
     // 只读：后端 Lambda（health checker / notifier / summarizer）需要**读** Key 注入
     // Bedrock 调用，但**不再写** —— Key 的唯一写入方是 webchat 管理页（web-chat-stack 的
@@ -1930,6 +1959,13 @@ def handler(event, context):
           //    但会与 BotStack 分叉。
           FEISHU_SECRET_ARN: feishuSecret.secretArn,
           SLACK_BOT_TOKEN_ARN: slackBotTokenSecret.secretName,
+          // 钉钉这条**只为巡检广播的兜底 webhook 服务**：
+          // `dingtalk_sender.send_markdown()` 走的是自定义机器人 webhook，URL 可以
+          // 放在这个 secret 的可选 `webhook_url` 字段里（见 shared/dingtalk_api.py
+          // 的 `push_webhook_url()`）。不显式注这一条也"能跑" —— `secret_id()` 会
+          // 回落到写死的默认名 `notiops/im-bot-dingtalk` —— 但那是**隐式依赖**：
+          // 方式A 哪天给 secret 换个名字，这里就会静默读不到（属于「不许静默降级」）。
+          DINGTALK_SECRET_ARN: dingtalkSecret.secretArn,
         },
         description:
           "资源巡检推送 — 工作日按时段窗口把当日变化投递给各 IM 群（分级节奏 + 退避重推）",
@@ -2242,6 +2278,16 @@ def handler(event, context):
         // and the name matches what BotStack passes to the bot
         // containers, keeping the contract uniform.
         SLACK_BOT_TOKEN_ARN: slackBotTokenSecret.secretName,
+        // 钉钉报告回写 —— **这一条最要命**：`shared/report_delivery/dingtalk_sender.py`
+        // 的 `_deliver_to_chat()` 走 `shared/dingtalk_api.py` 的服务端 API
+        // （`groupMessages/send` / `oToMessages/batchSend`），access_token 要用这个
+        // secret 里的 `app_key` / `app_secret` 换。
+        // ⚠️ 少这一条的症状**不是报错**：IM 侧调查照样跑完、面板照样显示结束，
+        //    但报告会回落到自定义机器人 webhook（投进那个机器人所在的群，不是提问
+        //    的那个群），甚至完全投不出去 —— 日志里只有一行
+        //    `dingtalk_sender: conversation-targeted delivery failed`。
+        //    2026-09 之前这个平台就是这么被误判成「钉钉不支持报告回写」的。
+        DINGTALK_SECRET_ARN: dingtalkSecret.secretArn,
         BEDROCK_API_KEY_SECRET_ARN: bedrockApiKeySecret.secretArn,
         // 巡检表 —— callback 要把判读文本按 finding_id 回拼到 finding 行
         // （R9.6）。权限走 lambdaRole，第 318 行已 grant。
@@ -2454,15 +2500,25 @@ def handler(event, context):
       environment: {
         ...lambdaEnv,
         FEISHU_SECRET_ARN: feishuSecret.secretArn,
+        // 钉钉的 heads-up 卡片（`send_push_headsup`）走自定义机器人 webhook，
+        // URL 允许放在这个 secret 的可选 `webhook_url` 字段里 —— 与巡检推送
+        // 同一条路径，理由见上面 InspectionPushLambda 处的注释。
+        DINGTALK_SECRET_ARN: dingtalkSecret.secretArn,
         DATA_BUCKET: dataBucket.bucketName,
       },
       description: "多源 AWS 事件实时推送到 IM(CloudWatch Alarm / Backup / GuardDuty / Cost Anomaly / Trusted Advisor）",
     } as lambda.FunctionProps);
 
     dataBucket.grantRead(pushLambda);
+    // ⚠️ 这条是**手写**的最小权限（不是 `grantRead`），所以加平台时必须手动补一行：
+    // 新平台的 sender 读不到 secret 时 `is_configured()` 返回 false → 整平台静默不推。
+    // 通配 `-*` 后缀是 Secrets Manager 给 secret 名字加的 6 位随机尾巴。
     pushLambda.addToRolePolicy(new iam.PolicyStatement({
       actions: ["secretsmanager:GetSecretValue"],
-      resources: [`arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/im-bot-feishu-*`],
+      resources: [
+        `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/im-bot-feishu-*`,
+        `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/im-bot-dingtalk-*`,
+      ],
     }));
 
     // EventBridge Rules — 默认 DISABLED(需显式启用)
@@ -2766,6 +2822,10 @@ def handler(event, context):
     new cdk.CfnOutput(this, "SlackBotTokenSecretArn", {
       value: slackBotTokenSecret.secretArn,
       description: "Slack bot token (xoxb-) Secret ARN",
+    });
+    new cdk.CfnOutput(this, "DingtalkSecretArn", {
+      value: dingtalkSecret.secretArn,
+      description: "钉钉机器人凭证 Secret ARN(app_key / app_secret;可选 webhook_url)",
     });
     new cdk.CfnOutput(this, "SlackAppTokenSecretArn", {
       value: slackAppTokenSecret.secretArn,

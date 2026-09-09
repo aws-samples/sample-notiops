@@ -370,16 +370,61 @@ if [ -z "$ENABLE_PHD" ]; then
 fi
 
 # ─── Organizations 检测(--multi-account)───
-# 若当前部署账号是组织管理账号(或 StackSets 委派管理员),启用 org 模式:
+# 若当前部署账号能驱动 service-managed StackSet,启用 org 模式:
 #   · CDK 传 -c organizationId=<o-xxxx>:解锁 LOCKED_ACCOUNT_ID 闸门 +
 #     Custom Bus / PHD SNS Topic 改用 aws:PrincipalOrgID 整组放行
-#   · 跳过 PHD / DevOps Agent 逐账号白名单交互(由 OrgID 条件替代)
+#   · 跳过 PHD / DevOps Agent 逐账号允许清单交互(由 OrgID 条件替代)
 #   · 部署完成后通过 CloudFormation StackSets(service-managed)向成员账号
 #     批量下发 infra/member-account-onboarding.yaml(只读角色 + 事件转发)
-# 非管理账号时退回原有逐账号白名单模式,成员账号需手动部署该模板。
+# 驱动不了时退回原有逐账号允许清单模式,成员账号需手动部署该模板。
+#
+# 📌 「能驱动」有**两种**身份(2026-09-08 起支持第二种):
+#      组织管理账号                → CallAs=SELF
+#      已注册的 StackSets 委派管理员 → CallAs=DELEGATED_ADMIN
+#    很多组织的管理账号是纯 payer、不允许部署任何工作负载,只支持第一种等于这类客户
+#    根本用不上多账号。判定逻辑见下面的 detect_stackset_call_as()。
 ORG_MODE=false
 ORG_ID=""
 ORG_FLAG=""
+
+# ─── service-managed StackSet 的操作身份(CallAs)────────────────────────────
+# 🔴 探测**必须在下面那个「降级守卫」之前**跑完。守卫的判据是
+#    `describe-stack-set notiops-member-onboarding` 存不存在,而委派管理员不带
+#    `--call-as DELEGATED_ADMIN` 时那个调用**查不到**已经存在的 StackSet ——
+#    于是守卫判「现网不是多账号」,不带 flag 重跑就静默把现网降级成单账号。
+#    这正是这条铁律要防的那类失败:一个静默少掉的能力比一个会报错的按钮更难发现。
+#
+# 🔴 第二步**必须按 service principal 过滤**。一个账号可能是**别的**服务
+#    (GuardDuty、Config …)的委派管理员 —— 那也会让它拿到 Organizations 只读权限,
+#    `list-delegated-administrators` 因此能调通、还能返回一串账号。不过滤就会把这类
+#    账号误判成「能用多账号」,然后在第一次 create-stack-set 上以 AccessDenied 收场。
+#
+# ⚠️ `SS_CALL_AS` 是**未加引号**展开的参数片段(SELF 时为空串 = 用 CLI 默认值,
+#    少一个能写错的地方)。每一个 `aws cloudformation *stack-set*` 调用都要带上它。
+STACKSET_CALL_AS="SELF"
+SS_CALL_AS=""
+ORG_MGMT_ID=""
+STACKSETS_SERVICE_PRINCIPAL="member.org.stacksets.cloudformation.amazonaws.com"
+detect_stackset_call_as() {
+  local probe mgmt me
+  probe=$(aws organizations describe-organization \
+    --query 'Organization.[Id,MasterAccountId]' --output text 2>/dev/null || echo "")
+  [ -n "$probe" ] || return 0
+  mgmt=$(echo "$probe" | awk '{print $2}')
+  ORG_MGMT_ID="$mgmt"
+  me=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
+  [ -n "$me" ] || return 0
+  [ "$me" = "$mgmt" ] && return 0          # 管理账号:CallAs=SELF(缺省)
+  if aws organizations list-delegated-administrators \
+       --service-principal "$STACKSETS_SERVICE_PRINCIPAL" \
+       --query 'DelegatedAdministrators[].Id' --output text 2>/dev/null \
+     | tr '\t' '\n' | grep -qx "$me"; then
+    STACKSET_CALL_AS="DELEGATED_ADMIN"
+    SS_CALL_AS="--call-as DELEGATED_ADMIN"
+  fi
+  return 0
+}
+detect_stackset_call_as
 
 # 🔴 **没带 `--multi-account` 时，成员账号接入整条路是死的 —— 而脚本会正常结束。**
 #
@@ -414,10 +459,15 @@ ORG_FLAG=""
 #   压根没渲染出来，那时已经过了 15 分钟，只能整套重跑。
 #   决定权仍在用户手里（默认 N = 保持单账号），所以「不自动开启」那条原则没破。
 #
-# 🔴 判据是**「能不能列出成员账号」**，不是「是不是管理账号」。
-#    StackSets 委派管理员也能建 StackSet，按管理账号判会把这类部署漏掉 ——
-#    而漏掉的表现和上面一样：多账号那一整套静默地不存在。
-#    顺带只数 ACTIVE：SUSPENDED 账号接不进来，算进去会虚报。
+# 🔴 **触发**判据是「组织里还有别的 ACTIVE 账号」（organizations list-accounts），
+#    不是「是不是管理账号」—— 只按后者判不知道有没有成员账号可接，而给一个
+#    「只有自己一个账号」的组织提示多账号纯是噪音。顺带只数 ACTIVE：
+#    SUSPENDED 账号接不进来，算进去会虚报。
+#
+# 🔴 但**问不问「现在就开多账号吗」**另有一条：只在**能驱动 StackSet 的账号**上问
+#    （管理账号，或已注册的 StackSets 委派管理员 —— 见上面的 `detect_stackset_call_as`）。
+#    两者都不是的账号答了 y 也会在 create-stack-set 那步失败 —— 在那儿问等于许一个
+#    做不到的诺，白花 15 分钟。
 if [ "$MULTI_ACCOUNT_MODE" != true ]; then
   # 🔴 降级守卫（2026-09-06 交叉 review 抓出）：现网**已经是**多账号部署时，
   #    不带 flag 重跑不是「少个功能」而是**降级现网**：
@@ -426,8 +476,9 @@ if [ "$MULTI_ACCOUNT_MODE" != true ]; then
   #      · 一键接入按钮还在，点了报 StackSetNotFound
   #    所以这里的默认值与「首装询问」相反：保护现网状态，默认**保持多账号**。
   #    判据用「member-onboarding StackSet 存在」—— 它只在 --multi-account 路径创建。
+  #    ⚠️ `$SS_CALL_AS`：委派管理员不带它就查不到那个 StackSet ⇒ 守卫失效 ⇒ 静默降级。
   if aws cloudformation describe-stack-set --stack-set-name notiops-member-onboarding \
-       --region "${DEPLOY_REGION:-us-east-1}" >/dev/null 2>&1; then
+       $SS_CALL_AS --region "${DEPLOY_REGION:-us-east-1}" >/dev/null 2>&1; then
     echo ""
     echo "  $(t "⚠ 现网已是多账号部署（member-onboarding StackSet 存在），但本次没带 --multi-account。" "⚠ The live deployment is multi-account (the member-onboarding StackSet exists), but --multi-account was NOT passed.")"
     echo "    $(t "按单账号重部会【降级现网】：重锁账号闸门、删掉 PHD 的组织放行、一键接入报错。" "Redeploying single-account would DOWNGRADE it: relock the account gate, drop the PHD org-wide allow, break one-click onboarding.")"
@@ -470,13 +521,28 @@ if [ "$MULTI_ACCOUNT_MODE" != true ]; then
       echo "  $(t "⚠ 检测到 AWS Organizations: ${_org_id}" "⚠ AWS Organizations detected: ${_org_id}")"
       if [ -n "$_me" ] && [ "$_me" = "$_org_mgmt" ]; then
         echo "    $(t "当前账号 ${_me} 是组织管理账号(payer)，组织内另有 ${_org_members} 个 ACTIVE 成员账号。" "This account (${_me}) is the Organization management account (payer); the org has ${_org_members} other ACTIVE member account(s).")"
+      elif [ "$STACKSET_CALL_AS" = "DELEGATED_ADMIN" ]; then
+        echo "    $(t "当前账号 ${_me} 是已注册的 StackSets 委派管理员，组织内另有 ${_org_members} 个 ACTIVE 账号（管理账号是 ${_org_mgmt}）。" "This account (${_me}) is a registered StackSets delegated administrator; the org has ${_org_members} other ACTIVE account(s) (management account: ${_org_mgmt}).")"
       else
-        echo "    $(t "当前账号 ${_me} 能列出组织里的账号(StackSets 委派管理员)，另有 ${_org_members} 个 ACTIVE 账号。" "This account (${_me}) can list org accounts (StackSets delegated admin); there are ${_org_members} other ACTIVE account(s).")"
+        echo "    $(t "当前账号 ${_me} 能列出组织里的账号，另有 ${_org_members} 个 ACTIVE 账号（管理账号是 ${_org_mgmt}）。" "This account (${_me}) can list org accounts; there are ${_org_members} other ACTIVE account(s) (management account: ${_org_mgmt}).")"
       fi
       echo "    $(t "本次**没有**带 --multi-account ⇒ 两个成员账号 StackSet 不会创建。" "--multi-account was NOT passed ⇒ the two member-account StackSets will not be created.")"
       echo "    $(t "后果：管理页里「一键接入」/「一键关联」整块不会出现（换成一段说明），跨账号查询报 org_mode_disabled。" "Consequence: the Admin page will not show the one-click onboarding section at all (a note replaces it), and cross-account queries return org_mode_disabled.")"
       echo "    $(t "(「手动接入账号」那条路不受影响：客户自行部署 CFN + 回填 Outputs)" "(The \"manual onboarding\" path is unaffected: the customer deploys the CFN themselves and you backfill the Outputs.)")"
-      if [ -t 0 ]; then
+      if { [ -z "$_me" ] || [ "$_me" != "$_org_mgmt" ]; } && [ "$STACKSET_CALL_AS" != "DELEGATED_ADMIN" ]; then
+        # 🔴 不在这里问「要不要开多账号」：本账号既不是管理账号、也不是已注册的 StackSets
+        #    委派管理员，开了会在 create-stack-set 那步失败。问了等于许一个做不到的诺。
+        #    ⇒ 给的是**可直接复制的注册命令**，而不是「换个账号重来」。
+        echo "    $(t "🔴 而且本账号现在**开不了**多账号：它既不是组织管理账号 ${_org_mgmt}，" "🔴 And this account CANNOT enable it yet: it is neither the management account ${_org_mgmt},")"
+        echo "       $(t "也不是已注册的 CloudFormation StackSets 委派管理员。" "nor a registered CloudFormation StackSets delegated administrator.")"
+        echo "    $(t "出路（任选一条）：" "Ways forward (pick one):")"
+        echo "      1. $(t "让管理账号 ${_org_mgmt} 把本账号注册成委派管理员（一条命令），然后重跑本脚本：" "have the management account ${_org_mgmt} register this account as a delegated administrator (one command), then re-run this script:")"
+        echo "         aws organizations register-delegated-administrator \\"
+        echo "           --service-principal ${STACKSETS_SERVICE_PRINCIPAL} --account-id ${_me}"
+        echo "         $(t "注意：委派管理员对组织内**任何**账号都有完整部署权限，无法收窄到某个 OU。" "Note: a delegated administrator has full deployment permissions to EVERY account in the org and cannot be scoped to specific OUs.")"
+        echo "      2. $(t "换到管理账号 ${_org_mgmt} 上跑 ./setup.sh --multi-account" "run ./setup.sh --multi-account in the management account ${_org_mgmt}")"
+        echo "    $(t "ℹ 本次按单账号继续。详见 docs/DEPLOYMENT.md §0.1.2。" "ℹ Continuing single-account this run. See docs/DEPLOYMENT.md 0.1.2.")"
+      elif [ -t 0 ]; then
         # ⚠️ `|| true`：`set -e` 下 read 读到 EOF 返回非 0 会让整个脚本退出。
         read -p "    $(t "现在就启用多账号模式(等同 --multi-account)？[y/N]: " "Enable multi-account mode now (same as --multi-account)? [y/N]: ")" _want_multi || true
         case "${_want_multi:-}" in
@@ -508,31 +574,56 @@ if [ "$MULTI_ACCOUNT_MODE" = true ]; then
     if [ "$CURRENT_ACCOUNT" = "$ORG_MGMT_ACCOUNT" ]; then
       ORG_MODE=true
       echo "  $(t "✓ 当前账号是组织管理账号(Org: " "✓ Current account is the Organization management account (Org: ")$ORG_ID)"
+    elif [ "$STACKSET_CALL_AS" = "DELEGATED_ADMIN" ]; then
+      # 从 linked account 部署（2026-09-08 起支持）。本账号已被管理账号注册为 StackSets
+      # 委派管理员 ⇒ 下面每一个 stack-set 调用都带 `$SS_CALL_AS`，StackSet 实体本身仍然
+      # 建在管理账号里（AWS 官方行为，不是我们的选择）。
+      ORG_MODE=true
+      echo "  $(t "✓ 当前账号 ${CURRENT_ACCOUNT} 是已注册的 StackSets 委派管理员(Org: ${ORG_ID}，管理账号 ${ORG_MGMT_ACCOUNT})。" "✓ This account (${CURRENT_ACCOUNT}) is a registered StackSets delegated administrator (Org: ${ORG_ID}, management account ${ORG_MGMT_ACCOUNT}).")"
+      echo "    $(t "所有 StackSet 操作走 CallAs=DELEGATED_ADMIN；StackSet 实体仍然存放在管理账号里。" "All StackSet operations use CallAs=DELEGATED_ADMIN; the StackSet itself still lives in the management account.")"
+      # 🔴 这条限制必须**在部署前**说，而不是等客户在管理页点了一键接入才发现：
+      #    CloudFormation 不会把 stack 部署到管理账号（即使它在被 target 的 OU 里），
+      #    而那个调用会**返回成功**、操作也会变 SUCCEEDED —— 是「假成功」不是报错。
+      echo "    $(t "⚠ 管理账号 ${ORG_MGMT_ACCOUNT} 自己无法通过 StackSet 上车（CloudFormation 不会把栈部署到管理账号）。" "⚠ The management account ${ORG_MGMT_ACCOUNT} itself cannot be onboarded via StackSets (CloudFormation never deploys a stack to the management account).")"
+      echo "      $(t "要让 NotiOps 查它：在管理账号里手工部一次 infra/member-account-onboarding.yaml，再用管理页「手动接入账号」登记。" "To query it, deploy infra/member-account-onboarding.yaml manually in that account, then register it via \"Manual onboarding\" in the Admin page.")"
     else
-      echo "  $(t "⚠ 当前账号 " "⚠ Current account ")$CURRENT_ACCOUNT$(t " 不是组织管理账号(" " is not the Org management account (")$ORG_MGMT_ACCOUNT)$(t "。" ".")"
-      echo "    $(t "若已在管理账号将本账号注册为 CloudFormation StackSets 委派管理员," "If this account is registered as a CloudFormation StackSets delegated administrator in the management account,")"
-      echo "    $(t "仍可使用 org 模式(StackSets 批量下发)。" "you can still use org mode (StackSets bulk deployment).")"
-      read -p "    $(t "本账号是 StackSets 委派管理员吗? [y/N]: " "Is this account a StackSets delegated administrator? [y/N]: ")" ORG_DELEGATED
-      case "$ORG_DELEGATED" in
-        [yY]*) ORG_MODE=true ;;
-        *) ORG_MODE=false ;;
-      esac
+      # 🔴 这里**不问**「你是委派管理员吗?」—— 上面 `detect_stackset_call_as` 已经用
+      #    `list-delegated-administrators` 查过了。让客户声明身份 = 把一个可以 100% 确定
+      #    的事实变成一个可以填错的输入，历史上正因如此白花过十几分钟（答 y 一路跑到
+      #    create-stack-set 才吃 AccessDenied）。
+      echo "  $(t "⚠ 当前账号 " "⚠ Current account ")${CURRENT_ACCOUNT}$(t " 既不是组织管理账号(" " is neither the Org management account (")${ORG_MGMT_ACCOUNT})$(t "，也不是已注册的 StackSets 委派管理员。" ") nor a registered StackSets delegated administrator.")"
+      echo ""
+      echo "  $(t "出路（三条，都不用等到部署失败）：" "Three ways forward (none requires waiting for a failed deploy):")"
+      echo "    1. $(t "让管理账号 ${ORG_MGMT_ACCOUNT} 把本账号注册成 StackSets 委派管理员（一条命令），然后重跑本脚本：" "have the management account ${ORG_MGMT_ACCOUNT} register this account as a StackSets delegated administrator (one command), then re-run this script:")"
+      echo "       aws organizations register-delegated-administrator \\"
+      echo "         --service-principal ${STACKSETS_SERVICE_PRINCIPAL} --account-id ${CURRENT_ACCOUNT}"
+      echo "       $(t "注意：委派管理员对组织内**任何**账号都有完整部署权限，管理账号无法把它收窄到某个 OU。" "Note: a delegated administrator has full deployment permissions to EVERY account in the org; the management account cannot scope it to specific OUs.")"
+      echo "    2. $(t "换到管理账号 ${ORG_MGMT_ACCOUNT} 上跑 ./setup.sh --multi-account" "run ./setup.sh --multi-account in the management account ${ORG_MGMT_ACCOUNT}")"
+      echo "    3. $(t "去掉 --multi-account 按单账号部署 —— 成员账号仍可用管理页的「手动接入账号」逐个接入" "drop --multi-account and deploy single-account -- member accounts can still be onboarded one by one via \"Manual onboarding\" in the Admin page")"
+      echo ""
+      echo "  $(t "✗ 这里就停下，不静默按单账号继续：你明确要了 --multi-account，而这个账号现在做不到。" "✗ Stopping here instead of silently continuing single-account: you explicitly asked for --multi-account and this account cannot do it yet.")"
+      exit 1
     fi
   else
     echo "  $(t "ℹ 无法读取 Organizations 信息(非组织成员或缺少权限)。" "ℹ Cannot read Organizations info (not an org member or lacking permission).")"
   fi
   if [ "$ORG_MODE" = true ]; then
-    ORG_FLAG="-c organizationId=$ORG_ID"
+    # 🔴 `stackSetCallAs` / `orgManagementAccountId` 必须一起传进 CDK：BFF 的一键接入
+    #    在**运行时**也要带 CallAs（`member_accounts.mjs`），而管理账号号是它拦
+    #    「一键接入管理账号」的判据（那个调用会假成功，见上面那段 ⚠）。
+    #    漏传的表现：委派管理员部署出来的 web 一键接入整片 StackSetNotFound ——
+    #    而那个错长得像「部署时没带 --multi-account」，会把人引去重装。
+    ORG_FLAG="-c organizationId=$ORG_ID -c stackSetCallAs=$STACKSET_CALL_AS -c orgManagementAccountId=$ORG_MGMT_ACCOUNT"
     # OAM Sink 复用发现（每账号每 Region 限 1 个；已有则复用，避免 CREATE_FAILED）
     EXISTING_OAM_SINK=$(aws oam list-sinks --region "$DEPLOY_REGION"       --query 'Items[0].Arn' --output text 2>/dev/null || echo "")
     if [ -n "$EXISTING_OAM_SINK" ] && [ "$EXISTING_OAM_SINK" != "None" ]; then
       ORG_FLAG="$ORG_FLAG -c oamSinkArn=$EXISTING_OAM_SINK"
       echo "  $(t "✓ 复用既有 OAM Sink: " "✓ Reusing existing OAM Sink: ")$EXISTING_OAM_SINK"
     fi
-    echo "  $(t "✓ Organizations 模式启用: 白名单交互跳过, 改用 aws:PrincipalOrgID 整组放行。" "✓ Organizations mode enabled: allowlist prompt skipped, using aws:PrincipalOrgID to allow the whole org.")"
+    echo "  $(t "✓ Organizations 模式启用: 允许清单交互跳过, 改用 aws:PrincipalOrgID 整组放行。" "✓ Organizations mode enabled: allowlist prompt skipped, using aws:PrincipalOrgID to allow the whole org.")"
     echo "    $(t "部署完成后将引导通过 StackSets 一键下发成员账号资源。" "After deployment, you will be guided to roll out member-account resources via StackSets.")"
   else
-    echo "  $(t "ℹ 退回逐账号白名单模式。成员账号需手动部署:" "ℹ Falling back to per-account allowlist mode. Member accounts must be deployed manually:")"
+    echo "  $(t "ℹ 退回逐账号允许清单模式。成员账号需手动部署:" "ℹ Falling back to per-account allowlist mode. Member accounts must be deployed manually:")"
     echo "    $(t "infra/member-account-onboarding.yaml(只读角色 + DevOps/PHD 事件转发)" "infra/member-account-onboarding.yaml (read-only role + DevOps/PHD event forwarding)")"
   fi
 fi
@@ -550,8 +641,8 @@ else
   PHD_LINKED_ACCOUNTS="${PHD_LINKED_ACCOUNTS:-}"
   if [ "$ORG_MODE" = true ]; then
     # Organizations 模式: SNS Topic Policy 由 aws:PrincipalOrgID 整组放行(CDK orgMode 分支),
-    # 无需逐账号白名单;成员账号转发规则由 StackSets 统一下发。
-    echo "  $(t "ℹ Organizations 模式: PHD 跨账号白名单交互跳过(OrgID 整组放行)" "ℹ Organizations mode: PHD cross-account allowlist prompt skipped (OrgID allows the whole org)")"
+    # 无需逐账号允许清单;成员账号转发规则由 StackSets 统一下发。
+    echo "  $(t "ℹ Organizations 模式: PHD 跨账号允许清单交互跳过(OrgID 整组放行)" "ℹ Organizations mode: PHD cross-account allowlist prompt skipped (OrgID allows the whole org)")"
     PHD_ACCOUNTS_FLAG=""
   elif [ "$MULTI_ACCOUNT_MODE" = false ]; then
     PHD_ACCOUNTS_FLAG=""
@@ -638,10 +729,10 @@ except Exception: pass
   fi  # end MULTI_ACCOUNT_MODE else (PHD linked accounts)
 fi
 
-# ─── Custom Event Bus 的跨账号判据（改动② 之后不再需要白名单交互）───
+# ─── Custom Event Bus 的跨账号判据（改动② 之后不再需要允许清单交互）───
 #
 # 🔴 **原来这里有约 190 行交互**：读现有资源策略里的 `aws:PrincipalAccount` 列表 →
-#    提示运维输入新白名单 → diff + 确认 → 用 `-c devopsAgentBusinessAccounts=`
+#    提示运维输入新允许清单 → diff + 确认 → 用 `-c devopsAgentBusinessAccounts=`
 #    传给 CDK。整块已删，因为策略的判据换成了与账号无关的形状：
 #
 #      ArnLike aws:PrincipalArn arn:<partition>:iam::*:role/notiops-devops-forwarder-role-*
@@ -664,29 +755,29 @@ echo ""
 echo "  $(t "ℹ Custom Event Bus 跨账号判据: 转发角色名 + events:source" "ℹ Custom Event Bus cross-account judgement: forwarder role name + events:source")"
 echo "    $(t "  ArnLike aws:PrincipalArn .../notiops-devops-forwarder-role-*" "  ArnLike aws:PrincipalArn .../notiops-devops-forwarder-role-*")"
 echo "    $(t "  AND events:source = aws.aidevops" "  AND events:source = aws.aidevops")"
-echo "    $(t "新增业务账户无需重新部署本栈(不再维护账号白名单)" "Onboarding a business account no longer requires redeploying this stack (no account allowlist to maintain)")"
+echo "    $(t "新增业务账户无需重新部署本栈(不再维护账号允许清单)" "Onboarding a business account no longer requires redeploying this stack (no account allowlist to maintain)")"
 
-# 存量部署上如果还挂着老的白名单语句，说明一句它会被替换掉（本次部署的正常结果）
+# 存量部署上如果还挂着老的允许清单语句，说明一句它会被替换掉（本次部署的正常结果）
 LEGACY_BUS_POLICY=$(aws events describe-event-bus \
   --name notiops-devops-events --region "$DEPLOY_REGION" \
   --query 'Policy' --output text 2>/dev/null || echo "")
 if [ -n "$LEGACY_BUS_POLICY" ] && [ "$LEGACY_BUS_POLICY" != "None" ] \
    && echo "$LEGACY_BUS_POLICY" | grep -q "aws:PrincipalAccount"; then
   echo ""
-  echo "  $(t "⚠️ 检测到旧的账号白名单语句，本次部署会用上面那条判据替换它。" "⚠️ A legacy account-allowlist statement was found; this deploy replaces it with the judgement above.")"
-  echo "     $(t "影响: 白名单里的账号仍然能投递(它们用的就是那个角色名)；" "Effect: accounts in the allowlist keep working (they use that same role name);")"
-  echo "     $(t "      不在白名单但部署过我们模板的账号，从此也能投递。" "      accounts not in the allowlist but running our template can now also forward.")"
+  echo "  $(t "⚠️ 检测到旧的账号允许清单语句，本次部署会用上面那条判据替换它。" "⚠️ A legacy account-allowlist statement was found; this deploy replaces it with the judgement above.")"
+  echo "     $(t "影响: 允许清单里的账号仍然能投递(它们用的就是那个角色名)；" "Effect: accounts in the allowlist keep working (they use that same role name);")"
+  echo "     $(t "      不在允许清单但部署过我们模板的账号，从此也能投递。" "      accounts not in the allowlist but running our template can now also forward.")"
 fi
 echo ""
 
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # ─── IM 平台选择 ───
-# v1 release: dingtalk 暂不开放给客户(凭据流程 + push 自定义机器人
-# 双 robot 配置链路在 Phase 2c 才稳定)。M2 之后 ImStack 只按 enabledPlatforms
-# 建对应平台的 Webhook 路由,没选的平台连 Lambda 都不建。
-# 第二版要恢复:把 "3) 钉钉 (DingTalk)" 选项加回菜单 + 在解析里加
-# IM_PLATFORM_CHOICE 含 "3" 时 append "dingtalk,"。
+# M2 之后 ImStack 只按 enabledPlatforms 建对应平台的 Webhook 路由,没选的平台
+# 连 Lambda 都不建。
+# 钉钉自 2026-09-08 起开放(与飞书/Slack 同一个 Lambda Webhook 形态)。
+# 它与飞书/Slack 的能力差异是**真实存在**的(没有回调按钮、不能更新已发消息),
+# 都写在 docs/IM_WEBHOOK_SETUP.md 的能力对比表里 —— 不要在这里含糊成"完全一样"。
 echo ""
 echo "$(t "── IM 平台选择（可选）──" "── IM Platform Selection (optional) ──")"
 echo "  $(t "web 端默认部署。IM Bot 是可选的：你可以现在部署、或暂时不部署、" "The web UI is always deployed. IM bots are optional: deploy now, or skip and")"
@@ -694,6 +785,9 @@ echo "  $(t "以后想起来再随时重跑本脚本启用（未选中的平台�
 echo "  0) $(t "暂不部署 IM（只部署 web 端，以后可随时再加）" "Skip IM for now (web UI only, can add later)")"
 echo "  1) $(t "飞书 (Feishu)" "Feishu")"
 echo "  2) Slack"
+echo "  3) $(t "钉钉 (DingTalk)" "DingTalk")"
+echo "     $(t "注: 钉钉机器人没有回调按钮、也不能更新已发出的消息，因此" "Note: DingTalk robots have no callback buttons and cannot edit a sent message, so")"
+echo "     $(t "     升级面板/案例表单改为命令式，进度是追加消息。详见 docs/IM_WEBHOOK_SETUP.md" "     the escalate panel / case form are command-driven and progress is appended. See docs/IM_WEBHOOK_SETUP.en.md")"
 echo ""
 read -p "  $(t "输入编号,多个用逗号分隔 [默认: 0 暂不部署]: " "Enter number(s), comma-separated [default: 0 skip]: ")" IM_PLATFORM_CHOICE
 IM_PLATFORM_CHOICE="${IM_PLATFORM_CHOICE:-0}"
@@ -705,11 +799,14 @@ fi
 if echo "$IM_PLATFORM_CHOICE" | grep -q "2"; then
   ENABLED_PLATFORMS="${ENABLED_PLATFORMS}slack,"
 fi
+if echo "$IM_PLATFORM_CHOICE" | grep -q "3"; then
+  ENABLED_PLATFORMS="${ENABLED_PLATFORMS}dingtalk,"
+fi
 ENABLED_PLATFORMS="${ENABLED_PLATFORMS%,}"  # 去尾逗号(空 = 不启用任何 IM)
 
 if [ -z "$ENABLED_PLATFORMS" ]; then
   # 不部署 IM：整个 ImStack 都不实例化（见 infra/bin/app.ts 的 enabledPlatforms 分支）。
-  # 以后想启用：重跑本脚本选 1/2 即可，无需重建。
+  # 以后想启用：重跑本脚本选 1/2/3 即可，无需重建。
   echo "  $(t "✓ 暂不部署 IM（web 端照常部署；以后重跑本脚本可随时启用 IM）" "✓ Skipping IM (web UI deploys as usual; re-run this script anytime to enable IM)")"
   PLATFORM_FLAG="-c enabledPlatforms=none"
 else
@@ -1473,6 +1570,7 @@ LAMBDA_ROLE_ARN=$(jq -r ".[\"$STACK_NAME\"].LambdaExecutionRoleArn" cdk-outputs.
 API_URL=$(jq -r ".[\"$STACK_NAME\"].ApiUrl" cdk-outputs.json 2>/dev/null || echo "N/A")
 DATA_BUCKET=$(jq -r ".[\"$STACK_NAME\"].DataBucketName" cdk-outputs.json 2>/dev/null || echo "N/A")
 FEISHU_SECRET=$(jq -r ".[\"$STACK_NAME\"].FeishuSecretArn" cdk-outputs.json 2>/dev/null || echo "N/A")
+DINGTALK_SECRET=$(jq -r ".[\"$STACK_NAME\"].DingtalkSecretArn" cdk-outputs.json 2>/dev/null || echo "N/A")
 SLACK_BOT_TOKEN_SECRET=$(jq -r ".[\"$STACK_NAME\"].SlackBotTokenSecretArn" cdk-outputs.json 2>/dev/null || echo "N/A")
 SLACK_APP_TOKEN_SECRET=$(jq -r ".[\"$STACK_NAME\"].SlackAppTokenSecretArn" cdk-outputs.json 2>/dev/null || echo "N/A")
 BEDROCK_API_KEY_SECRET=$(jq -r ".[\"$STACK_NAME\"].BedrockApiKeySecretArn" cdk-outputs.json 2>/dev/null || echo "${BEDROCK_API_KEY_SECRET_ARN:-N/A}")
@@ -1491,8 +1589,12 @@ CHAT_BFF_URL=$(jq -r ".WebChatStack.ChatBffUrl" cdk-outputs.json 2>/dev/null || 
 # CloudFormation 控制台翻 —— 那一步一卡住，IM 这条链路等于没交付。
 FEISHU_WEBHOOK_URL=$(jq -r ".ImStack.FeishuWebhookUrl" cdk-outputs.json 2>/dev/null || echo "N/A")
 SLACK_WEBHOOK_URL=$(jq -r ".ImStack.SlackWebhookUrl" cdk-outputs.json 2>/dev/null || echo "N/A")
+# 钉钉填的是「机器人 → 消息接收模式 → HTTP 模式」的请求网址，同一条 URL 兼收
+# 消息事件（钉钉机器人没有独立的回调按钮通道，所以只有这一个地址要填）。
+DINGTALK_WEBHOOK_URL=$(jq -r ".ImStack.DingtalkWebhookUrl" cdk-outputs.json 2>/dev/null || echo "N/A")
 [ "$FEISHU_WEBHOOK_URL" = "null" ] && FEISHU_WEBHOOK_URL="N/A"
 [ "$SLACK_WEBHOOK_URL" = "null" ] && SLACK_WEBHOOK_URL="N/A"
+[ "$DINGTALK_WEBHOOK_URL" = "null" ] && DINGTALK_WEBHOOK_URL="N/A"
 CUR_FINALIZER_FN_ARN=$(jq -r ".[\"$STACK_NAME\"].CurFinalizerFunctionArn" cdk-outputs.json 2>/dev/null || echo "")
 CUR_FINALIZER_SCHEDULER_ROLE_ARN=$(jq -r ".[\"$STACK_NAME\"].CurFinalizerSchedulerRoleArn" cdk-outputs.json 2>/dev/null || echo "")
 
@@ -1769,9 +1871,12 @@ if [ -n "$ENABLED_PLATFORMS" ]; then
   # 签名校验(notiops/slack-signing-secret),这个 Secret 平时留空即可 —— 把它跟
   # 必填项并排打印会让客户以为不填 bot 就不工作,白等一场。
   echo "$(t "Slack App Token:   " "Slack App Token:   ")$SLACK_APP_TOKEN_SECRET  $(t "← 仅回滚到长连接(socket mode)时才需要填,正常留空" "← only needed if you roll back to socket mode; leave empty otherwise")"
+  # 钉钉只有一个 Secret（JSON 里 app_key / app_secret,与飞书同构),没有 Slack 那种
+  # 「签名密钥另存一个」的分裂 —— 钉钉的验签用的就是 app_secret 本身。
+  echo "$(t "钉钉 Secret:       " "DingTalk Secret:   ")$DINGTALK_SECRET"
 else
   echo "$(t "── IM Bot ── 本次未部署（web 端已就绪）" "── IM Bot ── not deployed this run (web UI is ready)")"
-  echo "  $(t "以后想启用：重跑 ./setup.sh 选 1) 飞书 或 2) Slack 即可，无需重建其余资源。" "To enable later: re-run ./setup.sh and pick 1) Feishu or 2) Slack — no need to rebuild anything else.")"
+  echo "  $(t "以后想启用：重跑 ./setup.sh 选 1) 飞书 / 2) Slack / 3) 钉钉 即可，无需重建其余资源。" "To enable later: re-run ./setup.sh and pick 1) Feishu / 2) Slack / 3) DingTalk — no need to rebuild anything else.")"
 fi
 echo "Bedrock API Key:   $BEDROCK_API_KEY_SECRET"
 echo "Data Bucket:       $DATA_BUCKET"
@@ -1874,6 +1979,12 @@ if [ -n "$ENABLED_PLATFORMS" ]; then
   case "$ENABLED_PLATFORMS" in
     *slack*)  echo "  $(t "    · Slack: " "    · Slack:  ")$SLACK_WEBHOOK_URL" ;;
   esac
+  case "$ENABLED_PLATFORMS" in
+    *dingtalk*)
+      echo "  $(t "    · 钉钉: " "    · DingTalk: ")$DINGTALK_WEBHOOK_URL"
+      echo "  $(t "      填在「机器人 → 消息接收模式 → 选 HTTP 模式 → 消息接收地址」。" "      Paste under \"Robot → Message receiving mode → pick HTTP mode → callback URL\".")"
+      echo "  $(t "      钉钉**没有** URL challenge:保存时不会验证这个地址,填错了不会当场报错,只是机器人永远不回话。" "      DingTalk has NO URL challenge: saving does not verify the address, so a typo fails silently — the robot simply never replies.")" ;;
+  esac
   echo ""
   case "$ENABLED_PLATFORMS" in
     *feishu*)
@@ -1887,11 +1998,19 @@ if [ -n "$ENABLED_PLATFORMS" ]; then
       echo "  $(t "      需填: Bot Token(OAuth & Permissions 页)和 Signing Secret(Basic Information 页)。" "      Fill: the Bot Token (OAuth & Permissions page) and the Signing Secret (Basic Information page).")"
       echo "  $(t "      ⚠️ 这两个 Secret 现在装的是 CDK 随机生成的值,不是空串 —— 忘了填不会报「为空」,而是报「密钥不对」。" "      ⚠️ Both secrets currently hold a CDK-generated random value, not an empty string — forgetting to fill them shows up as a wrong credential, not as an empty one.")" ;;
   esac
+  case "$ENABLED_PLATFORMS" in
+    *dingtalk*)
+      echo "  $(t "  · 钉钉 —— Secret: " "  · DingTalk —— Secret: ")notiops/im-bot-dingtalk"
+      echo "  $(t "      需填字段: app_key / app_secret(钉钉开放平台「应用开发 → 企业内部应用 → 凭证与基础信息」)。" "      Fields: app_key / app_secret (DingTalk Open Platform \"App development → Internal app → Credentials & Basic Info\").")"
+      echo "  $(t "      验签用的就是 app_secret,不像 Slack 另有一个签名密钥 —— 只有这一个 Secret 要填。" "      The request signature is keyed with app_secret — unlike Slack there is no separate signing secret; this one secret is all you fill.")"
+      echo "  $(t "      可选字段 webhook_url: 自定义机器人的推送地址,只给巡检广播 / 主动通知用(群里问答不需要)。" "      Optional field webhook_url: a custom-robot push address, used only for inspection broadcasts / proactive notifications (in-chat Q&A does not need it).")" ;;
+  esac
   echo ""
-  echo "  $(t "  ▸ 两个平台在控制台具体点哪几个开关、顺序为什么不能反、怎么回滚:" "  ▸ Which switches to flip in each platform's console, why the order matters, and how to roll back:")"
-  echo "      docs/IM_WEBHOOK_SETUP.md"
-  echo "  $(t "    (飞书是「原地切换现有 App」,权限一条都不用加;Slack 是新建 App。" "    (Feishu is an in-place cutover of your existing app — no new scopes needed; Slack is a new app.")"
-  echo "  $(t "     必须先把 Secret 填好,再去平台上保存请求地址 —— 反了 URL 校验必失败。)" "     Fill the secrets BEFORE saving the Request URL in the console — the URL challenge fails otherwise.)")"
+  echo "  $(t "  ▸ 三个平台在控制台具体点哪几个开关、顺序为什么不能反、怎么回滚:" "  ▸ Which switches to flip in each platform's console, why the order matters, and how to roll back:")"
+  echo "      $(t "docs/IM_WEBHOOK_SETUP.md" "docs/IM_WEBHOOK_SETUP.en.md")"
+  echo "  $(t "    (飞书是「原地切换现有 App」,权限一条都不用加;Slack 和钉钉都是新建应用。" "    (Feishu is an in-place cutover of your existing app — no new scopes needed; Slack and DingTalk both need a new app.")"
+  echo "  $(t "     飞书 / Slack 必须先把 Secret 填好,再去平台上保存请求地址 —— 反了 URL 校验必失败;" "     For Feishu / Slack, fill the secrets BEFORE saving the Request URL — the URL challenge fails otherwise;")"
+  echo "  $(t "     钉钉没有 URL 校验这一步,但顺序反了同样白等 —— 机器人不报错,只是不回话。)" "     DingTalk has no URL challenge, but the wrong order still costs you a wait — the robot does not error, it just stays silent.)")"
 else
   echo "  $(t "3️⃣  (可选)IM 机器人 —— 本次未部署。" "3️⃣  (Optional) IM bots — not deployed this run.")"
   echo "      $(t "以后想加飞书/Slack:重跑 ./setup.sh 选对应平台即可,无需重建其余资源。" "To add Feishu/Slack later: re-run ./setup.sh and pick the platform — no need to rebuild anything else.")"
@@ -2035,18 +2154,25 @@ if [ "$ORG_MODE" = true ]; then
   #    member.org.stacksets… **已经在了**（第一条调用成功了），而 CFN 侧是
   #    DISABLED —— 所以只看第一条会以为没问题。
   #
-  # ⚠️ 两条都**只有管理账号能调**。委派管理员场景会失败，那时可信访问应该已经
-  #    在管理账号开过了，所以照旧忽略错误 —— 但**不能静默**：真的没开时
-  #    下面 create-stack-set 会报上面那个 ValidationError，而那句话**不提**
+  # ⚠️ 两条都**只有管理账号能调** —— 所以委派管理员模式下**直接跳过**，不是"调了忽略
+  #    错误"。原因不是省一次调用，而是别让现场以为"脚本已经帮我开好了"：委派管理员
+  #    这条路上可信访问**必须**由管理账号预先开好（注册委派管理员本身就要求它已开），
+  #    真没开时唯一正确的动作是回管理账号跑那两条命令，而不是在当前账号重试。
+  #    与 `infra/lambda/preflight/index.py::_activate_org_access` 同一口径。
+  #
+  #    校验仍然照做（`describe-organizations-access` 委派管理员可调，带 --call-as）：
+  #    真的没开时下面 create-stack-set 会报上面那个 ValidationError，而那句话**不提**
   #    该调 activate-organizations-access。所以这里把状态与补救命令打出来。
   #
   # ⚠️ API 形状已查官方文档核实：`activate-organizations-access` **无参数**
   #    （boto3 `activate_organizations_access()`）。
-  aws organizations enable-aws-service-access \
-    --service-principal member.org.stacksets.cloudformation.amazonaws.com 2>/dev/null || true
-  aws cloudformation activate-organizations-access --region "$DEPLOY_REGION" 2>/dev/null || true
+  if [ "$STACKSET_CALL_AS" = "SELF" ]; then
+    aws organizations enable-aws-service-access \
+      --service-principal member.org.stacksets.cloudformation.amazonaws.com 2>/dev/null || true
+    aws cloudformation activate-organizations-access --region "$DEPLOY_REGION" 2>/dev/null || true
+  fi
 
-  _ORG_ACCESS=$(aws cloudformation describe-organizations-access \
+  _ORG_ACCESS=$(aws cloudformation describe-organizations-access $SS_CALL_AS \
     --region "$DEPLOY_REGION" --query Status --output text 2>/dev/null || echo UNKNOWN)
   if [ "$_ORG_ACCESS" = "ENABLED" ]; then
     echo "  $(t "✓ StackSets 与 Organizations 的可信访问已激活" "✓ Trusted access between StackSets and Organizations is active")"
@@ -2060,7 +2186,7 @@ if [ "$ORG_MODE" = true ]; then
   fi
 
   # 2. 创建或更新 StackSet(SERVICE_MANAGED + auto-deployment)
-  if aws cloudformation describe-stack-set --stack-set-name "$STACKSET_NAME" \
+  if aws cloudformation describe-stack-set --stack-set-name "$STACKSET_NAME" $SS_CALL_AS \
        --region "$DEPLOY_REGION" >/dev/null 2>&1; then
     echo "  $(t "检测到已有 StackSet, 更新模板/参数..." "Existing StackSet detected, updating template/parameters...")"
     # 🔴 **继承客户自己改过的 `EnableSupportCaseWrite`**（案例多账号，2026-09-07）。
@@ -2074,7 +2200,7 @@ if [ "$ORG_MODE" = true ]; then
     #    StackSet 里压根不存在，CFN 直接 ValidationError("has no previous value")，
     #    第一次升级就整块失败。所以只能 describe 一次、**存在才继承**。
     #    与 `infra/lambda/stager/index.py::_PRESERVE_MEMBER_PARAMS` 同一口径。
-    _prev_scw=$(aws cloudformation describe-stack-set --stack-set-name "$STACKSET_NAME" \
+    _prev_scw=$(aws cloudformation describe-stack-set --stack-set-name "$STACKSET_NAME" $SS_CALL_AS \
       --region "$DEPLOY_REGION" \
       --query "StackSet.Parameters[?ParameterKey=='EnableSupportCaseWrite']|[0].ParameterValue" \
       --output text 2>/dev/null || true)
@@ -2083,7 +2209,7 @@ if [ "$ORG_MODE" = true ]; then
       echo "  $(t "保留既有 EnableSupportCaseWrite=" "Keeping existing EnableSupportCaseWrite=")$_prev_scw"
     fi
     aws cloudformation update-stack-set \
-      --stack-set-name "$STACKSET_NAME" \
+      --stack-set-name "$STACKSET_NAME" $SS_CALL_AS \
       --template-body "file://$MEMBER_TEMPLATE" \
       --parameters "${ONBOARD_SS_PARAMS[@]}" \
       --capabilities CAPABILITY_NAMED_IAM \
@@ -2093,7 +2219,7 @@ if [ "$ORG_MODE" = true ]; then
   else
     echo "  $(t "创建 StackSet: " "Creating StackSet: ")$STACKSET_NAME"
     aws cloudformation create-stack-set \
-      --stack-set-name "$STACKSET_NAME" \
+      --stack-set-name "$STACKSET_NAME" $SS_CALL_AS \
       --description "NotiOps member account onboarding (readonly role + event forwarding)" \
       --template-body "file://$MEMBER_TEMPLATE" \
       --parameters "${ONBOARD_SS_PARAMS[@]}" \
@@ -2137,10 +2263,10 @@ if [ "$ORG_MODE" = true ]; then
     "ParameterKey=CreateCollectionRole,ParameterValue=no"
   )
 
-  if aws cloudformation describe-stack-set --stack-set-name "$DA_STACKSET_NAME" \
+  if aws cloudformation describe-stack-set --stack-set-name "$DA_STACKSET_NAME" $SS_CALL_AS \
        --region "$DEPLOY_REGION" >/dev/null 2>&1; then
     aws cloudformation update-stack-set \
-      --stack-set-name "$DA_STACKSET_NAME" \
+      --stack-set-name "$DA_STACKSET_NAME" $SS_CALL_AS \
       --template-body "file://$DA_TEMPLATE" \
       --parameters "${DA_SS_PARAMS[@]}" \
       --capabilities CAPABILITY_NAMED_IAM \
@@ -2149,7 +2275,7 @@ if [ "$ORG_MODE" = true ]; then
       || echo "  $(t "⚠ DevOps Agent StackSet 更新失败(可能有进行中的 operation)" "⚠ DevOps Agent StackSet update failed (an operation may be in progress)")"
   else
     aws cloudformation create-stack-set \
-      --stack-set-name "$DA_STACKSET_NAME" \
+      --stack-set-name "$DA_STACKSET_NAME" $SS_CALL_AS \
       --description "NotiOps member DevOps Agent onboarding (agent space + trigger role)" \
       --template-body "file://$DA_TEMPLATE" \
       --parameters "${DA_SS_PARAMS[@]}" \
@@ -2173,7 +2299,7 @@ if [ "$ORG_MODE" = true ]; then
     echo "  $(t "下发 Stack Instances 到: " "Deploying Stack Instances to: ")$ORG_TARGET_OUS(region: $DEPLOY_REGION)"
     OU_JSON=$(echo "$ORG_TARGET_OUS" | awk -F',' '{printf "["; for(i=1;i<=NF;i++){printf "%s\"%s\"", (i>1?",":""), $i}; printf "]"}')
     aws cloudformation create-stack-instances \
-      --stack-set-name "$STACKSET_NAME" \
+      --stack-set-name "$STACKSET_NAME" $SS_CALL_AS \
       --deployment-targets "{\"OrganizationalUnitIds\":$OU_JSON}" \
       --regions "$DEPLOY_REGION" \
       --operation-preferences FailureTolerancePercentage=100,MaxConcurrentPercentage=100 \

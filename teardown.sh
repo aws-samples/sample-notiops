@@ -38,7 +38,7 @@
 # 绝不碰的东西(哪怕名字里有 notiops):CDK bootstrap(CDKToolkit 栈、
 # cdk-hnb659fds-assets-* 桶、cdk-hnb659fds-container-assets-* ECR、
 # SSM /cdk-bootstrap/hnb659fds/version)、Glue 数据库 cid_cur(属 CID 项目)、
-# Security Hub 委派管理员与 Finding Aggregator、任何不在下面白名单里的资源。
+# Security Hub 委派管理员与 Finding Aggregator、任何不在下面允许清单里的资源。
 # 本脚本只按【精确名字】删,不做前缀批量删除(日志组清理除外,且那几个前缀都是本项目独占)。
 # =============================================================================
 set -euo pipefail
@@ -129,6 +129,40 @@ GW_ROLE="notiops-websearch-gateway-role"
 GW_ROLE_POLICY="NotiOpsWebSearchGateway"
 STACKSET_ONBOARD="notiops-member-onboarding"
 STACKSET_DA="notiops-member-devops-agent"
+
+# ─── service-managed StackSet 的操作身份(CallAs)────────────────────────────
+# 多账号部署可以由**组织管理账号**(`CallAs=SELF`)或**已注册的 StackSets 委派管理员**
+# (`CallAs=DELEGATED_ADMIN`)驱动 —— 判定逻辑见下面的 detect_stackset_call_as()。
+# StackSet 实体在两种形态下都存放在**管理账号**里,委派管理员不带 `--call-as` 时
+# `describe-stack-set` 在本账号命名空间里**查不到**它。
+#
+# 🔴 teardown 里漏掉它的后果比 setup 更糟:盘点阶段判「没有 StackSet」⇒ 不列、不问、
+#    不删,`--delete-stacksets` 静默变成 no-op,最后打印「已清理完毕」——
+#    而管理账号里的 StackSet 和全组织的成员账号 stack **全都还在**(继续留着只读角色
+#    和事件转发规则),客户以为卸干净了。
+#
+# ⚠️ `SS_CALL_AS` 是**未加引号**展开的参数片段(SELF 时为空串 = 用 CLI 默认值)。
+#    与 setup.sh::detect_stackset_call_as 同一套算法,含**按 service principal 过滤**
+#    ——一个账号可能是**别的**服务的委派管理员,那也会让它拿到 Organizations 只读权限。
+STACKSET_CALL_AS="SELF"
+SS_CALL_AS=""
+STACKSETS_SERVICE_PRINCIPAL="member.org.stacksets.cloudformation.amazonaws.com"
+detect_stackset_call_as() {
+  local mgmt
+  mgmt=$(aws organizations describe-organization \
+    --query 'Organization.MasterAccountId' --output text 2>/dev/null || echo "")
+  [ -n "$mgmt" ] && [ "$mgmt" != "None" ] || return 0
+  [ "$ACCOUNT" = "$mgmt" ] && return 0        # 管理账号:CallAs=SELF(缺省)
+  if aws organizations list-delegated-administrators \
+       --service-principal "$STACKSETS_SERVICE_PRINCIPAL" \
+       --query 'DelegatedAdministrators[].Id' --output text 2>/dev/null \
+     | tr '\t' '\n' | grep -qx "$ACCOUNT"; then
+    STACKSET_CALL_AS="DELEGATED_ADMIN"
+    SS_CALL_AS="--call-as DELEGATED_ADMIN"
+  fi
+  return 0
+}
+detect_stackset_call_as
 # ⚠️ 这个清单必须与 CDK 里 RemovalPolicy.RETAIN 的表**一一对应**（少一张的后果：
 #    teardown 后那张表带着 PITR 持续计费，且盘点/删除/清点四处循环全看不见它 ——
 #    notiops-inspection 就这样漏过一次，2026-09-04 实测删库时靠手工补删）。
@@ -245,8 +279,8 @@ else
   echo "  · IAM role: $GW_ROLE  $(t "—— 不存在" "— not present")"
 fi
 for ss in "$STACKSET_ONBOARD" "$STACKSET_DA"; do
-  if aws cloudformation describe-stack-set --stack-set-name "$ss" --region "$REGION" >/dev/null 2>&1; then
-    cnt="$(awsq cloudformation list-stack-instances --stack-set-name "$ss" --query 'length(Summaries)')"
+  if aws cloudformation describe-stack-set --stack-set-name "$ss" $SS_CALL_AS --region "$REGION" >/dev/null 2>&1; then
+    cnt="$(awsq cloudformation list-stack-instances --stack-set-name "$ss" $SS_CALL_AS --query 'length(Summaries)')"
     echo "  · StackSet: $ss  ($(t "实例 " "instances ")${cnt:-?})"; FOUND_ANY=true
   else
     echo "  · StackSet: $ss  $(t "—— 不存在" "— not present")"
@@ -503,7 +537,7 @@ step "$(t "8/8 多账号:成员账号 StackSet" "8/8 Multi-account: member-accou
 # 跨账号删除影响别人的账号,默认只打印命令。--delete-member-stacksets 才真删。
 SS_PRESENT=()
 for ss in "$STACKSET_ONBOARD" "$STACKSET_DA"; do
-  aws cloudformation describe-stack-set --stack-set-name "$ss" --region "$REGION" >/dev/null 2>&1 && SS_PRESENT+=("$ss")
+  aws cloudformation describe-stack-set --stack-set-name "$ss" $SS_CALL_AS --region "$REGION" >/dev/null 2>&1 && SS_PRESENT+=("$ss")
 done
 if [ "${#SS_PRESENT[@]}" -eq 0 ]; then
   echo "$(t "没有 StackSet(单账号部署),跳过。" "No StackSets (single-account deployment) — skipping.")"
@@ -511,28 +545,31 @@ elif [ "$DELETE_STACKSETS" = false ]; then
   warn "$(t "发现 StackSet,但默认不删(它在成员账号里建资源,删除会影响别人的账号)。" \
            "StackSets found but not deleted by default (they create resources in member accounts).")"
   echo "$(t "  要删就重跑并加 --delete-member-stacksets,或手工:" "  Re-run with --delete-member-stacksets, or do it manually:")"
+  # ⚠️ 打出来的命令里必须带上 `$SS_CALL_AS`(委派管理员形态下才非空)。
+  #    少了它客户照着粘贴会得到 StackSetNotFoundException —— 而这个错误看起来像
+  #    「已经删过了」,于是就真的不管了,成员账号里的只读角色和转发规则永久留着。
   for ss in "${SS_PRESENT[@]}"; do
     cat <<EOF
-    aws cloudformation list-stack-instances --stack-set-name $ss --region $REGION
-    aws cloudformation delete-stack-instances --stack-set-name $ss --region $REGION \\
+    aws cloudformation list-stack-instances --stack-set-name $ss $SS_CALL_AS --region $REGION
+    aws cloudformation delete-stack-instances --stack-set-name $ss $SS_CALL_AS --region $REGION \\
       --deployment-targets OrganizationalUnitIds=<ou-id> --regions $REGION --no-retain-stacks
-    aws cloudformation delete-stack-set --stack-set-name $ss --region $REGION
+    aws cloudformation delete-stack-set --stack-set-name $ss $SS_CALL_AS --region $REGION
 EOF
   done
 else
   for ss in "${SS_PRESENT[@]}"; do
-    OUS="$(awsq cloudformation list-stack-instances --stack-set-name "$ss" \
+    OUS="$(awsq cloudformation list-stack-instances --stack-set-name "$ss" $SS_CALL_AS \
              --query 'Summaries[].OrganizationalUnitId' | tr '\t' '\n' | sort -u | grep -v '^None$' | tr '\n' ' ')"
     if [ -n "${OUS// /}" ]; then
       info "$(t "删 $ss 的实例(OU: ${OUS})…" "Deleting $ss instances (OUs: ${OUS})…")"
       # shellcheck disable=SC2086
-      OP="$(awsq cloudformation delete-stack-instances --stack-set-name "$ss" \
+      OP="$(awsq cloudformation delete-stack-instances --stack-set-name "$ss" $SS_CALL_AS \
               --deployment-targets OrganizationalUnitIds=$(echo "$OUS" | tr ' ' ',' | sed 's/,$//') \
               --regions "$REGION" --no-retain-stacks --query OperationId)"
       if [ -n "$OP" ] && [ "$OP" != "None" ]; then
         info "$(t "等待 StackSet 操作 " "Waiting for StackSet operation ")$OP …"
         for _ in $(seq 1 120); do
-          ST="$(awsq cloudformation describe-stack-set-operation --stack-set-name "$ss" \
+          ST="$(awsq cloudformation describe-stack-set-operation --stack-set-name "$ss" $SS_CALL_AS \
                   --operation-id "$OP" --query 'StackSetOperation.Status')"
           case "$ST" in
             SUCCEEDED) ok "$(t "实例已删除" "Instances deleted")"; break ;;
@@ -543,7 +580,7 @@ else
       fi
     fi
     info "$(t "删 StackSet " "Deleting StackSet ")$ss"
-    run aws cloudformation delete-stack-set --stack-set-name "$ss" --region "$REGION" >/dev/null 2>&1 || \
+    run aws cloudformation delete-stack-set --stack-set-name "$ss" $SS_CALL_AS --region "$REGION" >/dev/null 2>&1 || \
       warn "$(t "StackSet 删除失败(可能还有实例),需手工处理: " "StackSet deletion failed (instances may remain); handle manually: ")$ss"
   done
 fi

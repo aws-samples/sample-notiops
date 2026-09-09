@@ -92,17 +92,97 @@ Once `setup.sh` finishes, split features into two buckets — **don't mistake "o
 
 | | **Single-account (default)** | **Multi-account** `./setup.sh --multi-account` |
 |---|---|---|
-| **How to trigger** | Just `./setup.sh` | `./setup.sh --multi-account`, run in the **Organizations management account** — or in a member account registered as a **CloudFormation StackSets delegated administrator** |
+| **How to trigger** | Just `./setup.sh` | `./setup.sh --multi-account`, run either in the **organization management account (payer)** or in a member account registered as a **StackSets delegated administrator** — see the note below |
 | **Who it's for** | Using NotiOps in **this account only** (most trials / single-account customers) | Managing many accounts under Organizations and wanting **cross-member-account** inspection / investigation / event forwarding |
 | **Cross-account gate** | Locked to the deploy account (`LOCKED_ACCOUNT_ID` = this account); the Web console's multi-account selector lists only this account | Gate unlocked (`LOCKED_ACCOUNT_ID` empty, using `aws:PrincipalOrgID` to allow the whole org); console can onboard / switch member accounts |
 | **Member-account resources** | Not rolled out | Rolled out automatically to member accounts via **StackSets** (read-only role + DevOps/PHD event forwarding) |
 | **Features affected** | All Web Chat features work out of the box for **this account** | Additionally unlocks: cross-account **idle/cost inspection**, cross-account **incident investigation**, cross-account **PHD/DevOps event forwarding**, and the console "Account Onboarding (Organizations)" page |
 
-**Why isn't multi-account the default?** Multi-account mode requires the current identity to be the **Organizations management account** (or its **StackSets delegated administrator**), touches StackSets, and rolls out resources to member accounts — unnecessary and higher-privilege for the vast majority who just want to try it in a single account. Single-account is the least-privilege, fastest path to a working deployment, so it is **off by default**; add `--multi-account` explicitly when you need it.
+#### Hard prerequisite: management account, or a StackSets delegated administrator
 
-**Already deployed single-account and now want multi-account?** Re-run `./setup.sh --multi-account` in the Organizations management account (or a StackSets delegated-admin account) — the incremental CDK update rewrites the gate and rolls out member-account resources. If the Web console shows "This deployment does not have Organizations multi-account mode enabled. Redeploy with `./setup.sh --multi-account` from the management account (or a StackSets delegated-admin account)", that is exactly this signal — you are on a single-account deployment and need to re-run with `--multi-account` from the management account (or delegated admin). **This cannot be toggled from the console.**
+> `--multi-account` accepts **two** deploying identities — either one is enough:
+> 1. the **AWS Organizations management account (payer)**; or
+> 2. a member (linked) account that the management account has registered as a **CloudFormation StackSets delegated administrator**.
+>
+> **No flag distinguishes them** — `setup.sh` detects it (`detect_stackset_call_as`). Once it recognizes
+> a delegated administrator it carries `CallAs=DELEGATED_ADMIN` through every StackSets call (creating /
+> updating both StackSets, rolling out instances, and `teardown.sh`'s inventory and delete paths), and
+> passes `stackSetCallAs` / `orgManagementAccountId` into CDK so the runtime one-click onboarding in
+> `bff/web-chat/member_accounts.mjs` sends it too.
 
-> Not sure which to pick? **Get single-account working first**, confirm Web Chat is usable, then re-run `--multi-account` from the management account (or delegated admin) once you actually have a cross-account need. The two don't conflict — multi-account is a superset.
+Check before you run `--multi-account` (a few seconds):
+
+```bash
+aws organizations describe-organization --query 'Organization.[Id,MasterAccountId]' --output text
+aws sts get-caller-identity --query Account --output text
+```
+
+Second **column** of the first command (`MasterAccountId`) == output of the second ⇒ this is the
+management account, go ahead. They **differ** ⇒ this is a member account; check whether it is already a
+StackSets delegated administrator:
+
+```bash
+aws organizations list-delegated-administrators \
+  --service-principal member.org.stacksets.cloudformation.amazonaws.com \
+  --query 'DelegatedAdministrators[].Id' --output text
+```
+
+This account's id **is** in the output ⇒ go ahead. It is not ⇒ three ways forward: have the management
+account register it (below), run it in the management account instead, or stay on default single-account
+mode (web / IM / deep investigation / case creation all work exactly the same, it just only sees this one
+account).
+⚠️ That command **must** pass `--service-principal`. Without it you get the delegated administrators of
+**every** service (GuardDuty / Config / Security Hub …); those accounts also hold Organizations read-only
+permissions but **cannot** operate StackSets, so judging from that list gives you a "should work" that
+turns into `AccessDenied` at StackSet creation time.
+First command says `AWSOrganizationsNotInUseException` ⇒ this account is not in an organization at all;
+single-account is the only option.
+
+**Registering a delegated administrator (one-time, run in the management account):**
+
+```bash
+aws organizations register-delegated-administrator \
+  --service-principal member.org.stacksets.cloudformation.amazonaws.com \
+  --account-id <the member account you will deploy NotiOps into>
+```
+
+The reverse is `aws organizations deregister-delegated-administrator` (same two parameters). Then just
+re-run `./setup.sh --multi-account` in that member account — **no extra flags**.
+
+**Four things to know before taking this path:**
+
+1. ⚠️ **A delegated administrator has full deployment permissions across the whole organization.** AWS
+   states plainly that the management account **cannot** scope it to specific OUs or operations — once
+   registered, this member account can deploy StackSets into **any** account in the organization, not
+   just NotiOps' two. That is the AWS StackSets model, not a NotiOps implementation choice.
+2. **Trusted access must already be enabled by the management account.** `enable-aws-service-access` and
+   `activate-organizations-access` are **management-account only**, so on this path `setup.sh` **skips**
+   them (rather than "call and swallow the error", which would make people believe the script had turned
+   it on). It only verifies with `describe-organizations-access --call-as DELEGATED_ADMIN` and, if it is
+   off, prints both commands for you to run in the management account.
+3. **An organization allows at most 5 delegated administrators** (an AWS hard limit, across all services).
+4. **The StackSet entities live in the management account**, even when a delegated administrator created
+   them. So `notiops-member-onboarding` / `notiops-member-devops-agent` do not show up in the **deploying**
+   account's CloudFormation console (you need `--call-as DELEGATED_ADMIN` to see them); `teardown.sh`
+   passes that flag too, so nothing is silently skipped at delete time.
+
+> 🔴 **One hard limit that has nothing to do with which identity you use**: CloudFormation **never**
+> deploys a service-managed StackSet into the **organization management account itself** — even if you
+> target the OU it sits in, `CreateStackInstances` returns SUCCEEDED and creates nothing (a silent fake
+> success). So "let NotiOps inspect the management account itself" cannot go through a StackSet: deploy
+> `infra/member-account-onboarding.yaml` there by hand, then register it via "Manual onboarding" in the
+> Admin page. This is the same under both deploying identities.
+
+When the prerequisite isn't met, `setup.sh` **stops and exits 1 before `cdk deploy`** (it does not
+silently fall back to single-account), printing those three ways forward and the register command
+verbatim. The one-click equivalent is
+[DEPLOYMENT_ONECLICK.en.md §2.6.1](DEPLOYMENT_ONECLICK.en.md#261-hard-prerequisite-management-account-or-a-stacksets-delegated-administrator).
+
+**Why isn't multi-account the default?** Multi-account mode requires the current identity to be the **Organizations management account or a StackSets delegated administrator**, touches StackSets, and rolls out resources to member accounts — unnecessary and higher-privilege for the vast majority who just want to try it in a single account. Single-account is the least-privilege, fastest path to a working deployment, so it is **off by default**; add `--multi-account` explicitly when you need it.
+
+**Already deployed single-account and now want multi-account?** Re-run `./setup.sh --multi-account` from the management account (or a registered delegated administrator account) — the incremental CDK update rewrites the gate and rolls out member-account resources. If the Web console shows "This deployment does not have Organizations multi-account mode enabled. Redeploy with `./setup.sh --multi-account` from the organization management account", that is exactly this signal — you are on a single-account deployment and need to re-run with `--multi-account`. **This cannot be toggled from the console.**
+
+> Not sure which to pick? **Get single-account working first**, confirm Web Chat is usable, then re-run `--multi-account` once you actually have a cross-account need. The two don't conflict — multi-account is a superset.
 
 ### 0.2 Verify
 
@@ -687,12 +767,12 @@ Then try a plain question that is **not** an investigation (it goes to the DevOp
 5. Within **1–2 seconds**, a **🤔 Thinking · Ns elapsed** card appears (this is the criterion — a card, immediately)
 6. Body text and ⚙️ progress lines refresh on that same card, and the elapsed seconds in the title keep
    climbing (roughly every 2s for the first 30s, slower after that — see
-   [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §6.2)
+   [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §7.2)
 7. When it finishes (possibly minutes later) the card settles into the answer plus two buttons
 
 ⚠️ "It took several minutes to answer" is **not** a failure. There is exactly one criterion:
 **did the thinking card show up immediately after you sent the question?** The user-facing wording is in
-[IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §6 — don't file it as a regression.
+[IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §7 — don't file it as a regression.
 
 If it fails → §10 [Top 5 Deployment Errors](#10-top-5-deployment-errors).
 

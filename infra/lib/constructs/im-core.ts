@@ -253,20 +253,32 @@ export interface ImCoreProps {
   fnName: (role: string) => string;
   /** true = 显式建 `/aws/lambda/<fnName>` 同名日志组（方式B）；false = 交给 CFN 命名（方式A）。 */
   explicitLogGroupNames: boolean;
-  /** 合成期是否生成该平台的资源。方式A 两个都给 true，靠 conditions 在部署期决定。 */
-  platforms: { feishu: boolean; slack: boolean };
+  /** 合成期是否生成该平台的资源。方式A 三个都给 true，靠 conditions 在部署期决定。 */
+  platforms: { feishu: boolean; slack: boolean; dingtalk: boolean };
   /** 方式A：部署期条件。方式B 不传。anyPlatform 盖住共用资源（role / progress / 节拍）。 */
   conditions?: {
     feishu?: cdk.CfnCondition;
     slack?: cdk.CfnCondition;
+    dingtalk?: cdk.CfnCondition;
     anyPlatform?: cdk.CfnCondition;
   };
   /** EventBridge 规则物理名。方式A 不传（让 CFN 命名，避免与 setup.sh 部署撞名）。 */
   progressRuleName?: string;
   /** ingress 保活规则的物理名生成器（`role` 形如 `ingress-feishu`）。方式A 不传，同上。 */
   keepAliveRuleName?: (role: string) => string;
-  /** Secret 名。两条路径目前一致，留成参数是为了让"改名"这件事只能改一处。 */
-  secretNames?: { feishu?: string; slackBotToken?: string; slackSigningSecret?: string };
+  /** Secret 名。两条路径目前一致，留成参数是为了让"改名"这件事只能改一处。
+   *
+   *  ⚠️ 钉钉只有**一个** secret（JSON 里 `app_key` / `app_secret`），与飞书同构 ——
+   *  别按 Slack 那样拆两个：入站验签用的就是 `app_secret`（`sign = base64(
+   *  HMAC_SHA256(appSecret, ts + "\n" + appSecret))`），拆开等于让两个 secret 必须
+   *  永远保持一致。旧 Fargate 形态那两个（`notiops/dingtalk-app-key` /
+   *  `notiops/dingtalk-app-secret`）是**另一套**，不要复用。 */
+  secretNames?: {
+    feishu?: string;
+    slackBotToken?: string;
+    slackSigningSecret?: string;
+    dingtalk?: string;
+  };
 }
 
 export interface ImCoreResult {
@@ -274,6 +286,8 @@ export interface ImCoreResult {
   /** 飞书 webhook 地址 = HTTP API `$default` stage 的 URL（未启用飞书时 undefined）。 */
   feishuWebhookUrl?: string;
   slackWebhookUrl?: string;
+  /** 钉钉「机器人 → 消息接收模式 → HTTP 模式」里填的那个地址（未启用时 undefined）。 */
+  dingtalkWebhookUrl?: string;
   /** 本次实际创建的全部 IM 函数。
    *
    *  方式A 需要它来给每个函数挂 `addDependency(StagerArtifacts)` —— 代码在 staging 桶里，
@@ -291,14 +305,24 @@ export interface ImCoreResult {
   /** 本次实际生效的 Secret 名（props 没给就是默认值）。
    *
    *  同上：回调 Lambda 要靠 `FEISHU_SECRET_NAME` / `SLACK_BOT_TOKEN_ARN` 才发得出卡片，
-   *  而 `imRole` 的 secretsmanager 语句是按**这三个名字**收窄的。两处必须同源。 */
-  secretNames: { feishu: string; slackBotToken: string; slackSigningSecret: string };
+   *  而 `imRole` 的 secretsmanager 语句是按**这几个名字**收窄的。两处必须同源。
+   *
+   *  钉钉尤其要靠这个：报告回写走 `shared/dingtalk_api.py`，它读的是
+   *  `DINGTALK_SECRET_ARN` —— 回调 Lambda 少注这一条的症状是报告**投不出去**
+   *  （落到自定义机器人 webhook 兜底，甚至完全没有），而 IM 面板照样显示调查结束。 */
+  secretNames: {
+    feishu: string;
+    slackBotToken: string;
+    slackSigningSecret: string;
+    dingtalk: string;
+  };
 }
 
 export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult {
   const feishuSecret = props.secretNames?.feishu ?? "notiops/im-bot-feishu";
   const slackTokenSecret = props.secretNames?.slackBotToken ?? "notiops/slack-bot-token";
   const slackSigningSecret = props.secretNames?.slackSigningSecret ?? "notiops/slack-signing-secret";
+  const dingtalkSecret = props.secretNames?.dingtalk ?? "notiops/im-bot-dingtalk";
   // NotiOps agent runtime ARN（`/agent notiops` 那条路要用）。取值口径与
   // `web-chat-core.ts` 里那一行**逐字一致** —— 两边都读同一个 `-c agentRuntimeArn`，
   // 只要 setup.sh 传了，web 和 IM 就一定指向同一个 runtime（会话隔离靠 runtimeSessionId，
@@ -504,14 +528,20 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
     resources: [`arn:aws:ssm:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:parameter/notiops/*`],
   }));
 
-  // Secrets Manager —— 飞书凭证 + Slack token + Bedrock API Key。
+  // Secrets Manager —— 飞书凭证 + Slack token + 钉钉凭证 + Bedrock API Key。
   // 缺 bedrock-api-key 那条的失败模式是**静默的**（回退 IAM 角色，对话照常但 Key 永不生效）。
+  //
+  // ⚠️ 这里**无条件**给全 4 个平台 secret（不按 props.platforms 裁剪）：
+  // 授权的是"这个名字前缀"，secret 不存在时这条语句什么也授不到，没有权限蔓延；
+  // 而按平台裁剪的代价是方式A 里要为每种 InstallOption 组合各生成一份策略
+  // （客户切换选项时还得改策略），换来的收益是零。
   imRole.addToPrincipalPolicy(new iam.PolicyStatement({
     actions: ["secretsmanager:GetSecretValue"],
     resources: [
       `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:${feishuSecret}-*`,
       `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:${slackTokenSecret}-*`,
       `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:${slackSigningSecret}-*`,
+      `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:${dingtalkSecret}-*`,
       `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/bedrock-api-key-*`,
     ],
   }));
@@ -542,6 +572,7 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
       feishu: feishuSecret,
       slackBotToken: slackTokenSecret,
       slackSigningSecret,
+      dingtalk: dingtalkSecret,
     },
   };
 
@@ -750,10 +781,109 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
     }
   }
 
+  // ─── 钉钉 ──────────────────────────────────────────────────────────────
+  // 与飞书 / Slack 同构的 ingress + worker + HttpApi + 保活，差异只有三处，
+  // 每一处都在下面就地注明：
+  //   1. 只有**一个** secret（`app_key` / `app_secret` 在同一个 JSON 里）；
+  //   2. 群允许清单的变量名是 `ALLOWED_CONVERSATION_IDS`，且**只给 worker**；
+  //   3. 不进下面那个进度轮询门 —— 钉钉发出去的消息拿不到 id，改不了已发消息，
+  //      所以它压根不写 `imtask#` 行（设计文档 §4.4），轮询对它无事可做。
+  if (props.platforms.dingtalk) {
+    const dtWorkerName = props.fnName("worker-dingtalk");
+    const dtWorkerFn = new lambda.Function(scope, "DingtalkWorker", {
+      ...commonFnProps,
+      functionName: dtWorkerName,
+      handler: "platforms.dingtalk.lambda_worker.handler",
+      logGroup: createLogGroup("DingtalkWorkerLogs", dtWorkerName),
+      // 900s / 1024MB：与飞书 / Slack worker 逐字一致，理由同（要 join 后台线程，
+      // 案例路径含多次 LLM 调用）。钉钉这边还多一件事：`sessionWebhook` 的有效期是
+      // ≈90 分钟 > Lambda 的 15 分钟上限，所以整个 900s 里回复都不需要 access_token。
+      timeout: cdk.Duration.seconds(900),
+      memorySize: 1024,
+      environment: {
+        ...commonEnv,
+        // ⚠️ 变量名是 `..._SECRET_ARN`，但值这里给的是 secret **名**
+        // （GetSecretValue 两种都吃）。`shared/dingtalk_api.py::secret_id()` 先读
+        // 这个、再读 `DINGTALK_SECRET_NAME`、最后才回落字面默认值。
+        DINGTALK_SECRET_ARN: dingtalkSecret,
+        // 钉钉侧的群允许清单变量名是 `ALLOWED_CONVERSATION_IDS`（飞书 ALLOWED_CHAT_IDS /
+        // Slack ALLOWED_CHANNEL_IDS）—— 沿用 platforms/dingtalk/lambda_worker.py:68
+        // 的既有口径，别为了"统一"改名：改了等于给钉钉埋一个空白清单（=不限制）。
+        ALLOWED_CONVERSATION_IDS: props.allowedChatIds,
+      },
+      description: "NotiOps DingTalk IM worker -- shares platforms/common/router.py with the Feishu and Slack workers",
+    });
+    result.functions.push(dtWorkerFn);
+
+    const dtIngressFn = new lambda.Function(scope, "DingtalkIngress", {
+      ...commonFnProps,
+      functionName: props.fnName("ingress-dingtalk"),
+      handler: "platforms.dingtalk.lambda_ingress.handler",
+      logGroup: createLogGroup("DingtalkIngressLogs", props.fnName("ingress-dingtalk")),
+      // 20s / 2048MB / 并发 10 —— 与飞书 / Slack ingress 保持**同一组数**。
+      //
+      // 钉钉这条路的 import 其实轻得多（验签是 stdlib hmac，**没有** IM SDK：
+      // 见 platforms/dingtalk/lambda_ingress.py 文件头），所以它大概率不会撞
+      // Lambda 的 10s INIT 硬上限。仍然对齐而不是各调一套，理由有两条：
+      //   · 钉钉的回调超时同样是秒级，冷启动一次就是一次「操作失败」，余量没有坏处；
+      //   · 三个 ingress 的这三个数一旦各不相同，下次调优就会变成"改一个忘两个"。
+      // 想为钉钉单独降内存，先拿现网 INIT_REPORT 量一遍再说，别照着"应该更快"改。
+      timeout: cdk.Duration.seconds(20),
+      memorySize: 2048,
+      reservedConcurrentExecutions: 10,
+      environment: {
+        ...commonEnv,
+        DINGTALK_SECRET_ARN: dingtalkSecret,
+        DINGTALK_WORKER_FUNCTION: dtWorkerFn.functionName,
+        // ⚠️ 这里**故意不给** ALLOWED_CONVERSATION_IDS。飞书 / Slack 的 ingress 需要
+        // 群清单是因为它们要在投完 worker 之后贴一个"收到了"的表情
+        // （platforms/common/quick_ack.py），得先过一遍清单。**钉钉机器人没有
+        // 表情/回应 API**（设计文档 §4.2），ingress 除了验签+转投什么都不做 ——
+        // 给了只会让人以为这里也有一道判定。权威判定在 worker 那份。
+      },
+      description: "NotiOps DingTalk IM ingress -- HTTP API webhook: verify the HMAC signature, invoke the worker asynchronously, ACK immediately",
+    });
+    result.functions.push(dtIngressFn);
+    grantInvokeWorkerByName(imRole, dtWorkerName);
+
+    const dingtalkApi = createIngressHttpApi(
+      scope,
+      "DingtalkIngressApi",
+      dtIngressFn,
+      props.fnName("ingress-dingtalk"),
+      "NotiOps DingTalk IM webhook front door -- catch-all route to the ingress Lambda",
+    );
+    result.dingtalkWebhookUrl = dingtalkApi.url;
+
+    const dtKeepAlive = createIngressKeepAlive(
+      scope,
+      "DingtalkIngressKeepAlive",
+      dtIngressFn,
+      props.keepAliveRuleName?.("ingress-dingtalk"),
+      "Keeps the NotiOps DingTalk IM ingress Lambda warm -- DingTalk retries a slow callback and the user just sees a failed action",
+    );
+
+    if (props.conditions?.dingtalk) {
+      applyConditionDeep(dtWorkerFn, props.conditions.dingtalk);
+      applyConditionDeep(dtIngressFn, props.conditions.dingtalk);
+      applyConditionDeep(dtKeepAlive, props.conditions.dingtalk);
+      applyConditionDeep(dtWorkerFn.logGroup as unknown as Construct, props.conditions.dingtalk);
+      applyConditionDeep(dtIngressFn.logGroup as unknown as Construct, props.conditions.dingtalk);
+      // 第 6 处：HTTP API 子树。集成给 ingress 加的 `AWS::Lambda::Permission` 挂在
+      // **Route** 底下，不在函数子树里 —— 漏了就是「没选钉钉却留下引用不存在 API 的
+      // Permission」→ CREATE_FAILED 整栈回滚。
+      applyConditionDeep(dingtalkApi.api, props.conditions.dingtalk);
+    }
+  }
+
   // ─── 调查进度轮询（平台无关）───────────────────────────────────────────
   // 取代 Fargate 里的 progress_poller 常驻线程。1 分钟一跳；没有在飞的调查时
   // list_im_tasks 返回空、函数 ~100ms 结束（月成本 < $0.02）。
-  // 只要启用了任一 IM 平台就需要它。
+  //
+  // ⚠️ 门里**没有钉钉**，这是故意的：轮询的活是"读 `imtask#` 行 → 原地 PATCH 那张
+  // 进度卡片"，而钉钉发出去的消息拿不到 id、改不了已发消息，所以它压根不写
+  // `imtask#` 行（设计文档 §4.4，进度改成 ≤2 条追加消息，由 worker 自己在
+  // `append_progress.py` 里发）。只装钉钉时建这个函数 = 每分钟空跑一次。
   if (props.platforms.feishu || props.platforms.slack) {
     const progressName = props.fnName("progress");
     const progressFn = new lambda.Function(scope, "ImProgress", {
@@ -791,8 +921,22 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
       applyConditionDeep(progressFn, props.conditions.anyPlatform);
       applyConditionDeep(progressFn.logGroup as unknown as Construct, props.conditions.anyPlatform);
       applyConditionDeep(rule, props.conditions.anyPlatform);
-      applyConditionDeep(imRole, props.conditions.anyPlatform);
     }
+  }
+
+  // ─── 共用角色的部署期条件 ─────────────────────────────────────────────────
+  // ⚠️ 这一段**必须在上面那个进度轮询门之外**。它原来就写在门里，那时"门"和
+  // "anyPlatform"恰好等价（只有飞书 + Slack 两个平台）。加了钉钉之后不再等价：
+  // 客户在方式A 里选 `web+dingtalk` 时门是关的，imRole 就永远拿不到条件
+  // → 角色在 `InstallIm` 为假时照样被创建（无害但多一个空角色），更糟的是反过来 ——
+  // 若把门写成三平台或，只装钉钉时 progress 函数又会每分钟空跑。分开写两件事：
+  //   · progress 函数只服务会写 `imtask#` 的平台（飞书 / Slack）；
+  //   · imRole 服务**所有** IM 函数，所以跟着 anyPlatform（含钉钉）。
+  // 放在最后是刻意的：此时角色的 DefaultPolicy 已经收齐全部 grant（含钉钉那条
+  // `grantInvokeWorkerByName`），applyConditionDeep 才能把条件打到它身上。
+  if (props.conditions?.anyPlatform
+      && (props.platforms.feishu || props.platforms.slack || props.platforms.dingtalk)) {
+    applyConditionDeep(imRole, props.conditions.anyPlatform);
   }
 
   return result;

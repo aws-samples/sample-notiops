@@ -134,7 +134,18 @@ CLI_GENERATED_SIDS = {
 
 # runtime 执行角色的授权段。两个 marker 都是文件里的章节注释 —— 挑它们而不是行号，
 # 是因为行号会随任何编辑漂移，而章节注释改动时提取器会**失败**（见 main 的兜底）。
-ONECLICK_IAM_SCOPE = ("// ══ AgentCore Runtime（同栈资源）", "// ══ Web Chat 主体")
+#
+# ⚠️ 结束 marker 是「多账号资格前置检查」而不是「Web Chat 主体」（2026-09-08 改）：
+# PreflightFn 的角色原本排在 `// ══ Web Chat 主体` **之后**，天然落在窗口外；委派管理员
+# 那一版把这 ~100 行整块上移到 Runtime 之后（它的输出要喂给 web-chat 的环境变量与两个
+# StackSet ARN），于是 `PreflightOwnLogs` / `PreflightReadOrganization` /
+# `PreflightActivateStackSetsOrgAccess` 三条**混进了 runtime 角色的窗口**，被判成
+# 「方式 B 少了三条授权」。它们是方式 A 独有的**另一个角色**（方式 B 的同一段资格探测
+# 由 `setup.sh` 的 `detect_stackset_call_as()` 用本地凭证直接跑，没有 Lambda、也就没有
+# 角色），不是漂移，也不该塞进 CLI_GENERATED_SIDS（那张表的语义是「CLI 生成的等价授权」）。
+# 收窄窗口是正解：这两个 marker 之间除 PreflightFn 外没有别的角色（改动时自己核一遍
+# `awk 'NR>=a&&NR<=b && /new iam.Role/'`）。
+ONECLICK_IAM_SCOPE = ("// ══ AgentCore Runtime（同栈资源）", "// ══ 多账号资格前置检查")
 SETUP_IAM_SCOPE = ("// ── NotiOps：给所有 runtime 执行角色授予", "// Create AgentCoreMcp")
 
 
@@ -743,8 +754,14 @@ IM_PACKAGE_SCRIPT = "scripts/package_artifacts.sh"
 IM_STAGER = "infra/lambda/stager/index.py"
 
 #: 方式 A 的安装选项。`web` 必须是**默认值**（客户不动下拉框就只装 web），
-#: 且三项里每一项都含 web —— 用户的要求原话：「无论选择哪个，都必须安装 web」。
-IM_INSTALL_OPTIONS = ("web", "web+feishu", "web+slack")
+#: 且每一项都含 web —— 用户的要求原话：「无论选择哪个，都必须安装 web」。
+#: 2026-09-08 加入 `web+dingtalk`（钉钉切 Lambda Webhook 形态，两条路径同时上）。
+IM_INSTALL_OPTIONS = ("web", "web+feishu", "web+slack", "web+dingtalk")
+
+#: 现在有几个 IM 平台走 webhook 形态。改这个数字之前先想清楚：新平台的 ingress/worker、
+#: 保活规则、部署期条件、`InstallOption` 取值是不是**四处都加了** —— 下面几条断言就是
+#: 靠它换算出来的，漏一处会在这里红，而不是等客户报「机器人不回话」。
+IM_WEBHOOK_PLATFORMS = ("feishu", "slack", "dingtalk")
 
 #: 只允许出现在**一条**路径上的 props（其余必须两边都给，值可以不同）：
 #:   · conditions        —— 部署期开关，只有方式 A 有（方式 B 是合成期 -c enabledPlatforms）
@@ -786,9 +803,10 @@ def test_im_webhook_parity() -> None:
     #    共享 construct 里（栈里出现 = 有人抄了一份函数定义回去）。
     core = _read(IM_CORE_TS)
     handlers = re.findall(r'handler:\s*"(platforms\.[^"]+)"', core)
-    _check("三个 IM handler 都在共享 construct 里", len(handlers) == 5,
-           f"在 {IM_CORE_TS} 里数到 {len(handlers)} 个 handler（应为 5："
-           "飞书 ingress/worker、Slack ingress/worker、平台无关的 progress）")
+    want_handlers = 2 * len(IM_WEBHOOK_PLATFORMS) + 1
+    _check("每个 IM handler 都在共享 construct 里", len(handlers) == want_handlers,
+           f"在 {IM_CORE_TS} 里数到 {len(handlers)} 个 handler（应为 {want_handlers}："
+           f"{' / '.join(IM_WEBHOOK_PLATFORMS)} 各 ingress+worker，加平台无关的 progress）")
     for rel in (ONECLICK, IM_SETUP_STACK):
         text = _strip_comments(_read(rel))
         _check(f"{os.path.basename(rel)} 没有自己的 IM handler 定义",
@@ -815,8 +833,10 @@ def test_im_webhook_parity() -> None:
            "function createIngressKeepAlive(" in core,
            f"{IM_CORE_TS} 里找不到 createIngressKeepAlive")
     ka_calls = re.findall(r"createIngressKeepAlive\(", core)
-    _check("两个平台的 ingress 各有一条保活规则", len(ka_calls) == 3,
-           f"数到 {len(ka_calls)} 处（应为 3：1 个定义 + 飞书/Slack 各 1 次调用）")
+    want_ka = 1 + len(IM_WEBHOOK_PLATFORMS)
+    _check("每个平台的 ingress 各有一条保活规则", len(ka_calls) == want_ka,
+           f"数到 {len(ka_calls)} 处（应为 {want_ka}：1 个定义 + "
+           f"{' / '.join(IM_WEBHOOK_PLATFORMS)} 各 1 次调用）")
     _check("保活不以 keepAliveRuleName 是否传入为前提",
            not re.search(r"if\s*\(\s*props\.keepAliveRuleName", core),
            "写成条件建规则 = 方式 A（不传名字）静默没有保活")
@@ -836,19 +856,21 @@ def test_im_webhook_parity() -> None:
         param = oneclick[param_idx: _balanced_end(oneclick, oneclick.index("{", param_idx)) + 1]
         allowed = re.search(r"allowedValues:\s*\[([^\]]*)\]", param)
         values = tuple(v.strip().strip("\"'") for v in allowed.group(1).split(",") if v.strip()) if allowed else ()
-        _check("安装选项就是 web / web+feishu / web+slack", values == IM_INSTALL_OPTIONS,
+        _check("安装选项就是 " + " / ".join(IM_INSTALL_OPTIONS), values == IM_INSTALL_OPTIONS,
                f"实际是 {values}")
         _check("默认只装 web", re.search(r'default:\s*"web"', param) is not None)
         _check("每一项都包含 web", all(v == "web" or v.startswith("web+") for v in values),
                "「无论选择哪个都必须安装 web」是产品约束，不是巧合")
 
     # 4) 三个部署期条件都在，且共用资源挂的是 InstallIm（Or）而不是某一个平台。
-    for cond in ("InstallFeishu", "InstallSlack", "InstallIm"):
+    for cond in [f"Install{p.capitalize()}" for p in IM_WEBHOOK_PLATFORMS] + ["InstallIm"]:
         _check(f"方式 A 有 {cond} 条件", f'new cdk.CfnCondition(this, "{cond}"' in oneclick)
-    _check("InstallIm 是两个平台的 Or",
-           re.search(r'"InstallIm"[^}]*conditionOr\(installFeishu,\s*installSlack\)', oneclick, re.S) is not None,
+    or_args = r",\s*".join(f"install{p.capitalize()}" for p in IM_WEBHOOK_PLATFORMS)
+    _check("InstallIm 是全部平台的 Or",
+           re.search(rf'"InstallIm"[^}}]*conditionOr\({or_args}\)', oneclick, re.S) is not None,
            "共用资源（IAM 角色 / progress 函数 / 节拍规则）必须"
-           "「选了任一平台就建」，挂在单个平台上会让另一个平台的调查进度永远不刷新。")
+           "「选了任一平台就建」，挂在单个平台上会让另一个平台的调查进度永远不刷新。"
+           f"（期望 conditionOr({', '.join('install' + p.capitalize() for p in IM_WEBHOOK_PLATFORMS)})）")
 
     # 5) 代码来自 staging 桶 → 每个 IM 函数都必须等 StagerArtifacts。少一条依赖的症状是
     #    **偶发**的 NoSuchKey（CFN 并行创建，函数可能比产物先到）。

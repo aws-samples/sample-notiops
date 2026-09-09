@@ -166,9 +166,9 @@ def dispatch_blocks(body: str, locale: str, *, deep_link: str = "",
         blocks.context(usage_footer(locale, account=account, deploy=deploy)),
     ]
     btns: list[dict] = []
-    link = deep_link or home
+    # 标签必须与 href 对上 —— 判断在 `live_card.console_link()`（三家共用），见那边注释。
+    link, label = live_card.console_link(deep_link, home)
     if link:
-        label = ("progress.btn.open_link" if deep_link else "progress.btn.open_home")
         # url 按钮不产生回调；Slack 会拒绝 url 按钮上的 style，`blocks.button` 已处理。
         btns.append(blocks.button(i18n.t(label, locale), "im_open_console", url=link))
     if btns:

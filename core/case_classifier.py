@@ -300,12 +300,16 @@ _POPULAR_SERVICE_QUERIES: tuple[str, ...] = (
 POPULAR_SERVICE_LIMIT = 20
 
 
-def popular_services() -> list[dict]:
-    """IM 面板下拉用的常用服务清单 —— `[{"code", "name"}, ...]`，全部来自真实目录。
+def popular_service_choices() -> list[dict]:
+    """常用服务清单 + **查询词** —— `[{"query", "code", "name"}, ...]`。
 
-    目录读不到（`describe_services` 需要 Business/Enterprise 支持计划）就返回 `[]`：
-    调用方**必须**据此把下拉整块去掉、只留自由文本，并在面板上说明。给一个空下拉、
-    或者拿硬编码 code 顶上，都是静默降级。
+    与 `popular_services()` 同一份数据、同一个顺序，只是多回一个 `query`
+    （`_POPULAR_SERVICE_QUERIES` 里那个短词，如 `ec2`）。钉钉的案例模版把它印成
+    「1 ec2 / 2 s3 / …」，用户回一个数字，我们要还原成**能喂给
+    `support_logic.apply_case_overrides` 的文本** —— 目录里的全名（`Amazon Elastic
+    Compute Cloud (EC2) - Linux`）在一行选项里太长，短词才是给人看的那个。
+
+    目录读不到就 `[]`，理由同 `popular_services()`。
     """
     catalog, _ = _load_catalog()
     if not catalog:
@@ -321,10 +325,25 @@ def popular_services() -> list[dict]:
         if hit["code"] in seen:
             continue
         seen.add(hit["code"])
-        out.append({"code": hit["code"], "name": hit.get("name") or hit["code"]})
+        out.append({"query": q, "code": hit["code"],
+                    "name": hit.get("name") or hit["code"]})
         if len(out) >= POPULAR_SERVICE_LIMIT:
             break
     return out
+
+
+def popular_services() -> list[dict]:
+    """IM 面板下拉用的常用服务清单 —— `[{"code", "name"}, ...]`，全部来自真实目录。
+
+    目录读不到（`describe_services` 需要 Business/Enterprise 支持计划）就返回 `[]`：
+    调用方**必须**据此把下拉整块去掉、只留自由文本，并在面板上说明。给一个空下拉、
+    或者拿硬编码 code 顶上，都是静默降级。
+
+    形状**不许**跟着 `popular_service_choices()` 一起变：飞书 / Slack / web 的下拉
+    直接吃这两个 key，多一个 `query` 会跟着进卡片 payload。
+    """
+    return [{"code": c["code"], "name": c["name"]}
+            for c in popular_service_choices()]
 
 
 def service_categories(service_code: str) -> list[dict]:

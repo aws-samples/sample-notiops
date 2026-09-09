@@ -520,9 +520,12 @@ class SlackCaps(Caps):
         # 开场话从 5 条里按这条消息的 id 选一条（见 platforms/common/ack_variants.py）：
         # 同一条消息永远同一条文案，所以下面「排队转正」那次 set_ack 换的是 state，
         # 不是说法 —— 用户不会看到卡片自己改口。
+        # `platform=PLATFORM` 显式传：文案里"过程和结论会更新到这张卡片上"这半句由
+        # 平台的**刷新能力**决定（Slack 能 `chat_update`，钉钉不能），见 `ack_variants`。
         ack_seed = msg.message_id or msg.event_id
-        ack = (i18n.t("im.chat.queued_body", msg.locale) if queued
-               else ack_variants.ack_body(ack_seed, msg.locale, agent))
+        ack = (ack_variants.queued_body(msg.locale, platform=PLATFORM) if queued
+               else ack_variants.ack_body(ack_seed, msg.locale, agent,
+                                          platform=PLATFORM))
         try:
             resp = self._post(msg, blocks_out=im_blocks.answer_blocks(
                 ack, msg.locale, state=state, elapsed=0, agent=agent,
@@ -562,7 +565,8 @@ class SlackCaps(Caps):
             if queued:
                 # 排队转正：就地把这条消息变成「思考中」（不新发一条）。
                 if live is not None:
-                    live.set_ack(ack_variants.ack_body(ack_seed, msg.locale, agent))
+                    live.set_ack(ack_variants.ack_body(
+                        ack_seed, msg.locale, agent, platform=PLATFORM))
                     live.set_state("thinking")
                     live.flush(force=True)
                 # 前一轮很可能刚写过 execution_id，重新读一遍才是最新的上下文。
@@ -602,6 +606,10 @@ class SlackCaps(Caps):
                 sess = result.get("session") or {}
                 if sess.get("execution_id"):
                     ddb_state.put_im_chat_session(PLATFORM, msg.chat_id, sess)
+                elif result.get("reset_session"):
+                    # 上游把这条 execution 弄死了（`responseFailed` / 只回心跳）。必须
+                    # **删掉**会话行：留着它下一轮会原样复用、原样再坏一次。三家一致。
+                    ddb_state.clear_im_chat_session(PLATFORM, msg.chat_id)
         finally:
             # 租约必须在 finally 里放；心跳线程同理（Lambda 返回后冻结环境，
             # 没 join 的 daemon 线程是下一次调用的幽灵）。`finish()` 会再 close 一次。

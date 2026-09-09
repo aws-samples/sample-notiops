@@ -36,7 +36,6 @@ callers that haven't been updated).
 from __future__ import annotations
 
 import logging
-import re
 import threading
 from typing import Optional
 
@@ -50,6 +49,7 @@ from core import case_management
 from core import ddb_state
 from core import i18n
 from core import im_accounts
+from core import nl_router
 from core import support_logic
 from core import webhook_dispatch  # noqa: F401 — reserved for future skill paths
 from core.case_management import CaseSummary, Communication
@@ -63,6 +63,7 @@ from core.support_logic import (
 )
 
 from platforms.common import account_picker
+from platforms.common import im_markdown
 from platforms.feishu.app import feishu_utils
 
 logger = logging.getLogger(__name__)
@@ -120,11 +121,12 @@ def _locale_from_event(event_id: str = "", incident_id: str = "",
 # Slack-style "*bold*" → Feishu lark_md "**bold**". i18n templates are
 # written single-star (Slack convention); convert when rendering for
 # Feishu cards. Idempotent if already double-starred.
-_SINGLE_STAR_BOLD_RE = re.compile(r"(?<!\*)\*([^*\n]+?)\*(?!\*)")
-
-
+#
+# 实现搬到了 `platforms/common/im_markdown.star_to_bold` —— 钉钉的案例渲染需要
+# **同一条**规则（它的 markdown 也按标准解析，单星是斜体）。这里保留薄封装，
+# 因为本文件里有 30+ 个调用点。
 def _bold(s: str) -> str:
-    return _SINGLE_STAR_BOLD_RE.sub(r"**\1**", s)
+    return im_markdown.star_to_bold(s)
 
 
 def _account_banner(account_id: str, locale: str) -> list[dict]:
@@ -206,18 +208,10 @@ def start_create(chat_id: str, raw_text: str, locale: str = "zh",
 # Phrases users typically type to OPEN a case — when the input is just
 # this short kind of intent ("帮我开案例", "create case"), there's no
 # detail to summarize and Subject should stay empty.
-_INTENT_ONLY_PATTERNS = (
-    "创建案例", "创建 case", "创建case", "开案例", "开 case", "开case",
-    "新建案例", "新建 case", "新建case", "提工单", "开工单",
-    "升级到 support", "升级到support", "升级 support",
-    "create case", "open case", "new case", "support ticket",
-    "escalate to support", "ask support",
-)
-
-
 def _summarize_subject(raw_text: str) -> str:
     """Return a clean subject pre-fill, or '' if the input has no usable
-    detail. **确定性、0 token** —— 与 Slack 侧同一份逻辑（`slack/app/case_flow.py`）。
+    detail. **确定性、0 token** —— 实现在
+    `core.nl_router.summarize_case_subject`，三个平台共用那一份。
 
     🔴 2026-09-06：这里原本有第四步「长输入交给 Bedrock 抽一句
     `服务 + 资源 + 症状` 的标题」。那段调的是 `bedrock_intent._bedrock.invoke_model`
@@ -235,28 +229,9 @@ def _summarize_subject(raw_text: str) -> str:
          的 `core.case_classifier`）。把这条留着"以后修活"等于把那个口径变回三个。
 
     ⚠️ 行为与删除前的**运行时**表现逐字符一致：`len(stripped) <= 60` 那条早退返回
-    `stripped`，长输入的 except 分支返回 `stripped[:200]` —— 合起来就是下面这一行。
+    `stripped`，长输入的 except 分支返回 `stripped[:200]` —— 合起来就是共用那一行。
     """
-    text = (raw_text or "").strip()
-    if not text:
-        return ""
-
-    # 抹掉句中任意位置的「开案例」/「create case」意图标记 —— 很多人打
-    # 「@bot 开案例 调查 EC2 CPU 过高」，真正的主题是标记**后面**那段。
-    lowered = text.lower()
-    stripped = text
-    for p in _INTENT_ONLY_PATTERNS:
-        idx = lowered.find(p)
-        if idx >= 0:
-            # Keep what's before the marker (rare) + what's after it.
-            head = text[:idx].rstrip(" ,，:。.")
-            tail = text[idx + len(p):].lstrip(" ,，:。.")
-            stripped = (head + " " + tail).strip() if head else tail
-            break
-
-    # 抹完是空的 → 用户只说了「开案例」、没给主题；留空让表单上方那句提示引导他，
-    # 比把整段原话塞进 Subject 好。
-    return stripped[:200] if stripped else ""
+    return nl_router.summarize_case_subject(raw_text)
 
 
 # Mapping of status_filter slug → i18n key for the human-readable label.

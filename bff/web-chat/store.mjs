@@ -137,6 +137,20 @@ export async function setDevopsChatSession(conversationId, s) {
   }));
 }
 
+/** 丢掉这条会话记着的 executionId。
+ *
+ * ⚠️ 这不是"清理"，是**修复动作**：上游把一个 executionId 弄死之后（`responseFailed` /
+ * 只回心跳），留着它下一轮会原样复用、原样再坏一次 —— 客户看到的是"这个会话永久坏了"。
+ * 删掉它，下一轮自然会新建一段对话（代价是丢多轮上下文，比永久坏掉便宜得多）。
+ * 与 `deleteConversation()` 里删同一行的那一步是同一个 Key。
+ */
+export async function clearDevopsChatSession(conversationId) {
+  await ddb.send(new DeleteCommand({
+    TableName: TABLE,
+    Key: { PK: `conv#${conversationId}`, SK: "dachat" },
+  }));
+}
+
 export async function renameConversation(sub, conversationId, title) {
   await ddb.send(
     new UpdateCommand({

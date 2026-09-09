@@ -169,21 +169,22 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     //      而那个组合根本跑不起来（客户没有地方填 app_id/app_secret）。枚举从结构上
     //      消灭了这个非法状态，而不是靠文档提醒。
     //   2. 参数页上一个下拉框比两个复选框更少歧义（客户不用推理"两个都选 No 会怎样"）。
-    // 目前不提供「web+飞书+slack」：两个平台同时装没有技术障碍（资源互相独立），但
-    // 现网没有任何客户这么用，加进来就得跟着维护第 4 种组合的回归路径。要加时只需
-    // 在 allowedValues 里多一项、并把下面 InstallFeishu/InstallSlack 两个条件改成
-    // Fn::Or —— 不需要改 im-core.ts。
+    // 目前不提供多平台组合（「web+飞书+slack」之类）：几个平台同时装没有技术障碍
+    // （资源互相独立），但现网没有任何客户这么用，加进来就得跟着维护第 N 种组合的
+    // 回归路径。要加时只需在 allowedValues 里多一项、并把下面 InstallFeishu /
+    // InstallSlack / InstallDingtalk 那几个条件改成 Fn::Or —— 不需要改 im-core.ts。
     const installOption = new cdk.CfnParameter(this, "InstallOption", {
       type: "String",
       default: "web",
-      allowedValues: ["web", "web+feishu", "web+slack"],
+      allowedValues: ["web", "web+feishu", "web+slack", "web+dingtalk"],
       description:
         "Which entry points to install. 'web' installs the NotiOps web chat and admin console " +
-        "only. 'web+feishu' also installs the Feishu/Lark bot; 'web+slack' also installs the " +
-        "Slack bot. The web chat is always installed -- the admin console is where you enter the " +
-        "bot credentials. Adding a bot creates two extra Lambda functions with a public webhook " +
-        "URL (request signature verified, throttled to 10 concurrent executions) plus a " +
-        "once-a-minute poller; you can switch this value on a later stack update.",
+        "only. 'web+feishu' also installs the Feishu/Lark bot; 'web+slack' the Slack bot; " +
+        "'web+dingtalk' the DingTalk bot. The web chat is always installed -- the admin console " +
+        "is where you enter the bot credentials. Adding a bot creates two extra Lambda functions " +
+        "with a public webhook URL (request signature verified, throttled to 10 concurrent " +
+        "executions); Feishu and Slack also get a once-a-minute progress poller. You can switch " +
+        "this value on a later stack update.",
     });
 
     // CORS 白名单。默认 "*" 的理由与 CDK 路径一致（端点已由 AWS_IAM/SigV4 鉴权，
@@ -277,9 +278,13 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       description:
         "SingleAccount: NotiOps only looks at the account you deploy into. MultiAccount: also " +
         "inspect and investigate other accounts in your AWS Organization -- you then onboard them " +
-        "one click at a time from the admin console. MultiAccount REQUIRES that you deploy into " +
-        "the organization management account (or a CloudFormation StackSets delegated " +
-        "administrator) and that you fill in the organization id below.",
+        "one click at a time from the admin console. MultiAccount REQUIRES the organization id " +
+        "below, and a deployment account that is either the AWS Organizations MANAGEMENT account " +
+        "or a member account the management account has registered as a CloudFormation StackSets " +
+        "delegated administrator (service principal " +
+        "member.org.stacksets.cloudformation.amazonaws.com). The stack detects which one you are " +
+        "within the first minute and fails with instructions if it is neither, so nothing is " +
+        "left half-built.",
     });
 
     const organizationId = new cdk.CfnParameter(this, "OrganizationId", {
@@ -455,17 +460,25 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       expression: cdk.Fn.conditionEquals(cdk.Aws.REGION, "us-east-1"),
     });
 
-    // IM 加装项。三个条件而不是两个：`InstallIm` 盖住**平台无关**的共用资源
-    // （IM 角色、依赖层、两张表、进度轮询函数 + 它的 1 分钟节拍）。少了它，只装 web 的
-    // 客户也会白拿一个每分钟跑一次的 Lambda（以及两张空表）。
+    // IM 加装项。每个平台一个条件、外加一个"任意平台"的 `InstallIm`，后者盖住
+    // **平台无关**的共用资源（IM 角色、依赖层、两张表、DevOps 回调那一整块）。
+    // 少了它，只装 web 的客户也会白拿两张空表和一条永不触发的回调链路。
+    // ⚠️ 进度轮询函数（1 分钟节拍）**不**挂在 `InstallIm` 上，只挂飞书 / Slack ——
+    //    钉钉发出去的消息拿不到可寻址 id，进度是追加式的，没有卡片可 PATCH。
+    //    接线在 im-core.ts 里（`props.platforms.feishu || props.platforms.slack`），
+    //    这里不用管；写在这儿是因为读到 `InstallIm` 的人会以为它管所有 IM 资源。
     const installFeishu = new cdk.CfnCondition(this, "InstallFeishu", {
       expression: cdk.Fn.conditionEquals(installOption.valueAsString, "web+feishu"),
     });
     const installSlack = new cdk.CfnCondition(this, "InstallSlack", {
       expression: cdk.Fn.conditionEquals(installOption.valueAsString, "web+slack"),
     });
+    const installDingtalk = new cdk.CfnCondition(this, "InstallDingtalk", {
+      expression: cdk.Fn.conditionEquals(installOption.valueAsString, "web+dingtalk"),
+    });
+    // Fn::Or 一次最多吃 10 个条件 —— 现在 3 个，加平台时注意这个上限。
     const installIm = new cdk.CfnCondition(this, "InstallIm", {
-      expression: cdk.Fn.conditionOr(installFeishu, installSlack),
+      expression: cdk.Fn.conditionOr(installFeishu, installSlack, installDingtalk),
     });
 
     // 客户自有 CUR 数据源装没装。留空 = 这项能力按设计不存在（不是"坏了"）。
@@ -614,6 +627,26 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       ],
     }));
 
+    // ── Phase=StagingCleanup：删栈时清空 staging 桶的**最后一道闸** ──
+    // 只为 Delete 而存在（Create/Update 是 no-op）。它排在 Artifacts 与桶之间，于是
+    // 删栈顺序变成 Artifacts.Delete → StagingCleanup.Delete → DeleteBucket。
+    //
+    // 🔴 为什么需要第二次机会（2026-09-07 现网实测，秒级）：CFN「取消」一个自定义资源
+    // 只是不再等它的响应，那次 Lambda 调用**照跑到底**。回滚时被取消的 Artifacts 在
+    // 16:59:02 才把 144 MiB 的 agent zip 传完，而它自己的 Delete 已经在 16:59:03 清完桶
+    // 收工了 → 16:59:11 桶非空、DELETE_FAILED → 栈停在 ROLLBACK_FAILED 要人工收尾。
+    // 这一道闸跑在那之后，且 `_drain_bucket` 会「连续两轮空」才收手（还顺手中止未完成的
+    // 分片上传 —— 分片不是对象，list 看不见，但会让 DeleteBucket 报桶非空）。
+    const stagingCleanup = new cdk.CfnResource(this, "StagingCleanup", {
+      type: "Custom::NotiOpsStagingCleanup",
+      properties: {
+        ServiceToken: stagerFn.attrArn,
+        Phase: "StagingCleanup",
+        StagingBucket: stagingBucket.bucketName,
+      },
+    });
+    stagingCleanup.addDependency(stagerFn);
+
     const stagerArtifacts = new cdk.CfnResource(this, "StagerArtifacts", {
       type: "Custom::NotiOpsStagerArtifacts",
       properties: {
@@ -634,6 +667,8 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       },
     });
     stagerArtifacts.addDependency(stagerFn);
+    // 反向依赖 = 正向删除顺序（见 StagingCleanup 上方的注释）。
+    stagerArtifacts.addDependency(stagingCleanup);
 
     // ══ 联网搜索：AgentCore Web Search Gateway ═════════════════════════════════
     // AgentCore 的 web search 没有独立 API：只能建一个 **Gateway**（MCP 协议 + AWS_IAM
@@ -1233,6 +1268,102 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // 代码在 staging 桶里，必须等搬完。
     runtime.addDependency(stagerArtifacts);
 
+    // ══ 多账号资格前置检查（PreflightFn，仅 MultiAccount）══════════════════════
+    // 为什么要**第二个** Lambda，而不是给 StagerFn 再加一个 Phase（2026-09-07 现网实测）：
+    // StagerFn `DependsOn` 自己角色的 `DefaultPolicy`，而那份策略引用了桶 / 表 / 分发
+    // 十几个资源的 ARN → CFN 把它排到那些资源**之后**。实测栈开始 3 分 34 秒后
+    // StagerFn 才开始创建，于是「这个账号根本不是组织管理账号」这个第 0 秒就能判定的
+    // 事实，要等 100 多个资源建完才说出口，客户等 4 分钟换来一句话 + 一次全量回滚。
+    //
+    // 本函数**刻意什么都不依赖**：只有自己的日志组和一份只含组织级动作的策略，因此能
+    // 排在 CFN 最前面，30~40 秒内给出结论。代价是模板里多 4 个资源（都带 Condition，
+    // 单账号客户一个都不建）+ 一份 ~7KB 内联源码。
+    const preflightSource = fs.readFileSync(
+      path.join(INFRA_DIR, "lambda", "preflight", "index.py"), "utf-8");
+    const preflightFnName = `${cdk.Aws.STACK_NAME}-preflight`;
+
+    const preflightRole = new iam.Role(this, "PreflightRole", {
+      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+      description: "NotiOps one-click multi-account eligibility preflight",
+    });
+    (preflightRole.node.defaultChild as cdk.CfnResource).cfnOptions.condition = isMultiAccount;
+
+    const preflightLogs = new logs.LogGroup(this, "PreflightLogs", {
+      logGroupName: `/aws/lambda/${preflightFnName}`,
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    (preflightLogs.node.defaultChild as cdk.CfnResource).cfnOptions.condition = isMultiAccount;
+
+    // 独立 `AWS::IAM::Policy`（不用 addToPolicy 生成的 DefaultPolicy）：这里只引用**自己的**
+    // 日志组，不引用任何业务资源 —— 这正是本函数能排在最前面的原因，别往里加东西。
+    const preflightPolicy = new iam.Policy(this, "PreflightPolicy", {
+      roles: [preflightRole],
+      statements: [
+        new iam.PolicyStatement({
+          sid: "PreflightOwnLogs",
+          actions: ["logs:CreateLogStream", "logs:PutLogEvents"],
+          resources: [preflightLogs.logGroupArn, `${preflightLogs.logGroupArn}:*`],
+        }),
+        new iam.PolicyStatement({
+          sid: "PreflightReadOrganization",
+          // 这几个 Organizations API 都不支持资源级限定（只能 *）。EnableAWSServiceAccess
+          // 是组织级写动作，只开 StackSets 那一个 service principal（handler 里写死）。
+          // ListDelegatedAdministrators 是「从 linked account 部署」那条路径的判据：本账号
+          // 是不是已注册的 StackSets 委派管理员（见 preflight 的 _is_delegated_admin）。
+          actions: [
+            "organizations:DescribeOrganization",
+            "organizations:EnableAWSServiceAccess",
+            "organizations:ListAWSServiceAccessForOrganization",
+            "organizations:ListDelegatedAdministrators",
+          ],
+          resources: ["*"],
+        }),
+        new iam.PolicyStatement({
+          sid: "PreflightActivateStackSetsOrgAccess",
+          // 信任访问的**另一半**：只开 Organizations 侧不够，CFN 侧
+          // describe-organizations-access 仍是 DISABLED，而
+          // CreateStackSet(SERVICE_MANAGED) 会报「You must enable organizations access」。
+          // 这两个 API 也都不支持资源级限定。
+          actions: [
+            "cloudformation:ActivateOrganizationsAccess",
+            "cloudformation:DescribeOrganizationsAccess",
+          ],
+          resources: ["*"],
+        }),
+      ],
+    });
+    (preflightPolicy.node.defaultChild as cdk.CfnResource).cfnOptions.condition = isMultiAccount;
+
+    const preflightFn = new lambda.CfnFunction(this, "PreflightFn", {
+      functionName: preflightFnName,
+      role: preflightRole.roleArn,
+      runtime: "python3.13",
+      handler: "index.handler",
+      code: { zipFile: preflightSource },
+      // 只发 4 个控制面 API，秒级返回。60s 给足重试余量，128MB 是最小规格。
+      timeout: 60,
+      memorySize: 128,
+    });
+    preflightFn.cfnOptions.condition = isMultiAccount;
+    preflightFn.addDependency(preflightLogs.node.defaultChild as cdk.CfnResource);
+    preflightFn.addDependency(preflightRole.node.defaultChild as cdk.CfnResource);
+    preflightFn.addDependency(preflightPolicy.node.defaultChild as cdk.CfnResource);
+
+    const stagerPreflight = new cdk.CfnResource(this, "StagerPreflight", {
+      type: "Custom::NotiOpsMultiAccountPreflight",
+      properties: {
+        ServiceToken: preflightFn.attrArn,
+        OrganizationId: organizationId.valueAsString,
+        DeployRegion: this.region,
+        // 每个 Release 都重跑一次（同 OrgSetup 的理由）：handler 侧的判据变了不体现为
+        // 任何属性变化 → CFN 不发 Update → 存量多账号部署拿不到新的检查。
+        ReleaseTag: releaseTag,
+      },
+    });
+    stagerPreflight.cfnOptions.condition = isMultiAccount;
+    stagerPreflight.addDependency(preflightFn);
+
     // ══ Web Chat 主体 ═════════════════════════════════════════════════════════
     const webchat = createWebChatCore(this, {
       staticTemplate: true,
@@ -1247,7 +1378,17 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       agentSpaceId: agentSpaceIdOrEmpty,
       // 「单账号还是多账号」是部署期才知道的，所以传条件而不是布尔 —— 受影响的 6 个
       // BFF 环境变量在 web-chat-core.ts 里落成 Fn::If。
-      multiAccount: { organizationId: organizationId.valueAsString, conditionLogicalId: isMultiAccount.logicalId },
+      multiAccount: {
+        organizationId: organizationId.valueAsString,
+        conditionLogicalId: isMultiAccount.logicalId,
+        // PreflightFn 部署期探测出来的身份。注意这是**跨条件引用**：BFF 无条件存在，而
+        // StagerPreflight 只在 IsMultiAccount 下存在 —— 所以这里不能直接 GetAtt，必须走
+        // `orgSwitch` 生成的 `Fn::If`，让单账号栈那一支根本不求值这个引用（CFN 只求值被
+        // 选中的分支）。见 web-chat-core.ts 的 stackSetCallAs。
+        stackSetCallAs: stagerPreflight.getAtt("CallAs").toString(),
+        // 同一个跨条件引用（同样经 orgSwitch 落成 Fn::If）。BFF 用它拦「一键接入管理账号」。
+        orgManagementAccountId: stagerPreflight.getAtt("ManagementAccountId").toString(),
+      },
       // 报告分发 CDN（同栈资源，见 minimal-base-core.ts）。BFF 的「深度调查（直连）」
       // 没有 presign 分支，域名为空就不产出报告链接。
       reportsCdnDomain: base.reportsCdnDomain,
@@ -1360,6 +1501,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       resources: [
         "notiops/bedrock-api-key",
         "notiops/im-bot-feishu",
+        "notiops/im-bot-dingtalk",
         "notiops/slack-bot-token",
         "notiops/slack-signing-secret",
       ].map((n) => `arn:${this.partition}:secretsmanager:${this.region}:${this.account}:secret:${n}-*`),
@@ -1407,8 +1549,10 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         //     core/llm_config.py::_BEDROCK_KEY_SECRET 的默认值一致。
         //   · notiops/im-bot-feishu —— 管理控制台「集成 IM」页保存凭证时建（BFF 有
         //     CreateSecret 权限，见 web-chat-core.ts）。
+        //   · notiops/im-bot-dingtalk —— 同上（钉钉与飞书同构：一个 secret，JSON 里
+        //     `app_key` / `app_secret`）；客户也可以手建。
         //   · notiops/slack-* —— 客户按文档手建（Slack 侧没有"在控制台里填"的入口）。
-        // 三个 IM secret **无条件**列出，不跟着 InstallIm 走：客户可能先装 web+feishu、
+        // 四个 IM secret **无条件**列出，不跟着 InstallIm 走：客户可能先装 web+feishu、
         // 后来改回 web 再删栈，那时属性里若没有它，凭证就永久留在账号里
         // （自定义资源的 Delete 事件只带**上一次成功部署**的属性）。名字不存在时
         // handler 会忽略 ResourceNotFoundException（见 index.py `_ignore_missing`），
@@ -1416,6 +1560,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         SecretNames: cdk.Stack.of(this).toJsonString([
           "notiops/bedrock-api-key",
           "notiops/im-bot-feishu",
+          "notiops/im-bot-dingtalk",
           "notiops/slack-bot-token",
           "notiops/slack-signing-secret",
         ]),
@@ -1519,12 +1664,12 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       });
     }
 
-    // ══ IM 加装项（飞书 / Slack）════════════════════════════════════════════════
-    // 三个函数的**定义**在 `constructs/im-core.ts`，与方式 B（`im-stack.ts`）逐字同源；
+    // ══ IM 加装项（飞书 / Slack / 钉钉）══════════════════════════════════════════
+    // 函数的**定义**在 `constructs/im-core.ts`，与方式 B（`im-stack.ts`）逐字同源；
     // 允许的差异只有那 4 条（代码来源 / 物理名 / 日志组名 / 合成期布尔 vs 部署期条件），
     // 见该文件头。这里只负责喂给它方式 A 特有的那 4 样东西。
     //
-    // 整块都挂在 `InstallIm` / `InstallFeishu` / `InstallSlack` 上：只装 web 的客户
+    // 整块都挂在 `InstallIm` / `InstallFeishu` / `InstallSlack` / `InstallDingtalk` 上：只装 web 的客户
     // 模板里虽然有这些资源，但一个都不会创建（CFN 对 Condition 为 false 的资源是
     // 完全跳过，不是建了再删）。
 
@@ -1621,9 +1766,14 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       // 日志组交给 CFN 命名 —— 写死 `/aws/lambda/<fn>` 会撞上 Lambda 服务自建的同名组，
       // NAME_CONFLICT_VALIDATION 让整栈 9 秒内失败（同 WebNotifLogs 那段的实测）。
       explicitLogGroupNames: false,
-      // 两个平台的资源都**合成**出来，装不装由部署期条件决定。
-      platforms: { feishu: true, slack: true },
-      conditions: { feishu: installFeishu, slack: installSlack, anyPlatform: installIm },
+      // 三个平台的资源都**合成**出来，装不装由部署期条件决定。
+      platforms: { feishu: true, slack: true, dingtalk: true },
+      conditions: {
+        feishu: installFeishu,
+        slack: installSlack,
+        dingtalk: installDingtalk,
+        anyPlatform: installIm,
+      },
       // 不给 EventBridge 规则物理名（同上，避免与 setup.sh 的 notiops-im-progress-tick /
       // notiops-im-keepalive-* 撞名）—— progressRuleName 与 keepAliveRuleName 都不传。
     });
@@ -1716,12 +1866,21 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           // `S3_BUCKET or DATA_BUCKET or SKILLS_BUCKET` 解析 → commonEnv 里的
           // SKILLS_BUCKET 就够（它指的是同一个业务桶）。
           ...im.commonEnv,
-          // 发卡片要的两个凭证名。与 `imRole` 上按名字收窄的那条 secretsmanager
+          // 发卡片要的三个凭证名。与 `imRole` 上按名字收窄的那条 secretsmanager
           // 语句同源（`im.secretNames`），两处不会漂。
           FEISHU_SECRET_NAME: im.secretNames.feishu,
           // ⚠️ 变量名是 `*_ARN` 但值是 secret **名** —— 与 im-core 里 Slack 那两个
           // 环境变量同一个历史包袱（`slack_sender.py` 拿它当 SecretId，两种都能用）。
           SLACK_BOT_TOKEN_ARN: im.secretNames.slackBotToken,
+          // 钉钉用 `*_NAME`（不是 `*_ARN`）—— `shared/dingtalk_api.py::secret_id()`
+          // 的顺序是 `DINGTALK_SECRET_ARN` → `DINGTALK_SECRET_NAME` → 写死默认名，
+          // 这里手上只有名字（`im.secretNames.dingtalk`），填进 `*_ARN` 会让读的人
+          // 以为那是 ARN。
+          // ⚠️ 少这一条的症状**不是报错**：钉钉侧调查照样跑完、面板照样显示结束，
+          //    但报告会回落到自定义机器人 webhook（投进那个机器人所在的群，而不是
+          //    提问的那个群），甚至完全投不出去。理由与实测记录见
+          //    `shared/report_delivery/dingtalk_sender.py` 文件头。
+          DINGTALK_SECRET_NAME: im.secretNames.dingtalk,
           // 刻意**不注入**的三个，都不是漏写：
           //   · INSPECTION_TABLE / INSPECT_AGENT_SPACE_ID —— 一键部署不含资源巡检，
           //     没有那张表也没有那个 space。handler 侧对空值记 ERROR 后照常走排障
@@ -1823,6 +1982,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // 所以这里只需要保证策略先建好。
     if (stagerPolicy) stagerDevOpsOnboard.addDependency(stagerPolicy as cdk.CfnResource);
 
+
     // ══ 多账号落地（Phase=OrgSetup，仅 MultiAccount）═══════════════════════════
     // 两个成员账号 StackSet 的模板在**合成期**读进来、当字符串内联 —— 不是 CDK 资产
     // （客户账号没有资产桶，见文件头第 1 条）。`setup.sh` 那条路径用的是同两份文件，
@@ -1833,6 +1993,15 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
 
     // 权限用**独立的 AWS::IAM::Policy**挂到 StagerRole 上，好处就是能整块带 Condition：
     // 客户选单账号时，这个搬运工角色一条 organizations/StackSet 权限都没有。
+    // 🔴 StackSet 实体**永远存放在组织管理账号里**，包括委派管理员创建的那些（AWS 官方
+    // 文档 stacksets-orgs-delegated-admin：「StackSets with service-managed permissions are
+    // created in the management account, including StackSets created by delegated
+    // administrators」）。所以下面 ARN 的账号段必须是**管理账号**，不是部署账号 ——
+    // 从 linked account（委派管理员）部署时写 `this.account` 会在第一次 DescribeStackSet
+    // 上 AccessDenied，而现场只会看到一句没有上下文的拒绝。
+    // 管理账号自部署时 ManagementAccountId === this.account，所以这一个表达式同时覆盖
+    // CallAs=SELF 和 CallAs=DELEGATED_ADMIN 两种模式，不需要分支。
+    const stackSetOwnerAccount = stagerPreflight.getAtt("ManagementAccountId").toString();
     const stagerOrgPolicy = new iam.Policy(this, "StagerOrgSetupPolicy", {
       roles: [stagerRole],
       statements: [
@@ -1840,7 +2009,8 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           sid: "EnableStackSetsTrustedAccess",
           // Organizations 这三个 API 都不支持资源级限定（只能 *）。EnableAWSServiceAccess
           // 是本模板里**唯一**一个组织级写动作，只开 StackSets 那一个 service principal
-          // （handler 里写死，不从属性取）。
+          // （handler 里写死，不从属性取）。委派管理员模式下 handler 会整段跳过它
+          // （那是管理账号专属 API），但策略里留着无害：多账号两种模式共用同一份策略。
           actions: [
             "organizations:DescribeOrganization",
             "organizations:EnableAWSServiceAccess",
@@ -1855,10 +2025,10 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
             "cloudformation:DescribeStackSet",
             "cloudformation:UpdateStackSet",
           ],
-          // 精确到我们自己那两个 StackSet（名字写死）—— 不给「管理本账号任意 StackSet」。
+          // 精确到我们自己那两个 StackSet（名字写死）—— 不给「管理任意 StackSet」。
           resources: [
-            `arn:${this.partition}:cloudformation:${this.region}:${this.account}:stackset/${onboardingStackSetName}:*`,
-            `arn:${this.partition}:cloudformation:${this.region}:${this.account}:stackset/${devopsStackSetName}:*`,
+            `arn:${this.partition}:cloudformation:${this.region}:${stackSetOwnerAccount}:stackset/${onboardingStackSetName}:*`,
+            `arn:${this.partition}:cloudformation:${this.region}:${stackSetOwnerAccount}:stackset/${devopsStackSetName}:*`,
             `arn:${this.partition}:cloudformation:*::type/resource/*`,
           ],
         }),
@@ -1880,6 +2050,10 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         OnboardingTemplateBody: memberTemplate("member-account-onboarding.yaml"),
         DevOpsStackSetName: devopsStackSetName,
         DevOpsTemplateBody: memberTemplate("member-devops-agent.yaml"),
+        // PreflightFn 判定出来的身份：SELF（管理账号）/ DELEGATED_ADMIN（已注册的 StackSets
+        // 委派管理员，即「从 linked account 部署」那条路径）。service-managed StackSet 的
+        // 每个调用都要带它。
+        StackSetCallAs: stagerPreflight.getAtt("CallAs").toString(),
         // 每个 Release 都重跑一次这个 Phase（同 Site / WebSearch 的 ReleaseTag）。
         // 少了它，只有**成员账号模板本身**改了才会有属性变化 —— 两份 yaml 是在合成期
         // 读进来内联的，所以它们变了确实会触发 Update。但 handler 侧的修复（`_org_setup`
@@ -1891,6 +2065,9 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     });
     stagerOrgSetup.cfnOptions.condition = isMultiAccount;
     stagerOrgSetup.addDependency(stagerFn);
+    // 资格检查必须先过。两个资源带**同一个** Condition，所以这条 DependsOn 在单账号栈里
+    // 一起消失（跨条件的 DependsOn 会让 CFN 报 unresolved dependency）。
+    stagerOrgSetup.addDependency(stagerPreflight);
     stagerOrgSetup.addDependency(stagerOrgPolicy.node.defaultChild as cdk.CfnResource);
     if (stagerPolicy) stagerOrgSetup.addDependency(stagerPolicy as cdk.CfnResource);
 
@@ -1935,7 +2112,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     });
 
     // ── IM 加装项的 Outputs ──
-    // Webhook 地址是**部署后必做的一步**（要粘到飞书/Slack 的后台），所以它必须是
+    // Webhook 地址是**部署后必做的一步**（要粘到飞书/Slack/钉钉的后台），所以它必须是
     // Outputs 里的一行，而不是"去 API Gateway 控制台找那个 HTTP API 的调用地址"。
     if (im.feishuWebhookUrl) {
       const o = new cdk.CfnOutput(this, "FeishuWebhookUrl", {
@@ -1955,6 +2132,15 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       });
       o.condition = installSlack;
     }
+    if (im.dingtalkWebhookUrl) {
+      const o = new cdk.CfnOutput(this, "DingtalkWebhookUrl", {
+        description:
+          "Paste this into the DingTalk Open Platform as the robot's HTTP callback URL " +
+          "(Robot > Message receiving mode > HTTP mode)",
+        value: im.dingtalkWebhookUrl,
+      });
+      o.condition = installDingtalk;
+    }
     // 为什么单独一行「凭证放哪」：webhook 地址填好了但 secret 是空的时候，ingress 在
     // 冷启动就失败（fail-fast，见 lambda_ingress.py 文件头），而客户在 IM 里看到的
     // 只是"机器人不回话" —— 完全看不出缺的是凭证。
@@ -1966,9 +2152,20 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       "Create two secrets in AWS Secrets Manager -- 'notiops/slack-bot-token' (your xoxb- bot " +
       "token) and 'notiops/slack-signing-secret' (the app signing secret), each a plain string " +
       "-- then paste SlackWebhookUrl into your Slack app. The bot stays silent until both are done.";
+    const imDingtalkNextSteps =
+      "Open the admin console (ChatUrl > Admin > IM integration > DingTalk) and enter the robot " +
+      "AppKey and AppSecret. Then paste DingtalkWebhookUrl into the DingTalk Open Platform under " +
+      "Robot > Message receiving mode > HTTP mode. The bot stays silent until both are done.";
+    // 嵌套 `Fn::conditionIf`，不是 `Fn::Or` —— 三个平台是互斥的枚举值，要选的是
+    // **哪一段文字**。最内层落在钉钉上而不是再套一层判断：这个 Output 整体挂了
+    // `installIm`，所以能走到这里就说明装了三者之一；前两个都不成立时必然是钉钉。
     const imNextSteps = new cdk.CfnOutput(this, "ImNextSteps", {
       description: "Finish wiring up the chat bot you chose to install",
-      value: cdk.Fn.conditionIf(installFeishu.logicalId, imFeishuNextSteps, imSlackNextSteps).toString(),
+      value: cdk.Fn.conditionIf(
+        installFeishu.logicalId,
+        imFeishuNextSteps,
+        cdk.Fn.conditionIf(installSlack.logicalId, imSlackNextSteps, imDingtalkNextSteps),
+      ).toString(),
     });
     imNextSteps.condition = installIm;
 

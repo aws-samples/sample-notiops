@@ -253,6 +253,10 @@ def case_capability(account_id: str = "", *, use_cache: bool = True) -> dict:
 
     拿不准时（限流、网络抖动、未知错误码）**一律返回 ok** —— 宁可让客户走到真正建案
     那一步看到确切报错，也不要因为一次抖动就断言"你开不了工单"。
+
+    探针成功时顺手把**这个计划真的允许的严重等级**（`severities`，元组）带回来 ——
+    Basic/Developer 没有 `urgent` / `critical`，把它们印进选项里就是让客户挑一个
+    会被 AWS 拒收的值。取不到那一项的调用方走 `plan_severities()`（见那边）。
     """
     key = str(account_id or "").strip() or "_local"
     now = time.monotonic()
@@ -268,8 +272,8 @@ def case_capability(account_id: str = "", *, use_cache: bool = True) -> dict:
                 "code": CROSS_ACCOUNT_ERROR_CODE}
 
     try:
-        client.describe_severity_levels()
-        verdict = {"ok": True}
+        resp = client.describe_severity_levels()
+        verdict = {"ok": True, "severities": _plan_severities(resp)}
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         if code == "SubscriptionRequiredException":
@@ -290,6 +294,37 @@ def case_capability(account_id: str = "", *, use_cache: bool = True) -> dict:
 
     _cap_cache[key] = (now, dict(verdict))
     return verdict
+
+
+def _plan_severities(resp: dict) -> tuple[str, ...]:
+    """`DescribeSeverityLevels` 的响应 → 这个计划允许的 severity code。
+
+    回**元组**（不可变）是有意的：`case_capability` 的缓存命中走
+    `dict(hit[1])`，那是浅拷贝 —— 换成 list 的话调用方一个 `.remove()` 就把
+    进程内缓存改脏了，而那种 bug 只在第二个用户身上出现。
+
+    顺序以 `SEVERITY_CODES` 为准（低→高），而不是 API 的返回顺序：选项编号
+    「1 低 … 5 严重」在两个账号之间必须一致，否则用户凭记忆打「4」会挑错。
+    认不出一个（AWS 加了新档）就整个回空 → 调用方回落到全部五档。
+    """
+    try:
+        codes = {str(lv.get("code") or "").strip().lower()
+                 for lv in (resp or {}).get("severityLevels") or []}
+    except Exception:  # noqa: BLE001 —— 探针的附加值，绝不许因为它让探针失败
+        return ()
+    out = tuple(c for c in SEVERITY_CODES if c in codes)
+    return out if out else ()
+
+
+def plan_severities(cap: dict) -> tuple[str, ...]:
+    """`case_capability()` 的结论 → 可选的 severity code（低→高）。
+
+    没有 `severities` 那一项（探针抖动那两条 `probe_error` 路径、或者调用方自己
+    造的 `{"ok": True}`）就回**全部五档**：宁可多给一个选项让 AWS 自己拒，也不要
+    把客户真的需要的 `critical` 藏起来。
+    """
+    got = tuple((cap or {}).get("severities") or ())
+    return got or tuple(SEVERITY_CODES)
 
 
 def claim_inflight(key: str) -> bool:
@@ -391,6 +426,30 @@ def category_display(classification: dict, locale: str = "zh") -> str:
            if cls.get("categorySource") == "matched"
            else "case.create.category_source_auto")
     return f"{code} {i18n.t(key, locale)}"
+
+
+def overrides_cover_classification(service_text: str = "",
+                                   issue_type: str = "") -> bool:
+    """用户填的服务 + 案例类型是不是**已经把分类器的全部输出盖满了**？
+
+    `classify()` 只产出三样东西：`serviceCode`、`categoryCode`、`issueType`。
+    服务一旦在目录里匹配到、且它名下有类别，`apply_case_overrides` 会把前两样
+    **一起**换掉（类别必须跟着服务走，否则是非法组合）；`issueType` 是合法 code
+    时第三样也被换掉。三样全被盖 ⇒ 那次分类调用的结果一个字都不会进 CreateCase，
+    纯属白烧 token（钉钉案例模版把这两栏都做成了带默认值的必答项，所以这条路很常走）。
+
+    只看**能不能盖满**，不做任何 AWS 写操作；判据与 `apply_case_overrides` 里的
+    分支一一对应 —— 那边改了这边必须跟着改，否则会跳过一次其实需要的分类。
+    `category_text` 不参与：它只在**已定下来的服务**名下反查，盖不住 `serviceCode`。
+    """
+    if (issue_type or "").strip().lower() not in ISSUE_TYPE_CODES:
+        return False
+    if not (service_text or "").strip():
+        return False
+    hit = case_classifier.resolve_service(service_text)
+    # `category` 为空 = 那个服务名下没有类别，`apply_case_overrides` 会整条放弃并
+    # 保留分类器的挑选 —— 这种情况下分类**必须**跑。
+    return bool(hit and hit.get("code") and hit.get("category"))
 
 
 def apply_case_overrides(classification: dict, *, service_text: str = "",
@@ -509,12 +568,24 @@ def create_case(ctx: dict, *, platform: str, severity: str, language: str,
     subject = build_subject(ctx, platform)
     body = build_body(ctx, severity, extra, operator_name, platform)
 
-    classification = case_classifier.classify(
-        intent_summary=ctx.get("intent_summary", ""),
-        raw_text=ctx.get("raw_text", ""),
-        summary_md=ctx.get("summary_md", ""),
-    )
-    logger.info("Case classification: %s", classification)
+    if overrides_cover_classification(service_text, issue_type):
+        # 用户把服务和案例类型都填了、且服务在目录里匹配得上 —— 分类器那三个输出
+        # 会被 `apply_case_overrides` 全部覆盖掉，跑它等于白烧一次最贵的输入。
+        # 这里的种子值只是占位，下一行就会被逐个盖掉；`reason` 如实写成人填的。
+        classification = {
+            "serviceCode": case_classifier.FALLBACK_SERVICE,
+            "categoryCode": case_classifier.FALLBACK_CATEGORY,
+            "issueType": DEFAULT_ISSUE_TYPE,
+            "reason": "user-specified (classifier skipped)",
+        }
+        logger.info("Case classification skipped: overrides cover it (0 token)")
+    else:
+        classification = case_classifier.classify(
+            intent_summary=ctx.get("intent_summary", ""),
+            raw_text=ctx.get("raw_text", ""),
+            summary_md=ctx.get("summary_md", ""),
+        )
+        logger.info("Case classification: %s", classification)
     classification = apply_case_overrides(classification,
                                           service_text=service_text,
                                           issue_type=issue_type,

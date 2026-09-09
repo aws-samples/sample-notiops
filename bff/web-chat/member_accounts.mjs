@@ -1,9 +1,14 @@
 /**
  * 成员账号一键接入（Web Chat Admin「账户」页；与 idle 控制台 api/routes/org_onboard.py 同构）。
  *
- * 前提: org 模式部署（setup.sh --multi-account 且管理账号/委派管理员），CDK 注入
- *   MEMBER_ONBOARDING_STACKSET_NAME + ORGANIZATION_ID 并授权 StackSets/Organizations。
- * 非 org 模式下所有函数抛 org_mode_disabled（路由层转 400）。
+ * 前提: org 模式部署（setup.sh --multi-account / 方式 A DeployMode=MultiAccount），CDK 注入
+ *   MEMBER_ONBOARDING_STACKSET_NAME + ORGANIZATION_ID + STACKSET_CALL_AS 并授权
+ *   StackSets/Organizations。非 org 模式下所有函数抛 org_mode_disabled（路由层转 400）。
+ *
+ * 📌 部署账号可以是**组织管理账号**（`CallAs=SELF`）**或已注册的 StackSets 委派管理员**
+ *   （`CallAs=DELEGATED_ADMIN`）。身份由部署期探测、经 `STACKSET_CALL_AS` 注进来，本文件
+ *   **每一次** service-managed StackSet 调用都必须带上它 —— 见 `STACKSET_CALL_AS` 常量。
+ *   身份的判定逻辑在部署侧（`infra/lambda/preflight/index.py`），本文件只消费结果。
  *
  * 流程:
  *   listMemberAccounts  → Organizations ListAccounts(ACTIVE) × config 表接入状态
@@ -39,6 +44,55 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
 });
 
 let _rootIdCache = "";
+
+/**
+ * 本部署用什么身份操作 service-managed StackSet：`SELF`（组织管理账号）或
+ * `DELEGATED_ADMIN`（已注册的 StackSets 委派管理员）。
+ *
+ * 🔴 **每一次** StackSet 调用都要带（`CallAs: STACKSET_CALL_AS`）。委派管理员漏带一处，
+ *    那一处就会报 AccessDenied 或 `StackSetNotFoundException` —— 因为不带 CallAs 时 CFN
+ *    在**本账号自己的** StackSet 命名空间里找，而 StackSet 实体存在管理账号里
+ *    （AWS 官方行为：委派管理员创建的 service-managed StackSet 也在管理账号）。
+ *    这个错最坑的地方是它长得像「部署时没带 --multi-account」，会把人引去重装。
+ *
+ * 值由部署期探测得出（`infra/lambda/preflight/index.py` 的 `_resolve_stackset_role`，
+ * 方式 B 是 `setup.sh` 里同一套探测），经 CDK 注成环境变量。空 = 单账号部署（用不到）。
+ * 认不出的值按 SELF 处理并告警 —— 静默按委派管理员走会让管理账号部署整片报错。
+ */
+const STACKSET_CALL_AS = (() => {
+  const v = (process.env.STACKSET_CALL_AS || "").trim().toUpperCase();
+  if (v === "DELEGATED_ADMIN") return "DELEGATED_ADMIN";
+  if (v && v !== "SELF") console.warn(`STACKSET_CALL_AS=${v} 无法识别，按 SELF 处理`);
+  return "SELF";
+})();
+
+/**
+ * 组织管理账号号（`Fn::GetAtt PreflightFn.ManagementAccountId` / setup.sh 探测结果注入）。
+ * 空 = 单账号部署，或老版本部署没注这个值（此时下面的拦截退化为不拦，与改动前一致）。
+ */
+const ORG_MANAGEMENT_ACCOUNT_ID = (process.env.ORG_MANAGEMENT_ACCOUNT_ID || "").trim();
+
+/**
+ * 这个账号能不能靠 StackSet 下发。
+ *
+ * 🔴 **CloudFormation 不会把 stack 部署到组织管理账号**，即使管理账号在被 target 的 OU
+ *    里（AWS 官方限制）。管理账号自部署时这件事不可见 —— 部署账号自己本来就被排除在
+ *    列表外。但**委派管理员**部署时管理账号是一个普通行，一键接入按钮照常显示，而
+ *    `CreateStackInstances` 会**返回成功、操作也会变 SUCCEEDED、目标账号里什么都没有**：
+ *    账号被翻成 ACTIVE、enabled=true，然后每一次跨账号提问都 AssumeRole 失败。
+ *    所以必须在调用**之前**拦住，并给出唯一可行的替代做法。
+ */
+function assertStackSetTargetable(id) {
+  if (STACKSET_CALL_AS !== "DELEGATED_ADMIN") return;
+  if (!ORG_MANAGEMENT_ACCOUNT_ID || id !== ORG_MANAGEMENT_ACCOUNT_ID) return;
+  const e = new Error(
+    `一键接入不支持组织管理账号（${id}）：CloudFormation StackSets 不会把 stack 部署到`
+    + "管理账号，调用会「成功」但那个账号里什么都不会建。"
+    + "请在管理账号里手工部署一次 infra/member-account-onboarding.yaml（参数与本部署一致），"
+    + "然后用下方「手动接入账号」登记它。");
+  e.code = "bad_request";
+  throw e;
+}
 
 /**
  * StackSet 一键接入可不可用（= 是否 org 模式部署）。
@@ -197,6 +251,15 @@ export async function listMemberAccounts() {
     // 组织外账号（跨 Payer 接入）。默认 false —— 与 needsStackUpdate 同理：
     // 留 undefined 会让前端的 `?` 判不出来。上面 org 分支之后会覆盖它。
     outOfOrg: false,
+    /**
+     * 组织**管理账号**（只有委派管理员部署时这一行才会出现 —— 管理账号自部署时
+     * 部署账号本来就被排除）。CFN 不会把 stack 部署到管理账号，所以一键接入对它
+     * 永远不可用；前端据此打徽章 + 不渲染按钮，后端 `assertStackSetTargetable`
+     * 兜底拦住直接调 API 的情况。
+     */
+    isOrgManagementAccount: Boolean(
+      STACKSET_CALL_AS === "DELEGATED_ADMIN"
+      && ORG_MANAGEMENT_ACCOUNT_ID && id === ORG_MANAGEMENT_ACCOUNT_ID),
     /**
      * 接入方式：`"manual"`（客户自己部署 CFN）| `""`（一键接入 / 老记录）。
      *
@@ -376,6 +439,7 @@ export async function onboardAccount(accountId, regions) {
   const id = String(accountId || "").trim();
   if (!/^[0-9]{12}$/.test(id)) { const e = new Error("invalid_account_id"); e.code = "bad_request"; throw e; }
   if (!Array.isArray(regions) || regions.length === 0) { const e = new Error("regions_required"); e.code = "bad_request"; throw e; }
+  assertStackSetTargetable(id); // 管理账号：StackSet 下发不到，必须在调用前拦
 
   const existing = await getConfigAccount(id);
   if (existing && existing.org_onboard_status === "ACTIVE") {
@@ -406,6 +470,7 @@ export async function onboardAccount(accountId, regions) {
   try {
     const r = await cf.send(new CreateStackInstancesCommand({
       StackSetName: ss,
+      CallAs: STACKSET_CALL_AS,
       DeploymentTargets: {
         OrganizationalUnitIds: [await rootId()],
         Accounts: [id],
@@ -449,7 +514,7 @@ export async function onboardAccount(accountId, regions) {
 export async function onboardStatus(operationId, accountId) {
   const ss = stackSetName();
   const r = await cf.send(new DescribeStackSetOperationCommand({
-    StackSetName: ss, OperationId: operationId,
+    StackSetName: ss, OperationId: operationId, CallAs: STACKSET_CALL_AS,
   }));
   const status = (r.StackSetOperation && r.StackSetOperation.Status) || "UNKNOWN";
 
@@ -803,6 +868,7 @@ export async function offboardAccount(accountId) {
     if (!ss) throw Object.assign(new Error("no stackset"), { name: "StackInstanceNotFoundException" });
     const r = await cf.send(new DeleteStackInstancesCommand({
       StackSetName: ss,
+      CallAs: STACKSET_CALL_AS,
       DeploymentTargets: {
         OrganizationalUnitIds: [await rootId()],
         Accounts: [id],
@@ -825,6 +891,7 @@ export async function offboardAccount(accountId) {
     if (!DA_STACKSET) throw new Error("no da stackset");
     await cf.send(new DeleteStackInstancesCommand({
       StackSetName: DA_STACKSET,
+      CallAs: STACKSET_CALL_AS,
       DeploymentTargets: { OrganizationalUnitIds: [await rootId()], Accounts: [id], AccountFilterType: "INTERSECTION" },
       Regions: [process.env.AWS_REGION || "us-east-1"],
       RetainStacks: false,
@@ -852,7 +919,7 @@ export async function offboardAccount(accountId) {
 async function instanceRegionsOf(accountId) {
   const { ListStackInstancesCommand } = await import("@aws-sdk/client-cloudformation");
   const r = await cf.send(new ListStackInstancesCommand({
-    StackSetName: stackSetName(), StackInstanceAccount: accountId,
+    StackSetName: stackSetName(), StackInstanceAccount: accountId, CallAs: STACKSET_CALL_AS,
   }));
   const regions = [...new Set((r.Summaries || []).map((x) => x.Region))];
   return regions.length ? regions : [process.env.AWS_REGION || "us-east-1"];
@@ -867,6 +934,7 @@ export async function associateDevopsAgent(accountId) {
   stackSetName(); // org 模式校验
   const id = String(accountId || "").trim();
   if (!/^[0-9]{12}$/.test(id)) { const e = new Error("invalid_account_id"); e.code = "bad_request"; throw e; }
+  assertStackSetTargetable(id); // 同 onboardAccount：管理账号下发不到
   const cfg = await getConfigAccount(id);
   if (!cfg || cfg.org_onboard_status !== "ACTIVE") {
     const e = new Error("complete_step1_first"); e.code = "bad_request"; throw e;
@@ -875,6 +943,7 @@ export async function associateDevopsAgent(accountId) {
   try {
     const r = await cf.send(new CreateStackInstancesCommand({
       StackSetName: DA_STACKSET,
+      CallAs: STACKSET_CALL_AS,
       DeploymentTargets: {
         OrganizationalUnitIds: [await rootId()],
         Accounts: [id],
@@ -921,7 +990,7 @@ export async function associateDevopsAgent(accountId) {
 export async function devopsAgentAssocStatus(operationId, accountId) {
   const id = String(accountId || "").trim();
   const r = await cf.send(new DescribeStackSetOperationCommand({
-    StackSetName: DA_STACKSET, OperationId: operationId,
+    StackSetName: DA_STACKSET, OperationId: operationId, CallAs: STACKSET_CALL_AS,
   }));
   const status = (r.StackSetOperation && r.StackSetOperation.Status) || "UNKNOWN";
   if (status !== "SUCCEEDED" || !id) {
@@ -937,7 +1006,7 @@ export async function devopsAgentAssocStatus(operationId, accountId) {
   // 读回 outputs：成员数据角色有 cloudformation:DescribeStacks（模板 v4）
   const { ListStackInstancesCommand, DescribeStacksCommand } = await import("@aws-sdk/client-cloudformation");
   const inst = await cf.send(new ListStackInstancesCommand({
-    StackSetName: DA_STACKSET, StackInstanceAccount: id,
+    StackSetName: DA_STACKSET, StackInstanceAccount: id, CallAs: STACKSET_CALL_AS,
   }));
   const stackId = inst.Summaries?.[0]?.StackId;
   if (!stackId) return { operationId, status, accountId: id, note: "instance_not_found" };

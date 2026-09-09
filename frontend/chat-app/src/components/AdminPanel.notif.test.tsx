@@ -25,8 +25,15 @@ let getResp: {
     app_id: string; app_secret: string; verification_token: string;
     encrypt_key: string; notify_chat_ids: string; webhook_url?: string;
   };
+  /** 钉钉段**可选**是刻意的：旧 BFF（还没部署钉钉那段）不回这一段，
+   *  界面必须退回"全部空着"而不是白屏 —— 见下面同名断言。 */
+  dingtalk?: {
+    app_key: string; app_secret: string; push_webhook_url?: string; webhook_url?: string;
+  };
 };
 const putSpy = vi.fn(async (_cfg: Record<string, string>) => ({ message: "ok" }));
+const putDtSpy = vi.fn(async (_cfg: Record<string, string>) => ({ message: "ok" }));
+const testDtSpy = vi.fn(async () => ({ success: true, message: "token ok" }));
 
 vi.mock("../api/admin", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/admin")>();
@@ -36,6 +43,8 @@ vi.mock("../api/admin", async (importOriginal) => {
     fetchNotificationConfig: vi.fn(async () => getResp),
     putNotificationConfig: (cfg: Record<string, string>) => putSpy(cfg),
     testNotificationSend: vi.fn(async () => ({ success: true, message: "sent" })),
+    putDingtalkConfig: (cfg: Record<string, string>) => putDtSpy(cfg),
+    testDingtalkSend: () => testDtSpy(),
   };
 });
 
@@ -273,5 +282,195 @@ describe("飞书配置步骤抽屉", () => {
     expect(document.querySelector(".imd-title")!.textContent).toBe(zh("admin.notif.guideTitle"));
     expect(document.querySelector(".imd-sub")!.textContent).toBe(zh("admin.notif.guideSub"));
     expect(screen.getByLabelText(zh("panel.close"))).toBeTruthy();
+  });
+});
+
+/**
+ * 钉钉分页（2026-09-08）。
+ *
+ * 为什么单独一组、而不是把上面那些断言参数化：**钉钉不是"飞书换个名字"**。
+ * 字段集、能测到什么、以及配错时的症状，三样都不一样，而差异全都指向同一个后果 ——
+ * 客户以为自己配好了，其实机器人一句话不回：
+ *   · 钉钉保存回调地址时**不做任何校验**（没有飞书那种 URL challenge）→ 地址填错
+ *     不会当场报错，唯一的排错入口是抽屉里那两条 `aws logs tail`；
+ *   · 钉钉**没有**「往任意群发测试消息」的接口 → 「测试凭证」只能验 accessToken，
+ *     这一点必须写在界面上，否则"测试通过 + 群里没反应"会被当成产品坏了；
+ *   · 只有两把钥匙（没有 Encrypt Key / Verification Token），也没有推送群组列表 ——
+ *     少画的框必须是**故意**少画，多画一个空框客户就会去找不存在的值。
+ *
+ * 另外两条是回归性质的：平台切换默认必须停在飞书（否则老客户进来看到的是空表单），
+ * 且**同一时刻只挂一个抽屉**（`imd-webhook-url` 是固定 id）。
+ */
+const dtSecretInputs = () =>
+  Array.from(document.querySelectorAll('input[name^="notiops-dingtalk-"]')) as HTMLInputElement[];
+
+/** 打开「集成 IM」→ 切到钉钉分页。 */
+async function openDtTab() {
+  await openImTab();                       // 默认停在飞书（这本身是下面第一条断言）
+  const btn = Array.from(document.querySelectorAll("button"))
+    .find((b) => b.textContent === zh("admin.notif.platform.dingtalk"))!;
+  expect(btn).toBeTruthy();
+  fireEvent.click(btn);
+  await waitFor(() => expect(dtSecretInputs().length).toBe(2));
+}
+
+describe("Admin「集成 IM」钉钉分页", () => {
+  beforeEach(() => {
+    cleanup();
+    putDtSpy.mockClear();
+    testDtSpy.mockClear();
+    getResp = {
+      feishu: {
+        app_id: "cli_a1b2c3d4", app_secret: "****WXYZ",
+        verification_token: "", encrypt_key: "", notify_chat_ids: "oc_room1",
+      },
+      dingtalk: {
+        app_key: "dingabcd1234", app_secret: "****6789",
+        push_webhook_url: "", webhook_url: "",
+      },
+    };
+  });
+
+  it("默认停在飞书分页；两个平台都在切换器里", async () => {
+    // 老客户（只配了飞书）进这一页不该看到一张空表单 —— 那会让人以为配置丢了。
+    await openImTab();
+    expect(secretInputs().length).toBe(3);
+    expect(dtSecretInputs().length).toBe(0);
+    const btns = Array.from(document.querySelectorAll("button")).map((b) => b.textContent);
+    expect(btns).toContain(zh("admin.notif.platform.feishu"));
+    expect(btns).toContain(zh("admin.notif.platform.dingtalk"));
+  });
+
+  it("切到钉钉：两把钥匙 + App Key，飞书那三个框离场", async () => {
+    await openDtTab();
+    expect(secretInputs().length).toBe(0);       // 同一时刻只挂一个平台的表单
+    const names = dtSecretInputs().map((el) => el.name);
+    expect(names).toEqual(["notiops-dingtalk-app_secret", "notiops-dingtalk-push_webhook_url"]);
+    const labels = labelTexts();
+    expect(labels).toContain("App Key");
+    // 钉钉没有这两样 —— 多画一个空框，客户会去钉钉控制台找不存在的值。
+    expect(labels).not.toContain("Encrypt Key");
+    expect(labels).not.toContain("Verification Token");
+  });
+
+  it("name 带平台前缀（否则浏览器把飞书的密钥填进钉钉那个框）", async () => {
+    // 两个平台都有 `app_secret`。不带前缀的话，浏览器/密码管理器会认成同一个字段，
+    // 把上一页存下的飞书密钥自动填过来 —— 保存后钉钉验签失败，症状指向"地址填错"。
+    await openDtTab();
+    for (const el of dtSecretInputs()) {
+      expect(el.name).toMatch(/^notiops-dingtalk-/);
+      expect(el.getAttribute("autocomplete")).toBe("new-password");
+      expect(el.getAttribute("data-1p-ignore")).not.toBeNull();
+      expect(el.getAttribute("data-lpignore")).toBe("true");
+      expect(el.name).not.toMatch(/password/i);
+    }
+  });
+
+  it("没有推送群组列表，取而代之的是一句说明", async () => {
+    // 飞书要填 chat id 列表，钉钉不用（群里那条回复通道是回调里带的一次性地址）。
+    // 少画的框必须是**故意**少画：界面得说出来，不然客户会以为这一页没做完。
+    await openDtTab();
+    expect(document.body.textContent).toContain(zh("admin.notif.dt.noChatIds"));
+    expect(document.body.textContent).toContain(zh("admin.notif.dt.keysRequired"));
+  });
+
+  it("自定义机器人推送地址当**密钥**处理（那串地址本身就是凭证）", async () => {
+    // 谁拿到那个地址都能往那个群发消息。所以它跟 App Secret 走同一条路：
+    // 脱敏回显、谢绝自动填充、没动过就原样回传。
+    getResp.dingtalk!.push_webhook_url = "****send";
+    await openDtTab();
+    const [, push] = dtSecretInputs();
+    expect(push.value).toBe("****send");
+    expect(push.type).toBe("text");        // 没动过 → 后 4 位真的看得见
+    fireEvent.change(push, { target: { value: "https://oapi.dingtalk.com/robot/send?access_token=x" } });
+    expect(dtSecretInputs()[1].type).toBe("password");
+  });
+
+  it("保存时 trim；没动过的两把钥匙原样回传（= 不修改）", async () => {
+    await openDtTab();
+    const appKeyInput = Array.from(document.querySelectorAll("input"))
+      .find((el) => el.getAttribute("placeholder") === "dingxxxxxxxx")!;
+    fireEvent.change(appKeyInput, { target: { value: "  dingnewkey9999 \n" } });
+    const saveBtn = Array.from(document.querySelectorAll("button"))
+      .find((b) => b.textContent === zh("admin.notif.save"))!;
+    fireEvent.click(saveBtn);
+    await waitFor(() => expect(putDtSpy).toHaveBeenCalled());
+    const sent = putDtSpy.mock.calls[0][0];
+    expect(sent.app_key).toBe("dingnewkey9999");
+    expect(sent.app_secret).toBe("****6789");        // 没动过 → 服务端原值
+    expect(sent.push_webhook_url).toBe("");
+    // 飞书那份的字段一个都不该混进来（后端是两个独立的 Secret）
+    expect(sent.encrypt_key).toBeUndefined();
+    expect(sent.verification_token).toBeUndefined();
+    expect(sent.notify_chat_ids).toBeUndefined();
+  });
+
+  it("兜底：静默自动填充改不了钥匙", async () => {
+    await openDtTab();
+    const [secret] = dtSecretInputs();
+    secret.value = "autofilled-by-password-manager";   // 不触发 onChange，同飞书那条
+    fireEvent.click(Array.from(document.querySelectorAll("button"))
+      .find((b) => b.textContent === zh("admin.notif.save"))!);
+    await waitFor(() => expect(putDtSpy).toHaveBeenCalled());
+    expect(putDtSpy.mock.calls[0][0].app_secret).toBe("****6789");
+  });
+
+  it("「测试凭证」不需要群 id 就能点，并如实说明它测到了什么", async () => {
+    // 钉钉没有「往任意群发测试消息」的接口 → 这个按钮只验 accessToken。
+    // 提示文案必须在界面上，否则"测试通过 + 群里没反应"会被当成产品坏了。
+    await openDtTab();
+    const testBtn = Array.from(document.querySelectorAll("button"))
+      .find((b) => b.textContent === zh("admin.notif.dt.test"))!;
+    expect(testBtn.getAttribute("title")).toBe(zh("admin.notif.dt.testTip"));
+    fireEvent.click(testBtn);
+    await waitFor(() => expect(testDtSpy).toHaveBeenCalled());
+    await waitFor(() => expect(document.body.textContent).toContain("token ok"));
+  });
+
+  it("旧 BFF 不回 dingtalk 段 → 退回空表单，不白屏", async () => {
+    // 前端资产与 BFF 在同一个栈里更新，但客户浏览器可能拿到缓存下来的旧前端，
+    // 反过来也可能：新前端 + 还没更新完的 BFF。缺这一段时必须还能配。
+    delete getResp.dingtalk;
+    await openDtTab();
+    expect(dtSecretInputs().map((el) => el.value)).toEqual(["", ""]);
+    expect(document.querySelector(".imx-steps")).toBeTruthy();
+  });
+
+  it("钉钉抽屉：七节步骤 + 回调地址 + 明说钉钉保存时不校验", async () => {
+    const url = "https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/";   // 占位，见飞书那条
+    getResp.dingtalk!.webhook_url = url;
+    await openDtTab();
+    const panel = () => document.querySelector(".imd-panel")!;
+    fireEvent.click(document.querySelector("button.imx-guide-link") as HTMLButtonElement);
+    await waitFor(() => expect(panel().className).toContain("open"));
+
+    // 同一时刻只有一个抽屉在 DOM 里（`imd-webhook-url` 是固定 id）
+    expect(document.querySelectorAll(".imd-panel").length).toBe(1);
+    expect(document.querySelector(".imd-title")!.textContent).toBe(zh("admin.notif.dt.guideTitle"));
+    expect(document.querySelectorAll(".imd-body .imd-h").length).toBe(7);
+
+    const body = document.querySelector(".imd-body")!.textContent || "";
+    // 客户在浏览器里配不完的那几件事必须写明
+    expect(body).toContain("HTTP");                       // 默认是 Stream 模式，必须改
+    expect(body).toContain("不做任何校验");                 // 没有 URL challenge → 填错不报错
+    expect(body).toContain("notiops-im-ingress-dingtalk"); // 唯一的排错入口
+    expect(body).not.toContain("put-secret-value");        // 抽屉是给只有浏览器的客户看的
+
+    const input = document.querySelector("input.imd-url") as HTMLInputElement;
+    expect(input.value).toBe(url);
+    expect(input.readOnly).toBe(true);
+  });
+
+  it("取不到回调地址时指向 DingtalkWebhookUrl 这个 Output（不是飞书那个名字）", async () => {
+    // 指错 Output 名字的代价：客户在 Outputs 里翻不到，以为部署漏了东西。
+    await openDtTab();               // fixture 里 webhook_url 是空串
+    fireEvent.click(document.querySelector("button.imx-guide-link") as HTMLButtonElement);
+    await waitFor(() => expect(document.querySelector(".imd-panel")!.className).toContain("open"));
+    const body = document.querySelector(".imd-body")!.textContent || "";
+    expect(document.querySelector(".imd-urlbox")).toBeNull();
+    expect(body).toContain(zh("admin.notif.dt.url.missing"));
+    expect(body).toContain("DingtalkWebhookUrl");
+    expect(body).not.toContain("FeishuWebhookUrl");
+    expect(document.querySelectorAll(".imd-body .imd-h").length).toBe(7);
   });
 });

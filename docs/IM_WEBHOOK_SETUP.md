@@ -1,65 +1,89 @@
-# IM Webhook 配置指南（飞书 / Slack）
+# IM Webhook 配置指南（飞书 / Slack / 钉钉）
 
-飞书和 Slack 都走 **API Gateway HTTP API + Lambda webhook**（不再需要常驻容器和长连接）。
+飞书、Slack、钉钉都走 **API Gateway HTTP API + Lambda webhook**（不再需要常驻容器和长连接）。
 这份文档只讲**你要在 IM 平台控制台点什么**，是 **部署完成之后** 的那一步。
 
 > **三类读者，都适用**：
-> - **一键部署（方式 A）**：参数页的 **What to install** 选了 `web+feishu` / `web+slack`
+> - **一键部署（方式 A）**：参数页的 **What to install** 选了 `web+feishu` / `web+slack` /
+>   `web+dingtalk`
 >   （见 [DEPLOYMENT_ONECLICK.md §2.11](DEPLOYMENT_ONECLICK.md#211-加装-im-机器人飞书lark-或-slack)），
->   栈已经开完，剩下的就是这份文档 —— 先看 §0 那条 🅰️ 说明（只有四处不同），然后照 §1 / §2 做。
+>   栈已经开完，剩下的就是这份文档 —— 先看 §0 那条 🅰️ 说明（只有四处不同），然后照 §1 / §2 / §3 做。
 > - **新部署（方式 B，`setup.sh`）**：先按 [DEPLOYMENT.md](DEPLOYMENT.md) §3 建好应用、配好权限、拿到钥匙，
 >   跑完 `setup.sh`，然后回到这里填请求地址。
-> - **已有长连接部署**：这是**原地切换**，不需要新建应用、不需要改权限（飞书），
+> - **已有长连接部署**：飞书是**原地切换**，不需要新建应用、不需要改权限，
 >   只改「订阅方式 + 请求地址」两项，并补两把钥匙（§1.2）。
+>   **钉钉没有这条路** —— 老部署里钉钉跑的是已退役的 Fargate 长连接形态，
+>   现在要按 §3 新建一个企业内部应用。
 >
 > ⚠️ **顺序是硬的**：请求地址必须在「栈已部署」**且**「钥匙已写进 Secret」之后才填。
-> 反了的症状是飞书 / Slack 显示「校验失败」，看起来像地址填错了。
+> 反了的症状是飞书 / Slack 显示「校验失败」，看起来像地址填错了；
+> **钉钉连「校验失败」都不显示 —— 它保存地址时什么都不验，只是机器人不回话**（见 §3.4）。
+
+### 🔴 本版本支持的 IM 平台：飞书 / Lark、Slack、钉钉
+
+| 平台 | 本版本 | 说明 |
+|---|:--:|---|
+| 飞书 / Lark | ✅ | Lambda webhook，本文 §1 |
+| Slack | ✅ | Lambda webhook，本文 §2 |
+| 钉钉 DingTalk | ✅ | Lambda webhook，本文 §3（2026-09-08 起） |
+| Microsoft Teams | ❌ **不可用** | `platforms/teams/` 是空目录，只有设计意图，没有实现 |
+
+> Microsoft Teams 是**已知的待办**，不在本版本内。要在 Teams 上用 NotiOps，
+> 目前唯一的办法是走 Web Chat（浏览器），它的能力集与 IM 侧一致。
 
 ---
 
 ## 0. 先拿到 Webhook 地址
 
-**最省事的一条：管理控制台 →「集成 IM」→「查看详细配置步骤」→ 第 3 步。**
-本部署真实的飞书地址就显示在那里，带一个「复制」按钮 —— 不用开 CloudFormation 控制台、
+**最省事的一条：管理控制台 →「集成 IM」→ 切到你的平台分页 →「查看详细配置步骤」→ 第 3 步。**
+本部署真实的地址就显示在那里，带一个「复制」按钮 —— 不用开 CloudFormation 控制台、
 不用跑 CLI，两条部署路径（方式 A / 方式 B）都一样。地址由后端按名字查 IM 入口的
 HTTP API 得到，所以栈名叫什么都不影响。
 
-> 抽屉里那一块显示「取不到地址」时，说明这个部署没装 IM（只装了 `web`），
-> 或者查询没有权限 —— 退回下面的 CLI / Outputs 取法即可，两处是同一个值。
-> **Slack 的地址目前只在 Outputs 里**（管理控制台的「集成 IM」页只覆盖飞书）。
+> **这一页覆盖飞书和钉钉两个平台**（各有独立的分页和抽屉，取到的是各自那个入口的地址）。
+> **Slack 的地址目前只在 Outputs 里。**
+>
+> 抽屉里那一块显示「取不到地址」时，说明这个部署没装这个平台（比如只装了 `web`、
+> 或者只装了飞书而你在看钉钉那页），或者查询没有权限 —— 退回下面的 CLI / Outputs
+> 取法即可，两处是同一个值。
 
-下面是 CLI 取法（脚本部署、自动化、以及 Slack 都用这个）。`ImStack` 部署完会输出两个 CfnOutput：
+下面是 CLI 取法（脚本部署、自动化、以及 Slack 都用这个）。`ImStack` 部署完会按装了哪些平台输出对应的 CfnOutput：
 
 ```bash
 aws cloudformation describe-stacks --stack-name ImStack --region <REGION> \
-  --query 'Stacks[0].Outputs[?OutputKey==`FeishuWebhookUrl`||OutputKey==`SlackWebhookUrl`]' \
+  --query 'Stacks[0].Outputs[?OutputKey==`FeishuWebhookUrl`||OutputKey==`SlackWebhookUrl`||OutputKey==`DingtalkWebhookUrl`]' \
   --output table
 ```
 
 形如 `https://<随机>.execute-api.<region>.amazonaws.com/`。**结尾那个 `/` 要保留**。
 
-同一个 URL 同时用于：飞书的「事件」和「回调」；Slack 的 Events / Interactivity / Slash Commands。
+每个平台有**自己的**一个 HTTP API 和 ingress（`FeishuWebhookUrl` / `SlackWebhookUrl` /
+`DingtalkWebhookUrl` 是三个不同的地址，别互相填错）。但**同一个平台内部只有一个地址**：
+飞书的「事件」和「回调」两处填同一个；Slack 的 Events / Interactivity / Slash Commands
+三处填同一个；钉钉只有「消息接收地址」这一处要填。
 HTTP API 用的是 `$default` catch-all 路由（任意方法、任意路径都进 ingress），
 ingress 按请求体自己分流，不靠路径区分 —— 所以地址后面**加不加子路径都能通**，
 但建议就按 Outputs 里给的原样填。
 
 > 📌 **2026-09-01 起这个地址换了形态**：以前是 Lambda Function URL
 > （`https://<随机>.lambda-url.<region>.on.aws/`），现在前面加了一层 API Gateway
-> HTTP API。原因和取舍见 §4。**从旧版本升级上来的部署，这个地址会变** ——
-> 重新取一次 Outputs，回到 §1.3 / §1.4（或 §2.3）把新地址填一遍。旧地址不会保留。
+> HTTP API。原因和取舍见 §5。**从旧版本升级上来的部署，这个地址会变** ——
+> 重新取一次 Outputs，回到 §1.3 / §1.4（或 §2.3 / §3.4）把新地址填一遍。旧地址不会保留。
 
 > 🅰️ **一键部署（方式 A）的读者**：你没有 `ImStack` —— IM 是**主栈的加装项**（参数页的
-> **What to install** 选 `web+feishu` 或 `web+slack`，见
+> **What to install** 选 `web+feishu` / `web+slack` / `web+dingtalk`，见
 > [DEPLOYMENT_ONECLICK.md §2.11](DEPLOYMENT_ONECLICK.md#211-加装-im-机器人飞书lark-或-slack)）。差别只有下面四条，
-> §1 / §2 的每一步照做即可：
+> §1 / §2 / §3 的每一步照做即可：
 > - **地址从主栈的 Outputs 取**：上面那条命令把 `--stack-name` 换成你的栈名（默认 `notiops`）。
 >   OutputKey 一模一样，另外还多一个 `ImNextSteps` 告诉你还差哪一步。
-> - **secret 名字完全一致**（`notiops/im-bot-feishu` / `notiops/slack-bot-token` /
->   `notiops/slack-signing-secret`），本文所有命令原样可用。
+> - **secret 名字完全一致**（`notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` /
+>   `notiops/slack-bot-token` / `notiops/slack-signing-secret`），本文所有命令原样可用。
 > - **Slack 那两个 secret 要你手建**（`aws secretsmanager create-secret`，见 §2.2）——
->   模板不建 secret；飞书那个在管理控制台「集成 IM」页保存凭证时会由后端自动创建。
+>   模板不建 secret；**飞书和钉钉**那两个在管理控制台「集成 IM」页保存凭证时会由后端自动创建。
 > - **安装选项必须包含你要配的那个平台**：只装 `web` 的栈没有这个 HTTP API，
->   Outputs 里也不会出现 `FeishuWebhookUrl` / `SlackWebhookUrl`。
+>   Outputs 里也不会出现 `FeishuWebhookUrl` / `SlackWebhookUrl` / `DingtalkWebhookUrl`。
+>   ⚠️ **一次只能选一个 IM 平台** —— `web+feishu` / `web+slack` / `web+dingtalk` 是互斥的
+>   单选。要同时装两个 IM，走方式 B（`setup.sh` 可以多选）。
 
 ---
 
@@ -223,8 +247,8 @@ aws logs tail /aws/lambda/notiops-im-ingress-feishu --region <REGION> --since 5m
 
 | 日志里看到 | 含义 | 怎么办 |
 |---|---|---|
-| `RuntimeError: feishu secret missing encrypt_key/verification_token` | **钥匙没填**，ingress 冷启动即崩 —— 这是**故意**的 fail-fast（§1.2 / §4.2 第 1 条） | 回到 §1.2 把两把钥匙写进 Secret，再重填请求地址 |
-| `INIT_REPORT ... Status: timeout`，但同一份日志里 `REPORT` 那行是 `Memory Size: 2048 MB` 且**没有** `Task timed out` | **正常形态，不用管**（2026-09-02 起）。init 放不下 Lambda 的 10s INIT 硬上限，Lambda 会把它挪进首次 invoke 重跑并成功（`Duration` ~10.4s < `Timeout=20`）。冷请求确实超过飞书的 3s，但这本来就靠 §5 的保活解决 | 只确认 `MemorySize=2048` / `Timeout=20` 没被改小(见下一行)，然后去看保活规则在不在（§5.2） |
+| `RuntimeError: feishu secret missing encrypt_key/verification_token` | **钥匙没填**，ingress 冷启动即崩 —— 这是**故意**的 fail-fast（§1.2 / §5.2 第 1 条） | 回到 §1.2 把两把钥匙写进 Secret，再重填请求地址 |
+| `INIT_REPORT ... Status: timeout`，但同一份日志里 `REPORT` 那行是 `Memory Size: 2048 MB` 且**没有** `Task timed out` | **正常形态，不用管**（2026-09-02 起）。init 放不下 Lambda 的 10s INIT 硬上限，Lambda 会把它挪进首次 invoke 重跑并成功（`Duration` ~10.4s < `Timeout=20`）。冷请求确实超过飞书的 3s，但这本来就靠 §6 的保活解决 | 只确认 `MemorySize=2048` / `Timeout=20` 没被改小(见下一行)，然后去看保活规则在不在（§6.2） |
 | 同上，但 `Memory Size` **小于 2048 MB**，或出现 `Task timed out after 10.00 seconds` | ingress 的**内存/超时被改小了** —— init 重跑也撞上函数超时，入口对外恒返 500 | 这才是回归 —— ingress 必须是 `MemorySize=2048` / `Timeout=20`（1024MB 也不够，`im-core.ts` 里那两行有注释记了三档实测数据） |
 | 什么都没有（连 `INIT_START` 都没有） | 请求根本没到 Lambda | 地址填错，或 §0 的 URL 取自别的栈 |
 
@@ -391,7 +415,205 @@ Slack 特有的两个坑：
 
 ---
 
-## 3. 群允许清单（allowlist，可选，两个平台都支持）
+## 3. 钉钉 DingTalk（新建企业内部应用）
+
+> 与飞书那节不同，钉钉这边是**新建一个应用**（没有"原地切换"的路 —— 老部署里钉钉跑的是
+> 已退役的 Fargate 长连接形态，现在这条是 Lambda webhook）。
+>
+> **本页每一步都能只在浏览器里做完**：管理台 →「集成 IM」→ 切到**钉钉**分页 → 右上角
+> 「查看详细配置步骤」，抽屉里是同一份步骤，还直接给出本部署的消息接收地址 + 复制按钮。
+> 内容与本节一一对应（源文件 [`content/dingtalkGuide.ts`](../frontend/chat-app/src/content/dingtalkGuide.ts)）。
+> 下面额外给出 CLI 的做法，供脚本部署和自动化用。
+
+### 3.1 创建应用 + 开机器人能力（**不用**逐条勾权限）
+
+[open-dev.dingtalk.com](https://open-dev.dingtalk.com) → 应用开发 → 企业内部应用 →
+创建应用。填名称和简介即可，**不需要**填服务器出口 IP。
+
+进应用后：左侧「机器人」→ 开启机器人能力，填机器人名称与图标 → 保存。
+最后到「版本管理与发布」**发布一个版本** —— 不发布的话机器人加不进群。
+
+钉钉这边**不需要**像飞书那样逐条勾权限：机器人收发消息走的是机器人能力自带的通道，
+与飞书那批 `im:` / `cardkit:` scope 不是一回事，也没有 Slack 那张 Bot Token Scopes 表。
+
+### 3.2 两个凭证（**顺序很重要**）
+
+左侧「凭证与基础信息」→ 复制 **AppKey** 与 **AppSecret**（AppSecret 点一下才显示）。
+
+⚠️ **钉钉只有这一个 Secret。** AppSecret 同时做两件事：换 access token、以及校验入站
+请求头里的 `sign`。所以这里**没有**飞书那样的 `Encrypt Key` / `Verification Token`
+—— 界面上少两个输入框是**故意**的，不是漏了。
+
+与飞书同一条口径：**ingress 冷启动时会硬校验这两个值，缺任一就直接起不来**
+（宁可入口起不来，也不要开一个谁都能伪造请求的公网地址）。所以顺序是：
+**先把凭证存进去，再去 §3.4 填地址。**
+
+### 3.3 把凭证存进 Secret
+
+**方式一（推荐，只有浏览器就够）**：管理台 →「集成 IM」→ 钉钉分页 → 填 AppKey /
+AppSecret → 「保存」。Secret 不存在时后端会替你建。保存后页面只回显 AppSecret 的
+**后 4 位**（`****xxxx`）；**回传脱敏值 = 不修改**，所以以后只想改推送地址时不用重填
+AppSecret。这个值在日志里**连长度都不打**。
+
+**方式二（CLI）**：
+
+```bash
+aws secretsmanager put-secret-value --secret-id notiops/im-bot-dingtalk \
+  --region <REGION> \
+  --secret-string '{"app_key":"ding...","app_secret":"...","webhook_url":""}'
+```
+
+- Secret 名两条部署路径**完全一致**：`notiops/im-bot-dingtalk`。
+- `webhook_url` 这个键放的是 §3.7 的**自定义机器人推送地址**（可选，留空即可）。
+  ⚠️ 它跟「消息接收地址」是**方向相反**的两个东西，同名很容易搞混：
+  前者是我们**往钉钉发**（是凭证），后者是钉钉**往我们发**（是公开入口地址）。
+- 只想改一个字段时先 `get-secret-value` 拿全量再整份写回 ——
+  `put-secret-value` 是**整体替换**，不是合并。管理台的保存按钮替你做了合并。
+
+### 3.4 开 HTTP 模式并填消息接收地址
+
+地址就是 §0 拿到的那个（Output 名 `DingtalkWebhookUrl`），**结尾的 `/` 要保留**。
+回到应用的「机器人」页：
+
+| 填哪里 | 填什么 |
+|---|---|
+| 消息接收模式 | 选「**HTTP 模式**」（默认是 Stream 模式，**必须改**） |
+| 消息接收地址 | §0 的 `DingtalkWebhookUrl` |
+| 发布 | 改完保存，再到「版本管理与发布」**发布一次** |
+
+钉钉只有这**一个**地址要填：机器人没有独立的「按钮回调」通道，消息事件和卡片回传走
+同一条 URL（飞书要填「事件」+「回调」两处，Slack 要填三处）。
+
+> ⚠️ **钉钉保存这个地址时不做任何校验。** 没有飞书那种 URL challenge —— 不会当场变绿，
+> 也不会报错。所以**填错一个字符、或者凭证还没保存，表现完全一样：机器人一句话不回**。
+> 这是钉钉这条路上最贵的一个坑：症状不指向原因，客户往往会去反复检查凭证。
+> 唯一可靠的排错入口是 §3.5 的两条日志命令 —— 入口有没有收到请求，
+> 一眼就把「钉钉没发出来」和「我们没认出来」分开了。
+
+### 3.5 加进群并验证
+
+群设置 → 智能群助手 → 添加机器人 → 选刚发布的那个应用机器人。
+然后在群里发 `@机器人 你好`，应当收到回复。
+
+```bash
+aws logs tail /aws/lambda/notiops-im-ingress-dingtalk --region <REGION> --since 5m
+aws logs tail /aws/lambda/notiops-im-worker-dingtalk  --region <REGION> --since 5m
+```
+
+| 日志里看到 | 含义 | 怎么办 |
+|---|---|---|
+| 两个都没日志 | 钉钉根本没发出来 | 回 §3.4：消息接收模式真的切成 HTTP 了吗、地址一字不差吗、版本发布了吗 |
+| ingress 里有 `401` | `sign` 校验没过 | AppSecret 与钉钉控制台不一致，回 §3.2 / §3.3 |
+| ingress 里有 `timestamp skew` 类报错 | 时间窗对不上（钉钉的验签带 1 小时窗口） | 机器上的时间与钉钉相差超过 1 小时；这条基本只出现在自建 NTP 异常的环境 |
+| ingress 有日志、worker 没有 | 验签过了但投递失败 | 看 ingress 那条 ERROR 本身 |
+| `RuntimeError: dingtalk app_secret unavailable (...)` | **凭证没填**，ingress 冷启动即崩 —— 与飞书同一条**故意**的 fail-fast（§5.2 第 1 条） | 回 §3.3 存好凭证，再重填地址 |
+
+冷启动那一档的形态（`INIT_REPORT ... Status: timeout` 但 `REPORT` 那行内存正常）与
+飞书**逐字相同**，判法直接看 §1.5 那张表；三个 ingress 的内存/超时是同一组数
+（`MemorySize=2048` / `Timeout=20`），保活也是同一条规则（§6）。
+
+### 3.6 与飞书 / Slack 的差异（**平台能力差异，不是没做完**）
+
+钉钉机器人的平台原语比飞书少几样，所以同一个功能在钉钉里长得不一样。这些差异我们**写
+出来**而不是靠"没提到"暗示：
+
+| 差异 | 钉钉侧的形态 |
+|---|---|
+| **卡片按钮只能是链接** | 钉钉的 ActionCard 按钮全部是 URL 跳转，没有「点一下回传给服务器」这种交互。所以需要确认的操作（开案例、启动调查）在钉钉里**用回复关键词完成**。 |
+| **已发出的消息改不了** | 钉钉没有更新消息的接口，所以没有飞书那种「卡片自己变」的进度条；长任务改成**追加一两条**进度消息。 |
+| **机器人不能给消息贴表情** | 收到指令时没有 👀 / 👍 那种即时反馈，取而代之的是一条**文字回执**。 |
+| **群里主动推送要另配一个地址** | 机器人自己那条回复通道是钉钉在回调里给的**一次性会话地址**（`sessionWebhook`，收到消息后约 **90 分钟**内有效），做不了「定时主动发」。要主动推送见 §3.7。 |
+
+命令入口与另外两个平台**一致**：`/devops`、`/agent`、`/web`、`/account`、`/investigate`、
+`/case`、`/model`、`/language`、`/help` 都能用，中文说法（`/调查`、`/开案例`、`/智能体`、
+`/联网`）和不带斜杠的形式（`@机器人 agent notiops`）也都能用 —— 钉钉没有 Slack 那层
+斜杠命令注册表，所以**一步都不用注册**。
+
+#### 那么在钉钉怎么开案例？（**没有弹窗表单，但有一张可复制的模版**）
+
+飞书 / Slack 里 `/case` 会弹一个表单让你填主题、严重等级、语言。钉钉弹不出来 ——
+按上面那条「按钮只能是链接」，钉钉没有「点按钮回传给服务器」这条路，也就没有弹窗表单。
+所以钉钉把那张表单换成一张**纯文本模版**：你发一句「开案例」，机器人回这个 ——
+
+```
+📋 开案例模版
+🏷️ 账号: 111122223333(部署账号)
+复制整段,改完发回来。只有「问题描述」必填,其余根据实际情况进行修改即可。
+
+问题描述:
+严重等级: 2  (1 低 · Low / 2 中 · Normal / 3 高 · High / 4 紧急 · Urgent / 5 严重 · Critical)
+语言: 1  (1 中文 / 2 English / 3 日本語 / 4 한국어)
+案例类型: 1  (1 技术问题 / 2 账单和账户 / 3 提高服务限制)
+涉及服务: 0  (0 自动判断 / 1 ec2 / 2 rds / …; 清单外直接写名字,如 bedrock / msk / glue)
+标题: 自动  (留「自动」= 按你的描述生成)
+
+问题描述可以换行多写几段,都会进案例正文。
+发回来后我先给你一张确认卡,回「确认」才真的开工单。
+```
+
+**只有「问题描述」必填**，其余五项都已经预填好默认值：
+
+| 那一行 | 留着不改会怎样 | 想改的话 |
+| --- | --- | --- |
+| 问题描述 | **必填** —— 空着就把模版再发你一遍 | 一句话或者好几段都行，换行接着写就是（都会进案例正文） |
+| 严重等级 | 中 · Normal | 填**序号**（`4`）、**英文 code**（`urgent`）或**标签原文**（`紧急`）都认。选项跟着你的 Support 计划走：Basic / Developer 不会印出用不了的档 |
+| 语言 | 跟着当前会话语言（中文群默认「中文」） | 同上三种写法 |
+| 案例类型 | 技术问题 | 同上 |
+| 涉及服务 | `0` = **自动判断**（按你的描述挑服务和类别） | 填序号，或者直接写服务名（`bedrock`、`msk`）—— 清单里没有的照样认 |
+| 标题 | 「自动」= 从问题描述里取 | 直接写你自己的标题（括号照原样保留） |
+
+- 认不出的值会**明确告诉你**「这一项用了默认值」，不会静默套默认；
+- 要开在别的账号，先发 `/account <12 位账号>`（见 §4.2），模版和确认卡都会回显当前账号；
+- 发回来后机器人回一张**确认卡**（主题 / 严重等级 / 语言 / 问题描述），你回一句 **确认**
+  才真的开，回 **取消** 就作废，30 分钟内有效；
+- 整个模版流程**不消耗任何模型 token**（渲染是拼字符串、回填是关键词匹配）。自己填了
+  「涉及服务」+「案例类型」时，连那一次服务分类也省掉了。
+
+> 💡 **知道自己要报什么就不用走模版** —— 一句话照样开：
+>
+> ```
+> 开案例 RDS 连接数暴涨，应用大面积超时 severity=high language=en
+> ```
+>
+> 问题描述直接写在同一句里（它同时是案例主题和问题正文），可选参数跟在后面：
+> `severity=low|normal|high|urgent|critical`、`language=zh|en`、
+> `type=technical|account`、`service=...`、`category=...`。同样先回确认卡。
+> 只说「开案例」三个字时回的才是模版 —— 机器人**绝不会**拿「开案例」当案例主题去开单。
+
+> 💡 **`/案例 <描述>` 也能开案例** —— `/案例 RDS 连接数暴涨` 与 `开案例 RDS 连接数暴涨`
+> 等价，同样先回确认卡。判断规则：`案例` 后面跟**案例号**就是看详情，跟**一段描述**就是
+> 开案例，什么都不跟（或只跟 `列表` / `我的` / `最近` / `全部` 这类过滤词）才是列最近的。
+> 最明确的写法仍然是 `开案例`（或 `/开案例`、`create-case`、`提工单`）。
+
+其余案例动作也都是一句话，注意都是**动词+名词连成一个词**：`/案例` 列最近的、
+`/案例 <案例号>` 或 `/查看案例 <案例号>` 看详情、`/分析案例 <案例号>`、
+`/回复案例 <案例号> <内容>`、`/关闭案例 <案例号>`（关闭同样要回 **确认**）。
+英文同义词也都在：`/case`、`/view-case`、`/analyze-case`、`/reply-case`、`/close-case`。
+
+### 3.7 主动推送（可选：自定义机器人）
+
+巡检广播、告警、定时报告这类**没人先说话**的推送，钉钉必须走「自定义机器人」：
+群设置 → 智能群助手 → 添加机器人 → **自定义** → 复制它的 Webhook 地址 →
+填进管理台钉钉分页的「自定义机器人推送地址」（或 §3.3 那个 JSON 的 `webhook_url` 键）。
+
+> ⚠️ **那串地址本身就是凭证** —— 谁拿到都能往这个群发消息，而报告投递会把长报告
+> **全文** POST 过去。所以：管理台只回显后 4 位、只接受
+> `https://oapi.dingtalk.com/robot/send` 这一个形态、日志里不会出现它，
+> 报错也不会把你填的 URL 回显出来。**别贴到工单或截图里。**
+
+**群里 @机器人 的问答不需要这一项** —— 那条路用的是回调里带的一次性会话地址，
+零额外配置。留空即可。
+
+填好后点管理台的「**测试凭证**」：它先用 AppKey / AppSecret 换一次 access token
+（凭证是否正确的**权威判据**），填了推送地址的话再往那个群真发一条。
+
+> 钉钉**没有**「往任意群发一条测试消息」的接口。所以没填推送地址时，这个按钮
+> **只验凭证、什么都不发**，界面上也会**如实这么说**（不假装"已发送到你的群里"）。
+> 那种情况下要端到端验证，回 §3.5 在群里 @ 一句。
+
+---
+
+## 4. 群允许清单（allowlist，可选，三个平台都支持）
 
 只允许特定群/频道用 bot：
 
@@ -400,10 +622,18 @@ cd infra && npx cdk deploy ImStack --output ../.cdk-out --region <REGION> \
   -c imAllowedChatIds="oc_xxx,C0123ABC"
 ```
 
-飞书填 `oc_` 开头的 chat id，Slack 填 `C`/`D` 开头的 channel id，逗号分隔。
+飞书填 `oc_` 开头的 chat id，Slack 填 `C`/`D` 开头的 channel id，
+钉钉填 `conversationId`（群里 @ 一句后从 worker 日志里拿），逗号分隔。
 留空 = 不限制（与长连接时代行为一致）。
 
-### 3.1 同一个群里装两个 bot（测试环境 + 生产环境）
+> 📌 **钉钉这一层落在 worker、不在 ingress**（飞书 / Slack 是两处都拦）。因为钉钉的
+> `conversationId` 在**验签之后**才解得出来 —— ingress 拦不了一个自己还没看见的字段。
+> 对客户的可见行为一样：不在清单里的群，bot 完全不回话。代价是被挡的请求会多花一次
+> worker 的冷启动，量级上可以忽略。变量名也因此不同（钉钉 `ALLOWED_CONVERSATION_IDS`，
+> 飞书 `ALLOWED_CHAT_IDS`，Slack `ALLOWED_CHANNEL_IDS`）—— `-c imAllowedChatIds` 这个
+> **部署参数三个平台共用一个**，不用分开填。
+
+### 4.1 同一个群里装两个 bot（测试环境 + 生产环境）
 
 **可以**，而且它们不会互相抢答：@ 谁谁回，另一个完全静默 —— 连「思考中」的表情都不打。
 
@@ -424,7 +654,7 @@ bot 在群里是成员时，群里的每一句话都会作为 `im.message.receiv
 
 > Slack 侧不需要这一层：它有独立的 `app_mention` 事件，平台已经替我们分好了。
 
-### 3.2 多账号：`/account` 换「问哪个账号」
+### 4.2 多账号：`/account` 换「问哪个账号」
 
 启用了多账号（方式 A 的 `DeployMode=MultiAccount`，或方式 B 的
 `./setup.sh --multi-account`）之后，IM 里可以用 `/account` 决定这一轮问的是哪个账号：
@@ -465,15 +695,15 @@ bot 在群里是成员时，群里的每一句话都会作为 `im.message.receiv
 > ⚠️ **如实说清残留风险**：群里**任何**能 @ 到 bot 的成员都可以把这个群切到
 > **任何一个已启用**的账号 —— IM 侧没有按人的权限控制（IM 平台的身份不等于 AWS 身份，
 > 我们不拿它当授权依据）。控制手段是两条：**在 Web 上只启用真的该被问到的账号**，
-> 以及**用上面 §3 的群允许清单把 bot 限制在该看这些账号的群里**。
+> 以及**用上面 §4 的群允许清单把 bot 限制在该看这些账号的群里**。
 > 越权的最后一道线在 agent 侧（只允许问「部署账号 + 已启用账号」这个集合，
 > 拿不到清单时是**拒绝**而不是放开）和目标账号自己那个只读角色的信任策略上。
 
 ---
 
-## 4. 公网入口的安全边界
+## 5. 公网入口的安全边界
 
-### 4.1 入口结构：API Gateway HTTP API → ingress Lambda
+### 5.1 入口结构：API Gateway HTTP API → ingress Lambda
 
 ```
 飞书 / Slack ──HTTPS POST──▶ API Gateway HTTP API（$default catch-all，无鉴权）
@@ -508,14 +738,14 @@ Slack 用 signing secret 做 HMAC。这一点从头到尾没有变过。
   补偿是下面第 2 条的两层限流。要 WAF 的客户可以自己在前面套 CloudFront + WAF
   （对 HTTP API 而言是普通的自定义源，没有 Function URL 那个签名限制）。
 
-### 4.2 五道措施
+### 5.2 五道措施
 
 1. **验签 fail-fast** —— 飞书两把钥匙缺一即冷启动失败；Slack 验签用 stdlib HMAC +
    `compare_digest`，并拒绝时间戳偏移 > 300s 的请求（防重放）。
 2. **两层限流** —— HTTP API 阶段级 50 req/s、突发 100（超出的请求由 API Gateway 直接
    429，**不进 Lambda**、不产生 Lambda 费用）；ingress 上再叠
    `reservedConcurrentExecutions=10` 兜并发。真实 IM 事件量比这低几个数量级。
-3. **群允许清单**（§3）。
+3. **群允许清单**（§4）。
 4. **幂等去重** —— worker 侧按 `event_id` 落 DDB，重复投递只处理一次
    （Slack 的 Events API 重试会复用同一个 `event_id`）。
 5. **后端仍然只读** —— 即使有人伪造出一条能通过验签的消息（意味着钥匙已泄漏），
@@ -524,7 +754,7 @@ Slack 用 signing secret 做 HMAC。这一点从头到尾没有变过。
 日志侧：`encrypt_key` / `verification_token` / `app_secret` / signing secret
 **连长度都不打**，只记异常类型名（[LOGGING_STANDARD.md](LOGGING_STANDARD.md)）。
 
-### 4.3 还剩下的风险（如实列出）
+### 5.3 还剩下的风险（如实列出）
 
 1. **任何人都能触发一次调用** —— 入口未鉴权，验签失败也已经花掉了一次 Lambda 执行。
    上限由第 2 条的两层限流封住（可算出最坏成本），但**不为零**。
@@ -536,9 +766,9 @@ Slack 用 signing secret 做 HMAC。这一点从头到尾没有变过。
    直接指向原因。需要这一层的客户可以自己在 HTTP API 前面套 CloudFront + WAF，
    用 IP 集规则实现（改动不影响本文的配置步骤）。
 
-## 5. 冷启动与保活（4 分钟一次 ping）
+## 6. 冷启动与保活（4 分钟一次 ping）
 
-### 5.1 问题：3 秒的硬超时，撞上十几秒的冷启动
+### 6.1 问题：3 秒的硬超时，撞上十几秒的冷启动
 
 两个数放在一起，结论就已经定了：
 
@@ -571,7 +801,7 @@ Slack 用 signing secret 做 HMAC。这一点从头到尾没有变过。
 配置阶段还有"再点一次"这个自然补救动作，**卡片按钮没有** —— 用户看到的就是「操作失败」，
 而且下次再点（此时容器热了）又是好的，于是它长得像"偶发抽风"，最难查。
 
-### 5.2 做法：EventBridge 每 4 分钟敲一下 ingress
+### 6.2 做法：EventBridge 每 4 分钟敲一下 ingress
 
 每个 ingress 函数各挂一条 `rate(4 minutes)` 的 EventBridge 规则，常量 input 是哨兵
 `{"notiops_warmup": true}`，handler 第一行认出来就早返回（`platforms/common/warmup.py`）。
@@ -597,7 +827,7 @@ aws events list-rules --name-prefix notiops-im-keepalive --region <REGION> \
 aws logs tail /aws/lambda/notiops-im-ingress-feishu --region <REGION> --since 10m
 ```
 
-### 5.3 诚实的边界
+### 6.3 诚实的边界
 
 保活只保住 **1 个**执行环境。真并发（多个群同时来事件、或调查进度卡片批量刷新）仍然会
 扩容出冷容器，那些请求照旧可能超时。这条规则解决的是**绝大多数**场景（单人操作、低频
@@ -618,12 +848,12 @@ aws lambda put-provisioned-concurrency-config \
 
 ---
 
-## 6. 机器人会怎么回你
+## 7. 机器人会怎么回你
 
 配置完之后，这一节是给使用者看的：**哪种问题会等多久、等的时候屏幕上有什么**。
 写清楚是因为最常见的"故障"其实不是故障 —— 是一段没有任何反馈的等待。
 
-### 6.1 提问 → 立刻一张「思考中」卡片
+### 7.1 提问 → 立刻一张「思考中」卡片
 
 发完问题**马上**就会收到一张卡：
 
@@ -646,7 +876,7 @@ aws lambda put-provisioned-concurrency-config \
 > 「列出所有 S3 桶的名称**和其大小**」现网实测跑了 **347 秒** —— 桶多的时候它要逐个桶
 > 去问指标。以前这 347 秒里屏幕上一个字都没有，看起来跟后台挂了一模一样。
 
-### 6.2 刷新的节奏是**故意**越来越慢的
+### 7.2 刷新的节奏是**故意**越来越慢的
 
 | 已用时 | 卡片刷新间隔 |
 |---|---|
@@ -661,7 +891,7 @@ aws lambda put-provisioned-concurrency-config \
 **卡片被撤回**（或因为别的原因连续 3 次刷不动）时，机器人会停止刷这张卡，
 但**答案不会丢** —— 它会重新发一条；连发都发不出去才退成纯文本。
 
-### 6.3 深度调查：进度卡 + 跑完那张报告卡
+### 7.3 深度调查：进度卡 + 跑完那张报告卡
 
 `@机器人 深度调查 <问题>`（或 `/调查`）走的是另一条路：交给 DevOps Agent 后台跑，
 **不占用你的会话**。你会看到两张卡：
@@ -696,7 +926,7 @@ aws lambda put-provisioned-concurrency-config \
 > 那说明发起时的会话路由行没落上（`task#<task_id>`），排查见
 > [im-bot-interaction.md](im-bot-interaction.md) 里「调查结果返回」那一节。
 
-### 6.4 开案例的卡片上只有两颗按钮
+### 7.4 开案例的卡片上只有两颗按钮
 
 案例开出来之后，成功卡底部是「**查看案例**」（跳 AWS 控制台）+「**查看全部案例**」。
 
@@ -705,3 +935,36 @@ aws lambda put-provisioned-concurrency-config \
 想调查就直接说（`/调查` 或「帮我调查…」）。
 
 > 已经发在会话里的**旧卡片**上可能还带着那颗按钮 —— 点它仍然有效，不会"点了没反应"。
+
+### 7.5 钉钉不一样：进度是**追加**，不是刷新
+
+上面 7.1 / 7.2 讲的"一张卡自己变"是**飞书和 Slack** 的样子。钉钉做不到，所以那边的
+表现和文案都不同 —— 不是 bug，是平台差异：
+
+| | 飞书 / Slack | 钉钉 |
+|---|---|---|
+| 进度 | **同一张卡**原地刷新 | **另发新消息**（非终态最多 2 条：约 2 分钟、6 分钟各一条） |
+| 标题里的秒数 | 一直在走 | 第一条**不显示**秒数；追加的那几条显示"发出那一刻"的真实秒数 |
+| 开场话怎么说 | 「过程和结论都会**更新到这张卡片**上」 | 「过程和结论会**另发新消息**贴出来」 |
+| 最终答案 | 那张卡变成答案 | 一条新消息 |
+
+原因很实在：钉钉机器人回复用的是 `sessionWebhook`，它的返回里**只有 `errcode`，没有
+消息 id** —— 没有消息 id 就没有"改哪一条"的句柄，改不了已经发出去的消息。真正的可刷新
+卡片要在钉钉开放平台后台**手工注册一个卡片模板**（`cardTemplateId`），那是一次性人工
+配置、没法由 CFN 自动完成，所以现在这条路留着接口没启用。
+
+> ⚠️ **你不需要去注册这个卡片模板** —— 上面第 1~3 节的钉钉配置步骤是**完整**的，
+> 没有漏掉一步。`card_template_id` 只是凭证 secret 里一个**可选**字段，当前版本
+> **没有任何代码读它**，填了也不会有任何变化（控制台表单因此也不暴露它）。要不要
+> 走这条路是一次产品决定，不是部署步骤 —— 而且钉钉的按钮只能跳 URL、没有"按钮回调
+> 服务器"这条路，所以即使上了卡片模板，也只能换来"原地刷新"这一项，🆘 升级面板 /
+> 开案例表单那些按钮在钉钉上依旧没有。
+
+所以在钉钉上：
+
+- **答案在新消息里，不在第一条消息里**。第一条不会变，别盯着它等。
+- **第一条没有秒表是故意的**。它发出去就定格，写「已用时 0 秒」等于挂一个永远停在 0 的
+  计时器 —— 那不是少给信息，是给假信息。
+- **"不用重复发问"在钉钉一样成立**（三端都是）。重复发问会撞上"一个会话一次只跑一个"
+  的排队，把自己排到自己后面，越急越慢。
+- 群里因此会多出 1~2 条消息。上限是**硬**的（写死 2 条），不会刷屏。

@@ -448,9 +448,12 @@ class FeishuCaps(Caps):
         # 开场话从 5 条里按这条消息的 id 选一条（见 platforms/common/ack_variants.py）：
         # 同一条消息永远同一条文案，所以下面「排队转正」那次 set_ack 换的是 state，
         # 不是说法 —— 用户不会看到卡片自己改口。
+        # `platform=PLATFORM` 显式传：文案里"过程和结论会更新到这张卡片上"这半句由
+        # 平台的**刷新能力**决定（飞书能原地刷新，钉钉不能），见 `ack_variants`。
         ack_seed = msg.message_id or msg.event_id
-        ack = (i18n.t("im.chat.queued_body", msg.locale) if queued
-               else ack_variants.ack_body(ack_seed, msg.locale, agent))
+        ack = (ack_variants.queued_body(msg.locale, platform=PLATFORM) if queued
+               else ack_variants.ack_body(ack_seed, msg.locale, agent,
+                                          platform=PLATFORM))
         resp = feishu_utils.send_card(
             msg.chat_id,
             im_cards.answer_card(ack, msg.locale, state=state, elapsed=0,
@@ -491,7 +494,8 @@ class FeishuCaps(Caps):
                 # 排队转正：就地把这张卡变成「思考中」（不新发一条 —— 争抢一次只该
                 # 占一条消息）。这一下值得 force：用户最想知道的就是"轮到我了"。
                 if live is not None:
-                    live.set_ack(ack_variants.ack_body(ack_seed, msg.locale, agent))
+                    live.set_ack(ack_variants.ack_body(
+                        ack_seed, msg.locale, agent, platform=PLATFORM))
                     live.set_state("thinking")
                     live.flush(force=True)
                 # 前一轮很可能刚写过 execution_id，重新读一遍才是最新的上下文。
@@ -535,6 +539,10 @@ class FeishuCaps(Caps):
                 sess = result.get("session") or {}
                 if sess.get("execution_id"):
                     ddb_state.put_im_chat_session(PLATFORM, msg.chat_id, sess)
+                elif result.get("reset_session"):
+                    # 上游把这条 execution 弄死了（`responseFailed` / 只回心跳）。必须
+                    # **删掉**会话行：留着它下一轮会原样复用、原样再坏一次。三家一致。
+                    ddb_state.clear_im_chat_session(PLATFORM, msg.chat_id)
         finally:
             # 租约必须在 finally 里放 —— 中途抛异常还占着，整个会话要等 TTL 到期才解锁。
             turn.release()

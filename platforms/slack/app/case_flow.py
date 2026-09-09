@@ -52,6 +52,7 @@ from core import case_management
 from core import ddb_state
 from core import i18n
 from core import im_accounts
+from core import nl_router
 from core import support_logic
 from core import webhook_dispatch  # noqa: F401 — reserved for future skill paths
 from core.case_management import CaseSummary, Communication
@@ -1619,33 +1620,11 @@ def _reply_result_blocks(display_id: str, body_text: str,
 # detail to summarize and Subject should stay empty. Both languages
 # included because the bot speaks both; this is intent matching, not
 # user-facing text.
-_INTENT_ONLY_PATTERNS = (
-    "创建案例", "创建 case", "创建case", "开案例", "开 case", "开case",
-    "新建案例", "新建 case", "新建case", "提工单", "开工单",
-    "升级到 support", "升级到support", "升级 support",
-    "create case", "open case", "new case", "support ticket",
-    "escalate to support", "ask support",
-)
-
-
 def _summarize_subject(raw_text: str) -> str:
-    """Same logic as feishu's _summarize_subject (sans Bedrock — Slack
-    side keeps it simple; ≤60 char inputs after stripping intent prefix
-    are used directly, longer ones return as-is and the user can edit
-    in the modal anyway)."""
-    text = (raw_text or "").strip()
-    if not text:
-        return ""
-    lowered = text.lower()
-    stripped = text
-    for p in _INTENT_ONLY_PATTERNS:
-        idx = lowered.find(p)
-        if idx >= 0:
-            head = text[:idx].rstrip(" ,，:。.")
-            tail = text[idx + len(p):].lstrip(" ,，:。.")
-            stripped = (head + " " + tail).strip() if head else tail
-            break
-    return stripped[:200] if stripped else ""
+    """Subject pre-fill — 实现在 `core.nl_router.summarize_case_subject`，
+    三个平台共用那一份（确定性、0 token）。剪完是空就回空串，
+    用户在面板里自己补。"""
+    return nl_router.summarize_case_subject(raw_text)
 
 
 def _extract_reply_body(text: str, display_id: str) -> str:

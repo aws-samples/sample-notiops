@@ -27,9 +27,25 @@ Outbound-reply mechanism (Phase 1.6 correction): every reply goes
 through the SDK's `ChatbotHandler.reply_text` /
 `reply_markdown` / `reply_markdown_card` helpers, which use the
 PER-MESSAGE `incoming_message.session_webhook` URL the platform
-hands to the bot for ~5 minutes after each inbound. We do NOT
-mint a global access_token + POST to /v1.0/robot/groupMessages/send
-— that's a different class of robot (custom-bot / outgoing webhook).
+hands to the bot after each inbound. That URL is good for
+**~90 minutes** (official sample envelope:
+`sessionWebhookExpiredTime - createAt ≈ 5,402,586 ms`), not the
+~5 minutes an earlier version of this docstring claimed. For
+in-conversation replies we do NOT mint a global access_token.
+
+⚠️ LEGACY SHAPE. This module is the Fargate/Stream-Mode process,
+deployed by `infra/lib/bot-stack.ts`, kept only as a rollback path.
+The live path is the Lambda webhook one
+(`platforms/dingtalk/lambda_ingress.py` + `lambda_worker.py`); see
+`platforms/dingtalk/README.md`. **Never import this module from a
+Lambda** — `main()` below blocks on `while True: time.sleep(3600)`
+when credentials are missing,
+which on Fargate means "wait for someone to fill in credentials" and
+on Lambda means a guaranteed timeout. Out-of-conversation delivery in
+the live path uses `/v1.0/robot/groupMessages/send` via
+`platforms/dingtalk/sender.py::send_group` — that route IS available
+to enterprise-internal application robots (an earlier version of this
+note wrongly called it "a different class of robot").
 """
 from __future__ import annotations
 

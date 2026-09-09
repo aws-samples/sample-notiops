@@ -168,7 +168,18 @@ detect_stackset_call_as
 #    notiops-inspection 就这样漏过一次，2026-09-04 实测删库时靠手工补删）。
 #    tests/test_teardown_retained_tables.py 把两边钉在一起，加表先加那边判据。
 TABLES_RETAINED=("notiops-config" "notiops-conversations" "notiops-web-chat" "notiops-inspection")
-SECRETS=("notiops/im-bot-feishu" "notiops/slack-bot-token" "notiops/slack-app-token" \
+# ⚠️ 这个清单必须与 CDK 里 `new secretsmanager.Secret` 建的**每一个** secret 一一对应
+#    （现在是七个，全都 RemovalPolicy.DESTROY，见 infra/lib/notiops-backend-stack.ts）。
+#    少一个的后果不是「少删一个」，而是**下次装不上**：CFN 删 secret 只是把它排进
+#    7-30 天恢复期，名字仍然被占着 —— 重装时同名 CreateSecret 直接
+#    `InvalidRequestException: ... already scheduled for deletion` → 主栈
+#    CREATE_FAILED 回滚。客户看到的是「干净卸载完却重装失败」，而卸载那一次报的是成功。
+#    notiops/im-bot-dingtalk（钉钉 2026-09-08 开放）与 notiops/slack-signing-secret
+#    （webhook 验签，Socket Mode 时代没有）就这样各漏过一次 —— 与 notiops-inspection
+#    漏出 TABLES_RETAINED 完全同类：新资源比这份清单晚出现，没人回来补。
+#    tests/test_teardown_secrets.py 把两边钉在一起，加 secret 先加那边判据。
+SECRETS=("notiops/im-bot-feishu" "notiops/im-bot-dingtalk" "notiops/slack-bot-token" \
+         "notiops/slack-app-token" "notiops/slack-signing-secret" \
          "notiops/bedrock-api-key" "notiops/litellm-config")
 # 日志组:WebChatStack 走 logRetention(Lambda 自建 log group)、ECS/AgentCore 也各自建,
 # 删栈后会剩下孤儿。这几个前缀都是本项目独占(栈名前缀 / notiops 前缀),不会误伤别人。

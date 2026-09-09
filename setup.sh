@@ -196,7 +196,7 @@ fi
 # 所以这里不再探测、也不再有"选了 IM 就必须装 Docker"的硬闸门。
 #
 # ⚠️ 别顺手把 finch 支持加回来:若将来又引入 Docker 资产,同时要改
-#   docs/DEPLOYMENT.md{,.en.md} 的前置条件表 + publish/README.public.{zh,en}.md,
+#   docs/DEPLOYMENT.md{,.en.md} 的前置条件表 + 仓库根那两份 README(中英各一),
 #   否则客户按文档准备好环境、到跑的时候才炸(见「不许静默降级」)。
 
 # 检查 CDK CLI
@@ -772,42 +772,362 @@ echo ""
 
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 
+# ─── 现网状态回读：三态，不许两态 ───
+#
+# 🔴 本脚本有一整类既有缺陷长同一个样：某个能力只从**环境变量**读，环境变量没设就
+#    当"从来没配过"。可 CDK 的 context 不是"合并进已部署的栈"，而是每次 synth 从零
+#    重算 —— 于是我们自己在文档里教的升级动作（git pull + 重跑 ./setup.sh）会把上一次
+#    配好的能力静默清掉：客户看到一次**成功**的部署 + 一个悄悄少掉的功能，
+#    没有任何一行报错。
+#
+# 修法是回读现网。但回读**必须是三态的**：
+#   ① 读到了值    → 可以沿用（环境变量若也给了，环境变量赢：显式 > 探测）
+#   ② 资源不存在  → 首装 / 该功能本来就没装，没有历史值可沿用，静默是对的
+#   ③ 读不到      → AccessDenied / 凭证过期 / Throttling / 栈在奇怪状态
+#
+# ⚠️ 全仓到处都是的 `2>/dev/null || echo ""` 只有两态：它把 ② 和 ③ 压成同一个空串。
+#    压完的后果恰好是最坏的那个 —— 一次权限抖动被当成"客户没配过"，然后把人家配好的
+#    东西清掉。所以下面两个 helper 把 stderr 收下来自己分辨，③ 一律交回调用方**大声说**，
+#    本脚本任何一处都不许把 ③ 当 ② 处理。
+LIVE_READ_VALUE=""
+LIVE_READ_ERR=""
+
+# read_live_stack_output <栈名> <输出键>
+#   → 0 = 读到了（值在 LIVE_READ_VALUE，可能为空 = 栈在但没这个输出）
+#     1 = 栈不存在（含 DELETE_COMPLETE）
+#     2 = 读不到（原因在 LIVE_READ_ERR）
+read_live_stack_output() {
+  local _err="${TMPDIR:-/tmp}/notiops-live-read.err"
+  LIVE_READ_VALUE=""
+  LIVE_READ_ERR=""
+  rm -f "$_err"
+  if LIVE_READ_VALUE=$(aws cloudformation describe-stacks \
+       --stack-name "$1" --region "$DEPLOY_REGION" \
+       --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue | [0]" \
+       --output text 2>"$_err"); then
+    # JMESPath 没命中时 --output text 打的是字面量 None,不是空串
+    [ "$LIVE_READ_VALUE" = "None" ] && LIVE_READ_VALUE=""
+    return 0
+  fi
+  # 只按 "does not exist" 认"栈不存在"。不按 ValidationError 一刀切 ——
+  # 区域写错之类同样是 ValidationError，那属于 ③（读不到），不是"没有"。
+  if grep -q "does not exist" "$_err" 2>/dev/null; then
+    return 1
+  fi
+  LIVE_READ_ERR="$(tr '\n' ' ' < "$_err" 2>/dev/null | cut -c1-200)"
+  [ -n "$LIVE_READ_ERR" ] || LIVE_READ_ERR="aws cli exited non-zero with no stderr"
+  return 2
+}
+
+# read_live_lambda_env <函数名> <env 名> → 同上三态（1 = 函数不存在）
+read_live_lambda_env() {
+  local _err="${TMPDIR:-/tmp}/notiops-live-read.err"
+  LIVE_READ_VALUE=""
+  LIVE_READ_ERR=""
+  rm -f "$_err"
+  if LIVE_READ_VALUE=$(aws lambda get-function-configuration \
+       --function-name "$1" --region "$DEPLOY_REGION" \
+       --query "Environment.Variables.$2" --output text 2>"$_err"); then
+    [ "$LIVE_READ_VALUE" = "None" ] && LIVE_READ_VALUE=""
+    return 0
+  fi
+  if grep -qE "ResourceNotFoundException|Function not found" "$_err" 2>/dev/null; then
+    return 1
+  fi
+  LIVE_READ_ERR="$(tr '\n' ' ' < "$_err" 2>/dev/null | cut -c1-200)"
+  [ -n "$LIVE_READ_ERR" ] || LIVE_READ_ERR="aws cli exited non-zero with no stderr"
+  return 2
+}
+
+# read_live_ops_alert_email → 同上三态；0 时把现网**已部署**的运维告警邮箱放进
+#   LIVE_READ_VALUE（空 = 栈在但上次部署没传 opsAlertEmail）。
+#
+# ⚠️ 为什么读**已部署的模板**、不读 SNS 的订阅列表：
+#   · 本脚本自己在下面就写着「或事后订阅 notiops-inspection-ops-alerts」，所以那个
+#     topic 上很可能有一条**客户手工加的**订阅。它和 CDK 建的那条在
+#     `list-subscriptions-by-topic` 里长得一模一样 —— 认错了就会把客户手工建的订阅
+#     写进 `-c opsAlertEmail=` 交给 CloudFormation 托管，从此哪次没传就被 CFN 删掉。
+#     那是我们**新造**一个静默降级，比现在这个 bug 更难查。
+#   · 邮箱订阅在确认前是 PendingConfirmation 状态，SNS 侧那一行的可见性跟确认链接的
+#     生命周期绑在一起；模板里的 Endpoint 不受它影响。
+#   判据要回答的问题是「上一次部署到底传了什么」，只有模板答得上。
+read_live_ops_alert_email() {
+  local _err="${TMPDIR:-/tmp}/notiops-live-read.err"
+  local _tpl=""
+  LIVE_READ_VALUE=""
+  LIVE_READ_ERR=""
+  rm -f "$_err"
+  if ! _tpl=$(aws cloudformation get-template --stack-name NotiOpsBackendStack \
+       --region "$DEPLOY_REGION" --template-stage Original \
+       --query 'TemplateBody' --output json 2>"$_err"); then
+    if grep -q "does not exist" "$_err" 2>/dev/null; then
+      return 1
+    fi
+    LIVE_READ_ERR="$(tr '\n' ' ' < "$_err" 2>/dev/null | cut -c1-200)"
+    [ -n "$LIVE_READ_ERR" ] || LIVE_READ_ERR="aws cli exited non-zero with no stderr"
+    return 2
+  fi
+  # 全仓只有两条 SNS 订阅(另一条是 LambdaSubscription)，所以按 Protocol=email 筛是
+  # 无歧义的 —— 见 infra/lib/notiops-backend-stack.ts 的 InspectionOpsAlertTopic。
+  # 解析不了(比如模板不是 JSON)一律回 2 = 读不到，不许当"没配过"。
+  if ! LIVE_READ_VALUE=$(printf '%s' "$_tpl" | python3 -c '
+import json, sys
+try:
+    tpl = json.load(sys.stdin)
+    if isinstance(tpl, str):
+        tpl = json.loads(tpl)
+    res_all = tpl["Resources"]
+except Exception:
+    raise SystemExit(3)
+for res in res_all.values():
+    if res.get("Type") != "AWS::SNS::Subscription":
+        continue
+    props = res.get("Properties") or {}
+    if props.get("Protocol") == "email" and isinstance(props.get("Endpoint"), str):
+        print(props["Endpoint"])
+        break
+' 2>"$_err"); then
+    LIVE_READ_ERR="$(t "解析现网模板失败: " "failed to parse the deployed template: ")$(tr '\n' ' ' < "$_err" 2>/dev/null | cut -c1-160)"
+    return 2
+  fi
+  return 0
+}
+
+# 回读失败（③）时的统一警告。判据是"说清丢的是什么、怎么保住"，而不是只说一句
+# "读不到" —— 只说读不到的提示会被几百行部署输出刷过去，等于没说。
+warn_live_read_failed() {   # $1/$2 = 能力名(中/英)  $3/$4 = 后果(中/英)  $5 = 保住它的办法(命令)
+  echo ""
+  echo "  $(t "⚠️ 读不到现网配置，无法确认这项能力之前配过没有: " "⚠️ Could not read the live configuration; cannot tell whether this was configured before: ")$(t "$1" "$2")"
+  echo "     $(t "原因: " "Reason: ")${LIVE_READ_ERR}"
+  echo "     $(t "如果现网配过、而本次没带上,后果: " "If it was configured and is not passed this run: ")$(t "$3" "$4")"
+  echo "     $(t "保住它: " "To keep it: ")$5"
+}
+
 # ─── IM 平台选择 ───
 # M2 之后 ImStack 只按 enabledPlatforms 建对应平台的 Webhook 路由,没选的平台
 # 连 Lambda 都不建。
 # 钉钉自 2026-09-08 起开放(与飞书/Slack 同一个 Lambda Webhook 形态)。
 # 它与飞书/Slack 的能力差异是**真实存在**的(没有回调按钮、不能更新已发消息),
 # 都写在 docs/IM_WEBHOOK_SETUP.md 的能力对比表里 —— 不要在这里含糊成"完全一样"。
+#
+# 🔴 这段提示原来是**无状态**的：不管现网有没有 IM，回车都等于 0 = enabledPlatforms=none。
+#    而 none 的真实含义不是"删掉 IM"：infra/bin/app.ts 在 none 时**整个不实例化 ImStack**
+#    ⇒ 它不在本次 assembly 里 ⇒ `cdk deploy --all` 一个字节都不碰它。现网那套
+#    ingress/worker Lambda 继续收消息、继续计费，跑的却是**升级前**的代码，
+#    而部署日志从头到尾报成功。我们教客户的升级动作就是"git pull + 重跑 ./setup.sh"，
+#    于是每次升级都在这一个回车上踩一遍，而且没有任何信号。
+#    所以改成：先回读现网 → 回车 = 原样保留 → 要少掉正在跑的平台必须再确认一次。
+#    「保持现状」是零成本路径，「关掉一个在跑的平台」必须是一个刻意的动作
+#    （与上面多账号降级守卫、PHD 移除确认同一条口径）。
+IM_PLATFORM_CHOICE="${IM_PLATFORM_CHOICE:-}"   # 无人值守可预置: 0 / 1,3 / keep
+IM_CHOICE_FROM_ENV=false
+[ -n "$IM_PLATFORM_CHOICE" ] && IM_CHOICE_FROM_ENV=true
+
+# 判据用 ImStack 的 ImEnabledPlatforms 输出：它**无条件**创建（infra/lib/im-stack.ts），
+# 值就是逗号列表，可以直接当 `-c enabledPlatforms=` 的值原样传回去。各平台自己的
+# WebhookUrl 输出只在对应平台开着时才有，拿来交叉核对没必要。
+LIVE_IM_PLATFORMS=""
+LIVE_IM_STATE="absent"    # absent = 现网没有 IM(首装) / live = 有 / unknown = 读不到
+read_live_stack_output "ImStack" "ImEnabledPlatforms" && _im_probe_rc=0 || _im_probe_rc=$?
+case "$_im_probe_rc" in
+  0)
+    LIVE_IM_PLATFORMS="$LIVE_READ_VALUE"
+    if [ "$LIVE_IM_PLATFORMS" = "none" ]; then
+      # 栈在、但一个平台 Lambda 都没建（enabledPlatforms 传了非法值时的形态）。
+      # 没有正在服务的 IM 可丢 —— 等同于"现网没有 IM"。
+      LIVE_IM_PLATFORMS=""
+      LIVE_IM_STATE="absent"
+    elif [ -n "$LIVE_IM_PLATFORMS" ]; then
+      LIVE_IM_STATE="live"
+    else
+      # 栈在、却没有这个输出（很老的 ImStack / 半失败的栈）。这**不是** absent：
+      # 栈明明在跑，按 none 继续就是静默停更它。所以当"读不到"处理。
+      LIVE_IM_STATE="unknown"
+      LIVE_READ_ERR="$(t "ImStack 在，但没有 ImEnabledPlatforms 输出（半失败或很老的栈）" "ImStack exists but has no ImEnabledPlatforms output (half-failed or very old stack)")"
+    fi
+    ;;
+  1) LIVE_IM_STATE="absent" ;;
+  *) LIVE_IM_STATE="unknown" ;;
+esac
+case "$LIVE_IM_PLATFORMS" in
+  *[!a-z,]*)
+    # 平台名里不该有的字符。这个值会被原样拼进 `-c enabledPlatforms=…` 再按空格切成
+    # argv —— 宁可当"读不到"让人显式回答，也不要往 cdk 命令里塞不明内容。
+    LIVE_READ_ERR="$(t "ImEnabledPlatforms 输出里有非预期字符: " "unexpected characters in the ImEnabledPlatforms output: ")${LIVE_IM_PLATFORMS}"
+    LIVE_IM_PLATFORMS=""
+    LIVE_IM_STATE="unknown"
+    ;;
+esac
+
 echo ""
 echo "$(t "── IM 平台选择（可选）──" "── IM Platform Selection (optional) ──")"
-echo "  $(t "web 端默认部署。IM Bot 是可选的：你可以现在部署、或暂时不部署、" "The web UI is always deployed. IM bots are optional: deploy now, or skip and")"
-echo "  $(t "以后想起来再随时重跑本脚本启用（未选中的平台整个 ImStack 不实例化，零成本）。" "re-run this script anytime later (unselected platforms: the whole ImStack is not created — zero cost).")"
-echo "  0) $(t "暂不部署 IM（只部署 web 端，以后可随时再加）" "Skip IM for now (web UI only, can add later)")"
-echo "  1) $(t "飞书 (Feishu)" "Feishu")"
-echo "  2) Slack"
-echo "  3) $(t "钉钉 (DingTalk)" "DingTalk")"
-echo "     $(t "注: 钉钉机器人没有回调按钮、也不能更新已发出的消息，因此" "Note: DingTalk robots have no callback buttons and cannot edit a sent message, so")"
-echo "     $(t "     升级面板/案例表单改为命令式，进度是追加消息。详见 docs/IM_WEBHOOK_SETUP.md" "     the escalate panel / case form are command-driven and progress is appended. See docs/IM_WEBHOOK_SETUP.en.md")"
-echo ""
-read -p "  $(t "输入编号,多个用逗号分隔 [默认: 0 暂不部署]: " "Enter number(s), comma-separated [default: 0 skip]: ")" IM_PLATFORM_CHOICE
-IM_PLATFORM_CHOICE="${IM_PLATFORM_CHOICE:-0}"
+if [ "$IM_CHOICE_FROM_ENV" = true ]; then
+  echo "  $(t "已由环境变量指定(不再询问): IM_PLATFORM_CHOICE=" "Specified via environment (not asking): IM_PLATFORM_CHOICE=")${IM_PLATFORM_CHOICE}"
+else
+  echo "  $(t "web 端默认部署。IM Bot 是可选的：你可以现在部署、或暂时不部署、" "The web UI is always deployed. IM bots are optional: deploy now, or skip and")"
+  echo "  $(t "以后想起来再随时重跑本脚本启用（未选中的平台整个 ImStack 不实例化，零成本）。" "re-run this script anytime later (unselected platforms: the whole ImStack is not created — zero cost).")"
+  echo "  0) $(t "暂不部署 IM（只部署 web 端，以后可随时再加）" "Skip IM for now (web UI only, can add later)")"
+  echo "  1) $(t "飞书 (Feishu)" "Feishu")"
+  echo "  2) Slack"
+  echo "  3) $(t "钉钉 (DingTalk)" "DingTalk")"
+  echo "     $(t "注: 钉钉机器人没有回调按钮、也不能更新已发出的消息，因此" "Note: DingTalk robots have no callback buttons and cannot edit a sent message, so")"
+  echo "     $(t "     升级面板/案例表单改为命令式，进度是追加消息。详见 docs/IM_WEBHOOK_SETUP.md" "     the escalate panel / case form are command-driven and progress is appended. See docs/IM_WEBHOOK_SETUP.en.md")"
+fi
 
-ENABLED_PLATFORMS=""
-if echo "$IM_PLATFORM_CHOICE" | grep -q "1"; then
-  ENABLED_PLATFORMS="${ENABLED_PLATFORMS}feishu,"
+# 现网状态必须**在提问之前**摆出来 —— 「回车会发生什么」取决于它。
+case "$LIVE_IM_STATE" in
+  live)
+    echo ""
+    echo "  $(t "▸ 现网已部署 IM: " "▸ Currently deployed IM: ")${LIVE_IM_PLATFORMS}"
+    echo "    $(t "回车 = 原样保留（这些平台会随本次部署升级到新代码）。" "Enter = keep exactly these (they get upgraded to the new code by this run).")"
+    echo "    $(t "输入 0 = 本次不部署 IM。⚠️ 那不是删除: 现网那套会留在原地跑旧代码," "Enter 0 = no IM this run. WARNING: that is not a deletion -- the live one stays, running the OLD code,")"
+    echo "    $(t "所以会再确认一次。真要下掉请用 ./teardown.sh。" "so you will be asked to confirm. To actually remove it, use ./teardown.sh.")"
+    ;;
+  unknown)
+    echo ""
+    echo "  $(t "⚠️ 读不到现网 IM 状态 —— 无法判断这里有没有正在跑的 IM 平台。" "⚠️ Could not read the live IM state -- cannot tell whether IM platforms are running here.")"
+    echo "     $(t "原因: " "Reason: ")${LIVE_READ_ERR}"
+    echo "     $(t "这种情况**没有安全的默认值**: 默认 0 可能把现网正在跑的 IM 静默停更" "There is NO safe default here: defaulting to 0 could silently freeze live IM platforms")"
+    echo "     $(t "（不会被删除，但也不会被升级）。所以请显式回答,或先修好权限/凭证再重跑。" "(not deleted, but not upgraded either). So answer explicitly, or fix permissions/credentials and re-run.")"
+    echo "     $(t "自己核一眼: " "Check it yourself: ")aws cloudformation describe-stacks --stack-name ImStack --region ${DEPLOY_REGION}"
+    ;;
+esac
+
+if [ "$IM_CHOICE_FROM_ENV" != true ]; then
+  if [ "$LIVE_IM_STATE" = "live" ]; then
+    _im_prompt="$(t "输入编号,多个用逗号分隔 [回车 = 保留现网 " "Enter number(s), comma-separated [Enter = keep live ")${LIVE_IM_PLATFORMS}]: "
+  else
+    _im_prompt="$(t "输入编号,多个用逗号分隔 [默认: 0 暂不部署]: " "Enter number(s), comma-separated [default: 0 skip]: ")"
+  fi
+  echo ""
+  if [ -t 0 ]; then
+    # || true: set -e 下 read 读到 EOF 会让整个部署脚本在这里退出
+    read -p "  ${_im_prompt}" IM_PLATFORM_CHOICE || true
+    # 回读失败时**不许**把回车当成 0 —— 那正是这一轮要修的 bug 本身。
+    if [ "$LIVE_IM_STATE" = "unknown" ] && [ -z "$IM_PLATFORM_CHOICE" ]; then
+      _im_retry=0
+      while [ -z "$IM_PLATFORM_CHOICE" ] && [ "$_im_retry" -lt 2 ]; do
+        _im_retry=$(( _im_retry + 1 ))
+        echo "  $(t "这里没有安全的默认值,请显式输入(0 = 不部署 IM; 1/2/3 = 对应平台)。" "No safe default here -- please answer explicitly (0 = no IM; 1/2/3 = platforms).")"
+        read -p "  ${_im_prompt}" IM_PLATFORM_CHOICE || true
+      done
+    fi
+  fi
 fi
-if echo "$IM_PLATFORM_CHOICE" | grep -q "2"; then
-  ENABLED_PLATFORMS="${ENABLED_PLATFORMS}slack,"
+
+if [ -z "$IM_PLATFORM_CHOICE" ]; then
+  case "$LIVE_IM_STATE" in
+    live)
+      # 默认 = 不改变现网状态。
+      IM_PLATFORM_CHOICE="keep"
+      [ -t 0 ] || echo "  $(t "(非交互环境) 自动保留现网 IM 平台,避免静默停更。" "(Non-interactive) keeping the live IM platforms to avoid a silent freeze.")"
+      ;;
+    unknown)
+      # 非交互 + 读不到：唯一诚实的做法是停下来。按默认值继续 = 有可能把现网
+      # 正在服务的 IM 停更在旧代码上，而部署会报成功。
+      echo ""
+      echo "  $(t "❌ 读不到现网 IM 状态,而这里也没有 TTY 可问 —— 拒绝按默认值继续。" "❌ The live IM state could not be read and there is no TTY to ask -- refusing to continue on a default.")" >&2
+      echo "     $(t "为什么不干脆默认关掉 IM: enabledPlatforms=none 不会删除现网 ImStack,只是让它" "Why not just default to no IM: enabledPlatforms=none does not delete the live ImStack; it")" >&2
+      echo "     $(t "留在原地跑旧代码,而部署照样报成功 —— 静默停更比报错难查得多。" "leaves it in place running the old code while the deploy still reports success -- a silent freeze is far harder to find than an error.")" >&2
+      echo "     $(t "显式声明后重跑(任选一条): " "Re-run with an explicit answer (pick one): ")" >&2
+      echo "       IM_PLATFORM_CHOICE=keep ./setup.sh   # $(t "保留现网 IM 平台(需要回读能成功)" "keep the live IM platforms (needs the read-back to succeed)")" >&2
+      echo "       IM_PLATFORM_CHOICE=1,3 ./setup.sh    # $(t "显式指定飞书 + 钉钉" "explicitly Feishu + DingTalk")" >&2
+      echo "       IM_PLATFORM_CHOICE=0 ./setup.sh      # $(t "确认本次不部署 IM" "confirm no IM this run")" >&2
+      exit 1
+      ;;
+    *)
+      IM_PLATFORM_CHOICE="0"   # 首装：保持既有行为（默认不部署 IM）
+      ;;
+  esac
 fi
-if echo "$IM_PLATFORM_CHOICE" | grep -q "3"; then
-  ENABLED_PLATFORMS="${ENABLED_PLATFORMS}dingtalk,"
+
+if [ "$IM_PLATFORM_CHOICE" = "keep" ]; then
+  if [ -z "$LIVE_IM_PLATFORMS" ]; then
+    echo ""
+    echo "  $(t "❌ IM_PLATFORM_CHOICE=keep,但读不出现网的 IM 平台清单 —— 没法「保留」一个读不到的值。" "❌ IM_PLATFORM_CHOICE=keep, but the live IM platform list could not be read -- cannot keep a value we cannot read.")" >&2
+    echo "     $(t "原因: " "Reason: ")${LIVE_READ_ERR}" >&2
+    echo "     $(t "改成显式指定(例: IM_PLATFORM_CHOICE=1,3)或修好权限后重跑。" "Specify it explicitly (e.g. IM_PLATFORM_CHOICE=1,3), or fix permissions and re-run.")" >&2
+    exit 1
+  fi
+  ENABLED_PLATFORMS="$LIVE_IM_PLATFORMS"
+else
+  # 沿用宽松匹配（"1,3" / "13" / "1 3" 都认）—— 这里不值得为格式挑刺。
+  ENABLED_PLATFORMS=""
+  if echo "$IM_PLATFORM_CHOICE" | grep -q "1"; then
+    ENABLED_PLATFORMS="${ENABLED_PLATFORMS}feishu,"
+  fi
+  if echo "$IM_PLATFORM_CHOICE" | grep -q "2"; then
+    ENABLED_PLATFORMS="${ENABLED_PLATFORMS}slack,"
+  fi
+  if echo "$IM_PLATFORM_CHOICE" | grep -q "3"; then
+    ENABLED_PLATFORMS="${ENABLED_PLATFORMS}dingtalk,"
+  fi
+  ENABLED_PLATFORMS="${ENABLED_PLATFORMS%,}"  # 去尾逗号(空 = 不启用任何 IM)
 fi
-ENABLED_PLATFORMS="${ENABLED_PLATFORMS%,}"  # 去尾逗号(空 = 不启用任何 IM)
+
+# ─── 掉平台守卫：现网在跑、本次不带 = 停更，必须是刻意的 ───
+# IM_DROPPED 一路带到文末的总结里（那边同样不许说成"本次未部署，以后可随时启用"）。
+IM_DROPPED=""
+if [ "$LIVE_IM_STATE" = "live" ]; then
+  for _p in $(echo "$LIVE_IM_PLATFORMS" | tr ',' ' '); do
+    case ",${ENABLED_PLATFORMS}," in
+      *",${_p},"*) : ;;
+      *) IM_DROPPED="${IM_DROPPED}${_p} " ;;
+    esac
+  done
+  IM_DROPPED="${IM_DROPPED% }"
+fi
+if [ -n "$IM_DROPPED" ]; then
+  _im_this_run="$ENABLED_PLATFORMS"
+  [ -n "$_im_this_run" ] || _im_this_run="$(t "（一个都不部署）" "(none)")"
+  echo ""
+  echo "  ┌──────────────────────────────────────────────────────────────────┐"
+  echo "  $(t "  │ ⚠️  本次会【停止维护】现网正在跑的 IM 平台!                     │" "  │ ⚠️  This run will STOP MAINTAINING live IM platforms!                   │")"
+  echo "  └──────────────────────────────────────────────────────────────────┘"
+  echo "  $(t "  现网在跑:   " "  Live now:    ")${LIVE_IM_PLATFORMS}"
+  echo "  $(t "  本次会部署: " "  This run:    ")${_im_this_run}"
+  echo "  $(t "  被留在原地: " "  Left behind: ")${IM_DROPPED}"
+  echo ""
+  echo "  $(t "  后果不是「删除」,是「停更」:" "  The consequence is not deletion, it is a FREEZE:")"
+  echo "  $(t "   · enabledPlatforms 里少了它 ⇒ ImStack 不进本次 assembly ⇒ cdk deploy --all 完全不碰它。" "   - dropping it from enabledPlatforms means ImStack is not in this assembly, so cdk deploy --all never touches it.")"
+  echo "  $(t "   · 它的 Webhook Lambda / API Gateway / Secret 全都还在,继续收消息、继续计费," "   - its webhook Lambda / API Gateway / secrets all remain, still receiving messages and still billing,")"
+  echo "  $(t "     但跑的是**升级前**的代码 —— 本次的修复和新功能一个都不会生效。" "     but running the code from BEFORE this upgrade -- none of this release's fixes or features apply to it.")"
+  echo "  $(t "   · 部署日志会从头到尾报成功。除了这一段,没有任何信号。" "   - the deployment log will report success end to end. Apart from this block, there is no signal at all.")"
+  echo "  $(t "  真想下掉 IM: 用 ./teardown.sh（或在控制台删掉 ImStack）—— 那才是删除。" "  To actually remove IM: use ./teardown.sh (or delete ImStack in the console) -- that is a real deletion.")"
+  echo ""
+  if [ -t 0 ]; then
+    read -p "  $(t "确认把上面这些平台留在原地跑旧代码？[y/N]: " "Confirm leaving those platforms behind on the old code? [y/N]: ")" _im_confirm_drop || true
+    case "${_im_confirm_drop:-N}" in
+      [yY]*)
+        echo "  $(t "⚠ 按你的选择继续 —— 上面的后果会真实发生。" "⚠ Continuing as you chose -- the consequences above will really happen.")"
+        ;;
+      *)
+        ENABLED_PLATFORMS="$LIVE_IM_PLATFORMS"
+        IM_DROPPED=""
+        echo "  $(t "✓ 已改回保留现网 IM 平台: " "✓ Reverted to keeping the live IM platforms: ")${LIVE_IM_PLATFORMS}"
+        ;;
+    esac
+  elif [ "$IM_CHOICE_FROM_ENV" = true ]; then
+    # 显式 > 探测：环境变量是一个刻意的动作，非交互下照它执行。
+    # 但后果必须留在日志里 —— 上面那一整块已经打过了。
+    echo "  $(t "(非交互环境) IM_PLATFORM_CHOICE 是显式设的,按它执行 —— 上面的后果会真实发生。" "(Non-interactive) IM_PLATFORM_CHOICE was set explicitly, honouring it -- the consequences above will really happen.")"
+  else
+    # 今天走不到（非交互且没显式设时，上面已经解析成 keep）。留着是为了万一上面的
+    # 解析被改了形状，也不会退回"静默停更"。
+    ENABLED_PLATFORMS="$LIVE_IM_PLATFORMS"
+    IM_DROPPED=""
+    echo "  $(t "(非交互环境) 自动保留现网 IM 平台,避免静默停更。真要下掉请显式设 IM_PLATFORM_CHOICE=0。" "(Non-interactive) keeping the live IM platforms to avoid a silent freeze. To really drop them set IM_PLATFORM_CHOICE=0.")"
+  fi
+fi
 
 if [ -z "$ENABLED_PLATFORMS" ]; then
   # 不部署 IM：整个 ImStack 都不实例化（见 infra/bin/app.ts 的 enabledPlatforms 分支）。
   # 以后想启用：重跑本脚本选 1/2/3 即可，无需重建。
-  echo "  $(t "✓ 暂不部署 IM（web 端照常部署；以后重跑本脚本可随时启用 IM）" "✓ Skipping IM (web UI deploys as usual; re-run this script anytime to enable IM)")"
+  if [ "$LIVE_IM_STATE" = "live" ]; then
+    echo "  $(t "✓ 本次不部署 IM —— 现网的 " "✓ No IM this run -- the live ")${LIVE_IM_PLATFORMS}$(t " 留在原地跑旧代码(见上面的确认)。" " stays in place running the old code (see the confirmation above).")"
+  else
+    echo "  $(t "✓ 暂不部署 IM（web 端照常部署；以后重跑本脚本可随时启用 IM）" "✓ Skipping IM (web UI deploys as usual; re-run this script anytime to enable IM)")"
+  fi
   PLATFORM_FLAG="-c enabledPlatforms=none"
 else
   # 选了 IM 不再要求 Docker/Finch：M2 之后 IM 只有 Webhook + Lambda 一条路径，
@@ -852,6 +1172,83 @@ COST_AGENT_MCP_URL="${COST_AGENT_MCP_URL:-}"
 COST_AGENT_MCP_URL="${COST_AGENT_MCP_URL%/}"
 COST_AGENT_FN_ARN="${COST_AGENT_FN_ARN:-}"
 COST_AGENT_FLAG=""
+COST_AGENT_SOURCE="env"   # env = 本次显式给的 / live = 从现网回读沿用的
+
+# 🔴 回读现网（三态说明见文件上部 read_live_lambda_env）。不回读的后果是实打实的：
+#    客户配好 CUR 数据源之后重跑 ./setup.sh 升级，只要这次终端里没带这两个环境变量，
+#    -c costAgentMcpUrl 就不传 → capabilities.json 的 requiresEnv 把 4 个
+#    nav:finops:cur-* 节点摘掉 → 客户的 4 张 CUR 报表**静默消失**，而部署报成功。
+# ⚠️ 位置很要紧：必须在下面 scripts/deploy_agent.sh 那一步**之前**定完 ——
+#    agent runtime 和它的执行角色也靠这两个变量接线，晚一步就会得到
+#    「BFF 有、agent 没有」的半配置状态（每次调用 403，根因只在 CloudTrail 里）。
+_cost_live_url=""
+_cost_live_state="absent"   # absent = 现网没这个函数/没配过 / value = 配过 / unknown = 读不到
+read_live_lambda_env "notiops-web-chat-bff" "COST_AGENT_MCP_URL" && _cost_rc=0 || _cost_rc=$?
+case "$_cost_rc" in
+  0)
+    _cost_live_url="${LIVE_READ_VALUE%/}"
+    [ -n "$_cost_live_url" ] && _cost_live_state="value"
+    ;;
+  1) _cost_live_state="absent" ;;   # BFF 还不存在 = 首装，没有历史值可沿用（静默是对的）
+  *) _cost_live_state="unknown" ;;
+esac
+
+if [ -n "$COST_AGENT_MCP_URL" ]; then
+  # 显式 > 探测。但跟现网不一样就得说一声 —— 否则"我以为只是重跑一次"会悄悄换掉数据源。
+  if [ "$_cost_live_state" = "value" ] && [ "$_cost_live_url" != "$COST_AGENT_MCP_URL" ]; then
+    echo "  $(t "ℹ 环境变量给的 CUR 数据源与现网不同,按环境变量走(显式 > 探测):" "ℹ The CUR data source given in the environment differs from the live one; the environment wins (explicit > detected):")"
+    echo "    $(t "现网: " "live:     ")${_cost_live_url}"
+    echo "    $(t "本次: " "this run: ")${COST_AGENT_MCP_URL}"
+  fi
+elif [ "$_cost_live_state" = "value" ]; then
+  COST_AGENT_MCP_URL="$_cost_live_url"
+  COST_AGENT_SOURCE="live"
+  echo "  $(t "✓ 沿用现网已配的 CUR 数据源(来源: 现网 BFF Lambda 的 COST_AGENT_MCP_URL): " "✓ Preserved the live CUR data source (source: COST_AGENT_MCP_URL on the live BFF Lambda): ")${COST_AGENT_MCP_URL}"
+elif [ "$_cost_live_state" = "unknown" ]; then
+  warn_live_read_failed \
+    "客户自有 CUR 数据源（cost-agent MCP）" "your own CUR data source (cost-agent MCP)" \
+    "FinOps 的 4 张 CUR 报表（nav:finops:cur-*）会被静默摘掉" "the 4 FinOps CUR sheets (nav:finops:cur-*) get silently removed" \
+    "COST_AGENT_MCP_URL=<Function URL> COST_AGENT_FN_ARN=<function ARN> ./setup.sh"
+fi
+
+# 函数 ARN 不在任何 env / 栈输出 / DDB 里 —— 它只作为 BFF 执行角色 inline policy 里
+# lambda:InvokeFunctionUrl 那条语句的 Resource 存在。所以沿用现网 URL 时只能从那儿反推
+# （与 scripts/fix_web_chat_echo.sh 同一手法，那边也是这么救的）。
+# 反推不出来就**硬停**：只传 URL 不传 ARN 会部署出一个每次调用都 403 的数据源。
+if [ -n "$COST_AGENT_MCP_URL" ] && [ -z "$COST_AGENT_FN_ARN" ] && [ "$COST_AGENT_SOURCE" = "live" ]; then
+  _bff_role="$(aws lambda get-function-configuration --region "$DEPLOY_REGION" \
+    --function-name notiops-web-chat-bff --query 'Role' --output text 2>/dev/null \
+    | awk -F'/' '{print $NF}')"
+  for _pol in $(aws iam list-role-policies --role-name "$_bff_role" \
+                  --query 'PolicyNames[]' --output text 2>/dev/null); do
+    COST_AGENT_FN_ARN="$(aws iam get-role-policy --role-name "$_bff_role" \
+      --policy-name "$_pol" --output json 2>/dev/null | python3 -c '
+import json, sys
+doc = json.load(sys.stdin)["PolicyDocument"]
+for st in doc.get("Statement", []):
+    acts = st.get("Action", [])
+    acts = [acts] if isinstance(acts, str) else acts
+    if any(a == "lambda:InvokeFunctionUrl" for a in acts):
+        res = st.get("Resource", [])
+        res = [res] if isinstance(res, str) else res
+        for r in res:
+            if r.startswith("arn:") and ":function:" in r:
+                print(r); raise SystemExit
+' 2>/dev/null || true)"
+    [ -n "$COST_AGENT_FN_ARN" ] && break
+  done
+  if [ -n "$COST_AGENT_FN_ARN" ]; then
+    echo "    $(t "↳ 配套的函数 ARN 已从 BFF 执行角色的 inline policy 反推出来: " "-> the paired function ARN was recovered from the BFF role's inline policy: ")${COST_AGENT_FN_ARN}"
+  else
+    echo ""
+    echo "  $(t "❌ 现网配了 CUR 数据源,但反推不出配套的函数 ARN —— 拒绝继续。" "❌ The live deployment has a CUR data source but the paired function ARN could not be recovered -- refusing to continue.")" >&2
+    echo "     $(t "只传 URL 不传 ARN 会部署出一个每次调用都 403 的数据源；不传则客户的 4 张 CUR" "Passing the URL without the ARN deploys a data source that 403s on every call; passing neither silently drops")" >&2
+    echo "     $(t "报表静默消失。两种都是静默降级,所以这里停下来。" "the customer's 4 CUR sheets. Both are silent degradations, so this stops here.")" >&2
+    echo "     $(t "带上环境变量重跑: " "Re-run with: ")COST_AGENT_MCP_URL=$COST_AGENT_MCP_URL COST_AGENT_FN_ARN=<function ARN> ./setup.sh" >&2
+    exit 1
+  fi
+fi
+
 if [ -n "$COST_AGENT_MCP_URL" ]; then
   if [ -z "$COST_AGENT_FN_ARN" ]; then
     echo ""
@@ -1191,10 +1588,42 @@ INSPECTION_FLAGS=""
 # ① 运维告警收件人。**独立于客户推送通道**（R11c.2：混进去客户会收到
 #    我们的内部故障）。不填也会建 topic —— Alarm 必须有 action，否则它只在
 #    控制台变红，而「没人看控制台」正是 R11c.3 存在的原因。
-if [ -n "${OPS_ALERT_EMAIL:-}" ]; then
+#
+# 🔴 只从环境变量读的后果（本轮修的既有缺陷）：客户第一次带着 OPS_ALERT_EMAIL 跑通、
+#    以后按我们文档教的升级动作（git pull + 重跑 ./setup.sh）再跑一次、这次忘了带 ——
+#    CDK 就不再声明那条 email 订阅，CloudFormation 于是把它**删掉**。6 条告警回到
+#    「只在控制台变红」，而部署打印的是 ✅ 成功。
+#    所以先回读「上一次部署到底传了什么」，环境变量没给就沿用。
+OPS_ALERT_EMAIL="${OPS_ALERT_EMAIL:-}"
+_ops_live_email=""
+_ops_live_state="absent"
+read_live_ops_alert_email && _ops_rc=0 || _ops_rc=$?
+case "$_ops_rc" in
+  0)
+    _ops_live_email="$LIVE_READ_VALUE"
+    [ -n "$_ops_live_email" ] && _ops_live_state="value"
+    ;;
+  1) _ops_live_state="absent" ;;   # 主栈还没部署 = 首装，没有历史值
+  *) _ops_live_state="unknown" ;;  # ③ 读不到，绝不许当成"没配过"
+esac
+if [ -z "$OPS_ALERT_EMAIL" ] && [ "$_ops_live_state" = "value" ]; then
+  OPS_ALERT_EMAIL="$_ops_live_email"
+  echo "  $(t "✓ 沿用现网已配的运维告警邮箱（来源: 现网 NotiOpsBackendStack 模板里那条 email 订阅）: " "✓ Preserved the live ops alert email (source: the email subscription in the deployed NotiOpsBackendStack template): ")${OPS_ALERT_EMAIL}"
+elif [ -n "$OPS_ALERT_EMAIL" ] && [ "$_ops_live_state" = "value" ] && [ "$_ops_live_email" != "$OPS_ALERT_EMAIL" ]; then
+  # 显式 > 探测。但差异要说出来 —— 悄悄换掉收件人 = 老地址从此收不到告警而没人知道。
+  echo "  $(t "ℹ 运维告警邮箱与现网不同，按环境变量走（显式 > 探测）: 现网 " "ℹ The ops alert email differs from the live one; the environment variable wins (explicit > detected): live ")${_ops_live_email} -> ${OPS_ALERT_EMAIL}"
+fi
+if [ -n "$OPS_ALERT_EMAIL" ]; then
   INSPECTION_FLAGS="$INSPECTION_FLAGS -c opsAlertEmail=$OPS_ALERT_EMAIL"
   echo "  $(t "✓ 运维告警邮箱: " "✓ Ops alert email: ")$OPS_ALERT_EMAIL"
 else
+  if [ "$_ops_live_state" = "unknown" ]; then
+    warn_live_read_failed \
+      "运维告警收件邮箱（opsAlertEmail）" "the ops alert email recipient (opsAlertEmail)" \
+      "CloudFormation 会删掉那条 email 订阅，6 条巡检告警重新变成只在控制台变红" \
+      "CloudFormation deletes that email subscription and the 6 inspection alarms go back to only turning red in the console" \
+      "OPS_ALERT_EMAIL=sre@example.com ./setup.sh"
+  fi
   echo "  $(t "ℹ 未设 OPS_ALERT_EMAIL —— 6 条巡检告警只会在 CloudWatch 控制台变红。" "ℹ OPS_ALERT_EMAIL not set -- the 6 inspection alarms will only turn red in the console.")"
   echo "    $(t "补法: OPS_ALERT_EMAIL=sre@example.com ./setup.sh（或事后订阅 notiops-inspection-ops-alerts）" "Fix: OPS_ALERT_EMAIL=sre@example.com ./setup.sh (or subscribe to notiops-inspection-ops-alerts later)")"
 fi
@@ -1203,10 +1632,43 @@ fi
 #    `_env(..., "-1")` 恒取兜底 → used_ratio 恒 0 → tier 恒 NORMAL。
 #    按容量模型估算，满负荷月消耗
 #    远超 Enterprise Support Basic 的额度，护栏关着等于第一个月烧光全年。
-if [ -n "${INSPECTION_MONTHLY_LIMIT_SECONDS:-}" ]; then
+#
+# 🔴 同一类缺陷：只读环境变量 ⇒ 重跑一次没带 ⇒ 护栏从"开着"变回"关着"，零信号，
+#    而症状（额度一个月烧光）要等到月底才看得见。所以回读调度器上真实生效的值。
+# ⚠️ 读回 -1 时**不能**当成"配过"沿用：那是 CDK 侧 `?? "-1"` 的兜底值，含义正是
+#    "从来没配过"。沿用它会打印一条像配好了的 ✓，而护栏其实还是关着 —— 那比现在
+#    这个 bug 更坏（现在至少还打了一行 ⚠ 警告）。
+INSPECTION_MONTHLY_LIMIT_SECONDS="${INSPECTION_MONTHLY_LIMIT_SECONDS:-}"
+_limit_live=""
+_limit_live_state="absent"
+read_live_lambda_env "notiops-inspection-scheduler" "MONTHLY_LIMIT_SECONDS" && _limit_rc=0 || _limit_rc=$?
+case "$_limit_rc" in
+  0)
+    _limit_live="$LIVE_READ_VALUE"
+    [ "$_limit_live" = "-1" ] && _limit_live=""
+    [ -n "$_limit_live" ] && _limit_live_state="value"
+    ;;
+  1) _limit_live_state="absent" ;;
+  *) _limit_live_state="unknown" ;;
+esac
+if [ -z "$INSPECTION_MONTHLY_LIMIT_SECONDS" ] && [ "$_limit_live_state" = "value" ]; then
+  INSPECTION_MONTHLY_LIMIT_SECONDS="$_limit_live"
+  echo "  $(t "✓ 沿用现网已配的 DA 月度额度上限（来源: 现网 notiops-inspection-scheduler 的 MONTHLY_LIMIT_SECONDS）: " "✓ Preserved the live DA monthly limit (source: MONTHLY_LIMIT_SECONDS on the live notiops-inspection-scheduler): ")${INSPECTION_MONTHLY_LIMIT_SECONDS}s"
+elif [ -n "$INSPECTION_MONTHLY_LIMIT_SECONDS" ] && [ "$_limit_live_state" = "value" ] && [ "$_limit_live" != "$INSPECTION_MONTHLY_LIMIT_SECONDS" ]; then
+  echo "  $(t "ℹ DA 月度额度上限与现网不同，按环境变量走（显式 > 探测）: 现网 " "ℹ The DA monthly limit differs from the live one; the environment variable wins (explicit > detected): live ")${_limit_live}s -> ${INSPECTION_MONTHLY_LIMIT_SECONDS}s"
+fi
+if [ -n "$INSPECTION_MONTHLY_LIMIT_SECONDS" ]; then
   INSPECTION_FLAGS="$INSPECTION_FLAGS -c monthlyLimitSeconds=$INSPECTION_MONTHLY_LIMIT_SECONDS"
   echo "  $(t "✓ DA 月度额度上限: " "✓ DA monthly limit: ")${INSPECTION_MONTHLY_LIMIT_SECONDS}s"
 else
+  if [ "$_limit_live_state" = "unknown" ]; then
+    warn_live_read_failed \
+      "DA 月度额度上限（monthlyLimitSeconds，= 预算护栏的开关）" \
+      "the DA monthly limit (monthlyLimitSeconds -- i.e. the budget guardrail switch)" \
+      "护栏会从「开着」变回「关着」: used_ratio 恒 0 → tier 恒 NORMAL，额度可能一个月烧光" \
+      "the guardrail flips from ON back to OFF: used_ratio stays 0 -> tier stays NORMAL, and the quota can burn out in one month" \
+      "INSPECTION_MONTHLY_LIMIT_SECONDS=<seconds> ./setup.sh"
+  fi
   echo "  $(t "⚠ 未设 INSPECTION_MONTHLY_LIMIT_SECONDS —— 预算护栏关闭（P3 告警会停在 INSUFFICIENT_DATA 提示这一点）。" "⚠ INSPECTION_MONTHLY_LIMIT_SECONDS not set -- the budget guardrail is OFF (the P3 alarm stays INSUFFICIENT_DATA to surface this).")"
 fi
 
@@ -1215,22 +1677,67 @@ fi
 #    可能还不存在（首次部署）。所以从**已有部署**的 CFN 输出里读 ——
 #    首次部署拿不到（推送就没深链），重跑一次即补上。这正是
 #    「用 setup.sh 更新现有资源」的场景。
-EXISTING_CHAT_URL=$(aws cloudformation describe-stacks \
-  --stack-name WebChatStack --region "$DEPLOY_REGION" \
-  --query "Stacks[0].Outputs[?OutputKey=='ChatUrl'].OutputValue | [0]" \
-  --output text 2>/dev/null || echo "")
-if [ -n "$EXISTING_CHAT_URL" ] && [ "$EXISTING_CHAT_URL" != "None" ]; then
+#
+# ⚠️ 这里也必须走三态：老写法是 `2>/dev/null || echo ""`，读不到（AccessDenied /
+#    凭证过期 / region 写错）会打印「WebChatStack 尚未部署」——对着一个明明在跑的
+#    部署说假话，同时静默丢掉 webBaseUrl。首装拿不到深链是**设计如此**，权限抖动
+#    丢掉深链不是；两者必须能分开说。
+EXISTING_CHAT_URL=""
+read_live_stack_output "WebChatStack" "ChatUrl" && _chat_rc=0 || _chat_rc=$?
+case "$_chat_rc" in
+  0) EXISTING_CHAT_URL="$LIVE_READ_VALUE" ;;
+  1) : ;;   # 首次部署，WebChatStack 还不存在
+esac
+if [ -n "$EXISTING_CHAT_URL" ]; then
   INSPECTION_FLAGS="$INSPECTION_FLAGS -c webBaseUrl=$EXISTING_CHAT_URL"
   echo "  $(t "✓ 推送深链 base URL: " "✓ Push deep-link base URL: ")$EXISTING_CHAT_URL"
+elif [ "$_chat_rc" = "2" ]; then
+  warn_live_read_failed \
+    "推送深链 base URL（webBaseUrl）" "the push deep-link base URL (webBaseUrl)" \
+    "推送正文里的「查看详情 / 查看全部」深链会变空 —— 通知照发，只是点不进来" \
+    "the \"view details / view all\" deep links in push bodies go empty -- pushes still send, they just cannot be clicked through" \
+    "$(t "修好凭证/权限后重跑 ./setup.sh（本项无环境变量，只能靠回读）" "fix credentials/permissions and re-run ./setup.sh (no env var for this one; it is read-back only)")"
 else
   echo "  $(t "ℹ WebChatStack 尚未部署 —— 本轮推送正文没有深链，部署完重跑一次即补上。" "ℹ WebChatStack not deployed yet -- push bodies will have no deep links this round; re-run setup.sh once it exists.")"
 fi
 
 # ④ 判读正文语言（R11b.10）。默认 zh —— ⚠️ 不复用 DEFAULT_LOCALE，
 #    那个在 report_delivery 里兜底 "en"，共用会把巡检报告拖成英文。
-if [ -n "${INSPECTION_REPORT_LOCALE:-}" ]; then
+#
+# 🔴 同上：客户用 `-c inspectionReportLocale=en` 跑成英文以后，重跑一次没带这个环境
+#    变量，判读正文就静默变回中文 —— 报告还在、还是 success，只是语言换了，而
+#    「谁把我的英文报告改成中文了」这种问题没人查得出来。所以回读 executor 上生效的值。
+# ⚠️ 只在读回的值**不等于** CDK 默认（zh）时才沿用：默认就是 zh，读回 zh 分不出
+#    「显式配了 zh」和「从来没配、吃的兜底」，而两者行为完全一样。为了那个分不出来的
+#    情况打一行"已沿用"，等于对着从没配过这项的客户说了句假话。
+INSPECTION_REPORT_LOCALE="${INSPECTION_REPORT_LOCALE:-}"
+_locale_live=""
+_locale_live_state="absent"
+read_live_lambda_env "notiops-inspection-executor" "INSPECTION_REPORT_LOCALE" && _locale_rc=0 || _locale_rc=$?
+case "$_locale_rc" in
+  0)
+    _locale_live="$LIVE_READ_VALUE"
+    [ "$_locale_live" = "zh" ] && _locale_live=""
+    [ -n "$_locale_live" ] && _locale_live_state="value"
+    ;;
+  1) _locale_live_state="absent" ;;
+  *) _locale_live_state="unknown" ;;
+esac
+if [ -z "$INSPECTION_REPORT_LOCALE" ] && [ "$_locale_live_state" = "value" ]; then
+  INSPECTION_REPORT_LOCALE="$_locale_live"
+  echo "  $(t "✓ 沿用现网已配的判读正文语言（来源: 现网 notiops-inspection-executor 的 INSPECTION_REPORT_LOCALE）: " "✓ Preserved the live judgment body locale (source: INSPECTION_REPORT_LOCALE on the live notiops-inspection-executor): ")${INSPECTION_REPORT_LOCALE}"
+elif [ -n "$INSPECTION_REPORT_LOCALE" ] && [ "$_locale_live_state" = "value" ] && [ "$_locale_live" != "$INSPECTION_REPORT_LOCALE" ]; then
+  echo "  $(t "ℹ 判读正文语言与现网不同，按环境变量走（显式 > 探测）: 现网 " "ℹ The judgment body locale differs from the live one; the environment variable wins (explicit > detected): live ")${_locale_live} -> ${INSPECTION_REPORT_LOCALE}"
+fi
+if [ -n "$INSPECTION_REPORT_LOCALE" ]; then
   INSPECTION_FLAGS="$INSPECTION_FLAGS -c inspectionReportLocale=$INSPECTION_REPORT_LOCALE"
   echo "  $(t "✓ 判读正文语言: " "✓ Judgment body locale: ")$INSPECTION_REPORT_LOCALE"
+elif [ "$_locale_live_state" = "unknown" ]; then
+  warn_live_read_failed \
+    "判读正文语言（inspectionReportLocale）" "the judgment body locale (inspectionReportLocale)" \
+    "语言会静默退回默认的 zh —— 之前配成 en 的客户，报告正文这次开始变中文" \
+    "the locale silently falls back to the zh default -- a customer who had set en starts getting Chinese report bodies" \
+    "INSPECTION_REPORT_LOCALE=en ./setup.sh"
 fi
 
 # 3. CDK 部署
@@ -1874,6 +2381,19 @@ if [ -n "$ENABLED_PLATFORMS" ]; then
   # 钉钉只有一个 Secret（JSON 里 app_key / app_secret,与飞书同构),没有 Slack 那种
   # 「签名密钥另存一个」的分裂 —— 钉钉的验签用的就是 app_secret 本身。
   echo "$(t "钉钉 Secret:       " "DingTalk Secret:   ")$DINGTALK_SECRET"
+elif [ "$LIVE_IM_STATE" = "live" ]; then
+  # 🔴 这里以前无条件说「本次未部署」。可现网 ImStack 还在跑的时候，那句话是**假信息**：
+  #    `enabledPlatforms=none` 让 ImStack 压根不进 assembly，`cdk deploy --all` 因此
+  #    根本不碰它 —— 它既没被删、也没被更新，就那样冻在上一次部署的代码上继续收消息。
+  #    客户读到"未部署"会以为 IM 已经下线，于是既不去升级它、也不去删它。
+  echo "$(t "── IM Bot ── 本次没部署，但现网那套【还在】: " "── IM Bot ── not deployed this run, but the live one is STILL THERE: ")${LIVE_IM_PLATFORMS}"
+  echo "  $(t "它继续收消息、继续计费，跑的是**升级前**的代码 —— 本次的 IM 相关修复对它不生效。" "It keeps receiving messages and incurring cost, running the code from BEFORE this upgrade -- none of this run's IM fixes apply to it.")"
+  echo "  $(t "让它跟着升级: 重跑 ./setup.sh，在「IM 平台」那一步直接回车（默认就是保留现网平台）。" "To upgrade it: re-run ./setup.sh and just press Enter at the IM platform step (the default keeps the live platforms).")"
+  echo "  $(t "真正下掉它: ./teardown.sh，或在 CloudFormation 控制台删掉 ImStack —— 只有这两个才是删除。" "To really remove it: ./teardown.sh, or delete the ImStack stack in the CloudFormation console -- only those are a deletion.")"
+elif [ "$LIVE_IM_STATE" = "unknown" ]; then
+  # 读不到现网状态时不许替客户下结论说"没有 IM 在跑"—— 那正是本轮在修的那类假信息。
+  echo "$(t "── IM Bot ── 本次未部署。⚠️ 部署前读不到现网 IM 状态，所以这里**不能**断言现网没有 IM 在跑。" "── IM Bot ── not deployed this run. WARNING: the live IM state could not be read before deploying, so we cannot claim there is no live IM.")"
+  echo "  $(t "自己核一眼: " "Check it yourself: ")aws cloudformation describe-stacks --stack-name ImStack --region ${DEPLOY_REGION}"
 else
   echo "$(t "── IM Bot ── 本次未部署（web 端已就绪）" "── IM Bot ── not deployed this run (web UI is ready)")"
   echo "  $(t "以后想启用：重跑 ./setup.sh 选 1) 飞书 / 2) Slack / 3) 钉钉 即可，无需重建其余资源。" "To enable later: re-run ./setup.sh and pick 1) Feishu / 2) Slack / 3) DingTalk — no need to rebuild anything else.")"
@@ -2011,9 +2531,15 @@ if [ -n "$ENABLED_PLATFORMS" ]; then
   echo "  $(t "    (飞书是「原地切换现有 App」,权限一条都不用加;Slack 和钉钉都是新建应用。" "    (Feishu is an in-place cutover of your existing app — no new scopes needed; Slack and DingTalk both need a new app.")"
   echo "  $(t "     飞书 / Slack 必须先把 Secret 填好,再去平台上保存请求地址 —— 反了 URL 校验必失败;" "     For Feishu / Slack, fill the secrets BEFORE saving the Request URL — the URL challenge fails otherwise;")"
   echo "  $(t "     钉钉没有 URL 校验这一步,但顺序反了同样白等 —— 机器人不报错,只是不回话。)" "     DingTalk has no URL challenge, but the wrong order still costs you a wait — the robot does not error, it just stays silent.)")"
+elif [ "$LIVE_IM_STATE" = "live" ]; then
+  # 上面那个「必做:填写 IM 机器人凭证」的框子是按 ENABLED_PLATFORMS 非空才打的,这是对的:
+  # 本次没部署 IM 就没有新 bot 要填凭证。但**不能**顺着说成"未部署"—— 现网那套还在。
+  echo "  $(t "3️⃣  ⚠️ IM 机器人 —— 本次没部署,但现网的 " "3️⃣  WARNING: IM bots — not deployed this run, but the live ")${LIVE_IM_PLATFORMS}$(t " 还在原地跑升级前的代码。" " is still in place, running pre-upgrade code.")"
+  echo "      $(t "本次的 IM 修复对它不生效。要么重跑 ./setup.sh 在平台选择那步回车(让它跟着升级)," "None of this run's IM fixes apply to it. Either re-run ./setup.sh and press Enter at the platform step (so it gets upgraded),")"
+  echo "      $(t "要么用 ./teardown.sh 真正删掉它 —— 别让它这么半挂着。" "or remove it for real with ./teardown.sh -- do not leave it half-hanging like this.")"
 else
   echo "  $(t "3️⃣  (可选)IM 机器人 —— 本次未部署。" "3️⃣  (Optional) IM bots — not deployed this run.")"
-  echo "      $(t "以后想加飞书/Slack:重跑 ./setup.sh 选对应平台即可,无需重建其余资源。" "To add Feishu/Slack later: re-run ./setup.sh and pick the platform — no need to rebuild anything else.")"
+  echo "      $(t "以后想加飞书 / Slack / 钉钉:重跑 ./setup.sh 选对应平台即可,无需重建其余资源。" "To add Feishu / Slack / DingTalk later: re-run ./setup.sh and pick the platform — no need to rebuild anything else.")"
 fi
 echo ""
 echo "  $(t "4️⃣  (可选)开启闲置资源检测 + 成本自动巡检 —— 不配也不影响 Web Chat:" "4️⃣  (Optional) Enable idle-resource detection + auto cost inspection — does not affect Web Chat:")"

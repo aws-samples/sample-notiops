@@ -6,7 +6,7 @@
 > **三类读者，都适用**：
 > - **一键部署（方式 A）**：参数页的 **What to install** 选了 `web+feishu` / `web+slack` /
 >   `web+dingtalk`
->   （见 [DEPLOYMENT_ONECLICK.md §2.11](DEPLOYMENT_ONECLICK.md#211-加装-im-机器人飞书lark-或-slack)），
+>   （见 [DEPLOYMENT_ONECLICK.md §2.11](DEPLOYMENT_ONECLICK.md#211-加装-im-机器人飞书larkslack-或钉钉)），
 >   栈已经开完，剩下的就是这份文档 —— 先看 §0 那条 🅰️ 说明（只有四处不同），然后照 §1 / §2 / §3 做。
 > - **新部署（方式 B，`setup.sh`）**：先按 [DEPLOYMENT.md](DEPLOYMENT.md) §3 建好应用、配好权限、拿到钥匙，
 >   跑完 `setup.sh`，然后回到这里填请求地址。
@@ -72,7 +72,7 @@ ingress 按请求体自己分流，不靠路径区分 —— 所以地址后面*
 
 > 🅰️ **一键部署（方式 A）的读者**：你没有 `ImStack` —— IM 是**主栈的加装项**（参数页的
 > **What to install** 选 `web+feishu` / `web+slack` / `web+dingtalk`，见
-> [DEPLOYMENT_ONECLICK.md §2.11](DEPLOYMENT_ONECLICK.md#211-加装-im-机器人飞书lark-或-slack)）。差别只有下面四条，
+> [DEPLOYMENT_ONECLICK.md §2.11](DEPLOYMENT_ONECLICK.md#211-加装-im-机器人飞书larkslack-或钉钉)）。差别只有下面四条，
 > §1 / §2 / §3 的每一步照做即可：
 > - **地址从主栈的 Outputs 取**：上面那条命令把 `--stack-name` 换成你的栈名（默认 `notiops`）。
 >   OutputKey 一模一样，另外还多一个 `ImNextSteps` 告诉你还差哪一步。

@@ -1,12 +1,8 @@
-# 对外仓库的 .gitignore（由 scripts/publish-to-github.sh 复制成 public repo 根的 .gitignore）
+# NotiOps —— .gitignore
 #
-# 为什么单独有一份:内部仓的根 .gitignore 里点名了一批内部文档 / 宣传物料 / 评审产物的
-# 文件名,那份**本身就是内部信息**,不能原样外发。而 public 仓完全没有 .gitignore 也不行 ——
-# 客户 fork 后跑一次 setup.sh,`git status` 里就会混进 cdk.out / node_modules / __pycache__,
-# 以及 `bootstrap.env`、`infra/cdk-outputs*.json` 这类**带账号 ID 与 secret ARN**的本地产物;
-# 一不小心 `git add -A` 就提交上去了。这份只保留「客户跑我们的脚本会生成什么」这一类规则。
-#
-# 改这份时的判据:只写客户机器上会出现的再生物/本地配置。任何内部文档名不许进来。
+# 只覆盖「在你自己的机器上跑本仓脚本会生成的东西」:cdk.out / node_modules /
+# __pycache__ 这类再生物,以及 `bootstrap.env`、`infra/cdk-outputs*.json` 这类
+# **带账号 ID 与 secret ARN** 的本地产物 —— 免得一次 `git add -A` 就把它们提交上去。
 
 # Python
 .venv/

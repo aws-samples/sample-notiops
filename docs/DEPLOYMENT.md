@@ -241,8 +241,8 @@ CDK 部署三个栈(选了 IM 平台时是四个,多一个 `ImStack`),`./setup.s
 > 不再实例化 `BotStack`。IM 的 Python 依赖层由 `scripts/build_im_layer.sh` 用
 > `pip --platform manylinux2014_x86_64 --only-binary=:all:` 交叉下载,不需要容器。
 > 顺带的收益:`cdk synth` 不再把整个仓库根当 Docker build context 算 hash(实测 594s → 12s)。
-> ⚠️ 将来若又引入 Docker 资产,这一行、`setup.sh` 的 preflight、以及
-> `publish/README.public.{zh,en}.md` 要一起改回来。
+> ⚠️ 将来若又引入 Docker 资产,这一行、`setup.sh` 的 preflight、以及仓库根那两份
+> README(中英各一)要一起改回来。
 
 ### 2.2 AWS 账号准备
 

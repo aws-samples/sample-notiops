@@ -921,6 +921,34 @@ def test_im_webhook_parity() -> None:
     _check("方式 B 的 allowedChatIds 取自 -c imAllowedChatIds",
            'tryGetContext("imAllowedChatIds")' in _strip_comments(_read(IM_SETUP_STACK)),
            "方式 B 少了这个 context 键，两条路径就又不对等了")
+    # 🔴 `allowedPattern` 必须放得过**三家**的 id 形态。这条曾经真的挡住过钉钉:
+    #    `^[A-Za-z0-9_,:@.-]*$` 里没有 `+` `/` `=`，而钉钉的 `conversationId` 是
+    #    base64 形状（`cid…==`）—— 客户按文档粘进来，CloudFormation 在栈更新**开始
+    #    之前**就 `does not match pattern` 拒掉，等于这道防线在方式 A 上对钉钉根本
+    #    打不开（v1.0.27 修）。所以这里不查正则**长什么样**，而是把三家的样本 id 喂
+    #    给模板里那个正则本体跑一遍 —— 正则被改窄了立刻红。
+    _pat = re.search(r'new cdk\.CfnParameter\(this, "ImAllowedChatIds"'
+                     r'.*?allowedPattern:\s*"([^"]+)"', oneclick, re.S)
+    _check("方式 A 的 ImAllowedChatIds 有 allowedPattern", _pat is not None)
+    if _pat:
+        _rx = re.compile(_pat.group(1))
+        for _label, _sample in (
+            ("飞书 chat id", "oc_a1b2c3d4e5"),
+            ("Slack channel id", "C0123ABCDEF"),
+            # 真形态：base64 尾巴一定有 `=`，可能带 `+` 与 `/`。
+            ("钉钉 conversationId", "cidAb+cD/ef12GhIjKl=="),
+            ("三家混填（逗号分隔）", "oc_a1,C0123ABCDEF,cidAb+cD/ef12GhIjKl=="),
+            ("留空 = 不限制", ""),
+        ):
+            _check(f"allowedPattern 放得过 {_label}",
+                   _rx.fullmatch(_sample) is not None,
+                   f"{_sample!r} 会被 CloudFormation 在栈更新前拒掉 —— "
+                   "这道防线在方式 A 上对该平台打不开")
+        # 反向：`constraintDescription` 说了「No spaces.」，那就真的得挡住空格，
+        # 否则那句话是假的（客户会以为逗号后面可以敲空格）。
+        _check("allowedPattern 仍然挡住空格（constraintDescription 才不是假话）",
+               _rx.fullmatch("oc_a1, C0123") is None)
+
     # 两个平台的环境变量名故意不同（飞书 ALLOWED_CHAT_IDS / Slack ALLOWED_CHANNEL_IDS，
     # 沿用各自平台既有口径），但都必须由同一个 prop 喂 —— 少喂一个就是那个平台没防线。
     for env_name in ("ALLOWED_CHAT_IDS", "ALLOWED_CHANNEL_IDS"):

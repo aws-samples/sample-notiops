@@ -260,7 +260,7 @@ Credential flow: `setup.sh` **does not collect IM credentials** — it only sets
 > Side benefit: `cdk synth` no longer hashes the whole repo root as a Docker build context
 > (measured 594s → 12s).
 > ⚠️ If a Docker asset is ever reintroduced, this note, `setup.sh`'s preflight, and
-> `publish/README.public.{zh,en}.md` all have to change back together.
+> both root READMEs (one per language) all have to change back together.
 
 ### 2.2 AWS account preparation
 

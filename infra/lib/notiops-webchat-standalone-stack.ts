@@ -181,10 +181,12 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         "Which entry points to install. 'web' installs the NotiOps web chat and admin console " +
         "only. 'web+feishu' also installs the Feishu/Lark bot; 'web+slack' the Slack bot; " +
         "'web+dingtalk' the DingTalk bot. The web chat is always installed -- the admin console " +
-        "is where you enter the bot credentials. Adding a bot creates two extra Lambda functions " +
-        "with a public webhook URL (request signature verified, throttled to 10 concurrent " +
-        "executions); Feishu and Slack also get a once-a-minute progress poller. You can switch " +
-        "this value on a later stack update.",
+        "is where you enter the bot credentials. Adding a bot creates three extra Lambda functions: " +
+        "an ingress with a public webhook URL (request signature verified, throttled to 10 " +
+        "concurrent executions), its worker, and a once-a-minute progress poller (created on all " +
+        "three platforms; on DingTalk that scan finds nothing to do, because DingTalk progress is " +
+        "appended messages with no card to refresh). You can switch this value on a later stack " +
+        "update.",
     });
 
     // CORS 白名单。默认 "*" 的理由与 CDK 路径一致（端点已由 AWS_IAM/SigV4 鉴权，
@@ -213,15 +215,46 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         "then delete it.",
     });
 
+    // ── 出网受限账号的产物镜像 ──
+    // 🔴 这段 description 是**对客契约**，不是补充说明：它的读者恰好是「连不上 GitHub」
+    //    的那批账号 —— 最没条件自己排查的一批人。少列一个产物名，客户就照着少镜像一个，
+    //    然后在 StagerArtifacts 上以一个 404 收场，而这条参数存在的全部目的就是让他们
+    //    不必去翻 Lambda 日志。2026-09-09 修的就是这个：**已发布的 v1.0.26 模板里**这段
+    //    只点了三个（bff / chat-dist / agent-code），实际是**六个** —— 漏掉的 web-notif.zip 连
+    //    「只装 web」这条最常见的路径都镜像不全，im-code / im-layer 则让任何带 IM 的
+    //    安装选项必挂。说反了的文案比没有文案更贵：客户会照着做，然后信任那份清单。
+    // ⚠️ 产物清单的唯一权威是 scripts/postprocess_template.py 里那六个 `*_ARTIFACT`
+    //    常量（它们同时决定 Release 里的资产文件名）。那边加/改/删一个产物，这里必须
+    //    同步改，否则文案立刻变成假信息。
+    // ⚠️ 「四个 vs 六个」的分界不看 InstallOption 的具体取值，只看产物名的 `im-` 前缀
+    //    （infra/lambda/stager/index.py 的 `_artifacts_upsert`：InstallOption=web 时跳过
+    //    `im-` 开头的）。所以措辞按「InstallOption 不是 web 时」写 —— 以后新增
+    //    `web+xxx` 选项不需要回来改这段文案。
+    // ⚠️ 下载地址是 `<base>/<裸文件名>`，**不是** staging 桶里那些带 tag 前缀的 key
+    //    （`frontend/<tag>/chat-dist.zip` 之类）。镜像必须是**平铺**的，否则客户把目录
+    //    结构抄过去、每一个都 404 —— 名字对了地方错了，失败现象和名字漏了一模一样。
+    // ⚠️ **没有任何 CI 断言这段文案的内容**：golden fixture 是方式 B 的 WebChatStack
+    //    （参数只有 BootstrapVersion），一键模板的参数描述一个字都没被断言；
+    //    `assert_customer_text_is_ascii` 只管字符集不管说得对不对。上一次漂移是靠人眼
+    //    发现的，所以改产物集时请把这段当代码改，别当注释跳过。
     const artifactBaseUrl = new cdk.CfnParameter(this, "ArtifactBaseUrl", {
       type: "String",
       default: "",
       description:
         "Optional. Where to download the release artifacts from, if this account cannot reach " +
-        "GitHub. Mirror bff.zip / chat-dist.zip / agent-code.zip somewhere reachable and put the " +
-        "base here: either s3://my-bucket/my/prefix (read with your own credentials -- no public " +
-        "access needed, also set the bucket name below) or https://host/path (plain unauthenticated " +
-        "GET). Leave empty to use the public GitHub release.",
+        "GitHub. There are six release files: bff.zip, chat-dist.zip, web-notif.zip, " +
+        "agent-code.zip, im-code.zip and im-layer.zip. The first four are always needed; " +
+        "im-code.zip and im-layer.zip are downloaded only when InstallOption is not 'web', so a " +
+        "web-only install can mirror just the first four (mirror all six if you may add a bot " +
+        "later). Keep the mirror FLAT: the deployment helper fetches <base>/<filename>, so the " +
+        "files must sit directly under the base -- do not recreate the release tag folders. Set " +
+        "this to either s3://my-bucket/my/prefix (objects at my/prefix/bff.zip and so on, read " +
+        "with the deployment helper's own credentials -- no public access needed, also set the " +
+        "bucket name below) or https://host/path (plain unauthenticated GET of " +
+        "https://host/path/bff.zip and so on). Every file is sha256-checked after download, so " +
+        "mirror the byte-identical assets from the release this template was built for -- " +
+        "re-zipping or renaming them will fail the deployment. Leave empty to use the public " +
+        "GitHub release.",
     });
 
     // s3:// 镜像要读得到，就得给 StagerFn 的角色 GetObject —— 而桶名只有客户知道。
@@ -351,15 +384,22 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       default: "",
       // 允许 oc_/C0.../cid 等各家 id 形态 + 逗号分隔；不做更严的校验，因为三家平台
       // 的 id 前缀规则各不相同且会变，写死正则只会把合法值挡在外面。
-      allowedPattern: "^[A-Za-z0-9_,:@.-]*$",
+      // ⚠️ `+` `/` `=` 是**钉钉必需**的：`conversationId` 是 base64 形状（`cid…==`）。
+      // 漏掉它们的症状不是"少校验"，而是客户按文档粘进来后栈更新**开始之前**就被
+      // CloudFormation 拒掉（does not match pattern）—— 等于这道防线在方式 A 上对钉钉
+      // 根本打不开（v1.0.27 修）。`-` 必须留在字符类**最后**才是字面量。
+      allowedPattern: "^[A-Za-z0-9_,:@.+/=-]*$",
       constraintDescription:
         "Comma-separated chat/channel ids, or empty. No spaces.",
       description:
-        "Optional, IM only. Comma-separated list of the Feishu chat ids (oc_...) or Slack channel " +
-        "ids (C...) the bot is allowed to answer in. Empty means every chat the bot is invited to. " +
-        "This is defense in depth: even if request-signature verification were bypassed, a message " +
-        "from a chat outside this list is dropped before any model call. You normally deploy empty, " +
-        "create the group, then update the stack with its id.",
+        "Optional, IM only. Comma-separated list of the chat ids the bot is allowed to answer in: " +
+        "Feishu chat ids (oc_...), Slack channel ids (C...) or DingTalk conversationIds (cid...==) " +
+        "-- all three platforms share this one parameter. Empty means every chat the bot is invited " +
+        "to. This is defense in depth: a message from a chat outside this list is dropped before any " +
+        "model call -- for Feishu and Slack in the ingress function, so it holds even if " +
+        "request-signature verification were bypassed; for DingTalk one layer later, in the worker, " +
+        "because its conversationId only becomes readable after signature verification. You normally " +
+        "deploy empty, create the group, then update the stack with its id.",
     });
 
     // 控制台参数分组 —— 一键部署的门面就是那个参数页，顺序/分组直接决定客户观感。

@@ -3810,6 +3810,24 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Copy the whole block, edit it, send it back. Only "
               "\"Description\" is required — adjust the rest as needed.",
     },
+    # 六行字段的**复制边界**。现网原话(2026-09-09):「现在混在一起,不太明显看出来要
+    # 复制什么内容」。钉钉没有代码块、没有引用块能安全用(`>` 会被一起复制走)、更没有
+    # 「复制」按钮 —— 能用的只有两条肉眼可辨的界线,加上把标签加粗(在
+    # `case_text._form_body()` 里包 `**`)。
+    #
+    # ⚠️ 这两行的文案里**不许出现 `**`**:它们会跟着用户复制回来,靠
+    # `case_text._form_boilerplate()` → `nl_router.parse_case_form(boilerplate=…)`
+    # 剔掉,而那边比对前会用 `_case_form_probe` 把 `**` 剪掉 —— 存进来的原文自带星号
+    # 就对不上,界线会直接进 AWS 案例正文(工程师会读到「从这里开始复制」)。
+    # 同理**别加占位符**:比对是整行逐字的。
+    "im.dt.case.form.copy_begin": {
+        "zh": "━━━ ↓ 从这里开始复制 ↓ ━━━",
+        "en": "━━━ ↓ copy from here ↓ ━━━",
+    },
+    "im.dt.case.form.copy_end": {
+        "zh": "━━━ ↑ 复制到这里为止 ↑ ━━━",
+        "en": "━━━ ↑ copy up to here ↑ ━━━",
+    },
     "im.dt.case.form.label.description": {"zh": "问题描述", "en": "Description"},
     "im.dt.case.form.label.severity": {"zh": "严重等级", "en": "Severity"},
     "im.dt.case.form.label.language": {"zh": "语言", "en": "Language"},

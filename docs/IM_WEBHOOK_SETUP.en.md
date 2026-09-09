@@ -7,7 +7,7 @@ the IM platform console**, and it is the step you do **after the deployment fini
 > **Three kinds of reader, all covered**:
 > - **One-click (path A)**: you set **What to install** to `web+feishu` / `web+slack` /
 >   `web+dingtalk` on the parameters page (see
->   [DEPLOYMENT_ONECLICK.en.md §2.11](DEPLOYMENT_ONECLICK.en.md#211-add-an-im-bot-feishulark-or-slack)),
+>   [DEPLOYMENT_ONECLICK.en.md §2.11](DEPLOYMENT_ONECLICK.en.md#211-add-an-im-bot-feishulark-slack-or-dingtalk)),
 >   the stack is up, and this document is all that's left — read the 🅰️ note in §0 (four
 >   differences, that's all), then follow §1 / §2 / §3.
 > - **New deployment (path B, `setup.sh`)**: first follow [DEPLOYMENT.en.md](DEPLOYMENT.en.md)
@@ -85,7 +85,7 @@ the path — so appending a sub-path still works, but paste it exactly as the ou
 > 🅰️ **If you deployed one-click (path A)**: you have no `ImStack` — IM is an **add-on of the
 > main stack** (the **What to install** parameter set to `web+feishu`, `web+slack` or
 > `web+dingtalk`, see
-> [DEPLOYMENT_ONECLICK.en.md §2.11](DEPLOYMENT_ONECLICK.en.md#211-add-an-im-bot-feishulark-or-slack)).
+> [DEPLOYMENT_ONECLICK.en.md §2.11](DEPLOYMENT_ONECLICK.en.md#211-add-an-im-bot-feishulark-slack-or-dingtalk)).
 > Only these four things differ; every step in §1 / §2 / §3 applies as written:
 > - **Read the URL from the main stack's Outputs**: in the command above, replace
 >   `--stack-name` with your stack name (`notiops` by default). The output keys are

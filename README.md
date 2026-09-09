@@ -373,6 +373,16 @@ preserved, and one log group named like
 - **Upgrade**: `git pull`, then **re-run `./setup.sh`** — it is incremental and only
   updates what changed. IM credentials you already put in Secrets Manager are not
   overwritten.
+  ⚠️ The re-run asks about IM platforms again and shows **which ones are currently
+  deployed** — just press Enter to keep them as they are. Only while those platforms stay
+  selected does the re-run upgrade the web side **and** the IM side. If you answer `0`
+  (skip IM) instead, the script spells out the consequences and asks a separate `[y/N]`
+  confirmation that **defaults to keeping** them. Only if you confirm with `y` does this
+  deployment **stop managing** the IM you already have: it is **not deleted**, it stays in
+  your account serving the **pre-upgrade code**, and from there on the deployment reports
+  success from start to finish with no further sign. Non-interactively it keeps them
+  unless `IM_PLATFORM_CHOICE` says otherwise explicitly.
+  Actually removing IM is a separate, deliberate step — run `./teardown.sh`.
 - **Delete**: run **`./teardown.sh`** from the repository root. It deletes what
   `setup.sh` created in reverse dependency order, including the non-CDK leftovers
   (the CUR report definition, the one-shot EventBridge schedule, the WebSearch

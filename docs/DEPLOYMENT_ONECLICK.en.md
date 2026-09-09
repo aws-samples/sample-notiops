@@ -22,17 +22,17 @@ The repository ships **two** ways to deploy, with different scope. This document
 |---|---|---|
 | What you need | git, Node, Python, uv, AWS CDK, plus deployment credentials (**no Docker/finch** — since 2026-09-03 / M2 the IM side ships as a Lambda Layer and builds no images) | **just a browser logged into the AWS console** |
 | How you start | clone the repo → `./setup.sh` | download one template from the Release → upload it in the CloudFormation console |
-| What gets deployed | Web Chat + IM bots (Feishu/Slack) + daily inspection (including the inspection dashboard's write path) + CUR/Athena FinOps source | **Web Chat** (chat UI + BFF + agent + a DevOps Agent space; multi-account optional) **plus one optional IM bot** (Feishu/Lark or Slack — see [§2.11](#211-add-an-im-bot-feishulark-or-slack)) |
+| What gets deployed | Web Chat + IM bots (Feishu/Slack/DingTalk, several at once if you want) + daily inspection (including the inspection dashboard's write path) + CUR/Athena FinOps source | **Web Chat** (chat UI + BFF + agent + a DevOps Agent space; multi-account optional) **plus one optional IM bot** (Feishu/Lark, Slack or DingTalk — see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)) |
 | Good for | long-term use, IM notifications, scheduled inspection | trying it out / demos / just the read-only ops assistant in a browser (with the option of @-mentioning it in a group chat) |
 
-**You can do both, in order**: deploy one-click to try it (tick the IM bot right there on the parameters page if you want one — see [§2.11](#211-add-an-im-bot-feishulark-or-slack)), then run `setup.sh` later when you want scheduled inspection, proactive push, and the inspection dashboard to actually have data. (Both paths create the same admin username, `admin`, so they don't collide.)
+**You can do both, in order**: deploy one-click to try it (tick the IM bot right there on the parameters page if you want one — see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)), then run `setup.sh` later when you want scheduled inspection, proactive push, and the inspection dashboard to actually have data. (Both paths create the same admin username, `admin`, so they don't collide.)
 
 ### 0.1 What one-click does **not** include
 
 Better said up front than discovered later. These require `setup.sh`:
 
-- **Proactive push into IM**: daily inspection reports and alerts posted into a Feishu/Slack group. The IM bot itself **can** be installed (see [§2.11](#211-add-an-im-bot-feishulark-or-slack) — you @-mention it, it answers), but that is **request/response only**; proactive push needs the report pipeline that only `setup.sh` deploys. (The same 10 signal sources **do** land in the in-browser Notifications inbox — see [§2.9](#29-notifications-inbox); only the IM leg is missing.)
-- **DingTalk** bots (Feishu/Lark and Slack are both supported).
+- **Proactive push into IM**: daily inspection reports and alerts posted into a Feishu/Slack/DingTalk group. The IM bot itself **can** be installed (see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk) — you @-mention it, it answers), but that is **request/response only**; proactive push needs the report pipeline that only `setup.sh` deploys. (The same 10 signal sources **do** land in the in-browser Notifications inbox — see [§2.9](#29-notifications-inbox); only the IM leg is missing.)
+- **More than one IM platform at a time**: one one-click stack installs exactly **one** platform (Feishu/Lark, Slack or DingTalk — pick one, see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)); running several side by side needs `setup.sh` (`-c enabledPlatforms=feishu,slack,dingtalk`).
 - **Scheduled daily inspection** (idle-resource detection, cost-anomaly scanning) and its four Lambdas (`notiops-inspection-scheduler` / `-executor` / `-reconciler` / `-push`) plus the cost-anomaly scanner `notiops-cost-analyzer`.
 - **The inspection write path** — and therefore the data behind the *inspection dashboard /
   thresholds / scan scope / target-account* pages. Those pages are part of chat-app and ship on
@@ -43,7 +43,7 @@ Better said up front than discovered later. These require `setup.sh`:
 - **CUR + Athena cost detail**: FinOps questions still work at Cost Explorer granularity, but there is no bill-line-level drill-down.
 - **Cross-account scheduled inspection and event forwarding**: one-click *can* do **cross-account read-only inspection / investigation / case creation** (`DeployMode=MultiAccount`, see [§2.6](#26-optional-multi-account-across-an-organization)), but the member-account **CloudWatch OAM Sink** and **cross-account event forwarding** (Health / DevOps Agent investigation events flowing back) are not part of this path — those need `setup.sh`.
 
-(**DevOps Agent deep investigation**, **web search** and the **Notifications inbox** are *not* in this list — the stack creates all three for you, see [§2.7](#27-deep-investigation-aws-devops-agent), [§2.8](#28-web-search-agentcore-web-search) and [§2.9](#29-notifications-inbox). The **IM bot** is not in this list either — it's an option on the parameters page, see [§2.11](#211-add-an-im-bot-feishulark-or-slack).)
+(**DevOps Agent deep investigation**, **web search** and the **Notifications inbox** are *not* in this list — the stack creates all three for you, see [§2.7](#27-deep-investigation-aws-devops-agent), [§2.8](#28-web-search-agentcore-web-search) and [§2.9](#29-notifications-inbox). The **IM bot** is not in this list either — it's an option on the parameters page, see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk).)
 
 ---
 
@@ -85,7 +85,7 @@ notiops-webchat.template.json
 
 The same release also has six artifacts (`bff.zip` / `chat-dist.zip` / `web-notif.zip` / `im-code.zip` / `im-layer.zip` / `agent-code.zip`) — **you don't need to download those**; the template makes your account fetch them. Their SHA256 digests are baked into the template and verified on arrival; a mismatch fails the stack.
 
-> The two `im-*.zip` files are downloaded only if you pick an install option that includes IM ([§2.11](#211-add-an-im-bot-feishulark-or-slack)). The default (web only) skips them, so you don't pay transfer or storage for those ~28 MB.
+> The two `im-*.zip` files are downloaded only if you pick an install option that includes IM ([§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)). The default (web only) skips them, so you don't pay transfer or storage for those ~28 MB.
 
 > **Why isn't there a one-click "Launch Stack" link?** CloudFormation's `TemplateURL` only accepts
 > objects in S3, not GitHub URLs. So this costs you two extra clicks (download + upload) and buys
@@ -113,10 +113,10 @@ Everything else has a safe default. For a first deployment, **leave them all alo
 
 | Parameter | Default | When you'd change it |
 |---|---|---|
-| **What to install** | `web` | A three-way dropdown: `web` (just the in-browser chat UI) / `web+feishu` (plus a Feishu/Lark bot) / `web+slack` (plus a Slack bot). **All three install web** — IM is an add-on, not a replacement. Picking an IM option leaves a few steps to do on the IM platform side, see [§2.11](#211-add-an-im-bot-feishulark-or-slack). **You can change it after deploying** (update the stack with a different value — see §2.11). |
+| **What to install** | `web` | A four-way dropdown: `web` (just the in-browser chat UI) / `web+feishu` (plus a Feishu/Lark bot) / `web+slack` (plus a Slack bot) / `web+dingtalk` (plus a DingTalk bot). **All four install web** — IM is an add-on, not a replacement. Picking an IM option leaves a few steps to do on the IM platform side, see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk). **You can change it after deploying** (update the stack with a different value — see §2.11). |
 | **Give the agent account-wide read-only access?** | `Yes` | `Yes` attaches the AWS-managed `ReadOnlyAccess` policy so the agent can answer questions about any resource in the account. `No` restricts it to the explicit read-only grants (cost, logs, metrics, RDS/EC2 describe); some questions then fail with a message naming the missing action. **Neither option grants any write permission.** |
 | **CORS allowed origins** | `*` | The endpoint is already `AWS_IAM` (SigV4) authenticated, so `*` is not a privilege hole. For defense in depth, update the stack after the first deploy and set this to the `ChatUrl` output. |
-| **IM chat/channel allow list (optional)** | empty | Only meaningful once you installed IM ([§2.11](#211-add-an-im-bot-feishulark-or-slack)); with web only you can ignore it entirely. A comma-separated list of Feishu chat ids (`oc_...`) or Slack channel ids (`C...`), **no spaces**; empty means no restriction — the bot answers in every group it is invited to. It is one of the defense-in-depth boundaries on the IM entry point (boundary (c) in [§8](#8-security-notes-worth-knowing)): even if signature verification were bypassed, a message from a chat outside the list is dropped **before any model call**. **The normal rhythm is: deploy with it empty → create the group and take its chat id → then update the stack with that id**, which is why it sits in the `Security` group and not among the required parameters. Equivalent to `-c imAllowedChatIds=…` on the `setup.sh` path. |
+| **IM chat/channel allow list (optional)** | empty | Only meaningful once you installed IM ([§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)); with web only you can ignore it entirely. A comma-separated list of Feishu chat ids (`oc_...`), Slack channel ids (`C...`) or DingTalk `conversationId`s (@-mention the bot once, then take it out of the worker log), **no spaces**; empty means no restriction — the bot answers in every group it is invited to. All three platforms share this one parameter. It is one of the defense-in-depth boundaries on the IM entry point (boundary (c) in [§8](#8-security-notes-worth-knowing)): a message from a chat outside the list is dropped **before any model call** — Feishu/Slack are stopped in the ingress function (which holds even if signature verification were bypassed), while DingTalk's `conversationId` only becomes readable **after** signature verification, so its check lands one layer later, in the worker. **The normal rhythm is: deploy with it empty → create the group and take its chat id → then update the stack with that id**, which is why it sits in the `Security` group and not among the required parameters. Equivalent to `-c imAllowedChatIds=…` on the `setup.sh` path. |
 | **On stack delete** | `KeepData` | Decides what happens to your data when the stack is deleted. See [§6](#6-deleting-the-stack) — **there is a gotcha; read it before you delete**. |
 | **Deployment mode** | `SingleAccount` | Pick `MultiAccount` (and fill in the org id below) to let it also see **other** accounts in your organization. `MultiAccount` requires this account to be the **AWS Organizations management account** or a registered **StackSets delegated administrator** member account (auto-detected, no parameter to set) — run the commands in [§2.6.1](#261-hard-prerequisite-management-account-or-a-stacksets-delegated-administrator) first to confirm. If the account doesn't qualify, the stack fails within the first minute and tells you what to do. |
 | **AWS Organizations id (MultiAccount only)** | empty | Only needed with `MultiAccount` (starts with `o-`). **Half a choice does nothing**: `MultiAccount` with an empty org id stays single-account, and the `DeployModeStatus` output says so. Getting the id **wrong** — a valid org id that isn't this account's — is caught by the in-stack preflight (otherwise it gets baked into the member trust policy and every account onboarding afterwards fails with AccessDenied, with nothing on screen pointing at the id). |
@@ -147,8 +147,9 @@ Once the stack is **CREATE_COMPLETE**, open the **Outputs** tab:
 | **DevOpsAgentSpaceId** | Present only when deep investigation is on: the agent space the stack created. |
 | **WebSearchStatus** | Whether this Region **supports** web search at all (anything other than us-east-1 skips the whole block — see [§2.8](#28-web-search-agentcore-web-search)). |
 | **WebSearchProvisioning** | Present only where the Region supports it: whether the gateway **actually got built**. `enabled` = the toggle works; `unavailable (<code>)` = it failed, so the toggle returns nothing (the stack itself still succeeds — see [§2.8](#28-web-search-agentcore-web-search)). |
-| **FeishuWebhookUrl** | Present only with `web+feishu`: the request URL to paste into the Feishu open platform ([§2.11](#211-add-an-im-bot-feishulark-or-slack)). |
-| **SlackWebhookUrl** | Present only with `web+slack`: the request URL to paste into all three places in your Slack app ([§2.11](#211-add-an-im-bot-feishulark-or-slack)). |
+| **FeishuWebhookUrl** | Present only with `web+feishu`: the request URL to paste into the Feishu open platform ([§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)). |
+| **SlackWebhookUrl** | Present only with `web+slack`: the request URL to paste into all three places in your Slack app ([§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)). |
+| **DingtalkWebhookUrl** | Present only with `web+dingtalk`: the message-receive address to paste into the DingTalk open platform, under **Bot → message receive mode → HTTP mode** ([§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)). |
 | **ImNextSteps** | Present only when IM is installed: one line telling you which steps are still on you (credentials + request URL). **The bot stays silent until both are done.** |
 
 The link in that email **is** `ChatUrl` (the same address as in the table above — no need to cross-check them). Sign in with:
@@ -335,7 +336,7 @@ The Notifications topic also has an **AWS Health Dashboard live view** that the 
 - **Deleted with the stack**, session messages with it.
 - Billed by usage (events written / read), orders of magnitude smaller than the Bedrock tokens of the questions themselves — and smaller still now that extraction is gone.
 
-### 2.11 Add an IM bot (Feishu/Lark or Slack)
+### 2.11 Add an IM bot (Feishu/Lark, Slack or DingTalk)
 
 That **What to install** dropdown in the first parameter group:
 
@@ -344,35 +345,45 @@ That **What to install** dropdown in the first parameter group:
 | `web` (default) | Just the chat UI in the browser. |
 | `web+feishu` | Web Chat **plus** a Feishu/Lark bot: @-mention it in a group, or DM it. |
 | `web+slack` | Web Chat **plus** a Slack bot: the `/notiops` slash command, @-mentions, DMs. |
+| `web+dingtalk` | Web Chat **plus** a DingTalk bot: @-mention it in a group (nothing to register for slash commands — DingTalk has no command registry the way Slack does). |
 
-**All three options install web** — IM is an add-on, not a replacement. One stack installs **one** IM platform; if you want both, use `setup.sh` from [DEPLOYMENT.en.md](DEPLOYMENT.en.md) (`-c enabledPlatforms=feishu,slack`).
+**All four options install web** — IM is an add-on, not a replacement. One stack installs **one** IM platform; if you want several at once, use `setup.sh` from [DEPLOYMENT.en.md](DEPLOYMENT.en.md) (`-c enabledPlatforms=feishu,slack,dingtalk`).
 
 **IM and the web UI are the same backend**: the same read-only AWS DevOps Agent, the same Skills, the same config table. So whatever you ask in the browser (cost, investigations, Support cases) gives the same answer in a group chat.
+
+**Where DingTalk differs from the other two, stated plainly**: the capabilities (read-only inspection, deep investigation, case creation, Skills) and the command entry points (`/devops`, `/investigate`, `/case`, `/model`, …) are identical on all three platforms, but DingTalk offers fewer platform primitives, so the same thing looks different there. This is DingTalk's limitation, not a cut-down version of this deployment path:
+
+- **Actions that need confirming are completed by replying, not by clicking a button**: DingTalk card buttons can only open a link — there is no "click posts back to the server" channel — so a confirmation-bearing action like case creation is **a reply with a keyword** (and `/case` cannot pop a form either; it hands you a copyable plain-text template instead).
+- **Progress is appended, not updated in place**: DingTalk has no API to edit an already-sent message, so there is no self-updating progress card like on Feishu/Slack; long tasks post **at most two** appended progress messages.
+- **The bot won't react to your message**: the instant acknowledgement when it picks up a command is a **text receipt**, not a 👀 reaction.
+- **There is only one place to paste the message-receive address** (Feishu has two, Slack three), but DingTalk **validates nothing when you save it**: one wrong character in the address and credentials-not-written-yet look exactly the same — the bot just says nothing. So on DingTalk the way in to troubleshooting is the logs, see [§4.5](#45-im-is-installed-but-the-bot-stays-silent-in-the-group).
 
 **It doesn't burn tokens**: every incoming message first goes through deterministic routing (regex + keywords, in both English and Chinese); anything that matches "look at resources / start an investigation / check progress / switch model / switch language" calls the API directly and costs **zero tokens**. Only the **case flow** (turning your description into case text) actually calls the model.
 
 **A deep investigation started from a group chat delivers its report back to that group**: when the investigation finishes (usually a few minutes), a callback function in the stack writes the HTML report under the `investigations/` prefix of the data bucket and posts a card to the group carrying a **time-limited public download link** — whoever reads the report does not need access to this AWS account. The link is served by this stack's own CloudFront distribution, the one whose function only allows report paths.
 
-> ⚠️ This path is **asynchronous** (EventBridge → Lambda), so when it breaks it does so **without any error**: the progress card still reaches 100% (a different function draws that by polling task state) and then the report simply never arrives. If that happens, check in this order: does `aws lambda get-function --function-name <stack-name>-devops-callback` exist → does its log group (a CFN-generated random name; resolve it by the logical-ID prefix `DevOpsCallbackLogs`, same command shape as the table in [§4](#4-troubleshooting)) contain `account_not_configured` → does `aws s3 ls s3://<data-bucket>/investigations/` hold an object for this investigation. If all three are fine and it still doesn't arrive, look at that function's dead-letter queue.
+> ⚠️ This path is **asynchronous** (EventBridge → Lambda), so when it breaks it does so **without any error**: the progress card still reaches 100% (a different function draws that by polling task state) and then the report simply never arrives. On DingTalk there is no such card (progress is appended messages), so the symptom reads "the last progress message arrived, the report card never did" — the checks are the same. If that happens, check in this order: does `aws lambda get-function --function-name <stack-name>-devops-callback` exist → does its log group (a CFN-generated random name; resolve it by the logical-ID prefix `DevOpsCallbackLogs`, same command shape as the table in [§4](#4-troubleshooting)) contain `account_not_configured` → does `aws s3 ls s3://<data-bucket>/investigations/` hold an object for this investigation. If all three are fine and it still doesn't arrive, look at that function's dead-letter queue.
 
 **Two steps are left to you after deploying**, and the bot stays silent until both are done (the `ImNextSteps` output reminds you too):
 
 1. **Put credentials in Secrets Manager** — the bot needs keys to verify signatures and to reply.
    - **Feishu/Lark**: `notiops/im-bot-feishu`, four keys: `app_id` / `app_secret` / `encrypt_key` / `verification_token`.
      **Easiest path is the web UI**: sign in and go to **Admin → IM Integration** — all four credentials sit on one form and Save writes them into this secret, so you need no CLI and no extra credentials. That page also carries the four-step summary of the Feishu-side work and a "View the detailed setup steps" side panel.
-   - **Slack**: two secrets, `notiops/slack-bot-token` (starts with `xoxb-`) and `notiops/slack-signing-secret`, each holding a plain string. ⚠️ These two can currently **only** be created in the Secrets Manager console (the admin page covers Feishu only for now).
-2. **Paste the request URL back into the IM platform** — that's the `FeishuWebhookUrl` / `SlackWebhookUrl` output.
+   - **Slack**: two secrets, `notiops/slack-bot-token` (starts with `xoxb-`) and `notiops/slack-signing-secret`, each holding a plain string. ⚠️ These two can currently **only** be created in the Secrets Manager console (the admin page covers Feishu and DingTalk).
+   - **DingTalk**: `notiops/im-bot-dingtalk`, two keys: `app_key` / `app_secret` (the AppKey / AppSecret from "Credentials and basic info" on the DingTalk open platform). **The web UI works here too**: **Admin → IM Integration → the DingTalk tab**, two fields and Save; the backend creates the secret for you if it doesn't exist, and that page has the same "View the detailed setup steps" drawer in its top-right corner. ⚠️ DingTalk has **only this one** secret: the AppSecret both fetches access tokens and verifies the `sign` on inbound requests, so there is no equivalent of Feishu's `encrypt_key` / `verification_token` — the two missing fields on the form are **deliberate**.
+2. **Paste the request URL back into the IM platform** — that's the `FeishuWebhookUrl` / `SlackWebhookUrl` / `DingtalkWebhookUrl` output.
 
 > ⚠️ **Don't reverse the order**: credentials first, request URL second. Feishu and Slack fire a verification request the **moment** you save the request URL; with no credentials yet the ingress function fails outright, and what you see on the IM platform is "verification failed" — which looks like a wrong URL.
+> DingTalk needs the order kept even more: it does **not** validate at all when you save the address — nothing turns green, nothing errors — and the only symptom of missing credentials is a bot that says nothing (also remember to go back to "Version management and release" and **publish a version again** after changing the message-receive mode).
 
 **Where to click and what to type is in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md)** (Feishu §1, Slack §2, DingTalk §3; that doc covers both deployment paths — the secret names and the use of the request URL are identical).
 
 **Changing your mind later**: update the stack with a different **What to install** value.
 
-- `web` → `web+feishu`: creates the IM resources (~30 s), then do the two steps above.
-- `web+feishu` → `web`: removes them. ⚠️ **Both IM DynamoDB tables (conversations and usage) go with them** — that's the group-conversation context and investigation job state, and it's gone for good.
-- `web+feishu` → `web+slack`: removes the Feishu set, creates the Slack set. The Feishu HTTP API's address is **not** preserved — switching back gives you a new address, so you have to re-enter it in the Feishu console.
-- **Credentials don't follow the stack**: those secrets are outside the stack, so they survive option changes and a `KeepData` delete. Only a delete with `TeardownMode=DeleteEverything` removes them too (see [§6](#6-deleting-the-stack)).
+- `web` → any option with IM: creates the IM resources (~30 s), then do the two steps above.
+- Any option with IM → `web`: removes them. ⚠️ **Both IM DynamoDB tables (conversations and usage) go with them** — that's the group-conversation context and investigation job state, and it's gone for good.
+- Switching platform (`web+feishu` → `web+slack` / `web+dingtalk`, or back): removes the old platform's set, creates the new one's. The old HTTP API's address is **not** preserved — switching back gives you a new address, so you have to re-enter it in that platform's console.
+- **Credentials don't follow the stack**: those secrets (1 for Feishu, 2 for Slack, 1 for DingTalk) are outside the stack, so they survive option changes and a `KeepData` delete. Only a delete with `TeardownMode=DeleteEverything` removes them too (see [§6](#6-deleting-the-stack)).
 
 ---
 
@@ -400,7 +411,7 @@ This connects **someone else's CUR table** — a customer's, or several payers' 
 
 ## 3. What the stack creates
 
-**69 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 5 fewer with deep investigation off; 8 more if you pick multi-account; **16 more if you pick an install option with IM**):
+**69 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 5 fewer with deep investigation off; 8 more if you pick multi-account; **20 more if you pick an install option with IM**):
 
 | Category | Resources |
 |---|---|
@@ -415,7 +426,7 @@ This connects **someone else's CUR table** — a customer's, or several payers' 
 | Deep investigation (on by default) | 1 DevOps Agent agent space (**with its operator app enabled automatically**) + 1 read-only association + 1 role assumed by DevOps Agent (plus its policy) + 1 operator app role = 5 |
 | Web search (us-east-1 only) | 1 custom resource (creates the AgentCore gateway) + 1 gateway service role + 1 inline policy |
 | Multi-account (optional) | 2 custom resources (① the eligibility preflight ② creates the two member StackSets) + the preflight's own Lambda / role / policy / log group + 2 inline policies = 8 |
-| IM bot (optional, see [§2.11](#211-add-an-im-bot-feishulark-or-slack)) | 3 Lambdas (ingress / worker / progress refresh) + 3 log groups + 1 **API Gateway HTTP API** (a public entry point, see below; 4 resources counting its route / integration / stage) + 3 invoke permissions (HTTP API -> ingress, keep-alive rule -> ingress, progress rule -> progress) + 1 dependency layer + 2 DynamoDB tables (group conversations, usage) + 2 EventBridge rules (refreshes investigation progress every minute, pings the ingress every 4 minutes) + 1 role (plus its policy) = 20 |
+| IM bot (optional, see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)) | 3 Lambdas (ingress / worker / progress refresh) + 3 log groups + 1 **API Gateway HTTP API** (a public entry point, see below; 4 resources counting its route / integration / stage) + 3 invoke permissions (HTTP API -> ingress, keep-alive rule -> ingress, progress rule -> progress) + 1 dependency layer + 2 DynamoDB tables (group conversations, usage) + 2 EventBridge rules (refreshes investigation progress every minute, pings the ingress every 4 minutes) + 1 role (plus its policy) = 20. All three platforms have the **same shape**; only the ingress/worker pair is swapped for that platform's pair (with `web+dingtalk` the progress-refresh function is still created, but DingTalk progress is appended messages with no card to refresh, so its every-minute scan finds nothing to do) |
 
 **Cost, idle**: CloudFront, S3 and DynamoDB are pay-per-use, Lambda costs nothing when not invoked, and an idle AgentCore Runtime costs nothing — idle, this is cents of storage. The real cost is **Bedrock tokens when you ask questions**. Each installed release keeps ~**165 MB** in the staging bucket (~28 MB more with IM installed; ≈ $0.004/month in S3 Standard); upgrades don't purge old versions, see [§5](#5-upgrading). The IM set is likewise **free when idle** (three Lambdas that cost nothing uninvoked, two on-demand tables, and that per-minute progress rule only does real work while an investigation is running).
 
@@ -470,7 +481,7 @@ aws s3 rm "s3://notiops-data-$ACCT-$REGION" --recursive   # empty it first
 aws s3 rb "s3://notiops-data-$ACCT-$REGION"
 ```
 
-(The table-name prefix follows the stack name: if your stack isn't called `notiops`, replace the `notiops-` above with your stack name.)
+(**Leave those names exactly as written — they do not follow the stack name**: the two tables are always called `notiops-config` / `notiops-web-chat` (hardcoded constants, whatever you named the stack — see §2.3), and the data bucket is named after your **account id + region** (`notiops-data-<account-id>-<region>`) — neither contains the stack name. Renaming them after your stack goes wrong in three linked steps: `delete-table` returns `ResourceNotFoundException` (no table by that name exists) → you conclude the tables are already gone → your next create fails **as a whole stack** in the `NAME_CONFLICT_VALIDATION` preflight, because the two tables that really were retained are still sitting there (see the second warning in §6.1). What *does* follow the stack name is Lambda function names and log groups, which is §4.5's business.)
 
 ⚠️ This is **deliberately not auto-detected**: on a genuinely fresh install "the table doesn't exist yet" is the normal case, so treating "already exists" as an error would block every first-time deploy.
 
@@ -489,15 +500,15 @@ A new CloudFront distribution takes a few minutes to propagate. Wait 2–3 minut
 
 ### 4.5 IM is installed, but the bot stays silent in the group
 
-This is a **silent failure**, and it's almost always one of the two steps in [§2.11](#211-add-an-im-bot-feishulark-or-slack) left undone:
+This is a **silent failure**, and it's almost always one of the two steps in [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk) left undone:
 
 | Check this first | How to tell |
 |---|---|
-| Are the credentials complete | Does the secret exist in Secrets Manager, and does it have every key (Feishu needs all four)? The ingress function fails **on purpose** at cold start when a key is missing — better not to start at all than to expose a public entry point anyone can forge requests to. |
-| Did you fill in the request URL | Feishu needs it in **two** places (event config + callback config), Slack in **three** (Events / Interactivity / Slash Commands) — the same URL each time. |
-| The logs | ⚠️ Under one-click deployment the **log group names are CloudFormation-generated** (`<stack-name>-FeishuIngressLogs<hash>-<random>`); they do **not** start with `/aws/lambda/` and cannot be derived from the stack name (rationale and resolver in [IM_WEBHOOK_SETUP.en.md §1.5](IM_WEBHOOK_SETUP.en.md#15-verify)). To look one up: `aws cloudformation describe-stack-resources --stack-name <stack-name> --region <region> --query "StackResources[?starts_with(LogicalResourceId,'FeishuIngressLogs')].PhysicalResourceId" --output text` (use `FeishuWorkerLogs`, `SlackIngressLogs` / `SlackWorkerLogs`, or `ImProgressLogs` for the others). The **function** names, in contrast, are derivable: `<stack-name>-im-ingress-feishu` / `<stack-name>-im-worker-feishu` / `<stack-name>-im-progress`. The ingress function shows signature-verification failures — or no logs at all, which means the IM platform never called it, i.e. the URL isn't set correctly. |
+| Are the credentials complete | Does the secret exist in Secrets Manager, and does it have every key (Feishu needs all four; DingTalk needs both `app_key` and `app_secret`)? The ingress function fails **on purpose** at cold start when a key is missing — better not to start at all than to expose a public entry point anyone can forge requests to. |
+| Did you fill in the request URL | Feishu needs it in **two** places (event config + callback config), Slack in **three** (Events / Interactivity / Slash Commands) — the same URL each time. DingTalk needs it in exactly **one** (Bot → message receive mode → HTTP mode → message-receive address), but you must **publish a version again** afterwards, and DingTalk validates nothing on save, so a wrong address gives you no hint at all. |
+| The logs | ⚠️ Under one-click deployment the **log group names are CloudFormation-generated** (`<stack-name>-FeishuIngressLogs<hash>-<random>`); they do **not** start with `/aws/lambda/` and cannot be derived from the stack name (rationale and resolver in [IM_WEBHOOK_SETUP.en.md §1.5](IM_WEBHOOK_SETUP.en.md#15-verify)). To look one up: `aws cloudformation describe-stack-resources --stack-name <stack-name> --region <region> --query "StackResources[?starts_with(LogicalResourceId,'FeishuIngressLogs')].PhysicalResourceId" --output text` (use `FeishuWorkerLogs`, `SlackIngressLogs` / `SlackWorkerLogs`, `DingtalkIngressLogs` / `DingtalkWorkerLogs`, or `ImProgressLogs` for the others). The **function** names, in contrast, are derivable: `<stack-name>-im-ingress-feishu` / `<stack-name>-im-worker-feishu` (DingTalk is `-im-ingress-dingtalk` / `-im-worker-dingtalk`) / `<stack-name>-im-progress`. The ingress function shows signature-verification failures — or no logs at all, which means the IM platform never called it, i.e. the URL isn't set correctly. |
 
-The step-by-step checks and what each error means are in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md).
+The step-by-step checks and what each error means are in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) (Feishu §1.5, Slack §2.5, DingTalk §3.5).
 
 ### 4.6 Using the CLI instead of the console
 
@@ -514,7 +525,7 @@ aws cloudformation create-stack --stack-name notiops \
 # Multi-account: add both of these (either one alone does nothing, see §2.6)
 #   ParameterKey=DeployMode,ParameterValue=MultiAccount \
 #   ParameterKey=OrganizationId,ParameterValue=o-xxxxxxxxxx
-# Add an IM bot (see §2.11): web / web+feishu / web+slack
+# Add an IM bot (see §2.11): web / web+feishu / web+slack / web+dingtalk
 #   ParameterKey=InstallOption,ParameterValue=web+feishu
 ```
 
@@ -554,8 +565,8 @@ The `TeardownMode` parameter decides the fate of three things:
 | `notiops-config` table (settings) | **kept** | deleted |
 | `notiops-web-chat` table (chat history, notifications) | **kept** | deleted |
 | Data bucket `notiops-data-…` (exported reports etc.) | **kept** | deleted |
-| Everything else (frontend, CloudFront, Lambda, agent, **Cognito user pool**, and with IM installed those 16 resources including both IM tables) | deleted | deleted |
-| IM credentials (the `notiops/im-bot-feishu` etc. Secrets Manager secrets — outside the stack) | **kept** | deleted (unrecoverable) |
+| Everything else (frontend, CloudFront, Lambda, agent, **Cognito user pool**, and with IM installed those 20 resources including both IM tables) | deleted | deleted |
+| IM credentials (the `notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` / the two Slack Secrets Manager secrets — outside the stack) | **kept** | deleted (unrecoverable) |
 
 > ⚠️ **The Cognito user pool is deleted in both modes** — users and passwords are gone.
 > `KeepData` preserves **data**, not accounts.
@@ -597,10 +608,10 @@ During deletion the stack's deployment Lambda first **empties** the website and 
 
 | Left behind | Why | Recommendation |
 |---|---|---|
-| Log group `/aws/vendedlogs/RUMService_<stack>-web-chat<hash>` | Created by CloudWatch RUM itself; not owned by the stack | **Fine to ignore**: measured at 0 bytes, expires after 30 days. To clean up, delete it in CloudWatch by its **full name** (don't bulk-delete by prefix) |
+| Log group `/aws/vendedlogs/RUMService_notiops-web-chat<hash>` | Created by CloudWatch RUM itself; not owned by the stack. The `notiops-web-chat` part of that name is the **RUM app monitor's fixed name — it does not follow the stack name**, so it reads the same even when your stack is called something else | **Fine to ignore**: measured at 0 bytes, expires after 30 days. To clean up, delete it in CloudWatch by its **full name** (don't bulk-delete by prefix) |
 | The two tables + data bucket under `KeepData` | That is what `KeepData` **means** | Delete manually when you're done with them (empty the bucket first). **You must delete them before you can redeploy into this account** — see the second warning in §6.1 |
 | CloudFront access logs, if you enabled them yourself | Not managed by this stack | As you like |
-| **If you ever installed IM**: the `notiops/im-bot-feishu` / `notiops/slack-bot-token` / `notiops/slack-signing-secret` Secrets Manager secrets | They are not stack resources (the Feishu one is created on demand by the admin console, the two Slack ones by you), so `KeepData` leaves them alone | `DeleteEverything` **deletes them too** (unrecoverable). Under `KeepData`, delete them yourself if you want them gone; leave them and a reinstall reuses the same-named secrets |
+| **If you ever installed IM**: the `notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` / `notiops/slack-bot-token` / `notiops/slack-signing-secret` Secrets Manager secrets | They are not stack resources (the Feishu and DingTalk ones are created on demand by the admin console, the two Slack ones by you), so `KeepData` leaves them alone | `DeleteEverything` **deletes them too** (unrecoverable). Under `KeepData`, delete them yourself if you want them gone; leave them and a reinstall reuses the same-named secrets |
 | **In multi-account mode**: the `notiops-member-onboarding` / `notiops-member-devops-agent` StackSets, and Organizations trusted access for StackSets | **Deliberate.** (1) A StackSet can only be deleted once every stack instance is gone, and removing those wipes the cross-account roles in your member accounts — a cross-account destructive action shouldn't be triggered implicitly by deleting one stack. (2) Trusted access is an **organization-wide** switch; turning it off with our stack would break other people's StackSet deployments. | If you really want them gone: CloudFormation → StackSets → **Delete stacks from StackSet** (removes the instances), then delete the StackSet itself. Leave trusted access alone unless you're sure nobody else relies on it. |
 
 **No other orphans**: the agent's log group, the BFF's log group, the notification handler's log group, the deployment Lambda's log group, IAM roles, the Cognito user pool, the RUM app monitor, the AgentCore Runtime, the website bucket and the staging bucket were all verified to go away with the stack. The agent space and association created for deep investigation also go away with it (they are ordinary stack resources). Same for the session-memory AgentCore Memory ([§2.10](#210-session-memory-agentcore-memory)) — an ordinary stack resource with **no** retention policy, deleted with the stack, taking the stored session messages with it (this one is what the template declares; unlike the list above, it has not yet been verified by an actual stack deletion). The web-search AgentCore gateway splits two ways: one **this stack created** is deleted with the stack; one it **reused** (a pre-existing `notiops-websearch-gw` in the account, e.g. from `setup.sh`) is left alone — deleting one stack shouldn't take down something another deployment path still uses.
@@ -646,13 +657,13 @@ Integrity still holds: every artifact's SHA256 in the template was computed over
 3. **Code enters your account from the public internet.** That is what this path is. Two controls: (a) artifacts come only from a fixed tag of the `aws-samples/sample-notiops` release; (b) each artifact's SHA256 is baked into the template and verified on arrival — a mismatch deletes the uploaded object and fails the stack. If that premise doesn't work for you, use the private mirror in [§7](#7-no-internet-egress-use-a-private-s3-mirror), or use `setup.sh`.
 4. **We never touch the admin password**: Cognito generates it and emails it to you. The deployment never passes, reads, prints or outputs it.
 5. **Everything is done by your own credentials**: no account of ours, no bucket of ours, no role of ours is anywhere in this path.
-6. **Installing IM adds one public entry point** ([§2.11](#211-add-an-im-bot-feishulark-or-slack)) — that **API Gateway HTTP API** has to be **unauthenticated**, because Feishu and Slack won't sign SigV4 for you (before 2026-09-01 this was a Lambda Function URL; why it changed, and the two alternatives that were ruled out, are in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §5.1). Five boundaries: (a) **signature verification** (Feishu with the Encrypt Key + Verification Token, Slack with the signing secret; a missing key fails the cold start, so "misconfigured but still reachable" doesn't exist); (b) **two throttling layers** — the HTTP API stage caps at 50 req/s with a burst of 100 (anything above that gets a 429 straight from API Gateway and **never reaches Lambda**), and the ingress function additionally carries a **concurrency cap of 10**: together, the spend ceiling on a public unauthenticated entry point; (c) an optional **chat allowlist** (only messages from named groups take effect — see [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §4); (d) **idempotent de-duplication** (a redelivered event is processed once); (e) behind it is still the **same read-only agent** with no write permission at all — even a forged message gets, at worst, read-only information back. Credentials always live in Secrets Manager: never in environment variables, never printed to logs. The risks that remain are listed plainly in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §5.3.
+6. **Installing IM adds one public entry point** ([§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)) — that **API Gateway HTTP API** has to be **unauthenticated**, because Feishu, Slack and DingTalk won't sign SigV4 for you (before 2026-09-01 this was a Lambda Function URL; why it changed, and the two alternatives that were ruled out, are in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §5.1). Five boundaries: (a) **signature verification** (Feishu with the Encrypt Key + Verification Token, Slack with the signing secret, DingTalk with the AppSecret checking the `sign` header inside a one-hour time window; a missing key fails the cold start, so "misconfigured but still reachable" doesn't exist); (b) **two throttling layers** — the HTTP API stage caps at 50 req/s with a burst of 100 (anything above that gets a 429 straight from API Gateway and **never reaches Lambda**), and the ingress function additionally carries a **concurrency cap of 10**: together, the spend ceiling on a public unauthenticated entry point; (c) an optional **chat allowlist** (only messages from named groups take effect — see [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §4; on DingTalk this check lands in the worker, after signature verification, because `conversationId` is only readable once the signature has been verified); (d) **idempotent de-duplication** (a redelivered event is processed once); (e) behind it is still the **same read-only agent** with no write permission at all — even a forged message gets, at worst, read-only information back. Credentials always live in Secrets Manager: never in environment variables, never printed to logs. The risks that remain are listed plainly in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §5.3.
 
 ---
 
 ## 9. Next
 
 - [USER_GUIDE.en.md](USER_GUIDE.en.md) — using the UI and its topics (cost, investigation, Support cases, Skills…)
-- [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) — what to click on the Feishu/Slack side once you installed an IM bot ([§2.11](#211-add-an-im-bot-feishulark-or-slack))
+- [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) — what to click on the Feishu/Slack/DingTalk side once you installed an IM bot ([§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk))
 - [DEPLOYMENT.en.md](DEPLOYMENT.en.md) — the full deployment, when you want scheduled inspection, proactive push into IM, and the inspection dashboard to have data
 - [TECHNICAL_DESIGN.en.md](TECHNICAL_DESIGN.en.md) — architecture and design trade-offs

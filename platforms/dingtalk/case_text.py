@@ -815,29 +815,42 @@ def _service_spec(locale: str) -> dict:
 
 
 def _form_body(locale: str, cap: dict) -> str:
-    """模版那六行。
+    """模版那六行，上下各夹一条「从这里复制」的界线。
 
     一项一行、**不手工折行** —— 钉钉会吃掉单个 `\\n`（`im_markdown.to_dingtalk`
     在相邻非空行之间插空行），手工折的行回来时是断开的两行，解析器只会把后半截
     当正文。所以哪怕「涉及服务」那一行有 20 个选项，也必须待在同一行里。
+
+    ⚠️ 也正因为那条"相邻行之间插空行"的规则，**六行没法排得更紧** —— 钉钉里它们
+    与前后的说明文字行距完全一样，于是"要复制哪一段"看不出来（现网原话：「现在混在
+    一起」）。能用的只有两样：**上下两条界线**（`im.dt.case.form.copy_*`）和**把标签
+    加粗**。加粗的 `**` 在这里包，**不进 i18n** —— `_form_label()` 必须回没有星号的
+    原文，那是与 `nl_router._CASE_FORM_LABELS` 的唯一耦合点。用户把星号一起复制回来
+    也认得：`nl_router._case_form_probe` 判标签前会把 `**` 剪掉。
+
+    ⚠️ **别改用引用块（`>`）来框这一段**：`>` 会跟着一起被复制走，而它是
+    `_CASE_FORM_NOISE` 里的字符 —— 解析不受影响，但用户手工再编辑时那些尖括号
+    很碍事，且钉钉的引用块底色会把六行的可读性压低。
     """
     sev = _severity_spec(locale, cap)
     lang = _language_spec(locale)
     itype = _issue_type_spec(locale)
     svc = _service_spec(locale)
     return "\n".join([
-        f"{_form_label('description', locale)}:",
-        f"{_form_label('severity', locale)}: "
+        f"**{i18n.t('im.dt.case.form.copy_begin', locale)}**",
+        f"**{_form_label('description', locale)}**:",
+        f"**{_form_label('severity', locale)}**: "
         f"{sev['default_num']}  ({sev['hint']})",
-        f"{_form_label('language', locale)}: "
+        f"**{_form_label('language', locale)}**: "
         f"{lang['default_num']}  ({lang['hint']})",
-        f"{_form_label('issue_type', locale)}: "
+        f"**{_form_label('issue_type', locale)}**: "
         f"{itype['default_num']}  ({itype['hint']})",
-        f"{_form_label('service', locale)}: "
+        f"**{_form_label('service', locale)}**: "
         f"{_FORM_AUTO_NUM}  ({svc['hint']})",
-        f"{_form_label('subject', locale)}: "
+        f"**{_form_label('subject', locale)}**: "
         f"{i18n.t('im.dt.case.form.subject_auto', locale)}  "
         f"({i18n.t('im.dt.case.form.subject_hint', locale)})",
+        f"**{i18n.t('im.dt.case.form.copy_end', locale)}**",
     ])
 
 
@@ -876,9 +889,15 @@ def _form_boilerplate() -> tuple[str, ...]:
     `nl_router.parse_case_form(boilerplate=…)` 剔掉 —— 那边只对**认不出标签**的行
     生效，所以真正的字段行（用户一项没改时与模版逐字相同）不受影响。
     不剔的后果：AWS 工程师会在案例正文里读到「发回来后我先给你一张确认卡」。
+
+    ⚠️ 两条复制界线（`copy_begin` / `copy_end`）也在这里 —— 它们夹着字段行，**必然**
+    跟着复制回来，而 `copy_end` 出现在第一个标签**之后**（`copy_begin` 靠"第一个标签
+    之前的散行丢掉"就够了，但两条都收才不依赖用户的行序）。新增任何印在模版里的
+    装饰行都要同时加进这里，判据是 `test_our_own_boilerplate_never_reaches_the_case_body`。
     """
     keys = ("im.dt.case.form.footer", "im.dt.case.form.instruction",
-            "im.dt.case.form.need_description", "im.dt.case.form.title")
+            "im.dt.case.form.need_description", "im.dt.case.form.title",
+            "im.dt.case.form.copy_begin", "im.dt.case.form.copy_end")
     out: list[str] = []
     for key in keys:
         for loc in ("zh", "en"):

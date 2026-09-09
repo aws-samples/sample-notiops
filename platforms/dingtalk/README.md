@@ -100,7 +100,7 @@ access_token**。过期了才走机制 2/3 兜底（`sender.reply()` 自己判�
 |---|---|---|
 | 提问后 👀 表情（T+0.3s 反馈） | ❌ 无接口 | 首次反馈是 worker 的 ack（T+4~6s） |
 | 🆘 升级面板（按钮） | ❌ | 文案里给 `开案例` 命令 |
-| 开案例表单弹窗 + 账号下拉 | ❌ | `开案例 <描述>` 一句话开（**不是** `/案例 <描述>` —— bare `案例` 是列表/详情，见 `nl_router._CASE_CMD_PATTERNS`）；账号先用 `/account <12位账号>` 切；只说「开案例」不给描述 → 回一张**可复制的纯文本模版**（`im.dt.case.form.*`，六项都印全部选项与默认值），用户改完整段发回来由 [`case_text.py`](case_text.py) 的 `maybe_handle_form` 接住（解析走 `nl_router.parse_case_form`）—— **不拿意图当主题开单** |
+| 开案例表单弹窗 + 账号下拉 | ❌ | `开案例 <描述>` 一句话开（**不是** `/案例 <描述>` —— bare `案例` 是列表/详情，见 `nl_router._CASE_CMD_PATTERNS`）；账号先用 `/account <12位账号>` 切；只说「开案例」不给描述 → 回一张**可复制的纯文本模版**（`im.dt.case.form.*`，六项都印全部选项与默认值；六行上下各夹一条 `━━━ ↓ 从这里开始复制 ↓ ━━━` 界线、标签加粗 —— 钉钉在相邻行之间强制插空行，六行排不紧，不框出来客户看不出要复制哪一段），用户改完整段发回来由 [`case_text.py`](case_text.py) 的 `maybe_handle_form` 接住（解析走 `nl_router.parse_case_form`，界线与落款靠 `_form_boilerplate()` 剔掉）—— **不拿意图当主题开单** |
 | 进度卡**原地刷新**（`LiveCard`） | ❌ | [`append_progress.py`](append_progress.py)：**追加式**进度，t≈120s / t≈360s 最多 2 条 |
 | `investigate_status` 接上进度轮询 | ❌ | 一律静态快照 + 一句"不会自动刷新" |
 | 引用消息（`quoted_*`） | ❌ HTTP 回调不带 | 恒空，`router.QUOTE_AWARE_KINDS` 在钉钉上是 no-op |

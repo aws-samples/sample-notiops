@@ -5,18 +5,26 @@
  */
 import { useEffect, useState } from "react";
 import { useLocale } from "../i18n";
-import { getSecurityDashboard, getTaCheckResources, getGuarddutyDashboard, getSecurityOrgSummary, type SecurityDashboardData, type TaCheckResources, type GuarddutyData, type SecurityOrgRow } from "../api/security";
+import { getSecurityDashboard, getTaCheckResources, getGuarddutyDashboard, type SecurityDashboardData, type TaCheckResources, type GuarddutyData } from "../api/security";
+import FailBanner from "./FailBanner";
 
 interface Props {
+  /**
+   * 要渲染哪一个面板。**必填口径**：调用方只有 SecurityDashboardBrowser，它总是给值。
+   *
+   * 类型上仍是可选的（`?`）只为兼容旧签名；不给值等于四段 `show(...)` 全不成立，
+   * 渲染出一个空 div —— 不会崩，但也什么都看不到。
+   */
   dashboardId?: string;
-  onOpenDashboard?: (id: string) => void;
   data?: SecurityDashboardData;
   can?: (key: string) => boolean;
   /** 多账号：当前查看的账号（空 = 部署账号）；用于徽标 + 下钻请求 */
   accountId?: string;
-  accounts?: { accountId: string; accountName?: string }[];  /** 调查按钮：以预填 prompt 开一个「故障调查」会话（DevOps Agent 默认开） */
+  accounts?: { accountId: string; accountName?: string }[];
+  /** 调查按钮：以预填 prompt 开一个「故障调查」会话（DevOps Agent 默认开） */
   onInvestigate?: (prompt: string) => void;
-  onAccountChange?: (id: string) => void;
+  /** 「重试」时通知上层丢掉它手里的安全数据、重新拉一次（data prop 托管时必需）。 */
+  onReload?: () => void;
 }
 
 const SEVC: Record<string, string> = { CRITICAL: "#d13212", HIGH: "#e8590c", MEDIUM: "#f59e0b", LOW: "#64748b", INFORMATIONAL: "var(--muted)" };
@@ -35,51 +43,68 @@ const Label = ({ children }: { children: React.ReactNode }) => (
   <div style={{ color: "var(--muted)", fontSize: 11, textTransform: "uppercase", letterSpacing: ".07em", fontWeight: 600, marginBottom: 6 }}>{children}</div>
 );
 
-export default function SecurityDashboard({ dashboardId, onOpenDashboard, data: dataProp, can = () => true, accountId = "", accounts = [], onInvestigate, onAccountChange }: Props) {
+export default function SecurityDashboard({ dashboardId, data: dataProp, can = () => true, accountId = "", accounts = [], onInvestigate, onReload }: Props) {
   const { locale } = useLocale();
   const zh = locale !== "en";
   const [fetched, setFetched] = useState<SecurityDashboardData | null>(null);
   const [loadingState, setLoadingState] = useState(true);
+  // 「重试」计数：+1 = 各卡重新拉一次（安全数据由上层托管时还要请上层重取，见 onReload）。
+  const [reload, setReload] = useState(0);
   // TA 下钻：展开的 checkId + 各 check 的 flagged resources 缓存
   const [expanded, setExpanded] = useState<string | null>(null);
   const [taRes, setTaRes] = useState<Record<string, TaCheckResources | "loading" | "error">>({});
-  // ④ GuardDuty（独立拉取，账号感知）
+  // ④ GuardDuty（独立拉取，账号感知）——**只在真的看这一页时拉**。
+  // 以前是无条件拉：每次挂载 + 每次切账号都打一次 GetFindings，而当时
+  // `show("guardduty")` 压根选不中（目录里没这一项），所以 100% 的请求都白打。
+  // 现在按 dashboardId 惰性拉（与 InvestigationDashboard 的 eos 面板同口径）。
   const [gd, setGd] = useState<GuarddutyData | null>(null);
+  const wantGd = dashboardId === "guardduty";
   useEffect(() => {
+    if (!wantGd) return;
     let cancelled = false;
     setGd(null);
     getGuarddutyDashboard(accountId).then((d) => { if (!cancelled) setGd(d); });
     return () => { cancelled = true; };
-  }, [accountId]);
-  // 组织概览（仅 org 视角=未选账号时拉）
-  const [orgRows, setOrgRows] = useState<SecurityOrgRow[] | null>(null);
-  useEffect(() => {
-    if (accountId) { setOrgRows(null); return; }
-    let cancelled = false;
-    getSecurityOrgSummary().then((r) => { if (!cancelled) setOrgRows(r?.rows ?? []); });
-    return () => { cancelled = true; };
-  }, [accountId]);
+  }, [wantGd, accountId, reload]);
   const data = dataProp ?? fetched;
   const loading = dataProp ? false : loadingState;
 
   useEffect(() => {
     if (dataProp) return;
     let cancelled = false;
+    setLoadingState(true);
     getSecurityDashboard(accountId).then((d) => { if (!cancelled) { setFetched(d); setLoadingState(false); } });
     return () => { cancelled = true; };
-  }, [dataProp, accountId]);
+  }, [dataProp, accountId, reload]);
 
   if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: 60 }}><span className="pulsewave" style={{ display: "inline-flex", gap: 2 }}><i /><i /><i /></span></div>;
   if (!data) return null;
+
+  /** 「重试」：本地各卡重拉；数据若由上层托管（dataProp）则请上层重取。 */
+  const retry = () => {
+    setReload((n) => n + 1);
+    if (dataProp) onReload?.();
+  };
+
+  /* 整个响应都没拿到（未登录 / http_NNN / 网络断）。
+   *
+   * 这时 trustedAdvisor / securityHub / bulletins 全是 undefined，而下面每张卡的兜底
+   * 文案是「不可用」「Security Hub 未开通」「需 Business / Enterprise Support 计划」——
+   * 全是**关于客户环境的具体断言**。一次 500 会让人以为自己没开 Security Hub、
+   * 或者支持计划不够。所以这里整页只画「加载失败 + 重试」，不画任何一张卡。 */
+  if (data.ok === false) {
+    return (
+      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "14px 14px 20px", width: "100%" }}>
+        <FailBanner zh={zh} what={zh ? "安全态势数据" : "security posture data"} code={data.code} onRetry={retry} />
+      </div>
+    );
+  }
 
   const ta = data.trustedAdvisor;
   const hub = data.securityHub;
   const bul = data.bulletins;
   const show = (id: string) => dashboardId === id;
   const cardVisible = (id: string) => can(`nav:security:${id}`);
-
-  const taIssues = (ta?.summary?.error || 0) + (ta?.summary?.warning || 0);
-  const hubHigh = (hub?.severity?.CRITICAL || 0) + (hub?.severity?.HIGH || 0);
 
   // 账号上下文徽标：明确当前数据属于哪个账号（多账号防混淆）
   const acctLabel = accountId
@@ -116,49 +141,12 @@ export default function SecurityDashboard({ dashboardId, onOpenDashboard, data: 
   const invBtnStyle: React.CSSProperties = { flexShrink: 0, fontSize: 11, fontWeight: 700, padding: "2px 10px", borderRadius: 100, border: "1px solid var(--orange)", background: "rgba(255,153,0,.10)", color: "var(--text)", cursor: "pointer" };
 
   return (
-    <div style={{ maxWidth: dashboardId ? 1200 : 900, margin: "0 auto", padding: dashboardId ? "4px 14px 20px" : "8px 24px 40px", width: "100%" }}>
-      {!dashboardId && (<>
-      {!accountId && orgRows && orgRows.some((r) => r.accountId) && (
-        <div style={{ background: "var(--card)", border: "1px solid var(--line)", borderRadius: 12, padding: "12px 14px", marginTop: 6, marginBottom: 4 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--muted)", textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 8 }}>{zh ? "组织概览 · 按账号安全态势（点击下钻）" : "Org overview · security posture by account (click to drill down)"}</div>
-          {orgRows.map((r) => (
-            <div key={r.accountId || "self"} onClick={() => r.accountId && onAccountChange?.(r.accountId)} role={r.accountId ? "button" : undefined}
-              style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderTop: "1px dashed var(--line)", fontSize: 12 }}>
-              <span style={{ color: "var(--text)" }}>{(() => { const nm = accounts.find((a) => a.accountId === r.accountId)?.accountName || r.name || ""; return nm && r.accountId ? `${nm} · ${r.accountId}` : (nm || r.accountId); })()}</span>
-              <span style={{ color: "var(--muted)" }}>
-                {!r.available ? (zh ? "不可用" : "unavailable") : (<>
-                  {(r.gdHigh || 0) > 0 && <span style={{ color: "#d13212", fontWeight: 700, marginRight: 8 }}>{r.gdHigh} GuardDuty</span>}
-                  {(r.taIssues || 0) > 0 && <span style={{ color: "#e8590c", fontWeight: 700 }}>{r.taIssues} TA</span>}
-                  {(r.gdHigh || 0) === 0 && (r.taIssues || 0) === 0 && <span style={{ color: "var(--green)" }}>✓</span>}
-                </>)}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginTop: 6 }}>
-        {[
-          { id: "ta-security", label: zh ? "TA 安全建议" : "TA Security", metric: ta?.available ? String(taIssues) : "—", sub: ta?.available ? (zh ? "待处理项" : "issues") : (zh ? "未开通" : "n/a"), accent: taIssues > 0 ? "red" as const : undefined },
-          { id: "hub-score", label: zh ? "Security Hub" : "Security Hub", metric: hub?.available ? String(hubHigh) : "—", sub: hub?.available ? (zh ? "高危发现" : "high-sev") : (zh ? "未开通" : "n/a"), accent: hubHigh > 0 ? "red" as const : undefined },
-          { id: "guardduty", label: "GuardDuty", metric: gd?.available ? String((gd.severity?.CRITICAL || 0) + (gd.severity?.HIGH || 0)) : "—", sub: gd?.available ? (zh ? "高危发现" : "high-sev") : (zh ? "未开通" : "n/a"), accent: ((gd?.severity?.CRITICAL || 0) + (gd?.severity?.HIGH || 0)) > 0 ? "red" as const : undefined },
-          { id: "bulletins", label: zh ? "安全公告" : "Security Bulletins", metric: bul?.available ? String(bul.items?.length ?? 0) : "—", sub: zh ? "近 30 天" : "last 30d", accent: undefined },
-        ].filter((d) => cardVisible(d.id)).map((d) => (
-          <div key={d.id} onClick={() => onOpenDashboard?.(d.id)} role="button" tabIndex={0}
-            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onOpenDashboard?.(d.id); }}
-            style={{ background: "var(--card)", border: "1px solid var(--line)", borderLeft: d.accent ? `3px solid ${d.accent === "red" ? "#d13212" : "var(--line)"}` : undefined, borderRadius: 12, padding: "12px 14px", cursor: "pointer" }}
-            onMouseEnter={(e) => (e.currentTarget.style.borderColor = "var(--orange)")}
-            onMouseLeave={(e) => (e.currentTarget.style.borderColor = "var(--line)")}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <span style={{ fontSize: 12.5, fontWeight: 700, color: "var(--text)" }}>{d.label}</span>
-              <span style={{ color: "var(--muted)", fontSize: 16 }}>›</span>
-            </div>
-            <div style={{ fontSize: 22, fontWeight: 800, color: "var(--text)", marginTop: 6 }}>{d.metric}</div>
-            <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 2 }}>{d.sub}</div>
-          </div>
-        ))}
-      </div>
-      <div style={{ color: "var(--muted)", fontSize: 11.5, margin: "10px 2px 0" }}>{zh ? "点开卡片查看详情 →" : "Open a card for details →"}{acctBadge}</div>
-      </>)}
+    /* 单面板模式是**唯一**模式。以前这里还有一个 `!dashboardId` 的缩略卡落地页
+       （四张卡 + 组织概览），2026-09-11 删掉：唯一的调用方 SecurityDashboardBrowser
+       总是传 dashboardId，那一段从接进两栏浏览器起就再没被渲染过。
+       组织概览（getSecurityOrgSummary）只在那一段里用 → 一起删；接口本身还在，
+       将来要做「按账号安全态势」时从 api/security.ts 直接取。 */
+    <div style={{ maxWidth: 1200, margin: "0 auto", padding: "4px 14px 20px", width: "100%" }}>
 
       {show("ta-security") && cardVisible("ta-security") && (<>
       <SectionTitle>{zh ? "Trusted Advisor 安全检查" : "Trusted Advisor — Security"}{acctBadge}</SectionTitle>
@@ -245,10 +233,17 @@ export default function SecurityDashboard({ dashboardId, onOpenDashboard, data: 
       </>)}
       </>)}
 
-      {show("guardduty") && (<>
+      {/* 🔴 `cardVisible` 以前漏在这里：另外三段都有，GuardDuty 没有。当时不出问题只因为
+             这一段永远选不中；一接进目录就等于把一个管理员已关掉的面板照样渲染出来。 */}
+      {show("guardduty") && cardVisible("guardduty") && (<>
       <SectionTitle>{zh ? "GuardDuty 活跃发现" : "GuardDuty — Active Findings"}{acctBadge}</SectionTitle>
-      {!gd?.available ? (
-        <div style={{ color: "var(--muted)", fontSize: 13 }}>{gd?.reason === "not_enabled" ? (zh ? "GuardDuty 未开通。" : "GuardDuty not enabled.") : (zh ? "不可用" : "Unavailable")}</div>
+      {gd === null ? (
+        <div style={{ color: "var(--muted)", fontSize: 13 }}>{zh ? "加载中…" : "Loading…"}</div>
+      ) : gd.ok === false ? (
+        /* 没问到 ≠ 未开通。后者是关于客户环境的断言，画错了用户会去开一个已经开着的服务。 */
+        <FailBanner zh={zh} what={zh ? "GuardDuty 数据" : "GuardDuty data"} code={gd.reason} onRetry={retry} />
+      ) : !gd.available ? (
+        <div style={{ color: "var(--muted)", fontSize: 13 }}>{gd.reason === "not_enabled" ? (zh ? "GuardDuty 未开通。" : "GuardDuty not enabled.") : (zh ? "不可用" : "Unavailable")}{gd.reason && gd.reason !== "not_enabled" ? ` (${gd.reason})` : ""}</div>
       ) : (<>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(90px, 1fr))", gap: 8, marginBottom: 12 }}>
           {["CRITICAL", "HIGH", "MEDIUM", "LOW"].map((sv) => (

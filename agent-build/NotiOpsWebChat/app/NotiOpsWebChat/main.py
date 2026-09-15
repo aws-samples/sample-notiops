@@ -141,7 +141,11 @@ B) **当 Web search = OFF 时**，优先级 = **AWS 文档 MCP > 模型自身知
   再对照最佳实践给出体检结论与建议。
   **铁律（防编造）**：用户没指定实例时，**必须先调 `rds_list_instances` 列出当前真实实例**——
   即使对话历史里出现过某个实例名，也**绝不能直接拿来用**（可能已删除/改名，历史不可信）。
-  列表为空就如实说"当前账号没有 RDS 实例"，**不要编造实例名/配置/指标**。
+  **列表为空时**：这些工具**一次只查一个区域**（返回值里的 `region` / `regions_queried` 就是
+  实际查过的范围）。所以只能说"在 `<region>` 这个区域没有找到 RDS 实例"，并**主动问用户
+  资源在哪个区域 / 要不要换个区域再查**——**绝不能**说成"当前账号没有 RDS 实例"，那是把
+  "一个区域没有"讲成"整个账号没有"，是**假否定**（用户会据此下结论）。工具在空结果时会附
+  一句 `scope_note`，照它说。同样**不要编造实例名/配置/指标**。
   工具返回 `DBInstanceNotFound`/`not_found` → 如实告知该实例不存在或已删除，**严禁**用
   "缓存/快照/上下文"硬编一份报告。`error:access_denied` → **用【与用户提问相同的语言】**
   说明缺少哪条**只读** IAM action（取自 `missing_action` 字段，如 `rds:DescribeDBInstances`——
@@ -222,23 +226,49 @@ if _HERE not in _sys.path:
     _sys.path.insert(0, _HERE)  # core/ 部署前由打包脚本 copy 到本目录
 from core import aws_docs_mcp as _aws_docs  # noqa: E402
 
+# 检索**失败**与「确实一条都没搜到」必须让模型分得清。它们过去在这里长得一模一样
+# （`{"hits": []}`），而 system prompt 又写着「绝不仅凭记忆答这类问题」—— 于是一次网络抖动
+# 的结果是：模型看到"AWS 没有这方面的文档"，改口凭记忆答，用户完全看不出权威来源根本没被
+# 查过。这是 grounded 工具最坏的失败形态：它和一个真的有据可查的回答毫无区别。
+_DOCS_UNAVAILABLE_NOTE = (
+    "The AWS documentation service did not answer (transport failure) — this is NOT "
+    "'no documentation exists'. Do not answer this AWS technical question from memory: "
+    "tell the user the docs lookup failed and suggest retrying."
+)
+
 @tool
 def aws_docs_search(query: str) -> dict:
     """Search official AWS documentation for an AWS technical question.
     Use this FIRST for any AWS technical question; never answer from memory.
-    Returns hits and sources (for the UI Sources panel)."""
+    Returns hits and sources (for the UI Sources panel).
+    If the reply has a non-empty `error`, the lookup FAILED — say so, do not
+    treat it as 'AWS has no docs on this' and do not answer from memory."""
     res = _aws_docs.search_documentation(query)
     hits = res.get("results") or res.get("hits") or []
     sources = [{"icon": "doc", "title": h.get("title") or h.get("url", ""),
                 "detail": h.get("url", "")} for h in hits if h.get("url")]
-    return {"hits": hits, "sources": sources}
+    if err := res.get("error"):
+        log.warning("aws_docs_search unavailable: %s", err)
+        return {"hits": [], "sources": [], "error": err, "note": _DOCS_UNAVAILABLE_NOTE}
+    return {"hits": hits, "sources": sources, "error": ""}
 tools.append(aws_docs_search)
 
 @tool
 def aws_docs_read(url: str) -> dict:
     """Read the full content of a specific docs.aws.amazon.com page.
-    Call after aws_docs_search to read the most relevant URL, then answer."""
-    return {"content": _aws_docs.read_documentation(url),
+    Call after aws_docs_search to read the most relevant URL, then answer.
+    If the reply has a non-empty `error`, the fetch FAILED — say so rather than
+    answering from memory."""
+    res = _aws_docs.read_documentation_ex(url)
+    if err := res.get("error"):
+        log.warning("aws_docs_read unavailable: %s", err)
+        # 只读不到这一页 ≠ 整个文档服务挂了：URL 被我们自己的允许清单拒了是另一码事，
+        # 让模型换一个官方 URL 重试，而不是让它宣布"这次查不了"。
+        note = (_DOCS_UNAVAILABLE_NOTE if err != "url_not_allowed" else
+                "That URL is not an allowed AWS documentation host. Pick a URL from "
+                "aws_docs_search results instead of constructing one.")
+        return {"content": "", "sources": [], "error": err, "note": note}
+    return {"content": res["content"], "error": "",
             "sources": [{"icon": "doc", "title": url, "detail": url}]}
 tools.append(aws_docs_read)
 
@@ -842,7 +872,9 @@ def rds_list_instances(region: str = "") -> dict:
     """List the user's RDS / Aurora DB instances (live, read-only) with a health-relevant
     overview (engine, class, status, Multi-AZ, public access, encryption).
     Use for 'list my databases', or as the first step of an RDS health check.
-    region: optional AWS region (default us-east-1)."""
+    region: optional AWS region. Defaults to the region NotiOps runs in, and only THAT
+    one region is queried -- an empty list means "none in that region", NOT "none in the
+    account"; see the returned `region` / `scope_note`."""
     return _resources.rds_list_instances(account_id=_acct(), region=region or None)
 _resource_tools.append(rds_list_instances)
 
@@ -877,7 +909,10 @@ _resource_tools.append(rds_metrics)
 def ec2_list_instances(region: str = "", state: str = "") -> dict:
     """List EC2 instances (live, read-only) with overview (type/state/AZ/IPs).
     state: optional filter like 'running'/'stopped'. Use for 'what instances do I have',
-    or first step of incident triage. region defaults us-east-1."""
+    or first step of incident triage.
+    region: defaults to the region NotiOps runs in, and only THAT one region is queried --
+    an empty list means "none in that region", NOT "none in the account"; see the returned
+    `region` / `scope_note`."""
     return _resources.ec2_list_instances(account_id=_acct(), region=region or None, state=state)
 _resource_tools.append(ec2_list_instances)
 
@@ -919,7 +954,8 @@ def aws_readonly(service: str, operation: str, region: str = "", params: dict | 
       service: boto3 client/service name, e.g. 's3','ec2','ce','cloudwatch','lambda','iam'.
       operation: read-only API method (snake_case), e.g. 'list_buckets','describe_instances',
                  'get_cost_and_usage'. Non-read-only operations are rejected.
-      region: AWS region (default us-east-1; leave empty for global services like s3/iam).
+      region: AWS region. Defaults to the region NotiOps runs in, and only that one region
+              is queried; leave empty for global services like s3/iam.
       params: dict of API parameters, e.g. {"MaxResults": 50}.
     """
     return _aws_readonly.aws_readonly_call(
@@ -1015,6 +1051,13 @@ _devops_tools = []
 # SHOW_ESCALATE_FOLLOWUP —— 只改一处等于只藏一半。
 _SHOW_ESCALATE_FOLLOWUP = False
 
+# ⚠️ 2026-09-13：下面这几个工具的 `notice`（未开启时的那句）以前写的是「请打开『DevOps Agent』
+#    开关」—— 界面上**已经没有**这个开关了（前端把"经我们的模型转交"那一项撤掉，只留直连那条，
+#    名字就叫「深度调查」；见 frontend/chat-app/src/components/ModePicker.tsx 文件头）。
+#    一句让客户去点一个不存在的开关的提示，是本仓库最不能出的那类错（发出去就改不了的假信息），
+#    所以统一改成指「深度调查」开关。客户照着做能拿到想要的结果：那枚开关走的是 BFF 直连
+#    （0 token），这几个 agent 侧工具从此不会再被调到 —— 也就是说这些 notice 现在是它们
+#    **唯一**还会被看到的输出，文案对不对比以前更要紧。
 @tool
 def start_investigation(title: str, description: str) -> dict:
     """Start a DEEP AWS DevOps Agent investigation (async; returns task/execution id immediately).
@@ -1025,7 +1068,7 @@ def start_investigation(title: str, description: str) -> dict:
     `console_url` as a clickable link ("点开 DevOps Agent 后台实时查看进度") so they can watch the
     investigation there. They can ask again in a few minutes for the result."""
     if not _devops_agent_enabled.get():
-        return {"notice": "DevOps Agent 深度调查未开启。请在输入框下方打开『DevOps Agent』开关后重试；"
+        return {"notice": "DevOps Agent 深度调查未开启。请在输入框下方打开「深度调查」开关后重试；"
                           "当前可用本主题的只读工具（告警/指标/日志/事件/资源状态）做即时排查。"}
     return _devops_agent.start_investigation(title=title, description=description, account_id=_acct())
 _devops_tools.append(start_investigation)
@@ -1041,7 +1084,7 @@ def get_investigation_result(execution_id: str) -> dict:
     don't paste the URL yourself). If still running: returns status='running' — tell the user
     it's not done yet and to check again shortly (do NOT fabricate a conclusion)."""
     if not _devops_agent_enabled.get():
-        return {"notice": "DevOps Agent 深度调查未开启。请打开『DevOps Agent』开关后重试。"}
+        return {"notice": "DevOps Agent 深度调查未开启。请打开「深度调查」开关后重试。"}
     res = _devops_agent.get_investigation_result(execution_id, account_id=_acct(),
                                                  lang=_ui_locale.get())
     # 续查完成 → 对称地生成 **HTML 网页报告** + 网页链接（与 investigate_live 完成体验一致）。
@@ -1107,7 +1150,7 @@ def generate_mitigation_plan(root_cause: str) -> dict:
     text (from the investigation you just showed) as `root_cause`. Returns the mitigation plan
     markdown; present it to the user as-is. Only works when DevOps Agent is enabled."""
     if not _devops_agent_enabled.get():
-        return {"notice": "DevOps Agent 未开启。请打开『DevOps Agent』开关后重试。"}
+        return {"notice": "DevOps Agent 未开启。请打开「深度调查」开关后重试。"}
     md = _devops_agent.generate_mitigation(root_cause, account_id=_acct(), timeout_s=120)
     if not md:
         return {"ok": False, "message": "未能生成缓解方案（可稍后重试，或在 DevOps Agent 后台点 Generate mitigation plan）。"}
@@ -1253,7 +1296,7 @@ async def investigate_live(title: str, description: str):
     The system streams progress lines and appends the report download link automatically — after
     calling, you don't need to re-poll; just briefly frame the result."""
     if not _devops_agent_enabled.get():
-        yield {"notice": "DevOps Agent 深度调查未开启。请在输入框下方打开『DevOps Agent』开关后重试；"
+        yield {"notice": "DevOps Agent 深度调查未开启。请在输入框下方打开「深度调查」开关后重试；"
                          "当前可用本主题的只读工具（告警/指标/日志/事件/资源状态）做即时排查。"}
         return
     acct = _acct()
@@ -1285,7 +1328,7 @@ async def investigate_live(title: str, description: str):
            "console_url": console_url}
     seen = set()
     waited = 0
-    status = "IN_PROGRESS"
+    status = ""          # "还没查到状态"。别拿 "IN_PROGRESS" 当种子 —— 那是编的
     # 活跃度心跳（每 ~40s 一条瞬态 progress）。DevOps Agent 一次调查里常有**几分钟没有任何新
     # timeline 行**，此前那几分钟里整条 SSE 一个字节都不发 —— 用户只看到开场那句"过程在右侧栏
     # 实时更新"一动不动，无法区分"在跑"还是"已经断了"。走 progress 通道 = 纯瞬态（收到正文即
@@ -1294,6 +1337,17 @@ async def investigate_live(title: str, description: str):
     #    （bff/web-chat/index.mjs 的 `: ka` 注释行）—— 两者缺一不可。
     _hb_every = max(1, 40 // max(1, _DEVOPS_POLL_INTERVAL))  # 每 N 轮轮询发一次
     _ticks = 0
+    # 🔴 轮询失败**不许当成"这一轮没有新进展"**。此前这个循环只有 `if poll.get("ok")` 一条
+    #    分支，非 ok（连不上 / 跨账号被拒 / 没接入）和"状态查不到"都被静静丢掉，于是循环照常
+    #    转满整个等待上限，最后给用户一句"调查仍在 AWS 侧继续跑" —— 一次连接故障被讲成了
+    #    一次正在进行的调查。所以：连续失败要计数、要说出来、到阈值就停，并且停的原因要
+    #    和"超时但还在跑"分开讲。
+    _poll_fail = 0            # 连续失败轮数（含 status 查不到）
+    _poll_err = ""            # 最后一次的错误码（给收尾文案用）
+    _said_degraded = False    # 只提醒一次，别每轮刷右侧栏
+    _MAX_POLL_FAIL = 3
+    # 这几种错误重试也不会好（权限/未接入/跨账号未开），第一次就该停，别白等几分钟。
+    _FATAL_POLL_ERRORS = {"cross_account_denied", "not_onboarded", "org_mode_disabled"}
     while waited < _DEVOPS_MAX_WAIT:
         poll = await _asyncio.to_thread(_devops_agent.poll_investigation,
                                         exec_id, task_id, space, acct, seen, _ui_locale.get())
@@ -1302,9 +1356,30 @@ async def investigate_live(title: str, description: str):
             for line in poll.get("new_lines", []):
                 # 分析过程 → 右侧栏（不进主聊天）。
                 yield {"investigation_step": line}
-            status = poll.get("status", status)
+            # status 为空 = 这一轮没查到（不是"在跑"）：保留上一次已知状态，但计一次失败。
+            status = poll.get("status") or status
             if poll.get("terminal"):
                 break
+            if poll.get("status_unknown") or poll.get("records_error"):
+                _poll_fail += 1
+                _poll_err = poll.get("records_error") or "status_unknown"
+            else:
+                _poll_fail = 0
+        else:
+            _poll_fail += 1
+            _poll_err = (poll or {}).get("error", "poll_failed") if isinstance(poll, dict) else "poll_failed"
+            if _poll_err in _FATAL_POLL_ERRORS:
+                _poll_fail = _MAX_POLL_FAIL     # 不重试，直接走下面的中断分支
+        if _poll_fail and not _said_degraded:
+            _said_degraded = True
+            yield {"investigation_step": _dv(
+                f"⚠️ 实时进度拉取失败（{_poll_err}）—— 下面几行可能不完整，正在重试。",
+                f"⚠️ Could not fetch live progress ({_poll_err}) — the lines below may be "
+                f"incomplete; retrying.")}
+        if _poll_fail >= _MAX_POLL_FAIL:
+            log.error("deep dive poll failed %d times in a row (%s); stopping the live feed",
+                      _poll_fail, _poll_err)
+            break
         await _asyncio.sleep(_DEVOPS_POLL_INTERVAL)
         waited += _DEVOPS_POLL_INTERVAL
         _ticks += 1
@@ -1316,6 +1391,30 @@ async def investigate_live(title: str, description: str):
                             f"(steps stream in the “Investigation” panel)"),
                 "kind": "investigation"}}
 
+    # 轮询连续失败而中断：**不能**复用下面那段"调查仍在 AWS 侧继续跑"的文案 —— 我们此刻
+    # 恰恰不知道它在不在跑。如实说"实时跟踪断了"，并给出 execution_id 让用户/模型去续查。
+    if _poll_fail >= _MAX_POLL_FAIL and status not in _devops_agent._TERMINAL:
+        yield _dv(
+            f"\n\n⚠️ **实时进度跟踪中断**（连续 {_poll_fail} 次拉取失败：{_poll_err}）。\n\n"
+            f"> 我无法确认这次调查现在的状态 —— 它可能仍在跑，也可能已经失败。\n"
+            f"> 调查编号（execution_id）：`{exec_id}`\n\n"
+            f"你可以说一句「**查一下刚才的调查结果**」让我重新拉一次；"
+            f"也可以直接打开上面的 DevOps Agent 后台链接自己看。\n",
+            f"\n\n⚠️ **Live progress tracking stopped** ({_poll_fail} consecutive fetch failures: "
+            f"{_poll_err}).\n\n"
+            f"> I cannot confirm the current state of this investigation — it may still be running, "
+            f"or it may have failed.\n"
+            f"> Investigation id (execution_id): `{exec_id}`\n\n"
+            f"Say “**check the result of that investigation**” and I'll try again, or open the "
+            f"DevOps Agent console link above to look yourself.\n")
+        yield {"ok": False, "error": "poll_failed", "poll_error": _poll_err,
+               "status": status or "unknown", "execution_id": exec_id,
+               "note": ("Live progress tracking FAILED and was stopped; the investigation's current "
+                        "state is UNKNOWN. The message above is ALREADY displayed to the user — do NOT "
+                        "repeat it verbatim, do NOT claim the investigation is still running, finished, "
+                        "or failed, and do NOT invent a conclusion. At most add ONE short closing "
+                        "sentence, in the SAME language as the user's question.")}
+        return
     # 优雅超时兜底：到我们的等待上限还没终态 → **不报错**，明确告诉用户调查仍在 AWS 侧继续跑，
     # 给出 execution_id，并说明稍后回来一句"查一下刚才的调查结果"即可续查（模型会用
     # get_investigation_result 续拉、同样落 S3 给下载链接）。这样"没断"、只是最后一段转异步。
@@ -1558,6 +1657,14 @@ def _im_chat_tools(account_id: str | None):
     return _t
 
 
+# 本轮有哪些 MCP 工具组没起来 —— `_tools_for_topic` 写、`_build` 读进 system prompt。
+# 用 ContextVar 而不是模块级变量:并发请求各自一份。默认空串 = 一切正常,此时 system prompt
+# **一个字节都不变**(prompt 缓存不受影响),只有真降级的那次会话多这一段。
+_mcp_degraded: "_ctxvars.ContextVar[str]" = _ctxvars.ContextVar(
+    "notiops_mcp_degraded", default=""
+)
+
+
 def _tools_for_topic(topic, account_id: str | None = None, devops_deep: bool = False):
     """工具选择(**账号感知 + 深度调查感知**)。
 
@@ -1571,6 +1678,9 @@ def _tools_for_topic(topic, account_id: str | None = None, devops_deep: bool = F
     DevOps Agent。此时**只挂 devops 工具 + 文档/基础工具**,不挂 rds_*/ec2_*/MCP/boto3 兜底等
     直接查询工具——从工具层面强制模型走 investigate_live(prompt 强制 + 无替代工具,双保险)。
     devops_agent 走 core/devops_agent.py,已按 account AssumeRole trigger role,跨账号安全。"""
+    # 先清空本轮的"MCP 降级说明"。只有下面真正挂 MCP 工具的那条分支会写它;放在**所有
+    # 分支之前**清,是为了保证别的分支(跨账号/深度调查/IM)不会读到上一次请求留下的旧状态。
+    _mcp_degraded.set("")
     # IM 侧对话:窄工具集,**在所有分支之前**返回(见 `_im_chat_tools`)。
     # 放最前面是刻意的:IM 的深度调查不走这里(`core/nl_router.py` 的 `investigate` kind 直连
     # DevOps Agent、0 token),所以 `devops_deep` 对 im-chat 无意义,不该让它把窄集撑回去。
@@ -1613,6 +1723,15 @@ def _tools_for_topic(topic, account_id: str | None = None, devops_deep: bool = F
                     _t += _futs[_k].result()
                 except Exception as _e:  # noqa: BLE001 — 单个 MCP 起不来不阻断其它/整体
                     log.warning("MCP %s tools load failed (parallel): %s", _k, _safe_err(_e))
+        # 有 MCP 组没起来 → 把"这一类能力本会话不可用"写进 system prompt(见 _mcp_degraded)。
+        # 只在**真的挂了这些工具**的这条分支里算：跨账号/深度调查/IM 那几条压根不挂,不该把
+        # 别的分支的残缺状态说给用户(顶上已先清空,所以不会串到别的分支)。
+        try:
+            _mcp_degraded.set("\n".join(
+                _n for _n in (_finops_mcp.degraded_note(), _investigation_mcp.degraded_note(),
+                              _aws_api_mcp.degraded_note()) if _n))
+        except Exception as _e:  # noqa: BLE001 — 算不出这句说明,绝不能反过来挡住工具挂载
+            log.warning("MCP degraded note unavailable: %s", _safe_err(_e))
     # DevOps Agent 深度调查工具:凡提供该能力的主题都挂(执行仍受开关 ContextVar 门控)。
     if _topic_has_devops(topic):
         _t += _devops_tools
@@ -1678,7 +1797,10 @@ def agent_factory():
     cache: "_OrderedDict[str, object]" = _OrderedDict()
     def get_or_create_agent(session_id, user_id, model_key=None, topic=None, account_id=None, devops_deep=False):
         _actor_id = user_id
-        _topic = topic or "general"
+        # Retired-alias rewrite (security -> investigate). One line covers both the LRU
+        # cache key below AND _tools_for_topic, whose only call site is in this function.
+        # See _normalize_topic for why this layer exists on top of the BFF's.
+        _topic = _normalize_topic(topic)
         key = _agent_cache.build_key(
             generation=llm_config.generation(),
             session_id=session_id, user_id=_actor_id, model_key=model_key, topic=_topic,
@@ -1693,12 +1815,22 @@ def agent_factory():
         def _build(restore: bool):
             # restore=False：跳过 AgentCore Memory 的会话恢复（session_manager=None），
             # 用于旧会话持久化状态与新 conversation manager 不兼容时的兜底。
+            # 工具**先挂**、再算 system prompt:MCP 起不起得来只有挂载那一刻才知道
+            # (`_tools_for_topic` 里写 `_mcp_degraded`)。写成 Agent(...) 的关键字实参会按
+            # 源码顺序求值 —— system_prompt 在 tools 前面,那样读到的永远是上一轮的状态。
+            _tool_set = _tools_for_topic(_topic, account_id, devops_deep)
+            _degraded = _mcp_degraded.get()
+            if _degraded:
+                # 静默少工具是最坏的失败:模型只是"看不到工具",于是凭自己的知识编一个像真
+                # 的答案(指标/金额/告警),用户完全没有"这次没查到"的信号。所以必须告诉它。
+                log.error("mounting agent with degraded MCP capability for session %s", session_id)
             _agent = Agent(
                 model=load_model(model_key),
                 session_manager=get_memory_session_manager(session_id, _actor_id) if restore else None,
                 conversation_manager=_make_conversation_manager(),
-                system_prompt=DEFAULT_SYSTEM_PROMPT,
-                tools=_tools_for_topic(_topic, account_id, devops_deep),
+                system_prompt=(DEFAULT_SYSTEM_PROMPT + "\n\n## Degraded capability (this session)\n"
+                               + _degraded) if _degraded else DEFAULT_SYSTEM_PROMPT,
+                tools=_tool_set,
                 hooks=[],
             )
             # 历史已经在 Agent.__init__ 末尾被 session manager 恢复进 _agent.messages
@@ -1711,6 +1843,13 @@ def agent_factory():
                 _n = _history_scrub.scrub_cross_model_history(_agent.messages)
                 if _n:
                     log.info("scrubbed %d cross-model history block(s) for session %s", _n, session_id)
+                # 再修一遍 user/assistant 交替：上一轮如果模型调用失败，历史会停在 user，
+                # 本轮 Strands 再 append 一条 user 就是 ValidationException，而且此后**每
+                # 一轮都报**（坏历史进了 Memory，换模型也带着）。写入端的修复在下面模型
+                # 失败分支里补 assistant 消息；这里负责把**已经**坏掉的老会话救回来。
+                _r = _history_scrub.repair_role_alternation(_agent.messages)
+                if _r:
+                    log.info("repaired %d role-alternation break(s) for session %s", _r, session_id)
             return _agent
         def _build_with_restore_fallback():
             try:
@@ -1913,8 +2052,34 @@ _TOPIC_FOCUS = {
     ),
 }
 
+# Retired chat topics, rewritten on the way in.
+#
+# "security" stopped being a chat topic on 2026-09-11 and folded into "investigate".
+# The reason is visible right above in _TOPIC_FOCUS: there never was a "security" entry,
+# so a security turn ran with the *general* system prompt and, per _tools_for_topic,
+# only the 8 core investigation tools instead of investigate's 22 (no lake_query /
+# analyze_metric / execute_cwl_insights_batch). The security *dashboards* stay; only
+# the chat topic is gone.
+#
+# This layer exists on top of the BFF's own normalization because the two deploy in
+# separate steps: scripts/deploy_agent.sh runs BEFORE cdk deploy, so for that window a
+# new runtime keeps receiving "security" from the old BFF. Stored conversations also
+# keep the old value forever (the DDB write is conditional and nothing can rewrite it).
+_RETIRED_TOPICS = {"security": "investigate"}
+
+
+def _normalize_topic(topic) -> str:
+    """Map a retired topic alias onto its successor; pass anything else through.
+
+    Deliberately not an allowlist: unknown topics have always degraded quietly here
+    (``.get(topic, "")``), and raising on them would break older clients for no gain.
+    """
+    t = str(topic or "general")
+    return _RETIRED_TOPICS.get(t, t)
+
+
 def _topic_directive(topic) -> str:
-    return _TOPIC_FOCUS.get(str(topic or "general"), "")
+    return _TOPIC_FOCUS.get(_normalize_topic(topic), "")
 
 
 def _extract_prompt(payload: dict):
@@ -2794,6 +2959,62 @@ async def invoke(payload, context):
                 "3. For genuinely long investigations, turn on the Deep investigation toggle — "
                 "that path is built for long-running work.\n"
             )
+        elif _what.startswith("AccessDenied") or _what == "ResourceNotFoundException":
+            # 权限/未开通：**重试永远不会好**，给「重试通常就好」是把客户送进无限循环。
+            # 这是新客户装完之后最容易撞的第一堵墙 —— 两条安装路径都不预检 Bedrock 模型
+            # 访问权限，而默认模型（Grok）恰恰是需要单独开通的那类。所以这里必须点名
+            # 「要去改配置」，并把改哪儿说清楚。
+            _msg = (
+                f"\n\n---\n⚠️ 模型调用被拒绝（`{_what}`），本轮未能生成回答。\n\n"
+                f"当前 AWS 账号在本区域**没有这个模型（`{_model_id}`）的可用访问权限**。\n\n"
+                "**重试不会好转，需要改配置：**\n"
+                "1. 最快的办法 —— 在输入框上方**换一个模型**（每个模型的开通状态是独立的）；\n"
+                "2. 或去开通本模型：Amazon Bedrock 控制台 → **Model access**（模型访问权限）"
+                "→ 勾选该模型 → 提交，通常几分钟生效；\n"
+                "3. 若模型已经开通仍报这个错，是运行角色缺权限 —— 需要给它补上 "
+                "`bedrock:InvokeModel` 与 `bedrock:InvokeModelWithResponseStream`；\n"
+                f"4. 你若不是账号管理员，把错误码 `{_what}` 和模型名 `{_model_id}` "
+                "发给管理员即可。\n"
+                if _zh_err else
+                f"\n\n---\n⚠️ The model call was denied (`{_what}`), so this turn produced no "
+                "answer.\n\n"
+                f"This AWS account has no usable access to that model (`{_model_id}`) in this "
+                "region. **Retrying will not help — a configuration change is needed:**\n"
+                "1. Fastest fix — switch to a different model above the input box (each model "
+                "is enabled independently);\n"
+                "2. Or enable this one: Amazon Bedrock console → **Model access** → select the "
+                "model → submit; it usually takes effect within minutes;\n"
+                "3. If the model is already enabled and you still see this, the runtime role is "
+                "missing permissions — it needs `bedrock:InvokeModel` and "
+                "`bedrock:InvokeModelWithResponseStream`;\n"
+                "4. If you are not the account administrator, send the error code "
+                f"`{_what}` and the model name `{_model_id}` to whoever is.\n"
+            )
+        elif _what == "ValidationException":
+            # ValidationException 的现网含义几乎总是「这个会话的历史坏了」（上一轮模型调用
+            # 失败留下连续同角色，或跨模型残留字段）——**不是**用户这句话有问题，更不是
+            # 临时故障。给「重试通常就好」会让客户在同一个死会话里一直撞墙。
+            # 换模型 = 新的 agent 缓存键 = 重新从 Memory 恢复历史 = 走一遍
+            # core/history_scrub.repair_role_alternation()，所以「换模型」是真的能修。
+            _msg = (
+                f"\n\n---\n⚠️ 模型拒绝了本轮请求（`{_what}`），本轮未能生成回答。\n\n"
+                "这类错误通常是**这个会话的历史被上一次失败弄坏了**，而不是你这句话有问题。\n\n"
+                "**下一步：**\n"
+                "1. **新建一个对话**，把同样的问题再问一次 —— 这是最快的办法；\n"
+                "2. 或在输入框上方**换一个模型** —— 换模型会重建这个会话的上下文，"
+                "系统会顺手把坏掉的历史修好；\n"
+                f"3. 若新对话里仍报同样的错，请把错误码 `{_what}` 反馈给我们。\n"
+                if _zh_err else
+                f"\n\n---\n⚠️ The model rejected this request (`{_what}`), so this turn produced "
+                "no answer.\n\n"
+                "This error almost always means **this conversation's history was corrupted by "
+                "an earlier failure** — not that anything is wrong with your message.\n\n"
+                "**Next steps:**\n"
+                "1. **Start a new conversation** and ask the same question — fastest fix;\n"
+                "2. Or **switch models** above the input box — that rebuilds this session's "
+                "context and repairs the broken history on the way;\n"
+                f"3. If a fresh conversation still fails, report the error code `{_what}` to us.\n"
+            )
         else:
             _msg = (
                 f"\n\n---\n⚠️ 模型调用失败（`{_what}`），本轮未能生成回答。\n\n"
@@ -2809,6 +3030,23 @@ async def invoke(payload, context):
                 "above the input box and retry.\n"
             )
         yield {"event": {"contentBlockDelta": {"delta": {"text": _msg}, "contentBlockIndex": 0}}}
+        # 尾巴修复 —— 别让这一次失败把整个会话**永久**弄死。
+        # Strands 在**调模型之前**就把用户这句话 append 进了 agent.messages。本轮失败 =
+        # 这条 user 消息后面没有任何 assistant 消息；下一轮 Strands 再 append 一条 user 就是
+        # 连续同角色 → Bedrock ValidationException，而且**之后每一轮都报**（这一轮又失败，
+        # 又留一条 user，越堆越坏），换模型也带着走（坏历史进了 AgentCore Memory）。
+        # 这里就地补一条 assistant 消息把交替补平，内容就用刚发给用户的那段降级文案 ——
+        # 历史里因此留下「这一轮失败了」的真实痕迹，而不是凭空多一句假答案。
+        # 另一半修复在 agent_factory 的 restore 分支（repair_role_alternation），负责救
+        # **已经**坏在 Memory 里的老会话；两半都要有：这里管新会话不被写坏，那里管旧会话。
+        try:
+            _msgs = getattr(agent, "messages", None)
+            if (isinstance(_msgs, list) and _msgs and isinstance(_msgs[-1], dict)
+                    and _msgs[-1].get("role") == "user"):
+                _msgs.append({"role": "assistant", "content": [{"text": _msg.strip()}]})
+        except Exception as _tail_e:  # 补历史失败绝不能盖掉上面已经发出去的降级答案
+            log.warning("failed to repair message tail after model failure: type=%s",
+                        type(_tail_e).__name__)
     # 流结束：把清洗器里暂存的尾巴（确认非标记的部分）补发出去
     _tail = _scrubber.flush()
     if _tail:

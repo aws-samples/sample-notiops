@@ -18,6 +18,9 @@
 import { deflateRawSync } from "node:zlib";
 import * as zlib from "node:zlib";
 import { getSkillWithFiles, buildSkillMd, setSkillDevopsStatus } from "./skills.mjs";
+// userError：这些 message 都是手写的短码（skill_not_found / too_many_files …），
+// 显式标记成可外显，errBody 才不会把它们压成 "bad_request" 一句空话。
+import { userError } from "./safe_err.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 // 未被部署流程替换的 `__FOO__` 占位符按"未配置"处理（与 devops_investigate.mjs 的 envClean、
@@ -260,7 +263,7 @@ export async function resolveTarget(accountId, opts = {}) {
       // 且能力探测不会据此把开关置灰（见 deepInvestigationAvailability）。
       throw inconclusive
         ? new Error("agent_space_probe_failed")
-        : Object.assign(new Error("no_local_agent_space"), { code: "bad_request" });
+        : userError("no_local_agent_space");
     }
     return { agentSpaceId: spaceId, credentials: undefined, accountId: self, scope: "self" };
   }
@@ -270,7 +273,7 @@ export async function resolveTarget(accountId, opts = {}) {
   const rec = await ddb.send(new GetCommand({ TableName: CONFIG_TABLE, Key: { PK: `da#${id}`, SK: "meta" } }));
   const cfg = rec.Item;
   if (!cfg || !cfg.trigger_role_arn || !cfg.agent_space_id) {
-    throw Object.assign(new Error("account_not_onboarded_to_devops_agent"), { code: "bad_request" });
+    throw userError("account_not_onboarded_to_devops_agent");
   }
   if (opts.probeOnly) {
     return { agentSpaceId: cfg.agent_space_id, credentials: undefined, accountId: id,
@@ -325,7 +328,7 @@ async function findExistingAssetId(client, agentSpaceId, skillId, ListAssetsComm
  */
 export async function uploadSkillToDevopsAgent(skillId, { accountId = "", agentTypes } = {}) {
   const skill = await getSkillWithFiles(skillId);
-  if (!skill) throw Object.assign(new Error("skill_not_found"), { code: "bad_request" });
+  if (!skill) throw userError("skill_not_found");
 
   // 1) 组装 zip：根 SKILL.md（规范 frontmatter）+ references/assets 附属文档。
   const md = buildSkillMd(skill);
@@ -334,10 +337,10 @@ export async function uploadSkillToDevopsAgent(skillId, { accountId = "", agentT
     const safe = f.path.replace(/^\/+/, "").replace(/\.\.(\/|\\)/g, "");
     if (safe) entries.push({ name: safe, data: f.buf });
   }
-  if (entries.length > 100) throw Object.assign(new Error("too_many_files (max 100)"), { code: "bad_request" });
+  if (entries.length > 100) throw userError("too_many_files (max 100)");
   const zip = buildZip(entries);
   if (zip.length > MAX_ZIP_BYTES) {
-    throw Object.assign(new Error(`skill zip too large (>${MAX_ZIP_BYTES >> 20}MB)`), { code: "bad_request" });
+    throw userError(`skill zip too large (>${MAX_ZIP_BYTES >> 20}MB)`);
   }
 
   // 2) 解析目标 Agent Space + 凭证。
@@ -404,7 +407,7 @@ export async function uploadSkillToDevopsAgent(skillId, { accountId = "", agentT
 /** 从 DevOps Agent 撤下一个已上传的 skill（DeleteAsset），并清账。目标同 upload。 */
 export async function removeSkillFromDevopsAgent(skillId, { accountId = "" } = {}) {
   const skill = await getSkillWithFiles(skillId);
-  if (!skill) throw Object.assign(new Error("skill_not_found"), { code: "bad_request" });
+  if (!skill) throw userError("skill_not_found");
   const target = await resolveTarget(accountId);
   const uploads = { ...(skill.devops_agent?.uploads || {}) };
   // 归一化定位：优先规范键；否则回落到指向同一 Agent Space 的任意历史键（早期 self 曾以真实账号 id 记账）。

@@ -17,12 +17,12 @@ health inspection, and full AWS Support case management — all without leaving
 the web UI or touching the AWS Console.
 
 The same assistant is also available **inside your team's chat tools (Slack /
-Feishu)**: `@mention` the bot in an alert channel to run an investigation and
-read the report where the alert already landed. On top of on-demand questions,
-it does **proactive push** across 10 AWS signal sources (CloudWatch, AWS
-Health, Backup, GuardDuty, Cost Anomaly, Trusted Advisor, EC2 Spot
-interruption, Auto Scaling launch failure, RDS, Config), each independently
-switchable.
+Feishu / DingTalk)**: `@mention` the bot in an alert channel to run an
+investigation and read the report where the alert already landed. On top of
+on-demand questions, it does **proactive push** across 10 AWS signal sources
+(CloudWatch, AWS Health, Backup, GuardDuty, Cost Anomaly, Trusted Advisor, EC2
+Spot interruption, Auto Scaling launch failure, RDS, Config), each
+independently switchable.
 
 All models are served through **Amazon Bedrock** (managed security, compliance,
 and cost controls), with per-session model switching and automatic
@@ -43,7 +43,8 @@ write access.
 
 | Doc | Purpose |
 |---|---|
-| 🚀 [One-click Deploy](docs/DEPLOYMENT_ONECLICK.en.md) | Browser only: upload one CloudFormation template, about 5 minutes to a running Web Chat (optionally plus one IM bot — Feishu/Lark or Slack) |
+| 🚀 [One-click Deploy](docs/DEPLOYMENT_ONECLICK.en.md) | Browser only: upload one CloudFormation template, about 5 minutes to a running Web Chat (optionally plus one IM bot — Feishu/Lark, Slack or DingTalk) |
+| ✅ [Prerequisites](docs/PREREQUISITES.en.md) | **Read before running `./setup.sh`**: environment requirements, per-item fixes, and a one-command self-check (not needed for the one-click path) |
 | 🛠 [Deployment Guide](docs/DEPLOYMENT.en.md) | Full install: step-by-step from `./setup.sh` to first smoke test (web console + optional IM) |
 | 👤 [User Guide](docs/USER_GUIDE.en.md) | End-user manual + conversation samples + FAQ |
 | 🏗 [Technical Design](docs/TECHNICAL_DESIGN.en.md) | Module boundaries / data flow / security / read-only defense in depth |
@@ -86,11 +87,13 @@ write access.
   defense in depth per entry point — web: tool-level read-only + command denylist
   + read-only system prompt; IM: the read-only DevOps Agent + a mutation-wording
   regex second gate — the assistant never mutates your cloud
-- 💬 **IM channels**: Slack / Feishu / DingTalk full-feature — a card comes back **immediately** after you
-  ask, and progress / thinking / the answer all refresh **in that same card** (the seconds in
-  its title are the "still running" signal); when a deep investigation finishes, its report
-  card is posted back to the conversation that started it. **Two agents to pick from**:
-  `/agent devops` is the default (straight to the DevOps Agent, 0 tokens on the NotiOps side),
+- 💬 **IM channels**: Slack / Feishu / DingTalk full-feature — you get a reply **immediately**
+  after you ask: on Feishu / Slack progress / thinking / the answer all refresh **in that same
+  card** (the seconds in its title are the "still running" signal); DingTalk cannot edit a sent
+  message, so the same progress is **appended** as new messages; when a deep investigation
+  finishes, its report card is posted back to the conversation that started it.
+  **Two agents to pick from**: `/agent devops` is the default (straight to the DevOps Agent,
+  0 tokens on the NotiOps side),
   `/agent notiops` switches to the model-backed path (with a `/web on` web-search toggle).
   Every card's footer states three things in one line: **which path the turn took, which model
   answered, and which AWS account the answer is about** — that last segment matters most in a
@@ -149,7 +152,10 @@ walkthrough, the resource and cost breakdown, upgrade/rollback, and one-click te
 git clone https://github.com/aws-samples/sample-notiops.git
 cd sample-notiops
 
-# 2. Deploy (CDK, one command; interactive on first run)
+# 2. Environment self-check (read-only, installs nothing; strongly recommended)
+bash scripts/preflight.sh
+
+# 3. Deploy (CDK, one command; interactive on first run)
 ./setup.sh
 # First run: confirm AWS account → pick region → pick IM platforms
 # (Slack / Feishu / DingTalk, multi-select) → paste credentials for each (written
@@ -160,6 +166,14 @@ cd sample-notiops
 
 Requires git, Node.js, Python, uv and the AWS CDK locally, plus credentials that
 can deploy — **no container runtime needed**.
+
+> ⚠️ The version floors are real requirements (Python ≥ 3.10, Node ≥ 22, AWS CLI v2 ≥ 2.13), but
+> `setup.sh` only checks whether a command exists — it **never compares versions**; and it does not
+> check boto3 at all, whose absence makes the deploy "succeed" with features quietly missing. So run
+> `bash scripts/preflight.sh` first — it really does compare versions and prints a fix per item.
+> Full list, the consequence of each miss, and how to fix it:
+> **[docs/PREREQUISITES.en.md](docs/PREREQUISITES.en.md)**.
+> (None of this applies to Option A, the one-click path.)
 
 #### Deploy modes: single-account (default) vs multi-account
 
@@ -293,8 +307,8 @@ mode comparison and how to switch — see
 > **append** one or two progress messages instead of refreshing a single card, as Feishu does);
 > (3) DingTalk **validates nothing** when you save the callback URL (a wrong address raises no
 > error on the spot — the only symptom is that the robot never says a word).
-> **Microsoft Teams is still unavailable** — `platforms/teams/` is a directory with no
-> implementation, and remains a known to-do. The platform table is at the top of
+> **Microsoft Teams is still unavailable** — `platforms/` ships feishu / slack / dingtalk
+> adapters only, no teams, and it remains a known to-do. The platform table is at the top of
 > [docs/IM_WEBHOOK_SETUP.en.md](docs/IM_WEBHOOK_SETUP.en.md).
 
 > ⁵ **Bringing your own CUR data source is optional, and identical on both paths.** The

@@ -7,15 +7,19 @@ Mirrors the role of `platforms/feishu/app/main.py` and
 `platforms/slack/app/main.py` — same intent routing, same dispatch
 flow, same DDB conventions, same locale + LLM prefs.
 
-Phase 1 scope (this file): chitchat / general_qa replies, intent
+Scope of THIS retired module: chitchat / general_qa replies, intent
 classification, investigation dispatch, language + model commands.
-Case management, skill commands, push handler integration land in
-Phase 2-3.
+Anything else falls through to
+`dingtalk.legacy_stream_path_unsupported`. That is a property of this
+dead shape, NOT of DingTalk — the live Lambda webhook path below also
+does Support case management and proactive push. Do not read the gaps
+here as a roadmap; there is no DingTalk "phase 2".
 
 DingTalk-specific quirks:
 
-  * No native modal / view — case + skill-author flows fall back to
-    LLM-parsed conversational input. Phase 2.
+  * No native modal / view — the live path answers "open a case" with
+    a copy-and-edit plain-text template instead
+    (`platforms/dingtalk/case_text.py`).
   * No Slack `thread_ts` equivalent — group-level locale lock
     instead of per-thread. locale_resolver already supports
     chat_id-only fallback so we don't need to change `core/`.
@@ -61,6 +65,7 @@ import dingtalk_stream
 import case_flow
 import dingtalk_utils
 from core import bedrock_intent
+from core import multicloud
 from core import nl_router
 from core import dispatch_compose
 from core import i18n
@@ -110,7 +115,8 @@ def _help_text(locale: str) -> str:
     """Bilingual command menu (rendered from i18n `help.*`). Lists BOTH
     language forms of every command."""
     rows = "\n".join(
-        i18n.t(f"help.row.{feature}", locale)
+        # `multicloud.help_row_key` = 「这一行发哪份文案」，见 `core/multicloud.py`。
+        i18n.t(multicloud.help_row_key(feature), locale)
         for feature, _en, _zh in nl_router.HELP_COMMANDS
     )
     return (f"**{i18n.t('help.title', locale)}**\n\n"
@@ -510,8 +516,10 @@ class ChatBotHandler(dingtalk_stream.ChatbotHandler):
                     i18n.t("main.dispatch_failed_short", locale), msg)
             return dingtalk_stream.AckMessage.STATUS_OK, "ok"
 
-        # support / case / skill commands ship in Phase 2.
-        self.reply_text(i18n.t("dingtalk.phase2_not_yet", locale), msg)
+        # 这条通道(Stream 模式长连接)只实现了调查 / 概念问答 / 模型 / 语言,
+        # 其余意图落到这里。现网钉钉走 HTTP 回调 Lambda,那边是全的。
+        self.reply_text(
+            i18n.t("dingtalk.legacy_stream_path_unsupported", locale), msg)
         return dingtalk_stream.AckMessage.STATUS_OK, "ok"
 
 

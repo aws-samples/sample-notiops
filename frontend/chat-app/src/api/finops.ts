@@ -161,17 +161,6 @@ export interface CostExplorerDashboard {
   aiSpend?: AiSpend;
 }
 
-export interface EdpCommitment {
-  annualCommitmentUsd: number;
-  discountRate: number;
-  marketplaceCapRatio: number;
-  contractPeriod: string;
-  attainmentPct: number;
-  expectedPct: number;
-  remainingUsd: number;
-  remainingMarketplaceUsd: number;
-}
-
 /**
  * 每日多因子成本异常扫描（lambda5 产数，01:15 UTC）。
  *
@@ -198,7 +187,6 @@ export interface FinopsDashboard {
   curStatus: CurAthenaStatus;
   devOpsAgentCost: DevOpsAgentCostSummary;
   costExplorer: CostExplorerDashboard;
-  edpCommitment: EdpCommitment;
   potentialSavings?: PotentialSavings;
   /** 可选：存量 BFF 不返回 → 整卡不渲染（不显示一排 0）。 */
   dailyAnomaly?: DailyAnomaly;
@@ -220,10 +208,6 @@ const EMPTY: FinopsDashboard = {
   },
   potentialSavings: { available: false },
   dailyAnomaly: { available: false },
-  edpCommitment: {
-    annualCommitmentUsd: 0, discountRate: 0, marketplaceCapRatio: 0, contractPeriod: "",
-    attainmentPct: 0, expectedPct: 0, remainingUsd: 0, remainingMarketplaceUsd: 0,
-  },
 };
 
 export async function getFinopsDashboard(accountId?: string): Promise<FinopsDashboard> {

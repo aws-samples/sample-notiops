@@ -27,6 +27,8 @@
  */
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+// safeErr：异常一律压成"类型名/错误码"再进响应体（见 safe_err.mjs）。
+import { safeErr } from "./safe_err.mjs";
 import {
   DeleteCommand,
   DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, UpdateCommand,
@@ -612,7 +614,7 @@ async function queryFindings(acct, { kind = "", severityMin = "", visible = null
     //    （`queryAll` 自己的注释批评不分页版本的问题就是「静默截断」。）
     }, { onTruncate: (n) => { truncatedAt = n; } });
   } catch (e) {
-    return fail("ddb_error", String(e));
+    return fail("ddb_error", safeErr(e));
   }
   // 🔴 **跨账号查询之后按可见账号过滤。**
   //
@@ -987,7 +989,7 @@ export async function getFinding(accountId, findingId) {
     }));
     item = r.Item;
   } catch (e) {
-    return fail("ddb_error", String(e));
+    return fail("ddb_error", safeErr(e));
   }
   if (!item) return fail("not_found", "该 finding 不存在或已清理");
   const todayIso = isoDaysAgo(0);
@@ -1293,7 +1295,7 @@ export async function getSeries(accountId, { region, service, instance, metric =
       FilterExpression: "attribute_not_exists(#ttl) OR #ttl > :now",
     });
   } catch (e) {
-    return fail("ddb_error", String(e));
+    return fail("ddb_error", safeErr(e));
   }
 
   // SK 形状：<metric>#<stat>#<data_date>
@@ -1490,7 +1492,7 @@ export async function getScope({ account = "", visible = null } = {}) {
         resource_id: String(it.resource_id || ""),
       }));
     } catch (e) {
-      return fail("ddb_error", String(e));
+      return fail("ddb_error", safeErr(e));
     }
   }
   return out;
@@ -1783,7 +1785,7 @@ export async function putExclusion(kind, body, { actor = "", visible = null } = 
   try {
     await ddb.send(new PutCommand({ TableName: TABLE, Item: item }));
   } catch (e) {
-    return fail("ddb_error", String(e));
+    return fail("ddb_error", safeErr(e));
   }
   return {
     ok: true, key: item.SK, kind,
@@ -1861,7 +1863,7 @@ export async function renewExclusion(
     if (String(e).includes("ConditionalCheckFailed")) {
       return fail("not_found", "该排除条目不存在（可能已被删除）");
     }
-    return fail("ddb_error", String(e));
+    return fail("ddb_error", safeErr(e));
   }
   return { ok: true, key: sk, kind, expires_at: expiresAt };
 }
@@ -1939,7 +1941,7 @@ export async function deleteExclusion(kind, key, { actor = "", visible = null } 
       //    另一份可能早就没了。`already_gone` 让调用方能把它算成成功。
       return fail("not_found", "该排除条目不存在（可能已被删除）");
     }
-    return fail("ddb_error", String(e));
+    return fail("ddb_error", safeErr(e));
   }
   console.log("[inspection] 排除条目已删除 " + JSON.stringify({
     actor: String(actor || ""), kind, key: sk,
@@ -2030,7 +2032,7 @@ export async function putSchedule(runType, body, { actor = "" } = {}) {
   try {
     await ddb.send(new PutCommand({ TableName: TABLE, Item: item }));
   } catch (e) {
-    return fail("ddb_error", String(e));
+    return fail("ddb_error", safeErr(e));
   }
   // R13.5：明确回传「下一轮时间」，让 UI 不必自己算（自己算必然与调度器分叉）。
   return { ok: true, run_type: runType, at_utc: atUtc, enabled: item.enabled,
@@ -2205,7 +2207,7 @@ async function loadRuleOverrides(runType, { strict = false } = {}) {
       //    AccessDenied）是运维唯一的线索。
       throw Object.assign(new Error(
         `读不到当前阈值配置，拒绝写入（避免把已有自定义清空）：`
-        + `${e?.name || ""} ${e?.message || e}`.trim()),
+        + safeErr(e)),
         { code: "merge_base_unavailable" });
     }
     return {};
@@ -2236,7 +2238,7 @@ export async function getConfig(accountId) {
       if (!seen.has(rt)) out.schedules[rt] = shapeSchedule(rt, null);
     }
   } catch (e) {
-    return fail("ddb_error", String(e));
+    return fail("ddb_error", safeErr(e));
   }
 
   // 🔴 判定阈值（R13.4）。此前这个字段在初始化成 `{}` 之后**再没被赋值过**
@@ -2405,7 +2407,7 @@ export async function putRules(runType, body, { actor = "" } = {}) {
     if (String(e).includes("ConditionalCheckFailed")) {
       return fail("version_conflict", "同一时刻已有另一次写入，请重试");
     }
-    return fail("ddb_error", String(e));
+    return fail("ddb_error", safeErr(e));
   }
   return {
     ok: true, run_type: runType, config_version: version,

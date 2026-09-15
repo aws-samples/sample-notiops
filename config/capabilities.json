@@ -6,6 +6,7 @@
       "title_zh": "对话", "title_en": "Chat",
       "routes": [{ "method": "POST", "pattern": "/stream$" },
                  { "method": "GET", "pattern": "/features/deep-investigation$" },
+                 { "method": "GET", "pattern": "/features/starops$" },
                  { "method": "POST", "pattern": "/warmup$" }] },
 
     { "key": "nav:notifications", "level": "tab", "viewState": "notifications",
@@ -73,9 +74,6 @@
 
     { "key": "nav:finops:commitments", "level": "group", "parent": "nav:finops",
       "title_zh": "承诺与项目", "title_en": "Commitments & Programs" },
-    { "key": "nav:finops:commitment", "level": "subtab", "parent": "nav:finops:commitments",
-      "responseKey": "edpCommitment",
-      "title_zh": "承诺达成", "title_en": "Commitment" },
     { "key": "nav:finops:devops-credit", "level": "subtab", "parent": "nav:finops:commitments",
       "responseKey": "devOpsAgentCost",
       "title_zh": "DevOps Agent 用量", "title_en": "DevOps Agent Credit" },
@@ -139,7 +137,8 @@
         { "method": "GET", "pattern": "/support/services$" }
       ] },
     { "key": "nav:cases:overview", "level": "subtab", "parent": "nav:cases",
-      "responseKey": "overview", "title_zh": "概览", "title_en": "Overview" },
+      "responseKey": ["openCount", "totalCount", "bySeverity", "byService"],
+      "title_zh": "概览", "title_en": "Overview" },
     { "key": "nav:cases:waiting", "level": "subtab", "parent": "nav:cases",
       "responseKey": "waiting", "title_zh": "等待客户", "title_en": "Waiting on Customer" },
     { "key": "nav:cases:incidents", "level": "subtab", "parent": "nav:cases",
@@ -251,8 +250,9 @@
     { "key": "nav:customize", "level": "tab", "viewState": "customize",
       "title_zh": "自定义", "title_en": "Customize" },
 
-    { "key": "nav:security", "level": "tab", "viewState": "security",
+    { "key": "nav:security", "level": "tab", "viewState": "security", "moduleToggle": false,
       "title_zh": "安全", "title_en": "Security",
+      "_note": "moduleToggle:false —— 不出现在 Admin「模块」页的开关列表里（2026-09-12 产品要求）。理由：2026-09-11 起「安全」已不是侧栏里的顶层主题，而是「运行概览」主题下的一颗看板胶囊，把它列进「顶层模块」开关里会让管理员以为关掉它会少一个主题。⚠️ 这不是 alwaysOn：权限语义一字未改（依旧需要 nav:security 才看得到），alwaysOn 会把它放给每一个登录用户。详见 admin.mjs::apiGetModules 与 authz.mjs 里对 isModuleToggleOptOut 的使用。",
       "routes": [
         { "method": "GET", "pattern": "/security/dashboard$" },
         { "method": "GET", "pattern": "/security/ta-check/.+/resources$" },

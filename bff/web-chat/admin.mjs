@@ -9,7 +9,7 @@ import {
   AdminAddUserToGroupCommand, AdminRemoveUserFromGroupCommand,
 } from "@aws-sdk/client-cognito-identity-provider";
 import { randomBytes } from "node:crypto";
-import { allNodes } from "./capabilities.mjs";
+import { allNodes, toggleableTabs } from "./capabilities.mjs";
 import { PRESET_ROLES, DEFAULT_GROUP_ROLE_MAP, matchesAny } from "./authz.mjs";
 import {
   listRoles as storeListRoles, getRole, putRole, deleteRole,
@@ -322,20 +322,23 @@ export async function apiRemoveUserFromGroup(username, group) {
 
 /* ───────────────── 模块开关 ───────────────── */
 
-/** 可开关的顶层模块（tab 级，排除 chat/admin 恒开）。 */
+/**
+ * 可开关的顶层模块（tab 级；chat 恒开、admin 只给管理员、moduleToggle:false 的不算）。
+ *
+ * ⚠️ 三条排除判据都在 `capabilities.mjs::toggleableTabs()` 里，**不要**在这里重抄一份：
+ *    这个列表与下面 apiPutModules 的白名单、以及 authz 里那道 disabled 过滤必须同源，
+ *    否则会出现「界面上没有这一行，可存量记录还在生效」这种改不回来的状态。
+ */
 export async function apiGetModules() {
   const disabled = await getDisabledModules();
-  const toggleable = allNodes()
-    .filter((n) => n.level === "tab" && !n.alwaysOn && !n.adminOnly)
+  const toggleable = toggleableTabs()
     .map((n) => ({ key: n.key, title_zh: n.title_zh, title_en: n.title_en, disabled: disabled.includes(n.key) }));
   return { disabled, toggleable };
 }
 
 /** 写模块开关。只接受合法的可开关 tab key。 */
 export async function apiPutModules(disabled) {
-  const valid = new Set(
-    allNodes().filter((n) => n.level === "tab" && !n.alwaysOn && !n.adminOnly).map((n) => n.key),
-  );
+  const valid = new Set(toggleableTabs().map((n) => n.key));
   const clean = (Array.isArray(disabled) ? disabled : []).filter((k) => valid.has(k));
   await putDisabledModules(clean);
   return { status: 200, body: { disabled: clean } };

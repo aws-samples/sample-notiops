@@ -19,11 +19,20 @@ import { modelDisplayName } from "../models";
 // DevOps Agent** 答的（NotiOps 侧 0 token）。此时署名必须写 "AWS DevOps Agent" —— 沿用
 // "AWS Bedrock (某模型)" 会把答案的来源说错，客户会以为这是我们的模型在答、并按我们的
 // 模型能力去理解结果。也不带 token：DevOps Agent 侧用量计在客户自己的额度里，不在这里显示。
+// via="starops"：这条回答来自**客户自己在阿里云上的 STAROps 数字员工**（NotiOps 侧 0 token，
+// 计客户自己的阿里云 AI 额度）。署名必须点出**阿里云** —— 只写 "STAROps" 或沿用上面任何一条，
+// 客户就无法从署名分辨这段结论出自哪一朵云；而这一行恰恰是他判断"该去哪儿核实"的唯一依据。
+// 同样不带 token（用量不在我们这边）。
 // via="builtin"：agent 的**内置确定性回答**（如「你能做什么」），一个字都没过模型、0 token。
 // 同一个道理 —— 署成 "AWS Bedrock (某模型)" 就是把来源说错（还会让客户以为这段能力清单是
 // 模型"觉得"自己能做什么）。故署 "NotiOps"（产品自己答的），也不带 token。
 function modelSignature(model: string | undefined, usage: ChatMessage["usage"], via?: string): string {
   if (via === "devops-agent") return "AWS DevOps Agent";
+  // 「Alibaba Cloud」是这朵云的官方英文名，也是本产品里其余每一处的写法（i18n 那边
+  // 由一条 vitest 守卫钉着）。这里曾经写的是 "Aliyun STAROps" —— 同一朵云在一个产品里
+  // 有两个名字，客户读不出「这两处说的是同一件事」。而署名**不过 i18n**（zh/en 同一串），
+  // 所以那条只扫 STRINGS 的守卫扫不到它，得靠 Message.footer.test.tsx 逐字钉。
+  if (via === "starops") return "Alibaba Cloud STAROps";
   if (via === "builtin") return "NotiOps";
   const name = modelDisplayName(model);
   if (!name) return "";
@@ -147,6 +156,10 @@ function CaseReviewCard({ action, onConfirm, onCancel, locale }: {
   action: ProposedAction; onConfirm: () => void; onCancel: () => void; locale: string;
 }) {
   const en = locale === "en";
+  // 点过一次就锁死。建案是**不可逆**的：双击 = 真的开两个案例，而且第二次的结果会
+  // 覆盖第一次，界面上只留一个 Case ID —— 用户不知道自己开了两个，AWS 侧却有两条。
+  // done 由宿主在 await 之后才置上，所以那段时间必须由本地这一位挡住。
+  const [sending, setSending] = useState(false);
   const p = action.params || {};
   const r = action.result;
   const itLabel = (ISSUE_TYPE_OPTS.find((o) => o.code === p.issue_type) || ISSUE_TYPE_OPTS[0])[en ? "en" : "zh"];
@@ -163,6 +176,11 @@ function CaseReviewCard({ action, onConfirm, onCancel, locale }: {
                 {r.verified ? <span className="actcard-verified">{en ? "verified" : "已验证"}</span>
                   : <span className="actcard-verified pending">{en ? "status pending" : "状态待确认"}</span>}
               </div>
+              {/* BFF 回放的既有结果（刷新页面 / 另开标签页后再点确认）。不说这一句，
+                  用户会以为自己刚刚又开了一个案例。见 support.mjs 的幂等段。 */}
+              {r.duplicate && <div className="actcard-status">{en
+                ? "This is the existing result of the same request — nothing was created twice."
+                : "这是同一请求的既有结果 —— 没有重复创建。"}</div>}
               {(r.displayId || r.caseId) && (
                 <div className="actcard-caseid"><span>Case ID:</span>
                   <a href={caseUrl(r.displayId || r.caseId!)} target="_blank" rel="noopener noreferrer">{r.displayId || r.caseId}</a>
@@ -191,8 +209,11 @@ function CaseReviewCard({ action, onConfirm, onCancel, locale }: {
         <div className="cf-prev-row"><b>{en ? "Language" : "语言"}:</b> {langLabel}</div>
         <div className="cf-prev-body"><b>{en ? "Case body" : "案例正文"}:</b><pre>{String(p.communication_body || "")}</pre></div>
         <div className="casecard-foot">
-          <button className="actbtn cancel" onClick={onCancel}>{en ? "Cancel" : "取消"}</button>
-          <button className="actbtn confirm" disabled={!svcMatched} onClick={onConfirm}>{en ? "Create case" : "确认创建"}</button>
+          {/* 执行中连"取消"一起禁掉 —— 否则取消会把"已取消"盖到一个正在成功的写操作上。 */}
+          <button className="actbtn cancel" disabled={sending} onClick={onCancel}>{en ? "Cancel" : "取消"}</button>
+          <button className="actbtn confirm" disabled={!svcMatched || sending}
+            onClick={() => { setSending(true); onConfirm(); }}>
+            {sending ? (en ? "Creating…" : "创建中…") : (en ? "Create case" : "确认创建")}</button>
         </div>
       </div>
     </div>
@@ -240,6 +261,9 @@ function CaseFormCard({ action, onSubmit, onCancel, locale, accounts, deployAcco
     const stamped = String(action.account_id || "").trim();
     return stamped && acctOptions.some((o) => o.id === stamped) ? stamped : deployAcct;
   });
+  // 预览页「确认创建」点过一次就锁（见 CaseReviewCard 上的说明：建案不可逆，
+  // 宿主要 await 完才把 done 置上）。
+  const [sending, setSending] = useState(false);
   const [subject, setSubject] = useState(String(p.subject || ""));
   const [serviceCode, setServiceCode] = useState(String(p.service_code || ""));
   const [categoryCode, setCategoryCode] = useState(String(p.category_code || ""));
@@ -347,6 +371,11 @@ function CaseFormCard({ action, onSubmit, onCancel, locale, accounts, deployAcco
                 {r.verified ? <span className="actcard-verified">{en ? "verified" : "已验证"}</span>
                   : <span className="actcard-verified pending">{en ? "status pending" : "状态待确认"}</span>}
               </div>
+              {/* BFF 回放的既有结果（刷新页面 / 另开标签页后再点确认）。不说这一句，
+                  用户会以为自己刚刚又开了一个案例。见 support.mjs 的幂等段。 */}
+              {r.duplicate && <div className="actcard-status">{en
+                ? "This is the existing result of the same request — nothing was created twice."
+                : "这是同一请求的既有结果 —— 没有重复创建。"}</div>}
               {(r.displayId || r.caseId) && (
                 <div className="actcard-caseid"><span>Case ID:</span>
                   <a href={caseUrl(r.displayId || r.caseId!)} target="_blank" rel="noopener noreferrer">{r.displayId || r.caseId}</a>
@@ -499,14 +528,16 @@ function CaseFormCard({ action, onSubmit, onCancel, locale, accounts, deployAcco
           <div className="cf-prev-row"><b>{en ? "Language" : "语言"}:</b> {(LANG_OPTS.find((o) => o.code === language) || {}).label || language}</div>
           <div className="cf-prev-body"><b>{en ? "Case body" : "案例正文"}:</b><pre>{finalBody}</pre></div>
           <div className="casecard-foot">
-            <button className="actbtn cancel" onClick={() => setPreview(false)}>{en ? "Back to edit" : "返回修改"}</button>
-            <button className="actbtn confirm"
-              onClick={() => onSubmit({
+            {/* 执行中不许回编辑页 —— 回去就把这一位重置了，等于把锁解开。 */}
+            <button className="actbtn cancel" disabled={sending} onClick={() => setPreview(false)}>{en ? "Back to edit" : "返回修改"}</button>
+            <button className="actbtn confirm" disabled={sending}
+              onClick={() => { setSending(true); onSubmit({
                 subject: subject.trim(), communication_body: finalBody,
                 service_code: serviceCode, category_code: categoryCode,
                 severity_code: severity, language, issue_type: issueType,
               // 下拉没渲染时回传 `undefined` → 宿主沿用 `action.account_id`（向后兼容）。
-              }, showAcct ? acct : undefined)}>{en ? "Create case" : "确认创建"}</button>
+              }, showAcct ? acct : undefined); }}>
+              {sending ? (en ? "Creating…" : "创建中…") : (en ? "Create case" : "确认创建")}</button>
           </div>
         </div>
       )}
@@ -519,6 +550,8 @@ function ActionCard({ action, onConfirm, onCancel, locale }: {
   action: ProposedAction; onConfirm: () => void; onCancel: () => void; locale: string;
 }) {
   const en = locale === "en";
+  // 见 CaseReviewCard 上的说明：done 要等宿主 await 完才置上，这一位负责挡住这段窗口。
+  const [sending, setSending] = useState(false);
   const title = (ACTION_TITLE[action.type] || { zh: action.type, en: action.type })[en ? "en" : "zh"];
   const p = action.params || {};
   const r = action.result;
@@ -543,8 +576,10 @@ function ActionCard({ action, onConfirm, onCancel, locale }: {
       </div>
       {!action.done ? (
         <div className="actcard-foot">
-          <button className="actbtn cancel" onClick={onCancel}>{en ? "Cancel" : "取消"}</button>
-          <button className="actbtn confirm" onClick={onConfirm}>{en ? "Confirm & Execute" : "确认执行"}</button>
+          <button className="actbtn cancel" disabled={sending} onClick={onCancel}>{en ? "Cancel" : "取消"}</button>
+          <button className="actbtn confirm" disabled={sending}
+            onClick={() => { setSending(true); onConfirm(); }}>
+            {sending ? (en ? "Executing…" : "执行中…") : (en ? "Confirm & Execute" : "确认执行")}</button>
         </div>
       ) : (
         <div className={"actcard-result" + (r?.ok ? " ok" : " fail")}>
@@ -556,6 +591,9 @@ function ActionCard({ action, onConfirm, onCancel, locale }: {
                   ? <span className="actcard-verified">{en ? "verified" : "已验证"}</span>
                   : <span className="actcard-verified pending">{en ? "status pending" : "状态待确认"}</span>}
               </div>
+              {r.duplicate && <div className="actcard-status">{en
+                ? "This is the existing result of the same request — nothing was executed twice."
+                : "这是同一请求的既有结果 —— 没有重复执行。"}</div>}
               {r.status && (
                 <div className="actcard-status">{en ? "Current status: " : "当前状态："}<b>{r.status}</b></div>
               )}
@@ -740,7 +778,7 @@ export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAct
               /* 回复页脚**只有一行**：复制 / Sources / 署名(模型 · tokens) / 账号 ID。
                  以前是两行（署名单独一行 + 按钮一行），气泡下面留两条横向噪音；合成一行后
                  视觉安静得多。顺序按"操作 → 出处 → 谁答的 → 针对哪个账号"。
-                 「DevOps 对话」/「深度调查（直连）」的回复走的也是这个页脚，所以它们同样是一行。 */
+                 「DevOps 对话」/「深度调查」的回复走的也是这个页脚，所以它们同样是一行。 */
               <div className="msgbar">
                 <button className={"mb-btn" + (copied ? " copied" : "")} title={copied ? t("msg.copied") : t("msg.copy")} onClick={copy}>
                   <CopyIcon />
@@ -762,7 +800,14 @@ export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAct
                     **不是徽标**：外边框+胶囊底在一行页脚里比署名重得多，读起来像个可点的东西
                     （它不可点）。改成与署名同款的普通文字，只留一颗小圆点承载"成员账号=橙 /
                     部署·management=蓝"这唯一一条颜色信息。 */}
-                {accountLabel && (() => {
+                {/* 🔴 **STAROps 那条不显示账号**（2026-09-13）：这一行的账号是 **AWS** 账号 ID，
+                    而这条回答来自客户自己的**阿里云**数字员工。两个云的账号挨着写在同一行，
+                    读出来就是「这条阿里云回答对应 AWS 账号 5337…」—— 是**假信息**，而且是
+                    "发出去就改不了"的那一类（客户会拿这个 ID 去核对 / 贴进工单）。
+                    阿里云账号 UID 这条路径上**拿不到**，也不该拿：唯一带着它的是 STAROps 的
+                    workspace 值，而那个值是**管理员专属**、不回给非管理员的。
+                    所以宁可什么都不写，也不要写一个错的云的账号。别顺手把这个门条件删掉。 */}
+                {accountLabel && m.via !== "starops" && (() => {
                   const tone = accountIsMember ? "var(--orange)" : "var(--blue)";
                   return (
                     <span className="mb-acct" title={locale === "en" ? "This answer is for this AWS account" : "本回复针对该 AWS 账号的提问"}>
@@ -771,6 +816,22 @@ export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAct
                     </span>
                   );
                 })()}
+                {/* STAROps 那一位放**数字员工 ID**（占的就是上面账号 ID 的位置）：一个阿里云
+                    账号可以有多个数字员工，纳管范围与答题能力都不同，所以"谁答的"这条坐标
+                    必须精确到员工，光写 "Alibaba Cloud STAROps" 不够。
+                    ⚠️ 值来自**这一轮**（BFF 的 `via` 事件 + 逐条落库），不是读当前配置 ——
+                    管理员换过员工之后，历史回复仍显示当时那一个，否则又是一条假信息。
+                    class 故意**不叫** mb-acct：那个 class 在测试里是"AWS 账号 ID"的同义词，
+                    共用会让"STAROps 页脚不许出现 AWS 账号"那条断言失去意义。 */}
+                {m.via === "starops" && m.staropsEmployee && (
+                  <span className="mb-emp"
+                    title={locale === "en"
+                      ? "The Alibaba Cloud STAROps digital employee that answered (its ID)"
+                      : "回答这条的阿里云 STAROps 数字员工（ID）"}>
+                    <span className="mb-emp-dot" />
+                    {m.staropsEmployee}
+                  </span>
+                )}
               </div>
             )}
           </>

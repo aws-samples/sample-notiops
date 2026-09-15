@@ -288,8 +288,24 @@ def _body_for(group: str, per_server: list[tuple[str, list]]) -> bytes:
     }, ensure_ascii=False, sort_keys=False).encode("utf-8")
 
 
-def _counts(per_server: list[tuple[str, list]]) -> dict:
+def server_counts(per_server: list[tuple[str, list]]) -> dict:
+    """`{server_key: 该 server 报了几个工具}` —— 给日志用（工具名太多，只记数）。"""
     return {k: len(tools) for k, tools in per_server}
+
+
+def failed_servers(per_server: list[tuple[str, list]]) -> list[str]:
+    """这次启动里**一个工具都没拿到**的 server（= 没起来）。
+
+    与 `save()` 的闸门①**同一条判据**，刻意共用一个函数：进程内的工具缓存和 S3 快照
+    必须对「这次启动算不算干净」有完全一致的看法。三个 loader
+    （finops / investigation / aws_api）的 `_start_servers()` 都给每个 server 预分配一个
+    槽位、起不来就留空列表 —— 而 `[] is not None`，所以只要 loader 无脑缓存，一次偶发
+    冷启失败就会让**这个容器余生**都少这批工具，且没有任何异常、没有任何告警，只有用户
+    觉得"它以前会查 CloudWatch 的"。判定失败的地方只能有一处，否则两边迟早跑偏。
+    """
+    if not per_server:
+        return ["<none>"]
+    return [str(k) for k, tools in per_server if not tools]
 
 
 def _raw_tools(per_server: list[tuple[str, list]]) -> list[tuple[str, list]]:
@@ -332,7 +348,7 @@ def save(group: str, per_server: list[tuple[str, list]], *, background: bool = T
     if not per_server or any(not tools for _k, tools in per_server):
         logger.error("mcp_snapshot: %s has empty server(s) %s, refusing to save snapshot "
                      "(fast path stays disabled for this deployment until it starts cleanly)",
-                     group, _counts(per_server))
+                     group, server_counts(per_server))
         return
     try:
         per_server = _raw_tools(per_server)
@@ -342,7 +358,7 @@ def save(group: str, per_server: list[tuple[str, list]], *, background: bool = T
     prev = _load_group_doc(group)
     if prev:
         old = {str(e["key"]): len(e.get("tools") or []) for e in (prev.get("servers") or [])}
-        shrunk = {k: (old[k], n) for k, n in _counts(per_server).items()
+        shrunk = {k: (old[k], n) for k, n in server_counts(per_server).items()
                   if k in old and n < old[k]}
         if shrunk:
             logger.error("mcp_snapshot: %s live tool set shrank vs snapshot %s "

@@ -196,7 +196,9 @@ fi
 # 所以这里不再探测、也不再有"选了 IM 就必须装 Docker"的硬闸门。
 #
 # ⚠️ 别顺手把 finch 支持加回来:若将来又引入 Docker 资产,同时要改
-#   docs/DEPLOYMENT.md{,.en.md} 的前置条件表 + 仓库根那两份 README(中英各一),
+#   docs/PREREQUISITES.md{,.en.md} 的「容器运行时」那一行(现在写的是**不需要**)、
+#   docs/DEPLOYMENT.md{,.en.md} 的前置条件表、仓库根那两份 README(中英各一),
+#   以及 scripts/preflight.sh(它现在**完全没有**容器这一项),
 #   否则客户按文档准备好环境、到跑的时候才炸(见「不许静默降级」)。
 
 # 检查 CDK CLI

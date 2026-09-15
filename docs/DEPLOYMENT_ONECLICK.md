@@ -50,7 +50,54 @@
 
 ### 1.1 一个能开栈的 AWS 账号 + 控制台权限
 
-你的身份需要能创建 CloudFormation 栈以及栈里的资源（IAM 角色、Lambda、DynamoDB、S3、CloudFront、Cognito、Bedrock AgentCore）。**没有 `AdministratorAccess` 也能做**，但权限太窄会在开栈中途失败；如果不确定，先用一个测试账号。
+权限分**两段**看，实际卡住客户的几乎都是第一段（上传模板），不是第二段（开栈）。
+
+#### ① 上传模板 —— 控制台 Create stack 的那一步
+
+控制台会把你上传的模板先存进**你自己账号里**一个叫 `cf-templates-<随机串>-<区域>` 的桶。它不是 AWS 托管的桶，是你账号里的资源，所以这一步就需要建桶 + 写对象的权限：
+
+| 动作 | 资源 | 干什么用 |
+|---|---|---|
+| `cloudformation:CreateUploadBucket` | `*` | 控制台专用 API，第一次上传时创建那个 `cf-templates-*` 桶 |
+| `s3:CreateBucket` | `*` | 同上，桶建在你的账号里 |
+| `s3:PutObject` | `*` | 把模板 JSON 写进去 |
+| `s3:GetObject` | `*` | CloudFormation 回读模板 |
+| `s3:ListBucket` | `*` | 判断桶里已有什么 |
+
+> **这五条只能写 `Resource: "*"`**，别自己收窄到 `arn:aws:s3:::cf-templates-*` —— 桶名里的随机串是按账号 + 区域生成的，你事先写不出来；`CreateUploadBucket` 更是只有控制台会调、也只支持 `*`。
+>
+> **缺 `s3:PutObject` 时报错长这样**（真实客户反馈）：
+> `User: arn:aws:iam::111122223333:user/alice is not authorized to perform: s3:PutObject on resource: "arn:aws:s3:::cf-templates-xxxxxxxx-us-east-1/2026-01-01T000000.000Zabc-notiops-webchat.template.json"`
+>
+> **不想加这五条权限也有退路**：先把模板传到一个你已有的 S3 桶，Create stack 时选 **Amazon S3 URL** 而不是 **Upload a template file**，填那个对象的 URL。这条路不需要任何新的 S3 权限。模板 370 KB 出头，远低于 S3 URL 方式的 1 MB 上限。
+
+#### ② 开栈 —— 栈里的资源是用**你自己的身份**建的
+
+这个模板**不带** CloudFormation 服务角色（stack service role）。CloudFormation 不会切换身份，栈里 133 个资源每一个都是拿**你当前这个 IAM 身份**去创建的 —— 你的权限就是这个栈能建出来的上限。涉及的服务范围（这就是「服务范围」这个问题的答案）：
+
+| 服务前缀 | 这个栈要建什么 | 个数 |
+|---|---|---|
+| `cloudformation` | 栈本身（create / describe / rollback / delete） | 1 个栈 |
+| `iam` | 角色 + 内联策略 + 托管策略；**还要 `iam:PassRole`** —— 把执行角色交给 Lambda / EventBridge / AgentCore 的动作也是你的身份在做 | 12 Role + 12 Policy + 1 ManagedPolicy |
+| `lambda` | 函数、层、调用权限、Function URL | 12 Function + 1 Layer + 10 Permission + 1 Url |
+| `logs` | 日志组；**另外还要 `logs:PutResourcePolicy`（资源写 `*`）** —— RUM 开了写 CloudWatch Logs | 12 LogGroup |
+| `events` | 定时规则（巡检、哨兵、报告） | 16 Rule |
+| `dynamodb` | 配置表、会话表、Skills 表、通知表 | 4 Table |
+| `s3` | 前端站点桶、产物桶、Skills 桶 + 桶策略（与①是同一个服务，但对象不同） | 3 Bucket + 3 BucketPolicy |
+| `cloudfront` | 站点分发 + 函数 + OAI / OAC | 2 Distribution + 1 Function + 2 访问身份 |
+| `cognito-idp` | 用户池、App client、8 个权限组 | 1 UserPool + 1 Client + 8 Group |
+| `cognito-identity` | 身份池 + 角色映射（前端拿临时凭证签 SigV4 用） | 2 IdentityPool + 2 RoleAttachment |
+| `apigateway` | BFF 的 HTTP API（HTTP API 也走 `apigateway:` 前缀） | 3 Api + 3 Integration + 3 Route + 3 Stage |
+| `sqs` | 通知投递队列 + 队列策略 | 1 Queue + 1 QueuePolicy |
+| `rum` | 前端真实用户监控 | 1 AppMonitor |
+| `bedrock-agentcore` | agent 运行时 + 会话记忆 | 1 Runtime + 1 Memory |
+| `aidevops` | DevOps Agent 的 agent space 与关联（**IAM 前缀是 `aidevops:`**，不是 `devops-agent:`） | 1 AgentSpace + 1 Association |
+
+**不需要给你的身份**的服务：`organizations` / `securityhub` / `cur` / `oam`。这四样只在多账号、安全巡检、账单明细这些可选功能里用到，而且是由栈里的 `StagerOrgSetup` 这个 Lambda 拿**它自己的执行角色**去调的 —— 不是你的身份。（这一点与 `setup.sh` 不同，见 [DEPLOYMENT.md §2.4](DEPLOYMENT.md#24-iam-部署权限)。）
+
+> ⚠️ **说清楚一件事：这条路径的安装者实际上等于账号管理员。**
+> 上面那张表里的 `iam:CreateRole` + `iam:PutRolePolicy` + `iam:AttachRolePolicy`（资源只能是 `*`，因为角色名带 CloudFormation 生成的后缀）在安全上等价于权限提升 —— 拿到这三条就能给自己造一个管理员角色。所以这里的「最小权限」只能是**收窄服务范围**（上表 15 个服务，而不是 `*`），**不可能**做到「让一个非管理员来安装」。
+> 如果你们的规则不允许长期持有这种权限：用一个临时的安装身份装完，然后把它回收 —— 装完之后**日常使用 NotiOps 完全不需要任何 AWS 权限**，用户只在 Cognito 里登录。
 
 > 开栈时必须勾选 **"I acknowledge that AWS CloudFormation might create IAM resources"** ——
 > 这个栈要为 agent 和 BFF 建角色。
@@ -95,7 +142,7 @@ notiops-webchat.template.json
 1. 确认右上角**区域**是你在 §1.2 选好的那个。
 2. **CloudFormation** → **Create stack** → **With new resources (standard)**。
 3. **Choose an existing template** → **Upload a template file** → 选刚下的 `notiops-webchat.template.json` → **Next**。
-   （控制台会自己把模板存进 CFN 托管的 S3，你不需要有桶。）
+   （控制台会把模板存进**你自己账号里**一个 `cf-templates-<随机串>-<区域>` 的桶 —— 它会替你建，但**用的是你的权限**，所以你得有 §1.1 ① 那五条动作。没有的话就改用 **Amazon S3 URL**，见 [§1.1](#11-一个能开栈的-aws-账号--控制台权限)。）
 
 ### 2.3 填参数
 
@@ -376,7 +423,7 @@ service-managed StackSet 要求 CloudFormation 与 Organizations 之间的**信�
 1. **凭证进 Secrets Manager** —— 机器人要有钥匙才能验签和回消息。
    - **飞书/Lark**：`notiops/im-bot-feishu`，四个键：`app_id` / `app_secret` / `encrypt_key` / `verification_token`。
      **推荐直接在网页里填**：登录后 **管理控制台 → 集成 IM**，四个凭证在同一张表单上，点保存即写进这个 secret —— 不用装 CLI、不用另开凭证。那一页还带飞书那一半的四步速览和「查看详细配置步骤」侧边栏。
-   - **Slack**：两个 secret，`notiops/slack-bot-token`（`xoxb-` 开头）和 `notiops/slack-signing-secret`，各存一个纯字符串。⚠️ Slack 这两个目前**只能**在 Secrets Manager 控制台建（管理控制台那一页只管飞书和钉钉）。
+   - **Slack**：两个 secret，`notiops/slack-bot-token`（`xoxb-` 开头）和 `notiops/slack-signing-secret`，各存一个**纯字符串**（不是 JSON —— 数据面直接把整个 SecretString 当值用）。**也在网页里填**：**管理控制台 → 集成 IM → Slack** 分页，两个框加保存，secret 不存在时后端替你建；那一页同样有「查看详细配置步骤」抽屉。⚠️ Slack 这两个**都是凭证**（没有飞书 `app_id` / 钉钉 `app_key` 那种明文可核对的字段），所以「我配的是哪个 App」只能靠那一页的「测试凭证」按钮 —— 它会回你 workspace 与机器人的名字，并把**缺的 Bot Token Scopes 逐条报出来**。
    - **钉钉**：`notiops/im-bot-dingtalk`，两个键：`app_key` / `app_secret`（钉钉开放平台「凭证与基础信息」里的 AppKey / AppSecret）。**也在网页里填**：**管理控制台 → 集成 IM → 钉钉**分页，两个框加保存，secret 不存在时后端替你建；那一页右上角同样有「查看详细配置步骤」抽屉。⚠️ 钉钉**只有这一个** secret：AppSecret 既换 access token 又验入站请求的 `sign`，所以没有飞书那两个 `encrypt_key` / `verification_token`，界面上少两个框是**故意**的。
 2. **请求地址填回 IM 平台** —— 就是 Outputs 里的 `FeishuWebhookUrl` / `SlackWebhookUrl` / `DingtalkWebhookUrl`。
 
@@ -524,7 +571,7 @@ CloudFront 分发要几分钟才在全球生效。先等 2–3 分钟、强刷�
 可以，但有两个坑：
 
 ```bash
-# 模板 200 KB 出头（随资源数逐版增长），远超 --template-body 的 51,200 字节上限 ⇒ 必须先传 S3、用 --template-url
+# 模板 370 KB 出头（随资源数逐版增长），远超 --template-body 的 51,200 字节上限 ⇒ 必须先传 S3、用 --template-url
 aws s3 cp notiops-webchat.template.json s3://<你的桶>/notiops-webchat.template.json
 aws cloudformation create-stack --stack-name notiops \
   --template-url https://<你的桶>.s3.<区域>.amazonaws.com/notiops-webchat.template.json \
@@ -616,7 +663,7 @@ CloudFormation → 选中栈 → **Delete**。**实测**：`KeepData` ~**3 分 1
 | `/aws/vendedlogs/RUMService_notiops-web-chat<hash>` 日志组 | CloudWatch RUM 自己建的，不属于这个栈。名字里那段 `notiops-web-chat` 是 **RUM app monitor 的固定名字，不跟栈名走** —— 栈叫别的名字时照样是这一串 | **可以不管**：实测 0 字节，30 天后自动过期。想清就在 CloudWatch 里按这个**完整名字**删（别按前缀批量删） |
 | `KeepData` 下的两张表 + 数据桶 | 这是 `KeepData` 的**本意** | 不再用了就手工删（桶要先清空）。**想在这个账号里重新部署就必须先删** —— 见 §6.1 的第二条警告 |
 | CloudFront 的访问日志（如果你自己开过） | 不由这个栈管理 | 按需 |
-| **装过 IM 的话**：`notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` / `notiops/slack-bot-token` / `notiops/slack-signing-secret` 这几个 Secrets Manager secret | 它们不是栈内资源（飞书和钉钉那两个由管理控制台按需创建、Slack 那两个你手建），所以 `KeepData` 不会动它们 | `DeleteEverything` 会**连它们一起删**（不可恢复）。`KeepData` 下想清就自己删；留着的话下次重装同名 secret 会被直接复用 |
+| **装过 IM 的话**：`notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` / `notiops/slack-bot-token` / `notiops/slack-signing-secret` 这几个 Secrets Manager secret | 它们不是栈内资源（三个平台的 secret 都由管理控制台「集成 IM」那一页按需创建），所以 `KeepData` 不会动它们 | `DeleteEverything` 会**连它们一起删**（不可恢复）。`KeepData` 下想清就自己删；留着的话下次重装同名 secret 会被直接复用 |
 | **多账号模式下**：`notiops-member-onboarding` / `notiops-member-devops-agent` 两个 StackSet，以及 Organizations 对 StackSets 的信任访问 | **故意留的。** ① StackSet 要先删掉全部 stack instance 才删得掉，而那等于抹掉各成员账号里的跨账号角色 —— 这种跨账号的破坏性动作不该由"删一个栈"隐式触发；② 信任访问是**组织级**开关，删我们的栈就把它关掉会打断组织里别人的 StackSets 部署。 | 确实不要了：先在 CloudFormation → StackSets 里 **Delete stacks from StackSet**（删实例），再删 StackSet 本身。信任访问除非你确认没别人在用，否则别关。 |
 
 **没有**其他孤儿：agent 的日志组、BFF 的日志组、「通知」函数的日志组、部署 Lambda 的日志组、IAM 角色、Cognito 用户池、RUM app monitor、AgentCore Runtime、网站桶、staging 桶 —— 实测全部随栈删除。深度调查建的 Agent Space 与关联也随栈删除（它是栈里的普通资源）。会话记忆的 AgentCore Memory（[§2.10](#210-会话记忆agentcore-memory)）同理 —— 它是栈里的普通资源、**没有**保留策略，随栈删除，里面存的会话消息一起消失（这条是按模板声明说的，还没像上面那串一样删栈实测过）。联网搜索的 AgentCore Gateway 分两种：**这个栈建出来的**随栈删除；**它复用的别人的**（同账号里已经存在的 `notiops-websearch-gw`，比如 `setup.sh` 建的）留着不动 —— 删一个栈不该顺手拆掉另一条部署路径还在用的东西。

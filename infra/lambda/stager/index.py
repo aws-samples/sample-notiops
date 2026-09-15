@@ -734,10 +734,10 @@ def _teardown_site(props) -> dict:
     # "不留东西"，所以必须在这里收尾：
     #   · notiops/bedrock-api-key —— 管理员在 Admin「模型」页选「API Key」凭证方式时
     #     由 BFF 按需 CreateSecret（见 bff/web-chat/llm_config.mjs）；
-    #   · notiops/im-bot-feishu —— 装了 IM（InstallOption=web+feishu）时，管理控制台
-    #     「集成 IM」页保存凭证时由 BFF 建；
-    #   · notiops/slack-* —— 装了 web+slack 时客户按文档手建（Slack 侧没有在控制台里
-    #     填的入口，见 docs/IM_WEBHOOK_SETUP.md §2.2）。
+    #   · notiops/im-bot-feishu / notiops/im-bot-dingtalk / notiops/slack-bot-token /
+    #     notiops/slack-signing-secret —— 装了对应 IM 平台时，管理控制台「集成 IM」页
+    #     保存凭证时由 BFF 按需建（三个平台都有分页；Slack 那两个是纯字符串 secret，
+    #     见 bff/web-chat/slack_config.mjs 与 docs/IM_WEBHOOK_SETUP.md §2.2）。
     # 名字**无条件**全列（模板侧同理），因为客户可能装过 IM 又改回只装 web：那时
     # 凭证还在账号里，而属性里若没有它就永远删不掉了。
     # 用 ForceDeleteWithoutRecovery：默认的 30 天恢复期会让同账号同区重装时

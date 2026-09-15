@@ -10,9 +10,12 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, 
 import { useT, useLocale } from "../i18n";
 import FeishuGuideDrawer from "./FeishuGuideDrawer";
 import DingTalkGuideDrawer from "./DingTalkGuideDrawer";
+import SlackGuideDrawer from "./SlackGuideDrawer";
+import AliyunGuideDrawer from "./AliyunGuideDrawer";
+import { MULTICLOUD_UI } from "../featureFlags";
 import {
   IconSettings, IconSecurity, IconSliders, IconChatBubble,
-  IconUser, IconUsers, IconOrg, IconCalendarClock, IconChip,
+  IconUser, IconUsers, IconOrg, IconCalendarClock, IconChip, IconCloud,
 } from "./icons";
 import {
   fetchAllCapabilities, fetchRoles, saveRole, deleteRole,
@@ -29,6 +32,8 @@ import {
   fetchAccountAccess, putAccountAccess, deleteAccountAccess,
   fetchNotificationConfig, putNotificationConfig, testNotificationSend,
   putDingtalkConfig, testDingtalkSend,
+  putSlackConfig, testSlackSend,
+  fetchAliyunConfig, putAliyunConfig,
   generateLaunchStack, saveManualPayload, testDaConnection,
   fetchLlmConfig, putLlmConfig, fetchLlmCandidates, putBedrockKey, testLlmModel,
   fetchLlmAudit, rollbackLlmConfig, fetchBackendTasks,
@@ -38,9 +43,20 @@ import {
   type ModelSurface, type ModelKind,
 } from "../api/admin";
 
-type Tab = "roles" | "users" | "groups" | "modules" | "accounts" | "lifecycle" | "notifications" | "models";
+type Tab = "roles" | "users" | "groups" | "modules" | "accounts" | "lifecycle" | "notifications" | "models" | "aliyun";
 type TFn = (key: string) => string;
 const ADMIN_ROLE = "role:admin";
+/**
+ * 角色名的合法字符集 —— 必须与服务端 `bff/web-chat/admin.mjs::apiSaveRole` 里那条
+ * 正则**逐字相同**。这里放宽 → 界面上过了、发到后端才被 400 `invalid_role_name` 拒；
+ * 这里收紧 → 本来合法的名字被前端拦住，客户以为是产品不支持。
+ *
+ * 服务端为什么这么窄（别顺手放宽）：角色名会直接进 URL 路径段
+ * （`DELETE /admin/roles/{name}`），而 authz 的免鉴权清单是按**尾段**匹配的
+ * （见 authz.mjs 的 `/admin/roles/models` 碰撞注释）。允许任意字符会让这条路径
+ * 的匹配面变得难以推理。
+ */
+const ROLE_NAME_RE = /^[A-Za-z0-9:_-]{2,64}$/;
 const RED = "#d13212";
 
 /* ── 设计 token 对齐的共享样式 ── */
@@ -126,6 +142,10 @@ const NAV_ITEMS = [
   { key: "groups", group: "access", icon: <IconUsers size={16} /> },
   { key: "accounts", group: "cloud", icon: <IconOrg size={16} /> },
   { key: "lifecycle", group: "cloud", icon: <IconCalendarClock size={16} /> },
+  // 「多云」归在「云环境」组而不是「系统」组:它配的是**客户另一朵云的账号**，
+  // 与上面两项（AWS 成员账号、EOL 日期）是同一类「客户的云长什么样」，
+  // 不是 NotiOps 自己的系统设置。
+  { key: "aliyun", group: "cloud", icon: <IconCloud size={16} /> },
   { key: "modules", group: "system", icon: <IconSliders size={16} /> },
   { key: "notifications", group: "system", icon: <IconChatBubble size={16} /> },
   { key: "models", group: "system", icon: <IconChip size={16} /> },
@@ -136,6 +156,13 @@ const NAV_ITEMS = [
 type NavKey = (typeof NAV_ITEMS)[number]["key"];
 const _navCoversAllTabs: Tab extends NavKey ? true : never = true;
 void _navCoversAllTabs;
+// ⚠️ 2026-09-15 产品决策：多云先**不对外**，所以「多云」这一条不进左导航。
+// 过滤放在这里而不是直接从 `NAV_ITEMS` 删：上面那个 `_navCoversAllTabs` 编译期检查
+// 管的正是「视图代码都在、左导航里却点不到」，而这次改动**故意**造出这个状态 ——
+// 把条目删掉等于顺手把这个检查废了，以后真的漏登记一个 tab 就再也抓不到。
+// `Tab` 联合类型、`AliyunView`、`AliyunGuideDrawer` 一行没动：把
+// `featureFlags.ts` 的 `MULTICLOUD_UI` 翻成 `true`，入口原样回来。
+const NAV_VISIBLE = NAV_ITEMS.filter((it) => it.key !== "aliyun" || MULTICLOUD_UI);
 
 export default function AdminPanel() {
   const t = useT();
@@ -157,7 +184,7 @@ export default function AdminPanel() {
         {NAV_GROUPS.map((g) => (
           <div key={g.key}>
             <div className="notif-side-group">{t(g.labelKey)}</div>
-            {NAV_ITEMS.filter((it) => it.group === g.key).map((it) => (
+            {NAV_VISIBLE.filter((it) => it.group === g.key).map((it) => (
               <button
                 key={it.key}
                 className={"notif-navitem" + (tab === it.key ? " active" : "")}
@@ -183,6 +210,7 @@ export default function AdminPanel() {
           {tab === "lifecycle" && <LifecycleView />}
           {tab === "notifications" && <NotificationsView />}
           {tab === "models" && <ModelsView />}
+          {tab === "aliyun" && <AliyunView />}
         </div>
       </div>
     </div>
@@ -202,12 +230,17 @@ export default function AdminPanel() {
  * JSON —— 只有浏览器的客户走不通那条路，「一键集成 IM」就断在这一步。
  * ⚠️ 全部这些值都不打日志、连长度都不打（docs/LOGGING_STANDARD.md）。
  *
- * 两个平台**分成两个子组件**（FeishuNotifications / DingtalkNotifications），不是一个
- * 带 platform 分支的表单:字段集、校验、以及「测试」能做到什么，三样都不一样（钉钉没有
- * Encrypt Key / Verification Token，也没有「往任意群发测试消息」的接口）。后端同理分成
- * 两个模块 —— 分支越多，这一页最贵的 bug（**界面骗人**）越藏得住。 */
-type SecretKey = "app_secret" | "encrypt_key" | "verification_token" | "push_webhook_url";
-/** 「用户是否真的动过这个框」。`Partial` 是因为两个平台的字段集不同 ——
+ * 三个平台**分成三个子组件**（FeishuNotifications / DingtalkNotifications /
+ * SlackNotifications），不是一个带 platform 分支的表单:字段集、校验、以及「测试」能做到
+ * 什么，三样都不一样（钉钉没有 Encrypt Key / Verification Token，也没有「往任意群发测试
+ * 消息」的接口;Slack 只有两个字段、而且**两个都是凭证**，没有可明文回显的标识符）。
+ * 后端同理分成三个模块 —— 分支越多，这一页最贵的 bug（**界面骗人**）越藏得住。 */
+type SecretKey = "app_secret" | "encrypt_key" | "verification_token" | "push_webhook_url"
+  | "bot_token" | "signing_secret"
+  // 阿里云（「多云」页，不是 IM 平台）—— 复用同一个 SecretField 是因为防覆盖那三件事
+  // （脱敏回显 / 不动就回传原值 / 谢绝 autofill）与平台无关，一字不差地都要做。
+  | "access_key_secret";
+/** 「用户是否真的动过这个框」。`Partial` 是因为三个平台的字段集不同 ——
  *  各自只登记自己那几个键，没有的键就是 undefined（= 没动过）。 */
 type TouchedMap = Partial<Record<SecretKey, boolean>>;
 
@@ -226,9 +259,9 @@ type TouchedMap = Partial<Record<SecretKey, boolean>>;
  *    touched，那种情况靠 ② 拦、靠 ① 让用户看得见值变了 —— 不是数学上的消除。
  */
 function SecretField({ platform, label, k, value, onChange, touched, setTouched, hint, placeholder }: {
-  // 只进 input 的 `name`（`notiops-<platform>-<k>`）。两个平台都有 `app_secret`，
+  // 只进 input 的 `name`（`notiops-<platform>-<k>`）。飞书和钉钉都有 `app_secret`，
   // 不带平台前缀的话浏览器会把飞书的密钥往钉钉那个框里自动填。
-  platform: "feishu" | "dingtalk";
+  platform: "feishu" | "dingtalk" | "slack" | "aliyun";
   label: string;
   k: SecretKey;
   value: string;
@@ -270,20 +303,20 @@ function SecretField({ platform, label, k, value, onChange, touched, setTouched,
 /**
  * 「集成 IM」页的外壳:标题 + 平台切换。
  *
- * ⚠️ 只挂**当前平台**那一个子组件（以及它自己的抽屉）。两个抽屉同时留在 DOM 里会撞
- *    `imd-webhook-url` 这个固定 id，而且「详细步骤」会出现两份 —— 见 ImGuideDrawer 文件头。
+ * ⚠️ 只挂**当前平台**那一个子组件（以及它自己的抽屉）。多个抽屉同时留在 DOM 里会撞
+ *    `imd-webhook-url` 这个固定 id，而且「详细步骤」会出现好几份 —— 见 ImGuideDrawer 文件头。
  */
 function NotificationsView() {
   const t = useT();
-  const [platform, setPlatform] = useState<"feishu" | "dingtalk">("feishu");
+  const [platform, setPlatform] = useState<"feishu" | "dingtalk" | "slack">("feishu");
   return (
     <div>
       <SectionHead title={t("admin.notif.title")} />
-      {/* 两个平台名并排、没有可见标签，读屏软件只会念出两个专有名词 —— 给分页组一个
+      {/* 几个平台名并排、没有可见标签，读屏软件只会念出几个专有名词 —— 给分页组一个
           `平台 / Platform` 的可访问名字。 */}
       <div role="group" aria-label={t("admin.notif.platform")}
            style={{ display: "inline-flex", gap: 4, padding: 4, ...box, background: "var(--page)", borderRadius: 10, marginBottom: 16 }}>
-        {(["feishu", "dingtalk"] as const).map((p) => (
+        {(["feishu", "dingtalk", "slack"] as const).map((p) => (
           <button key={p} onClick={() => setPlatform(p)} style={{
             padding: "5px 14px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 12.5,
             fontWeight: platform === p ? 700 : 500,
@@ -293,7 +326,9 @@ function NotificationsView() {
           }}>{t(`admin.notif.platform.${p}`)}</button>
         ))}
       </div>
-      {platform === "feishu" ? <FeishuNotifications /> : <DingtalkNotifications />}
+      {platform === "feishu" ? <FeishuNotifications />
+        : platform === "dingtalk" ? <DingtalkNotifications />
+        : <SlackNotifications />}
     </div>
   );
 }
@@ -600,6 +635,332 @@ function DingtalkNotifications() {
         </button>
       </div>
       <DingTalkGuideDrawer open={guide} onClose={() => setGuide(false)} webhookUrl={webhookUrl} />
+    </div>
+  );
+}
+
+/**
+ * Slack 分页。与另两个平台的**结构性**差别（不是样式差别）：
+ *
+ * ① **两个字段都是凭证**，一个明文回显的都没有。飞书有 `App ID`、钉钉有 `App Key`
+ *    这种"能让客户核对自己配的是哪个应用"的标识符，Slack 没有对应物 —— 所以这一页
+ *    没有普通 `<input>`，两个都走 `SecretField`。
+ * ② **「未配置」不等于「空」。** 方式 B（setup.sh）下这两个 secret 由 CDK 建、值是
+ *    **随机串**，忘了填的表现是「密钥不对」而不是「为空」。后端按形状判定（bot token
+ *    要 `xoxb-` 开头、signing secret 要小写十六进制），形状不对一律回空串 = 这里显示
+ *    未配置。所以客户"明明填过却显示未配置"的正解是**粘错了**，提示文案必须这么写。
+ * ③ **「测试」验不了 signing secret。** Slack 没有任何 API 能验它，唯一时机是在 Slack
+ *    后台保存 Request URL。所以 `success: true` 只覆盖 bot token + scope，文案里由后端
+ *    明确写清 —— 不许把"没验"说成"通过"。
+ *    换来的额外好处：`auth.test` 的响应头带 scope 清单，缺哪条直接点名（"装好了但漏勾
+ *    im:history"否则要等到「DM 里 bot 收到空消息」才发现）。
+ */
+function SlackNotifications() {
+  const t = useT();
+  const [loading, setLoading] = useState(true);
+  const [botToken, setBotToken] = useState("");
+  const [signingSecret, setSigningSecret] = useState("");
+  /** 入站回调地址（后端只读回带；没装 Slack / 查不到 = 空串 → 抽屉退回文字说明）。
+   *  ⚠️ Slack 那边**三处** Request URL 填的都是这同一个地址。 */
+  const [webhookUrl, setWebhookUrl] = useState("");
+  const [touched, setTouched] = useState<TouchedMap>({ bot_token: false, signing_secret: false });
+  /** 服务端给的脱敏原值，用于「没动过 → 原样回传」。理由与另两个平台逐字相同。 */
+  const loaded = useRef({ bot_token: "", signing_secret: "" });
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [guide, setGuide] = useState(false);
+
+  // `silent` 的理由与另两个平台相同（首次加载时 loading 初值已是 true）。
+  const load = (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setLoading(true);
+    fetchNotificationConfig()
+      .then((r) => {
+        // 旧 BFF（还没部署 Slack 那段）不回 `slack` —— 退回"全部空着"，不能白屏。
+        const s = r.slack ?? { bot_token: "", signing_secret: "", webhook_url: "" };
+        setBotToken(s.bot_token || "");
+        setSigningSecret(s.signing_secret || "");
+        setWebhookUrl(s.webhook_url || "");
+        loaded.current = { bot_token: s.bot_token || "", signing_secret: s.signing_secret || "" };
+        setTouched({ bot_token: false, signing_secret: false });
+      })
+      .catch((e) => setMsg({ ok: false, text: String(e?.message || e) }))
+      .finally(() => setLoading(false));
+  };
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { load({ silent: true }); }, []);   // 判据同另两个平台（同步路径上没有 setState）
+
+  const save = async () => {
+    setSaving(true); setMsg(null);
+    try {
+      const keep = (k: keyof typeof loaded.current, cur: string) =>
+        touched[k] ? cur.trim() : loaded.current[k];
+      // trim:两个值都是从 Slack 后台**复制**来的，粘贴带尾随空格/换行是常事。
+      // bot token 带空格 → Slack 回 invalid_auth;signing secret 带空格 → 验签
+      // 每次都 401，而 Slack 后台只说「URL 校验不通过」，两种症状都指不到真因。
+      const r = await putSlackConfig({
+        bot_token: keep("bot_token", botToken),
+        signing_secret: keep("signing_secret", signingSecret),
+      });
+      setMsg({ ok: true, text: r.message || t("admin.notif.saved") });
+      load();   // 重新拉取,让 secret 显示为脱敏形态
+    } catch (e) {
+      setMsg({ ok: false, text: String((e as Error)?.message || e) });
+    } finally { setSaving(false); }
+  };
+
+  const test = async () => {
+    setTesting(true); setMsg(null);
+    try {
+      const r = await testSlackSend();
+      setMsg({ ok: r.success, text: r.message });
+    } catch (e) {
+      setMsg({ ok: false, text: String((e as Error)?.message || e) });
+    } finally { setTesting(false); }
+  };
+
+  return (
+    <div>
+      {loading ? <div style={{ color: "var(--muted)", fontSize: 13 }}>{t("admin.notif.loading")}</div> : (
+        <div style={{ ...box, padding: 18, maxWidth: 640, display: "flex", flexDirection: "column", gap: 14 }}>
+          <SecretField platform="slack" label="Bot User OAuth Token" k="bot_token"
+            value={botToken} onChange={setBotToken}
+            touched={touched} setTouched={setTouched} hint={t("admin.notif.sl.botTokenHint")}
+            placeholder="xoxb-..." />
+          <SecretField platform="slack" label="Signing Secret" k="signing_secret"
+            value={signingSecret} onChange={setSigningSecret}
+            touched={touched} setTouched={setTouched} hint={t("admin.notif.sl.signingHint")}
+            placeholder={t("admin.notif.secretPh")} />
+          <div className="imx-steps-order">{t("admin.notif.sl.keysRequired")}</div>
+          {/* 「未配置≠空」这条必须画在表单里，不能只写在抽屉里 —— 它是方式 B 客户
+              最容易卡住的地方，而卡住时人不会去点「详细步骤」。 */}
+          <div style={{ color: "var(--muted)", fontSize: 11.5, lineHeight: 1.6 }}>{t("admin.notif.sl.notEmptyWarn")}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <button style={btnPrimary} disabled={saving} onClick={save}>{saving ? t("admin.notif.saving") : t("admin.notif.save")}</button>
+            <button style={btnGhost} disabled={testing} onClick={test} title={t("admin.notif.sl.testTip")}>
+              {testing ? t("admin.notif.sl.testing") : t("admin.notif.sl.test")}
+            </button>
+            {msg && <span style={msg.ok ? okText : errText}>{msg.text}</span>}
+          </div>
+        </div>
+      )}
+
+      <div className="imx-steps">
+        <div className="imx-steps-title">{t("admin.notif.sl.steps.title")}</div>
+        <ol>
+          <li>{t("admin.notif.sl.steps.s1")}</li>
+          <li>{t("admin.notif.sl.steps.s2")}</li>
+          <li>{t("admin.notif.sl.steps.s3")}</li>
+          <li>{t("admin.notif.sl.steps.s4")}</li>
+        </ol>
+        <div className="imx-steps-order">{t("admin.notif.sl.steps.order")}</div>
+        <button className="imx-guide-link" onClick={() => setGuide(true)}>
+          {t("admin.notif.guideLink")} <span aria-hidden="true">→</span>
+        </button>
+      </div>
+      <SlackGuideDrawer open={guide} onClose={() => setGuide(false)} webhookUrl={webhookUrl} />
+    </div>
+  );
+}
+
+/* ───────────────── 多云:阿里云只读凭据 ─────────────────
+ * 界面形状像上面三个 IM 平台，但**不是一类东西**:那三个是我们的机器人在客户 IM 里的身份，
+ * 这一个是**客户另一朵云账号的凭据**。所以它自己一个 tab、自己一条后端路由
+ * （PUT/GET /admin/aliyun-config，见 bff/web-chat/aliyun_config.mjs），
+ * **不做**「集成 IM」页的第 4 个平台分页 —— 混进去等于让那一页的"一次请求画出全部平台"
+ * 多背一个失败源，而这一页最贵的 bug 恰好是**界面骗人**。
+ *
+ * 与那三页的结构性差别（都在文案里明说，属于「不许静默降级」）:
+ *   ① **没有「测试连接」按钮**。阿里云那边能证明凭据有效的调用还没接进来;做一个只验格式的
+ *      按钮，「通过」会被客户读成「多云功能已可用」。替代判据写进 `admin.aliyun.noTest`:
+ *      去 RAM 控制台看这副 AccessKey 的「最后使用时间」。
+ *   ② **抽屉里没有 webhook 地址块**。配阿里云是反方向 —— 我们这边没有任何要交给对方的地址，
+ *      所以 AliyunGuideDrawer 不传那三个 url 相关 prop（见 ImGuideDrawer 文件头）。
+ *   ③ **只有一种认证模式**。后端 `auth_mode` 只接受 `"ak"`，所以这里连模式选择器都不画 ——
+ *      留半个 OIDC 入口 = 客户能存下一组运行时用不上的值，然后界面显示「已配置」。
+ *
+ * 「已配置」的判据**由后端给**（`configured`）:AK id 与 AK secret 都非空才算。前端不自己
+ * 判空 —— 两边各判一次迟早不一致。
+ *
+ * ── 第二块:STAROps 数字员工 ──────────────────────────────────────────
+ * 与凭据同一页、同一个保存按钮，因为它们**永远一起用**:没 AK 的员工名发不出一次调用，
+ * 有 AK 没员工名同样发不出。拆成两块各自保存只会造出"一半配好"的中间态,而对话页那边
+ * 只有一个"可用/不可用"的分段控件 —— 中间态在那里表达不出来,客户只会看到它是灰的、
+ * 却不知道差哪一项（这正是 `/features/starops` 要逐项回 reason 的原因）。
+ *
+ * ⚠️ 两个 region 字段**不是**一件事,合并就是个必然的 404:
+ *    · 上面的「地域」   = 要被巡检的地域（客户资源在哪,如 cn-hangzhou,自由填）
+ *    · 下面的「接口地域」= STAROps 服务自己在哪,**全世界只有两个取值** → 做成下拉,
+ *      不给自由填的机会（填错的症状是语义不明的 404,客户会去怀疑员工名）。
+ */
+/** STAROps 接口地域的全部取值。**与 bff/web-chat/aliyun_config.mjs 的 STAROPS_REGIONS
+ *  同一份事实**:那边是保存时的硬校验,这里只是不让客户填出会被拒的值。阿里云加了新地域
+ *  时两边都要改 —— 只改这边的症状是保存时 400,只改那边的症状是客户在页面上选不到。 */
+const STAROPS_REGION_OPTIONS = ["cn-beijing", "ap-southeast-1"] as const;
+
+function AliyunView() {
+  const t = useT();
+  const [loading, setLoading] = useState(true);
+  const [akId, setAkId] = useState("");
+  const [akSecret, setAkSecret] = useState("");
+  const [region, setRegion] = useState("");
+  const [configured, setConfigured] = useState(false);
+  const [soEmployee, setSoEmployee] = useState("");
+  const [soRegion, setSoRegion] = useState<string>(STAROPS_REGION_OPTIONS[0]);
+  const [soWorkspace, setSoWorkspace] = useState("");
+  const [soProject, setSoProject] = useState("");
+  const [staropsConfigured, setStaropsConfigured] = useState(false);
+  const [touched, setTouched] = useState<TouchedMap>({ access_key_secret: false });
+  /** 服务端给的脱敏原值，用于「没动过 → 原样回传」。理由与三个 IM 平台逐字相同:
+   *  密码管理器填进来的值不以 `****` 开头，后端会当成"改了新值"直接覆盖 Secrets Manager。
+   *  客户只是进这一页改个地域，密钥就被静默换掉 —— 然后阿里云那边开始"签名不对"。 */
+  const loaded = useRef({ access_key_secret: "" });
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [guide, setGuide] = useState(false);
+
+  // `silent` 的理由与三个 IM 平台相同（首次加载时 loading 初值已是 true）。
+  const load = (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setLoading(true);
+    fetchAliyunConfig()
+      .then((r) => {
+        // 老 BFF（还没部署这条路由）不回 `aliyun` —— 退回"空表单"，不能白屏。
+        const a = r.aliyun ?? {
+          access_key_id: "", access_key_secret: "", region_id: "", configured: false,
+          starops_employee: "", starops_region: "", starops_workspace: "", starops_project: "",
+          starops_configured: false,
+        };
+        setAkId(a.access_key_id || "");
+        setAkSecret(a.access_key_secret || "");
+        setRegion(a.region_id || "");
+        setConfigured(Boolean(a.configured));
+        setSoEmployee(a.starops_employee || "");
+        // 后端没存过接口地域时给默认值,但**只在这里**给 —— 保存时原样回传这个显式值,
+        // 不让"页面显示 cn-beijing、库里是空、运行时再各自回落"这种三方不一致存在。
+        setSoRegion(a.starops_region || STAROPS_REGION_OPTIONS[0]);
+        setSoWorkspace(a.starops_workspace || "");
+        setSoProject(a.starops_project || "");
+        setStaropsConfigured(Boolean(a.starops_configured));
+        loaded.current = { access_key_secret: a.access_key_secret || "" };
+        setTouched({ access_key_secret: false });
+      })
+      .catch((e) => setMsg({ ok: false, text: String(e?.message || e) }))
+      .finally(() => setLoading(false));
+  };
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { load({ silent: true }); }, []);   // 判据同三个 IM 平台（同步路径上没有 setState）
+
+  const save = async () => {
+    setSaving(true); setMsg(null);
+    try {
+      const r = await putAliyunConfig({
+        // trim:这两串是从阿里云控制台**复制**来的，粘贴带尾随空格/换行是常事，而后果是
+        // 签名校验失败 —— 症状与"密钥填错了"一模一样，指不到真因。
+        access_key_id: akId.trim(),
+        access_key_secret: touched.access_key_secret ? akSecret.trim() : loaded.current.access_key_secret,
+        region_id: region.trim(),
+        // 同样 trim:员工名是从 STAROps 控制台复制来的,尾随空格会被拼进 URL 路径 →
+        // 404,而客户看着页面上的名字是对的。
+        starops_employee: soEmployee.trim(),
+        starops_region: soRegion,
+        starops_workspace: soWorkspace.trim(),
+        starops_project: soProject.trim(),
+      });
+      setMsg({ ok: true, text: r.message || t("admin.notif.saved") });
+      load();   // 重新拉取,让 secret 显示为脱敏形态、并让「已配置」跟着后端判据走
+    } catch (e) {
+      setMsg({ ok: false, text: String((e as Error)?.message || e) });
+    } finally { setSaving(false); }
+  };
+
+  return (
+    <div>
+      <SectionHead title={t("admin.aliyun.title")} sub={t("admin.aliyun.sub")} />
+      {loading ? <div style={{ color: "var(--muted)", fontSize: 13 }}>{t("admin.notif.loading")}</div> : (
+        <div style={{ ...box, padding: 18, maxWidth: 640, display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: configured ? "var(--green)" : "var(--muted)" }}>
+            {configured ? t("admin.aliyun.configured") : t("admin.aliyun.notConfigured")}
+          </div>
+          <div>
+            <FieldLabel>AccessKey ID</FieldLabel>
+            <input style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} value={akId}
+              onChange={(e) => setAkId(e.target.value)} placeholder="LTAIxxxxxxxxxxxxxxxx" />
+            <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>{t("admin.aliyun.akIdHint")}</div>
+          </div>
+          <SecretField platform="aliyun" label="AccessKey Secret" k="access_key_secret"
+            value={akSecret} onChange={setAkSecret}
+            touched={touched} setTouched={setTouched} hint={t("admin.aliyun.akSecretHint")}
+            placeholder={t("admin.notif.secretPh")} />
+          <div>
+            <FieldLabel>{t("admin.aliyun.region")}</FieldLabel>
+            <input style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} value={region}
+              onChange={(e) => setRegion(e.target.value)} placeholder="cn-hangzhou" />
+            <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>{t("admin.aliyun.regionHint")}</div>
+          </div>
+          <div className="imx-steps-order">{t("admin.aliyun.required")}</div>
+
+          {/* ── STAROps 数字员工（对话对象那一段的全部配置）───────────────────
+              放在凭据**下面**、同一个保存按钮里:先有钥匙才谈得上找谁说话,顺序反了客户会
+              先填员工名、保存、然后看到"未配置"。 */}
+          <div style={{ borderTop: "1px solid var(--line)", paddingTop: 14, marginTop: 2 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 4 }}>{t("admin.aliyun.so.title")}</div>
+            <div style={{ color: "var(--muted)", fontSize: 11.5, lineHeight: 1.6 }}>{t("admin.aliyun.so.sub")}</div>
+            <div style={{ fontSize: 12.5, fontWeight: 600, marginTop: 10, color: staropsConfigured ? "var(--green)" : "var(--muted)" }}>
+              {staropsConfigured ? t("admin.aliyun.so.configured") : t("admin.aliyun.so.notConfigured")}
+            </div>
+          </div>
+          <div>
+            <FieldLabel>{t("admin.aliyun.so.employee")}</FieldLabel>
+            <input style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} value={soEmployee}
+              onChange={(e) => setSoEmployee(e.target.value)} placeholder="my-sre-agent" />
+            <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>{t("admin.aliyun.so.employeeHint")}</div>
+          </div>
+          <div>
+            <FieldLabel>{t("admin.aliyun.so.region")}</FieldLabel>
+            {/* 下拉而不是输入框:全世界只有这两个取值（见 STAROPS_REGION_OPTIONS 的注释）。 */}
+            <select style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} value={soRegion}
+              onChange={(e) => setSoRegion(e.target.value)}>
+              {STAROPS_REGION_OPTIONS.map((r) => <option key={r} value={r}>{r}</option>)}
+            </select>
+            <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>{t("admin.aliyun.so.regionHint")}</div>
+          </div>
+          <div>
+            <FieldLabel>{t("admin.aliyun.so.workspace")}</FieldLabel>
+            <input style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} value={soWorkspace}
+              onChange={(e) => setSoWorkspace(e.target.value)} placeholder={t("admin.aliyun.so.optionalPh")} />
+            <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>{t("admin.aliyun.so.workspaceHint")}</div>
+          </div>
+          <div>
+            <FieldLabel>{t("admin.aliyun.so.project")}</FieldLabel>
+            <input style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} value={soProject}
+              onChange={(e) => setSoProject(e.target.value)} placeholder={t("admin.aliyun.so.optionalPh")} />
+            <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 4 }}>{t("admin.aliyun.so.projectHint")}</div>
+          </div>
+          <div className="imx-steps-order">{t("admin.aliyun.so.required")}</div>
+
+          {/* 「没有测试连接」这条必须画在表单里，不能只写在抽屉里 —— 客户按完保存就会去找
+              「测试」，而找不到的时候人不会去点「详细步骤」。 */}
+          <div style={{ color: "var(--muted)", fontSize: 11.5, lineHeight: 1.6 }}>{t("admin.aliyun.noTest")}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <button style={btnPrimary} disabled={saving} onClick={save}>{saving ? t("admin.notif.saving") : t("admin.notif.save")}</button>
+            {msg && <span style={msg.ok ? okText : errText}>{msg.text}</span>}
+          </div>
+        </div>
+      )}
+
+      <div className="imx-steps">
+        <div className="imx-steps-title">{t("admin.aliyun.steps.title")}</div>
+        <ol>
+          <li>{t("admin.aliyun.steps.s1")}</li>
+          <li>{t("admin.aliyun.steps.s2")}</li>
+          <li>{t("admin.aliyun.steps.s3")}</li>
+        </ol>
+        <div className="imx-steps-order">{t("admin.aliyun.steps.order")}</div>
+        <button className="imx-guide-link" onClick={() => setGuide(true)}>
+          {t("admin.notif.guideLink")} <span aria-hidden="true">→</span>
+        </button>
+      </div>
+      <AliyunGuideDrawer open={guide} onClose={() => setGuide(false)} />
     </div>
   );
 }
@@ -1477,8 +1838,18 @@ function RolesView({ caps }: { caps: FullCapabilityNode[] }) {
   const [newName, setNewName] = useState("");
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
+  /**
+   * 左栏（新建 / 删除 / 列表加载）自己的提示位。
+   *
+   * 为什么不复用上面那对：`err`/`msg` 只渲染在**右侧权限树里**，而右侧那块只在
+   * `sel` 非空（已选中某个角色）时才存在。于是「刚进角色页 → 什么都没选 → 点新建角色」
+   * 这条最常见的路径上，每一种失败都被写进一个当时**根本没有渲染**的变量 ——
+   * 界面上的表现就是「点了以后没有反应」（客户实测报的就是这个）。
+   * 新建和删除两个按钮都在左栏，它们的失败原因必须落在左栏。
+   */
+  const [listErr, setListErr] = useState("");
 
-  const reload = () => fetchRoles().then(setRoles).catch((e) => setErr(String(e?.message || e)));
+  const reload = () => fetchRoles().then(setRoles).catch((e) => setListErr(String(e?.message || e)));
   useEffect(() => { reload(); }, []);
 
   // 父→子索引（按 registry 顺序）
@@ -1541,18 +1912,40 @@ function RolesView({ caps }: { caps: FullCapabilityNode[] }) {
   };
   const create = async () => {
     const name = newName.trim();
-    if (!name) return;
-    setMsg(""); setErr("");
-    try { await saveRole(name, []); setNewName(""); await reload(); selectRole(name); }
-    catch (e) { setErr(String((e as Error)?.message || e)); }
+    setMsg(""); setErr(""); setListErr("");
+    // ① 空名字：此前是 `if (!name) return`,静默 —— 「点了没反应」最直接的一种成因。
+    if (!name) { setListErr(t("admin.roles.err.empty")); return; }
+    // ② 不合法的名字（中文 / 空格 / 单个字符 / 点和斜杠…）：服务端会 400 invalid_role_name。
+    //    这里先拦一次不是为了省一个请求,而是为了把"为什么不行"说成人话 ——
+    //    否则界面上最好的情况也只是甩出一个 `invalid_role_name` 错误码。
+    if (!ROLE_NAME_RE.test(name)) { setListErr(t("admin.roles.err.name")); return; }
+    // ③ 已存在的名字**必须**拦住:`POST /admin/roles` 是 upsert,拿一个已有角色名去
+    //    「新建」会把那个角色的权限**清空**(预置角色则被一条空权限的 DDB 记录盖掉,
+    //    因为 authz 解析时 DDB 优先于内存 PRESET_ROLES)。界面上只表现为"没建出来",
+    //    实际是一次静默的权限回收 —— 这是这个按钮身上最贵的一个 bug。
+    if (roles.some((r) => r.name === name)) {
+      setListErr(t("admin.roles.err.exists").replace("{name}", roleName(t, name)));
+      selectRole(name);   // 顺手把它选中：客户想要的多半就是编辑它
+      return;
+    }
+    try {
+      await saveRole(name, []);
+      setNewName("");
+      await reload();
+      // 不走 selectRole():它从**闭包里那份旧 roles** 查权限,刚建的角色不在里面。
+      // 新角色权限本来就是空的,直接置空更诚实,也不依赖 reload 的时序。
+      setSel(name); setPerms(new Set());
+    } catch (e) { setListErr(String((e as Error)?.message || e)); }
   };
   const remove = async (name: string) => {
     if (!window.confirm(t("admin.confirm.deleteRole").replace("{name}", name))) return;
-    setMsg(""); setErr("");
+    setMsg(""); setErr(""); setListErr("");
     try { await deleteRole(name); if (sel === name) { setSel(""); setPerms(new Set()); } await reload(); }
     catch (e) {
       const m = String((e as Error)?.message || e);
-      setErr(m === "role_in_use" ? t("admin.roles.inuse").replace("{n}", "≥1") : m);
+      // 删除按钮也在左栏 → 失败原因（典型是 409 role_in_use）同样落在左栏,
+      // 否则没选中角色时删一个在用的角色又是一次"点了没反应"。
+      setListErr(m === "role_in_use" ? t("admin.roles.inuse").replace("{n}", "≥1") : m);
     }
   };
 
@@ -1620,10 +2013,22 @@ function RolesView({ caps }: { caps: FullCapabilityNode[] }) {
     <div style={{ display: "flex", gap: 20, alignItems: "flex-start" }}>
       {/* 左：角色列表 + 新建 */}
       <div style={{ ...box, padding: 12, width: 232, flexShrink: 0 }}>
-        <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
-          <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder={t("admin.roles.name")} style={{ ...inputStyle, flex: 1, minWidth: 0 }} />
+        <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+          <input
+            value={newName}
+            onChange={(e) => { setNewName(e.target.value); setListErr(""); }}
+            onKeyDown={(e) => { if (e.key === "Enter") void create(); }}
+            placeholder={t("admin.roles.name")}
+            style={{ ...inputStyle, flex: 1, minWidth: 0 }}
+          />
           <button style={btnPrimary} onClick={create}>{t("admin.roles.new")}</button>
         </div>
+        {/* 命名规则**先说在前面**,而不是等失败了再说：服务端只收字母/数字/`:`/`_`/`-`
+            且 2–64 位,中文角色名是最容易踩的那一个。 */}
+        <div style={{ fontSize: 11, color: "var(--muted)", lineHeight: 1.5, marginBottom: listErr ? 5 : 14 }}>
+          {t("admin.roles.nameRule")}
+        </div>
+        {listErr && <div style={{ ...errText, marginBottom: 14, lineHeight: 1.5 }}>{listErr}</div>}
         <FieldLabel>{t("admin.roles.listTitle")}</FieldLabel>
         {roles.map((r) => (
           <div key={r.name} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>

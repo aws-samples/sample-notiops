@@ -11,8 +11,13 @@ GSI1 Query 和一次 STS），不碰任何模型。
 
 ── 三个开关的语义（详见 `core/im_prefs.py`）────────────────────────────────────
   · `agent`  ：`devops`（默认，直连客户自己的 DevOps Agent，NotiOps 侧 0 token）
-               / `notiops`（走模型的 NotiOps Agent，**会烧 token**）；
-  · `web`    ：联网搜索开关，**只对 `agent=notiops` 生效**（直连那条路上联不联网由
+               / `notiops`（走模型的 NotiOps Agent，**会烧 token**）
+               / `starops`（直连阿里云 STAROps 数字员工，NotiOps 侧 0 token，但**烧客户
+                 自己的阿里云 AI 额度**，而且看的是**阿里云**资源不是 AWS。
+                 ⚠️ 2026-09-15 起这一档**不再对客户宣传**：用法行与「可用: …」都不列它
+                 （`core/multicloud.py` 的 `VISIBLE`），但 `/agent starops` 照旧能打通，
+                 已经配好阿里云的部署不受影响 —— 藏的是文案，不是功能）；
+  · `web`    ：联网搜索开关，**只对 `agent=notiops` 生效**（两条直连路上联不联网由
                客户自己那套 agent 决定，我们说不上话）；
   · `account`：这个会话在问哪个 AWS 账号（默认 = 部署账号）。**上车 / 启用 / 停用只在
                Web 做**，这里只"选"，且每次都拿注册表校验（`core/im_accounts.py`）。
@@ -27,12 +32,16 @@ GSI1 Query 和一次 STS），不碰任何模型。
 """
 from __future__ import annotations
 
-from core import agent_chat, i18n, im_accounts, im_prefs, nl_router
+from core import (
+    agent_chat, i18n, im_accounts, im_prefs, multicloud, nl_router, starops_chat,
+)
 from platforms.common.im_types import ImMessage
 
-#: `/agent <arg>` 的入参别名。故意**只收 ASCII**：中文触发词在
+#: `/agent <arg>` 的入参别名。**本模块一个中文字都不写**：中文触发词在
 #: `core/nl_router.py::_AGENT_RE` 那一层（`/智能体 notiops`），到这里 `arg` 已经是
-#: 命令后面那半截。两个 agent 的名字本身不翻译（它们是产品名）。
+#: 命令后面那半截；而 STAROps 那几个中文同义词（「阿里云」）也从 nl_router 取 ——
+#: 本模块故意**不在** `scripts/lint_i18n.py` 的 CJK 允许清单里（无用的豁免会掩盖真实的
+#: 漏翻译），所以中文字面量只许出现在那边。三个 agent 的名字本身不翻译（它们是产品名）。
 _AGENT_ALIASES: dict[str, str] = {
     "devops": im_prefs.AGENT_DEVOPS,
     "dev": im_prefs.AGENT_DEVOPS,
@@ -40,6 +49,17 @@ _AGENT_ALIASES: dict[str, str] = {
     "notiops": im_prefs.AGENT_NOTIOPS,
     "noti": im_prefs.AGENT_NOTIOPS,
     "notiops-agent": im_prefs.AGENT_NOTIOPS,
+    **{w: im_prefs.AGENT_STAROPS for w in nl_router.AGENT_STAROPS_WORDS},
+}
+
+#: agent → 显示标签的 i18n key。**用映射而不是 if/else**：第三个 agent 进来时 if/else
+#: 的失败方式是"悄悄显示成 DevOps Agent"（else 分支兜住了一切），客户切了 STAROps 却
+#: 看到 DevOps 的标签，而且没有任何报错。映射 + `.get()` 显式回落，加第四个时漏改会在
+#: 测试里当场暴露（`tests/test_im_starops_agent.py`）。
+_AGENT_LABEL_KEYS: dict[str, str] = {
+    im_prefs.AGENT_DEVOPS: "agent.label.devops",
+    im_prefs.AGENT_NOTIOPS: "agent.label.notiops",
+    im_prefs.AGENT_STAROPS: "agent.label.starops",
 }
 
 #: 「清除偏好，回到默认」。与 `/model default` 同一个词，用户不用记第二套。
@@ -57,16 +77,15 @@ _OFF_WORDS = nl_router.WEB_OFF_WORDS
 def _agent_label(agent: str, locale: str) -> str:
     """agent → 带口径说明的显示名（「…(走模型 · 会消耗 token)」）。
 
-    **不要**只回 "NotiOps Agent"：这两个名字对客户来说都只是名字，"花不花钱"才是他
-    切换时真正要看的信息，所以标签自带那句。
+    **不要**只回 "NotiOps Agent"：这几个名字对客户来说都只是名字，"花不花钱、看的是哪家
+    云"才是他切换时真正要看的信息，所以标签自带那句。
     """
-    key = ("agent.label.notiops" if agent == im_prefs.AGENT_NOTIOPS
-           else "agent.label.devops")
+    key = _AGENT_LABEL_KEYS.get(agent, "agent.label.devops")
     return i18n.t(key, locale)
 
 
 def agent_reply(msg: ImMessage, arg: str, *, platform: str) -> str:
-    """`/agent [notiops|devops|default]` 的回复文本。**永不抛**（写失败也只是回一句）。
+    """`/agent [notiops|devops|starops|default]` 的回复文本。**永不抛**（写失败也只是回一句）。
 
     空参 = 查看当前值（与 `/model` 同口径：查看永远不改任何东西）。
     """
@@ -79,7 +98,7 @@ def agent_reply(msg: ImMessage, arg: str, *, platform: str) -> str:
         cur, source = im_prefs.resolve_agent(**where)
         return (i18n.t("agent.current", msg.locale,
                        label=_agent_label(cur, msg.locale), source=source)
-                + "\n" + i18n.t("agent.usage", msg.locale))
+                + "\n" + i18n.t(multicloud.agent_usage_key(), msg.locale))
 
     if a in _CLEAR_WORDS:
         ok = im_prefs.clear_agent(**where)
@@ -87,14 +106,22 @@ def agent_reply(msg: ImMessage, arg: str, *, platform: str) -> str:
 
     target = _AGENT_ALIASES.get(a)
     if target is None:
-        return (i18n.t("agent.unknown", msg.locale, arg=a)
-                + "\n" + i18n.t("agent.usage", msg.locale))
+        return (i18n.t(multicloud.agent_unknown_key(), msg.locale, arg=a)
+                + "\n" + i18n.t(multicloud.agent_usage_key(), msg.locale))
 
     # 这套部署没接 NotiOps Agent → **拒绝**，并且不写偏好。写进去的后果是每一轮都
     # 悄悄回落到 devops（`agent_chat.run_agent_chat` 会明确拒答），用户只会觉得
     # "切了但没用"，而日志在另一个函数里。
     if target == im_prefs.AGENT_NOTIOPS and not agent_chat.configured():
         return i18n.t("agent.not_configured", msg.locale)
+
+    # 同一条口径对 STAROps：没在 Admin「多云」页填阿里云 AccessKey + 数字员工 ID 时
+    # **拒绝且不写偏好**。写进去的后果更糟：每一轮 `run_starops_chat` 都会回一句"去配一下"，
+    # 而用户以为自己已经切成功了、只是产品坏了。
+    # ⚠️ 这里**只读本地配置、不打阿里云**（见 `core/starops_chat.availability`）—— 代价是
+    #    "配了但员工 ID 写错"这里放行，那种错由第一次真实对话报出更具体的话术。
+    if target == im_prefs.AGENT_STAROPS and not starops_chat.configured():
+        return i18n.t("agent.starops_not_configured", msg.locale)
 
     if not im_prefs.set_agent(target, **where):
         return i18n.t("agent.set_failed", msg.locale)
@@ -103,6 +130,13 @@ def agent_reply(msg: ImMessage, arg: str, *, platform: str) -> str:
                  label=_agent_label(target, msg.locale))
     if target == im_prefs.AGENT_NOTIOPS:
         out += "\n" + i18n.t("agent.token_notice", msg.locale)
+    if target == im_prefs.AGENT_STAROPS:
+        # 切到 STAROps 也必须把两件事说出来，理由和 `token_notice` 一样（IM 是被动入口）：
+        #   1. 这条路问的是**阿里云**资源，不是 AWS —— 不说的话客户会拿它问 EC2 然后
+        #      得到"查不到"，并归因成产品坏了；
+        #   2. NotiOps 侧 0 token，但**烧客户自己的阿里云 AI 额度**。
+        out += "\n" + i18n.t("agent.starops_notice", msg.locale,
+                             employee=starops_chat.availability().get("employee") or "-")
     return out
 
 

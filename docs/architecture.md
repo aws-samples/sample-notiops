@@ -45,7 +45,7 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 │                                                                                              │
 │  飞书 ──webhook──┐   ingress λ（验签+去重+异步投递）                                          │
 │  Slack ──webhook─┤──▶ ─────────────────────────▶ worker λ (import core/)                     │
-│  钉钉 ⏳ Phase 2（M2 拆掉 Fargate 后需要补 webhook 适配）│                                    │
+│  钉钉 ──webhook──┘   （三家同形态、各自一套 HTTP API；钉钉须选 HTTP 模式）                   │
 │                           ├─ core.nl_router       确定性意图路由（0 token）                  │
 │                           ├─ core.bedrock_intent  意图分类(只剩案例路径用)                  │
 │                           ├─ core.bedrock_chat    通用对话 + AWS Docs MCP（仅回滚路径）      │
@@ -164,10 +164,10 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 | Lambda — Web Notif Handler (`notiops-web-notif-handler`) | 256MB / 60s,`shared.report_delivery.web_push_handler`,把同样的事件写进 `notiops-web-chat` 表的 `notif#` 段(Web Chat 站内收件箱);**两条部署路径都建**,共用 `infra/lib/constructs/web-notif-sources.ts` 这一份事件源定义 |
 | Lambda — DevOps Callback (`devops_agent_callback`) | 256MB / 120s,跨账户拉一次长报告 → S3 + Bedrock 精简 summary_card → 入 `invst#` 行 |
 | Lambda — PHD Forwarder (`phd_event_forwarder`) | 128MB / 90s,AWS Health 事件 LLM 翻译,SNS 触发 |
-| Lambda — IM ingress (`platforms/{feishu,slack}/lambda_ingress.py`) | 2048MB / 20s,只验签 + 幂等去重 + 异步 invoke worker;由 HTTP API 触发,`reservedConcurrentExecutions=10`。内存给到 2048MB 是为了压住冷启动 —— Lambda 的 INIT 阶段有 10s 硬上限(不受函数 timeout 约束),内存给小了 init 就会超时并挪到首次 invoke 里重跑,见 `infra/lib/constructs/im-core.ts` 里那段实测记录 |
-| Lambda — IM worker (`platforms/{feishu,slack}/lambda_worker.py`) | 900s,真正处理消息 / 卡片回调,import `core/` |
+| Lambda — IM ingress (`platforms/{feishu,slack,dingtalk}/lambda_ingress.py`) | 2048MB / 20s,只验签 + 幂等去重 + 异步 invoke worker;由 HTTP API 触发,`reservedConcurrentExecutions=10`。内存给到 2048MB 是为了压住冷启动 —— Lambda 的 INIT 阶段有 10s 硬上限(不受函数 timeout 约束),内存给小了 init 就会超时并挪到首次 invoke 里重跑,见 `infra/lib/constructs/im-core.ts` 里那段实测记录 |
+| Lambda — IM worker (`platforms/{feishu,slack,dingtalk}/lambda_worker.py`) | 900s,真正处理消息 / 卡片回调,import `core/` |
 | Lambda — IM progress (`notiops-im-progress`) | 512MB / 5min(`platforms.common.lambda_progress.handler`),每 1 分钟被 EventBridge 唤醒刷新调查进度卡 |
-| ~~ECS Fargate — IM bots (`platforms/{feishu,slack,dingtalk}/app/`)~~ | ❌ 2026-09-03(M2)退役,不再创建。应用代码(`app/main.py`)与 Dockerfile 保留在仓库里作回滚路径;dingtalk 仍是 Phase 2,且 M2 之后接钉钉需要先写 webhook 适配 |
+| ~~ECS Fargate — IM bots (`platforms/{feishu,slack,dingtalk}/app/`)~~ | ❌ 2026-09-03(M2)退役,不再创建。应用代码(`app/main.py`)与 Dockerfile 保留在仓库里作回滚路径,不被任何 app 引用;三家(含钉钉)现在都走上面那对 webhook Lambda |
 
 > 另有 CDK 自管的 Custom Resource Lambda(如 seed-data 初始化配置)。
 

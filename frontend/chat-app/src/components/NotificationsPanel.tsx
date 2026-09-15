@@ -335,6 +335,8 @@ export default function NotificationsPanel({
   // 此时徽章退回本页条数、截断提示退化成不带总数的版本 —— 宁可说"未知"也不编数字。
   const [inboxBySource, setInboxBySource] = useState<Record<string, number> | null>(null);
   const [loading, setLoading] = useState(true);
+  // 拉取失败 ≠ 收件箱是空的。没有这一位，一次 500 会被下面的空态画成「暂无事件 / 没开这个源」。
+  const [inboxFailed, setInboxFailed] = useState(false);
   const [health, setHealth] = useState<HealthDashboard | null>(null);
   const [healthLoading, setHealthLoading] = useState(true);
   const [section, setSection] = useState<SectionKey>("service");
@@ -352,12 +354,13 @@ export default function NotificationsPanel({
   const load = () => {
     setLoading(true);
     listNotifications().then((r) => {
+      setInboxFailed(r.ok === false);
       setItems(r.items); setLastReadTs(r.lastReadTs);
       // bySource 可能是 null(后端聚合失败)；?? null 把 undefined(老后端)也归一成"未知"
       setInboxTruncated(!!r.truncated);
       setInboxBySource(r.bySource ?? null);
       setLoading(false);
-    }).catch(() => setLoading(false));
+    }).catch(() => { setInboxFailed(true); setLoading(false); });
     setHealthLoading(true);
     getHealthDashboard(accountId).then((h) => { setHealth(h); setHealthLoading(false); }).catch(() => setHealthLoading(false));
   };
@@ -417,6 +420,31 @@ export default function NotificationsPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountId]);
 
+  /**
+   * 「加载失败」行 —— 与 .notif-health-unavail（灰色「不可用」）**刻意不同**：
+   * 「不可用」= 这就是你环境的事实（别再等了）；「加载失败」= 我们没问到（重试 / 查权限）。
+   * 两者混成一态时，一次 HTTP 500 会被读成「你的支持计划不够」或「收件箱是空的」。
+   * code 只放我们自己的码（http_NNN / fetch_failed / error），绝不放上游 message。
+   */
+  const FailLine = ({ msg, code, onRetry }: { msg: string; code?: string; onRetry: () => void }) => (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 13, color: "var(--text)",
+      background: "rgba(209,50,18,.06)", border: "1px solid rgba(209,50,18,.35)", borderRadius: 9, padding: "9px 12px" }}>
+      <span style={{ color: "#d13212", fontWeight: 700 }}>{locale === "en" ? "Load failed" : "加载失败"}</span>
+      <span style={{ color: "var(--muted)" }}>{msg}{code ? ` (${code})` : ""}</span>
+      <button onClick={onRetry}
+        style={{ marginLeft: "auto", fontSize: 12, fontWeight: 700, padding: "2px 12px", borderRadius: 100, border: "1px solid var(--orange)", background: "rgba(255,153,0,.10)", color: "var(--text)", cursor: "pointer" }}>
+        {t("notif.retry")}
+      </button>
+    </div>
+  );
+
+  /** Health 三处（服务/账户/计划变更）共用的「没问到」判定。`reason === "error"` = 后端抛异常。 */
+  const healthFailed = !health || health.ok === false || health.reason === "error";
+  const retryHealth = () => {
+    setHealthLoading(true);
+    getHealthDashboard(accountId).then((h) => { setHealth(h); setHealthLoading(false); }).catch(() => setHealthLoading(false));
+  };
+
   const renderHealthEvent = (e: HealthEvent) => (
     <HealthEventCard key={e.arn} e={e} locale={locale} t={t} tpl={tpl}
       onInvestigate={onInvestigate} onAsk={onAsk} />
@@ -428,11 +456,15 @@ export default function NotificationsPanel({
     subLink: { href: string; label: string }, moreLink: string,
   ) => {
     if (healthLoading) return <div className="notif-health-empty">…</div>;
-    if (!health || health.available === false) {
+    // `!health ||` 写在前面是给 TS 收窄用的（healthFailed 是外部布尔，不参与收窄）。
+    if (!health || healthFailed) return <FailLine msg={t("notif.health.loadFailed")} code={health?.reason} onRetry={retryHealth} />;
+    if (health.available === false) {
       return (
         <div className="notif-health-unavail">
-          {t("notif.health.unavailable")}
-          {health?.links?.home && (
+          {health.reason && health.reason !== "subscription_required"
+            ? `${t("notif.health.unavailable")} (${health.reason})`
+            : t("notif.health.unavailable")}
+          {health.links?.home && (
             <a href={health.links.home} target="_blank" rel="noreferrer"> {t("notif.health.openConsole")} <IconExternal size={12} /></a>
           )}
         </div>
@@ -467,11 +499,15 @@ export default function NotificationsPanel({
     const L = health?.links;
     const subHref = L?.scheduledChanges || "#";
     if (healthLoading) return <div className="notif-health-empty">…</div>;
-    if (!health || health.available === false) {
+    // `!health ||` 写在前面是给 TS 收窄用的（healthFailed 是外部布尔，不参与收窄）。
+    if (!health || healthFailed) return <FailLine msg={t("notif.health.loadFailed")} code={health?.reason} onRetry={retryHealth} />;
+    if (health.available === false) {
       return (
         <div className="notif-health-unavail">
-          {t("notif.health.unavailable")}
-          {health?.links?.home && (
+          {health.reason && health.reason !== "subscription_required"
+            ? `${t("notif.health.unavailable")} (${health.reason})`
+            : t("notif.health.unavailable")}
+          {health.links?.home && (
             <a href={health.links.home} target="_blank" rel="noreferrer"> {t("notif.health.openConsole")} <IconExternal size={12} /></a>
           )}
         </div>
@@ -822,6 +858,8 @@ export default function NotificationsPanel({
         </div>
         {loading ? (
           <div className="notif-health-empty">…</div>
+        ) : inboxFailed ? (
+          <FailLine msg={t("notif.loadFailed")} onRetry={load} />
         ) : group.length === 0 ? (
           <div className="notif-empty">
             <div className="notif-empty-ic"><IconBell size={36} /></div>

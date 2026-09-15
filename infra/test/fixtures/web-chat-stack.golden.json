@@ -1779,16 +1779,35 @@
               "Effect": "Allow",
               "Resource": [
                 "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-feishu*",
-                "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-dingtalk*"
-              ]
+                "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-dingtalk*",
+                "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/slack-bot-token*",
+                "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/slack-signing-secret*"
+              ],
+              "Sid": "ImBotSecretsReadWrite"
             },
             {
               "Action": "secretsmanager:CreateSecret",
               "Effect": "Allow",
               "Resource": [
                 "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-feishu*",
-                "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-dingtalk*"
-              ]
+                "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/im-bot-dingtalk*",
+                "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/slack-bot-token*",
+                "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/slack-signing-secret*"
+              ],
+              "Sid": "ImBotSecretsCreate"
+            },
+            {
+              "Action": [
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:PutSecretValue",
+                "secretsmanager:UpdateSecret",
+                "secretsmanager:DescribeSecret",
+                "secretsmanager:CreateSecret",
+                "secretsmanager:TagResource"
+              ],
+              "Effect": "Allow",
+              "Resource": "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/aliyun-credentials*",
+              "Sid": "AliyunCredentialsSecretAccess"
             },
             {
               "Action": "apigateway:GET",

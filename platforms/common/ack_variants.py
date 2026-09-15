@@ -81,6 +81,34 @@ ACK_BODY_KEYS_NOTIOPS: tuple[str, ...] = (
     "im.chat.ack_body.notiops.5",
 )
 
+#: 第三套：`/agent starops`（阿里云 STAROps 数字员工，2026-09-14）。同一个种子在三套里
+#: 选到同一个下标，所以"这条消息的语气"仍然一致。
+#:
+#: 这一套换掉的不只是名字，是**云**。前两套都在说 AWS，这条路问的是阿里云 —— 复用前两套
+#: 里任何一条的下场：客户拿 AWS 的问题过来，ack 说得像 AWS 那条路，几分钟后拿到一句
+#: "查不到"，然后把这归因成产品坏了。ack 是这一轮**唯一**的早期纠错窗口（真正的答案在
+#: 几分钟之后），所以这五条里「阿里云」必须出现。
+ACK_BODY_KEYS_STAROPS: tuple[str, ...] = (
+    "im.chat.ack_body.starops.1",
+    "im.chat.ack_body.starops.2",
+    "im.chat.ack_body.starops.3",
+    "im.chat.ack_body.starops.4",
+    "im.chat.ack_body.starops.5",
+)
+
+#: agent → 那一套开场句。**用映射而不是 if/elif 链**（同 `pref_commands._AGENT_LABEL_KEYS`
+#: 的理由）：if/elif 加第四个 agent 时的失败方式是"悄悄用 DevOps 那套文案"，一条报错都
+#: 没有。`.get()` 的回落目标刻意仍是 devops 那套 —— 见 :func:`ack_body_key`。
+#:
+#: ⚠️ 键必须与 `core.im_prefs.AGENT_*` 的值逐字相等。这里写字面量是**依赖纪律**：本模块
+#: 被 ingress import，模块级只许 stdlib，而 `core.im_prefs` 会拉进 boto3（见文件头）。
+#: 对齐由 `tests/test_im_ack_variants.py` 一条断言盯着。
+_ACK_BODY_SETS: dict[str, tuple[str, ...]] = {
+    "devops": ACK_BODY_KEYS,
+    "notiops": ACK_BODY_KEYS_NOTIOPS,
+    "starops": ACK_BODY_KEYS_STAROPS,
+}
+
 #: **去处句** —— "过程和结论会出现在哪"，按平台的**刷新能力**分两种，不按平台数量分。
 #:
 #: 2026-09-08 现网反馈原话：钉钉上那句「过程和结论会一起更新在这张卡片上」是**假的**。
@@ -144,10 +172,13 @@ def slack_emoji(seed: str) -> str:
 def ack_body_key(seed: str, agent: str = "devops") -> str:
     """开场文案的 i18n key。选 key 而不是选文本，locale 由调用方决定。
 
-    `agent` ∈ {"devops"（默认）, "notiops"} —— 见 :data:`ACK_BODY_KEYS_NOTIOPS`。
-    不认识的值一律当 "devops"（**宁可说成默认那条，也不要凭空宣称在花钱**）。
+    `agent` ∈ :data:`_ACK_BODY_SETS` 的键 = {"devops"（默认）, "notiops", "starops"}。
+
+    不认识的值一律当 "devops"（**宁可说成默认那条，也不要凭空宣称在花钱、也不要凭空
+    宣称在查另一家云**）。这个回落只在"加了第四条路但漏改这里"时生效，代价是文案说旧了；
+    反过来（默认落 notiops 那套）会对着一个不花钱的路说在花钱，不对称。
     """
-    keys = ACK_BODY_KEYS_NOTIOPS if agent == "notiops" else ACK_BODY_KEYS
+    keys = _ACK_BODY_SETS.get(agent, ACK_BODY_KEYS)
     return keys[_index(seed, len(keys))]
 
 

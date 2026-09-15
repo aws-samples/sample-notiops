@@ -30,10 +30,15 @@ let getResp: {
   dingtalk?: {
     app_key: string; app_secret: string; push_webhook_url?: string; webhook_url?: string;
   };
+  /** Slack 段同理可选（旧 BFF 不回）。注意这一段**两个字段都是凭证** ——
+   *  没有飞书 App ID / 钉钉 App Key 那种明文可核对的字段。 */
+  slack?: { bot_token: string; signing_secret: string; webhook_url?: string };
 };
 const putSpy = vi.fn(async (_cfg: Record<string, string>) => ({ message: "ok" }));
 const putDtSpy = vi.fn(async (_cfg: Record<string, string>) => ({ message: "ok" }));
 const testDtSpy = vi.fn(async () => ({ success: true, message: "token ok" }));
+const putSlSpy = vi.fn(async (_cfg: Record<string, string>) => ({ message: "ok" }));
+const testSlSpy = vi.fn(async () => ({ success: true, message: "scopes ok" }));
 
 vi.mock("../api/admin", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/admin")>();
@@ -45,6 +50,8 @@ vi.mock("../api/admin", async (importOriginal) => {
     testNotificationSend: vi.fn(async () => ({ success: true, message: "sent" })),
     putDingtalkConfig: (cfg: Record<string, string>) => putDtSpy(cfg),
     testDingtalkSend: () => testDtSpy(),
+    putSlackConfig: (cfg: Record<string, string>) => putSlSpy(cfg),
+    testSlackSend: () => testSlSpy(),
   };
 });
 
@@ -331,7 +338,7 @@ describe("Admin「集成 IM」钉钉分页", () => {
     };
   });
 
-  it("默认停在飞书分页；两个平台都在切换器里", async () => {
+  it("默认停在飞书分页；三个平台都在切换器里", async () => {
     // 老客户（只配了飞书）进这一页不该看到一张空表单 —— 那会让人以为配置丢了。
     await openImTab();
     expect(secretInputs().length).toBe(3);
@@ -339,6 +346,7 @@ describe("Admin「集成 IM」钉钉分页", () => {
     const btns = Array.from(document.querySelectorAll("button")).map((b) => b.textContent);
     expect(btns).toContain(zh("admin.notif.platform.feishu"));
     expect(btns).toContain(zh("admin.notif.platform.dingtalk"));
+    expect(btns).toContain(zh("admin.notif.platform.slack"));
   });
 
   it("切到钉钉：两把钥匙 + App Key，飞书那三个框离场", async () => {
@@ -471,6 +479,178 @@ describe("Admin「集成 IM」钉钉分页", () => {
     expect(body).toContain(zh("admin.notif.dt.url.missing"));
     expect(body).toContain("DingtalkWebhookUrl");
     expect(body).not.toContain("FeishuWebhookUrl");
+    expect(document.querySelectorAll(".imd-body .imd-h").length).toBe(7);
+  });
+});
+
+/**
+ * Slack 分页（2026-09-11）。
+ *
+ * 与另两个平台的差异比它们彼此之间大 —— 这一组盯的就是这些差异，而不是"再跑一遍
+ * 同样的断言"：
+ *   · **两个字段都是凭证**：没有飞书 App ID / 钉钉 App Key 那种明文可核对的字段，
+ *     所以"我配的是哪个 App"只能靠「测试凭证」回的 workspace 名字确认；
+ *   · **「未配置」不等于「空」**：方式 B 里这两个 secret 由 CDK 建、值是随机串，
+ *     忘了填的症状是 `invalid_auth` / 401，不是"空"。这句警告必须画在**表单里**，
+ *     不能只写在抽屉里 —— 卡住的人不会去点「详细步骤」；
+ *   · **「测试凭证」验不了 signing secret**（没有任何 API 能验），但能报出缺的 scope。
+ *     界面必须如实说，否则"测试通过 + Slack 说校验失败"会被当成产品坏了；
+ *   · 抽屉必须说清**三处 Request URL 是同一个地址**、以及**不要开 Socket Mode**
+ *     （开了之后 Slack 根本不发请求，日志里什么都没有，看起来像地址填错）。
+ */
+const slSecretInputs = () =>
+  Array.from(document.querySelectorAll('input[name^="notiops-slack-"]')) as HTMLInputElement[];
+
+/** 打开「集成 IM」→ 切到 Slack 分页。 */
+async function openSlTab() {
+  await openImTab();                       // 默认停在飞书
+  const btn = Array.from(document.querySelectorAll("button"))
+    .find((b) => b.textContent === zh("admin.notif.platform.slack"))!;
+  expect(btn).toBeTruthy();
+  fireEvent.click(btn);
+  await waitFor(() => expect(slSecretInputs().length).toBe(2));
+}
+
+describe("Admin「集成 IM」Slack 分页", () => {
+  beforeEach(() => {
+    cleanup();
+    putSlSpy.mockClear();
+    testSlSpy.mockClear();
+    getResp = {
+      feishu: {
+        app_id: "cli_a1b2c3d4", app_secret: "****WXYZ",
+        verification_token: "", encrypt_key: "", notify_chat_ids: "oc_room1",
+      },
+      slack: { bot_token: "****wxyz", signing_secret: "****cdef", webhook_url: "" },
+    };
+  });
+
+  it("切到 Slack：两个框都是密钥框，另两个平台的表单离场", async () => {
+    await openSlTab();
+    expect(secretInputs().length).toBe(0);       // 同一时刻只挂一个平台的表单
+    expect(dtSecretInputs().length).toBe(0);
+    expect(slSecretInputs().map((el) => el.name))
+      .toEqual(["notiops-slack-bot_token", "notiops-slack-signing_secret"]);
+    const labels = labelTexts();
+    expect(labels).toContain("Bot User OAuth Token");
+    expect(labels).toContain("Signing Secret");
+    // Slack 没有这些 —— 多画一个空框，客户会去 Slack 后台找不存在的值。
+    expect(labels).not.toContain("Encrypt Key");
+    expect(labels).not.toContain("App Key");
+  });
+
+  it("name 带平台前缀（否则浏览器把钉钉/飞书的密钥填进这两个框）", async () => {
+    await openSlTab();
+    for (const el of slSecretInputs()) {
+      expect(el.name).toMatch(/^notiops-slack-/);
+      expect(el.getAttribute("autocomplete")).toBe("new-password");
+      expect(el.getAttribute("data-1p-ignore")).not.toBeNull();
+      expect(el.getAttribute("data-lpignore")).toBe("true");
+      expect(el.name).not.toMatch(/password/i);
+    }
+  });
+
+  it("「未配置≠空」这条警告画在表单里，不只在抽屉里", async () => {
+    // 方式 B 客户最容易卡住的地方就是这个（secret 里躺着 CDK 随机串），而卡住时
+    // 人不会去点「详细步骤」—— 所以这句必须在表单上直接看得到。
+    await openSlTab();
+    expect(document.body.textContent).toContain(zh("admin.notif.sl.notEmptyWarn"));
+    expect(document.body.textContent).toContain(zh("admin.notif.sl.keysRequired"));
+  });
+
+  it("已配置且没动过 → type=text（后 4 位真看得见）；一动手切 password", async () => {
+    await openSlTab();
+    const [tok, sign] = slSecretInputs();
+    expect(tok.value).toBe("****wxyz");
+    expect(sign.value).toBe("****cdef");
+    expect(tok.type).toBe("text");
+    // 这里刻意**不**写成 `xoxb-…` 形状：本条只断言"动过手就切 password"，跟值的形状无关，
+    // 而任何 `xoxb-` 开头的字面量都会被 pre-commit 的密钥扫描器当硬编码 Slack token 报警
+    // （每次改这个文件都报一次），也会在公开仓库里给客户的安全扫描制造假阳性。
+    fireEvent.change(tok, { target: { value: "a-value-typed-by-hand" } });
+    expect(slSecretInputs()[0].type).toBe("password");
+  });
+
+  it("保存时 trim；没动过的那个原样回传（= 不修改）", async () => {
+    // 两个值都是从 Slack 后台**复制**来的，粘贴带尾随空格/换行是常事：bot token 带
+    // 空格 → invalid_auth；signing secret 带空格 → 每次验签 401，而 Slack 只说
+    // 「URL 校验不通过」。两种症状都指不到真因。
+    await openSlTab();
+    const [, sign] = slSecretInputs();
+    fireEvent.change(sign, { target: { value: "  0123456789abcdef0123456789abcdef \n" } });
+    fireEvent.click(Array.from(document.querySelectorAll("button"))
+      .find((b) => b.textContent === zh("admin.notif.save"))!);
+    await waitFor(() => expect(putSlSpy).toHaveBeenCalled());
+    const sent = putSlSpy.mock.calls[0][0];
+    expect(sent.signing_secret).toBe("0123456789abcdef0123456789abcdef");
+    expect(sent.bot_token).toBe("****wxyz");     // 没动过 → 服务端原值
+    // 另两个平台的字段一个都不该混进来（后端是三份独立的 Secret）
+    expect(sent.app_key).toBeUndefined();
+    expect(sent.encrypt_key).toBeUndefined();
+    expect(sent.push_webhook_url).toBeUndefined();
+  });
+
+  it("兜底：静默自动填充改不了钥匙", async () => {
+    await openSlTab();
+    const [tok] = slSecretInputs();
+    tok.value = "autofilled-by-password-manager";   // 不触发 onChange，同另两个平台
+    fireEvent.click(Array.from(document.querySelectorAll("button"))
+      .find((b) => b.textContent === zh("admin.notif.save"))!);
+    await waitFor(() => expect(putSlSpy).toHaveBeenCalled());
+    expect(putSlSpy.mock.calls[0][0].bot_token).toBe("****wxyz");
+  });
+
+  it("「测试凭证」如实说明它验不了 signing secret、但会报缺的 scope", async () => {
+    await openSlTab();
+    const testBtn = Array.from(document.querySelectorAll("button"))
+      .find((b) => b.textContent === zh("admin.notif.sl.test"))!;
+    expect(testBtn.getAttribute("title")).toBe(zh("admin.notif.sl.testTip"));
+    fireEvent.click(testBtn);
+    await waitFor(() => expect(testSlSpy).toHaveBeenCalled());
+    await waitFor(() => expect(document.body.textContent).toContain("scopes ok"));
+  });
+
+  it("旧 BFF 不回 slack 段 → 退回空表单，不白屏", async () => {
+    delete getResp.slack;
+    await openSlTab();
+    expect(slSecretInputs().map((el) => el.value)).toEqual(["", ""]);
+    expect(document.querySelector(".imx-steps")).toBeTruthy();
+  });
+
+  it("Slack 抽屉：七节 + 三处同一地址 + 不要开 Socket Mode + 回调地址", async () => {
+    const url = "https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/";   // 占位，见飞书那条
+    getResp.slack!.webhook_url = url;
+    await openSlTab();
+    fireEvent.click(document.querySelector("button.imx-guide-link") as HTMLButtonElement);
+    await waitFor(() => expect(document.querySelector(".imd-panel")!.className).toContain("open"));
+
+    // 同一时刻只有一个抽屉在 DOM 里（`imd-webhook-url` 是固定 id）
+    expect(document.querySelectorAll(".imd-panel").length).toBe(1);
+    expect(document.querySelector(".imd-title")!.textContent).toBe(zh("admin.notif.sl.guideTitle"));
+    expect(document.querySelectorAll(".imd-body .imd-h").length).toBe(7);
+
+    const body = document.querySelector(".imd-body")!.textContent || "";
+    expect(body).toContain("全填同一个");                  // 三处 Request URL 是同一个地址
+    expect(body).toContain("Socket Mode");                // 开了就收不到任何请求
+    expect(body).toContain("app_mention");                // 4 个 bot events
+    expect(body).toContain("notiops-im-ingress-slack");   // 排错入口
+    expect(body).not.toContain("put-secret-value");       // 抽屉是给只有浏览器的客户看的
+
+    const input = document.querySelector("input.imd-url") as HTMLInputElement;
+    expect(input.value).toBe(url);
+    expect(input.readOnly).toBe(true);
+  });
+
+  it("取不到回调地址时指向 SlackWebhookUrl 这个 Output（不是另两个名字）", async () => {
+    await openSlTab();               // fixture 里 webhook_url 是空串
+    fireEvent.click(document.querySelector("button.imx-guide-link") as HTMLButtonElement);
+    await waitFor(() => expect(document.querySelector(".imd-panel")!.className).toContain("open"));
+    const body = document.querySelector(".imd-body")!.textContent || "";
+    expect(document.querySelector(".imd-urlbox")).toBeNull();
+    expect(body).toContain(zh("admin.notif.sl.url.missing"));
+    expect(body).toContain("SlackWebhookUrl");
+    expect(body).not.toContain("FeishuWebhookUrl");
+    expect(body).not.toContain("DingtalkWebhookUrl");
     expect(document.querySelectorAll(".imd-body .imd-h").length).toBe(7);
   });
 });

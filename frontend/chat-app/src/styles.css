@@ -79,9 +79,14 @@ body { background: var(--page); color: var(--text); overflow: hidden; }
 /* 仪表盘子页「返回」按钮:醒目的描边胶囊 + 文字,比 panel-btn 的透明箭头显眼 */
 .dash-back { display: inline-flex; align-items: center; gap: 5px; margin-right: 12px; padding: 6px 13px; font-size: 13px; font-weight: 600; color: var(--text); background: var(--card); border: 1px solid var(--line); border-radius: 9px; cursor: pointer; flex-shrink: 0; transition: all .15s; }
 .dash-back:hover { border-color: var(--orange); color: var(--orange2); background: color-mix(in srgb, var(--orange) 8%, var(--card)); }
-.sb-new { margin: 4px 12px 12px; padding: 10px 12px; border: 1px solid var(--sidebar-border); border-radius: 9px; color: var(--sidebar-strong); background: transparent; cursor: pointer; display: flex; align-items: center; gap: 10px; font-size: 13.5px; font-family: inherit; }
-.sb-new:hover { background: var(--sidebar-hover); border-color: #2a4a6b; }
-.sb-new .ni-ic { display: inline-flex; align-items: center; justify-content: center; }
+/* 「新对话」——侧栏里唯一的主操作，所以给它一层**极淡的品牌橙**：淡底 + 橙描边 +
+   橙图标 + 半粗字。刻意**不**做成实心橙按钮：那会盖过下面整列导航、也和右侧内容区
+   的橙色主按钮打架（同一屏出现两个实心橙 CTA，用户不知道该点哪个）。
+   用 color-mix 而不是写死色值，是为了 深色 / 浅色 两套主题都能自动跟着 --orange 走
+   （同一手法在 `.dash-back:hover` 已经用过）。 */
+.sb-new { margin: 4px 12px 12px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--orange) 34%, var(--sidebar-border)); border-radius: 9px; color: var(--sidebar-strong); background: color-mix(in srgb, var(--orange) 9%, transparent); cursor: pointer; display: flex; align-items: center; gap: 10px; font-size: 13.5px; font-weight: 600; font-family: inherit; transition: background .15s ease, border-color .15s ease; }
+.sb-new:hover { background: color-mix(in srgb, var(--orange) 17%, transparent); border-color: color-mix(in srgb, var(--orange) 60%, var(--sidebar-border)); }
+.sb-new .ni-ic { display: inline-flex; align-items: center; justify-content: center; color: var(--orange); }
 .sb-nav { padding: 0 8px; display: flex; flex-direction: column; gap: 1px; }
 .navitem { display: flex; align-items: center; gap: 11px; padding: 8px 11px; border-radius: 8px; font-size: 13.5px; color: var(--sidebar-text); cursor: pointer; background: none; border: none; text-align: left; font-family: inherit; width: 100%; }
 .navitem:hover { background: var(--sidebar-hover); color: var(--sidebar-strong); }
@@ -150,8 +155,18 @@ body { background: var(--page); color: var(--text); overflow: hidden; }
 
 /* 左下角用户区 + 向上弹出的设置菜单 */
 .usermenu-wrap { position: relative; border-top: 1px solid var(--sidebar-border); margin-top: 8px; }
-.sb-foot { width: 100%; border: none; background: transparent; padding: 10px 12px; display: flex; align-items: center; gap: 9px; font-size: 13px; color: var(--sidebar-text); cursor: pointer; font-family: inherit; text-align: left; }
+/* 底部一行 = 设置（用户名，可伸缩）+ 加星 / 反馈两个定宽图标按钮。
+   `.sb-foot` 上的 `min-width: 0` 是让 `.um-name` 的省略号在窄侧栏里还能生效
+   —— 少了它，flex 子项的 min-width 默认是 auto，长用户名会把两个图标顶出去。 */
+.sb-footrow { display: flex; align-items: center; padding-right: 6px; }
+.sb-foot { flex: 1; min-width: 0; border: none; background: transparent; padding: 10px 12px; display: flex; align-items: center; gap: 9px; font-size: 13px; color: var(--sidebar-text); cursor: pointer; font-family: inherit; text-align: left; }
 .sb-foot:hover { background: var(--sidebar-hover); }
+/* 两个图标按钮的视觉重量**对齐上面那列主题图标**（`.navitem .ni-ic`：18px / opacity .9 /
+   继承 `--sidebar-text`）。原来是 16px + `--sidebar-muted`(#6b7480)，比主题图标暗了整两档，
+   描边细到几乎看不见 —— 用户的原话是「框架线条稍微明显一些，参考各个主题前面的那种样式」。
+   ⚠️ hover 时必须把 opacity 抬回 1：否则那一下的橙色被 .9 压住，反而比不 hover 时更闷。 */
+.sb-footlink { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 8px; color: var(--sidebar-text); opacity: .9; flex-shrink: 0; text-decoration: none; }
+.sb-footlink:hover { background: var(--sidebar-hover); color: var(--orange); opacity: 1; }
 .um-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .um-caret { color: var(--sidebar-muted); font-size: 11px; }
 .usermenu { position: absolute; left: 8px; right: 8px; bottom: 52px; background: var(--menu-bg); border: 1px solid var(--sidebar-border); border-radius: 12px; box-shadow: 0 14px 38px rgba(0, 0, 0, .4); padding: 6px; z-index: 30; }
@@ -195,8 +210,16 @@ a.um-item:visited { color: var(--text); }
 
 /* ===== 对话流 ===== */
 /* 滚动区铺满整个主区；底部留出 composer 的空间，让内容能滚到输入框"下方" */
-.stream { flex: 1; overflow-y: auto; padding: 26px 0 210px; }
+/* 底部 padding 必须留够悬浮 composer 的高度，否则最后一条消息被输入框永久盖住、滚也滚不出来。
+   2026-09-11：调查主题在输入框上方多了一行「仪表盘」胶囊（.dashpills，约 40px 含 margin），
+   原来的 210px 只剩约 37px 余量，兜不住 → 提到 255px。 */
+.stream { flex: 1; overflow-y: auto; padding: 26px 0 255px; }
 .thread { max-width: 900px; margin: 0 auto; padding: 0 24px; display: flex; flex-direction: column; gap: 24px; }
+/* 历史被截断的提示条（.thread 第一个子元素）。橙色系与巡检看板的 .imd-warn 同源。 */
+.thread-truncated { font-size: 12.5px; line-height: 1.6; color: var(--muted);
+  background: color-mix(in srgb, var(--orange) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--orange) 32%, var(--line));
+  border-radius: 9px; padding: 8px 12px; }
 .row { display: flex; flex-direction: column; }
 .row.user { align-items: flex-end; }
 .row.bot { align-items: stretch; }
@@ -218,6 +241,14 @@ a.um-item:visited { color: var(--text); }
   margin-left: 10px; font-size: 12px; color: var(--muted);
 }
 .msgbar .mb-acct-dot { width: 5px; height: 5px; border-radius: 3px; display: inline-block; }
+/* 数字员工 ID：与账号 ID 同款（同一位），只是颜色换成与顶栏「阿里云 STAROps」标签同色，
+   让"这条来自另一朵云"这件事在页脚上也是一眼的。单独一个 class 而不是复用 .mb-acct ——
+   见 Message.tsx 里的说明。 */
+.msgbar .mb-emp {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin-left: 10px; font-size: 12px; color: var(--muted);
+}
+.msgbar .mb-emp-dot { width: 5px; height: 5px; border-radius: 3px; display: inline-block; background: var(--link); }
 
 /* ===== 历史水合骨架屏 =====
    套在真实的 .stream/.thread/.row/.msg 里，只把文字换成灰块，所以历史到达时
@@ -539,6 +570,12 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
   width: 100%; padding: 0; background: none; pointer-events: auto;
 }
 .empty-center .chips { justify-content: center; }
+/* ⚠️ 这里刻意**没有** `.empty-center .dashpills { justify-content: center }`。
+   「仪表盘」那行必须始终与聊天框（.cbox）左边缘对齐 —— 空态也一样。它们是 .cwrap 的
+   兄弟节点，所以默认的 flex-start 就正好落在 .cbox 的左边缘上，不用写任何偏移。
+   曾经居中过一版（"上下都居中，只有这行左对齐显得没对齐"），产品否掉了：胶囊是**入口**，
+   入口应当贴着它要打开的那个框起头；居中之后它跟输入框、跟自己下一行的按钮全都不对齐。
+   别再给它加 justify-content —— 加了在空态就会重新飘到中间去。 */
 /* Composer 与其后面板(dashboard 卡片等)之间额外拉开距离；gap 已给 22px，这里再叠加。 */
 .empty-center .composer + * { margin-top: 26px; }
 .empty-center .empty-recents {
@@ -645,6 +682,17 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 :root[data-theme="light"] .obj-seg-btn.sel { background: rgba(255, 153, 0, .26); }
 .obj-seg-btn.sel > svg { color: var(--orange); }
 .obj-seg-btn.disabled { cursor: not-allowed; opacity: .45; }
+/* beta 徽标（只有阿里云 STAROps 那一段有）：描边小胶囊，**不给底色**。
+   给它填充色会和上面那条"选中态靠填充说话"的约定打架 —— 未选中的 beta 段会看起来
+   像是选上了。字号压到 10px 并降一档不透明度：它是限定词，不能盖过段名本身。 */
+.obj-seg-beta {
+  flex-shrink: 0; margin-left: 1px; padding: 1px 5px;
+  border: 1px solid var(--line); border-radius: 999px;
+  font-size: 10px; font-weight: 600; line-height: 1.4;
+  letter-spacing: .02em; text-transform: lowercase; opacity: .8;
+}
+/* 选中态下轨道底色变暖，1px 灰边会糊在里面 —— 换成继承当前字色的半透明边，保持可辨。 */
+.obj-seg-btn.sel > .obj-seg-beta { border-color: currentColor; opacity: .65; }
 /* 提示行：一句话说清两边的差别（选中态变化时跟着换）。固定最小高度 —— 否则切换时
    整个 hero 会上下跳一行。 */
 .obj-hint {
@@ -654,27 +702,49 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 @media (max-width: 480px) {
   .obj-pick { padding: 0 12px; }
   .obj-seg-btn { padding: 6px 11px; font-size: 12px; }
+  /* 三段（NotiOps / DevOps Agent / 阿里云 STAROps）在窄屏上放不进一行，而每段都是
+     white-space:nowrap —— 不允许换行的话轨道会被撑破整个 hero 横向滚。这里允许折行，
+     并把 999px 圆角降到 18px:两行高的胶囊用全圆角会变成一个怪异的腰鼓形。 */
+  .obj-seg { flex-wrap: wrap; border-radius: 18px; }
 }
-/* 主题页：紧贴输入框左上角的一体化「打开 Dashboard」标签。
-   标签行左对齐；标签底边与 .cbox 顶边相接（负 margin 压 1px），底部圆角抹平 → 与输入框连成一体。 */
-.cbox-tabs { display: flex; }
-.cbox-tab {
-  display: inline-flex; align-items: center; gap: 6px;
-  margin-bottom: -1px; /* 压住 cbox 上边框，视觉连体 */
-  padding: 7px 13px 8px; font-family: inherit; font-size: 12.5px; font-weight: 600;
+/* 输入框上方那行**粗粒度**仪表盘入口（调查主题：运行概览 / 安全态势）。
+   与 .chip 的视觉区分是刻意的：同一位置上 .chip 的语义是"把这句填进输入框"，
+   这里的语义是"跳到看板"。所以 .dashpill 透明底 + 全圆角（999px），.chip 卡片底 + 18px。
+   **单行不换行**：flex-wrap 会把输入框往下推，两三个入口不值得；宽度不够就横向滚。 */
+.dashpills {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 10px;
+  flex-wrap: nowrap; overflow-x: auto;
+  /* 悬浮层默认 pointer-events:none（见 .composer），这一行要能点。 */
+  pointer-events: auto;
+  /* 横向滚动条在 macOS 上会盖住胶囊下沿；这一行只有一排，隐掉更干净。 */
+  scrollbar-width: none;
+}
+.dashpills::-webkit-scrollbar { display: none; }
+/* 2026-09-11：`.dashpills-label` 已删 —— 那是这一行前面的「仪表盘」图标+文字标签，
+   产品要求去掉（胶囊名字本身就说清了是什么，再加个分类词只占地方）。 */
+.dashpill {
+  display: inline-flex; align-items: center; gap: 6px; flex: none;
+  padding: 8px 14px; font-family: inherit; font-size: 12.5px; font-weight: 600;
   color: var(--muted); cursor: pointer;
-  background: var(--sidebar);
-  border: 1px solid var(--line); border-bottom: none;
-  border-radius: 12px 12px 0 0;
-  box-shadow: 0 -2px 8px rgba(13, 27, 42, .05);
-  transition: color .12s, background .12s;
+  background: transparent;
+  border: 1px solid var(--line); border-radius: 999px;
+  white-space: nowrap;
+  transition: color .12s, border-color .12s, background .12s;
 }
-.cbox-tab:hover { color: var(--text); background: var(--sidebar-hover); }
-.cbox-tab svg:first-child { color: var(--orange); }
-.cbox-tab svg:last-child { opacity: .55; }
+.dashpill:hover { color: var(--text); border-color: var(--orange); background: var(--sidebar-hover); }
+/* ⚠️ 这一行刻意**没有** `.dashpill svg:first-of-type { color: var(--orange) }`。
+   第一版给左边那个主题图标上了橙色，客户原话「这些 dashboard 前面的图标，不需要有颜色」。
+   现在两个 svg 都继承 .dashpill 的 color（默认 --muted、hover 随 .dashpill:hover 变 --text），
+   层次靠下面那条 opacity 拉开，不靠色相。看板浏览器左栏那些图标本来就是 --muted /
+   选中态 --text，不用动；icons.tsx 里也没有任何硬编码色值，全是 currentColor —— 想给
+   图标上色只能从这里加，所以**这里不加**就等于全链路无色。 */
+.dashpill svg:last-of-type { opacity: .5; }
+/* 2026-09-11：`.cbox-tabs` / `.cbox-tab` / `.cbox.has-tab` 三条已删。
+   那是旧的「打开 Dashboard」标签（紧贴输入框左上角、与 .cbox 连成一体），只有成本 / 案例
+   两个主题在用；这次它们都改成了上面那行 `.dashpills` 粗粒度胶囊，与调查主题统一。
+   要复活的话别只加 CSS —— Composer 的 `onOpenDashboard` 那条 prop 也一起删了。 */
 .cbox { position: relative; display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--line); border-radius: 16px; padding: 12px 14px 10px; background: var(--sidebar); box-shadow: 0 6px 24px rgba(13, 27, 42, .1), 0 2px 6px rgba(13, 27, 42, .06); }
-/* 带标签时：左上角圆角抹平，与标签的直角底部拼成连续边缘。 */
-.cbox.has-tab { border-top-left-radius: 4px; }
 .cbox:focus-within { border-color: var(--orange); box-shadow: 0 0 0 3px rgba(255, 153, 0, .12); }
 .cbox textarea { width: 100%; border: none; outline: none; resize: none; font-size: 14.5px; line-height: 1.5; font-family: inherit; min-height: 30px; max-height: 160px; color: var(--text); background: transparent; padding: 2px 2px; }
 /* 无条件换行：聊天区被侧栏/Sources 面板挤窄时(视口仍宽,媒体查询不触发),
@@ -692,31 +762,16 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 .websearch-toggle.disabled, .websearch-toggle:disabled { opacity: .5; cursor: not-allowed; color: var(--muted); }
 .websearch-toggle.disabled:hover { color: var(--muted); border-color: var(--line); }
 .toggle-soon { font-size: 10px; font-weight: 700; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; margin-left: 2px; }
-/* ── 「回答模式」下拉（ModePicker）──────────────────────────────────────────────
-   收起态刻意长得**和联网搜索那个 pill 一样**（同圆角/同字号/同 .on 橙色描边）：它就是
-   原来那四个 pill 的位置，只是四个变一个，不该在视觉上变成另一类控件。
-   `.mode-wrap` 要 position:relative —— 菜单锚在按钮上而不是聊天框上（模型菜单那份是
-   写死的 right/bottom 偏移，这里的按钮位置随主题、随标签长度浮动，锚不住）。 */
-.mode-wrap { position: relative; display: inline-flex; }
-.modepick { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 18px; padding: 6px 12px; font-size: 12.5px; font-weight: 600; color: var(--muted); cursor: pointer; background: var(--card); font-family: inherit; white-space: nowrap; transition: all .15s; }
-.modepick:hover { color: var(--text); border-color: var(--muted); }
-.modepick svg { opacity: .85; }
-.modepick .caret { color: var(--muted); font-size: 11px; }
-.modepick.on { color: var(--orange2); border-color: var(--orange); background: color-mix(in srgb, var(--orange) 12%, transparent); }
-.modepick.on svg, .modepick.on .caret { opacity: 1; color: var(--orange2); }
-.modemenu { position: absolute; bottom: 100%; left: 0; margin-bottom: 8px; width: 330px; max-width: min(330px, calc(100vw - 40px)); background: var(--menu-bg); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 12px 32px rgba(13, 27, 42, .16); padding: 6px; z-index: 25; max-height: min(400px, 70vh); overflow-y: auto; }
-.modemenu.drop-down { bottom: auto; top: 100%; margin: 8px 0 0; }
-.mode-item { display: flex; align-items: flex-start; gap: 9px; width: 100%; text-align: left; border: none; background: transparent; padding: 9px 11px; border-radius: 9px; cursor: pointer; font-family: inherit; }
-.mode-item:hover { background: var(--menu-hover); }
-.mode-ico { display: inline-flex; color: var(--muted); padding-top: 1px; flex-shrink: 0; }
-.mode-body { display: flex; flex-direction: column; min-width: 0; }
-.mode-name { display: flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 600; color: var(--text); }
-.mode-desc { font-size: 11.5px; color: var(--muted); line-height: 1.45; margin-top: 2px; }
-.mode-check { margin-left: auto; color: var(--orange2); flex-shrink: 0; padding-top: 2px; }
-.mode-item.sel .mode-name, .mode-item.sel .mode-ico { color: var(--orange2); }
-/* 置灰项：不 hover 变色（会读成"能点"），说明行此时写的是"为什么点不动" */
-.mode-item.disabled { opacity: .55; cursor: not-allowed; }
-.mode-item.disabled:hover { background: transparent; }
+/* 只留图标的 pill（当前只有联网搜索）：收成正圆，否则一个 12px 的地球仪套在 pill 的
+   左右 12px 内边距里会成一枚横向的胶囊，看起来像"标签掉了"而不是"就是个图标按钮"。
+   `gap` 归零 —— 里面只有一个 svg，留着 gap 会把它顶偏一格。 */
+.websearch-toggle.icon-only { gap: 0; padding: 0; width: 32px; height: 32px; justify-content: center; border-radius: 50%; }
+/* 🗑 2026-09-13：「回答模式」下拉（ModePicker）那一整组样式删掉了 ——
+   `.mode-wrap` / `.modepick` / `.modemenu` / `.mode-item` / `.mode-ico` / `.mode-body` /
+   `.mode-name` / `.mode-desc` / `.mode-check`。产品把下拉拆回平铺，ModePicker 现在直接
+   复用上面的 `.websearch-toggle`（它本来就是"工具条上一枚开关"的样式）。
+   把下拉加回来时不要照抄回这些规则：那份收起态是刻意长得和 `.websearch-toggle` 一样的，
+   两份同义的 CSS 迟早漂开一处。 */
 
 /* 多账号选择器（cbar 内，紧跟联网搜索） */
 .account-sel { margin-left: 8px; border: 1px solid var(--line); border-radius: 18px; padding: 6px 10px; font-size: 12.5px; font-weight: 600; color: var(--text); background: var(--card); font-family: inherit; cursor: pointer; max-width: 220px; }

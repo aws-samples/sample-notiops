@@ -478,7 +478,7 @@ setup.sh 建 CUR ReportDefinition
 - **AWS Health 事件转发**：`notiops-phd-forwarder`（128MB / 90s）。
 - **IM 机器人**：API Gateway **HTTP** API（`$default` catch-all 路由）+ Lambda ingress，
   见 [im-bot-interaction.md](im-bot-interaction.md) 与 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md)。
-  **每个启用的 IM 平台各带一条 `rate(4 minutes)` 保活规则**（飞书 / Slack 的 ingress 各一条，
+  **每个启用的 IM 平台各带一条 `rate(4 minutes)` 保活规则**（飞书 / Slack / 钉钉的 ingress 各一条，
   常量 input 是哨兵 `{"notiops_warmup": true}`，handler 第一行早返回）—— 审计 EventBridge
   规则清单时会看到它们，但那是防冷启动，不是流水线。定义在 `infra/lib/constructs/im-core.ts`。
 - **客户 CUR 仪表盘缓存预热**：`web-chat-core.ts` 里一条 `cron(0 22 * * ? *)` 规则

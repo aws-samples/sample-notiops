@@ -12,6 +12,8 @@
  */
 import { CostExplorerClient, GetCostAndUsageCommand, GetCostAndUsageComparisonsCommand, GetCostForecastCommand, GetAnomaliesCommand, GetSavingsPlansCoverageCommand, GetReservationCoverageCommand, GetTagsCommand } from "@aws-sdk/client-cost-explorer";
 import { findPayerAccount, getAssumedCredentialsForAccount } from "./devops_agent_accounts.mjs";
+// safeErr：异常一律压成"类型名/错误码"再进响应体（见 safe_err.mjs）。
+import { safeErr } from "./safe_err.mjs";
 
 // Cost Explorer 是全局服务，SDK 端点固定 us-east-1。
 // 跨账号查询：<member-account> 是 Organization 成员账号，真实历史成本大多记在 payer
@@ -386,7 +388,7 @@ export async function getAiSpend() {
 export async function getCostExplorerDashboard() {
   const safe = async (fn, fallback) => {
     try { return { available: true, ...(await fn()) }; }
-    catch (e) { return { available: false, reason: "error", message: String(e?.message || e), ...fallback }; }
+    catch (e) { return { available: false, reason: "error", message: safeErr(e), ...fallback }; }
   };
   const [spendTrend, marketplace, support, movers, forecast, topServices, anomalies, coverage, aiSpend] = await Promise.all([
     safe(getSpendTrend, {}),

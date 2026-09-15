@@ -5,6 +5,8 @@
  * 单账号(部署账号=payer)用默认凭证查本账号；COH 是全局服务，端点固定 us-east-1。
  */
 import { CostOptimizationHubClient, ListRecommendationSummariesCommand } from "@aws-sdk/client-cost-optimization-hub";
+// safeErr：异常一律压成"类型名/错误码"再进响应体（见 safe_err.mjs）。
+import { safeErr } from "./safe_err.mjs";
 
 const _coh = new CostOptimizationHubClient({ region: "us-east-1" });
 
@@ -24,6 +26,6 @@ export async function getPotentialSavings() {
     ) / 100;
     return { available: true, totalMonthlyUsd, byAction: byAction.slice(0, 5), currency: r.currencyCode || "USD" };
   } catch (e) {
-    return { available: false, message: String(e?.message || e) };
+    return { available: false, message: safeErr(e) };
   }
 }

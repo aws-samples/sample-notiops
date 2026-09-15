@@ -1,6 +1,6 @@
 # IM 机器人交互方式说明
 
-> ℹ️ **入口定位**:NotiOps 的**主入口是浏览器里的 Web Chat 网页控制台**(见 `USER_GUIDE.md §12`);飞书 / Slack 等 IM 是必要但**次要的补充入口**。本文档只讲 **IM 补充入口**的交互方式与配置。
+> ℹ️ **入口定位**:NotiOps 的**主入口是浏览器里的 Web Chat 网页控制台**(见 `USER_GUIDE.md` 第一部分);飞书 / Slack 等 IM 是必要但**次要的补充入口**。本文档只讲 **IM 补充入口**的交互方式与配置。
 
 > ⚠️ **NotiOps bot 是只读机器人**:它只做**查询**(读 DynamoDB 报告)和**发起调查**(派发给 DevOps Agent),**绝不代用户执行任何变更 / 数据采集等写操作**。
 
@@ -154,25 +154,27 @@ graph LR
 
 ## 钉钉交互方式
 
-> ⏳ **钉钉为 Phase 2（v1 默认不启用）**：适配代码 + sender 完整保留（`platforms/dingtalk/`），但 v1 `setup.sh` 不开放钉钉选项 → 钉钉 ECS task `desiredCount=0`，不启动、不计费。按 USER_GUIDE §9.5：启用后**对话 / 调查派发 / 报告回贴属 Phase 1 能力**，而**进度卡 / Push 主动观察 / case 管理属 Phase 2**（尚未 GA）。
+> ✅ **钉钉已上线（2026-09-08 起两条部署路径都开放）**：`./setup.sh` 里的选项 `3`、一键部署 `InstallOption=web+dingtalk`。钉钉与飞书 / Slack 是**同一个 Lambda webhook 形态**：自己的 API Gateway HTTP API + 一对 Lambda（`platforms/dingtalk/lambda_ingress.py` 验签去重 → `lambda_worker.py` 干活），CDK 输出 `DingtalkWebhookUrl`。对话 / 调查派发 / 报告回贴 / case 全流程 / Push 主动观察 / 定时日报都可用（服务端**主动推送**类的那几项要在 secret 里补一个可选的 `webhook_url`）。**ECS Fargate 长连接形态已于 2026-09-03 退役**，不再创建任何 ECS task。
 
-钉钉的逻辑与飞书一致：创建 1 个钉钉企业内部机器人（Stream 模式），所有人共用。
+钉钉的逻辑与飞书一致：创建 1 个钉钉企业内部机器人（**HTTP 模式**），所有人共用。
 
 ```mermaid
 graph TB
-    subgraph DingTalk["钉钉（⏳ Phase 2）"]
-        DBot["🤖 NotiOps<br/>（企业内部机器人，Stream 模式）"]
+    subgraph DingTalk["钉钉"]
+        DBot["🤖 NotiOps<br/>（企业内部机器人，HTTP 模式）"]
         DUser1["👤 用户A"] --> DBot
         DUser2["👤 用户B"] --> DBot
     end
 
     subgraph AWS2["AWS（同一套后端）"]
-        DECS["ECS Fargate Bot<br/>（钉钉 task，v1 desiredCount=0）"]
+        DIngress["Ingress Lambda<br/>（API Gateway HTTP API；只验签 + 异步投递）"]
+        DWorker["Worker Lambda<br/>（真正干活，900s）"]
         DInvestigate["create_investigation"]
     end
 
-    DBot -->|Stream 长连接| DECS
-    DECS --> DInvestigate
+    DBot -->|"webhook（HTTPS）"| DIngress
+    DIngress -->|"验签通过 → 异步 invoke"| DWorker
+    DWorker --> DInvestigate
 ```
 
 ## 飞书 vs 钉钉 对比
@@ -181,20 +183,21 @@ graph TB
 |------|------|------|
 | 机器人类型 | 企业自建应用 | 企业内部机器人 |
 | 创建位置 | 飞书开放平台 | 钉钉开放平台 |
-| 当前状态 | ✅ v1 GA | ⏳ v1 默认不启用（task `desiredCount=0`）；启用后对话/派发可用 |
-| 连接方式 | API Gateway HTTP API + Lambda webhook（ingress 验签 + worker 干活）| Stream 模式长连接 |
-| 私聊 | ✅ 支持 | ✅ Phase 1（启用后）|
-| 群聊 @ | ✅ 支持 | ✅ Phase 1（启用后）|
-| 定时日报推送 | ✅ 支持（Lambda4，配置 `notify_chat_ids`）| ⏳ Phase 2 |
-| 调查结果返回 | ✅ 回贴发起线程（一张最终报告卡 summary_card + 「查看完整报告」）| ✅ Phase 1（markdown 回贴，需操作员在群里加自定义机器人）|
-| 进度卡 / Push / case 管理 | ✅ 支持 | ⏳ Phase 2 |
+| 当前状态 | ✅ 已上线 | ✅ 已上线（2026-09-08 起两条部署路径都开放）|
+| 连接方式 | API Gateway HTTP API + Lambda webhook（ingress 验签 + worker 干活）| 同上（同一个形态，各有一套自己的 API + 一对 Lambda）|
+| 私聊 | ✅ 支持 | ✅ 支持 |
+| 群聊 @ | ✅ 支持 | ✅ 支持 |
+| 定时日报推送 | ✅ 支持（Lambda4，配置 `notify_chat_ids`）| ✅ 支持（需在 secret 里填可选的 `webhook_url`；且**只能配一个**推送目标）|
+| 调查结果返回 | ✅ 回贴发起线程（一张最终报告卡 summary_card + 「查看完整报告」）| ✅ markdown 回贴（会话内回复走入站报文自带的 `sessionWebhook`，报告回贴走服务端 API + 派发时存下的路由）|
+| 进度反馈 / Push / case 管理 | ✅ 20s 原地刷新的进度卡 + Push + case 全流程 | ✅ case 全流程；Push 同样需要 `webhook_url`；进度是**追加式**（消息不可编辑 → 进度作为新消息追加，不是原地刷新的卡）|
+| 卡片按钮能否回传服务器 | ✅ 能（🆘 升级开单 / 📎 同步到 case 都是回传按钮）| ❌ **永久不能**（ActionCard 按钮只能跳 URL，没有按钮回调）→ 需要确认的动作（开案例 / 派发调查）改成**回复关键词**完成 |
 | 后端 | `ImStack` 的一对 Lambda + `create_investigation` | 共用同一套后端 |
 
 ## 总结
 
-- 飞书 v1 GA；钉钉适配代码保留，Phase 2 才启动（v1 task `desiredCount=0`）
+- 飞书 / Slack / 钉钉**三家同一个形态、都已上线**（钉钉 2026-09-08 起，两条部署路径都开放）
 - 所有用户共用机器人，通过 user_id 区分身份
-- bot 是 **两个 Lambda**（`ImStack`）：ingress 由 API Gateway HTTP API 触发收 webhook、**只验签 + 异步投递**（`reservedConcurrentExecutions=10`），worker 真正干活；**read-only**，只做查询 + 派发调查。原来的 ECS Fargate 长连接容器保留为**回滚路径**（`desiredCount=0`，不计费）
+- bot 是 **两个 Lambda**（`ImStack`）：ingress 由 API Gateway HTTP API 触发收 webhook、**只验签 + 异步投递**（`reservedConcurrentExecutions=10`），worker 真正干活；**read-only**，只做查询 + 派发调查。原来的 ECS Fargate 长连接容器**已于 2026-09-03 退役、不再创建**（`infra/lib/bot-stack.ts` 与三个 Dockerfile 还留在仓库里作长连接回滚路径的存档，但不被任何 app 引用，所以也不再需要 Docker / finch 构建 IM 镜像）
 - **调查派发链路**：编辑卡 3 字段 `details / starting_point / log_snippet` → `core/dispatch_compose.compose_edited` → `shared/devops_agent.create_investigation(incident_id=...)`（在 description 末尾嵌入 `<!--notiops:<id>-->` 标记）→ EventBridge → `devops_agent_callback` → `report_handler` 单 S3 报告管线 → **一张最终报告卡回贴发起线程**（summary_card + 「📊 查看完整报告」按钮）
 - 报告单一 S3 来源：`investigations/<task_id>/report.md|report.html|trace.html`；DDB 调查行 = summary_card + S3 指针（**不再内联 summary_raw**）
 - **调查事件不推送 `notify_chat_ids`**（`_notify_im` 已从 `devops_agent_callback/handler.py` 删除）；`notify_chat_ids` 只用于 Lambda4 每日 02:00 UTC 日报（+ PHD）
@@ -221,17 +224,23 @@ graph TB
 没回复时按 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §1.5 那张症状表定位（两个 Lambda
 的日志分别说明是「没发过来」「验签没过」还是「投递失败」）。
 
-## 钉钉机器人配置步骤（⏳ Phase 2）
+## 钉钉机器人配置步骤
 
-> 钉钉在 v1 不启动（`desiredCount=0`），下面流程作为 Phase 2 预读参考。
+> 钉钉现在可用（`./setup.sh` 选项 `3` / 一键部署 `web+dingtalk`）。完整的分步操作在
+> [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §3，这里只给顺序骨架。
 
-1. 在 [钉钉开放平台](https://open-dev.dingtalk.com) 创建企业内部应用（H5 微应用），获取 **AppKey** / **AppSecret**
-2. 「应用能力 → 机器人」→ 启用 → 消息接收模式选 **Stream 模式**（长连接，与飞书一样无需公网入站）
-3. 钉钉凭证 Secret **由用户手动创建**（CDK 不自动创建）：
-   - `notiops/dingtalk-app-key` → 钉钉 AppKey 字符串
-   - `notiops/dingtalk-app-secret` → 钉钉 AppSecret 字符串
-4. 权限：至少添加 `Robot 接收消息` / `Robot 主动发送消息` / `IM 群消息读写`
-5. 发布机器人上线，并把机器人加进目标群
+1. 在 [钉钉开放平台](https://open-dev.dingtalk.com) 创建企业内部应用，获取 **AppKey** / **AppSecret**
+2. 「应用能力 → 机器人」→ 启用 → 消息接收模式选 **HTTP 模式**，消息接收地址填 CDK 输出的 `DingtalkWebhookUrl`
+   （钉钉只有这一处要填：消息事件和卡片回传走同一条 URL）
+   > ⚠️ **默认值是 Stream 模式，必须手动改掉。** 留在 Stream 模式 = 钉钉永远不 POST =
+   > 机器人一句话不回；而钉钉保存回调地址时**不做任何校验**（没有飞书那种当场校验），
+   > 控制台上看不出任何异常。排错只能看 `/aws/lambda/notiops-im-ingress-dingtalk` 与
+   > `/aws/lambda/notiops-im-worker-dingtalk` 两条日志。
+3. 钉钉凭证 Secret `notiops/im-bot-dingtalk` **由 CDK 自动创建**（建出来是空的，部署后填），JSON 字段：
+   - `app_key` / `app_secret` → **必填**，ingress 冷启动硬校验，缺一个入口就直接起不来
+   - `webhook_url` → **可选**，自定义机器人地址，只给服务端主动推送（定时日报 / 巡检 / Push）用
+4. 权限：**不用**像飞书那样逐条勾 —— 机器人收发消息走机器人能力自带的通道
+5. 到「版本管理与发布」发布一个版本，并把机器人加进目标群
 
 ## 定时日报推送（主动通知）
 
@@ -357,7 +366,7 @@ DevOps Agent 调查任务状态变更时，通过 EventBridge 跨账户转发到
 - 后端通过 `PUT /api/notification-config` 写回 `notiops/im-bot-feishu` Secret，带格式校验（`cli_xxx` / `oc_xxx`）
 - 敏感字段（secret / token）在页面上以 `****` 遮罩展示
 - `POST /api/notification-config/test` 可发送一条测试通知验证配置
-- 通知配置**仅支持飞书**（后端拒绝非 `feishu` platform）
+- 这一页**飞书 / 钉钉都能配**（同一条 `notification-config` 路由按 `platform` 分发）。钉钉那一页填 AppKey / AppSecret + 可选的「自定义机器人推送地址」，见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §3.3 / §3.7
 
 **或直接改 Secret JSON**（绕过校验，仅建议运维排障时使用）：
 

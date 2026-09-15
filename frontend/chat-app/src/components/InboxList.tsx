@@ -101,19 +101,25 @@ export default function InboxList({
   const [items, setItems] = useState<NotificationItem[]>([]);
   const [lastReadTs, setLastReadTs] = useState(0);
   const [loading, setLoading] = useState(true);
+  // 拉取失败 ≠ 收件箱是空的。没有这一位，一次 500 会被下面的空态画成「暂无事件」——
+  // 那是一句用户会当真、且不会去重试的假话。
+  const [failed, setFailed] = useState(false);
+  const [reload, setReload] = useState(0);
 
   useEffect(() => {
     let stop = false;
+    setLoading(true);
     listNotifications().then((r) => {
       if (stop) return;
+      setFailed(r.ok === false);
       setItems(r.items || []);
       setLastReadTs(r.lastReadTs || 0);
       setLoading(false);
-      if (markReadOnMount) markRead().then(() => onLoaded?.()).catch(() => {});
-    }).catch(() => { if (!stop) setLoading(false); });
+      if (markReadOnMount && r.ok !== false) markRead().then(() => onLoaded?.()).catch(() => {});
+    }).catch(() => { if (!stop) { setFailed(true); setLoading(false); } });
     return () => { stop = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [reload]);
 
   const norm = (sources || []).map((s) => s.toLowerCase());
   const filtered = norm.length
@@ -121,6 +127,16 @@ export default function InboxList({
     : items;
 
   if (loading) return <div className="notif-health-empty">…</div>;
+  if (failed) {
+    return (
+      <div style={{ color: "var(--muted)", fontSize: 13, padding: "8px 2px" }}>
+        {t("notif.loadFailed")}
+        <button onClick={() => setReload((n) => n + 1)}
+          style={{ marginLeft: 8, fontSize: 12, fontWeight: 700, padding: "2px 10px", borderRadius: 100, border: "1px solid var(--orange)", background: "rgba(255,153,0,.10)", color: "var(--text)", cursor: "pointer" }}>
+          {t("notif.retry")}</button>
+      </div>
+    );
+  }
   if (filtered.length === 0) {
     return <div style={{ color: "var(--muted)", fontSize: 13, padding: "8px 2px" }}>{emptyHint || (locale === "en" ? "No events." : "暂无事件。")}</div>;
   }

@@ -39,13 +39,18 @@ LAYER_DIR = PROJECT_ROOT / "lambda_layer_im"
 SENTINEL_PATTERNS = ("dist/**", ".cdk-out", "**/node_modules/**")
 MIN_PATTERNS = 20
 
-#: 三个 handler（im-core.ts 里的 `handler:` 逐字对应）+ 它们必然要 import 的模块。
+#: 每个 handler（im-core.ts 里的 `handler:` 逐字对应）+ 它们必然要 import 的模块。
 #: 少任何一个 = 客户账号里 ImportModuleError，而方式B 完全正常。
 REQUIRED_IN_CODE = (
     "platforms/feishu/lambda_ingress.py",
     "platforms/feishu/lambda_worker.py",
     "platforms/slack/lambda_ingress.py",
     "platforms/slack/lambda_worker.py",
+    # 钉钉那两个（2026-08 加的第三家）**一直漏在这份清单外面** —— 补上。漏的形态与
+    # 下面几条同类：方式A 的钉钉入口整条 ImportModuleError，而方式B 完全正常，
+    # 而这份清单的全部意义就是把这种「只有一键部署会炸」的形态在打包时判死。
+    "platforms/dingtalk/lambda_ingress.py",
+    "platforms/dingtalk/lambda_worker.py",
     "platforms/common/lambda_progress.py",
     "platforms/common/router.py",
     # 两个 ingress 的**第一行**就 import 它（EventBridge 保活探测的判定）。
@@ -61,6 +66,23 @@ REQUIRED_IN_CODE = (
     # 案例功能整条挂），而方式B 完全正常 —— 所以必须在这里当场判死。
     "core/aws_session.py",
     "shared/account_scope.py",
+    # 阿里云 STAROps（2026-09-14）：`agent starops` 那一支的四个模块。这条链
+    # （`starops_chat` → `starops_sse` / `aliyun_signer` → `aliyun_config`）只在
+    # **切到 STAROps 之后**才被 import，所以缺了它不会让入口挂掉、也不会让 DevOps
+    # 那条路出问题 —— 症状只是「切过去之后每一句都失败」，而客户第一反应是
+    # 「阿里云 AccessKey 填错了」，会去反复重填一副其实没问题的凭据。
+    # 这正是这份清单要拦的那类：**只有方式A 会炸，且归因指向错误的方向**。
+    "core/aliyun_config.py",
+    "core/aliyun_signer.py",
+    "core/starops_sse.py",
+    "core/starops_chat.py",
+    # 多云可见性开关（2026-09-15）：`core/multicloud.py` 只是**选 i18n key**，很容易
+    # 被当成"无关紧要的小文件"。但它的失败形态比上面那四个都严重：三家的
+    # `app/main.py` 与 `platforms/common/pref_commands.py` 都在**模块加载时**
+    # `from core import multicloud`（不是切到某个功能之后才 import）—— 缺了它，
+    # 方式A 三家的 worker **全部**ImportModuleError，等于 IM 侧一句话都答不了，
+    # 而方式B 完全正常。三家 `caps.py` 里那三处是函数内 import，晚一步而已。
+    "core/multicloud.py",
 )
 
 #: 层里必须真的装到了的包。**判具体包，不判 `python/` 目录在不在** ——

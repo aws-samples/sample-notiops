@@ -1,11 +1,11 @@
 /**
- * 「事件通知 → 深入调查」必须开「深度调查（直连）」—— 这条链的回归测试。
+ * 「事件通知 → 深入调查」必须开「深度调查」—— 这条链的回归测试。
  *
  * 为什么值得一个测试文件：这是一个**已经发生过**的静默缺陷。事件卡的正文来自后端
  * `core/push_event.py` 的 `dispatch_query`，那个字段的注释写的就是 "text to send to
  * DevOps Agent for follow-up investigation"；`ChatApp.startFromNotification` 的注释也写着
  * 「默认开 DevOps Agent」。但代码从未设置过任何一个开关 —— 用户点「深入调查」，跳进去
- * Composer 里「深度调查（直连）」没勾，那一轮走的是普通问答（还照常计费）。
+ * Composer 里「深度调查」没勾，那一轮走的是普通问答（还照常计费）。
  * 界面没有任何异常：会话起来了、消息发出去了、也有回答。
  *
  * 链路有 4 段，任一段断掉都复现同样的静默失败，所以逐段钉：
@@ -33,8 +33,11 @@ describe("deepDiveTogglesFor", () => {
     });
   });
 
+  // 2026-09-11：原来这两个循环里还有 "security"。它已经不是聊天主题（并入 investigate），
+  // 留着等于在钉一个产品里不存在的主题的行为 —— 且它恰好**碰巧**过：
+  // `topicHasDevopsAgent` 是"默认给、按例外排除"，任何拼错的字符串都返回 true。
   it("covers every topic that renders the toggle", () => {
-    for (const topic of ["investigate", "finops", "security"]) {
+    for (const topic of ["investigate", "finops"]) {
       expect(topicHasDevopsAgent(topic)).toBe(true);
       expect(deepDiveTogglesFor(topic).devopsAgentDirect).toBe(true);
     }
@@ -52,7 +55,7 @@ describe("deepDiveTogglesFor", () => {
 
   // 两个开关同时为 true 会让同一轮既走 agent 又走直连。
   it("never returns both toggles on", () => {
-    for (const topic of ["investigate", "finops", "security", "general", "cases"]) {
+    for (const topic of ["investigate", "finops", "general", "cases"]) {
       const t = deepDiveTogglesFor(topic);
       expect(t.devopsAgent && t.devopsAgentDirect).toBe(false);
     }
@@ -68,7 +71,7 @@ describe("the notification -> deep dive wiring", () => {
     const call = body.match(/onInvestigate\(n\.dispatchQuery \|\| n\.title[^)]*\)/);
     expect(call, `${label}: 找不到事件卡的 onInvestigate(n.dispatchQuery ...) 调用`).not.toBeNull();
     expect(call![0], `${label}: 事件卡「深入调查」没有带 { deep: true }，` +
-      `点进去 Composer 里「深度调查（直连）」不会勾上`).toContain("deep: true");
+      `点进去 Composer 里「深度调查」不会勾上`).toContain("deep: true");
   });
 
   // ③ ChatApp 的两个调用点：拿到 opts.deep 后必须真的兑换成会话开关。

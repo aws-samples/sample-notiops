@@ -4,14 +4,14 @@ import { useModelCatalog } from "../models";
 // `MODELS` 不再从 types 引入：模型清单已改为运行时从 `/models` 拉取（useModelCatalog），
 // types.ts 里那份只剩历史落款用途。main 侧这行原本是 `{ MODELS, topicHasDevopsAgent }`，
 // 合并时只保留后者 —— 本文件已无 MODELS 引用，留着会是未使用导入。
-import { topicHasDevopsAgent } from "../types";
+import { topicHasDevopsAgent, topicHasDevopsChat } from "../types";
 import { getCasesSummary, getDeepInvestigationAvailability } from "../api/chat";
 import { listSkills, skillDisplay, isPresetSkill, type Skill } from "../api/skills";
 // IconSkill 随「/命令菜单」的两层结构一起去掉了：现在根层直接就是 skill 列表，
 // 不再有那条「技能 ▸」父项，所以这个图标已无处使用（留着 tsc 会报未使用导入）。
 // IconChatBubble 随「DevOps 对话」那个平铺 pill 一起搬进了 ModePicker（工具条瘦身），
 // 本文件已无引用 —— 留着 tsc 会报未使用导入。
-import { IconInvestigate, IconCases, IconFinOps, IconReports, IconGlobe, IconSecurity, IconWhatsNew, IconChevronRight, IconPlus, IconCustomize, IconGauge, skillIcon } from "./icons";
+import { IconInvestigate, IconCases, IconFinOps, IconReports, IconGlobe, IconSecurity, IconWhatsNew, IconChevronRight, IconPlus, IconCustomize, skillIcon } from "./icons";
 import ModePicker from "./ModePicker";
 
 interface Props {
@@ -39,6 +39,14 @@ interface Props {
    *  （ChatObjectPicker），本字段仍然是同一个状态位，只是入口不同。 */
   devopsChat?: boolean;
   onToggleDevopsChat?: () => void;
+  /** 「阿里云 STAROps」对话对象（默认关；**没有任何平铺开关** —— 唯一入口是通用会话新对话
+   *  主页的 ChatObjectPicker）。BFF 直连阿里云 CreateChat（SSE），由客户自己的数字员工回答。
+   *
+   *  ⚠️ 这里之所以**必须**传进 Composer（虽然没有开关要画）：它和 `devopsChat` 一样会让
+   *     模型选择器 / 联网搜索 / ModePicker / 模型目录门禁**全部失去意义**。不传的后果不是
+   *     "少一个开关"，而是界面上摆着一个"当前模型 Sonnet 5"、而答话的是阿里云的数字员工 ——
+   *     纯粹的假信息；并且管理员没勾任何 Bedrock 模型时，这条根本不需要模型的路径会发不出去。 */
+  starops?: boolean;
   /** 停止当前会话正在进行的生成。 */
   onStop?: () => void;
   /** 当前会话主题，用于切换专属推荐 prompt。 */
@@ -50,15 +58,34 @@ interface Props {
   accountId?: string;
   /** 跳转到 Skills 管理页（Customize → Skills）。 */
   onManageSkills?: () => void;
-  /** 主题页：点「打开 Dashboard」跳该主题仪表盘详情。传了才渲染——作为紧贴输入框左上角的一体化标签。 */
-  onOpenDashboard?: () => void;
+  /**
+   * 输入框上方那行**粗粒度**仪表盘入口（每项 = 一整棵看板树的入口，不是某一页）。
+   * 有看板的主题全走这一条：调查（运行概览 / 安全态势）、成本（支出与优化）、案例（案例进展）。
+   *
+   * ⚠️ 粗粒度是**刻意**的：这里只给"运行概览 / 安全态势 / 支出与优化 / 案例进展"这一层描述，
+   *    点进去才是现在那棵树状结构（告警总览 / TA 安全检查 / 成本总览 / 案例总览 …）。细节
+   *    以后往树里加，不往这行加 —— 这行是导航，不是目录。
+   *
+   * ⚠️ 四个名字**故意不共用同一个词尾**，改名口径见 `i18n.ts` 的 `dash.pill.*`：第一版四个
+   *    都叫「XX 态势」，客户明确指出三个是硬套（`Case posture` 在英文里不成立），只有安全
+   *    保留 posture。别为了"看起来整齐"再统一回去。
+   *
+   * ⚠️ 2026-09-11：原来还有一条 `onOpenDashboard` prop（紧贴输入框左上角、与 `.cbox` 连成
+   *    一体的「打开 Dashboard」标签，`.cbox-tab`），成本 / 案例两个主题在用。已删 —— 同一个
+   *    位置上两套长得不一样的"仪表盘入口"，客户要在两种交互之间来回适应，而且那个标签名
+   *    （"打开 Dashboard"）根本没说清进去是什么。要复活的话 styles.css 里那三条也一起删了。
+   */
+  dashPills?: { key: string; label: string; Icon: ComponentType<{ size?: number }>; onClick: () => void }[];
   /** 当前会话 id：用于隔离「未发送草稿」。同一 Composer 实例在切会话时不卸载，
    *  故内部 text 会跨会话泄漏（bug）。传了 convKey 后按会话各存各的草稿，切走保存、切回恢复。 */
   convKey?: string;
 }
 
 
-export default function Composer({ model, onModelChange, onSend, busy, showSuggestions = true, webSearch = false, onToggleWebSearch, devopsAgent = false, onToggleDevopsAgent, devopsAgentDirect = false, onToggleDevopsAgentDirect, devopsChat = false, onToggleDevopsChat, onStop, topic = "general", prefill, onManageSkills, onOpenDashboard, convKey, accountId = "" }: Props) {
+// ⚠️ 加了 Props 字段就**必须**在下面这行解构里也加上 —— 漏了不会有任何 TypeScript 报错，
+//    props 会被静默丢弃（现成的例子：`finopsAgent` / `onToggleFinopsAgent` 在 Props 里、
+//    六个调用点都传了，但从没解构出来，于是那个开关永远不显示）。
+export default function Composer({ model, onModelChange, onSend, busy, showSuggestions = true, webSearch = false, onToggleWebSearch, devopsAgent = false, onToggleDevopsAgent, devopsAgentDirect = false, onToggleDevopsAgentDirect, devopsChat = false, onToggleDevopsChat, starops = false, onStop, topic = "general", prefill, onManageSkills, dashPills, convKey, accountId = "" }: Props) {
   const t = useT();
   const { locale } = useLocale();
   const [text, setText] = useState("");
@@ -115,17 +142,18 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
   // account_not_onboarded_to_devops_agent。这里提前问一次，不可用就置灰 + 写清原因和出路。
   // "" = 可用（或还没问出来 —— 探测不确定一律按可用处理，见 api/chat.ts）。
   const deepShown = topicHasDevopsAgent(topic);
-  // 「DevOps 对话」的**平铺开关**只留给故障调查主题（产品决定：显式列举，不跟随
-  // topicHasDevopsAgent 的"默认提供、按例外排除"口径 —— 那份排除表管的是"给我们的 agent
-  // 挂 DevOps 工具"，与这条根本不经我们 agent 的路径无关）。
-  // 通用会话**不显示这个开关**：那里改由新对话主页的「对话对象」两张卡来选
-  // （ChatObjectPicker），选完发第一句即锁定 —— 一个能力两个入口会让"这段对话谁在答"
-  // 变得不可预期（开关是每轮修饰，对象是整段会话的事实）。
-  const CHAT_TOPICS: ReadonlySet<string> = new Set(["investigate"]);
-  const chatShown = CHAT_TOPICS.has(topic || "general");
+  // 「DevOps 对话」的**平铺开关**只留给故障调查主题。判据搬到了 types.ts 的
+  // `topicHasDevopsChat`（原因与口径见那里）—— ChatApp 恢复会话模式时要用同一个判断。
+  const chatShown = topicHasDevopsChat(topic);
   // 通用会话里选了「DevOps Agent」这个对话对象：这一段对话不经我们的模型，
-  // 模型选择器 / "/" 命令 / 联网搜索**全都与它无关**，留在界面上是在承诺不成立的事。
-  const objMode = devopsChat && (topic || "general") === "general";
+  // 模型选择器 / 联网搜索**全都与它无关**，留在界面上是在承诺不成立的事。
+  const objDevops = devopsChat && (topic || "general") === "general";
+  // 同理的第二个对象：阿里云 STAROps 数字员工。
+  const objStarops = starops && (topic || "general") === "general";
+  /** 「这段对话不由我们的模型回答」——凡是靠这一条做界面瘦身的地方都用它。
+   *  ⚠️ 新增一个对话对象时**只需**加进这里；千万不要在下面逐处写 `devopsChat || starops`
+   *     —— 那样漏掉任何一处都不报错，只是那一处继续展示一个不生效的控件（假信息）。 */
+  const objMode = objDevops || objStarops;
   const [deepNa, setDeepNa] = useState("");
   useEffect(() => {
     // 通用会话既不显示深度调查、也不显示这个开关 → 不探（可用性由 ChatObjectPicker 自己探，
@@ -150,6 +178,10 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
     ? t("composer.devops.na.account") : t("composer.devops.na.self");
 
   // 本轮这个 skill 会不会被交给客户自己的 DevOps Agent 执行 —— 三条路径都算（见芯片处注释）。
+  // 🔴 **刻意不含 `starops`**（别顺手补上去）：这个标志唯一的作用是打出「本轮由你的
+  //    DevOps Agent 执行」那条提示，而 STAROps 那条链路根本不接 skill（runStarOpsChat
+  //    只收 text/locale/conversationId），加进来就是一句纯假信息。STAROps 下 `/` 按钮
+  //    本身也已经隐掉（见下面 `!objStarops`），正常走不到这里。
   const devopsHandsOff = devopsAgent || devopsAgentDirect || devopsChat;
   // 已发布到某个 Agent Space（世界 B）= DevOps Agent 那边有完整一份（含 references/）。
   const skillPublishedToDevops = !!activeSkill?.devops_agent?.uploads
@@ -189,7 +221,8 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
   // 「深度调查（直连）」和「DevOps 对话」都由 BFF 直连 DevOps Agent API，全程 0 token、
   // 不碰 Bedrock，所以它们不受模型目录门禁约束 —— 否则管理员取消勾选全部 webchat 模型后，
   // 唯一不需要模型的功能反而发不出去，而提示语还指向一个与它无关的配置项。
-  const sendAllowed = (devopsAgentDirect || devopsChat) ? canSendWithoutModel : catalogCanSend;
+  // STAROps 同理，而且更彻底：答话的是**阿里云**的数字员工，一个字都不经 Bedrock。
+  const sendAllowed = (devopsAgentDirect || devopsChat || starops) ? canSendWithoutModel : catalogCanSend;
   const modelName = modelOptions.find((m) => m.id === model)?.name ?? model;
 
   useEffect(() => {
@@ -232,6 +265,9 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
       { Icon: IconCases, key: "chip.cases.summary" },
       { Icon: IconReports, key: "chip.cases.create" },
     ],
+    // 调查池 = 原调查 6 条 + 原安全 6 条（2026-09-11「安全」主题并入「调查」）。
+    // 池子变大不改抽样数（下面 N_CHIPS=3），只是每次刷出来的组合更多样；安全那 6 条
+    // 的图标保持 IconSecurity，客户一眼能看出这条是安全向的。
     investigate: [
       { Icon: IconInvestigate, key: "chip.inv.resource" },
       { Icon: IconInvestigate, key: "chip.inv.ec2reboot" },
@@ -239,6 +275,12 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
       { Icon: IconInvestigate, key: "chip.inv.connectivity" },
       { Icon: IconReports, key: "chip.inv.cwalarms" },
       { Icon: IconInvestigate, key: "chip.inv.rootcause" },
+      { Icon: IconSecurity, key: "chip.sec.findings" },
+      { Icon: IconSecurity, key: "chip.sec.publics3" },
+      { Icon: IconSecurity, key: "chip.sec.opensg" },
+      { Icon: IconSecurity, key: "chip.sec.iamreview" },
+      { Icon: IconSecurity, key: "chip.sec.mfa" },
+      { Icon: IconReports, key: "chip.sec.bestpractice" },
     ],
     finops: [
       { Icon: IconFinOps, key: "chip.fin.anomaly" },
@@ -248,14 +290,9 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
       { Icon: IconFinOps, key: "chip.fin.ri" },
       { Icon: IconFinOps, key: "chip.fin.untagged" },
     ],
-    security: [
-      { Icon: IconSecurity, key: "chip.sec.findings" },
-      { Icon: IconSecurity, key: "chip.sec.publics3" },
-      { Icon: IconSecurity, key: "chip.sec.opensg" },
-      { Icon: IconSecurity, key: "chip.sec.iamreview" },
-      { Icon: IconSecurity, key: "chip.sec.mfa" },
-      { Icon: IconReports, key: "chip.sec.bestpractice" },
-    ],
+    // （原 security 池已并入上面的 investigate —— 「安全」不再是聊天主题。
+    //   留一个空的 security 键没有意义：`CHIP_POOL[topic] ?? CHIP_POOL.general` 本身就兜得住，
+    //   而留着会让人以为还有个安全主题。）
     "whats-new": [
       { Icon: IconWhatsNew, key: "chip.wn.recent" },
       { Icon: IconWhatsNew, key: "chip.wn.mine" },
@@ -388,18 +425,29 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
             ))}
           </div>
         )}
-        {/* 主题页专属：紧贴输入框左上角的一体化「打开 Dashboard」标签（视觉上与 .cbox 连成一体：
-            底边压在 cbox 上、共用圆角与描边）。仅主题页传了 onOpenDashboard 才渲染。 */}
-        {onOpenDashboard && (
-          <div className="cbox-tabs">
-            <button type="button" className="cbox-tab" onClick={onOpenDashboard}>
-              <IconGauge size={14} />
-              {locale === "en" ? "Open Dashboard" : "打开 Dashboard"}
-              <IconChevronRight size={14} />
-            </button>
+        {/* 输入框上方那行**粗粒度**仪表盘入口（调查：运行概览 / 安全态势；成本：支出与优化；
+            案例：案例进展）。跟上面那排 `.chip` 靠**形状**区分，不靠文字说明 ——
+            `.dashpill` 是透明底 + 全圆角 + 右侧一个 `›`，`.chip` 是卡片底 + 18px 圆角。
+            ⚠️ 2026-09-11：这一行原来前面还有一个「仪表盘」图标+文字标签（`.dashpills-label`），
+            产品要求去掉 —— 胶囊名字本身（运行概览 / 安全态势 / …）已经说清是什么了，再加一个
+            分类词只是占掉输入框上方本来就很紧的横向空间。别再加回来。
+            ⚠️ 左边那个主题图标**不上色**（客户原话「这些 dashboard 前面的图标，不需要有颜色」）：
+            两个 svg 都继承 `.dashpill` 的 color，层次靠 opacity 不靠色相。见 styles.css。
+            单行、不换行（`nowrap` + 横向滚动）：换行会把输入框往下推，两三个入口不值得。
+            这一行**左对齐**（贴 .cbox 左边缘），空态也一样 —— 见 styles.css 里 .empty-center
+            那段注释：曾经在空态居中过一版，产品否掉了。 */}
+        {!!dashPills?.length && (
+          <div className="dashpills">
+            {dashPills.map((p) => (
+              <button key={p.key} type="button" className="dashpill" onClick={p.onClick}>
+                <p.Icon size={14} />
+                {p.label}
+                <IconChevronRight size={13} />
+              </button>
+            ))}
           </div>
         )}
-        <div className={"cbox" + (onOpenDashboard ? " has-tab" : "")}>
+        <div className="cbox">
           {/* 命令菜单：点 "/" 按钮或手输 "/" 弹出。**一层扁平列表**（不再是「Skills ▸」+ 悬停子菜单）：
               根层(text==="/")列出**全部** skill，过滤层(text==="/xxx")列出全部匹配项 —— 两层同一个
               渲染分支，唯一差别是列表内容。
@@ -455,11 +503,12 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
           )}
           {/* 已激活的 skill 芯片（发送时随本轮强制使用该 skill）。「DevOps Agent」标记的含义是
               **这一轮谁来执行这个 skill**，所以三条交给 DevOps Agent 的路径都要打上：
-                · 深度调查（devopsAgent）      → 我们的 agent 转交 DevOps Agent；
-                · 深度调查（直连）（devopsAgentDirect）→ BFF 直连 CreateBacklogTask；
-                · DevOps 对话（devopsChat）    → BFF 直连 CreateChat/SendMessage。
-              以前只认第一个，于是勾了「深度调查（直连）」的客户在界面上**看不出**这个 skill 会被
-              交给 DevOps Agent —— 同一件事，界面说法却随路径变。 */}
+                · `devopsAgent`       → 我们的 agent 转交 DevOps Agent（**已无界面入口**，
+                                        2026-09-13 撤掉，见 ModePicker 文件头；字段仍在）；
+                · `devopsAgentDirect` → 界面上的「深度调查」，BFF 直连 CreateBacklogTask；
+                · `devopsChat`        → 界面上的「DevOps 对话」，BFF 直连 CreateChat/SendMessage。
+              以前只认第一个，于是走直连的客户在界面上**看不出**这个 skill 会被交给
+              DevOps Agent —— 同一件事，界面说法却随路径变。 */}
           {activeSkill && (() => { const ChipIcon = skillIcon(activeSkill.skill_id); return (
             <div className="skill-active">
               <ChipIcon size={14} /> <span>{skillDisplay(activeSkill, locale).name}</span>
@@ -470,11 +519,15 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
             </div>
           ); })()}
           {/* 未发布到 DevOps Agent 的 skill，在两类路径上的后果**不一样**，所以提示分两句写：
-              · 「深度调查」：我们的 agent 只是转交一个任务描述，正文不过去 → 这个 skill 真的不会被激活，必须先发布；
+              · 转交路径（`devopsAgent`）：我们的 agent 只是转交一个任务描述，正文不过去 →
+                这个 skill 真的不会被激活，必须先发布；
               · 两条**直连**路径：BFF 把正文内联进发给 DevOps Agent 的那段话（devops_skill.mjs）→ 无需发布也生效，
                 唯一缺口是 references/ 附属文件取不到。
               这里以前只有第一句、且只在 devopsAgent 时出现：直连路径既没提示（客户不知道谁在执行），
-              而把第一句套上去更糟 —— 那是在说一件不成立的事（"不会被激活"）。 */}
+              而把第一句套上去更糟 —— 那是在说一件不成立的事（"不会被激活"）。
+              ⚠️ 2026-09-13 起 `devopsAgent` 已经没有界面入口（见 ModePicker 文件头）⇒ 实际走到
+              的永远是第二句。这个三元刻意不删：字段与 BFF 侧那条路都还在，入口一旦加回来，
+              第一句必须跟着回来 —— 删了就得有人重新发现"两条路径后果不同"这件事。 */}
           {activeSkill && devopsHandsOff && !skillPublishedToDevops && (
             <div className="skill-needs-devops">
               <IconInvestigate size={13} /> {t(devopsAgent ? "composer.skill.notPublished" : "composer.skill.directInline")}
@@ -489,7 +542,9 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
               rows={1}
               placeholder={activeSkill
                 ? `使用 Skill「${skillDisplay(activeSkill, locale).name}」…`
-                : t(devopsChat ? "composer.placeholder.devopschat" : "composer.placeholder")}
+                : t(starops ? "composer.placeholder.starops"
+                    : devopsChat ? "composer.placeholder.devopschat"
+                    : "composer.placeholder")}
               value={text}
               onChange={(e) => { setText(e.target.value); autogrow(); }}
               onKeyDown={(e) => {
@@ -519,7 +574,13 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
                 给客户点了不生效的控件。
                 "/" 则保留 —— 它现在是真生效的：BFF 会把 skill 正文内联进发给 DevOps Agent 的
                 那段话（bff/web-chat/devops_skill.mjs），DevOps Agent 按它执行，我们侧仍 0 token。 */}
-            {/* "/" 命令菜单按钮：填入 "/" 并弹出扁平 skill 列表（全部 + 管理 / 新建） */}
+            {/* "/" 命令菜单按钮：填入 "/" 并弹出扁平 skill 列表（全部 + 管理 / 新建）
+                🔴 STAROps 那个对象下**不显示**：BFF 的 STAROps 分支根本不接 skillId
+                （runStarOpsChat 只收 text/locale/conversationId），而 Skills 全是 AWS 侧的
+                做法（调 AWS API、读 CloudWatch），内联给阿里云的数字员工也毫无意义。留着它
+                客户会挑一个 skill、看到输入框被填成「使用 Skill「X」」、发出去却什么都没按它执行
+                —— 又一条"发出去才知道没生效"的假信息。要给 STAROps 做 skill 是另一件事。 */}
+            {!objStarops && (
             <button
               type="button"
               className={"cmd-btn" + (slashOpen ? " on" : "")}
@@ -529,54 +590,51 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
             >
               /
             </button>
+            )}
+            {/* 联网搜索：**只留图标**（产品指定，2026-09-13）。地球仪这个图标本身就是"联网"的
+                通用符号，「联网」两个字在它旁边不增加任何信息，只占工具条宽度。
+                ⚠️ 去掉可见文字后**必须**有 `aria-label` —— 否则读屏软件念出来的是一个空按钮
+                （IconGlobe 是个裸 `<svg>`，既没有 `<title>` 也没有 `aria-hidden`）。这里用
+                `t("composer.websearch")` 而不是硬编码英文，因为同一句已经在 `title` 里用了，
+                两处同源就不会漂。（旁边 Stop/Send 两个按钮的 aria-label 是硬编码英文 —— 那是
+                旧写法，别照抄。） */}
             {!objMode && (
               <button
                 type="button"
-                className={"websearch-toggle" + (webSearch ? " on" : "")}
+                className={"websearch-toggle icon-only" + (webSearch ? " on" : "")}
                 onClick={onToggleWebSearch}
                 title={t("composer.websearch") + " — " + t("composer.websearch.hint")}
+                aria-label={t("composer.websearch")}
                 aria-pressed={webSearch}
               >
-                <IconGlobe size={15} /> {t("composer.websearch.short")}
+                <IconGlobe size={15} />
               </button>
             )}
-            {/* 回答模式：**平铺后工具条上带文字的按钮 >2 个就收成下拉，≤2 个保持原样** ——
-                产品要求（2026-09-04：「聊天框只有 ≤2 个按钮的（比如：联网+深度），可以保持不变」）。
-                ⚠️ 数的是**工具条上带文字的按钮总数（含「联网」这一枚）**，不是模式项数 ——
-                用户给的例子「联网+深度」就把联网算进去了。`/` 和发送是图标按钮，不占这个预算。
-                各主题（barCount = 联网 1 + 模式项数）：
-                  · investigate = 1+3 = 4（DevOps 对话 + 深度调查 + 深度调查（直连）） → 下拉
-                  · finops      = 1+3 = 4（深度调查 + 深度调查（直连）+ FinOps 置灰） → 下拉
-                  · security 等 deepShown-only = 1+2 = 3（深度调查 + 深度调查（直连）） → 下拉
-                  · general / cases / whats-new = 1+0 = 1 → 一个模式都没有，什么都不渲染
-                所以在**当前**主题集合里，"保持平铺"这条只是一道**未来的保险**：将来某主题只提供
-                **一个**模式（联网+它 = 2 枚）时它才生效 —— 而不是把「深度调查 / 深度调查（直连）」
-                这一对留在外面。那一对恰恰是最该收的：两个标签只差四个字、真正的区别只藏在
-                tooltip 里、而且它们互斥（同时亮起来的语义不是"更强"，是同一个问题被送上两条路）。
-                ⚠️ 阈值判据**落在 ModePicker 里**（`items.length === 2`，即"不启用 + 唯一一个
-                模式" → 画成平铺 pill），
-                不在这里 —— 项清单、置灰、图标都在那边，在这边再列一份必然漂。这里只负责
-                "联网那一枚在不在"这个前提：!objMode 时它总在，所以 ModePicker 侧的
-                "1 项 = 总共 2 枚" 恒成立。
-                收成下拉的原因（原来这里是**四个并列 pill**）：它们在状态上本来就是单选
-                （ChatApp 的 `setDevopsMode` 一次写三个字段），画成四个并列复选既占一整行、
-                又看起来能同时开。收成下拉后每一项有名称 + 说明两行，那句说明才是这个控件真正
-                要给的信息。详见 ModePicker 的文件头注释。
-                主题门控、置灰（deepNa）、互斥（ChatApp 的三个 onToggle*）在两条路径上都原样
-                保留 —— 关着时前端仍然一个字段都不传，后端行为与从前逐字节一致。
-                ⚠️ objMode（通用会话选了 DevOps Agent）不走这两条路径：那里剩下的「深度调查」
-                是**这一轮的修饰**而不是选模式，仍是下面单独那个开关。 */}
+            {/* 「谁来答这一轮」的开关：**平铺**，不是下拉。
+                🔁 2026-09-13 产品指定改回平铺。上一版（2026-09-04）这里写着一条阈值规则
+                「工具条上带文字的按钮 >2 个就收成下拉」，并算出每个主题都是 3~4 枚 ⇒ 全部走
+                下拉。那条规则和那笔账**现在都不成立了**，因为同一次改动把项数砍到了 ≤2：
+                  · 「深度调查」（经我们的 agent 转交）从界面撤掉；
+                  · 成本主题那项永久置灰的「FinOps」删掉；
+                  · 「联网」只留图标，本来就不再占"带文字按钮"的预算。
+                现在各主题的实际枚数（ModePicker 渲染几枚就是几枚，没有"不启用"那一项）：
+                  · investigate = 2（DevOps 对话 + 深度调查）
+                  · finops / security 等 deepShown 主题 = 1（深度调查）
+                  · general / cases / whats-new = 0 → ModePicker 返回 null，什么都不渲染
+                项清单、置灰（deepNa）、图标、互斥调用都在 ModePicker 里，**这边不再列第二份**
+                —— 上一版就是在这里列了一份主题→枚数的账，然后那份账先烂掉。
+                主题门控与互斥（ChatApp 的 onToggle*）原样保留：关着时前端一个字段都不传，
+                后端行为与从前逐字节一致。
+                ⚠️ objMode（通用会话选了 DevOps Agent）不走这条：那里剩下的「深度调查」
+                是**这一轮的修饰**而不是选模式，仍是下面单独那个开关（两处现在同名同字段）。 */}
             {!objMode && (
               <ModePicker
-                topic={topic}
                 deepShown={deepShown}
                 chatShown={chatShown}
                 deepNa={deepNa}
                 deepNaHint={deepNaHint}
-                devopsAgent={devopsAgent}
                 devopsAgentDirect={devopsAgentDirect}
                 devopsChat={devopsChat}
-                onToggleDevopsAgent={onToggleDevopsAgent}
                 onToggleDevopsAgentDirect={onToggleDevopsAgentDirect}
                 onToggleDevopsChat={onToggleDevopsChat}
               />
@@ -588,8 +646,12 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
                 **默认不勾**（产品指定）：深度调查要跑几分钟，不能替客户默认选上。
                 不置灰：能进 objMode 就说明这个账号已接入 DevOps Agent（可用性已由
                 ChatObjectPicker 探过），这里再探一次只是多一个签名请求。
-                互斥由 ChatApp 的 toggleDevopsAgentDirect 保证 —— 勾它**不会**把对话对象换掉。 */}
-            {objMode && (
+                互斥由 ChatApp 的 toggleDevopsAgentDirect 保证 —— 勾它**不会**把对话对象换掉。
+                🔴 判据是 `objDevops` 而**不是** `objMode`：STAROps 那个对象**没有**这个开关
+                   （它靠一句自然语言自己发起巡检/调查，正如 STAROps 控制台里的做法）。写成
+                   objMode 会在阿里云会话里摆出一个 AWS DevOps Agent 的深度调查开关 ——
+                   勾上之后 BFF 的一选一让 STAROps 胜出，这个开关**什么也不做**。 */}
+            {objDevops && (
               <button
                 type="button"
                 className={"websearch-toggle" + (devopsAgentDirect ? " on" : "")}
@@ -700,10 +762,14 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
           </div>
         </div>
         {/* 免责声明仅在已开始对话时显示；空对话居中态隐藏。
-            通用会话选了 DevOps Agent（objMode）时必须换主语：这段对话答话的不是 NotiOps，
-            把"NotiOps 可能出错"挂在别人的答案下面既张冠李戴、也让客户不知道该找谁核实。 */}
+            通用会话选了 DevOps Agent（objDevops）时必须换主语：这段对话答话的不是 NotiOps，
+            把"NotiOps 可能出错"挂在别人的答案下面既张冠李戴、也让客户不知道该找谁核实。
+
+            🔴 这里是**三选一**、判据必须是 `objDevops` / `objStarops` 而不是笼统的 `objMode`：
+               objMode 把两个对象并成一个，会让阿里云 STAROps 的会话底下写着"由你的
+               DevOps Agent 回答" —— 落款写成另一朵云，比不写更糟。 */}
         {!showSuggestions && (
-          <div className="chint">{t(objMode ? "composer.hint.devops" : "composer.hint")}</div>
+          <div className="chint">{t(objStarops ? "composer.hint.starops" : objDevops ? "composer.hint.devops" : "composer.hint")}</div>
         )}
       </div>
     </div>

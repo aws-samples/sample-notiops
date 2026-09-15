@@ -89,6 +89,9 @@ _DISABLED = os.environ.get("NOTIOPS_DISABLE_FINOPS_MCP", "").strip().lower() in 
 _clients = []      # 常驻 MCPClient 单例
 _tools_cache = None  # 合并后的白名单工具列表（缓存）
 _LOAD_LOCK = threading.Lock()  # 守住"子进程只起一次"（_load_all_tools 可能被并发进入）
+# 最近一次启动里没起来的 server（就地改 list，不重绑，`main.py` 因此总读到本轮状态）。
+# 与 core/investigation_mcp.py / core/aws_api_mcp.py 同一范式，见各自的 degraded_note()。
+_degraded_servers: list[str] = []
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +221,20 @@ def get_tools(core_only: bool = False):
     return all_tools
 
 
+def degraded_note() -> str:
+    """本轮有 server 没起来时给模型的说明；正常时空串。见 investigation_mcp.degraded_note。
+
+    成本这一类特别不能让模型"凭印象答"：它会给出一个**看起来很具体的金额**（客户会拿去
+    做决策），而真实数字根本没查到。文案给模型看，故英文（本模块受 lint_i18n 约束）。
+    """
+    if not _degraded_servers:
+        return ""
+    return ("Cost/billing and pricing tools are UNAVAILABLE in this session "
+            f"({', '.join(_degraded_servers)} failed to start). Never state any cost, spend "
+            "or price figure from memory: say this data source failed to start for this "
+            "session and suggest retrying in a new conversation.")
+
+
 def _load_all_tools():
     """拿到全量白名单工具并缓存（只跑一次）。两条路：
 
@@ -252,7 +269,19 @@ def _load_all_tools():
                         "no subprocess started)", len(lazy))
             return lazy
         per_server = _start_servers()
-        _tools_cache = _post(per_server)
+        merged = _post(per_server)
+        failed = _snap.failed_servers(per_server)
+        if failed:
+            # **不缓存**残缺结果：`_start_servers()` 起不来的 server 留空槽位，而
+            # `[] is not None` —— 缓存下来就是"这个容器余生都没有成本工具"，且完全静默。
+            # 不缓存 = 同容器下一个会话重试。判据与 `_snap.save` 闸门①共用（failed_servers）。
+            _degraded_servers[:] = failed
+            logger.error("finops_mcp: server(s) failed to start: %s (counts %s); NOT caching "
+                         "this tool set, next session in this container retries",
+                         failed, _snap.server_counts(per_server))
+            return merged
+        _degraded_servers[:] = []
+        _tools_cache = merged
         logger.info("finops_mcp: total %d FinOps tools exposed", len(_tools_cache))
         # 落盘存**原始** list_tools 输出（不是过滤后的）：这样以后改白名单立刻生效，
         # 不必让白名单参与快照指纹。

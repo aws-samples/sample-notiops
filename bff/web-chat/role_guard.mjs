@@ -21,6 +21,8 @@
  *    `bff/web-chat/tests/role_guard.test.mjs` 的元断言盯着调用点数量。
  */
 
+import { userError } from "./safe_err.mjs";
+
 const ROLE_ARN = /^arn:aws(?:-[a-z-]+)?:iam::(\d{12}):role\/.+$/;
 
 /** 解析 role ARN 的账号段；不是合法 role ARN → 空串。 */
@@ -37,12 +39,12 @@ export function assertRoleBelongsTo(roleArn, accountId, code = "bad_request") {
   const acct = String(accountId || "").trim();
   const got = roleArnAccount(roleArn);
   if (!acct || !got || got !== acct) {
-    const e = new Error(
+    // userError：这段文案是手写的、不含任何上游散文，且 ARN 就是调用方自己传进来的
+    // 那一个 —— 显式标记成可外显，errBody 才不会把它压成一句干巴巴的 code。
+    throw userError(
       `role ARN 不属于账号 ${acct || "?"}（ARN 账号段=${got || "无法解析"}）—— `
       + `拒绝 AssumeRole。这是 confused-deputy 防御：config 表里的角色 ARN 指向了`
-      + `别的账号，通常意味着登记数据被写错或被篡改。ARN=${String(roleArn || "")}`);
-    e.code = code;
-    throw e;
+      + `别的账号，通常意味着登记数据被写错或被篡改。ARN=${String(roleArn || "")}`, code);
   }
   return got;
 }

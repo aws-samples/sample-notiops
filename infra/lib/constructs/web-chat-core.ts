@@ -54,8 +54,9 @@ export interface WebChatCoreProps {
   agentSpaceId?: string;
   // （`idleConsoleUrl` 已随老控制台退役，2026-09-04 —— 见 app.ts 的说明。）
   /** 报告 CDN 域名（NotiOpsBackendStack.reportsCdnDomain，CloudFront + OAC，只暴露 reports/*）。
-   * 「深度调查（直连）」把 HTML 报告落到 dataBucket 的 reports/ 前缀后，用它拼**不过期**的链接。
-   * 缺省时直连路径只是少一个报告链接（摘要仍在聊天里），不报错。 */
+   * 「深度调查（直连）」与「STAROps 对话」的巡检报告都落到 dataBucket 的 reports/ 前缀，
+   * 用它拼**不带签名**的直读链接（有效期由桶上的 `expire-reports-7d` 决定：7 天，不是永久）。
+   * 缺省时这两条路径只是少一个报告链接（正文仍在聊天里），不报错。 */
   reportsCdnDomain?: string;
 
   /**
@@ -566,29 +567,79 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   );
 
   // Admin「通知」板块：读写 IM 机器人配置（每个平台一个 Secrets Manager secret）。
-  // 按**字面名**限定到 notiops/im-bot-*（Secrets Manager ARN 带随机后缀故加 *），
-  // 不做跨栈 CFN import —— 老管理前端未来 sunset 时本栈零依赖、零影响。
+  // 按**字面名**限定（Secrets Manager ARN 带随机后缀故加 *），不做跨栈 CFN import
+  // —— 老管理前端未来 sunset 时本栈零依赖、零影响。
   // CreateSecret 用于 secret 尚不存在的首次配置场景（如未部署过 IM bot 栈）。
   //
-  // ⚠️ 加平台必须在这两条里各补一行（飞书 = bff/web-chat/feishu_config.mjs，
-  //    钉钉 = dingtalk_config.mjs）。漏了的症状**不是 403 页面**：GET 那条路整页 500
-  //    （index.mjs 里刻意用 Promise.all 而不是 allSettled —— 宁可整页报错，也不要画出一个
-  //    "该平台未配置"的假象让客户去重填一份已经填好的凭证）。
+  // ⚠️ 加平台必须在这份清单里补齐它**全部**的 secret 名（飞书 = bff/web-chat/
+  //    feishu_config.mjs，钉钉 = dingtalk_config.mjs，Slack = slack_config.mjs）。
+  //    漏了的症状**不是 403 页面**：GET 那条路整页 500（index.mjs 里刻意用 Promise.all
+  //    而不是 allSettled —— 宁可整页报错，也不要画出一个"该平台未配置"的假象让客户去
+  //    重填一份已经填好的凭证）。
   // 逐个字面名列出、不用 `notiops/im-bot-*` 一条通配盖住：将来若有别的组件也叫
   // `notiops/im-bot-...`，通配会把它一起交给 BFF 改写。
-  const imBotSecretArns = ["feishu", "dingtalk"].map(
-    (p) => `arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:notiops/im-bot-${p}*`,
+  //
+  // ⚠️ Slack **不在 `notiops/im-bot-*` 命名空间里**，而且是**两个纯字符串 secret**
+  //    （不是飞书/钉钉那种"一个 secret 里放 JSON"）：`notiops/slack-bot-token`
+  //    存 `xoxb-…`、`notiops/slack-signing-secret` 存验签密钥。名字是历史遗留，
+  //    数据面（platforms/slack/caps.py、lambda_ingress.py）按这两个名字读，**不能**
+  //    为了对齐命名而改 —— 改名等于让现网所有已配好的 Slack 机器人当场失效。
+  const imBotSecretNames = [
+    "notiops/im-bot-feishu",
+    "notiops/im-bot-dingtalk",
+    "notiops/slack-bot-token",
+    "notiops/slack-signing-secret",
+  ];
+  const imBotSecretArns = imBotSecretNames.map(
+    (n) => `arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:${n}*`,
   );
+  // ⚠️ 这两条的 `sid` 不是装饰：`scripts/test_oneclick_parity.py` 的 `statements()`
+  //    **按 sid 建索引**，没有 sid 的语句在两条路径的对比里是**不可见**的 —— 也就是说
+  //    在补上 sid 之前，方式A 漏授这两条不会有任何门禁报红（R21 记的就是这个）。
+  //    新增任何 BFF 读写 Secret 的语句都必须带 sid。
   bff.addToRolePolicy(
     new iam.PolicyStatement({
+      sid: "ImBotSecretsReadWrite",
       actions: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:UpdateSecret"],
       resources: imBotSecretArns,
     }),
   );
   bff.addToRolePolicy(
     new iam.PolicyStatement({
+      sid: "ImBotSecretsCreate",
       actions: ["secretsmanager:CreateSecret"],
       resources: imBotSecretArns,
+    }),
+  );
+
+  // Admin「多云」板块：读写客户阿里云账号凭据（AK/SK，单个 Secrets Manager secret）。
+  //
+  // **独立一条语句、独立一份名字清单**，不追加进上面的 `imBotSecretNames`：那份清单的
+  // 注释块通篇讲的是 IM 平台（"加平台必须补齐它全部的 secret 名"），把一朵云的账号凭据
+  // 混进去，下一个加 IM 平台的人会顺手把它一起改掉或删掉。两者的爆炸半径也不同一个量级：
+  // IM secret 泄漏止于"能往那个群发消息"，这一条泄漏的是客户阿里云账号里这把钥匙能碰到
+  // 的一切。
+  //
+  // 动作里 `TagResource` 是 **CreateSecret 带 Tags 的硬依赖**：方式A 的一键模板不预建
+  // 任何凭据资源，这个 secret 由 BFF 在客户首次保存时 CreateSecret 建出来 —— 栈级 Tags
+  // 盖不到它。没有 TagResource 就打不上 `project` / `auto-delete` 标签（本仓强制标签规则），
+  // 而症状是**保存直接失败**（AccessDenied），不是"标签少了"。
+  // 对应的 BFF 侧实现见 bff/web-chat/aliyun_config.mjs，名字必须与那里的 `SECRET_ID`
+  // 逐字一致 —— 漏了不是 403，是 GET /admin/aliyun-config 整条 500。
+  const aliyunSecretNames = ["notiops/aliyun-credentials"];
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      sid: "AliyunCredentialsSecretAccess",
+      actions: [
+        "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue",
+        "secretsmanager:UpdateSecret", "secretsmanager:DescribeSecret",
+        "secretsmanager:CreateSecret", "secretsmanager:TagResource",
+      ],
+      // 按**字面名** + `*`（Secrets Manager ARN 带随机后缀）。不用 `notiops/*` 通配 ——
+      // 那会把本部署里所有 notiops secret（含 Bedrock API key、IM 凭证）一并交给 BFF 改写。
+      resources: aliyunSecretNames.map(
+        (n) => `arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:${n}*`,
+      ),
     }),
   );
 
@@ -887,9 +938,12 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
         conditions: { StringLike: { "s3:prefix": ["skills/*", "skills/"] } },
       }),
     );
-    // 「深度调查（直连）」报告落盘：HTML 报告写共享数据桶的 reports/ 前缀，读取走
-    // ReportsCDN（CloudFront + OAC，ReportsPathGuard 把非 /reports/ 一律 403），
-    // 因此**只需写权限、不需要 presign**（CDN 链接直读且不过期）。
+    // 报告落盘：HTML 报告写共享数据桶的 reports/ 前缀，读取走 ReportsCDN
+    // （CloudFront + OAC，ReportsPathGuard 把非 /reports/ 一律 403），因此**只需写权限、
+    // 不需要 presign**（CDN 链接不带签名、直读）。
+    // ⚠️ 前缀刻意是整个 `reports/*`，不是 `reports/investigation/*`：「深度调查（直连）」
+    // 写 `reports/investigation/`，「STAROps 对话」的巡检报告写 `reports/starops/`。
+    // 收窄到某个子前缀 = 下一个报告类型上线时静默失败（只在 CloudWatch 里留一行 warn）。
     bff.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["s3:PutObject"],

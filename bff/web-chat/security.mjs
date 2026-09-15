@@ -13,6 +13,8 @@ import {
 import { SecurityHubClient, GetFindingsCommand } from "@aws-sdk/client-securityhub";
 import https from "node:https";
 import { credsFor } from "./xacct.mjs";
+// safeErr：异常一律压成"类型名/错误码"再进响应体（见 safe_err.mjs）。
+import { safeErr } from "./safe_err.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 // Support / Trusted Advisor API 只在 us-east-1
@@ -129,7 +131,7 @@ async function bulletins() {
     }
     return { available: true, items };
   } catch (e) {
-    return { available: false, reason: String(e?.message || e), items: [] };
+    return { available: false, reason: safeErr(e), items: [] };
   }
 }
 

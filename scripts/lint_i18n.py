@@ -85,6 +85,17 @@ CJK_ALLOWLIST = {
     # 长成现在这样，见 §13.2）。CJK 字面量与事件流处理紧耦合、只在这一条路径出现，
     # 拆成 20 个 i18n key 会让"和 JS 端逐行对照"不再可能 —— 语义偏差就出来了。
     "core/devops_chat.py",
+    # STAROps（阿里云数字员工）直连的两个模块 —— 与 core/devops_chat.py 完全同一条理由，
+    # 只是对端换成了阿里云：
+    #   · core/starops_sse.py  是 bff/web-chat/starops_sse.mjs 的逐行对照实现。两份解析器
+    #     必须能**并排 diff**（漂移的症状是"Web 面板正常、飞书卡片把答案说两遍"，线上极难
+    #     归因，所以专门有 tests/test_starops_sse.py 里的两条跨语言判据盯着）。把 CJK 拆成
+    #     i18n key 会让逐行对照当场失效。它自己的双语分支走本地 `_dv(zh, en)`，不是漏翻。
+    #   · core/starops_chat.py 的 CJK 是**故障话术**：哪一项配置没填、缺哪一条 RAM 授权、
+    #     这一轮为什么不完整。每一句都紧贴一个具体的阿里云错误码与一处实测结论（措辞本身
+    #     就是产品，见 tests/test_starops_chat.py 的文件头），同样用本地 `dv()` 出双语。
+    "core/starops_sse.py",
+    "core/starops_chat.py",
     # 变更请求/prompt-injection 二道门。CJK 字面量是**输入匹配正则**（匹配用户键入
     # 的「删除实例」「忽略以上指令」），不是输出文案 —— 与 core/nl_router.py 同源
     # 同理。输出（拒绝话术）走 i18n.t('out_of_scope.change_request', locale)。
@@ -153,6 +164,13 @@ CJK_ALLOWLIST = {
     # 只在开发者终端里出现（「🔴 dispatched == mapped（taskId 接住了）」
     # 这种话的价值就在于长且具体）。
     "scripts/inspection_verify_live.py",
+    # 跨模型历史清洗 / 模型失败语义的测试。它的 CJK 字面量全是**断言针**：钉的是
+    # main.py 里那几段降级文案的**原样字节**（「重试不会好转」只许出现在权限档、
+    # 「1. 直接再发一次」只许出现在真临时故障那一档）。这类断言搬进 core/i18n.py 就
+    # 自我否定了 —— 它要验的正是「产品里到底写着哪几个字」，通过 i18n.t 取回来只能
+    # 证明键存在。测试脚本本身零用户可见输出，本 linter 的立论（对外文案必须双语）
+    # 对它不适用。
+    "scripts/test_webchat_history_scrub.py",
     # 接线检查（domain 层算好了但调用方没取）。与上面三个同类：**开发者工具**，
     # 输出只在终端与 CI 日志里出现，客户永远看不到。
     #

@@ -195,6 +195,9 @@ def _truncate_text(s: str) -> str:
 _clients = []        # 常驻 MCPClient 单例
 _tools_cache = None  # 白名单工具列表（缓存）
 _LOAD_LOCK = threading.Lock()  # 守住"子进程只起一次"（get_tools 可能被并发进入）
+# 最近一次启动里没起来的 server（就地改 list，不重绑）。与 finops_mcp / investigation_mcp
+# 同一范式；这一组的缺失最致命 —— 它是**全主题**的只读兜底，见 degraded_note()。
+_degraded_servers: list[str] = []
 
 # 官方包：console script 名 + 模块回退路径。
 _SERVER = ("awslabs.aws-api-mcp-server", "awslabs.aws_api_mcp_server.server")
@@ -475,6 +478,21 @@ def get_tools():
     return _load_all_tools()
 
 
+def degraded_note() -> str:
+    """本轮 server 没起来时给模型的说明；正常时空串。见 investigation_mcp.degraded_note。
+
+    这一组是**全主题**挂载的只读兜底（call_aws），它一没，模型手上就只剩少数专用工具，
+    而 system prompt 还在要求"必须查了再答" —— 最容易的失败就是编一个像真的答案。
+    文案给模型看，故英文（本模块受 lint_i18n 约束）。
+    """
+    if not _degraded_servers:
+        return ""
+    return ("The generic read-only AWS API fallback (call_aws / suggest_aws_commands) is "
+            f"UNAVAILABLE in this session ({', '.join(_degraded_servers)} failed to start). If a "
+            "question needs an AWS API call you have no dedicated tool for, say so plainly "
+            "and suggest retrying in a new conversation. Never invent the API output.")
+
+
 def _load_all_tools():
     """拿到白名单工具并缓存（只跑一次）。与 finops_mcp / investigation_mcp 同构，两条路：
 
@@ -500,7 +518,19 @@ def _load_all_tools():
                         len(lazy))
             return _tools_cache
         per_server = _start_servers()
-        _tools_cache = _post(per_server)
+        merged = _post(per_server)
+        failed = _snap.failed_servers(per_server)
+        if failed:
+            # **不缓存**残缺结果：起不来的 server 留空槽位，而 `[] is not None` —— 缓存下来
+            # 就是"这个容器余生都没有只读兜底"，且完全静默（用户只觉得它突然什么都查不了）。
+            # 不缓存 = 同容器下一个会话重试。判据与 `_snap.save` 闸门①共用（failed_servers）。
+            _degraded_servers[:] = failed
+            logger.error("aws_api_mcp: server(s) failed to start: %s (counts %s); NOT caching "
+                         "this tool set, next session in this container retries",
+                         failed, _snap.server_counts(per_server))
+            return merged
+        _degraded_servers[:] = []
+        _tools_cache = merged
         # 存**原始** list_tools 输出（不是过滤/包装后的）：白名单与 `_wrap_capped` 的改动
         # 因此立刻生效，不必参与快照指纹。
         _snap.save(_GROUP, per_server)

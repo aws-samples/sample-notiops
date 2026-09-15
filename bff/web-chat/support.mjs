@@ -19,7 +19,10 @@ import {
 import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
 import { roleArnAccount } from "./role_guard.mjs";
 import { fillAccountNames } from "./accounts.mjs";
+// safeErr：异常一律压成"类型名/错误码"再进响应体（见 safe_err.mjs）。
+import { safeErr } from "./safe_err.mjs";
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
+import { createHash } from "node:crypto";
 
 // 多账号基座（BFF 侧）：按目标账号拿 SupportClient。
 // account_id 缺省/部署账号 → 本地凭证（缓存复用）；其他账号 → STS AssumeRole。
@@ -122,7 +125,7 @@ function wrapErr(e) {
     return { ok: false, code: "support_plan_required",
              message: "AWS Support API 需要 Business / Enterprise On-Ramp / Enterprise 支持计划。" };
   }
-  return { ok: false, code, message: String(e?.message || e) };
+  return { ok: false, code, message: safeErr(e) };
 }
 
 /**
@@ -229,6 +232,12 @@ export async function casesDashboard(accountId) {
     }
     worst.sort((a, b) => (b.hoursSinceActivity / b.targetHours) - (a.hoursSinceActivity / a.targetHours));
 
+    // ⚠️ 这四个平铺字段（openCount / totalCount / bySeverity / byService）**就是**「概览」那一栏
+    //    的全部内容 —— 没有、也不要包一层 `overview: {...}`（前端 CasesDashboard 直接读
+    //    平铺字段）。代价是 capabilities.json 的 `nav:cases:overview` 必须把这四个键
+    //    **逐个列进 `responseKey` 数组**：它原本写的是 `"overview"`，于是 filterDashboard
+    //    删的是一个从不存在的键，无权看概览的角色照样拿到全部概览数据（200、无日志）。
+    //    以后往「概览」加字段，两个 capabilities.json 的那个数组也要同步加。
     return {
       ok: true,
       openCount: open.length,
@@ -330,7 +339,10 @@ Return ONLY the JSON object, no markdown.`;
       recommendations: Array.isArray(parsed.recommendations) ? parsed.recommendations.map(String).slice(0, 5) : [],
     };
   } catch (e) {
-    return { insight: "", recommendations: [], aiError: String(e?.message || e) };
+    // aiError 是**要进响应体、要被前端画出来**的（cases.ts::aiError）。这里原来回的是
+    // `e.message` —— Bedrock 的 AccessDenied 散文带调用方 role ARN + 账号 id + 模型 ARN，
+    // 会直接印在案例看板上。同一字段在 finops.mjs 走的是 _clientErr，这里漏了一处。
+    return { insight: "", recommendations: [], aiError: safeErr(e) };
   }
 }
 
@@ -387,6 +399,92 @@ async function resolveCaseId(cli, given) {
   }
 }
 
+/* ─────────────── 写操作幂等（同一操作只真执行一次）───────────────
+ *
+ * 为什么必须在服务端做（前端那道锁不够）：
+ *   ① 确认卡的执行结果 `done` 只活在前端内存里（`ChatApp.patchMsgIn` 不回写后端）。
+ *      刷新一次页面，一张**已经开过案例**的卡会重新画成"待确认" —— 再点一次就是
+ *      第二个真案例，而界面从头到尾没说过谎的地方，它就是不知道。
+ *   ② 两个标签页 / 两台设备打开同一个会话，各自都有一张"待确认"的卡。
+ *   ③ 前端的 disabled 随组件重挂就丢。
+ *
+ * 语义（**只重放，不假装**）：
+ *   第一次   → 真执行，成功后把结果落表（30 分钟窗口）。
+ *   窗口内重复 → 回**第一次的真实结果**并打上 `duplicate:true`，前端明说"这是同一
+ *              操作的既有结果，没有重复执行"。绝不回一个编造的成功。
+ *   正在执行中 → `{ok:false, code:"action_in_flight"}`，如实说"没重复提交、去确认结果"。
+ *   第一次失败  → 删掉认领，重试照常放行（否则一次网络抖动会把这个操作永久堵死）。
+ *
+ * 表：复用 `notiops-web-chat`（`table.grantReadWriteData(bff)` 已覆盖，**不需要**改
+ * IAM / 不需要新表 / 两条部署路径都不用动）。key 段 `actidem#`，带 `ttl` 自动过期。
+ * DDB 本身出错 → **fail-open** 照常执行：幂等是加固，不是可用性的前置条件。
+ */
+const _IDEM_TTL_SEC = 30 * 60;
+const _IDEM_INFLIGHT_STALE_MS = 120 * 1000;
+
+/** 参与幂等指纹的字段（按类型取，避免把 undefined 与 "" 算成两个不同操作）。 */
+function _idemFields(type, p) {
+  if (type === "create_case") {
+    return [p.subject, p.communication_body, p.service_code, p.category_code, p.severity_code, p.issue_type, p.language];
+  }
+  if (type === "add_communication") return [p.case_id, p.communication_body];
+  if (type === "resolve_case") return [p.case_id];
+  return null;
+}
+
+/** `PK` = `actidem#<sha256>`。账号进指纹 —— 同一份内容开到两个不同账号是两个操作。 */
+export function actionIdemKey(action, effectiveAccount) {
+  const type = String(action?.type || "");
+  const fields = _idemFields(type, action?.params || {});
+  if (!fields) return "";
+  const canon = JSON.stringify([type, String(effectiveAccount || ""), ...fields.map((v) => String(v ?? ""))]);
+  return "actidem#" + createHash("sha256").update(canon).digest("hex");
+}
+
+/** 认领执行权。回 go=真执行 / replay=回放既有结果 / inflight=别人在跑 / skip=幂等不可用(照常执行)。 */
+async function _idemClaim(pk) {
+  const now = Date.now();
+  try {
+    await _aggDdb.send(new _AggPut({
+      TableName: _AGG_TABLE,
+      Item: { PK: pk, SK: "v1", state: "inflight", at: now, ttl: Math.floor(now / 1000) + _IDEM_TTL_SEC },
+      // 没人认领过，或上一个认领已经超时（Lambda 被掐死 / 超时 → 不能永久堵住）。
+      ConditionExpression: "attribute_not_exists(PK) OR (#s = :inflight AND #at < :stale)",
+      ExpressionAttributeNames: { "#s": "state", "#at": "at" },
+      ExpressionAttributeValues: { ":inflight": "inflight", ":stale": now - _IDEM_INFLIGHT_STALE_MS },
+    }));
+    return { mode: "go" };
+  } catch (e) {
+    if (e?.name !== "ConditionalCheckFailedException") {
+      // 只记类型名（见 docs/LOGGING_STANDARD.md）。fail-open：不因幂等表故障拒绝写操作。
+      console.error(`[executeAction] idem claim failed (${e?.name || "Error"}) -> fail-open`);
+      return { mode: "skip" };
+    }
+    try {
+      const got = await _aggDdb.send(new _AggGet({ TableName: _AGG_TABLE, Key: { PK: pk, SK: "v1" } }));
+      if (got.Item && got.Item.result) return { mode: "replay", result: got.Item.result };
+    } catch { /* 读不到就当成"别人正在跑" —— 宁可让用户去确认，也不重复写。 */ }
+    return { mode: "inflight" };
+  }
+}
+
+/** 收尾：成功 → 落结果供窗口内重放；失败 → 删认领放行重试。两者都不致命。 */
+async function _idemFinish(pk, result) {
+  const now = Date.now();
+  try {
+    if (result && result.ok) {
+      await _aggDdb.send(new _AggPut({
+        TableName: _AGG_TABLE,
+        Item: { PK: pk, SK: "v1", state: "done", at: now, result, ttl: Math.floor(now / 1000) + _IDEM_TTL_SEC },
+      }));
+    } else {
+      await _aggDdb.send(new _AggDelete({ TableName: _AGG_TABLE, Key: { PK: pk, SK: "v1" } }));
+    }
+  } catch (e) {
+    console.error(`[executeAction] idem finish failed (${e?.name || "Error"})`);
+  }
+}
+
 /** 执行一个已被用户确认的写操作。action = {type, params, account_id}。
  *  按 account_id 拿目标账号 client（缺省=部署账号）。 */
 export async function executeAction(action) {
@@ -403,6 +501,24 @@ export async function executeAction(action) {
   const cli = await supportClientFor(reqAcct);
   if (!cli) return { ok: false, code: "cross_account_unavailable",
                      message: "无法访问目标 AWS 账号（未注册/角色未部署/单账号锁定）。" };
+  // 幂等认领：放在真正发出写请求之前（见上面 `_idemClaim` 的说明）。
+  const idemPk = actionIdemKey(action, effAcct);
+  let claimed = false;
+  if (idemPk) {
+    const claim = await _idemClaim(idemPk);
+    if (claim.mode === "replay") {
+      console.log(`[executeAction] type=${type} duplicate -> replaying stored result`);
+      return { ...claim.result, duplicate: true };
+    }
+    if (claim.mode === "inflight") {
+      console.log(`[executeAction] type=${type} duplicate -> already in flight`);
+      return { ok: false, code: "action_in_flight",
+               message: "同一操作正在执行中，本次未重复提交。请稍后刷新或在 AWS 控制台确认结果。" };
+    }
+    claimed = claim.mode === "go";
+  }
+  /** 每条出口都过这里：认领成功才收尾（成功落结果 / 失败删认领）。 */
+  const fin = async (res) => { if (claimed) await _idemFinish(idemPk, res); return res; };
   try {
     if (type === "create_case") {
       const out = await cli.send(new CreateCaseCommand({
@@ -417,8 +533,8 @@ export async function executeAction(action) {
           ? { ccEmailAddresses: p.cc_email_addresses.slice(0, 10) } : {}),
       }));
       const v = await verifyCase(cli, out.caseId);
-      return { ok: true, verified: v.found, type, caseId: out.caseId,
-               displayId: v.displayId || out.caseId, status: v.status, subject: v.subject };
+      return await fin({ ok: true, verified: v.found, type, caseId: out.caseId,
+               displayId: v.displayId || out.caseId, status: v.status, subject: v.subject });
     }
     if (type === "add_communication") {
       // 统一把 displayId(纯数字)解析成内部 caseId(API 只认内部 ID)。
@@ -431,8 +547,8 @@ export async function executeAction(action) {
       }));
       const apiOk = Boolean(out.result ?? true);
       const v = await verifyCase(cli, cid, { latestBody: p.communication_body });
-      return { ok: apiOk, verified: v.found && v.latestMatches, type, caseId: cid,
-               displayId: v.displayId || p.case_id, status: v.status };
+      return await fin({ ok: apiOk, verified: v.found && v.latestMatches, type, caseId: cid,
+               displayId: v.displayId || p.case_id, status: v.status });
     }
     if (type === "resolve_case") {
       const cid = await resolveCaseId(cli, p.case_id);
@@ -440,13 +556,14 @@ export async function executeAction(action) {
       const finalStatus = out.finalCaseStatus;
       const v = await verifyCase(cli, cid);
       const closed = ["resolved", "closed"].includes((v.status || finalStatus || "").toLowerCase());
-      return { ok: true, verified: v.found && closed, type, caseId: cid,
+      return await fin({ ok: true, verified: v.found && closed, type, caseId: cid,
                displayId: v.displayId || p.case_id,
-               initialStatus: out.initialCaseStatus, finalStatus: finalStatus || v.status, status: v.status };
+               initialStatus: out.initialCaseStatus, finalStatus: finalStatus || v.status, status: v.status });
     }
-    return { ok: false, code: "unknown_action", message: `未知操作类型: ${type}` };
+    return await fin({ ok: false, code: "unknown_action", message: `未知操作类型: ${type}` });
   } catch (e) {
-    return wrapErr(e);
+    // 失败也要过 fin —— 它会把认领删掉，否则一次抖动把这个操作堵到 TTL 过期。
+    return await fin(wrapErr(e));
   }
 }
 
@@ -481,7 +598,7 @@ export async function describeServices(language = "en") {
 // 100+ 账号的终局形态是 EventBridge 定时聚合；
 // v1 用请求触发 + 15 分钟 DDB 缓存，账号数 ≤~20 时延迟可接受，且缓存命中后毫秒级。
 import { DynamoDBClient as _AggDdbClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient as _AggDoc, GetCommand as _AggGet, PutCommand as _AggPut, QueryCommand as _AggQuery } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient as _AggDoc, GetCommand as _AggGet, PutCommand as _AggPut, QueryCommand as _AggQuery, DeleteCommand as _AggDelete } from "@aws-sdk/lib-dynamodb";
 const _aggDdb = _AggDoc.from(new _AggDdbClient({}), { marshallOptions: { removeUndefinedValues: true } });
 const _AGG_TABLE = process.env.WEB_CHAT_TABLE || "notiops-web-chat";
 const _CFG_TABLE = process.env.CONFIG_TABLE || "notiops-config";

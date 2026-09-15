@@ -48,6 +48,27 @@ Bedrock Converse 要求 user/assistant 严格交替。Grok 那种「只有 reaso
 Strands 自己有一份同样的修复，但硬编码只认 DeepSeek（`strands/models/bedrock.py`
 里 `if "deepseek" in model_id.lower() and "reasoningContent" in content_block`，旁边
 挂着 TODO 说要换成模型能力注册表）。等不到那个注册表，这里自己做。
+
+## 第二种坏历史：`user, user` —— 一次模型失败把会话**永久**弄死
+
+`repair_role_alternation()` 修的是另一个故障，和上面的清洗无关，但坏在同一个地方
+（Bedrock 的严格交替）：
+
+Strands 在**调模型之前**就把用户这句话 append 进 `agent.messages`。所以只要模型调用
+失败一次（限流 / 5xx / 读超时 / 没开模型访问权限），这一轮就没有 assistant 消息补上，
+历史结尾停在 `user`。下一轮再 append 一条 `user` → 出现连续同角色 → Bedrock 报
+`ValidationException`，**而且每一轮都报**：这一轮又失败 → 又留一条 `user` → 越堆越坏。
+更糟的是这段坏历史会被 AgentCore Memory 持久化下来，换模型、换 Agent 实例都带着它，
+从用户角度看就是「这个会话彻底不能用了，报的还是看不懂的 validation 错误」。
+
+所以修复分两头：
+  * 写入端 —— `main.py` 的模型失败分支里补一条 assistant 降级消息，新会话不再被写坏；
+  * 读取端 —— 这里，在历史刚从 Memory 恢复出来时把**已经**坏掉的会话救回来。
+
+顺带修 `toolUse` / `toolResult` 悬空：同一次中途失败也可能留下「assistant 发了
+toolUse、但后面没有对应的 toolResult」（或反过来）。Bedrock 对这两种同样报
+ValidationException，而且补占位文本救不了它（它要的是配对的 toolResult），只能把悬空的
+块摘掉。
 """
 from __future__ import annotations
 
@@ -67,6 +88,11 @@ _DROP_KEYS = ("reasoningContent", "cachePoint")
 # 只允许 i18n 表里出现 CJK 字面量；这段文本也不该被翻译 —— 它是给模型看的历史痕迹，
 # 不是给用户看的 UI 文案）。
 _PLACEHOLDER_TEXT = "[reasoning omitted]"
+
+# 交替修复用的占位文案。同样必须非空 + ASCII（理由见上）。这两句是**给模型看的历史
+# 痕迹**，不是 UI 文案 —— 用户永远看不到它们，所以不进 i18n 表。
+_ASSISTANT_GAP_TEXT = "[the previous turn failed before an answer was produced]"
+_USER_GAP_TEXT = "[continue]"
 
 
 def _is_droppable(block: Any) -> bool:
@@ -106,3 +132,99 @@ def scrub_cross_model_history(messages: Any) -> int:
             continue
         msg["content"] = kept if kept else [{"text": _PLACEHOLDER_TEXT}]
     return dropped
+
+
+def _blocks(msg: Any) -> list:
+    content = msg.get("content") if isinstance(msg, dict) else None
+    return content if isinstance(content, list) else []
+
+
+def _tool_ids(msg: Any, key: str) -> set:
+    """msg 里某一类工具块（toolUse / toolResult）的 id 集合。"""
+    out = set()
+    for block in _blocks(msg):
+        if isinstance(block, dict) and isinstance(block.get(key), dict):
+            tid = block[key].get("toolUseId")
+            if tid:
+                out.add(tid)
+    return out
+
+
+def _drop_unpaired_tool_blocks(messages: list) -> int:
+    """摘掉悬空的 toolUse / toolResult 块，返回摘掉的块数。
+
+    Bedrock 的配对规则：assistant 的每个 toolUse 必须在**紧接着**那条 user 消息里有同
+    id 的 toolResult，反之亦然。中途失败的一轮会留下单边的块，补占位文本救不了 —— 只能
+    摘掉。摘空的消息补占位文本（不能删消息，删了就破交替）。
+    """
+    dropped = 0
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        nxt = messages[i + 1] if i + 1 < len(messages) else None
+        prev = messages[i - 1] if i > 0 else None
+        if msg.get("role") == "assistant":
+            paired = _tool_ids(nxt, "toolResult") if isinstance(nxt, dict) and nxt.get("role") == "user" else set()
+            drop_key, keep_ids = "toolUse", paired
+        elif msg.get("role") == "user":
+            paired = _tool_ids(prev, "toolUse") if isinstance(prev, dict) and prev.get("role") == "assistant" else set()
+            drop_key, keep_ids = "toolResult", paired
+        else:
+            continue
+        content = _blocks(msg)
+        if not content:
+            continue
+        kept = []
+        for block in content:
+            if (isinstance(block, dict) and isinstance(block.get(drop_key), dict)
+                    and block[drop_key].get("toolUseId") not in keep_ids):
+                dropped += 1
+                continue
+            kept.append(block)
+        if len(kept) != len(content):
+            msg["content"] = kept if kept else [{"text": _PLACEHOLDER_TEXT}]
+    return dropped
+
+
+def repair_role_alternation(messages: Any) -> int:
+    """就地修复被打断的 user/assistant 交替，返回改动次数（0 = 历史本来就是好的）。
+
+    先摘悬空工具块，再在连续同角色之间插占位消息；历史若以 assistant 开头也补一条
+    user 占位（Bedrock 要求首条是 user）。见模块 docstring「第二种坏历史」。
+    """
+    if not isinstance(messages, list) or not messages:
+        return 0
+    fixed = _drop_unpaired_tool_blocks(messages)
+
+    def _role(m: Any) -> str:
+        return m.get("role") if isinstance(m, dict) else ""
+
+    i = 0
+    while i < len(messages):
+        role = _role(messages[i])
+        if role not in ("user", "assistant"):
+            i += 1
+            continue
+        if i == 0:
+            if role == "assistant":
+                messages.insert(0, {"role": "user", "content": [{"text": _USER_GAP_TEXT}]})
+                fixed += 1
+                i += 1
+            i += 1
+            continue
+        if role == _role(messages[i - 1]):
+            gap = (_ASSISTANT_GAP_TEXT if role == "user" else _USER_GAP_TEXT)
+            filler = "assistant" if role == "user" else "user"
+            messages.insert(i, {"role": filler, "content": [{"text": gap}]})
+            fixed += 1
+            i += 1
+        i += 1
+
+    # 结尾停在 user = 上一轮没写出 assistant 消息（模型调用失败）。这是**最常见**的那种
+    # 坏历史，而且此刻还不是「连续同角色」—— 得等 Strands 把本轮这句 append 进来才变成
+    # user,user。所以必须在这里就把结尾补平，不能只修已经出现的重复。
+    # 一轮正常结束的历史结尾一定是 assistant，所以这个判断不会误伤好会话。
+    if _role(messages[-1]) == "user":
+        messages.append({"role": "assistant", "content": [{"text": _ASSISTANT_GAP_TEXT}]})
+        fixed += 1
+    return fixed

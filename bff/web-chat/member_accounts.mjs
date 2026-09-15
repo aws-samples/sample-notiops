@@ -28,6 +28,8 @@ import {
 } from "@aws-sdk/client-organizations";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { credsFor } from "./xacct.mjs";
+// safeErr：异常一律压成"类型名/错误码"再进响应体（见 safe_err.mjs）。
+import { safeErr } from "./safe_err.mjs";
 import {
   DynamoDBDocumentClient, DeleteCommand, GetCommand, QueryCommand, UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
@@ -1127,7 +1129,7 @@ export async function generateLaunchStackUrl(accountId) {
       const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: TEMPLATE_KEY }));
       tmplBody = await r.Body.transformToString();
     } catch (e) {
-      throw Object.assign(new Error(`template not found at ${tmplPath} or s3://${BUCKET}/${TEMPLATE_KEY}: ${e.message}`), { code: "config_error" });
+      throw Object.assign(new Error(`template not found at ${tmplPath} or s3://${BUCKET}/${TEMPLATE_KEY}: ${safeErr(e)}`), { code: "config_error" });
     }
   }
 
@@ -1404,7 +1406,7 @@ export async function manualPayloadSave(accountId, payload) {
   try {
     collection = await verifyAndRegisterCollectionRole(id);
   } catch (e) {
-    collection = { ok: false, error: `${e?.name || ""} ${e?.message || e}`.trim() };
+    collection = { ok: false, error: safeErr(e) };
   }
 
   return {
@@ -1455,7 +1457,8 @@ export async function testDaConnection(accountId, probe = null) {
     const { assertRoleBelongsTo } = await import("./role_guard.mjs");
     assertRoleBelongsTo(cfg.trigger_role_arn, id);
   } catch (e) {
-    return { success: false, step: "RoleArnCheck", error: e.message };
+    // e.userMessage：assertRoleBelongsTo 抛的是手写文案（可外显）；其余压成异常名。
+    return { success: false, step: "RoleArnCheck", error: e?.userMessage || safeErr(e) };
   }
   const sts = new STSClient({});
   let creds;
@@ -1466,7 +1469,7 @@ export async function testDaConnection(accountId, probe = null) {
     }));
     creds = { accessKeyId: r.Credentials.AccessKeyId, secretAccessKey: r.Credentials.SecretAccessKey, sessionToken: r.Credentials.SessionToken };
   } catch (e) {
-    return { success: false, step: "AssumeRole", error: e.message || String(e) };
+    return { success: false, step: "AssumeRole", error: safeErr(e) };
   }
   // Step 2: GetAgentSpace
   try {
@@ -1474,7 +1477,7 @@ export async function testDaConnection(accountId, probe = null) {
     const dac = new DevOpsAgentClient({ region: cfg.region || process.env.AWS_REGION || "us-east-1", credentials: creds });
     await dac.send(new GetAgentSpaceCommand({ agentSpaceId: cfg.agent_space_id }));
   } catch (e) {
-    return { success: false, step: "GetAgentSpace", error: e.message || String(e) };
+    return { success: false, step: "GetAgentSpace", error: safeErr(e) };
   }
   // 写测试成功时间(审计)。
   // ⚠️ 条件写 `attribute_exists(PK)`：用 probe 测一个**还没保存**的账号时
@@ -1638,8 +1641,9 @@ export async function associateInspectionSource(accountId) {
   } catch (e) {
     // 已存在 = 目标状态已达成（客户可能自己在控制台做过了）
     if (!/already exists/i.test(String(e?.message || ""))) {
-      const err = new Error(
-        `关联失败：${e?.name || ""} ${e?.message || e}`.trim());
+      // 只带异常名：AccessDenied / ValidationException 已经把"该做什么"说清了，
+      // SDK 的散文里却带账号 id / ARN（见 safe_err.mjs）。
+      const err = new Error(`关联失败：${safeErr(e)}`);
       err.code = "cross_account_unavailable";
       throw err;
     }
@@ -1768,9 +1772,10 @@ export async function verifyAndRegisterCollectionRole(accountId) {
       DurationSeconds: 900,
     }));
   } catch (e) {
-    // 把 AWS 的原话带出去 —— 「AccessDenied」与「NoSuchEntity」指向完全不同的动作
-    const err = new Error(
-      `AssumeRole ${roleArn} 失败：${e?.name || ""} ${e?.message || e}`);
+    // 带上异常名 —— 「AccessDenied」与「NoSuchEntity」指向完全不同的动作；
+    // 但**不带** SDK 散文（那里面有账号 id / 别的 ARN，见 safe_err.mjs）。
+    // roleArn 是管理员自己刚填进来的值，原样回显没有新增泄漏。
+    const err = new Error(`AssumeRole ${roleArn} 失败：${safeErr(e)}`);
     err.code = "cross_account_unavailable";
     throw err;
   }
@@ -1841,7 +1846,7 @@ export async function generateCollectionStackUrl(accountId) {
       tmplBody = await r.Body.transformToString();
     } catch (e) {
       throw Object.assign(new Error(
-        `template not found at ${tmplPath} or s3://${BUCKET}/${KEY}: ${e.message}`),
+        `template not found at ${tmplPath} or s3://${BUCKET}/${KEY}: ${safeErr(e)}`),
         { code: "config_error" });
     }
   }

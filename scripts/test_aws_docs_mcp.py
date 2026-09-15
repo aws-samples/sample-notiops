@@ -164,7 +164,7 @@ def test_failure_paths(t: _CaseRunner) -> None:
     }
     res = aws_docs_mcp.search_documentation("")
     t.expect("empty query returns empty hits",
-             res == {"hits": [], "queried": ""})
+             res == {"hits": [], "queried": "", "error": ""})
 
     with mock.patch.object(aws_docs_mcp, "_mcp_call", return_value=None):
         res = aws_docs_mcp.search_documentation("anything")
@@ -175,6 +175,53 @@ def test_failure_paths(t: _CaseRunner) -> None:
                                                        "text": "not json"}]}):
         res = aws_docs_mcp.search_documentation("anything")
     t.expect("MCP non-JSON returns empty hits", res["hits"] == [])
+
+    # ── 「查不了」必须和「确实没有」分得清 ──────────────────────────────
+    # 两者过去都是 `{"hits": []}`。而 system prompt 写着「绝不仅凭记忆答这类问题」——
+    # 于是一次网络抖动 = 模型认为"AWS 没有这方面的文档" = 改口凭记忆答，用户看不出
+    # 权威来源根本没被查过。grounded 工具最坏的失败就是它和真答案长得一样。
+    with mock.patch.object(aws_docs_mcp, "_mcp_call", return_value=None):
+        res = aws_docs_mcp.search_documentation("anything")
+    t.expect("transport failure is flagged as an error",
+             res["error"] == aws_docs_mcp._ERR_UNAVAILABLE)
+
+    with mock.patch.object(aws_docs_mcp, "_mcp_call",
+                           return_value={"content": [{"type": "text",
+                                                       "text": "not json"}]}):
+        res = aws_docs_mcp.search_documentation("anything")
+    t.expect("unparseable reply is flagged as an error",
+             res["error"] == aws_docs_mcp._ERR_UNAVAILABLE)
+
+    # 服务确实答了、确实一条没有 → 不是 error（否则模型会永远说"查不了"）。
+    with mock.patch.object(aws_docs_mcp, "_mcp_call",
+                           return_value={"content": [{"type": "text",
+                                                       "text": "[]"}]}):
+        res = aws_docs_mcp.search_documentation("anything")
+    t.expect("a genuine zero-hit search is NOT an error",
+             res["hits"] == [] and res["error"] == "")
+
+    with mock.patch.object(aws_docs_mcp, "_mcp_call", return_value=None):
+        r = aws_docs_mcp.read_documentation_ex("https://docs.aws.amazon.com/x.html")
+    t.expect("read failure is flagged as an error",
+             r == {"content": "", "error": aws_docs_mcp._ERR_UNAVAILABLE})
+
+    r = aws_docs_mcp.read_documentation_ex("https://evil.example.com/x.html")
+    t.expect("a rejected host is a DIFFERENT error from a dead service",
+             r["error"] == aws_docs_mcp._ERR_URL_NOT_ALLOWED)
+
+    with mock.patch.object(aws_docs_mcp, "_mcp_call",
+                           return_value={"content": [{"type": "text",
+                                                       "text": "page body"}]}):
+        r = aws_docs_mcp.read_documentation_ex("https://docs.aws.amazon.com/x.html")
+    t.expect("a good read carries no error",
+             r == {"content": "page body", "error": ""})
+    # 老签名（只要正文）必须还能用：IM 侧与测试里都有调用方。
+    with mock.patch.object(aws_docs_mcp, "_mcp_call",
+                           return_value={"content": [{"type": "text",
+                                                       "text": "page body"}]}):
+        t.expect("read_documentation still returns just the text",
+                 aws_docs_mcp.read_documentation(
+                     "https://docs.aws.amazon.com/x.html") == "page body")
 
 
 # ---------------------------------------------------------------------------

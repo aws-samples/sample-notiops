@@ -101,27 +101,27 @@ for the AWS-resource-inventory view see [architecture.md](architecture.md).
 ┌────────────────────────────────────────────────────────────────────┐
 │                       Customer IM platforms                        │
 │  ┌─────────┐  ┌─────────┐  ┌──────────┐  ┌─────────┐              │
-│  │ Feishu  │  │  Slack  │  │ DingTalk │  │  Teams  │   ← future   │
-│  └────┬────┘  └────┬────┘  └─────────┘  └─────────┘              │
-└───────┼────────────┼───────────────────────────────────────────────┘
-        │  webhook   │ webhook
+│  │ Feishu  │  │  Slack  │  │ DingTalk │  │  Teams  │←Teams future │
+│  └────┬────┘  └────┬────┘  └────┬────┘  └─────────┘              │
+└───────┼────────────┼────────────┼──────────────────────────────────┘
+        │  webhook   │ webhook    │ webhook (HTTP Mode, not Stream)
         │  (HTTPS)   │ (Events / Interactivity / Slash)
-        ▼            ▼
+        ▼            ▼            ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │                    NotiOps (this project)                 │
 │                                                                    │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐         │
-│  │  Feishu      │    │  Slack       │    │ Other plats  │         │
-│  │  ingress λ   │    │  ingress λ   │    │ (extend on   │         │
-│  │  + worker λ  │    │  + worker λ  │    │  demand)     │         │
-│  │  (ImStack)   │    │  (ImStack)   │    │              │         │
-│  └──────┬───────┘    └──────┬───────┘    └──────────────┘         │
+│  │  Feishu      │    │  Slack       │    │  DingTalk    │         │
+│  │  ingress λ   │    │  ingress λ   │    │  ingress λ   │         │
+│  │  + worker λ  │    │  + worker λ  │    │  + worker λ  │         │
+│  │  (ImStack)   │    │  (ImStack)   │    │  (ImStack)   │         │
+│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘         │
 │   ingress: fronted by an API GW HTTP API; verify + async invoke     │
 │   (the old ECS Fargate long connection was retired on 2026-09-03 /  │
 │    M2; only the source stays as a rollback path)                    │
-│         │                   │                                       │
-│         └─────────┬─────────┘                                       │
-│                   ▼                                                 │
+│         │                   │                   │                   │
+│         └───────────────────┼───────────────────┘                   │
+│                             ▼                                       │
 │  ┌─────────────────────────────────────────────────────┐           │
 │  │           core/  platform-agnostic shared code       │           │
 │  │  • bedrock_intent   (intent classification)          │           │
@@ -157,7 +157,7 @@ for the AWS-resource-inventory view see [architecture.md](architecture.md).
 
 | Layer | Physical location | Responsibility | Code |
 |---|---|---|---|
-| **L1 platform adapter** | Lambda (one pair per platform: ingress + worker, in `ImStack`) | ingress: signature check + idempotent de-dup + async hand-off; worker: message / card-callback routing and handling | `platforms/{feishu,slack}/lambda_ingress.py` + `lambda_worker.py` (the rollback-only long-connection entrypoints live in `platforms/*/app/`) |
+| **L1 platform adapter** | Lambda (one pair per platform: ingress + worker, in `ImStack`) | ingress: signature check + idempotent de-dup + async hand-off; worker: message / card-callback routing and handling | `platforms/{feishu,slack,dingtalk}/lambda_ingress.py` + `lambda_worker.py` (the rollback-only long-connection entrypoints live in `platforms/*/app/`) |
 | **L2 shared business logic** | Same process as L1 or inside Lambda | Deterministic intent routing (`core/nl_router`, 0 tokens), chat, progress polling, case, push, signed dispatch | `core/` |
 | **L3 background jobs** | AWS Lambda (stateless) | Receive EventBridge events, render reports, deliver to IM | `shared/report_delivery/report_handler.py`, `shared/report_delivery/push_handler.py`, `shared/report_delivery/feishu_sender.py`, `shared/report_delivery/slack_sender.py` |
 
@@ -208,8 +208,10 @@ Feishu ─ webhook →  │  ┌──────────────┐   
 ```
 ┌───────────────────────────────────────────────────────────────┐
 │  Browser · React / Vite frontend                              │
-│  • Left nav themes: Notifications / Investigate / FinOps /     │
-│    Cases / Skills / More                                       │
+│  • Left nav: Notifications / Investigate / Cost / Cases /      │
+│    Inspection / Skills / Admin  (no "More" group)              │
+│    (Security is folded into Investigate; the Investigate /     │
+│     Cost / Cases dashboards hang above the composer)           │
 │  • Main chat + right "Sources / Investigation steps" dock      │
 │  • Model switch · account selector · web-search toggle · /menu │
 └───────────────┬───────────────────────────────────────────────┘
@@ -285,7 +287,17 @@ The BFF turns AgentCore Runtime output into a single SSE event stream; the front
 
 #### 2.4.5 Left-side theme navigation (ordered)
 
-Notifications / Investigate / FinOps / Cases / Skills (top-level) / More (security · inspection-report external links · customization). New conversations default to **Claude Sonnet 5**; other options are Claude Opus 5, Claude Haiku 4.5, Amazon Nova Pro, DeepSeek V3.2, and GPT-5.6 (Terra / Sol / Luna). Both the default and the enabled set are set by an administrator on the Admin "Models" page (source of truth: `config/llm-model-catalog.json` → DynamoDB `llmcfg`). Model preference is remembered per conversation, and each reply is attributed with the model used. The account selector defaults to the deployment account (team-shared); the web-search toggle defaults to off.
+Notifications / Investigate / Cost (FinOps) / Cases / Inspection / Skills / Admin. **All seven are top-level — there is no "More" group**: `Sidebar.tsx` sets `SHOW_MORE_GROUP = false`, and "Admin" was promoted out of the old "More" submenu on 2026-09-11. ⚠️ "How many sidebar items" ≠ "how many chat topics": of the seven, "Inspection" is a **dashboard-only entry** and "Admin" is a console, so `TOPICS` holds only **4** (investigate / finops / cases / whats-new). ⚠️ **There is no "Security" item** — it was removed the same day (see below); the security dashboards are reachable only from the "Security posture" pill above the Investigate composer, and `Sidebar.tsx` no longer even declares the `showSecurity` / `securityActive` / `onSecurity` props. Adding the entry back would resurrect a retired chat topic in the navigation.
+
+> **2026-09-11: "Security" is no longer a chat topic — only its dashboards remain.** Its chat capability was already a strict subset of Investigate's (the agent's `_TOPIC_FOCUS` has no `security` entry, and it mounted only the 8 core tools versus Investigate's 22), so the same security question got a worse answer there. What changed:
+> - **`security` removed from the topic registry**, and its 6 starter questions folded into Investigate's pool as a set (6 → 12);
+> - **the sidebar item is gone entirely** (the same day's second pass: it was first changed to open the dashboards directly, then removed outright, because leaving a same-named top-level entry makes it look like Security is still an independent chat topic); the security dashboards are reachable only from the pill row below;
+> - Investigate gained a **coarse-grained** pill row **above the composer** (`Operations overview` / `Security posture`) — deliberately only two pills, so adding panels to either tree never adds a pill here; the row is a single `nowrap` line with horizontal scroll, and **`flex-wrap` is not allowed** (wrapping would push the composer down). The row is **left-aligned with the chat box** (`.dashpills` and `.cbox` are both children of `.cwrap`, so the default `flex-start` already lands on the box's left edge — **no selector may give it a `justify-content`**, not even in the empty state), and it carries **no** leading "Dashboards" icon/label;
+> - Cost and Cases **use the same pill row** (`Spend & savings` / `Case progress`), replacing the old "Open Dashboard" tab that used to sit flush against the composer's top-left corner — `Composer`'s `onOpenDashboard` prop and the `.cbox-tabs` / `.cbox-tab` / `.cbox.has-tab` CSS rules were all deleted along with it;
+> - **The four pill names deliberately do not share a common suffix**, and the icons carry **no colour**. The first cut named all four "XX posture"; the customer pointed out that three of them were forced — `posture` is an industry term in security (CSPM = Cloud Security **Posture** Management), so only "Security posture" stands up, while `Case posture` is barely idiomatic English. The second cut names each pill after its own tree's semantic core: `Operations overview` (6 of the 7 panels are alarms / health / EOL risk), `Spend & savings` (of 11 panels, half are "what did we spend" and half "how do we save"), `Case progress` (all 4 are "where is this now, whose move is it") — each language just has to read well on its own; matching word shapes is not a goal. One collision is known and deliberately accepted: "Operations overview" sits close to that tree's own first panel, "Alarm overview" (the customer picked it over the alternative). The colour change deleted `.dashpill svg:first-of-type { color: var(--orange) }` — `icons.tsx` hardcodes no colour at all (everything is `currentColor`) and the dashboard browser's left rail was already `--muted` / `--text` when selected, so that one rule was the **only** place that could tint a pill icon; removing it makes the whole chain colourless. Visual hierarchy now comes from `.dashpill svg:last-of-type { opacity:.5 }` instead of hue. Both facts are pinned by source-level assertions in `topicmerge.test.tsx`;
+> - existing `topic:"security"` conversation rows **cannot be changed** (`ensureConversation` writes under `attribute_not_exists(SK)` and no endpoint can mutate `topic`), so normalisation happens on **read**: the frontend's `normalizeTopic` (when hydrating the conversation header) plus the BFF's `topic.mjs` on **both** `POST /stream` and `POST /warmup` — the agent's LRU cache key includes `topic`, so normalising only one of them would waste every warmup. The BFF **passes unknown topics through unchanged and applies no allowlist**, to avoid breaking older clients.
+
+New conversations default to **Claude Sonnet 5**; other options are Claude Opus 5, Claude Haiku 4.5, Amazon Nova Pro, DeepSeek V3.2, and GPT-5.6 (Terra / Sol / Luna). Both the default and the enabled set are set by an administrator on the Admin "Models" page (source of truth: `config/llm-model-catalog.json` → DynamoDB `llmcfg`). Model preference is remembered per conversation, and each reply is attributed with the model used. The account selector defaults to the deployment account (team-shared); the web-search toggle defaults to off.
 
 > ⚠️ **FinOps Agent deep analysis is currently greyed-out / disabled (coming soon, not yet complete)**: the DevOps Agent toggle now shows in both the "Investigate" and "FinOps" themes, and inside FinOps it can enable deep cost / usage analysis; however the **FinOps Agent toggle is currently greyed-out / disabled** and the UI shows "coming soon". Entering the FinOps theme, the toggle defaults to off (only the "Investigate" theme defaults it on).
 
@@ -1127,7 +1139,7 @@ Triggered by user phrases like "analyze case xxx" / "summarize case xxx" / "what
 4. **Rendering** (per-platform sender):
    - Feishu: purple v2 card with 5-6 sections + 2 buttons (reply / view full case)
    - Slack: Block Kit blocks; suggested_reply uses `> ` quote-block styling
-   - DingTalk: single markdown reply (Phase 2a constraint), same 6-section structure + a markdown link footer to the AWS Support console
+   - DingTalk: single markdown reply (permanent platform limitation: sent messages cannot be edited, and card buttons can only open URLs with no button callback), same 6-section structure + a markdown link footer to the AWS Support console
 
 **Performance notes**: total round-trip is 5-15 seconds (describe_case ~500ms + list_communications ~1-2s + Bedrock invoke ~3-10s), so the sender posts an "Analyzing case xxx…" placeholder first to avoid the chat looking unresponsive.
 
@@ -1145,7 +1157,7 @@ A single shared table `notiops-devops-conversations` (deletion policy: Retain) h
 
 - 7-day TTL auto-cleans, no cron needed
 - All access via `get_item` / `put_item` / `update_item` + ConditionExpression — no secondary indexes
-- Cross-platform shared: Feishu / Slack / future DingTalk all use the same table, distinguished by the `platform` field
+- Cross-platform shared: Feishu / Slack / DingTalk all use the same table, distinguished by the `platform` field
 
 #### 4.8.2 lookup_key prefix list
 
@@ -1496,9 +1508,10 @@ Key env vars (BFF / Agent):
 | Feishu worker | `/aws/lambda/notiops-im-worker-feishu` | actual message / card-callback handling |
 | Slack ingress | `/aws/lambda/notiops-im-ingress-slack` | same (Events / Interactivity / Slash all land here) |
 | Slack worker | `/aws/lambda/notiops-im-worker-slack` | actual message / interaction handling |
+| DingTalk ingress | `/aws/lambda/notiops-im-ingress-dingtalk` | same (DingTalk does not validate the callback URL when saving it, so **start here when the bot stays silent**: no incoming requests = the message-receiving mode is still Stream Mode and must be switched to HTTP Mode) |
+| DingTalk worker | `/aws/lambda/notiops-im-worker-dingtalk` | actual message handling (in-chat replies use the inbound payload's `sessionWebhook`) |
 | IM progress poller | `/aws/lambda/notiops-im-progress` | investigation progress-card refresh |
 | Feishu / Slack bot (rollback path) | `/ecs/<bot-stack>-{feishu,slack}-bot-*` | long-connection / Socket Mode containers; traffic only after a rollback |
-| DingTalk bot | `/ecs/<bot-stack>-dingtalk-bot-*` | Stream Mode + custom robot writeback (⏳ Phase 2) |
 | DevOps Callback | `/aws/lambda/notiops-devops-callback` | investigation result callback |
 | Lambda4 Notifier | `/aws/lambda/notiops-notifier` | scheduled push (6 sources) |
 | Health Checker | `/aws/lambda/notiops-health-checker` | AWS Health sweep |
@@ -1554,7 +1567,7 @@ push_handler: dispatched feishu-push-<dedupe_key>
 
 ## 8. Extending to a New Platform
 
-Adding a new IM platform (DingTalk / Teams / WeCom / any platform that supports bots) takes only three things, and **`core/` is not touched at all**.
+Adding a new IM platform (Teams / WeCom / any platform that supports bots) takes only three things, and **`core/` is not touched at all**.
 
 > **This section only covers adding a supplementary IM platform; the primary Web Chat surface is a separate integration surface** (see §2.4): it is not an IM platform adapter but a browser-based agentic assistant, with its own AgentCore Runtime + BFF Function URL SSE + React frontend + Cognito/SigV4 auth. It shares some backend constraints and storage with the IM side (e.g. the Skills S3 `skills/` prefix, the read-only defense philosophy), but does not reuse this section's `core/` + IM adapter layer (ingress/worker Lambda) or the sender contract.
 
@@ -1658,14 +1671,13 @@ Current progress:
 | 6 | Multi-LLM switching (Claude / Nova / GPT) | ✅ Implemented (2026-06-05) | `core/model_catalog.py` alias table + `core/llm_pref_resolver.py` per-chat preference + per-model `max_output_tokens`; `@bot model nova` flips at any time |
 | 7 | Cross-investigation memory / FAQ library | ⏳ Long-term | OpenSearch / S3 Vectors |
 | 8 | General conversation capability | ✅ Implemented (2026-05-27) | Three-layer defense (⚠️ rollback path only, see §5.3) + three-tier toggle + 17 / 23 / 38 case unit tests |
-| 9 | Skill orchestration | ✅ Feishu / Slack implemented / ⏳ DingTalk Phase 2c | DevOps Agent skill selection + self-upload (authoring) |
+| 9 | Skill orchestration | 🔴 Retired on the IM side (2026-09-06) | Dropped for all three platforms at once (`_SKILLS_RE` / `Caps.skills` / the `"skills"` entry in `KINDS` are all gone from `core/nl_router.py`) — not a per-platform gap; skill selection + self-upload (authoring) remain fully available in Web Chat |
 | 10 | Bilingual support (zh / en) | ✅ Implemented (2026-05-31) | Auto-detection + 4-layer locking + `language` command + natural-language switching; see §4.9 |
 | 11 | AWS MCP (docs / pricing / cost) | ⚠️ docs only on the IM side (2026-09-03 / M2) | The Tier-1 hosted Knowledge MCP is still there; the Pricing/Cost/WA **sidecars retired with `BotStack`** and the IM Lambda pins them off (Web Chat uses in-process stdio MCP and is unaffected) |
-| 12 | DingTalk platform support | ⚠️ Phase 1/1.5/1.6/2a/2b implemented (2026-06-05) | Chat / dispatch / conversational case CRUD / push delivery / markdown report writeback. Phase 2c (live progress card / Skill / Next-step buttons) blocked on customer-side `cardTemplateId` registration |
+| 12 | DingTalk platform support | ✅ Shipped (2026-09-08) | Available on both deploy paths (`setup.sh` option 3 / one-click `InstallOption=web+dingtalk`), on the same Lambda webhook shape as Feishu / Slack. Chat / dispatch / full case lifecycle (the bot replies with a plain-text template, the user copies the whole block back with edits, then answers "confirm") / push delivery / markdown report writeback. Permanent platform differences (not phases): sent messages cannot be edited → progress is appended instead (still delivered); card buttons can only open URLs → no one-tap Next-step dispatch; proactive push supports a single sink only |
 
 ### 9.1 Short Term (this quarter)
 
-- **#9 Skill orchestration** — let customer-uploaded DevOps Agent skills be selectable and dispatchable from inside the IM.
 - **#5 Scheduled inspection** — let the bot work proactively, complementing push mode's passive wait.
 - **#2 enrichment** — reduce agent clarification round-trips, improving single-investigation quality.
 - **#4 v2** — rollup storm mode + routing table (different services push to different groups) + cross-account subscription.
@@ -1673,7 +1685,6 @@ Current progress:
 ### 9.2 Mid Term (next quarter)
 
 - **#7 Cross-investigation memory** — match similar issues and reuse historical conclusions (saving the agent from redundant investigations).
-- **#12 DingTalk Phase 2c** — live progress card + Skill orchestration + Next-step buttons (pending customer cardTemplateId registration).
 - **#4 Proactive monitoring v2** — rollup storms / routing table / cross-account.
 - **New platform expansion** — Teams / WeCom (DingTalk already shipped).
 
@@ -1777,7 +1788,14 @@ notiops/
 │   │   │   └── support_flow.py
 │   │   ├── Dockerfile
 │   │   └── requirements.txt
-│   └── dingtalk/                      # DingTalk H5 Stream Mode
+│   └── dingtalk/                      # same Lambda webhook shape as Feishu / Slack
+│       ├── lambda_ingress.py          # ★ webhook entry (console must be set to HTTP Mode)
+│       ├── lambda_worker.py           # ★ message handling (in-chat reply via sessionWebhook)
+│       ├── case_text.py               # plain-text case template + "confirm" parsing (0 token)
+│       ├── append_progress.py         # appended progress (sent messages cannot be edited)
+│       ├── app/                       # ⚠️ retired (M2): long-connection bot process, rollback only
+│       ├── Dockerfile
+│       └── requirements.txt
 ├── sidecars/                          # ⚠️ retired (M2): ECS sidecar images (MCP server wrappers)
 │   ├── aws-pricing-mcp/               # awslabs/aws-pricing-mcp-server (in production)
 │   ├── aws-cost-mcp/                  # enabled by default (re-enabled 2026-06-10)

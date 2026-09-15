@@ -332,17 +332,28 @@ await t("过期 executionId 只在还没吐字时重试一次（否则会重复�
   assert.match(SRC, /const stale = canReopen\(\) && STALE_RE\.test/);
 });
 
-await t("BFF 三条 DevOps 路径互斥，且老客户端不传字段时永不进新分支", () => {
+await t("BFF 四条路径互斥（含 STAROps），且老客户端不传字段时永不进新分支", () => {
   const idx = readFileSync(new URL("../index.mjs", import.meta.url), "utf8");
   assert.match(idx, /const objDevops = body\.devops_chat_direct === true;/);
   assert.match(idx, /const deepDirectAsked = body\.deep_investigate_direct === true;/);
+  // 2026-09-13：多了第四条路径「STAROps 对话」（BFF 直连客户自己的阿里云数字员工）。
+  // 它与 objDevops 同类 —— 是这段会话的**对话对象**，不是本轮修饰。`=== true` 的写法保证
+  // 老客户端不传这个字段时永远走老路（行为逐字节不变）。
+  assert.match(idx, /const objStarops = body\.starops_chat === true;/);
   // 「深度调查」是**这一轮的修饰**，两个字段同时为真时它优先 —— 否则通用会话里客户勾了
   // 深度调查，答回来的还是普通直答（不报错，只是没照做）。
-  assert.match(idx, /const chatDirect = objDevops && !deepDirectAsked;/);
+  // 而 `!objStarops` 这一项是**跨云**的那道闸，必须逐字在这里钉住：手搓请求把两个对话对象
+  // 同时打开时，宁可让 STAROps 生效，也绝不能让一个明确指向阿里云的问题被 AWS DevOps Agent
+  // 悄悄接走 —— 那等于把客户的问题原文**发到另一朵云**，答案还是错对象给的，而界面上完全
+  // 看不出来。所以三条 DevOps 路径都必须显式让位给 STAROps。
+  assert.match(idx, /const chatDirect = objDevops && !deepDirectAsked && !objStarops;/);
   // 同一轮仍然只能进一条分支：deep 被勾上 → chatDirect 恒 false；「转人工」那轮两条直连都让位
   // 给计费的 agent 路径（escalateFallback → devopsAgent），否则 escalate 的 prompt 会被当成
   // 一句普通问话发给 DevOps Agent。
-  assert.match(idx, /const directInvestigate = deepDirectAsked && !escalateFallback;/);
+  assert.match(idx, /const directInvestigate = deepDirectAsked && !escalateFallback && !objStarops;/);
+  // STAROps 自己不带任何「本轮修饰」：让数字员工自己发起巡检/调查就是一句自然语言的事
+  // （这正是 STAROps 控制台的行为）。多一个开关等于造一个我们保证不了的语义。
+  assert.match(idx, /const staropsDirect = objStarops;/);
   // 答案来源要落库，否则刷新后历史回复被错误署名成本地模型，且通用会话的「对话对象」锁
   // 失去唯一依据。「转人工」那轮真由我们的 agent 答，
   // 就该署我们的模型名。
@@ -352,8 +363,14 @@ await t("BFF 三条 DevOps 路径互斥，且老客户端不传字段时永不�
   // 增长，而**必须不变**的只有这两点：devops-agent 这个署名仍然只由
   // `objDevops && !escalateFallback` 决定；其余情况下的署名来自流里报的 via，不许在
   // 这里硬编码任何模型名/来源名。
-  assert.match(idx, /via: objDevops && !escalateFallback \? "devops-agent" :/);
-  assert.match(idx, /via: objDevops && !escalateFallback \? "devops-agent" : \(agentVia \|\| undefined\)/);
+  // 2026-09-13：署名的三元链前面插了 STAROps 那一档，所以 `via:` 已不再紧贴 objDevops。
+  // 判据拆成两条、各钉一件必须不变的事：
+  //  ① STAROps 那轮落库的 via 是**独立的值** `"starops"`，不是借用 "devops-agent" ——
+  //     借用会把刷新后的「对话对象」锁到**错误的云**上（落款阿里云、对象却锁成 AWS）。
+  assert.match(idx, /via: staropsDirect \? "starops"/);
+  //  ② devops-agent 这个署名仍然只由 `objDevops && !escalateFallback` 决定，其余情况的署名
+  //     来自流里报的 via（`agentVia`），不许在这里硬编码任何模型名/来源名。
+  assert.match(idx, /objDevops && !escalateFallback \? "devops-agent" : \(agentVia \|\| undefined\)/);
 });
 
 /* ─────────── 卡死的 execution：判得出来、且不许把坏 id 留在库里 ───────────

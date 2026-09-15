@@ -546,6 +546,31 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
     ],
   }));
 
+  // 阿里云凭据（`/agent starops` 那条路，2026-09-14）—— **只读**。
+  //
+  // 独立一条语句、独立的 sid，不追加进上面那份 IM 平台 secret 清单：那条语句的注释
+  // 通篇讲的是"加 IM 平台要补齐它全部的 secret 名"，把一朵**云的账号凭据**混进去，
+  // 下一个加平台的人会顺手把它一起改掉或删掉。两者的爆炸半径也不在一个量级：IM secret
+  // 泄漏止于"能往那个群发消息"，这一条泄漏的是客户阿里云账号里这把钥匙能碰到的一切。
+  // （同 `web-chat-core.ts` 的 `AliyunCredentialsSecretAccess`，那边的注释是权威说明。）
+  //
+  // ⚠️ 与 web 侧那条的**唯一**差别：这里只有 `GetSecretValue`。写那一半只在 Admin
+  //    「多云」页（`bff/web-chat/aliyun_config.mjs`），IM 侧一行都不写 ——
+  //    `core/aliyun_config.py` 通篇只调 `get_secret_value`（见那个文件头第 1 条）。
+  //    别"顺手对齐"成 web 那六个动作：多一个写入者就多一种"界面骗人"的骗法。
+  //
+  // 名字必须与 `core/aliyun_config.py` 的 `SECRET_ID` 逐字一致（改名要同时改的五处
+  // 已在那行注释里列全）。这个 secret 方式A **不预建**、由 BFF 在客户首次保存时
+  // CreateSecret 建出来 —— 所以客户没配阿里云时这条语句什么也授不到，没有权限蔓延，
+  // IM 侧拿到 `None` 会当场告诉用户去配（不静默降级）。
+  imRole.addToPrincipalPolicy(new iam.PolicyStatement({
+    sid: "AliyunCredentialsReadOnly",
+    actions: ["secretsmanager:GetSecretValue"],
+    resources: [
+      `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:notiops/aliyun-credentials-*`,
+    ],
+  }));
+
   // 显式建 LogGroup。不给的话 Lambda 服务自建一个 `/aws/lambda/<名>` —— 那个组
   // **不属于任何栈**：永不过期(白留日志费)、删栈不消失。方式A 走"建组但不指定名字 +
   // LoggingConfig 指过来"（见文件头差异表第 3 条）。

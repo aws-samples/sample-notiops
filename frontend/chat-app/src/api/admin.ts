@@ -321,6 +321,17 @@ export interface FeishuConfig { app_id: string; app_secret: string; verification
  *     后端刻意把 secret 里的 `webhook_url` 改名成 `push_webhook_url` 对外，就是为了这两个
  *     不同名（见 bff/web-chat/dingtalk_config.mjs 文件头「命名陷阱」）。 */
 export interface DingtalkConfig { app_key: string; app_secret: string; push_webhook_url?: string }
+/** Slack 的字段集与另两个平台**结构上不同**：只有两个字段，而且**两个都是凭证**
+ *  （飞书/钉钉的 `app_id` / `app_key` 是明文回显的标识符，Slack 没有对应物）。
+ *
+ *  ⚠️ 后端存的是**两个纯字符串 secret**（`notiops/slack-bot-token` /
+ *     `notiops/slack-signing-secret`），不是飞书/钉钉那种"一个 secret 里放 JSON"。
+ *     前端不用关心这一点，但改这一块之前请先读 bff/web-chat/slack_config.mjs 文件头 ——
+ *     那里写着为什么"未配置"不等于"空"（方式 B 下 CDK 会给这两个 secret 填随机值）。
+ *
+ *  ⚠️ 这两个字段 GET 回来**永远是脱敏形态或空串**，没有明文回显的可能。空串 = 未配置
+ *     （含"值的形状不对"，比如粘到了 `xoxa-`/`xapp-` 或 CDK 那个随机占位值）。 */
+export interface SlackConfig { bot_token: string; signing_secret: string }
 /** GET 额外回带一个**只读**字段 `webhook_url`：该平台 IM 入口的回调地址，后端按名字查
  *  HTTP API 得到（bff/web-chat/{feishu,dingtalk}_config.mjs）。它不是凭证、不脱敏，给抽屉
  *  第 3 步显示 + 一键复制用。**没装 IM / 查不到时是空串**，界面据此退回"去 Outputs 里找"。
@@ -329,12 +340,13 @@ export interface DingtalkConfig { app_key: string; app_secret: string; push_webh
  *  一次 GET 回全部平台（不是每个平台一次请求）：这一页要同时画出"哪个配好了、哪个还空着"，
  *  拆成多次请求就多出一堆半成功状态，而这一页最贵的 bug 恰好是**界面骗人**。
  *
- *  `dingtalk` 标成**可选**是诚实的:前端资产与 BFF Lambda 虽然在同一个栈里更新，但客户
- *  浏览器可能拿到的是缓存下来的旧前端（或反过来:新前端 + 还没更新完的 BFF）。缺这一段时
- *  钉钉分页要退回"全部空着"，而不是白屏 —— 所以调用方必须给兜底。 */
+ *  `dingtalk` / `slack` 标成**可选**是诚实的:前端资产与 BFF Lambda 虽然在同一个栈里更新，
+ *  但客户浏览器可能拿到的是缓存下来的旧前端（或反过来:新前端 + 还没更新完的 BFF）。缺这一段时
+ *  对应分页要退回"全部空着"，而不是白屏 —— 所以调用方必须给兜底。 */
 export async function fetchNotificationConfig(): Promise<{
   feishu: FeishuConfig & { webhook_url?: string };
   dingtalk?: DingtalkConfig & { webhook_url?: string };
+  slack?: SlackConfig & { webhook_url?: string };
 }> {
   return req("GET", "/admin/notification-config");
 }
@@ -353,6 +365,80 @@ export async function putDingtalkConfig(config: Partial<DingtalkConfig>): Promis
  *  因此这个函数**没有 chatId 参数** —— 不是漏了。 */
 export async function testDingtalkSend(): Promise<{ success: boolean; message: string }> {
   return req("POST", "/admin/notification-config/test", { platform: "dingtalk" });
+}
+export async function putSlackConfig(config: Partial<SlackConfig>): Promise<{ message: string }> {
+  return req("PUT", "/admin/notification-config", { platform: "slack", config });
+}
+/** Slack 的"测试"**也不发到群里**，但它比钉钉那条能多说一件事：`auth.test` 的响应头
+ *  带着 bot token 实际拿到的 scope 清单，所以后端会把**缺的 scope**直接点名报回来
+ *  （"装好了但漏勾 im:history"这种坑否则要等到"DM 里 bot 收到空消息"才发现）。
+ *
+ *  ⚠️ 它**验不了 signing secret** —— Slack 没有任何 API 能验它，唯一的验证时机是在
+ *     Slack 后台保存 Request URL（那一步会立刻发一个 url_verification 过来）。所以
+ *     `success: true` 只代表 bot token + scope 没问题，文案里会明确写清这一点。
+ *  因此这个函数**没有参数** —— 不是漏了。 */
+export async function testSlackSend(): Promise<{ success: boolean; message: string }> {
+  return req("POST", "/admin/notification-config/test", { platform: "slack" });
+}
+
+// ── 阿里云只读凭据（Admin「多云」板块;单个 secret notiops/aliyun-credentials）──
+/**
+ * ⚠️ 路由**不复用** `/admin/notification-config`，自己一条 `/admin/aliyun-config`。
+ *    阿里云凭据不是 IM 平台:字段集、校验规则、以及"测试连接"能证明什么，三样都不一样;
+ *    而且那条 IM 路由是「一次请求画出全部平台」，混进去等于给那一页的渲染多背一个失败源。
+ *    后端同理是独立模块（bff/web-chat/aliyun_config.mjs）。
+ *
+ * ⚠️ 本轮只有 AccessKey（AK/SK）一种模式。`auth_mode` 后端**只接受 `"ak"`**，传别的会被
+ *    显式 400（不是静默当成 ak）—— 所以这里把它写成字面量类型，将来加 OIDC 是**追加**
+ *    一个取值。前端目前根本不传这个字段（后端补默认值），留着它是为了让「只支持一种模式」
+ *    这件事在类型上看得见。
+ */
+export interface AliyunConfig {
+  /** 不是凭证（阿里云签名要 id+secret 成对），后端明文回显 —— 客户要能核对填的是哪一把。 */
+  access_key_id: string;
+  /** GET 回来**永远是脱敏形态（`****后4位`）或空串**。回传脱敏值 = 不修改。 */
+  access_key_secret: string;
+  /** 阿里云地域 id（如 cn-hangzhou）。后端只放过小写字母/数字/连字符 —— 它会被拼进
+   *  endpoint 主机名，那条校验是 SSRF 闸门，不是格式美化（见 aliyun_config.mjs 文件头）。 */
+  region_id: string;
+  auth_mode?: "ak";
+  /** ── STAROps 数字员工（「对话对象」里那一段的全部配置）───────────────────
+   *
+   * 与上面的凭据同一个 secret、同一条路由：它们**永远一起用**（没有 AK 的员工名毫无意义，
+   * 有 AK 没员工名也发不出一次 CreateChat），拆成两条路由只会造出"一半配好"的中间态。
+   *
+   * ⚠️ `starops_region` 与上面的 `region_id` 是**两件事**，别合并（后端注释同款警告）：
+   *    · `region_id`      = 要被巡检的地域（客户资源在哪，如 cn-hangzhou）
+   *    · `starops_region` = STAROps **接口**地域，取值只有 cn-beijing / ap-southeast-1
+   *      —— 填错的症状是一个语义不明的 404，客户会以为是员工名写错了。
+   *
+   * 🔒 `starops_workspace` 的值里嵌着阿里云账号 UID：可以在这一页填写与回显（管理员本来
+   *    就看得到自己的账号），但**不进日志**，也不出现在任何非 admin 的响应里
+   *    （`/features/starops` 那条探测就刻意不回它）。 */
+  starops_employee?: string;
+  starops_region?: string;
+  /** 可选的定位上下文（不填数字员工也能答，只是范围更宽）。`starops_project` 是**日志服务
+   *  (SLS) 的 project**，不是"项目"这种泛称 —— 文案里必须写清楚，否则客户会填个部门名，
+   *  症状是数字员工"什么都查不到"，这种归因极难。 */
+  starops_workspace?: string;
+  starops_project?: string;
+}
+/**
+ * GET 额外回带两个只读判据:**别在前端自己判「空串算不算配好」**。
+ * `configured` 的判据是「AK id 与 AK secret 都非空」—— 半副密钥一次调用都发不出去，
+ * 所以不算配好；`starops_configured` 还要求员工名非空。
+ * 两边各判一次的话迟早不一致，而这一页最贵的 bug 恰好是**界面骗人**。
+ *
+ * `aliyun` 标成**可选**是诚实的:客户浏览器可能拿到缓存的新前端 + 还没更新完的 BFF
+ * （那时这条路由是 404 / 不回这一段）。缺它时要退回"空表单"，不能白屏。
+ */
+export async function fetchAliyunConfig(): Promise<{
+  aliyun?: AliyunConfig & { configured?: boolean; starops_configured?: boolean };
+}> {
+  return req("GET", "/admin/aliyun-config");
+}
+export async function putAliyunConfig(config: Partial<AliyunConfig>): Promise<{ message: string }> {
+  return req("PUT", "/admin/aliyun-config", { config });
 }
 
 // ── 跨 Payer 接入(组织外账号:Launch Stack + 手工回填 + 测试连接)──

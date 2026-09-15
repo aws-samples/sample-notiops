@@ -37,6 +37,7 @@ from core import im_prefs
 from core import llm_pref_resolver
 from core import locale_resolver
 from core import model_catalog
+from core import starops_chat
 from platforms.common import (ack_variants, chat_lease, live_card, long_answer,
                               pref_commands)
 from platforms.common.im_types import Caps, ImMessage
@@ -153,10 +154,11 @@ class SlackCaps(Caps):
         只认单星号，直接发过去星号会原样显示（同一次改动也修了飞书那边的"纯文本不渲染
         markdown"）。标题走 header block，正文走 section。
         """
-        from core import nl_router
+        from core import multicloud, nl_router
         from platforms.slack.app import blocks
+        # `multicloud.help_row_key` = 「这一行发哪份文案」，见 `core/multicloud.py`。
         rows = "\n".join(
-            i18n.t(f"help.row.{feat}", msg.locale)
+            i18n.t(multicloud.help_row_key(feat), msg.locale)
             for feat, _en, _zh in nl_router.HELP_COMMANDS
         )
         body = (f"{i18n.t('help.intro', msg.locale)}\n\n{rows}\n\n"
@@ -241,7 +243,7 @@ class SlackCaps(Caps):
         self.reply_text(msg, i18n.t(key, msg.locale, label=entry.label))
 
     def agent(self, msg: ImMessage, arg: str) -> None:
-        """`/agent [notiops|devops|default]` —— 这个会话的对话由谁答（0 token）。
+        """`/agent [notiops|devops|starops|default]` —— 这个会话的对话由谁答（0 token）。
 
         与飞书**同一份**逻辑和文案（`platforms.common.pref_commands`）；两边各写一遍
         必然漂移，见那个模块的文件头。
@@ -458,7 +460,7 @@ class SlackCaps(Caps):
                                         kind=type(e).__name__))
 
     def chat(self, msg: ImMessage, text: str) -> None:
-        """对话问答 —— **两条路，同一条消息**。由 `/agent` 开关（`core.im_prefs`）决定：
+        """对话问答 —— **三条路，同一条消息**。由 `/agent` 开关（`core.im_prefs`）决定：
 
           · `devops`（默认）→ `core.devops_chat.run_devops_chat`，客户 DevOps Agent
             直答，**NotiOps 侧 0 token**。多轮上下文靠 `imchat#<channel_id>` 存的
@@ -466,10 +468,13 @@ class SlackCaps(Caps):
           · `notiops` → `core.agent_chat.run_agent_chat`，走我们的 AgentCore runtime，
             **会消耗 token**。多轮上下文靠 `imagent#<channel_id>` 存的 runtime session
             id（6 小时轮换，理由见 `core.ddb_state.im_agent_session_id`）。
+          · `starops` → `core.starops_chat.run_starops_chat`，直连**阿里云** STAROps
+            数字员工，**NotiOps 侧 0 token**（烧客户自己的阿里云 AI 额度）。多轮上下文
+            靠 `imsochat#<channel_id>` 存的 `thread_id`。2026-09-14 加。
 
-        ⚠️ 与飞书那份**逐字对齐**（分流只影响 ack 文案 / 调哪个 runner / 消息上
-        `agent=` `sources=` `usage=` 三个参数），排队、心跳、终版、截断落报告、兜底
-        全部共用下面这一份。
+        ⚠️ 与飞书那份**逐字对齐**（分流只影响 ack 文案 / 读哪一行会话 / 调哪个 runner /
+        消息上 `agent=` `sources=` `usage=` `employee=` 那几个参数），排队、心跳、终版、
+        截断落报告、兜底全部共用下面这一份。
 
         答案发 blocks 而不是纯文本：要有状态标题（排队中/思考中/答完 + 计时）、过程行、
         正文超长时的「查看完整报告」外链 —— 纯文本这三样一样都做不到。
@@ -498,17 +503,27 @@ class SlackCaps(Caps):
             platform=PLATFORM, chat_id=msg.chat_id, user_id=msg.user_id,
             is_dm=msg.is_direct)
         notiops = agent == im_prefs.AGENT_NOTIOPS
+        starops = agent == im_prefs.AGENT_STAROPS
 
         # 落款里的账号那一段（多账号，2026-09-07）—— **这一轮只解析一次**（org 模式下
         # 底下是 STS，而落款会被 `LiveCard.flush` 每几秒渲染一次）。与飞书同一个做法。
+        # ⚠️ STAROps 那条路上这个值**不会显示**（换成数字员工 ID，见 `im_footer` 的 🔴），
+        #    但照旧解析：互斥判断只在 `im_footer` 一处。
         deploy_acct = im_accounts.deploy_account_id()
 
-        session = ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
+        # 会话行按路分段（`imchat#` / `imsochat#`；notiops 那条不读这一行）。用闭包读是
+        # 因为「排队转正」之后还要重读一次 —— 与飞书同一个做法。
+        def _load_session() -> dict:
+            if starops:
+                return ddb_state.get_im_starops_session(PLATFORM, msg.chat_id) or {}
+            return ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
+
+        session = _load_session()
         question = (text or msg.text or "").strip()
 
-        # 来源 / 用量要等这一轮跑完才知道，而 `LiveCard` 的 `render` 回调只透传五个固定
-        # kwarg。所以放一个可变盒子让 `render=` 的闭包读（与飞书同一个做法）。
-        extra: dict = {"sources": [], "usage": {}}
+        # 来源 / 用量 / 数字员工 ID 要等这一轮跑完才知道，而 `LiveCard` 的 `render` 回调
+        # 只透传五个固定 kwarg。所以放一个可变盒子让 `render=` 的闭包读（同飞书）。
+        extra: dict = {"sources": [], "usage": {}, "employee": ""}
 
         # 第 0 步：抢这个会话的"轮次"。`acquire()` 不阻塞 —— 先把消息发出去再等，
         # 否则用户在排队的那几分钟里一个字都看不到。
@@ -548,7 +563,8 @@ class SlackCaps(Caps):
                     steps=kw["steps"], state=kw["state"], elapsed=kw["elapsed"],
                     report_url=kw["report_url"],
                     agent=agent, sources=extra["sources"], usage=extra["usage"],
-                    account=msg.account_id, deploy=deploy_acct),
+                    account=msg.account_id, deploy=deploy_acct,
+                    employee=extra["employee"]),
                 update=_update,
             )
             # 心跳：agent 可以整整 5 分钟不吐一个事件（现网 cd0f6745），只靠 emit 驱动
@@ -569,8 +585,8 @@ class SlackCaps(Caps):
                         ack_seed, msg.locale, agent, platform=PLATFORM))
                     live.set_state("thinking")
                     live.flush(force=True)
-                # 前一轮很可能刚写过 execution_id，重新读一遍才是最新的上下文。
-                session = ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
+                # 前一轮很可能刚写过 execution_id / thread_id，重新读一遍才是最新的上下文。
+                session = _load_session()
 
             # 第 3 步：跑，并把过程实时刷回那条消息。
             if notiops:
@@ -596,6 +612,25 @@ class SlackCaps(Caps):
                 extra["sources"] = result.get("sources") or []
                 extra["usage"] = result.get("usage") or {}
                 # 这条路**不写 `imchat#`**：会话连续性由 `imagent#` 那行负责。
+            elif starops:
+                # 直连阿里云 STAROps 数字员工。**NotiOps 侧 0 token**，但这一轮烧的是
+                # 客户自己的阿里云 AI 额度。与飞书那支**逐字对齐**（含下面两条 ⚠️）。
+                # ⚠️ `text` 是**位置参数** —— 与 `run_devops_chat(text=…)` 刻意不同。
+                result = starops_chat.run_starops_chat(
+                    question, locale=msg.locale,
+                    session=session,
+                    emit=(live.emit if live is not None else None),
+                )
+                # 落款上「哪个数字员工答的」那一位（必须在 `finish()` 之前填）。
+                extra["employee"] = str(result.get("employee") or "")
+                # ⚠️ 判断顺序与下面 devops 那支**相反**：`run_starops_chat` 在
+                #    `reset_session=True` 时**照样带着那个已经死掉的 thread_id 返回**。
+                #    先判 thread_id 会把死 thread 存回去、下一轮原样再坏一次。
+                sess = result.get("session") or {}
+                if result.get("reset_session"):
+                    ddb_state.clear_im_starops_session(PLATFORM, msg.chat_id)
+                elif sess.get("thread_id"):
+                    ddb_state.put_im_starops_session(PLATFORM, msg.chat_id, sess)
             else:
                 result = devops_chat.run_devops_chat(
                     text=question, locale=msg.locale,
@@ -638,7 +673,8 @@ class SlackCaps(Caps):
                                              sources=extra["sources"],
                                              usage=extra["usage"],
                                              account=msg.account_id,
-                                             deploy=deploy_acct)
+                                             deploy=deploy_acct,
+                                             employee=extra["employee"])
         try:
             resp = self._post(msg, blocks_out=blocks_out)
         except Exception as e:                    # noqa: BLE001
@@ -651,4 +687,5 @@ class SlackCaps(Caps):
             # 走模型那条路上那句是假的。
             self.reply_text(msg, body + "\n\n" + im_blocks.usage_footer(
                 msg.locale, agent=agent, usage=extra["usage"],
-                account=msg.account_id, deploy=deploy_acct))
+                account=msg.account_id, deploy=deploy_acct,
+                employee=extra["employee"]))

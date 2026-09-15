@@ -4,7 +4,8 @@ import { useT, useLocale } from "../i18n";
 import type { Conversation, TopicKey } from "../types";
 import { TOPICS } from "../types";
 import {
-  IconNewChat, IconInvestigate, IconFinOps, IconCases, IconSecurity,
+  // IconSecurity 不在这里了 —— 侧栏没有「安全」这一项（见下方 nav 里那段注释）。
+  IconNewChat, IconInvestigate, IconFinOps, IconCases,
   IconInspection, IconMore, IconSkill, IconCustomize, IconWhatsNew, IconChevronRight, IconBell,
   IconCollapseAll, IconExpandAll,
 } from "./icons";
@@ -40,8 +41,10 @@ interface Props {
   casesActive?: boolean;        // Cases 页当前是否激活（高亮）
   onAdmin?: () => void;         // 打开「管理」页（角色/用户/模块）
   adminActive?: boolean;        // 管理页当前是否激活（高亮）
-  onSecurity?: () => void;      // 打开「安全」仪表盘独立页
-  securityActive?: boolean;     // 安全页当前是否激活（高亮）
+  // 2026-09-11：`onSecurity` / `securityActive` / `showSecurity` 三条已删 —— 侧栏不再有
+  // 「安全」这一项（产品要求）。安全看板还在，唯一入口是**「调查」输入框上方的「安全态势」
+  // 胶囊**（ChatApp 的 dashPillsFor）。要复活侧栏入口的话别只加 prop：门禁必须写成
+  // `isAdmin || (capsLoaded && can("nav:security"))`，与那颗胶囊逐字一致。
   onInvestigate?: () => void;   // 打开「调查」告警仪表盘独立页
   investigateActive?: boolean;  // 调查页当前是否激活（高亮）
   onInspection?: () => void;    // 打开「资源巡检」看板独立页（站内，非外链）
@@ -53,11 +56,10 @@ interface Props {
   showInvestigation?: boolean;  // 能力门禁：Investigation（默认 true）
   showSkills?: boolean;         // 能力门禁：Skills（默认 true）
   showCustomize?: boolean;      // 能力门禁：Customize（默认 true）
-  showSecurity?: boolean;       // 能力门禁：Security（默认 false，需 nav:security）
   /**
    * 能力门禁：资源巡检看板（默认 **false**，需 `nav:inspection`）。
    *
-   * ⚠️ 默认 false 而不是 true —— 与 Security / Admin 同档。巡检看板会显示
+   * ⚠️ 默认 false 而不是 true —— 与 Admin 同档（Security 那一项已不在侧栏里）。巡检看板会显示
    * 客户的排除清单与阈值配置，那是运维决策而不是公开信息。
    * 默认 true 会让能力还没加载完的那一瞬间对所有人闪出这个入口。
    */
@@ -76,13 +78,31 @@ const PanelIcon = () => (
    openConsole()/按钮/idleConsoleUrl 一并移除。站内巡检看板不受影响
    （nav:inspection 那套是独立入口）。 */
 
-export default function Sidebar({ conversations, activeId, busyIds, unreadIds, onSelect, onNew, onRename, onTogglePin, onDelete, collapsed, onToggle, username, onSignOut, width = 264, onSkills, skillsActive, onCustomize, customizeActive, onWhatsNew, onNotifications, notificationsActive, notifUnread = 0, onFinops, finopsActive, onCases, casesActive, onAdmin, adminActive, showFinops = true, showCases = true, showAdmin = false, showNotifications = true, showInvestigation = true, showSkills = true, showCustomize = true, onSecurity, securityActive, showSecurity = false, onInvestigate, investigateActive, onInspection, inspectionActive, showInspection = false }: Props) {
+/**
+ * 「更多」分组的总开关（2026-09-11 关掉）。
+ *
+ * 背景：这个折叠组原本收着「管理」和「定制」两项。**「管理」已提到一级**（Skills 下面），
+ * 于是组里只剩「定制」——而「定制」页目前还没有真正的功能，点进去是个空壳。
+ * 一个只有一项、且那一项没内容的折叠菜单，对用户来说纯粹是噪音，所以整组先隐藏。
+ *
+ * ⚠️ **是隐藏，不是删除**：`onCustomize` / `customizeActive` / `showCustomize` 这套 props
+ * 与下面的 JSX 一并保留，`ChatApp.tsx` 那边也照旧传。定制页做出来之后把这里改回 `true`
+ * 即可恢复，不需要重新接线。改成 `true` 前先确认 `nav.customize` 那一页真有内容 ——
+ * 否则又回到「点开是空盒子」。
+ *
+ * ⚠️ 「管理」**不再**在这个组里，所以关掉它不会影响 admin 的入口（见下面 nav 里那一项）。
+ */
+const SHOW_MORE_GROUP = false;
+
+export default function Sidebar({ conversations, activeId, busyIds, unreadIds, onSelect, onNew, onRename, onTogglePin, onDelete, collapsed, onToggle, username, onSignOut, width = 264, onSkills, skillsActive, onCustomize, customizeActive, onWhatsNew, onNotifications, notificationsActive, notifUnread = 0, onFinops, finopsActive, onCases, casesActive, onAdmin, adminActive, showFinops = true, showCases = true, showAdmin = false, showNotifications = true, showInvestigation = true, showSkills = true, showCustomize = true, onInvestigate, investigateActive, onInspection, inspectionActive, showInspection = false }: Props) {
   const t = useT();
   const { locale } = useLocale();
-  // "更多"子菜单展开态（收纳 安全 / 巡检&报告 等非高频入口）
+  // "更多"子菜单展开态（现在只剩「定制」一项，且整组被 SHOW_MORE_GROUP 关着）
   const [moreOpen, setMoreOpen] = useState(false);
-  // 子菜单里到底还剩没剩东西：都没了就连「更多」按钮一起藏，别让用户点开一个空菜单
-  const hasMoreItems = showAdmin || showCustomize;
+  // 子菜单里到底还剩没剩东西：都没了就连「更多」按钮一起藏，别让用户点开一个空菜单。
+  // 「管理」已提到一级，所以这里**不再**算 showAdmin —— 算进来会让 admin 看到一个
+  // 点开只有「定制」的「更多」，而「管理」明明已经在上面了。
+  const hasMoreItems = SHOW_MORE_GROUP && showCustomize;
 
   // 主题会话分组的收起态：记录**已收起**的组 key（默认全部展开）。持久化到 localStorage，跨刷新保留。
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
@@ -167,7 +187,9 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
         {/* 主题入口（②）：点击将在右侧打开该主题的定制 chat 页。 */}
         {showInvestigation && <button className={"navitem" + (investigateActive ? " active" : "")} onClick={() => onInvestigate?.()}><span className="ni-ic"><IconInvestigate /></span>{t("topic.investigate")}</button>}
         {showFinops && <button className={"navitem" + (finopsActive ? " active" : "")} onClick={onFinops}><span className="ni-ic"><IconFinOps /></span>{t("topic.cost")}</button>}
-        {showSecurity && <button className={"navitem" + (securityActive ? " active" : "")} onClick={() => onSecurity?.()}><span className="ni-ic"><IconSecurity /></span>{t("topic.security")}</button>}
+        {/* ⚠️ 这里**没有**「安全」——2026-09-11 产品要求从侧栏去掉（安全已并入「调查」，
+            留一个同名一级入口会让人以为它还是个独立的聊天主题）。安全**看板**没删，
+            入口是「调查」输入框上方的「安全态势」胶囊。别顺手补回来。 */}
         {showCases && <button className={"navitem" + (casesActive ? " active" : "")} onClick={onCases}><span className="ni-ic"><IconCases /></span>{t("topic.cases")}</button>}
         {/* 巡检：站内看板（2026-09-04 从「资源巡检」改名并挪到 案例/Skills
             之间 —— 用户指定的位置；老外链入口已随 idle 控制台退役）。 */}
@@ -178,9 +200,17 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
             <span className="ni-ic"><IconSkill /></span>{t("cz.nav.skills")}
           </button>
         )}
-        {/* 「更多」：可展开子菜单，收纳非高频入口（巡检&报告 / 管理 / 定制）。
-            子菜单三项全被门禁挡掉时不渲染「更多」本身 —— 否则用户点开是个空盒子。
-            （隐藏巡检&报告后，非 admin 且无 nav:customize 的用户就会撞上这种情况。） */}
+        {/* 管理：仅 admin 可见（后端 nav:admin 门禁 + 前端能力过滤）。角色 / 用户 / 模块。
+            2026-09-11 从「更多」子菜单提到**一级**，紧跟 Skills —— 它是 admin 每天要点的
+            入口，藏在折叠菜单里多一次点击、而且新 admin 根本找不到。 */}
+        {showAdmin && (
+          <button className={"navitem" + (adminActive ? " active" : "")} onClick={() => onAdmin?.()}>
+            <span className="ni-ic"><IconCustomize /></span>{t("nav.admin")}
+          </button>
+        )}
+        {/* 「更多」：可展开子菜单，现在只收「定制」一项。
+            整组由 SHOW_MORE_GROUP 关着（定制页还没内容，见文件头那段注释）；
+            开关打开后仍保留「门禁全挡掉就连「更多」一起藏」的行为 —— 否则用户点开是空盒子。 */}
         {hasMoreItems && (
           <button className={"navitem" + (moreOpen ? " expanded" : "")} onClick={() => setMoreOpen((v) => !v)}>
             <span className="ni-ic"><IconMore /></span>{t("nav.more")}
@@ -189,13 +219,8 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
         )}
         {hasMoreItems && moreOpen && (
           <div className="sb-submenu">
-            {/* 管理：仅 admin 可见（后端 nav:admin 门禁 + 前端能力过滤）。角色/用户/模块。从一级收进「更多」。 */}
-            {showAdmin && (
-              <button className={"navitem subitem" + (adminActive ? " active" : "")} onClick={() => onAdmin?.()}>
-                <span className="ni-ic"><IconCustomize /></span>{t("nav.admin")}
-              </button>
-            )}
-            {/* 定制（连接器/插件等）：从一级收进「更多」。 */}
+            {/* 定制（连接器/插件等）：从一级收进「更多」。
+                ⚠️ 「管理」曾经也在这里，2026-09-11 提到一级了 —— 别再往这里加回来。 */}
             {showCustomize && (
               <button className={"navitem subitem" + (customizeActive ? " active" : "")} onClick={() => onCustomize?.()}>
                 <span className="ni-ic"><IconCustomize /></span>{t("nav.customize")}
@@ -233,7 +258,10 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
             </button>
           </div>
         )}
-        {/* 主题分组：组标题已标明主题，组内会话不再重复显示 tag（showTag=false）。
+        {/* 主题分组：组标题已标明主题，组内会话不再重复显示**主题** tag（showTag=false）。
+            ⚠️ showTag 只管主题 tag。「对话对象」tag（NotiOps / DevOps / STAROps）不受它约束、
+            照样显示 —— 组标题说得清主题，说不清"这段是哪朵云的哪个 agent 答的"，而「通用」
+            这一组恰恰全靠它才分得开。见 ConvItem 里的取舍。
             标题可点击收起/展开该组（caret 指示，收起态持久化）。 */}
         {groups.map((g) => {
           if (g.items.length === 0) return null;

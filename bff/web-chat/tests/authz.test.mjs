@@ -3,6 +3,7 @@
  * 运行：node bff/web-chat/tests/authz.test.mjs
  */
 import { matchesAny, satisfies, satisfiesAdmin, filterDashboard, visibleTree, authorize, PRESET_ROLES } from "../authz.mjs";
+import { allNodes, toggleableTabs } from "../capabilities.mjs";
 
 let pass = 0, fail = 0;
 function eq(name, got, want) {
@@ -26,13 +27,37 @@ ok("* grants pass", satisfies({ grants: ["*"], denies: [] }, "anything:here"));
 ok("grant within prefix", satisfies({ grants: ["nav:finops:*"], denies: [] }, "nav:finops:spend-overview"));
 ok("no grant → deny", satisfies({ grants: ["nav:cases:*"], denies: [] }, "nav:finops") === false);
 
-/* ── filterDashboard：response-side 删字段 ── */
-const casesPayload = { overview: 1, waiting: 2, incidents: 3, sla: 4, _meta: "keep" };
+/* ── filterDashboard：response-side 删字段 ──
+ *
+ * ⚠️ payload 必须**照抄** support.mjs::casesDashboard 的真实返回形状（平铺的
+ * openCount / totalCount / bySeverity / byService + waiting / incidents / sla）。
+ * 这条断言以前喂的是自己编的 `{overview:1, waiting:2, ...}` —— 于是它"证明"了
+ * `responseKey: "overview"` 能把概览剥掉，而真实响应里根本没有 `overview` 这个键：
+ * 无权看概览的角色照样拿到全部概览数据，200、无日志。**编造的输入让测试为反面事实
+ * 背书**，比没有测试更糟。以后往「概览」加字段，这里和两个 capabilities.json 一起改。
+ */
+const casesPayload = {
+  ok: true, openCount: 3, totalCount: 9,
+  bySeverity: { urgent: 1, normal: 2 }, byService: { EC2: 2 },
+  waiting: { count: 1, cases: [] }, incidents: { count: 0, cases: [] },
+  sla: { onTrack: 2, atRisk: 1, breached: 0, worst: [] },
+};
 const filtered = filterDashboard("nav:cases", { ...casesPayload },
   { grants: ["nav:cases:overview", "nav:cases:sla"], denies: [] });
-eq("filter keeps granted subtabs", { overview: 1, sla: 4, _meta: "keep" }, filtered);
+eq("filter keeps granted subtabs", {
+  ok: true, openCount: 3, totalCount: 9,
+  bySeverity: { urgent: 1, normal: 2 }, byService: { EC2: 2 },
+  sla: { onTrack: 2, atRisk: 1, breached: 0, worst: [] },
+}, filtered);
 
-const finopsPayload = { costExplorer: 1, budgetAlerts: 2, devOpsAgentCost: 3, potentialSavings: 4, edpCommitment: 5, curStatus: "meta" };
+// 反例：**没有** nav:cases:overview 时，四个概览键必须一个都不剩（这才是原 bug 的判据）。
+const noOverview = filterDashboard("nav:cases", { ...casesPayload },
+  { grants: ["nav:cases:sla"], denies: [] });
+eq("filter drops all four overview keys", {
+  ok: true, sla: { onTrack: 2, atRisk: 1, breached: 0, worst: [] },
+}, noOverview);
+
+const finopsPayload = { costExplorer: 1, budgetAlerts: 2, devOpsAgentCost: 3, potentialSavings: 4, curStatus: "meta" };
 const finF = filterDashboard("nav:finops", { ...finopsPayload },
   { grants: ["nav:finops:spend-overview"], denies: [] });
 eq("finops keeps only spend-overview + meta", { costExplorer: 1, curStatus: "meta" }, finF);
@@ -176,6 +201,51 @@ ok("explicit nav:admin renders the admin tab",
 const adminDisabled = await authorize({ method: "GET", path: "/admin/llm-config", query: null, body: null },
   { grants: ["*"], denies: [] }, { disabledModules: ["nav:admin"] });
 ok("module switch still outranks admin grant", adminDisabled.allow === false);
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 「安全」不再出现在 Admin 的模块开关列表里（2026-09-12 产品要求）
+ *
+ * 三条判据缺一不可，缺哪条都是一种静默的坏状态：
+ *   ① 列表里没有它       —— 界面上那一行真的消失了；
+ *   ② 权限语义一字未改   —— 它**不是** alwaysOn：viewer 之外的门禁照旧是 nav:security，
+ *                            用 alwaysOn 实现会把安全看板放给每一个登录用户；
+ *   ③ 存量 disabled 记录失效 —— 升级前关掉过「安全」的客户，记录里还躺着
+ *                            `nav:security`，而界面上已经没有那一行去开回来。若仍然
+ *                            生效 = 看板永久隐身、没有任何提示、也没有任何操作能恢复。
+ * ────────────────────────────────────────────────────────────────────────── */
+const secTab = allNodes().find((n) => n.key === "nav:security");
+ok("nav:security 声明了 moduleToggle:false", secTab && secTab.moduleToggle === false);
+ok("nav:security 不在可开关模块列表里", !toggleableTabs().map((n) => n.key).includes("nav:security"));
+// 反例：真正的可开关模块一个都没被这次改动带走（否则"列表清空"也能让上一条变绿）
+const togKeys = toggleableTabs().map((n) => n.key);
+ok("其余模块仍可开关", ["nav:finops", "nav:cases", "nav:investigate"].every((k) => togKeys.includes(k)));
+ok("恒开的 chat 仍不可开关", !togKeys.includes("nav:chat"));
+ok("adminOnly 的 admin 仍不可开关", !togKeys.includes("nav:admin"));
+
+// ② 权限语义未变：不给 nav:security 的角色照旧 403 / 侧栏无入口
+ok("nav:security 不是 alwaysOn", !secTab.alwaysOn);
+const secDash = { method: "GET", path: "/api/security/dashboard", query: null, body: null };
+ok("没有 nav:security 的用户仍被拒",
+  (await authorize(secDash, { grants: ["nav:chat", "nav:cases:*"], denies: [] }, { disabledModules: [] })).allow === false);
+ok("有 nav:security 的用户照旧放行",
+  (await authorize(secDash, { grants: ["nav:security:*"], denies: [] }, { disabledModules: [] })).allow === true);
+ok("deny nav:security 仍能否决",
+  (await authorize(secDash, { grants: ["*"], denies: ["nav:security:*"] }, { disabledModules: [] })).allow === false);
+const vtNoSec = await visibleTree({ grants: ["nav:chat"], denies: [] }, { disabledModules: [] });
+ok("没有 nav:security 的用户侧栏拿不到这颗节点", !vtNoSec.map((n) => n.key).includes("nav:security"));
+
+// ③ 存量 disabled 记录里的 nav:security 不再生效（改不回来的状态不许存在）
+ok("存量 disabled 里的 nav:security 不再挡住端点",
+  (await authorize(secDash, { grants: ["nav:security:*"], denies: [] }, { disabledModules: ["nav:security"] })).allow === true);
+const vtStale = await visibleTree({ grants: ["*"], denies: [] }, { disabledModules: ["nav:security"] });
+ok("存量 disabled 里的 nav:security 不再从侧栏摘节点",
+  vtStale.map((n) => n.key).includes("nav:security"));
+ok("存量 disabled 里的 nav:security 不再摘它的子页",
+  vtStale.map((n) => n.key).includes("nav:security:guardduty"));
+// 反例：同一条过滤不许顺手把**真正的**模块开关也放行了
+ok("真正的模块开关仍然生效（finops）",
+  (await authorize({ method: "GET", path: "/api/finops/dashboard", query: null, body: null },
+    { grants: ["*"], denies: [] }, { disabledModules: ["nav:security", "nav:finops"] })).allow === false);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

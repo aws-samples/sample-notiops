@@ -747,13 +747,26 @@ def respond(user_text: str, *, command: str,
     # rather than overwriting with a single docs_search.
     if mcp_enabled and not reply and not tool_calls:
         logger.info("bedrock_chat: tool-use empty, falling back to P1 RAG")
+        p1_unavailable = False
         try:
             res = _aws_docs_mcp.search_documentation(text)
             p1_hits = (res or {}).get("hits", []) or []
+            p1_unavailable = bool((res or {}).get("error"))
         except Exception as e:
             logger.warning("bedrock_chat: P1 RAG search failed: %s", e)
             p1_hits = []
-        search_context = _format_search_context(p1_hits) if p1_hits else ""
+            p1_unavailable = True
+        # 检索**没答**时，不能就这么把空上下文喂给模型 —— 那等于让它凭记忆答一个 AWS
+        # 技术问题，而用户以为它查过文档了。塞一句说明进去，让它自己说出"这次没查到"。
+        if p1_hits:
+            search_context = _format_search_context(p1_hits)
+        elif p1_unavailable:
+            search_context = ("<aws_docs_search_results>\nThe AWS documentation service "
+                              "could not be reached for this question. Do not answer from "
+                              "memory: say the docs lookup failed and suggest retrying.\n"
+                              "</aws_docs_search_results>")
+        else:
+            search_context = ""
         reply = _invoke_with_context(
             text, search_context, locale,
             model_id=model_id, model_kind=model_kind,
@@ -1579,6 +1592,13 @@ def _exec_tool(name: str, args: dict) -> tuple[bool, str, list[dict]]:
             logger.warning("bedrock_chat: tool search exception: %s", e)
             return False, f"search failed: {e}", []
         hits = (res or {}).get("hits") or []
+        # 「查不了」和「确实没有」必须分开告诉模型。合成一句 "no results" 的后果是：
+        # 一次网络抖动会让模型认为 AWS 没有这方面的文档，于是凭记忆作答，用户看不出
+        # 权威来源根本没被查过（详见 core/aws_docs_mcp.py 里 `_ERR_UNAVAILABLE` 的注释）。
+        if err := (res or {}).get("error"):
+            logger.warning("bedrock_chat: docs search unavailable: %s", err)
+            return False, ("docs service unavailable (not 'no results') — say the docs "
+                           "lookup failed; do not answer from memory"), []
         if not hits:
             return True, "no results", []
         rendered = _json.dumps(
@@ -1595,13 +1615,20 @@ def _exec_tool(name: str, args: dict) -> tuple[bool, str, list[dict]]:
         if not url:
             return False, "url is empty", []
         try:
-            text = _aws_docs_mcp.read_documentation(url, max_chars=4000)
+            r = _aws_docs_mcp.read_documentation_ex(url, max_chars=4000)
         except Exception as e:
             logger.warning("bedrock_chat: tool read exception: %s", e)
             return False, f"read failed: {e}", []
-        if not text:
-            return False, "url disallowed or not reachable", []
-        return True, text, [{"title": url, "url": url}]
+        # 「这个 URL 我们不许读」和「文档服务没答」对模型是两种不同的下一步：前者换一个
+        # 官方 URL 重试，后者只能如实说这次读不到。原来一句 "url disallowed or not
+        # reachable" 把两者糊在一起，模型多半选择直接不读了、凭记忆答。
+        if r.get("error") == _aws_docs_mcp._ERR_URL_NOT_ALLOWED:
+            return False, "url is not an allowed AWS docs host — pick one from search results", []
+        if r.get("error"):
+            logger.warning("bedrock_chat: docs read unavailable: %s", r["error"])
+            return False, ("docs service unavailable — say the page could not be fetched; "
+                           "do not answer from memory"), []
+        return True, r["content"], [{"title": url, "url": url}]
 
     if name == _TOOL_NAME_DOCS_RECOMMEND:
         url = (args.get("url") or "").strip()
@@ -1613,6 +1640,9 @@ def _exec_tool(name: str, args: dict) -> tuple[bool, str, list[dict]]:
             logger.warning("bedrock_chat: tool recommend exception: %s", e)
             return False, f"recommend failed: {e}", []
         hits = (res or {}).get("hits") or []
+        if err := (res or {}).get("error"):
+            logger.warning("bedrock_chat: docs recommend unavailable: %s", err)
+            return False, "recommend unavailable (not 'no recommendations')", []
         if not hits:
             return True, "no recommendations", []
         rendered = _json.dumps(

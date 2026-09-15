@@ -158,19 +158,30 @@ App-Level Token(`xapp-...`),那是长连接时代的东西。
 
 ### Slack tokens 怎么填(关键)
 
-`setup.sh` **不采集任何 IM 凭据**。CDK(`NotiOpsBackendStack`,不是 `ImStack`)只创建**空的**
-Secret `notiops/slack-bot-token`(`xoxb-...`)和 `notiops/slack-signing-secret`(验签用);
+`setup.sh` **不采集任何 IM 凭据**。CDK(`NotiOpsBackendStack`,不是 `ImStack`)只创建两个
+**占位** Secret:`notiops/slack-bot-token`(`xoxb-...`)和 `notiops/slack-signing-secret`(验签用)。
+
+> ⚠️ 占位值**不是空串**,是 Secrets Manager 随机生成的一串字符(CDK 里这两个
+> `new secretsmanager.Secret(...)` 没给 `secretStringValue`)。所以「忘了填」的症状不是
+> 「空」,而是**像填错了**:`auth.test` 回 `invalid_auth`、Slack 存 Request URL 时验签 401。
+> 别照 secret 里有没有值来判断配没配 —— 看下面。
+
 部署完成后再填,两种方式:
 
-1. **(推荐)** 登录 Web Chat(admin)→「通知设置」填入 Slack 凭据。
-2. 直接更新 Secret:
+1. **(推荐,不需要任何 AWS 权限)** 登录 Web Chat →「管理控制台 → 集成 IM → **Slack** 分页」,
+   填 **Bot User OAuth Token** 和 **Signing Secret**,保存。那一页的「已配置」徽标是按**值的形状**
+   判断的(`xoxb-` 前缀 / 32 位十六进制),所以随机占位值只会显示「未配置」,不会骗你;
+   保存后点「测试凭证」会调 `auth.test` 把 workspace / bot 名字和**缺的 scope 逐条**报出来。
+2. 直接更新 Secret(有 AWS 控制台/CLI 权限时的等价做法):
    ```bash
    aws secretsmanager put-secret-value --secret-id notiops/slack-bot-token \
      --secret-string '<从 OAuth & Permissions 页复制的 bot token>' --region <REGION>
    ```
-   Lambda 是**冷启动时**读 Secret 的:改完等旧执行环境自然回收即可,急的话改一下 ingress
-   的环境变量(任意无害的值)强制换一批执行环境 —— 做法和注意点见
-   `docs/DEPLOYMENT.md` §8.2。
+   两个 secret 存的都是**纯字符串**,不是 JSON —— 数据面(`platforms/slack/caps.py`)直接把整个
+   `SecretString` 当值用,写成 `{"bot_token":"xoxb-..."}` 会把这一整坨当 token 发出去。
+
+不论走哪条路径:Lambda 是**冷启动时**读 Secret 的,改完等旧执行环境自然回收即可,急的话改一下
+ingress 的环境变量(任意无害的值)强制换一批执行环境 —— 做法和注意点见 `docs/DEPLOYMENT.md` §8.2。
 
 > `notiops/slack-app-token`(`xapp-...`)是 Socket Mode 时代的东西,webhook 路径**不读它**。
 

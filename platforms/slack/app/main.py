@@ -20,6 +20,7 @@ from slack_bolt import App, Ack
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from core import bedrock_intent
+from core import multicloud
 from core import nl_router
 from core import chat_history
 from core import ddb_state
@@ -349,7 +350,8 @@ def _help_text(locale: str) -> str:
     """Bilingual command menu (rendered from i18n `help.*`). Lists BOTH
     language forms of every command."""
     rows = "\n".join(
-        i18n.t(f"help.row.{feature}", locale)
+        # `multicloud.help_row_key` = 「这一行发哪份文案」，见 `core/multicloud.py`。
+        i18n.t(multicloud.help_row_key(feature), locale)
         for feature, _en, _zh in nl_router.HELP_COMMANDS
     )
     return (f"*{i18n.t('help.title', locale)}*\n\n"

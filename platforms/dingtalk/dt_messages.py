@@ -74,27 +74,35 @@ _ANSWER_TITLES_NOCLOCK = {
     "thinking": "im.chat.thinking_title.noclock",
 }
 
-#: 终态标题按"谁答的"分两套。**与另外两家的 `_FINAL_TITLES` 逐字对齐**。
+#: 终态标题按"谁答的"分三套。**与另外两家的 `_FINAL_TITLES` 逐字对齐**
+#: （`starops` 那条点明**阿里云** —— 理由见飞书那份的说明）。
 _FINAL_TITLES = {
     "devops": "im.chat.card_title",
     "notiops": "im.chat.card_title.notiops",
+    "starops": "im.chat.card_title.starops",
 }
 
 
 def usage_footer(locale: str, *, agent: str = "devops", usage=None,
-                 account: str = "", deploy: str = "") -> str:
+                 account: str = "", deploy: str = "",
+                 employee: str = "") -> str:
     """落款 —— 实现在 `platforms.common.im_footer`，**三个平台共用同一份**。
     这里只保留入口，理由同另外两家：`caps.py` 的纯文本兜底路径直接调它。
+
+    `agent="starops"` 时 AWS 账号那一段**整段消失**、换成阿里云数字员工 ID
+    （跨云假信息，见 `im_footer` 文件头 🔴 那一段）。
     """
     return im_footer.usage_footer(locale, agent=agent, usage=usage,
-                                  account=account, deploy=deploy)
+                                  account=account, deploy=deploy,
+                                  employee=employee)
 
 
 def answer_text(reply: str, locale: str, *,
                 steps=None, state: str = "final", elapsed: int = 0,
                 report_url: str = "", sources=None,
                 agent: str = "devops", usage=None,
-                account: str = "", deploy: str = "") -> tuple[str, str]:
+                account: str = "", deploy: str = "",
+                employee: str = "") -> tuple[str, str]:
     """对话问答的答案消息 → `(title, markdown)`。
 
     与 `im_cards.answer_card` / `im_blocks.answer_blocks` **逐参数对齐**（含 `state`
@@ -105,6 +113,9 @@ def answer_text(reply: str, locale: str, *,
     `account` / `deploy` 是落款里「这条回答基于哪个账号」那一段（多账号）：`account`
     是本轮目标账号（空 = 部署账号），`deploy` 是部署账号号。**两个都必须由调用方传** ——
     这个函数会被追加式进度反复调，在这里解析账号等于把一次 STS 塞进渲染循环。
+
+    `employee` 是 STAROps 那条路上**替代**账号那一段的阿里云数字员工 ID（2026-09-14），
+    口径与另外两家逐字相同（含"进度态拿不到、只有终版有值"那条）。
     """
     final = state == "final"
     # 非终态且还没走过一秒 → 用不带秒表的标题（见 `_ANSWER_TITLES_NOCLOCK`）。
@@ -130,7 +141,8 @@ def answer_text(reply: str, locale: str, *,
         parts.extend(["", _link(i18n.t("report.see_full", locale), report_url)])
     parts.extend(["", "---", "",
                   usage_footer(locale, agent=agent, usage=usage,
-                               account=account, deploy=deploy)])
+                               account=account, deploy=deploy,
+                               employee=employee)])
     return title, "\n".join(parts)
 
 

@@ -1532,9 +1532,16 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       resources: [base.dataBucket.bucketArn],
     }));
     // 这几个 secret 都不在栈里（Bedrock API Key 由 BFF 按需建，见 web-chat-core.ts 的
-    // `BedrockApiKeySecretAccess`；IM 凭证由管理控制台建或客户手建），CFN 不会删它们
-    // —— DeleteEverything 时由 StagerFn 收尾。**逐个点名**：不给「删本账号任意 secret」，
-    // 也不写成 `notiops/*`（那会把客户自己起名带 notiops/ 前缀的 secret 一起纳入）。
+    // `BedrockApiKeySecretAccess`；IM 凭证与阿里云凭据由管理控制台建或客户手建），CFN
+    // 不会删它们 —— DeleteEverything 时由 StagerFn 收尾。**逐个点名**：不给「删本账号
+    // 任意 secret」，也不写成 `notiops/*`（那会把客户自己起名带 notiops/ 前缀的 secret
+    // 一起纳入）。
+    // ⚠️ 新增一个「BFF 按需 CreateSecret」的 secret 时，**这里和下面 StagerSite 的
+    //    `SecretNames` 必须一起加**。漏一个的后果不是「少删一个」，而是**客户下次装不上**：
+    //    DeleteSecret 默认排 7-30 天恢复期，期间名字仍被占着，重装时同名 CreateSecret 报
+    //    `InvalidRequestException: ... already scheduled for deletion` → 主栈 CREATE_FAILED
+    //    回滚。方式B 那侧由 `tests/test_teardown_secrets.py` 双向卡住，方式A 这两份清单
+    //    **没有任何 CI 校验**（`test_oneclick_parity.py` 也不比这一维），只能靠这段注释。
     stagerRole.addToPolicy(new iam.PolicyStatement({
       sid: "TeardownDeleteOwnSecrets",
       actions: ["secretsmanager:DeleteSecret"],
@@ -1544,6 +1551,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         "notiops/im-bot-dingtalk",
         "notiops/slack-bot-token",
         "notiops/slack-signing-secret",
+        "notiops/aliyun-credentials",
       ].map((n) => `arn:${this.partition}:secretsmanager:${this.region}:${this.account}:secret:${n}-*`),
     }));
 
@@ -1591,10 +1599,18 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         //     CreateSecret 权限，见 web-chat-core.ts）。
         //   · notiops/im-bot-dingtalk —— 同上（钉钉与飞书同构：一个 secret，JSON 里
         //     `app_key` / `app_secret`）；客户也可以手建。
-        //   · notiops/slack-* —— 客户按文档手建（Slack 侧没有"在控制台里填"的入口）。
-        // 四个 IM secret **无条件**列出，不跟着 InstallIm 走：客户可能先装 web+feishu、
-        // 后来改回 web 再删栈，那时属性里若没有它，凭证就永久留在账号里
-        // （自定义资源的 Delete 事件只带**上一次成功部署**的属性）。名字不存在时
+        //   · notiops/slack-bot-token / notiops/slack-signing-secret —— 同样由「集成 IM」
+        //     页的 Slack 分页保存时建（bff/web-chat/slack_config.mjs）。与另两个平台不同：
+        //     这是**两个纯字符串** secret，不是一个 JSON secret（数据面
+        //     platforms/slack/caps.py 直接把整个 SecretString 当值用，没有 json.loads）。
+        //   · notiops/aliyun-credentials —— 管理控制台「多云」页保存客户阿里云 AK/SK 时建
+        //     （bff/web-chat/aliyun_config.mjs）。**方式B 是栈内资源**（见
+        //     notiops-backend-stack.ts 的 `AliyunCredentialsSecret`），方式A 没有对应的
+        //     CFN 资源，所以只能走这条 StagerFn 收尾路径 —— 这也是它必须在这份清单里的原因。
+        //     里面装的是客户阿里云账号的长期凭据，漏删的代价比 IM 凭证高一个量级。
+        // 四个 IM secret 和阿里云那个都**无条件**列出，不跟着 InstallIm / 多云开关走：
+        // 客户可能先装 web+feishu、后来改回 web 再删栈，那时属性里若没有它，凭证就永久
+        // 留在账号里（自定义资源的 Delete 事件只带**上一次成功部署**的属性）。名字不存在时
         // handler 会忽略 ResourceNotFoundException（见 index.py `_ignore_missing`），
         // 所以多列几个不会让删栈失败。
         SecretNames: cdk.Stack.of(this).toJsonString([
@@ -1603,6 +1619,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           "notiops/im-bot-dingtalk",
           "notiops/slack-bot-token",
           "notiops/slack-signing-secret",
+          "notiops/aliyun-credentials",
         ]),
         // 只精确点名本次部署自己那个 AgentCore 运行时日志组 —— **绝不**按前缀扫描后批量删。
         // BFF 与 StagerFn 的日志组都是栈内资源（DESTROY），CFN 自己会删，不用列在这里。
@@ -2189,9 +2206,10 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       "app secret, Encrypt Key and Verification Token. Then paste FeishuWebhookUrl into the " +
       "Feishu console under Events and Card callbacks. The bot stays silent until both are done.";
     const imSlackNextSteps =
-      "Create two secrets in AWS Secrets Manager -- 'notiops/slack-bot-token' (your xoxb- bot " +
-      "token) and 'notiops/slack-signing-secret' (the app signing secret), each a plain string " +
-      "-- then paste SlackWebhookUrl into your Slack app. The bot stays silent until both are done.";
+      "Open the admin console (ChatUrl > Admin > IM integration > Slack) and enter the bot user " +
+      "OAuth token (xoxb-) and the app signing secret. Then paste SlackWebhookUrl into your Slack " +
+      "app -- the same URL goes into Event Subscriptions, Interactivity and Slash Commands. The " +
+      "bot stays silent until both are done.";
     const imDingtalkNextSteps =
       "Open the admin console (ChatUrl > Admin > IM integration > DingTalk) and enter the robot " +
       "AppKey and AppSecret. Then paste DingtalkWebhookUrl into the DingTalk Open Platform under " +

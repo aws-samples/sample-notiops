@@ -41,6 +41,13 @@ function STR(zh: boolean) {
         : (zh
           ? `客户 CUR 数据源暂时不可用（${reason}），稍后重试即可。这期间成本问题照样可以在对话里问我 —— 会自动改用 Cost Explorer 口径回答（聚合口径，可能与账单对不齐）。`
           : `The customer-CUR data source is temporarily unavailable (${reason}). Retry later. In the meantime you can ask cost questions in chat — they fall back to Cost Explorer (aggregate scope, may not reconcile with the invoice).`),
+    // 顶栏切了账号、但本表是组织级（payer）口径时的如实说明。
+    // 后端 curdash 接口**没有** account 参数（CUR 表就是 payer 级的行级明细），
+    // 所以这里既不能伪造 `?account=`，也不能默不作声让人以为图里就是那个账号的数据 ——
+    // 图里 Cost - Account 那张恰好按账号拆，最容易被读成"已经按我选的账号过滤了"。
+    orgScopeNote: (acct: string) =>
+      zh ? `本表是组织级（payer）口径的 CUR 行级明细，顶栏选中的账号 ${acct} 对它不适用 —— 下面看到的是**全组织**数据（可点 Cost - Account 图例交叉筛选到单个账号）。`
+         : `This sheet is organization-level (payer) CUR line-item data; the selected account ${acct} does not apply — what you see below covers the whole organization (use the Cost - Account legend to cross-filter to one account).`,
     filteredBy: (v: string) => (zh ? `已筛选：${v}（点图例取消）` : `Filtered: ${v} (click legend to clear)`),
     windowHint: zh ? "（默认 T-33 ~ T-3，最近 3 天账单未出全）"
       : "(default T-33 to T-3; the last 3 days are not fully billed)",
@@ -422,12 +429,28 @@ function SpSheet() {
 
 /* ═══════════ 出口 ═══════════ */
 
-export default function CurDashboard({ sheet }: { sheet: string }) {
-  switch (sheet) {
-    case "cur-trend": return <TrendSheet />;
-    case "cur-credit": return <CreditSheet />;
-    case "cur-es": return <EsSheet />;
-    case "cur-sp": return <SpSheet />;
-    default: return null;
-  }
+/**
+ * @param accountId 顶栏账号选择器的当前值（空 = 组织聚合）。**本表不按它过滤** ——
+ *   CUR 行级明细是 payer 级的，后端接口也没有 account 参数。选了账号时如实挂一条
+ *   说明，而不是让人以为图里已经过滤过了。
+ */
+export default function CurDashboard({ sheet, accountId = "" }: { sheet: string; accountId?: string }) {
+  const { locale } = useLocale();
+  const s = STR(locale !== "en");
+  const sheetEl = (() => {
+    switch (sheet) {
+      case "cur-trend": return <TrendSheet />;
+      case "cur-credit": return <CreditSheet />;
+      case "cur-es": return <EsSheet />;
+      case "cur-sp": return <SpSheet />;
+      default: return null;
+    }
+  })();
+  if (!sheetEl) return null;
+  return (
+    <>
+      {accountId && <Notice text={s.orgScopeNote(accountId)} />}
+      {sheetEl}
+    </>
+  );
 }

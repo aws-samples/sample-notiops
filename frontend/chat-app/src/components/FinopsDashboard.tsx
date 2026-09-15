@@ -6,17 +6,15 @@
  * 主题变量（不引入独立配色系统，跟随应用深浅色主题自动切换）：
  *   1. Spend Overview   — Hero 卡（Total Spend + MoM）+ 6 月趋势图（recharts）
  *   2. Cost Breakdown    — Marketplace Spend 卡
- *   3. Commitments       — EDP Commitment Attainment 仪表盘（demo mock）
- *                           + DevOps Agent Credit Usage 卡（真实 CUR/Athena 数据）
+ *   3. Commitments       — DevOps Agent Credit Usage 卡 + AI 支出（真实 CUR/Athena 数据）
  *   4. MoM Movers        — Top Cost Driver / Largest Decrease
  *   5. Ask about costs   — 底部输入框，直接复用聊天 API（不是模板里的假输入框）
  *
  * 数据源：GET /finops/dashboard（见 bff/web-chat/finops.mjs），一次拿齐所有卡片。
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ComposedChart, Area, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  RadialBarChart, RadialBar, PolarAngleAxis,
   PieChart, Pie, Cell,
 } from "recharts";
 import { useLocale } from "../i18n";
@@ -34,6 +32,15 @@ interface Props {
   data?: FinopsDashboardData;
   /** 能力门禁：判断某 permissionKey 是否可见（未传=全允许，兼容旧调用）。 */
   can?: (key: string) => boolean;
+  /**
+   * 多账号：当前看板正在看的账号（空 = 组织聚合 / payer 视角）。
+   *
+   * ⚠️ 原来这个组件**完全不知道**顶栏切了账号：ChatApp 传进来的 `data` 是按账号拉的，
+   * 但组件自己发的三类请求（兜底 getFinopsDashboard、标签键、标签值/成本）全是裸调用 ——
+   * 于是同一屏里上半部分是成员账号的成本，标签浏览器却是**部署账号**的成本，
+   * 界面上没有任何地方说明这件事。
+   */
+  accountId?: string;
 }
 
 const fmtUsd = (n: number | undefined, opts?: Intl.NumberFormatOptions) =>
@@ -118,14 +125,14 @@ export function finopsPanelVisible(id: string, can: (k: string) => boolean): boo
     spend: can("nav:finops:spend-overview") || can("nav:finops:marketplace") || can("nav:finops:top5"),
     optimization: can("nav:finops:potential-savings") || can("nav:finops:anomalies")
       || can("nav:finops:daily-anomaly") || can("nav:finops:ri-sp"),
-    progress: can("nav:finops:commitment") || can("nav:finops:devops-credit") || can("nav:finops:ai-spend"),
+    progress: can("nav:finops:devops-credit") || can("nav:finops:ai-spend"),
     movers: can("nav:finops:movers"),
     deepdive: deepDive,
     "tag-explorer": can("nav:finops:tag-explorer"),
   } as Record<string, boolean>)[id] ?? true;
 }
 
-export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: dataProp, can = () => true, onAsk }: Props) {
+export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: dataProp, can = () => true, onAsk, accountId = "" }: Props) {
   const { locale } = useLocale();
   const zh = locale !== "en";
   const [fetched, setFetched] = useState<FinopsDashboardData | null>(null);
@@ -136,9 +143,10 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
   useEffect(() => {
     if (dataProp) return; // 外部已提供数据（ChatApp 统一拉取）→ 不自拉，避免重复查 Athena
     let cancelled = false;
-    getFinopsDashboard().then((d) => { if (!cancelled) { setFetched(d); setLoadingState(false); } });
+    setLoadingState(true);
+    getFinopsDashboard(accountId).then((d) => { if (!cancelled) { setFetched(d); setLoadingState(false); } });
     return () => { cancelled = true; };
-  }, [dataProp]);
+  }, [dataProp, accountId]);
 
   const [ddScenario, setDdScenario] = useState<string | null>(null);
   const [ddResult, setDdResult] = useState<DeepDiveResult | null>(null);
@@ -156,17 +164,34 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
   // 标签浏览器可见时，懒加载「已激活的成本分配标签键」列表（只加载一次）。
   // 面板模式(dashboardId==='tag-explorer') 或 landing 全量模式(无 dashboardId) 都需要。
   const tagSectionActive = (!dashboardId || dashboardId === "tag-explorer") && can("nav:finops:tag-explorer");
-  // 依赖只放 tagSectionActive：若把 tagKeys/tagKeysLoading 放进依赖，setTagKeysLoading(true)
-  // 会触发 effect 重跑 → cleanup 先把上一轮的 cancelled 置 true → 在途请求的 .then 里
-  // setTagKeysLoading(false) 被跳过 → 永久 loading（竞态）。内部 guard 已足够防重复请求。
+  /**
+   * 「键列表已经是哪个账号的」记在 ref 里，**不用 state 也不看 tagKeys**。
+   *
+   * 两个坑各踩过一次，这一位同时躲开：
+   * 🔴 把 `tagKeysLoading` 列进依赖 → effect 里 `setTagKeysLoading(true)` 触发自我重跑，
+   *    cleanup 把 `cancelled` 置 true → 在途请求的 `.then` 被跳过 → **永久 loading**。
+   * 🔴 只列 `tagSectionActive`、靠「另一个 effect 把 tagKeys 置 null」来重拉 → 置 null
+   *    改的是 state 不是依赖，本 effect 根本不会重跑；而且 guard 读的是当前渲染闭包里的
+   *    旧 tagKeys（仍非 null）→ 切账号后标签浏览器**空着不再取数**，屏上既没有新账号的
+   *    标签也没有加载提示。
+   * ref 不参与依赖也不受闭包影响，还顺带保住了原来的缓存语义：同一账号来回切页面不重拉。
+   */
+  const tagKeysFor = useRef<string | null>(null);
   useEffect(() => {
-    if (!tagSectionActive || tagKeys !== null || tagKeysLoading) return;
+    if (!tagSectionActive) return;
+    if (tagKeysFor.current === accountId) return; // 已经是这个账号的键列表
+    tagKeysFor.current = accountId;
+    // 切账号 → 三层结果（键/值/成本）全部失效，先清掉再拉，别让上一个账号的成本留在屏上。
+    setTagKey("");
+    setTagValues([]);
+    setTagValue(null);
+    setTagCost(null);
+    setTagKeys(null);
     let cancelled = false;
     setTagKeysLoading(true);
-    getFinopsTagKeys().then((r) => { if (!cancelled) { setTagKeys(r); setTagKeysLoading(false); } });
+    getFinopsTagKeys(accountId).then((r) => { if (!cancelled) { setTagKeys(r); setTagKeysLoading(false); } });
     return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tagSectionActive]);
+  }, [tagSectionActive, accountId]);
 
   // 选标签键 → 拉该键的值列表 + 默认查「全部值合计」的按服务成本。
   function onPickTagKey(k: string) {
@@ -176,15 +201,15 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
     setTagCost(null);
     if (!k) return;
     setTagCostLoading(true);
-    getFinopsTagValues(k).then((r) => setTagValues(r.available ? r.tagValues : []));
-    getFinopsTagCost(k, null).then((r) => { setTagCost(r); setTagCostLoading(false); });
+    getFinopsTagValues(k, accountId).then((r) => setTagValues(r.available ? r.tagValues : []));
+    getFinopsTagCost(k, null, accountId).then((r) => { setTagCost(r); setTagCostLoading(false); });
   }
   // 选具体标签值(或"全部值")→ 重查。valArg: null=全部值合计；字符串(含"")=该值
   function onPickTagValue(valArg: string | null) {
     setTagValue(valArg);
     setTagCost(null);
     setTagCostLoading(true);
-    getFinopsTagCost(tagKey, valArg).then((r) => { setTagCost(r); setTagCostLoading(false); });
+    getFinopsTagCost(tagKey, valArg, accountId).then((r) => { setTagCost(r); setTagCostLoading(false); });
   }
 
   if (loading) {
@@ -228,14 +253,6 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
       })
     : [];
 
-  const edp = data.edpCommitment;
-  const edpGaugeVal = Math.min(edp?.attainmentPct || 0, 100);
-  const edpAtt = edp?.attainmentPct || 0;
-  const edpExp = edp?.expectedPct || 0;
-  // 风险 = 达成 vs 应达成(按合同已过月份数线性)：>=应达成 → 低(绿)；>=应达成×0.72 → 中(橙)；否则高(红)
-  const edpRisk = edpExp <= 0 ? "none" : edpAtt >= edpExp ? "low" : edpAtt >= edpExp * 0.72 ? "medium" : "high";
-  const edpColor = edpRisk === "high" ? "#d13212" : edpRisk === "medium" ? "#f59e0b" : "var(--green)";
-
   const aiSpend = ce?.aiSpend;
   const dac = data.devOpsAgentCost;
   const curStatus = data.curStatus;
@@ -253,7 +270,6 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
     anomalies: can("nav:finops:anomalies"),
     dailyAnomaly: can("nav:finops:daily-anomaly"),
     riSp: can("nav:finops:ri-sp"),
-    commitment: can("nav:finops:commitment"),
     devopsCredit: can("nav:finops:devops-credit"),
     aiSpend: can("nav:finops:ai-spend"),
     movers: can("nav:finops:movers"),
@@ -268,7 +284,7 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
         {[
           { id: "spend", label: zh ? "支出概览" : "Spend Overview", metric: spend?.available ? fmtK(spend.totalThisMonthK) : "—", sub: zh ? "本月至今" : "MTD" },
           { id: "optimization", label: zh ? "优化与风险" : "Optimization & Risk", metric: savings?.available ? fmtUsd(savings.totalMonthlyUsd) : ((anomalies?.count || 0) > 0 ? String(anomalies?.count) : "—"), sub: savings?.available ? (zh ? "可省/月" : "savings/mo") : (zh ? "异常数" : "anomalies") },
-          { id: "progress", label: zh ? "关键进度" : "Key Progress", metric: (dac?.available && dac.usedPct != null) ? `${dac.usedPct}%` : (edp ? `${edp.attainmentPct}%` : "—"), sub: (dac?.available && dac.usedPct != null) ? (zh ? "credit 已用" : "credit used") : (zh ? "承诺达成" : "attainment") },
+          { id: "progress", label: zh ? "关键进度" : "Key Progress", metric: (dac?.available && dac.usedPct != null) ? `${dac.usedPct}%` : "—", sub: zh ? "credit 已用" : "credit used" },
           { id: "movers", label: zh ? "环比变化" : "MoM Movers", metric: ce?.movers?.topDriver?.name || "—", sub: zh ? "涨幅最大" : "top driver" },
           { id: "deepdive", label: zh ? "成本深挖" : "Cost Deep Dive", metric: zh ? "深挖" : "Explore", sub: zh ? "点开选场景 →" : "pick a scenario →" },
           { id: "tag-explorer", label: zh ? "按标签查成本" : "Cost by Tag", metric: zh ? "标签" : "Tags", sub: zh ? "选成本分配标签 →" : "pick a tag →" },
@@ -519,28 +535,6 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
       {/* SECTION 3: Commitments & Programs */}
       <SectionTitle consoleUrl="https://console.aws.amazon.com/athena/home?region=us-east-1#/query-editor" consoleLabel={zh ? "在 Athena 查看 SQL" : "View SQL in Athena"}>{zh ? "承诺与项目" : "Commitments & Programs"}</SectionTitle>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 14 }}>
-        {canCard.commitment && edp && (edp.expectedPct > 0 || (edp.attainmentPct || 0) > 0) && (
-        <Card style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <div style={{ flex: "0 0 140px", height: 120 }}>
-            <ResponsiveContainer width="100%" height={120}>
-              <RadialBarChart innerRadius="65%" outerRadius="100%" data={[{ value: edpGaugeVal }]} startAngle={90} endAngle={-90}>
-                <PolarAngleAxis type="number" domain={[0, 100]} angleAxisId={0} tick={false} />
-                <RadialBar dataKey="value" fill={edpColor} background={{ fill: "var(--line)" }} cornerRadius={8} />
-              </RadialBarChart>
-            </ResponsiveContainer>
-          </div>
-          <div>
-            <Label>{zh ? "承诺达成率" : "Commitment Attainment"}</Label>
-            <div style={{ fontSize: 28, fontWeight: 800, color: edpColor }}>{edp?.attainmentPct}%</div>
-            <div style={{ color: "var(--muted)", fontSize: 11.5, marginTop: 2 }}>
-              {edp?.contractPeriod} · {zh ? "应达成" : "expected"} {(edp?.expectedPct || 0).toFixed(1)}%
-            </div>
-            <div style={{ marginTop: 6, fontSize: 11.5, fontWeight: 700, color: edpColor }}>
-              {edpRisk === "high" ? (zh ? "⚠ 高 shortfall 风险" : "⚠ High shortfall risk") : edpRisk === "medium" ? (zh ? "⚠ 中风险 · 偏慢" : "⚠ Medium risk · behind") : edpRisk === "low" ? (zh ? "✓ 进度健康" : "✓ On track") : "—"}
-            </div>
-          </div>
-        </Card>
-        )}
         {canCard.devopsCredit && (
         <Card accent="info">
           <Label>{zh ? "DevOps Agent 调用额度" : "DevOps Agent — Credit Usage"}</Label>
@@ -672,6 +666,15 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
       <div style={{ color: "var(--muted)", fontSize: 12, margin: "0 2px 10px", lineHeight: 1.5 }}>
         {zh ? "点击场景 → 后台跑 Athena 保存查询(CUR 明细,100% 真实数据)→ AI 出图表 + 洞察,原始数据可下载。" : "Pick a scenario → runs a saved Athena query (real CUR data) → AI chart + insight; download raw data."}
       </div>
+      {/* 顶栏切了账号时的如实说明：deep-dive 走 payer 的 Athena 保存查询，后端接口**没有**
+          account 参数，跑的就是全组织 CUR。不说清楚的话，"CUR 明细,100% 真实数据"这句会被
+          读成"这就是我选的那个账号的明细"—— 数字是真的，归属是假的。 */}
+      {accountId && (
+        <div style={{ color: "var(--muted)", fontSize: 12, margin: "0 2px 10px", lineHeight: 1.5, border: "1px solid var(--line)", borderRadius: 9, padding: "7px 10px" }}>
+          {zh ? `本节是组织级(payer)口径的 Athena 保存查询,顶栏选中的账号 ${accountId} 对它不适用 —— 下面的明细覆盖全组织。`
+              : `This section runs organization-level (payer) saved Athena queries; the selected account ${accountId} does not apply — results below cover the whole organization.`}
+        </div>
+      )}
       <div style={{ display: "grid", gap: 10 }}>
         {[
           { k: "cloudwatch", t: zh ? "CloudWatch 成本明细" : "CloudWatch cost breakdown", d: zh ? "按用量类型:Logs 摄取/存储、Metrics、API…" : "By usage type: Logs, Metrics, API…" },
@@ -748,8 +751,17 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
             </div>
           </div>
         );
-      })() : (
-        <div style={{ color: "#d13212", fontSize: 12, marginTop: 12 }}>{zh ? "查询失败:" : "Query failed: "}{ddResult.message || ddResult.reason}</div>
+      })() : ["no_named_queries", "named_query_not_found", "unknown_scenario"].includes(ddResult.reason || "") ? (
+        /* 「payer 账号里还没建这条 Athena 保存查询」是**配置缺口**,不是查询失败 ——
+           原来一律印红色「查询失败」,用户会以为是自己环境/权限出了问题去查 Athena 日志。 */
+        <div style={{ color: "var(--muted)", fontSize: 12, marginTop: 12 }}>
+          {zh ? "本场景尚未配置(payer 账号里没有对应的 Athena 保存查询)。" : "This scenario is not configured yet (no matching Athena saved query in the payer account)."}
+          {ddResult.reason ? ` (${ddResult.reason})` : ""}
+        </div>
+      ) : (
+        /* 只印我们自己的码 / 后端回的异常类型名。**不印** message —— 客户端那条是
+           String(e)(带请求 URL),服务端那条已被 _clientErr 压成 "internal error"。 */
+        <div style={{ color: "#d13212", fontSize: 12, marginTop: 12 }}>{zh ? "查询失败:" : "Query failed: "}{ddResult.reason || "error"}</div>
       ))}
       </>)}
 

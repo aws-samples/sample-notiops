@@ -50,8 +50,9 @@ export async function getSecurityDashboard(accountId?: string): Promise<Security
     const r = await s.aws.fetch(`${s.base}/security/dashboard${q}`, { headers: { "x-notiops-id-token": s.idToken } });
     if (!r.ok) return { ok: false, code: "http_" + r.status };
     return await r.json();
-  } catch (e) {
-    return { ok: false, code: "error", message: String(e) };
+  } catch {
+    // 不带 String(e)：那串会带上请求 URL 和运行时报文，而 code 是要画到界面上的。
+    return { ok: false, code: "fetch_failed" };
   }
 }
 
@@ -61,15 +62,20 @@ export interface GuarddutyData {
   severity?: Record<string, number>; total?: number;
   top?: { title: string; severity: number; type: string; resource: string; region: string }[];
 }
-export async function getGuarddutyDashboard(accountId?: string): Promise<GuarddutyData | null> {
+/**
+ * 失败**不再**回 null：调用方拿 `null` 当「加载中」哨兵，两者混用时一次 HTTP 500
+ * 会被画成「GuardDuty 未开通」—— 那是一条关于客户环境的假事实。
+ * `ok:false` = 我们没问到（可重试）；`available:false` = 问到了，答案是没开。
+ */
+export async function getGuarddutyDashboard(accountId?: string): Promise<GuarddutyData> {
   const s = await signedClient();
-  if (!s) return null;
+  if (!s) return { ok: false, reason: "not_authenticated" };
   try {
     const q = accountId ? `?account=${encodeURIComponent(accountId)}` : "";
     const r = await s.aws.fetch(`${s.base}/security/guardduty${q}`, { headers: { "x-notiops-id-token": s.idToken } });
-    if (!r.ok) return null;
+    if (!r.ok) return { ok: false, reason: "http_" + r.status };
     return await r.json();
-  } catch { return null; }
+  } catch { return { ok: false, reason: "fetch_failed" }; }
 }
 
 // Security 组织概览

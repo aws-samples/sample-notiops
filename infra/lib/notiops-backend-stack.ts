@@ -945,6 +945,32 @@ export class NotiOpsBackendStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
+    // ─── 阿里云账号凭据（多云上车；Admin「多云」页填）───
+    // 预建（而不是让 BFF 首次保存时 CreateSecret）的理由是**卸载能收干净**：
+    // `tests/test_teardown_secrets.py` 双向比对 teardown.sh 的 SECRETS 与本文件里声明为
+    // DESTROY 的 secret —— 不在这里建，teardown.sh 就不许列它，方式B 卸载会永久留下一个
+    // 装着客户 AK/SK 的孤儿 secret。方式A 那边没有这个约束（一键模板不预建任何凭据资源），
+    // 由 BFF 的 CreateSecret 兜底 + StagerSite/Teardown 两份名字清单负责清理。
+    //
+    // 与飞书/钉钉同样用 `secretStringTemplate` 播**空串**（而不是让 CFN 生成随机值）：
+    // BFF 侧「空 ⇒ 未配置」这条判定就建立在这上面，回 `****` 会让客户以为已经配好。
+    // 不绑变量：本栈没有任何 Lambda 直接读它（读它的是 web-chat 栈里的 BFF，按字面名
+    // 授权、不走跨栈 Export）。绑一个用不到的变量会让下一个人以为这里还该接点什么。
+    new secretsmanager.Secret(this, "AliyunCredentialsSecret", {
+      secretName: "notiops/aliyun-credentials",
+      description: "阿里云账号凭据（access_key_id / access_key_secret / region_id；Admin「多云」页填）",
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      generateSecretString: {
+        secretStringTemplate: JSON.stringify({
+          auth_mode: "ak",
+          access_key_id: "",
+          access_key_secret: "",
+          region_id: "cn-hangzhou",
+        }),
+        generateStringKey: "placeholder",
+      },
+    });
+
     const liteLlmConfigSecret = new secretsmanager.Secret(this, "LiteLlmConfigSecret", {
       secretName: "notiops/litellm-config",
       description:

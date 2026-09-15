@@ -1,5 +1,6 @@
 import type { SourceItem, TokenUsage, InvestigationStep } from "./api/chat";
 import type { TimelineStep } from "./thinking";
+import { MULTICLOUD_UI } from "./featureFlags";
 
 export type Role = "user" | "assistant";
 
@@ -15,7 +16,9 @@ export interface ProposedAction {
   account_id?: string;
   // 前端本地状态：执行结果（确认后回填，用于卡片显示已执行/失败）
   done?: boolean;
-  result?: { ok: boolean; verified?: boolean; status?: string; message?: string; caseId?: string; displayId?: string };
+  /** `duplicate:true` = BFF 回放的**同一操作既有结果**（没有重复执行；见 support.mjs 幂等段）。
+   *  卡上必须明说，否则用户以为自己刚刚又开了一个案例。 */
+  result?: { ok: boolean; verified?: boolean; status?: string; message?: string; caseId?: string; displayId?: string; duplicate?: boolean };
 }
 
 export interface Followup { label: string; prompt?: string; url?: string }
@@ -40,6 +43,11 @@ export interface ChatMessage {
   //                     0 token，署名 "NotiOps"。前端事先不知道，由 agent 在流里发
   //                     `via` 事件告知（BFF 落库同字段，刷新后历史不被错误署名）。
   via?: string;
+  // 阿里云数字员工 ID（只有 via="starops" 的回复有）：页脚里"这条是哪个数字员工答的"。
+  // 一个阿里云账号可以有多个员工、纳管范围各不相同，所以这是读答案的必要坐标。
+  // ⚠️ 必须来自**这一轮**（BFF 在 `via` 事件里带回、并逐条落库），不能读当前配置 ——
+  //    管理员换过员工之后，历史回复要仍显示当时那一个。
+  staropsEmployee?: string;
   accountId?: string;    // 本轮提问的目标 AWS 账号（多账号可切换，故按条记录，让历史回复能标明针对哪个账号）
   streaming?: boolean;   // 正在流式输出
   thinking?: boolean;    // 思考态（尚无 token）
@@ -50,7 +58,16 @@ export interface ChatMessage {
 
 // 会话主题：general=通用（默认，不打 tag）；其余对应侧边栏主题入口。
 // 通用对话已能完成大部分工作；主题只是带特定上下文的入口 + 会话分类标签。
-export type TopicKey = "general" | "investigate" | "finops" | "cases" | "security" | "whats-new";
+//
+// 🔴 **"security" 不再是聊天主题**（2026-09-11 并入 investigate）。原因是它的聊天能力是
+//    investigate 的**真子集**，不是另一种能力：agent 侧 `_TOPIC_FOCUS` 里根本没有
+//    "security" 这一项（system prompt 与 general 逐字节相同），工具也只挂到 core 8 个 ——
+//    investigate 是 22 个，且独有 `lake_query`（CloudTrail Lake）/ `analyze_metric` /
+//    `execute_cwl_insights_batch`。也就是说客户在「安全」里问安全问题，拿到的能力
+//    **比在「调查」里问同一句更差**。安全看板（TopicKey 之外的 `view === "security"`）
+//    保留，改由侧栏入口与调查输入框上方那行「仪表盘」pill 进入。
+//    老会话里存着的 topic:"security" 由 `normalizeTopic` 读时改写（见下）。
+export type TopicKey = "general" | "investigate" | "finops" | "cases" | "whats-new";
 
 export interface TopicDef {
   key: TopicKey;
@@ -63,13 +80,35 @@ export interface TopicDef {
 export const TOPICS: TopicDef[] = [
   { key: "investigate", labelKey: "topic.investigate", color: "var(--orange2)" },
   { key: "finops",      labelKey: "topic.cost",        color: "var(--green)" },
-  { key: "security",    labelKey: "topic.security",    color: "#8b5cf6" },
   { key: "cases",       labelKey: "topic.cases",       color: "var(--blue)" },
   { key: "whats-new",   labelKey: "topic.whatsnew",    color: "var(--teal)" },
 ];
 
 export const topicDef = (k?: string): TopicDef | undefined =>
   TOPICS.find((t) => t.key === k);
+
+/**
+ * 退役主题的读时改写（**只做一件事：security → investigate**）。
+ *
+ * 为什么必须有：会话头条目里的 `topic` 属性**永远不会被改写** ——
+ * `store.mjs` 的 `ensureConversation` 带 `ConditionExpression: "attribute_not_exists(SK)"`，
+ * 而 `touchConversation` / `renameConversation` / `PATCH /conversations/{id}` 都不碰 topic。
+ * 所以 DynamoDB 里那些 `topic:"security"` 会一直存在（TTL 每轮刷新，活跃用户等于永久）。
+ * 任何「下次发消息就自愈」的假设都是错的，必须在**读**的时候归一。
+ *
+ * 不归一会怎样（不报错、全静默）：`topicDef("security")` 返回 undefined → 顶栏主题 tag 消失；
+ * 侧栏分组回落到「通用」灰 tag；chip 池回落到 general；而且它继续把 `topic:"security"` 发给
+ * agent → 那边照旧只挂 8 个 core 工具。TypeScript 抓不到任何一处：
+ * `ConversationSummary.topic` 是 `string`，水合处是 `as TopicKey` 硬转。
+ *
+ * ⚠️ 前端归一只覆盖**本次加载的这个 bundle**。已经打开的旧标签页会继续发 "security"，
+ *    所以 BFF 入口（`index.mjs` 的 /stream 与 /warmup）必须有一份同样的归一，agent 侧
+ *    再兜一层 —— 三层都要，理由见 bff/web-chat/topic.mjs 的注释。
+ */
+export function normalizeTopic(k?: string): TopicKey {
+  if (k === "security") return "investigate";
+  return TOPICS.some((t) => t.key === k) ? (k as TopicKey) : "general";
+}
 
 // 通用会话的 tag 定义：不在 TOPICS（不作侧栏导航入口），但需要一个与其它主题**设计一致**
 // 的标签（中性灰 + 对话气泡图标），用于置顶组等需要显式标注主题的场合。
@@ -80,6 +119,33 @@ export const GENERAL_TAG: TopicDef = { key: "general", labelKey: "topic.general"
 // tagDef 永远返回一个可渲染的 tag（用于会话标签展示，保证通用会话也有一致的 tag）。
 export const tagDef = (k?: string): TopicDef =>
   TOPICS.find((t) => t.key === k) ?? GENERAL_TAG;
+
+// ── 侧栏的「对话对象」tag（这段会话最后一轮是**谁**答的）─────────────────────
+// 为什么侧栏需要它：主题分组的组标题只说"这是通用/故障调查会话"，说不了"这段是 NotiOps
+// 答的、还是客户自己的 DevOps Agent / 阿里云数字员工答的"。而通用会话恰恰全都堆在一个
+// 「通用」组里 —— 翻回一段旧会话时，除了点开看，没有任何线索。
+//
+// 唯一的事实来源是服务端 `listConversations()` 回的 `obj`（store.mjs 写在会话头上）。
+// **不许**用本地那份 convMode 记忆代替：那是 per-浏览器 的，换台机器就成了空 —— 而
+// 「猜错」比「不标」糟得多（把一段阿里云会话标成 NotiOps 是跨云假信息）。
+//
+// 颜色/图标与顶栏那三枚对象 tag 同源（ChatApp.tsx 的 topbar-topic）：
+// starops=--link、devops=--ok、notiops=--orange。两处必须一致，否则同一段会话在侧栏
+// 和顶栏是两个颜色，客户会以为是两个东西。
+// 标签文字用**短名**（NotiOps / DevOps / STAROps），全称放 title —— 侧栏那一行宽度就那么点，
+// "AWS DevOps Agent" 会把会话标题挤没。
+export interface ObjTagDef { key: string; labelKey: string; hintKey: string; color: string }
+
+const OBJ_TAGS: readonly ObjTagDef[] = [
+  { key: "starops", labelKey: "conv.obj.starops", hintKey: "obj.tag.starops.hint", color: "var(--link)" },
+  { key: "devops", labelKey: "conv.obj.devops", hintKey: "obj.tag.devops.hint", color: "var(--ok)" },
+  { key: "notiops", labelKey: "conv.obj.notiops", hintKey: "obj.tag.notiops.hint", color: "var(--orange)" },
+];
+
+/** 服务端 `obj` → tag 定义。**未知/空一律返回 undefined**（老会话没有这个属性）：
+ *  调用方据此回落到主题 tag，而不是把它当成 notiops —— 默认值猜错就是标错。 */
+export const objTagDef = (obj?: string): ObjTagDef | undefined =>
+  OBJ_TAGS.find((o) => o.key === obj);
 
 // ── 「深度调查」（DevOps Agent）的主题适用范围 ────────────────────────────────
 // **口径：默认提供，按例外排除**（不是按主题白名单开启）。深度调查是一条与主题解耦的
@@ -92,6 +158,58 @@ const DEVOPS_TOPICS_EXCLUDED: ReadonlySet<string> = new Set(["general", "cases",
 
 export const topicHasDevopsAgent = (k?: string): boolean =>
   !DEVOPS_TOPICS_EXCLUDED.has(k || "general");
+
+/**
+ * 哪些主题在工具条上提供「DevOps 对话」这个**平铺开关**。
+ *
+ * 口径与上面那条相反 —— 这里是**显式列举**，不跟随 `topicHasDevopsAgent` 的
+ * 「默认提供、按例外排除」：那份排除表管的是"给我们的 agent 挂 DevOps 工具"，
+ * 与这条**根本不经我们 agent** 的直连路径无关。
+ * 通用会话（general）刻意不在其中：那里改由新对话主页的「对话对象」两张卡来选
+ * （ChatObjectPicker），选完发第一句即锁定 —— 一个能力两个入口会让"这段对话谁在答"
+ * 变得不可预期（开关是每轮修饰，对象是整段会话的事实）。
+ *
+ * 从 Composer 里那个局部 `CHAT_TOPICS` 提上来的：会话模式要**跨刷新**恢复，
+ * ChatApp 侧也要判"这个主题到底有没有这个开关"，两处各写一份必然漂。
+ */
+const DEVOPS_CHAT_TOPICS: ReadonlySet<string> = new Set(["investigate"]);
+
+export const topicHasDevopsChat = (k?: string): boolean =>
+  DEVOPS_CHAT_TOPICS.has(k || "general");
+
+/**
+ * 哪些主题可以把「对话对象」选成 **STAROps**（客户自己的阿里云数字员工）。
+ *
+ * 口径与上面 `DEVOPS_CHAT_TOPICS` 一样是**显式列举**，而且**只有通用会话**。两条理由：
+ *  1. 入口只有一个 —— 新对话主页的「对话对象」选择器（ChatObjectPicker）。STAROps
+ *     **刻意不做**工具条上的平铺开关：其余主题（FinOps / 故障调查 / 案例 / 巡检 / 安全）
+ *     整套语境、工具和左侧看板都是 **AWS**，在里面摆一个指向阿里云的开关，客户勾上以后
+ *     看到的答案与这一页的数据来自两朵不同的云 —— 界面上却完全看不出来。
+ *  2. STAROps 也**不需要**单独的「深度调查」开关：让数字员工自己发起巡检/排查就是一句
+ *     自然语言的事（这正是 STAROps 控制台的行为）。多一个开关只会造出一个我们保证不了的语义。
+ *
+ * ⚠️ 必须真的包含 `general`，否则 `restorableMode` 会把记住的模式**静默丢掉**
+ *    —— 而 general 恰恰是唯一能选 STAROps 的地方（`devopsChat` 今天就踩在这个坑里：
+ *    它的表里没有 general，所以通用会话里选的「DevOps 对话」跨刷新只能靠历史 `via` 回锁）。
+ */
+const STAROPS_TOPICS: ReadonlySet<string> = new Set(["general"]);
+
+/**
+ * ⚠️ 2026-09-15 产品决策：多云先**不对外**，所以这里在 `MULTICLOUD_UI` 关着的时候
+ * 一律回 `false` —— 表本身（上面那个 `STAROPS_TOPICS`）原样留着，把
+ * `featureFlags.ts` 里的 `MULTICLOUD_UI` 翻成 `true` 就整套回来。
+ *
+ * 为什么闸门放在这个函数里，而不是只在选择器那边不渲染：这个函数还被
+ * `convMode.restorableMode` 用来判"这个主题到底有没有这个模式"。只藏 UI 的话，
+ * 之前选过 STAROps 的会话刷新后会**恢复成一个界面上根本看不见的对象** —— 用户在
+ * 通用会话里问一句 AWS，答案来自阿里云，而界面上没有任何地方显示它切走了。
+ * 那正是 `convMode.ts` 文件头点名的那种坑。
+ *
+ * 只影响「还能不能**新选** STAROps」。已经存在的 STAROps 会话在侧栏仍然正确显示
+ * 成 STAROps（`CONV_OBJECTS` 那格是只读展示，有意不跟着藏）。
+ */
+export const topicHasStarops = (k?: string): boolean =>
+  MULTICLOUD_UI && STAROPS_TOPICS.has(k || "general");
 
 /**
  * 从「事件通知」类卡片的「深入调查」发起会话时，新会话要带的两个深度调查开关。
@@ -123,6 +241,11 @@ export interface Conversation {
   title: string;
   icon?: string;
   topic?: TopicKey;      // 会话所属主题（默认 general/未设 = 通用）
+  // 最后一轮的「对话对象」（"notiops" | "devops" | "starops"）。**只读展示字段**，
+  // 事实来源是服务端 `listConversations()`；本地新建的会话恒为 undefined（没答过就没有对象）。
+  // 与下面那四个互斥开关是两回事：开关是"下一轮走哪条路"，obj 是"上一轮谁答的"。
+  // 别拿开关反推它 —— 客户在会话里换过对象、或换台机器打开，两者就不一致了。
+  obj?: string;
   model?: string;        // 本会话选用的模型（缺省走 defaultModelId()，兜底 DEFAULT_MODEL）
   accountId?: string;    // 本会话目标 AWS 账号（默认空=部署账号）
   webSearch?: boolean;   // 本会话是否开启联网搜索（默认关；每会话独立）
@@ -135,6 +258,18 @@ export interface Conversation {
   // 由**客户自己的 DevOps Agent** 回答（NotiOps 侧 **0 token**，默认关）。
   // 与上面两个开关**三方互斥**（同时开会同时走多条路），互斥逻辑在 ChatApp 的 setDevopsMode 里。
   devopsChat?: boolean;
+  // 本会话的「对话对象」是否为 **STAROps**：BFF 直连**阿里云** STAROps 数字员工
+  // （CreateChat + SSE），由客户自己的数字员工回答 —— 计他自己的阿里云 AI 额度，
+  // NotiOps 侧同样 **0 token**、不经 Bedrock（默认关）。
+  // 与上面三个 DevOps 开关**四方互斥**，且 STAROps **优先**（互斥在 ChatApp 的
+  // setDevopsMode 与 BFF 的一选一里各自落实）。互斥不是洁癖：一个指向阿里云的问题被
+  // AWS DevOps Agent 悄悄接走，等于把问题原文发到了**另一朵云**，而界面上看不出来。
+  starops?: boolean;
+  // 后端只回了最近 N 条历史、更早的没读（GET /conversations/{id} 的 truncated）。
+  // 只在**从后端水合**时置位；本地新建会话恒为 undefined。
+  historyTruncated?: boolean;
+  // 服务端那一次读用的条数上限（只在 historyTruncated 为真时有意义）。
+  historyLimit?: number;
   messages: ChatMessage[];
   updatedAt: number;
   pinned?: boolean;

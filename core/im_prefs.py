@@ -5,8 +5,10 @@
 
   · `agent`  ：`"devops"`（默认，DevOps Agent 直连，NotiOps 侧 0 token）
                / `"notiops"`（NotiOps Agent，**走模型、烧 token**）
-  · `web`    ：`"off"`（默认）/ `"on"` —— 只对 `agent=notiops` 有意义（DevOps Agent
-               直连那条路上联网与否由客户自己的 agent 决定，我们说不上话）。
+               / `"starops"`（阿里云 STAROps 数字员工直连，NotiOps 侧 0 token，
+                 **烧的是客户自己的阿里云 AI 额度**）
+  · `web`    ：`"off"`（默认）/ `"on"` —— 只对 `agent=notiops` 有意义（另两条都是直连，
+               联网与否由客户自己那套 agent 决定，我们说不上话）。
   · `account`：`""`（默认 = 部署账号）/ 12 位 AWS 账号 id —— 「这个会话在问哪个账号」。
                **上车/启用/停用只在 Web 做**，本模块只存"选了哪个"，且每次解析都拿它去
                注册表校验（`core/im_accounts.py`）。
@@ -39,7 +41,14 @@ _PREF_TTL = 30 * 24 * 3600
 
 AGENT_DEVOPS = "devops"
 AGENT_NOTIOPS = "notiops"
-AGENTS: tuple[str, ...] = (AGENT_DEVOPS, AGENT_NOTIOPS)
+#: 阿里云 STAROps 数字员工（`core/starops_chat.py`）。NotiOps 侧 0 token，但**会消耗客户
+#: 自己的阿里云 AI 额度**，而且它看到的是**阿里云**资源、不是 AWS 资源 —— 所以它绝不能
+#: 是默认值，必须由用户显式切过来（`/agent starops`）。
+AGENT_STAROPS = "starops"
+AGENTS: tuple[str, ...] = (AGENT_DEVOPS, AGENT_NOTIOPS, AGENT_STAROPS)
+#: ⚠️ 默认值**永远是 `devops`**。加第三个 agent 时最容易顺手动这一行 —— 别动：
+#: `tests/test_im_agent_prefs_and_session.py` 有一条断言正对着它，因为默认值一变，
+#: 所有现网会话下一轮就换了后端（AWS 问题会被发给一个只看阿里云的数字员工）。
 DEFAULT_AGENT = AGENT_DEVOPS
 DEFAULT_WEB = False
 #: 空 = 部署账号（**不是**"没选"的哨兵值以外的含义；`core/im_accounts.py` 负责把它翻成
@@ -215,7 +224,7 @@ def clear_account(*, platform: str = "", chat_id: str = "", user_id: str = "",
     return bool(chat_id) and _delete(_k("account", "chat", platform, chat_id))
 
 
-__all__ = ["AGENTS", "AGENT_DEVOPS", "AGENT_NOTIOPS", "DEFAULT_ACCOUNT",
-           "DEFAULT_AGENT", "DEFAULT_WEB", "clear_account", "clear_agent",
-           "is_account_id", "resolve_account", "resolve_agent", "resolve_web",
-           "set_account", "set_agent", "set_web"]
+__all__ = ["AGENTS", "AGENT_DEVOPS", "AGENT_NOTIOPS", "AGENT_STAROPS",
+           "DEFAULT_ACCOUNT", "DEFAULT_AGENT", "DEFAULT_WEB", "clear_account",
+           "clear_agent", "is_account_id", "resolve_account", "resolve_agent",
+           "resolve_web", "set_account", "set_agent", "set_web"]

@@ -51,7 +51,54 @@ Better said up front than discovered later. These require `setup.sh`:
 
 ### 1.1 An AWS account and console permissions to create the stack
 
-Your identity needs to be able to create a CloudFormation stack and the resources in it (IAM roles, Lambda, DynamoDB, S3, CloudFront, Cognito, Bedrock AgentCore). You **don't need `AdministratorAccess`**, but overly narrow permissions will fail partway through. If unsure, use a test account.
+There are **two** separate permission stages. What actually blocks customers is almost always the first one (uploading the template), not the second (creating the stack).
+
+#### (1) Uploading the template — the console's Create stack step
+
+The console stores the template you upload in a bucket named `cf-templates-<random>-<region>` **inside your own account**. That is not an AWS-managed bucket — it is a resource in your account, so this step needs bucket-create and object-write permissions:
+
+| Action | Resource | What it's for |
+|---|---|---|
+| `cloudformation:CreateUploadBucket` | `*` | Console-only API; creates the `cf-templates-*` bucket on first upload |
+| `s3:CreateBucket` | `*` | Same — the bucket lands in your account |
+| `s3:PutObject` | `*` | Writes the template JSON |
+| `s3:GetObject` | `*` | CloudFormation reads it back |
+| `s3:ListBucket` | `*` | Checks what's already in the bucket |
+
+> **These five can only be `Resource: "*"`.** Don't narrow them to `arn:aws:s3:::cf-templates-*` — the random suffix is generated per account and region, so you cannot write it ahead of time, and `CreateUploadBucket` is console-only and supports `*` alone.
+>
+> **Missing `s3:PutObject` looks like this** (a real customer report):
+> `User: arn:aws:iam::111122223333:user/alice is not authorized to perform: s3:PutObject on resource: "arn:aws:s3:::cf-templates-xxxxxxxx-us-east-1/2026-01-01T000000.000Zabc-notiops-webchat.template.json"`
+>
+> **You can avoid these five entirely**: upload the template to a bucket you already have, then on Create stack choose **Amazon S3 URL** instead of **Upload a template file** and paste the object URL. That path needs no new S3 permissions. The template is a little over 370 KB, well under the 1 MB ceiling for the S3-URL route.
+
+#### (2) Creating the stack — the resources are created **as you**
+
+This template ships **no** CloudFormation service role (stack service role). CloudFormation does not switch identity: every one of the stack's 133 resources is created using **your current IAM identity**, so your permissions are the ceiling on what this stack can build. The service scope:
+
+| Service prefix | What the stack creates | Count |
+|---|---|---|
+| `cloudformation` | The stack itself (create / describe / rollback / delete) | 1 stack |
+| `iam` | Roles + inline policies + one managed policy; **also `iam:PassRole`** — handing an execution role to Lambda / EventBridge / AgentCore is also done as you | 12 Role + 12 Policy + 1 ManagedPolicy |
+| `lambda` | Functions, a layer, invoke permissions, a Function URL | 12 Function + 1 Layer + 10 Permission + 1 Url |
+| `logs` | Log groups; **plus `logs:PutResourcePolicy` (resource `*`)** because RUM writes to CloudWatch Logs | 12 LogGroup |
+| `events` | Scheduled rules (inspection, sentinel, reports) | 16 Rule |
+| `dynamodb` | Config, sessions, Skills, notifications | 4 Table |
+| `s3` | Site bucket, artifact bucket, Skills bucket + bucket policies (same service as (1), different objects) | 3 Bucket + 3 BucketPolicy |
+| `cloudfront` | Site distributions + a function + OAI / OAC | 2 Distribution + 1 Function + 2 access identities |
+| `cognito-idp` | User pool, app client, 8 permission groups | 1 UserPool + 1 Client + 8 Group |
+| `cognito-identity` | Identity pools + role attachments (how the frontend gets temporary credentials to sign SigV4) | 2 IdentityPool + 2 RoleAttachment |
+| `apigateway` | The BFF's HTTP APIs (HTTP API also uses the `apigateway:` prefix) | 3 Api + 3 Integration + 3 Route + 3 Stage |
+| `sqs` | Notification delivery queue + queue policy | 1 Queue + 1 QueuePolicy |
+| `rum` | Frontend real-user monitoring | 1 AppMonitor |
+| `bedrock-agentcore` | Agent runtime + session memory | 1 Runtime + 1 Memory |
+| `aidevops` | The DevOps Agent space and its association (**the IAM prefix is `aidevops:`**, not `devops-agent:`) | 1 AgentSpace + 1 Association |
+
+Services your identity does **not** need: `organizations` / `securityhub` / `cur` / `oam`. Those are only used by the optional multi-account, security-inspection and billing-detail features, and they are called by the stack's own `StagerOrgSetup` Lambda under **its own execution role** — not as you. (This differs from `setup.sh`; see [DEPLOYMENT.en.md §2.4](DEPLOYMENT.en.md#24-iam-deployment-permissions).)
+
+> ⚠️ **Be clear about one thing: on this path the installer is effectively an account administrator.**
+> `iam:CreateRole` + `iam:PutRolePolicy` + `iam:AttachRolePolicy` in the table above can only be scoped to `*` (role names carry CloudFormation-generated suffixes), and that combination is equivalent to privilege escalation — with it you can mint yourself an admin role. So "least privilege" here can only mean **narrowing the service scope** (the 15 services above instead of `*`); it can **never** mean "let a non-administrator install this".
+> If your policy forbids holding that permission long-term: install with a temporary identity and then retire it — **using NotiOps day to day requires no AWS permissions at all**; users only sign in to Cognito.
 
 > You must tick **"I acknowledge that AWS CloudFormation might create IAM resources"** —
 > the stack creates roles for the agent and the BFF.
@@ -97,7 +144,7 @@ The same release also has six artifacts (`bff.zip` / `chat-dist.zip` / `web-noti
 1. Check the **region** selector top-right matches what you picked in §1.2.
 2. **CloudFormation** → **Create stack** → **With new resources (standard)**.
 3. **Choose an existing template** → **Upload a template file** → pick `notiops-webchat.template.json` → **Next**.
-   (The console stores the template in CFN-managed S3 for you; you don't need a bucket.)
+   (The console stores the template in a `cf-templates-<random>-<region>` bucket **in your own account** — it creates that bucket for you, but **using your permissions**, so you need the five actions in §1.1 (1). If you don't have them, use **Amazon S3 URL** instead; see [§1.1](#11-an-aws-account-and-console-permissions-to-create-the-stack).)
 
 ### 2.3 Fill in the parameters
 
@@ -369,7 +416,7 @@ That **What to install** dropdown in the first parameter group:
 1. **Put credentials in Secrets Manager** — the bot needs keys to verify signatures and to reply.
    - **Feishu/Lark**: `notiops/im-bot-feishu`, four keys: `app_id` / `app_secret` / `encrypt_key` / `verification_token`.
      **Easiest path is the web UI**: sign in and go to **Admin → IM Integration** — all four credentials sit on one form and Save writes them into this secret, so you need no CLI and no extra credentials. That page also carries the four-step summary of the Feishu-side work and a "View the detailed setup steps" side panel.
-   - **Slack**: two secrets, `notiops/slack-bot-token` (starts with `xoxb-`) and `notiops/slack-signing-secret`, each holding a plain string. ⚠️ These two can currently **only** be created in the Secrets Manager console (the admin page covers Feishu and DingTalk).
+   - **Slack**: two secrets, `notiops/slack-bot-token` (starts with `xoxb-`) and `notiops/slack-signing-secret`, each holding a **plain string** (not JSON — the data plane uses the whole SecretString as the value). **The web UI works here too**: **Admin → IM Integration → the Slack tab**, two fields and Save; the backend creates the secret for you if it doesn't exist, and that page has the same "View the detailed setup steps" drawer. ⚠️ **Both** Slack values are credentials (there is no plainly-visible field to cross-check against, like Feishu's `app_id` or DingTalk's `app_key`), so the only way to confirm *which* app you configured is that page's Test credentials button — it reports your workspace and bot name back, and **names every missing bot token scope**.
    - **DingTalk**: `notiops/im-bot-dingtalk`, two keys: `app_key` / `app_secret` (the AppKey / AppSecret from "Credentials and basic info" on the DingTalk open platform). **The web UI works here too**: **Admin → IM Integration → the DingTalk tab**, two fields and Save; the backend creates the secret for you if it doesn't exist, and that page has the same "View the detailed setup steps" drawer in its top-right corner. ⚠️ DingTalk has **only this one** secret: the AppSecret both fetches access tokens and verifies the `sign` on inbound requests, so there is no equivalent of Feishu's `encrypt_key` / `verification_token` — the two missing fields on the form are **deliberate**.
 2. **Paste the request URL back into the IM platform** — that's the `FeishuWebhookUrl` / `SlackWebhookUrl` / `DingtalkWebhookUrl` output.
 
@@ -515,7 +562,7 @@ The step-by-step checks and what each error means are in [IM_WEBHOOK_SETUP.en.md
 You can, with two catches:
 
 ```bash
-# The template is over 200 KB (it grows with the resource count each release), well past the
+# The template is over 370 KB (it grows with the resource count each release), well past the
 # 51,200-byte --template-body limit, so it must go via S3 + --template-url
 aws s3 cp notiops-webchat.template.json s3://<your-bucket>/notiops-webchat.template.json
 aws cloudformation create-stack --stack-name notiops \
@@ -611,7 +658,7 @@ During deletion the stack's deployment Lambda first **empties** the website and 
 | Log group `/aws/vendedlogs/RUMService_notiops-web-chat<hash>` | Created by CloudWatch RUM itself; not owned by the stack. The `notiops-web-chat` part of that name is the **RUM app monitor's fixed name — it does not follow the stack name**, so it reads the same even when your stack is called something else | **Fine to ignore**: measured at 0 bytes, expires after 30 days. To clean up, delete it in CloudWatch by its **full name** (don't bulk-delete by prefix) |
 | The two tables + data bucket under `KeepData` | That is what `KeepData` **means** | Delete manually when you're done with them (empty the bucket first). **You must delete them before you can redeploy into this account** — see the second warning in §6.1 |
 | CloudFront access logs, if you enabled them yourself | Not managed by this stack | As you like |
-| **If you ever installed IM**: the `notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` / `notiops/slack-bot-token` / `notiops/slack-signing-secret` Secrets Manager secrets | They are not stack resources (the Feishu and DingTalk ones are created on demand by the admin console, the two Slack ones by you), so `KeepData` leaves them alone | `DeleteEverything` **deletes them too** (unrecoverable). Under `KeepData`, delete them yourself if you want them gone; leave them and a reinstall reuses the same-named secrets |
+| **If you ever installed IM**: the `notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` / `notiops/slack-bot-token` / `notiops/slack-signing-secret` Secrets Manager secrets | They are not stack resources (all three platforms' secrets are created on demand by the admin console's "IM Integration" page), so `KeepData` leaves them alone | `DeleteEverything` **deletes them too** (unrecoverable). Under `KeepData`, delete them yourself if you want them gone; leave them and a reinstall reuses the same-named secrets |
 | **In multi-account mode**: the `notiops-member-onboarding` / `notiops-member-devops-agent` StackSets, and Organizations trusted access for StackSets | **Deliberate.** (1) A StackSet can only be deleted once every stack instance is gone, and removing those wipes the cross-account roles in your member accounts — a cross-account destructive action shouldn't be triggered implicitly by deleting one stack. (2) Trusted access is an **organization-wide** switch; turning it off with our stack would break other people's StackSet deployments. | If you really want them gone: CloudFormation → StackSets → **Delete stacks from StackSet** (removes the instances), then delete the StackSet itself. Leave trusted access alone unless you're sure nobody else relies on it. |
 
 **No other orphans**: the agent's log group, the BFF's log group, the notification handler's log group, the deployment Lambda's log group, IAM roles, the Cognito user pool, the RUM app monitor, the AgentCore Runtime, the website bucket and the staging bucket were all verified to go away with the stack. The agent space and association created for deep investigation also go away with it (they are ordinary stack resources). Same for the session-memory AgentCore Memory ([§2.10](#210-session-memory-agentcore-memory)) — an ordinary stack resource with **no** retention policy, deleted with the stack, taking the stored session messages with it (this one is what the template declares; unlike the list above, it has not yet been verified by an actual stack deletion). The web-search AgentCore gateway splits two ways: one **this stack created** is deleted with the stack; one it **reused** (a pre-existing `notiops-websearch-gw` in the account, e.g. from `setup.sh`) is left alone — deleting one stack shouldn't take down something another deployment path still uses.

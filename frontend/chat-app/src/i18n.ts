@@ -610,6 +610,8 @@ export const STRINGS: Dict = {
   "admin.tab.lifecycle": { zh: "生命周期", en: "Lifecycle" },
   "admin.tab.notifications": { zh: "集成 IM", en: "IM Integration" },
   "admin.tab.models": { zh: "模型", en: "Models" },
+  // 「多云」而不是「阿里云」:这一页将来还要装别的云，改名比加一层分组便宜。
+  "admin.tab.aliyun": { zh: "多云", en: "Multi-cloud" },
   // 左侧子导航的分组标题（纵向排版，与「通知」/「定制」一致）
   "admin.nav.access": { zh: "访问控制", en: "Access control" },
   "admin.nav.cloud": { zh: "云环境", en: "Cloud environment" },
@@ -812,6 +814,137 @@ export const STRINGS: Dict = {
   "admin.notif.dt.guideSub": { zh: "本页保存 AppKey / AppSecret,钉钉控制台开 HTTP 模式并填消息接收地址。两边都做完才通。", en: "AppKey and AppSecret are saved on this page; HTTP mode and the callback URL are set in the DingTalk console. It only works once both are done." },
   "admin.notif.dt.url.label": { zh: "钉钉消息接收地址(Webhook)", en: "DingTalk callback URL (webhook)" },
   "admin.notif.dt.url.missing": { zh: "取不到地址。请到 CloudFormation 控制台 → 你的栈 → Outputs → DingtalkWebhookUrl 里复制(没装钉钉的栈没有这一项)。", en: "Could not retrieve the URL. Copy it from the CloudFormation console → your stack → Outputs → DingtalkWebhookUrl (a stack deployed without DingTalk has no such output)." },
+  // ── Slack ──────────────────────────────────────────────────────────────
+  // 与另两个平台的**结构性**差别，界面文案里必须体现，别照抄钉钉那套:
+  //   · 两个字段都是凭证（飞书的 AppID / 钉钉的 AppKey 是明文可核对的，这里没有）;
+  //   · 「未配置」不等于「空」（方式 B 里 CDK 给的是随机串）—— notEmptyWarn 那条;
+  //   · 「测试凭证」验不了 signing secret（没有任何 API 能验），但能报出缺的 scope。
+  "admin.notif.platform.slack": { zh: "Slack", en: "Slack" },
+  "admin.notif.sl.botTokenHint": { zh: "Slack App → OAuth & Permissions 页顶部的 Bot User OAuth Token(xoxb- 开头)。这串本身就是凭证 —— 谁拿到都能以这个机器人的身份发消息，所以只显示后 4 位、也不进日志。改过 scope 之后必须重新安装一次应用，token 才会带上新权限。", en: "The Bot User OAuth Token at the top of your Slack app's OAuth & Permissions page (starts with xoxb-). It IS a credential — anyone holding it can post as your bot — so only the last 4 chars are shown and it is never logged. After changing scopes you must reinstall the app before the token carries them." },
+  "admin.notif.sl.signingHint": { zh: "Slack App → Basic Information → App Credentials → Signing Secret(点 Show 才显示，32 位小写十六进制)。入口用它对每个请求做 HMAC 验签。仅显示后 4 位。它是入口在**冷启动时**读的，刚改完热着的执行环境还拿着旧值 —— 若 Slack 那边立刻重试仍报 401，几分钟后再试。", en: "Slack app → Basic Information → App Credentials → Signing Secret (click Show; 32 lowercase hex chars). The entry point HMAC-verifies every request with it. Only last 4 chars shown. It is read when the entry point cold-starts, so warm execution environments keep the old value for a few minutes — if Slack's retry still returns 401 right after saving, try again shortly." },
+  "admin.notif.sl.keysRequired": { zh: "两个都必填。顺序是硬的:先在这里保存 Signing Secret，再去 Slack 填 Request URL —— Slack 保存地址时会**立刻**发一次校验请求，签名过不了就显示校验失败，看起来像地址填错了。", en: "Both are required, and the order is hard: save the signing secret here BEFORE pasting the Request URL into Slack. Slack sends a verification request the moment you save that URL, and a failed signature shows up as \"verification failed\" — which looks like a wrong URL." },
+  "admin.notif.sl.notEmptyWarn": { zh: "⚠️「未配置」不等于「空」:脚本部署里这两个 Secret 由 CDK 创建，值是一串随机字符。所以忘了填不会提示没配，而是表现成「密钥不对」—— bot token 没填则机器人一句话都发不出(invalid_auth)，signing secret 没填则每个请求 401。本页按值的形状判断，显示「未配置」就是真的没填过。", en: "⚠️ \"Not configured\" is not the same as \"empty\": with script deployment CDK creates these two secrets with a random value. So forgetting to fill them in surfaces as \"wrong key\", not \"not configured\" — an unset bot token means the bot says nothing at all (invalid_auth), an unset signing secret means every request gets 401. This page judges by the value's shape, so \"Not configured\" really does mean never filled in." },
+  "admin.notif.sl.test": { zh: "测试凭证", en: "Test credentials" },
+  "admin.notif.sl.testing": { zh: "校验中…", en: "Checking…" },
+  "admin.notif.sl.testTip": { zh: "用 bot token 调一次 auth.test(凭证是否有效的权威判据)，并把缺的 Bot Token Scopes 逐条报出来。signing secret 没有任何 API 能验 —— 唯一的验证是在 Slack 后台保存 Request URL。", en: "Calls auth.test once with the bot token (the authoritative check) and names every missing bot token scope. No API can verify the signing secret — the only check is saving the Request URL in your Slack app." },
+  "admin.notif.sl.steps.title": { zh: "在 Slack 后台要做的四步", en: "Four steps in the Slack console" },
+  "admin.notif.sl.steps.s1": { zh: "api.slack.com/apps → Create New App → From scratch 新建应用。", en: "api.slack.com/apps → Create New App → From scratch." },
+  "admin.notif.sl.steps.s2": { zh: "OAuth & Permissions 里加 7 条 Bot Token Scopes，然后 Install to Workspace，复制 xoxb- 开头的 token;Signing Secret 在 Basic Information 里。两个都回到上面保存。", en: "Add the 7 bot token scopes under OAuth & Permissions, click Install to Workspace, copy the xoxb- token; the signing secret is under Basic Information. Save both above." },
+  "admin.notif.sl.steps.s3": { zh: "Event Subscriptions / Interactivity & Shortcuts 的 Request URL 都填栈输出的 SlackWebhookUrl(同一个地址)，并订阅 4 个 bot events。不要开 Socket Mode。", en: "Set the Request URL on both Event Subscriptions and Interactivity & Shortcuts to the stack output SlackWebhookUrl (the same URL), and subscribe to the 4 bot events. Do NOT enable Socket Mode." },
+  "admin.notif.sl.steps.s4": { zh: "在频道里 /invite @你的机器人，然后 @机器人 试一句。", en: "Run /invite @your-bot in a channel, then @mention it once to verify." },
+  "admin.notif.sl.steps.order": { zh: "Slack 是三个平台里唯一会**当场告诉你对不对**的:Request URL 下面出现绿色 Verified 才算通。这也是全流程中唯一能验证 signing secret 的动作 —— 所以先保存凭证，再去填地址。", en: "Slack is the only one of the three platforms that tells you on the spot: you need the green Verified under the Request URL. That is also the only step that verifies your signing secret — so save the credentials here first, then paste the URL." },
+  "admin.notif.sl.guideTitle": { zh: "配置 Slack 机器人", en: "Set up the Slack bot" },
+  "admin.notif.sl.guideSub": { zh: "本页保存 Bot Token / Signing Secret，Slack 后台勾权限并把 Request URL 填到三处(都是同一个地址)。两边都做完才通。", en: "The bot token and signing secret are saved on this page; scopes and the three Request URLs (all the same URL) are set in the Slack console. It only works once both are done." },
+  "admin.notif.sl.url.label": { zh: "Slack Request URL(三处都填这一个)", en: "Slack Request URL (all three places take this one)" },
+  "admin.notif.sl.url.missing": { zh: "取不到地址。请到 CloudFormation 控制台 → 你的栈 → Outputs → SlackWebhookUrl 里复制(没装 Slack 的栈没有这一项)。", en: "Could not retrieve the URL. Copy it from the CloudFormation console → your stack → Outputs → SlackWebhookUrl (a stack deployed without Slack has no such output)." },
+
+  /* ── 多云:阿里云只读凭据（2026-09-12）───────────────────────────────────
+   * 与上面三个 IM 平台**不是一类东西**，只是界面形状像:那三个是我们的机器人在客户 IM 里的
+   * 身份，这一个是**客户另一朵云账号的凭据**。所以文案有三件事必须写明，都属于「不许静默降级」:
+   *   ① **只支持 AccessKey 一种模式**。RAM 角色 / OIDC（免长期密钥）那条路的出站契约还没
+   *      核实完，界面上就不留半个入口 —— 后端对 auth_mode 只放 "ak"，别的显式 400。
+   *   ② **这副 AK 不是「数字员工能看到什么」的边界**。🔁 2026-09-13 修订：这一条原来写的是
+   *      「AliyunReadOnlyAccess 按 *:Describe* / *:List* / *:Get* 通配覆盖，连数据面的读也覆盖」。
+   *      那个策略名**根本不存在**（枚举全部 979 条系统策略确认），而且真正推荐的路径**根本不挂
+   *      账号级只读** —— 实测把 ReadOnlyAccess 从那个 RAM 用户上摘掉后，数字员工读到的资源
+   *      实体逐字不变（5 类 18 个、零权限错误），因为那些读走的是 STAROps / 云监控自己的资源
+   *      中心，不消耗客户给我们的这副 AK。
+   *      🔁 2026-09-13 **第二次修订**（同一条文案，两次都不许改回去）：上一版这里的结论写成
+   *      「边界在 STAROps 纳管范围与数字员工自己那个角色上，不在这副 AK 上 —— 客户想收紧，得去
+   *      那两处收」。**那句错在两处**：① 内置员工**没有自己的角色**（实测 GetDigitalEmployee
+   *      回来的 roleArn 是空字符串），「去改员工角色」只对自建员工成立；② 官方权限配置页的口径是
+   *      **系统内置员工继承调用者权限** ⇒ 对内置员工，这副 AK 的 RAM 策略**就是它权限上限的一半**，
+   *      写成「这副 AK 不是边界」会让客户推出「那挂个账号级只读也无所谓」—— 正好和 steps.s2 里
+   *      刚劝住的那件事对着干。现在的口径：①「只挂官方那一条」= 把上限按到最小；② 实体库那一段
+   *      不花这副 AK、由纳管范围决定，叠 Deny 收不住；③「继承调用者权限」的确切范围**未实测**
+   *      （内置员工连 aliyun CLI 都被 STAROps 自己禁掉，那条继承今天没有落地路径），按上限读。
+   *   ③ **本页没有「测试连接」按钮**。做一个"看起来验过了"的按钮，客户会把「通过」读成
+   *      「多云功能已可用」，而只验格式既不证明密钥有效、更不证明 RAM 授权够。没有就是没有，
+   *      由 noTest 那条文案讲明白替代判据（去「新对话」问一句；或去 RAM 控制台看密钥的
+   *      "最后使用时间"）。
+   * zh 用 ** 强调、en 不用（与 content/aliyunGuide.ts 同一排版约定;这些值都按纯文本渲染）。 */
+  "admin.aliyun.title": { zh: "阿里云凭据", en: "Alibaba Cloud credentials" },
+  // 🔁 2026-09-13:这句话上一版是「至少挂上 AliyunReadOnlyAccess」，两个错 —— 那个策略名不存在，
+  // 而且「至少挂上、再叠一份」这个口径本身也错（真账号实测：官方那一条就够）。理由见 steps.s2 的注释。
+  "admin.aliyun.sub": { zh: "登记一副**只读** AccessKey，NotiOps 用它以只读方式访问你的阿里云资源。请新建一个专用 RAM 用户，**只挂官方的 AliyunSTAROpsReadOnlyAccess 这一条**(内置数字员工到此为止;数字员工是自建的还要再加一条限定到它自己的策略，见下面第 2 步) —— **绝不要填主账号(根账号)的密钥**:主账号密钥等于账号本身的全部权限，泄漏之后没有任何权限收敛能兜底。", en: "Register one read-only AccessKey pair; NotiOps uses it to read your Alibaba Cloud resources. Create a dedicated RAM user and attach the official AliyunSTAROpsReadOnlyAccess policy ONLY (that is the whole grant for a built-in digital employee; a custom one needs one more policy scoped to itself -- see step 2 below), and never paste your root account's key: a root key carries the account's full authority, and no amount of permission tightening contains a leak after the fact." },
+  "admin.aliyun.akIdHint": { zh: "RAM 控制台 → 身份管理 → 用户 → 你的用户 → AccessKey 里的 AccessKey ID(通常以 LTAI 开头)。它不是凭证(阿里云签名要 id 与 secret 成对)，所以明文显示，方便你核对填的是哪一副密钥。", en: "The AccessKey ID from RAM console → Identities → Users → your user → AccessKey (usually starts with LTAI). It is not a credential on its own (Alibaba Cloud signing needs both id and secret), so it is shown in full to let you confirm which key pair is configured." },
+  "admin.aliyun.akSecretHint": { zh: "与 AccessKey ID 同时生成的 AccessKey Secret。⚠️ 它**只在创建的那一刻显示一次**，关掉页面就再也取不回来(只能删掉重建一副)。仅显示后 4 位，不进日志、连长度都不记。", en: "The AccessKey Secret generated alongside the ID. It is shown only at creation time -- once you leave that page it cannot be retrieved again, only replaced. Only the last 4 chars are shown here; it is never logged, not even its length." },
+  "admin.aliyun.region": { zh: "默认地域", en: "Default region" },
+  "admin.aliyun.regionHint": { zh: "调用阿里云接口时用的默认地域，填你账号资源所在的那个(例如 cn-hangzhou)。要写地域 **id**:小写字母、数字和连字符 —— 不是「华东1(杭州)」这样的中文名，也不是一整条 endpoint 地址。", en: "The default region used when calling Alibaba Cloud APIs -- use the one your resources live in (for example cn-hangzhou). It must be a region id: lowercase letters, digits and hyphens only. Not a display name, and not a full endpoint URL." },
+  "admin.aliyun.required": { zh: "两个都必填:缺任一，阿里云那边一次调用都发不出去，所以本页会显示「未配置」而不是「配了一半」。只想改地域时不用重填密钥 —— 保持密钥框里的 **** 不动即可。", en: "Both are required: with either one missing not a single call can be signed, so this page reports \"not configured\" rather than \"half configured\". To change only the region, leave the masked (****) secret untouched -- you do not need to retype the key." },
+  // ⚠️ 这条文案的**理由**在 STAROps 对话上线时换过一次。旧理由是「能证明密钥有效的调用还没
+  // 接进来」—— 那句已经不成立(现在就有一条真的阿里云调用)，但**结论没变**:只验格式的
+  // 「通过」会被读成「阿里云侧真的能用」，而格式对既不代表密钥有效、更不代表 RAM 授权够。
+  // 真正的验证办法现在有了，所以直接写在文案里。
+  "admin.aliyun.noTest": { zh: "本页**没有「测试连接」**:格式对不代表密钥有效，更不代表 RAM 授权够 —— 只验格式的「通过」会被读成「阿里云侧真的能用」。真正的验证只有一条:去「新对话」选「阿里云 STAROps」问一句。想确认这副密钥有没有被用上，去 RAM 控制台看它的「最后使用时间」。", en: "There is no \"test connection\" button here: a well-formed key proves neither that the key is valid nor that its RAM permissions suffice, so a format-only \"pass\" would read as \"Alibaba Cloud works now\". There is exactly one real check -- start a new conversation, pick Alibaba Cloud STAROps and ask something. To see whether the key is being used at all, check its Last used time in the RAM console." },
+  "admin.aliyun.configured": { zh: "已配置", en: "Configured" },
+  "admin.aliyun.notConfigured": { zh: "未配置", en: "Not configured" },
+  "admin.aliyun.steps.title": { zh: "在阿里云控制台要做的三步", en: "Three steps in the Alibaba Cloud console" },
+  "admin.aliyun.steps.s1": { zh: "用主账号登录 RAM 控制台(ram.console.aliyun.com) → 身份管理 → 用户 → 创建用户，访问方式只勾「使用永久 AccessKey 访问」。", en: "Sign in with your root account, open the RAM console (ram.console.aliyun.com) → Identities → Users → Create User, and tick only \"Using permanent AccessKey to access\"." },
+  // ⚠️ 这一步的文案 2026-09-13 被真账号实测**两次推翻**，别再按印象改回去:
+  //   ·「勾上 AliyunReadOnlyAccess 就完了」→ 假:那个策略名**不存在**(枚举全部 979 条系统策略确认)。
+  //   ·「只读通配盖不到 CreateThread / CreateChat，所以客户要自己手写一份策略」→ 也是假:官方的
+  //     AliyunSTAROpsReadOnlyAccess **自己就含**这两个 Action(资源限定 digitalemployee/apsara-*)，
+  //     内置员工只勾这一条就实测跑通了全链路，客户一行 JSON 都不用写。
+  //   · 真正缺的那半只对**自建**员工存在,而且原因**不是** ram:PassRole，是官方策略的资源 ARN 前缀
+  //     把非 apsara-* 的员工挡死(实测 CreateThread → 403 NoPermission)。补 PassRole 治不了它。
+  // 这个缺陷的形状仍是最坏那种:界面显示已接入、能选中，**第一句话才被拒** —— 所以自建员工那一句
+  // 必须留在这里，不能只写在抽屉里。
+  "admin.aliyun.steps.s2": { zh: "给这个用户新增授权:授权范围选整个账号，策略里搜 AliyunSTAROpsReadOnlyAccess 并勾上 —— 官方的 STAROps 只读系统策略，它自己就含对话要用的 starops:CreateThread / starops:CreateChat。**内置**数字员工(ID 以 apsara- 开头)**只需要这一条**，别再挂账号级只读。⚠️ 数字员工是**自建**的(ID 不以 apsara- 开头)还差一条:官方策略把这两个 Action 的资源限死在 digitalemployee/apsara-*，所以要再建一条自定义策略，Action 只放 starops:CreateThread 与 starops:CreateChat，Resource **两条都写**:acs:starops:*:*:digitalemployee/<数字员工ID> 和 同样的 ARN 再加 /*(子资源;2026-09-14 实测少了它仍会被拒，补上它同一副 AK 立刻全通 —— 缺的就是它)。地域与账号 ID 那两位刻意留成 *:*，那是实测跑通的形状，填成具体值我们没实测过。建完还要真的「新增授权」给那个 RAM 用户，改过的策略还要确认生效的是新版本。少了它，界面会显示已接入、问第一句才吃 403。", en: "Grant that user permission: set the scope to the whole account, search for AliyunSTAROpsReadOnlyAccess and tick it -- the official STAROps read-only system policy, which already carries the starops:CreateThread / starops:CreateChat a conversation needs. For a BUILT-IN digital employee (an ID starting with apsara-) that one policy is the whole grant; do not add account-wide read-only. A CUSTOM digital employee (an ID that does not start with apsara-) needs one more: the official policy pins those two actions to digitalemployee/apsara-*, so create a custom policy carrying only starops:CreateThread and starops:CreateChat and list BOTH resource ARNs: acs:starops:*:*:digitalemployee/<employee-id> and the same ARN plus /* (sub-resources; measured 2026-09-14, leaving it out is still refused, and adding it made the same key pair work immediately -- that one ARN was the whole gap). The region and account-id positions are deliberately left as *:* because that is the shape we measured working; we have not measured the narrowed form. Then actually GRANT that policy to the RAM user, and after any edit confirm the version in effect is the new one. Without it this page still reports configured and only the first question is refused with a 403." },
+  "admin.aliyun.steps.s3": { zh: "把 AccessKey ID / Secret 复制到上面并保存 —— 务必在关闭那个页面之前做，Secret 只显示一次。", en: "Copy the AccessKey ID and Secret into the form above and save -- do it before closing that page, since the secret is shown only once." },
+  "admin.aliyun.steps.order": { zh: "顺序不硬(阿里云那边不校验我们)，但有一件事不可逆:Secret 关页面就没了。另外要知道:**「只读」不等于「数字员工看不到敏感数据」，但这副 AK 也不是无关紧要的** —— 内置数字员工按官方权限配置页的口径**继承调用者权限**，所以这副 AK 的策略就是它权限上限的一半(这才是「只挂 AliyunSTAROpsReadOnlyAccess 一条、别挂账号级只读」的真正理由);而它读资源清单那一段走 STAROps / 云监控自己的资源中心、**不花这副 AK**，那一半由纳管进去的资源范围决定，在这副 AK 上叠 Deny 收不住。⚠️ 内置员工**没有自己的角色**可改(实测 roleArn 为空)，「去改员工角色」只对自建员工成立。", en: "The order is not hard here (nothing on the Alibaba Cloud side validates us), but one thing is irreversible: the secret is gone once you close that page. Also worth knowing: read-only does not mean the digital employee cannot see sensitive data -- and this key pair is not irrelevant either. Per Alibaba Cloud's own permission-configuration page a built-in digital employee inherits the CALLER's permissions, so the policy on this key pair is half of its permission ceiling (that is the real reason to attach AliyunSTAROpsReadOnlyAccess only and never account-wide read-only). The part where it reads a resource inventory goes through STAROps' / CloudMonitor's own entity store and does not consume this key; that half is decided by which resources are onboarded there, and no Deny policy on this key narrows it. Note a built-in employee has no role of its own to tighten (measured: an empty roleArn) -- the adjust-the-employee-role path exists for custom employees only." },
+  "admin.aliyun.guideTitle": { zh: "配置阿里云只读凭据", en: "Set up read-only Alibaba Cloud credentials" },
+  "admin.aliyun.guideSub": { zh: "全程只有一个方向:在阿里云控制台建一个只读 RAM 用户，把它的 AccessKey 复制到本页。我们这边没有任何要交给阿里云的地址。", en: "This flow only goes one way: create a read-only RAM user in the Alibaba Cloud console and copy its AccessKey into this page. Nothing of ours has to be handed to Alibaba Cloud." },
+  // ── STAROps 数字员工（「新对话」里第三个对话对象的全部配置）─────────────────
+  // 这一段的文案有一件事必须说清:**答话的是客户自己在阿里云上的数字员工**，NotiOps 只是
+  // 把问题转过去。不说清，客户会把 STAROps 的结论当成 NotiOps 的结论，出错时找错人核实。
+  // en 一律写 "Alibaba Cloud"（与本页其余 admin.aliyun.* 同一个品牌名，不要混用 "Aliyun"）。
+  "admin.aliyun.so.title": { zh: "STAROps 数字员工", en: "STAROps digital employee" },
+  "admin.aliyun.so.sub": {
+    zh: "填上数字员工 ID，「新对话」里就会多出一个可选的对话对象「阿里云 STAROps」。选它之后，问题原文会带着上面那副只读密钥发到你自己的 STAROps 数字员工，**回答由它给出**，不经过 NotiOps 的模型 —— 所以这条路径在我们这边不消耗 token，用量记在你自己的阿里云账号上。",
+    en: "Fill in a digital employee ID here and a third conversation object, \"Alibaba Cloud STAROps\", becomes selectable when starting a new conversation. Pick it and your question is signed with the read-only key above and sent to your own STAROps digital employee, which produces the answer -- none of it passes through a NotiOps model, so this path consumes no tokens on our side and its usage is billed to your own Alibaba Cloud account.",
+  },
+  // 这两句写的是**对话那一侧看得见的后果**，而不是又一个"已配置/未配置"：管理员在这一页
+  // 关心的唯一问题是"客户现在能不能选它"。置灰(而不是隐藏)是实情，别写成"不出现"。
+  "admin.aliyun.so.configured": { zh: "已接入 —— 新对话里可以选「阿里云 STAROps」", en: "Ready -- \"Alibaba Cloud STAROps\" can be picked in a new conversation" },
+  "admin.aliyun.so.notConfigured": { zh: "未接入 —— 新对话里那一段是置灰的", en: "Not ready -- that segment is greyed out in new conversations" },
+  // 🔴 2026-09-13 现网配置时改名：原来叫「数字员工名称」，**这个说法是错的**。
+  //    要填的是 STAROps 控制台里那个 **ID**（内置员工形如 `apsara-ops`，实测过），不是它的
+  //    显示名称（`GetDigitalEmployee` 的 `displayName` 与 `name` 是两个字段）。写「名称」会把客户直接推向唯一
+  //    那个我们诊断不了的错误：阿里云对不存在的员工回一个语义为空的 404
+  //    `DigitalEmployeeNotExist`，界面只能说"连不上"，指不到真因。
+  //    我们自己的代码就是这两件事不同的证据：`starops_chat.mjs` 里连上以后显示的是
+  //    `emp.displayName || emp.name` —— displayName 与 name 是 GetDigitalEmployee 回的
+  //    两个不同字段，而我们请求里发出去的是 name。
+  //    ⚠️ 只改**文案**：存储键仍是 `starops_employee`、阿里云的入参仍叫 `digitalEmployeeName`
+  //    （逐字抄他们的 API，别为了对齐文案去改线上字段名，那会把已存的配置读空）。
+  "admin.aliyun.so.employee": { zh: "数字员工 ID", en: "Digital employee ID" },
+  "admin.aliyun.so.employeeHint": {
+    zh: "STAROps 控制台里那个数字员工的 **ID**（内置员工形如 `apsara-ops`），**不是给人看的显示名** —— 如果控制台另外显示了一个便于阅读的名字，填那个是**连不上**的。只允许字母、数字、点、连字符和下划线，**大小写要完全一致** —— 不能有空格或斜杠。填错时阿里云回的是一个语义为空的 404，界面只能说「连不上」，指不到真因，所以请对着控制台复制粘贴。",
+    en: "The digital employee's **ID** as shown in the STAROps console (a built-in one looks like `apsara-ops`) -- **not the human-readable display name**: if the console also shows a friendlier name for it, filling that in does not connect. Letters, digits, dot, hyphen and underscore only, matching case exactly -- no spaces or slashes. A wrong value comes back from Alibaba Cloud as a semantically empty 404 that we can only report as \"cannot reach it\", so copy it from the console rather than typing it.",
+  },
+  "admin.aliyun.so.region": { zh: "STAROps 接口地域", en: "STAROps API region" },
+  "admin.aliyun.so.regionHint": {
+    zh: "STAROps 服务**只有这两个地域**，所以这里是下拉而不是输入框。要选你的数字员工所在的那个。它与上面那个「默认地域」是两件事:那个是读你阿里云资源用的(可以是 cn-hangzhou)，这个是 STAROps 自己的接口地址。选错了同样只表现为一个空 404，很容易被误读成员工 ID 填错。",
+    en: "STAROps exists in these two regions only, which is why this is a dropdown rather than a text field. Pick the one your digital employee lives in. It is not the same thing as the default region above: that one is used to read your Alibaba Cloud resources (it may well be cn-hangzhou), while this one is the STAROps API endpoint itself. A wrong choice here also surfaces as an empty 404 and is easily misread as a wrong employee ID.",
+  },
+  "admin.aliyun.so.workspace": { zh: "工作空间 ID（可留空）", en: "Workspace ID (optional)" },
+  "admin.aliyun.so.workspaceHint": {
+    zh: "数字员工排查时使用的工作空间，从 STAROps 控制台复制。留空就不传这一项，由数字员工按它自己的默认设置来 —— 大多数部署留空即可。这个值只在本页(管理员)显示，不进日志、也不会出现在非管理员的接口响应里。",
+    en: "The workspace the digital employee works in; copy it from the STAROps console. Leave it empty to omit it and let the employee use its own default -- that is right for most deployments. This value is shown only here, to admins; it is never logged and never appears in non-admin API responses.",
+  },
+  // 🔴 「项目」必须点明是**日志服务(SLS)**的 project：阿里云上"项目"这个词至少有三层意思，
+  //    写成笼统的"项目名"客户会填一个业务项目名，然后收到一个查不到日志的空回答。
+  "admin.aliyun.so.project": { zh: "日志服务（SLS）项目名（可留空）", en: "Log Service (SLS) project (optional)" },
+  "admin.aliyun.so.projectHint": {
+    zh: "这里填的是**日志服务(SLS)**里的 Project 名，不是泛指的「项目」—— 数字员工查日志时在这个 Project 下找。留空就不传，由它自己决定查哪个。",
+    en: "This is the Project name in Log Service (SLS), not a generic \"project\" -- it is where the digital employee looks when it reads logs. Leave it empty to omit it and let the employee decide.",
+  },
+  "admin.aliyun.so.optionalPh": { zh: "可留空", en: "Optional" },
+  "admin.aliyun.so.required": {
+    zh: "四项里**只有「数字员工 ID」必填**:地域有默认值，工作空间与项目留空就不传。这一段与上面的凭据共用同一个保存按钮 —— 没有「配了一半」的中间态:缺密钥时，填了员工 ID 对话里也仍然是置灰的。",
+    en: "Of the four, only the digital employee ID is required: the region has a default, and an empty workspace or project is simply not sent. This section shares the single Save button with the credentials above, so there is no half-configured state -- without a key pair, filling in an employee ID still leaves that segment greyed out.",
+  },
   // 🔴 原名「添加组织外账号(跨 Payer)」对一大类客户是**错的**：
   //    partner-resold 客户手里没有 payer 账号、系统部署在某个 linked account
   //    上，他要加的 456 与部署账号 123 **在同一个组织里** —— 只是他没有管理
@@ -1292,6 +1425,12 @@ export const STRINGS: Dict = {
   "admin.error": { zh: "操作失败", en: "Action failed" },
   "admin.roles.new": { zh: "新建角色", en: "New role" },
   "admin.roles.name": { zh: "角色名", en: "Role name" },
+  // 下面四条是「新建角色点了没反应」的修复：命名规则前置 + 三种失败各自说人话。
+  // ⚠️ 规则文案与服务端 apiSaveRole 的正则同源（AdminPanel 的 ROLE_NAME_RE），改一处要改三处。
+  "admin.roles.nameRule": { zh: "字母、数字、: _ - ，2–64 位（不支持中文和空格）", en: "Letters, digits, : _ - · 2–64 chars (no spaces or non-ASCII)" },
+  "admin.roles.err.empty": { zh: "请先填写角色名", en: "Enter a role name first" },
+  "admin.roles.err.name": { zh: "角色名不合法：只能用字母、数字、: _ - ，长度 2–64 位，不支持中文和空格。", en: "Invalid role name — only letters, digits, : _ - are allowed, 2–64 characters, no spaces or non-ASCII." },
+  "admin.roles.err.exists": { zh: "角色「{name}」已存在，已为你选中它（继续新建会清空它现有的权限）。", en: "Role \"{name}\" already exists — selected it for you (creating it again would wipe its current permissions)." },
   "admin.roles.save": { zh: "保存角色", en: "Save role" },
   "admin.roles.delete": { zh: "删除", en: "Delete" },
   "admin.roles.preset": { zh: "预置", en: "Preset" },
@@ -1374,6 +1513,9 @@ export const STRINGS: Dict = {
   "notif.sev.warn": { zh: "警告", en: "Warning" },
   "notif.sev.info": { zh: "信息", en: "Info" },
   "notif.toast": { zh: "条新通知", en: "new notification(s)" },
+  // 加载失败 ≠ 暂无事件。失败必须自己说出来并给「重试」，否则一次抖动就被画成"收件箱是空的"。
+  "notif.loadFailed": { zh: "收件箱加载失败（不是没有事件）。", en: "Failed to load the inbox (this does not mean there are no events)." },
+  "notif.retry": { zh: "重试", en: "Retry" },
   // Health Dashboard 区块
   "notif.health.title": { zh: "AWS Health Dashboard", en: "AWS Health Dashboard" },
   "notif.health.serviceHealth": { zh: "服务运行状况", en: "Service health" },
@@ -1410,6 +1552,9 @@ export const STRINGS: Dict = {
   "notif.health.openConsole": { zh: "在控制台查看", en: "View in console" },
   "notif.health.moreInConsole": { zh: "还有 {n} 条，去控制台查看", en: "{n} more — view in console" },
   "notif.health.windowNote": { zh: "仅显示近 {d} 天；完整历史见控制台", en: "Showing last {d} days; full history in console" },
+  // 「没问到」不能画成「需 Business/Enterprise Support」——那是一条具体且错误的诊断,
+  // 用户会照着它去查甚至升级支持计划,而真实原因在我们这边。
+  "notif.health.loadFailed": { zh: "AWS Health 数据加载失败（不是支持计划的问题）。", en: "Failed to load AWS Health data (this is not a support-plan issue)." },
   "notif.health.unavailable": { zh: "Health Dashboard 需要 Business 或 Enterprise Support 计划。可直接在控制台查看。", en: "Health Dashboard requires a Business or Enterprise Support plan. View directly in the console." },
   "notif.health.otherCount": { zh: "{n} 条其他通知", en: "{n} other notifications" },
   // 事件通知按类型分组(每组对应 core/push_event.py 的一个 normalizer / 一条 EventBridge 规则)
@@ -1465,7 +1610,14 @@ export const STRINGS: Dict = {
     zh: "用 Skills、连接器和插件，塑造 NotiOps 为你工作的方式。",
     en: "Skills, connectors, and plugins shape how NotiOps works for you.",
   },
-  "cz.nav.skills": { zh: "Skills", en: "Skills" },
+  // 侧栏一级导航那一项（也复用作 Skills 页的顶栏标题，见 ChatApp.tsx 的 view==="skills"）。
+  //
+  // ⚠️ zh 是「技能」、**不要**改回原文 "Skills"（2026-09-11 产品决定）：这一栏是**导航标签**，
+  //    与它并列的兄弟全是中文（连接器 / 插件 / 通知 / 调查 / 成本 / 安全 / 案例 / 巡检 / 更多），
+  //    夹一个英文词进去是这一列里唯一的异类。英文界面照旧 "Skills"。
+  //    产品**功能名**仍然叫 Skill / Skills（`cz.skills.title`、`cmd.skills.*`、
+  //    「新建 Skill」等都保持原文）—— 只有这一条导航标签本地化。
+  "cz.nav.skills": { zh: "技能", en: "Skills" },
   "cz.nav.connectors": { zh: "连接器", en: "Connectors" },
   "cz.nav.plugins": { zh: "插件", en: "Plugins" },
   "cz.skills.title": { zh: "Skills", en: "Skills" },
@@ -1616,6 +1768,10 @@ export const STRINGS: Dict = {
   // 开着「DevOps 对话」时的提示语：答话的是客户自己的 DevOps Agent，不是 NotiOps；
   // 这条路径也不走 /命令 与 skill，所以不重复那两个提示。
   "composer.placeholder.devopschat": { zh: "跟 DevOps Agent 对话…", en: "Chat with DevOps Agent…" },
+  // 「STAROps 对话」的占位符：答话的是客户自己在**阿里云**上的数字员工。这里点名"阿里云"
+  // 不是啰嗦 —— 输入框是客户唯一确认"我这句话要发去哪朵云"的地方，只写"STAROps"会让
+  // 从上一段 AWS 会话切过来的人分不清。同样不提 /命令 与 skill：那条链路不接（见 Composer）。
+  "composer.placeholder.starops": { zh: "跟阿里云 STAROps 数字员工对话…", en: "Chat with your Alibaba Cloud STAROps digital employee…" },
   "chip.investigate": { zh: "调查一个资源", en: "Investigate a resource" },
   "chip.cases": { zh: "我的 Support cases", en: "My Support cases" },
   "chip.cost": { zh: "本月成本异常", en: "This month's cost anomalies" },
@@ -1670,6 +1826,12 @@ export const STRINGS: Dict = {
     zh: "DevOps Agent 可能出错，重要结论请核实",
     en: "DevOps Agent can make mistakes — verify important conclusions",
   },
+  // 同理的第三个主语：阿里云 STAROps 数字员工。**不能**复用上面那条 —— 落款写成
+  // "DevOps Agent"等于告诉客户去找 AWS 侧核实一个阿里云给出的结论。
+  "composer.hint.starops": {
+    zh: "STAROps 数字员工可能出错，重要结论请核实",
+    en: "The STAROps digital employee can make mistakes — verify important conclusions",
+  },
   "composer.stop": { zh: "停止生成", en: "Stop generating" },
   // "/" 命令菜单
   "cmd.button.hint": { zh: "命令菜单（/）", en: "Command menu (/)" },
@@ -1690,8 +1852,26 @@ export const STRINGS: Dict = {
   // 各主题空态主页标题（与通用主页同一视觉，主题化措辞）
   "home.h.finops": { zh: "一起优化你的云成本", en: "Let's optimize your cloud costs" },
   "home.h.cases": { zh: "处理你的 AWS Support 案例", en: "Handle your AWS support cases" },
-  "home.h.security": { zh: "看看你的安全态势", en: "Let's review your security posture" },
   "home.h.investigate": { zh: "排查一下你的 AWS 环境", en: "Let's investigate your AWS environment" },
+  // ── 输入框上方的「仪表盘」粗粒度入口（有看板的主题都用这一套）─────────────────────
+  // 故意起得很粗：点进去才是原来那棵树（告警总览/当前告警/…、TA 安全检查/Security Hub/…、
+  // 成本总览/…、案例总览/…）。以后往树里加面板不用动这几个名字，也就不会每加一个面板就在
+  // 输入框上多出一颗 pill。
+  //
+  // ⚠️ 命名口径（2026-09-11 第二轮，别再统一成同一个词尾）：第一版四个都叫「XX 态势」，
+  // 客户看了原话「我发现取的 dashboard 名字都是 XX 态势」—— 整齐是整齐，但三个是硬套：
+  //   · 「安全态势」**保留** —— posture 在安全语境是行业术语（CSPM = Cloud Security
+  //     Posture Management），这个词尾只有安全撑得住；
+  //   · 其余三个按各自看板的**语义内核**分别取名，中英各自读得通就行，不追求词形对齐。
+  //     `Case posture` 这种在英文里基本不成立，这是换名的直接原因之一。
+  // 依据（改名前先数过树里有什么）：ops 7 项里 6 项是告警/健康/EOL 风险；cost 11 项一半
+  // 「花了多少」一半「怎么省」；cases 4 项全是「现在到哪一步、该谁动」。
+  // ⚠️ 已知撞词，刻意接受：「运行概览」与该树第一项「告警总览」语义相近（客户在两个候选里
+  // 明确选了「运行概览」而不是「运行健康」）。不要因为觉得撞词就自行改回去。
+  "dash.pill.ops": { zh: "运行概览", en: "Operations overview" },
+  "dash.pill.security": { zh: "安全态势", en: "Security posture" },
+  "dash.pill.cost": { zh: "支出与优化", en: "Spend & savings" },
+  "dash.pill.cases": { zh: "案例进展", en: "Case progress" },
   "home.h.whatsnew": { zh: "看看 AWS 有什么新发布", en: "See what's new at AWS" },
   "home.card.inspect.desc": { zh: "巡检闲置和低利用率资源，列出可优化项", en: "Scan for idle and underused resources and what to trim" },
   "home.card.alarm.desc": { zh: "排查一条 CloudWatch 告警，定位根因", en: "Investigate a CloudWatch alarm and trace the root cause" },
@@ -1713,9 +1893,25 @@ export const STRINGS: Dict = {
     zh: "选择这个会话由谁来回答（可跳过，默认 NotiOps；发出第一句后本会话就固定了）",
     en: "Pick who answers this conversation (optional — defaults to NotiOps; locked once you send the first message)",
   },
-  // 分段控件上只放两个名字（选中态靠填充表达，不写"已选"）。
+  // 分段控件上只放名字（选中态靠填充表达，不写"已选"）。
   "obj.notiops.name": { zh: "NotiOps", en: "NotiOps" },
-  "obj.devops.name": { zh: "DevOps Agent", en: "DevOps Agent" },
+  // 带上 "AWS" 是刻意的：这一排现在有两朵云（第三段是阿里云），只写 "DevOps Agent" 时
+  // 客户读不出它是**哪朵云**的。而且答案页脚的署名本来就逐字是 "AWS DevOps Agent"
+  // （Message.tsx，硬编码不过 i18n）—— 段名与署名对不上，客户会以为选的和答的不是一个东西。
+  "obj.devops.name": { zh: "AWS DevOps Agent", en: "AWS DevOps Agent" },
+  // 第三个对象：客户自己的**阿里云** STAROps 数字员工。名字里带「阿里云」是刻意的 ——
+  // 这一排另外两个都是 AWS 侧的，不写云名客户会把它读成又一个 AWS 服务，而这一段
+  // 真的会把他的问题送到另一朵云上。
+  "obj.starops.name": { zh: "阿里云 STAROps", en: "Alibaba Cloud STAROps" },
+  // 段名后面那个 beta 徽标（只这一段有）。为什么必须画在**段名旁边**而不是只写进提示行：
+  // 客户是在这里做"这句话发给谁"的选择，而这一段与另外两段的成熟度不同 —— 提示行只在选中/
+  // 点击后才说话，等他选完再告知就晚了（问题原文已经出境到另一朵云）。
+  // "beta" 两种语言都不译：它是行业通行词，译成「测试版」反而会被读成"这是个测试环境"。
+  "obj.starops.beta": { zh: "beta", en: "beta" },
+  "obj.starops.beta.hint": {
+    zh: "阿里云 STAROps 目前是 beta 能力：可用，但还不是正式功能 —— 行为与文案都可能变，也不承诺兼容。",
+    en: "Alibaba Cloud STAROps is a beta capability: usable, but not a formal feature yet -- its behaviour and wording may change, and no compatibility is promised.",
+  },
   // 控件下面那一行提示：说两边**擅长的事**有什么不同，不解释内部机制（谁调谁、谁扣 token）——
   // 客户在这一步要做的判断是"我这个问题该问谁"，不是"计费怎么走"。
   "obj.notiops.hint": {
@@ -1730,10 +1926,44 @@ export const STRINGS: Dict = {
     zh: "深入现场 · 实时排查，免模型配置",
     en: "On the ground · live diagnostics, no model setup",
   },
+  // STAROps 那一段：同样只说**擅长的事**。「阿里云环境」这四个字是这句里最要紧的信息 ——
+  // 它划清了适用边界（问 AWS 的事不该选这边），比任何机制说明都有用。
+  "obj.starops.hint": {
+    zh: "阿里云环境 · 数字员工排查与巡检",
+    en: "Your Alibaba Cloud estate · digital-employee diagnostics and inspection",
+  },
+  // ── STAROps 那一段置灰时的原因（逐个映射，不回一句笼统的"未配置"）──
+  // 这几种缺失的**修法完全不同**，所以必须分开说清"缺哪一项"。全部指向同一个落点：
+  // 管理 →「多云」→ 阿里云。reason 取值由 BFF 的 loadStarOpsConfig 给出。
+  "obj.starops.na.creds": {
+    zh: "尚未登记阿里云凭据 —— 请管理员在「管理 → 多云 → 阿里云」中填写 AccessKey",
+    en: "No Alibaba Cloud credentials yet -- an admin needs to add an AccessKey under Admin -> Multi-cloud -> Alibaba Cloud",
+  },
+  "obj.starops.na.employee": {
+    zh: "尚未指定 STAROps 数字员工 —— 请管理员在「管理 → 多云 → 阿里云」中填写数字员工 ID",
+    en: "No STAROps digital employee set -- an admin needs to fill in its ID under Admin -> Multi-cloud -> Alibaba Cloud",
+  },
+  "obj.starops.na.badEmployee": {
+    zh: "STAROps 数字员工 ID 格式不合法 —— 请管理员在「管理 → 多云 → 阿里云」中更正",
+    en: "The STAROps digital-employee ID is malformed -- an admin needs to correct it under Admin -> Multi-cloud -> Alibaba Cloud",
+  },
+  "obj.starops.na.badRegion": {
+    zh: "STAROps 地域取值不合法（仅支持 cn-beijing 与 ap-southeast-1）—— 请管理员在「管理 → 多云 → 阿里云」中更正",
+    en: "Invalid STAROps region (only cn-beijing and ap-southeast-1 are supported) -- an admin needs to correct it under Admin -> Multi-cloud -> Alibaba Cloud",
+  },
+  "obj.starops.na.badVars": {
+    zh: "STAROps 工作空间/项目取值不合法 —— 请管理员在「管理 → 多云 → 阿里云」中更正",
+    en: "The STAROps workspace/project value is malformed -- an admin needs to correct it under Admin -> Multi-cloud -> Alibaba Cloud",
+  },
+  "obj.starops.na.other": {
+    zh: "STAROps 暂不可用 —— 请管理员检查「管理 → 多云 → 阿里云」的配置",
+    en: "STAROps is unavailable -- an admin should check the settings under Admin -> Multi-cloud -> Alibaba Cloud",
+  },
   // 标题栏的「对话对象」tag：通用会话没有主题 tag，而"谁在答"恰恰是这类会话唯一会变的东西。
   // 锁定后**只靠这个 tag** 说明身份（输入框上方那条身份条已按产品要求去掉）。
   "obj.tag.notiops": { zh: "NotiOps", en: "NotiOps" },
-  "obj.tag.devops": { zh: "DevOps Agent", en: "DevOps Agent" },
+  // 与 obj.devops.name 同一个对象、必须同一个写法（锁定后就只靠这个 tag 说明身份）。
+  "obj.tag.devops": { zh: "AWS DevOps Agent", en: "AWS DevOps Agent" },
   "obj.tag.notiops.hint": {
     zh: "本会话由 NotiOps 的 agent 回答",
     en: "This conversation is answered by the NotiOps agent",
@@ -1742,12 +1972,32 @@ export const STRINGS: Dict = {
     zh: "本会话由你自己的 DevOps Agent 回答",
     en: "This conversation is answered by your own DevOps Agent",
   },
+  "obj.tag.starops": { zh: "阿里云 STAROps", en: "Alibaba Cloud STAROps" },
+  "obj.tag.starops.hint": {
+    zh: "本会话由你自己的阿里云 STAROps 数字员工回答",
+    en: "This conversation is answered by your own Alibaba Cloud STAROps digital employee",
+  },
+  // 侧栏会话条目上那枚「对话对象」tag 的**短名**。刻意与上面标题栏那三个分开：
+  // 侧栏一行里标题本来就在挤，"AWS DevOps Agent" 会把会话标题整条挤没。
+  // 全称走 title（复用 obj.tag.*.hint），鼠标一停就能看到，信息没有丢。
+  "conv.obj.notiops": { zh: "NotiOps", en: "NotiOps" },
+  "conv.obj.devops": { zh: "DevOps", en: "DevOps" },
+  "conv.obj.starops": { zh: "STAROps", en: "STAROps" },
   // 选中 DevOps Agent 时的启动卡片：与 NotiOps 那 4 张分开 —— 这条路径不做成本/案例/Skills，
   // 用它们当引导会把客户带到一条答不了的问题上。
   "obj.dv.card.anomaly": { zh: "这个账号最近有什么异常？", en: "Any anomalies in this account recently?" },
   "obj.dv.card.ec2": { zh: "帮我看看这台 EC2 为什么重启了", en: "Help me find out why this EC2 instance rebooted" },
   "obj.dv.card.rds": { zh: "我的 RDS 现在健康吗？", en: "Is my RDS healthy right now?" },
   "obj.dv.card.change": { zh: "最近有哪些变更可能影响可用性？", en: "Which recent changes could affect availability?" },
+  // 选中 STAROps 时的启动卡片：全部换成**阿里云**的说法（ECS / SLS / 云监控），并且第一张
+  // 就是"发起一次巡检" —— 用户要的正是"在 web 里跟 STAROps 对话并发起调查"，而这条路径
+  // 不另设「深度调查」开关：让数字员工从这句自然语言自己发起，就是控制台里的做法。
+  // ⚠️ 不要把 AWS 的四张卡直接翻译过来（EC2/RDS/CloudWatch）—— 那会引导客户去问
+  //    STAROps 一个它看不到的环境，答案必然是空的，而客户会以为是产品坏了。
+  "obj.so.card.inspect": { zh: "帮我巡检一下当前环境有没有风险", en: "Run an inspection -- any risks in my environment right now?" },
+  "obj.so.card.ecs": { zh: "帮我看看这台 ECS 实例为什么负载这么高", en: "Help me find out why this ECS instance is running hot" },
+  "obj.so.card.alarm": { zh: "云监控刚才那条告警是什么原因？", en: "What caused that CloudMonitor alert just now?" },
+  "obj.so.card.log": { zh: "帮我从日志里定位这次错误的根因", en: "Trace the root cause of this error from the logs" },
   "recents.title": { zh: "该主题下的会话", en: "Conversations in this topic" },
   // 简化、合并后的说明（仅有会话列表时显示）
   "recents.note.basic": {
@@ -1758,34 +2008,47 @@ export const STRINGS: Dict = {
     zh: "显示最近 {shown} 个 · 会话保留近 30 天",
     en: "Latest {shown} shown · conversations kept for 30 days",
   },
+  // ⚠️ 这一条现在同时是联网按钮的 `title` 前半句和它的 **`aria-label`** —— 那枚按钮
+  //    2026-09-13 起**只有图标没有文字**（产品指定），读屏软件唯一能念的就是这句。
+  //    别把它改成一句只在 tooltip 里通顺的话（例如加上"（可选）"这类修饰）。
   "composer.websearch": { zh: "联网搜索", en: "Web search" },
   // 短标签(composer 按钮省空间用;完整名走 tooltip/hint)
-  "composer.websearch.short": { zh: "联网", en: "Web" },
-  "composer.finops.short": { zh: "FinOps", en: "FinOps" },
+  // 🗑 2026-09-13 删掉四条：
+  //    · `composer.websearch.short`（联网/Web）—— 那枚按钮改成只留图标，短名没有去处了；
+  //    · `composer.finops.short`（FinOps）—— 成本主题那项永久置灰的占位删掉了；
+  //    · `composer.devops.direct.short`（深度调查（直连））—— 唯一的深度调查改叫「深度调查」，
+  //      也就是下面这条 `composer.devops.short`；留着它会变成同一枚按钮的两个名字。
   "composer.devops.short": { zh: "深度调查", en: "Deep Dive" },
-  "composer.devops.direct.short": { zh: "深度调查（直连）", en: "Deep Dive (Direct)" },
   "composer.devopschat.short": { zh: "DevOps 对话", en: "DevOps Chat" },
   "composer.websearch.hint": {
     zh: "开启后可联网查最新信息（默认走 AWS AgentCore 搜索，数据不出 AWS）",
     en: "Search the web for current info when on (uses AWS AgentCore search by default; data stays in AWS)",
   },
-  "composer.finops": { zh: "FinOps Agent", en: "FinOps Agent" },
+  // 「谁来答」的正式名。两处在用：工具条上「深度调查」那枚 pill 的 tooltip 前半句，
+  // 以及 skill 芯片上那个「DevOps Agent」标记的 tooltip。
   "composer.devops": { zh: "DevOps Agent", en: "DevOps Agent" },
-  "composer.devops.hint": {
-    zh: "开启 DevOps Agent 深度调查（发起多信号根因排查，耗时几分钟；关闭时用只读工具即时排查）",
-    en: "Enable DevOps Agent deep investigation (multi-signal root-cause; takes minutes. Off = instant read-only triage)",
-  },
-  "composer.devops.direct": { zh: "DevOps Agent（直连）", en: "DevOps Agent (Direct)" },
+  // 下面两条 `*.hint` 是工具条上那两枚 pill 的 tooltip 后半句。
+  // 2026-09-11 统一收短：一行讲清「谁来答 + 多久 + 代价」，其余细节（Bedrock 开通、
+  // 需审批动作去哪确认、概念问题会不会先答）留给 USER_GUIDE。**不许**为了短而删掉
+  // 「0 token」「不挂工具/Skills」这类会影响客户判断的事实。
+  //
+  // 🗑 2026-09-13 删掉 `composer.devops.hint` 与 `composer.devops.direct`：前者是"经我们的
+  //    agent 转交"那一项的说明（该项已从界面撤掉），后者是它的对照名「DevOps Agent（直连）」。
+  // ⚠️ 下面这条键名里仍有 `.direct`，**刻意的** —— 它绑的字段就是 `devopsAgentDirect`。
+  //    界面上的名字（深度调查）与字段名不同这件事，在 ModePicker 里有注释交代。
+  // 🔁 值在同一天重写过：原来它是"跟转交那一项的差异说明"（「同一个深度调查，绕过大模型
+  //    直连 API」），对照对象消失后那句话没有指代了。现在它必须自己把三件事说全 ——
+  //    做什么、代价（0 token + 原话透传）、关着是什么。
   "composer.devops.direct.hint": {
-    zh: "同样的 DevOps Agent 深度调查，但绕过大模型直连 API —— 不消耗 token。代价：调查描述按你的原话透传（不做智能改写），也不会先回答概念问题",
-    en: "The same DevOps Agent deep investigation, but calls the API directly without an LLM — costs 0 tokens. Trade-off: your wording is passed through as-is (no smart rewrite), and conceptual questions aren't answered first",
+    zh: "交给 AWS DevOps Agent 做多信号根因排查并出报告，通常几分钟、0 token（按你的原话透传，不做智能改写）；关着就是 NotiOps 用只读工具即时排查",
+    en: "Hand it to AWS DevOps Agent for multi-signal root cause + a report — usually minutes, 0 tokens (your wording passed through as-is); off = NotiOps triages instantly with read-only tools",
   },
   // 「DevOps 对话」：这轮由客户自己的 DevOps Agent 直接回答（不是我们的模型），故 NotiOps 侧 0 token。
   // 文案要说清两件事：谁在答（客户自己的 DevOps Agent）、代价在哪（额度计他自己那边；不挂我们的工具/技能）。
   "composer.devopschat": { zh: "DevOps 对话（直连）", en: "DevOps Chat (Direct)" },
   "composer.devopschat.hint": {
-    zh: "直接和你自己的 AWS DevOps Agent 对话（体验与它自己的页面一致，流式输出）——不消耗 NotiOps 的 token、也免模型配置（不需要在 Bedrock 开通模型），用量计入你自己的 DevOps Agent。代价：本轮不挂 NotiOps 的工具与 Skills，需人工确认的动作要去 DevOps Agent 控制台完成",
-    en: "Chat directly with your own AWS DevOps Agent (same streaming experience as its own console) — costs no NotiOps tokens and needs no model setup (nothing to enable in Bedrock); usage is billed to your DevOps Agent. Trade-off: NotiOps tools and Skills aren't attached this turn, and any action needing approval must be confirmed in the DevOps Agent console",
+    zh: "直接和你自己的 AWS DevOps Agent 对话 —— 0 token、免模型配置，用量计它那边；代价：本轮不挂 NotiOps 的工具与 Skills",
+    en: "Chat with your own AWS DevOps Agent — 0 NotiOps tokens, no model setup, billed to your Agent; NotiOps tools and Skills aren't attached this turn",
   },
   // objMode（通用会话，对象已是客户自己的 DevOps Agent）里那个「深度调查」勾选的说明。
   // 只讲这一轮的行为差别（问答 vs 调查、秒级 vs 几分钟），不重复"直连/0 token"这些机制词 ——
@@ -1794,38 +2057,29 @@ export const STRINGS: Dict = {
     zh: "勾上后这一轮让它做一次完整的深度调查（多信号根因排查、出报告，通常几分钟）；不勾就是即时问答",
     en: "Have it run a full deep investigation this turn (multi-signal root cause, produces a report, usually minutes); leave it off for instant Q&A",
   },
-  "composer.finops.hint": {
-    zh: "开启 FinOps Agent 深度分析（更全面的成本归因/优化建议，耗时较长；关闭时走快速成本查询）",
-    en: "Enable FinOps Agent deep analysis (richer cost attribution & optimization; takes longer. Off = fast cost lookup)",
-  },
-  "composer.finops.soon": {
-    zh: "FinOps Agent 深度分析即将上线；当前可开启 DevOps Agent 来分析成本与用量",
-    en: "FinOps Agent deep analysis coming soon; use DevOps Agent to analyze cost & usage for now",
-  },
-  "composer.soon": { zh: "即将上线", en: "Soon" },
-  // 「回答模式」下拉（ModePicker）—— 原来工具条上四个各自独立的 pill 收成一个控件。
-  // 名字取「回答模式」而不是「深度模式」：这一组选的是**谁来答、答到多深**（NotiOps 自己的
-  // 模型 / 客户自己的 DevOps Agent / 发起一次完整调查），"深度"只覆盖其中一半。
-  "composer.mode.label": { zh: "回答模式", en: "Answer mode" },
-  "composer.mode.hint": {
-    zh: "选这段对话由谁来答、答到多深（默认由 NotiOps 直接回答）",
-    en: "Choose who answers and how deep (default: NotiOps answers directly)",
-  },
-  "composer.mode.off": { zh: "不启用", en: "Off" },
-  "composer.mode.off.desc": {
-    zh: "普通对话，由 NotiOps 用你选的模型回答",
-    en: "Normal chat, answered by NotiOps with the model you picked",
-  },
-  // 深度调查不可用（这个部署/这个账号没有 DevOps Agent Agent Space）。开关置灰 + 说清原因与出路，
+  // 🗑 2026-09-13 成本主题里那项永久置灰的「FinOps」占位删掉了（产品指定：一个永远点不动的
+  //    项除了让客户点一下发现点不动，没有别的作用），随它删掉 `composer.finops.soon`
+  //    与 `composer.soon`。功能真上线时这两条也不该照抄回来 —— 那时要写的是**用法**，
+  //    不是「即将上线」。
+  // 🗑 同一天删掉「回答模式」下拉那一整组：`composer.mode.label` / `.hint` / `.off` /
+  //    `.off.desc`。下拉拆回平铺 pill 之后，既没有下拉按钮要标题，也没有「不启用」那一项
+  //    （点亮的 pill 再点一次就是关）。
+  // DevOps Agent 不可用（这个部署/这个账号没有 Agent Space）。开关置灰 + 说清原因与出路，
   // 而不是让用户点开、发一轮、再吃一句 no_local_agent_space / account_not_onboarded。
+  //
+  // ⚠️ 这两句**不是只讲「深度调查」**：同一份文案被三处当置灰理由用 ——
+  //    ModePicker 的「深度调查」与「DevOps 对话」，以及新对话主页
+  //    ChatObjectPicker 里的「DevOps Agent」对话对象。以前开头写死「深度调查不可用：」，
+  //    在后两处就是**指错功能**（客户看到的是「DevOps 对话」置灰、说明却在说深度调查）。
+  //    所以现在只陈述**原因**，不点名某一个功能：谁被它挡住，界面上那一项自己会显示。
   "composer.devops.na": { zh: "未接入", en: "N/A" },
   "composer.devops.na.self": {
-    zh: "深度调查不可用：本部署账号里没有 AWS DevOps Agent 的 Agent Space。请在本账号创建 Agent Space（或重新部署 NotiOps 让它自动创建）后再用。",
-    en: "Deep investigation is unavailable: this deployment account has no AWS DevOps Agent Agent Space. Create one in this account (or redeploy NotiOps, which creates it automatically) and try again.",
+    zh: "本部署账号里没有 AWS DevOps Agent 的 Agent Space，凡是靠它的都用不了。请在本账号创建 Agent Space（或重新部署 NotiOps 让它自动创建）后再用。",
+    en: "This deployment account has no AWS DevOps Agent Agent Space, so anything backed by it is unavailable. Create one in this account (or redeploy NotiOps, which creates it automatically) and try again.",
   },
   "composer.devops.na.account": {
-    zh: "深度调查不可用：所选账号尚未接入 AWS DevOps Agent。请在「管理 → 账户」里给该账号完成 DevOps Agent 接入，或切回部署账号。",
-    en: "Deep investigation is unavailable: the selected account isn't onboarded to AWS DevOps Agent. Onboard it under Admin → Accounts, or switch back to the deployment account.",
+    zh: "所选账号尚未接入 AWS DevOps Agent，凡是靠它的都用不了。请在「管理 → 账户」里给该账号完成 DevOps Agent 接入，或切回部署账号。",
+    en: "The selected account isn't onboarded to AWS DevOps Agent, so anything backed by it is unavailable. Onboard it under Admin → Accounts, or switch back to the deployment account.",
   },
   // Nova Pro 在成本主题不推荐:它对「大量工具 + 大成本明细结果」处理易超限/失败(输出上限仅 5K),
   // Claude / DeepSeek 更稳。见 D 诊断。
@@ -1856,21 +2110,22 @@ export const STRINGS: Dict = {
   "login.newPassword": { zh: "设置新密码", en: "Set a new password" },
   "login.submit": { zh: "登录", en: "Sign in" },
   "login.signout": { zh: "退出登录", en: "Sign out" },
-  "login.settings": { zh: "设置", en: "Settings" },
+  // 2026-09-11：`login.settings` / `menu.soon` 两个键删了 —— 用户菜单第一项那个
+  // 从未实现、点了只弹「即将上线」的「设置」占位项已下线（见 UserMenu.tsx）。
   "menu.language": { zh: "语言", en: "Language" },
   "menu.appearance": { zh: "外观", en: "Appearance" },
   "menu.theme.dark": { zh: "深色", en: "Dark" },
   "menu.theme.light": { zh: "浅色", en: "Light" },
-  "menu.changelog": { zh: "更新日志", en: "View changelog" },
-  "menu.learnmore": { zh: "了解更多", en: "Learn more" },
-  "menu.report": { zh: "反馈问题", en: "Report an issue" },
-  // hover 提示：说清会跳到哪、要做什么。内网打不开 github.com 时,用户至少
-  // 看得到完整 URL,而不是以为按钮坏了。
-  "menu.report.hint": {
-    zh: "在 GitHub 上提交 issue 反馈问题或提需求 — https://github.com/aws-samples/sample-notiops/issues",
-    en: "Report a bug or request a feature on GitHub — https://github.com/aws-samples/sample-notiops/issues",
+  // 2026-09-12：`menu.changelog` / `menu.learnmore` / `menu.report` / `menu.report.hint`
+  // 四个键删了 —— 弹出菜单里那三条外链与左下角那个「提 issue」图标按产品要求一起下线
+  // （见 UserMenu.tsx）。菜单现在只有 外观 / 语言 / 退出登录。
+  // 左下角用户名右侧的那个图标按钮（只有图标 + title，没有可见文字 ——
+  // 侧栏最窄时用户名已经在省略号了，再塞一段文字会把用户名挤没）。
+  "menu.star": { zh: "给我们加星", en: "Star us on GitHub" },
+  "menu.star.hint": {
+    zh: "在 GitHub 给 NotiOps 加星 — https://github.com/aws-samples/sample-notiops",
+    en: "Star NotiOps on GitHub — https://github.com/aws-samples/sample-notiops",
   },
-  "menu.soon": { zh: "即将上线", en: "Coming soon" },
   "sources.empty": { zh: "暂无来源", en: "No sources" },
   "panel.close": { zh: "关闭", en: "Close" },
   // DevOps Agent 后台深链（只有 DevOps 那条过程有；面板本身与普通对话共用同一套文案）

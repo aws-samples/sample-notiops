@@ -10,7 +10,7 @@
  *
  * effective/satisfies 同时被 authorize 与 visibleTree 复用，避免前后端判定漂移。
  */
-import { matchRoute, subtabsOf, rootTabOf, allNodes, getNode } from "./capabilities.mjs";
+import { matchRoute, subtabsOf, rootTabOf, allNodes, getNode, isModuleToggleOptOut } from "./capabilities.mjs";
 import { getUserPerm, getRole, getDisabledModules, getGroupMap } from "./rbac_store.mjs";
 
 /** 预置角色。key 为角色名，值为 permissions 数组。 */
@@ -22,7 +22,20 @@ export const PRESET_ROLES = {
   "role:finops": ["nav:chat", "nav:notifications", "nav:finops:*", "nav:inspection:*"],
   // ⚠️ 巡检看板给 support 与 finops 两个角色：高负载/结构性是可靠性视角（support），
   //    闲置/成本是成本视角（finops）。只给一个会让另一半人看不到本该他们看的页。
-  "role:support": ["nav:chat", "nav:notifications", "nav:investigate", "nav:cases:*", "action:cases:*", "nav:inspection:*"],
+  //
+  // 🔴 `nav:investigate:*` 而不是裸 `nav:investigate`（2026-09-11 修）：裸 tab key 能过
+  //    `authorize`，但过不了 `filterDashboard` —— 它逐个 subtab 判 `satisfies`，不满足就
+  //    **删掉对应的 responseKey**，而且**不改状态码、不加错误字段**。于是 support 角色以前
+  //    `GET /investigate/alarms` 拿到的是 `200 {ok:true, available:true, total:N}`：告警总览/
+  //    当前告警/最近变更三块全被静默清空，页面显示"没有告警"——一条日志都没有。
+  //    `nav:investigate:*` 的 `key === base` 分支同时覆盖 tab 自身（见 matchesAny），
+  //    与上面 `nav:inspection:*` 同一个写法。
+  //
+  // 🔴 `nav:security:*`（2026-09-11 加）：在此之前**没有任何预置角色**含 nav:security ——
+  //    安全态势看板只有 `role:admin` 的 `*` 能进，其余角色连侧栏入口都不显示。安全看板
+  //    （TA 安全检查 / Security Hub 评分 / GuardDuty / 安全公告）全是只读，给 support 是它
+  //    本来的工作面。同样必须带 `:*`，否则会重演上面 filterDashboard 静默清空那一幕。
+  "role:support": ["nav:chat", "nav:notifications", "nav:investigate:*", "nav:security:*", "nav:cases:*", "action:cases:*", "nav:inspection:*"],
   "role:service-manager": [
     "nav:chat",
     "nav:cases:overview", "nav:cases:waiting", "nav:cases:incidents", "nav:cases:sla",
@@ -45,6 +58,10 @@ export const PRESET_ROLES = {
     //    要放开就在「角色」页给具体角色显式加 `action:inspection:scope`，
     //    别加进这里 —— 预置角色是所有部署的默认值，收紧比放开难得多。
     "nav:inspection:*",
+    // 安全态势看板：四个 subtab（TA 安全检查 / Security Hub 评分 / GuardDuty / 安全公告）
+    // 全是只读拉取，与上面的 finops / inspection 同一个性质，所以只读角色也给。
+    // 同样必须写 `:*` —— 裸 `nav:security` 过得了 authorize、过不了 filterDashboard。
+    "nav:security:*",
     "nav:cases:overview", "nav:cases:waiting", "nav:cases:incidents", "nav:cases:sla",
   ],
 };
@@ -90,6 +107,9 @@ const LOGIN_ONLY = [
   // 深度调查可用性：只回 {available, reason}（无 Agent Space id / 无账号清单），
   // 任何能看到输入框的用户都要用它决定「深度调查」开关是否置灰。
   /\/features\/deep-investigation$/,
+  // 「STAROps 对话」可用性：只回 {available, reason?, employee?, region?}（无凭据、
+  // 无 workspace —— 那个值嵌着阿里云账号 UID）。任何能看到「对话对象」选择器的用户都要用它。
+  /\/features\/starops$/,
 ];
 
 function isLoginOnly(path) {
@@ -221,8 +241,11 @@ export async function authorize({ method, path, query, body }, eff, { disabledMo
   if (node.alwaysOn) return { allow: true };
 
   // 模块开关优先：node 所属顶层 tab 被关 → 拒绝
+  // ⚠️ 先把 `moduleToggle:false` 的 key 剔掉：这类 tab（今天是 nav:security）在存量
+  //    `tenantcfg#modules` 记录里可能还躺着，而界面上已经没有那一行去把它开回来。
+  //    见 capabilities.mjs::isModuleToggleOptOut 的注释。
   const rootTab = rootTabOf(node.key);
-  const disabled = disabledModules || (await getDisabledModules());
+  const disabled = (disabledModules || (await getDisabledModules())).filter((k) => !isModuleToggleOptOut(k));
   if (rootTab && disabled.includes(rootTab)) {
     return { allow: false, status: 403, required: node.key };
   }
@@ -278,7 +301,10 @@ export function filterDashboard(tabKey, payload, eff) {
  * @returns {Promise<Array>} 扁平节点数组（含层级字段），前端自行按 parent 组树。
  */
 export async function visibleTree(eff, { disabledModules = null } = {}) {
-  const disabled = disabledModules || (await getDisabledModules());
+  // 与 authorize() 同一道过滤：`moduleToggle:false` 的 tab 不受存量 disabled 记录影响
+  // （见 capabilities.mjs::isModuleToggleOptOut）。两处必须一致，否则会出现
+  //「侧栏没有这个入口、端点却放行」或反过来。
+  const disabled = (disabledModules || (await getDisabledModules())).filter((k) => !isModuleToggleOptOut(k));
   const nodes = allNodes();
   const visibleKeys = new Set();
 

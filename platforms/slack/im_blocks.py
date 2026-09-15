@@ -66,33 +66,39 @@ _ANSWER_TITLES = {
     "thinking": "im.chat.thinking_title",
 }
 
-#: 终态标题按"谁答的"分两套。**与飞书那份 `im_cards._FINAL_TITLES` 逐字对齐**。
+#: 终态标题按"谁答的"分三套。**与飞书那份 `im_cards._FINAL_TITLES` 逐字对齐**
+#: （`starops` 那条点明**阿里云** —— 理由见飞书那份的说明）。
 _FINAL_TITLES = {
     "devops": "im.chat.card_title",
     "notiops": "im.chat.card_title.notiops",
+    "starops": "im.chat.card_title.starops",
 }
 
 
 def usage_footer(locale: str, *, agent: str = "devops", usage=None,
-                 account: str = "", deploy: str = "") -> str:
+                 account: str = "", deploy: str = "",
+                 employee: str = "") -> str:
     """落款 —— 实现在 `platforms.common.im_footer`，**与飞书共用同一份**（不再是
     两份"逐字对齐"的副本；理由见那个模块的文件头）。这里只保留入口，因为 `caps.py`
     的纯文本兜底路径直接调它，而那个调用点是 Slack 自己的。
 
     口径（都在 `im_footer` 里）：直连说"无模型消耗"、走模型的那条报**实际生效的
     模型 id**、拿不到模型 id 也不许退成"无模型消耗"、用量只统计不显示、账号号
-    拿不到就整段不显示。
+    拿不到就整段不显示；`agent="starops"` 时 AWS 账号那一段**整段消失**、换成阿里云
+    数字员工 ID（跨云假信息，见 `im_footer` 文件头 🔴 那一段）。
     """
     return im_footer.usage_footer(locale, agent=agent, usage=usage,
-                                  account=account, deploy=deploy)
+                                  account=account, deploy=deploy,
+                                  employee=employee)
 
 
 def answer_blocks(reply: str, locale: str, *,
                   steps=None, state: str = "final", elapsed: int = 0,
                   report_url: str = "", sources=None,
                   agent: str = "devops", usage=None,
-                  account: str = "", deploy: str = "") -> list[dict]:
-    """对话问答的答案消息 —— 「思考中」与「答完」**共用**这一份，两个 agent 也共用。
+                  account: str = "", deploy: str = "",
+                  employee: str = "") -> list[dict]:
+    """对话问答的答案消息 —— 「思考中」与「答完」**共用**这一份，三个 agent 也共用。
 
     与 `im_cards.answer_card` 逐参数对齐（含 `state` 三态 queued/thinking/final、
     **只有终版挂按钮**、`report_url` 只挂按钮不上传的口径、`agent` 只影响标题与落款），
@@ -103,6 +109,9 @@ def answer_blocks(reply: str, locale: str, *,
     `account` 是本轮目标账号（空 = 部署账号），`deploy` 是部署账号号。**两个都必须由
     调用方传** —— 这个函数会被 `LiveCard.flush` 每几秒调一次，在这里解析账号等于把
     一次 STS 塞进渲染循环。
+
+    `employee` 是 STAROps 那条路上**替代**账号那一段的阿里云数字员工 ID（2026-09-14），
+    口径与飞书那份逐字相同（含"进度态拿不到、只有终版有值"那条）。
     """
     final = state == "final"
     title_key = _ANSWER_TITLES.get(
@@ -124,7 +133,8 @@ def answer_blocks(reply: str, locale: str, *,
             out.append(_sec(src, locale))
     out.append(blocks.divider())
     out.append(blocks.context(usage_footer(locale, agent=agent, usage=usage,
-                                          account=account, deploy=deploy)))
+                                          account=account, deploy=deploy,
+                                          employee=employee)))
     btns: list[dict] = []
     if report_url and final:
         # url 按钮不产生回调，`action_id` 只用来占位。

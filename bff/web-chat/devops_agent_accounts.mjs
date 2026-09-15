@@ -17,6 +17,8 @@
 import { DevOpsAgentClient, ListAssociationsCommand } from "@aws-sdk/client-devops-agent";
 import { OrganizationsClient, DescribeOrganizationCommand } from "@aws-sdk/client-organizations";
 import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
+// safeErr：异常一律压成"类型名/错误码"再进响应体（见 safe_err.mjs）。
+import { safeErr } from "./safe_err.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const AGENT_SPACE_ID = process.env.DEVOPS_AGENT_SPACE_ID || "";
@@ -81,7 +83,7 @@ async function _assumeAndCheckPayer(accountId, roleArn) {
   } catch (e) {
     // Trust Policy 未信任本 BFF Role，或角色已失效——记录但不中断整体发现流程
     // （其它账号可能能 assume 成功）。
-    return { accountId, roleArn, assumable: false, isPayer: false, error: String(e?.message || e) };
+    return { accountId, roleArn, assumable: false, isPayer: false, error: safeErr(e) };
   }
 
   let isPayer = false;

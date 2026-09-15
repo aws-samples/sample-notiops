@@ -23,7 +23,7 @@
 - **§0 [Quick Deploy (TL;DR)](#0-quick-deploy-tldr)** — skip the prose, just run this
 - §1 [Deployment Architecture](#1-deployment-architecture)
 - §2 [Prerequisites](#2-prerequisites)
-- §3 [Register IM Apps](#3-register-im-apps) (Feishu / Slack)
+- §3 [Register IM Apps](#3-register-im-apps) (Feishu / Slack / DingTalk)
 - §4 [Configuration & IM Credentials](#4-configuration--im-credentials)
 - §5 [One-Command Deploy `setup.sh`](#5-one-command-deploy-setupsh)
 - §6 [Smoke Tests](#6-smoke-tests)
@@ -40,7 +40,7 @@
 
 ## 0. Quick Deploy (TL;DR)
 
-> For "get it running first, read details later". All commands assume you've already finished §2 Prerequisites. The web console (browser chat) deploys by default and is the product's main entry; IM (Feishu / Slack) is an optional supplement — only walk §3 Register IM Apps if you want to enable it.
+> For "get it running first, read details later". All commands assume you've already finished §2 Prerequisites. The web console (browser chat) deploys by default and is the product's main entry; IM (Feishu / Slack / DingTalk) is an optional supplement — only walk §3 Register IM Apps if you want to enable it.
 
 > 💡 **Just want to try Web Chat?** Then you can skip this whole document.
 > [DEPLOYMENT_ONECLICK.en.md](DEPLOYMENT_ONECLICK.en.md) is a path that needs **nothing installed
@@ -57,9 +57,9 @@
 ./setup.sh
 ```
 
-The first run is **interactive**: confirm AWS account + region → (optional) PHD event forwarding → **pick which IM platforms to deploy (default `0` = skip, web UI only; pick Feishu / Slack only if you want IM)** → build the frontend (there is only one: Web Chat's `frontend/chat-app`) → deploy the Web Chat Agent (AgentCore Runtime) → CDK bootstrap → CDK synth → CDK deploy `--all`. **Web Chat + the backend agent deploy by default.** IM credentials are **not** collected here — CDK creates **empty** secrets, and you fill them in *after* deploy (see §4 / §5).
+The first run is **interactive**: confirm AWS account + region → (optional) PHD event forwarding → **pick which IM platforms to deploy (`1` Feishu / `2` Slack / `3` DingTalk, multi-select such as `1,3`; on a first install the default is `0` = skip, web UI only. On a **re-run** the default is "keep whatever the live deployment already has enabled", so pressing Enter will not freeze a running bot — see §4.1)** → build the frontend (there is only one: Web Chat's `frontend/chat-app`) → deploy the Web Chat Agent (AgentCore Runtime) → CDK bootstrap → CDK synth → CDK deploy `--all`. **Web Chat + the backend agent deploy by default.** IM credentials are **not** collected here — CDK creates **empty** secrets, and you fill them in *after* deploy (see §4 / §5).
 
-> **About DingTalk**: the DingTalk adapter code (`platforms/dingtalk/`) is retained, but v1 `setup.sh` doesn't surface the option → `enabledPlatforms` never includes `dingtalk` → `ImStack` creates no DingTalk Lambda / webhook, no cost. v2 ships the dual-robot credential flow.
+> **About DingTalk**: DingTalk is supported on **both deployment paths** since 2026-09-08, in the same Lambda-webhook shape as Feishu / Slack (`setup.sh` option `3`; one-click `InstallOption=web+dingtalk`). If you don't pick it, `enabledPlatforms` excludes `dingtalk` → `ImStack` creates no DingTalk Lambda / webhook, no cost. DingTalk does have a few **real platform-capability** differences from Feishu / Slack (card buttons can only be links, sent messages cannot be edited, robots cannot add reactions, proactive pushes need a second URL) — the full table is in [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §3.6; separately, the DingTalk console validates nothing when you save the message-receive URL — see §3.3.
 
 Two stacks land (one shot via `cdk deploy --all`; three when you pick an IM platform — `ImStack` is added):
 - `NotiOpsBackendStack` — shared backend (DDB, 8 Lambdas, S3 report bucket, EventBridge rules)
@@ -192,10 +192,10 @@ verbatim. The one-click equivalent is
 Open the Web Chat URL printed at the end of the script → log in as admin / temp password → send a question
 ```
 
-**Only if you enabled an IM platform** (Feishu / Slack), also @bot in the channel to verify:
+**Only if you enabled an IM platform** (Feishu / Slack / DingTalk), also @bot in the channel to verify:
 
 ```bash
-# In your Feishu / Slack channel, @bot a message (fill that platform's credentials first — see §4 / §5):
+# In your Feishu / Slack / DingTalk channel, @bot a message (fill that platform's credentials first — see §4 / §5):
 @NotiOps hello
 ```
 
@@ -213,7 +213,7 @@ CDK deploys three stacks in one shot via `cdk deploy --all` (four when you pick 
 |---|---|---|
 | **`notiops-*`** | ✅ Required | 8 Lambdas (`notiops-inspection-scheduler` / `-executor` / `-reconciler` / `-push`, `notiops-cost-analyzer`, `notiops-notifier`, `notiops-push-handler`, `notiops-phd-forwarder`), shared DDB tables, S3 report bucket, EventBridge rules (5 IM push rules + 10 web notification rules + notiops schedules), agent-trigger Role (for STS AssumeRole) |
 | **`WebChatStack`** | ✅ Deployed by default | The browser-based agentic AI assistant (**the product's main entry**): BFF Lambda (`notiops-web-chat-bff`) + Function URL (`AWS_IAM`), single DDB table `notiops-web-chat` (sessions/messages + notification inbox), static frontend (chat-app), notification handler. The BFF gets the previous step's agent Runtime ARN injected via `-c agentRuntimeArn` |
-| **`ImStack`** | Only when IM is selected | **The production path for IM**: one **API Gateway HTTP API** per platform (the public entry point, a `$default` catch-all route) plus one Lambda pair — ingress (validates the signature and hands off asynchronously, `reservedConcurrentExecutions=10`) + worker (does the real work, 900s) — plus the shared dependency Layer and a de-duplication table. Its `FeishuWebhookUrl` / `SlackWebhookUrl` outputs are the request URLs you paste into the IM platform console (see [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md)) |
+| **`ImStack`** | Only when IM is selected | **The production path for IM**: one **API Gateway HTTP API** per platform (the public entry point, a `$default` catch-all route) plus one Lambda pair — ingress (validates the signature and hands off asynchronously, `reservedConcurrentExecutions=10`) + worker (does the real work, 900s) — plus the shared dependency Layer and a de-duplication table. Its `FeishuWebhookUrl` / `SlackWebhookUrl` / `DingtalkWebhookUrl` outputs are the request URLs you paste into the IM platform console (see [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md)) |
 | ~~**`BotStack`**~~ | ❌ **Retired (2026-09-03)** | It used to be: VPC + public subnets, ECS Cluster (512 CPU / 1024 MB per task), ECR repo, one Fargate Service per selected platform, pricing + cost MCP sidecars per task, Task Role, Security Group. After IM refactor M2, `infra/bin/app.ts` **no longer instantiates it**, so fresh installs get no VPC / ECS / ECR and need no finch / docker. The source (`infra/lib/bot-stack.ts` + three Dockerfiles) is deliberately kept in the repo as the long-connection rollback path — rolling back means `new BotStack(...)` again, which is far cheaper than rebuilding VPC/ECS and the images from scratch. Accounts installed before M2 still have the stack: `teardown.sh` deletes it by name, or delete it on its own with `aws cloudformation delete-stack --stack-name BotStack` (it publishes **no CFN exports**, so no other stack can be importing it) |
 
 **Deployment order** (handled automatically by `./setup.sh`):
@@ -223,11 +223,19 @@ CDK deploys three stacks in one shot via `cdk deploy --all` (four when you pick 
 (optional) to enable IM: §3 Register an IM app first, then re-run setup.sh and pick the platform
 ```
 
-Credential flow: `setup.sh` **does not collect IM credentials** — it only sets the `enabledPlatforms` flag based on your selection. CDK creates **empty** secrets (`notiops/im-bot-feishu` / `notiops/slack-bot-token` / `notiops/slack-signing-secret`); after deploy you fill them in under Web Chat admin console → "IM Integration" (all four Feishu credentials on one form), or directly in Secrets Manager (see §4.2 — webhook mode needs **no** service restart). CDK stacks always reference the secrets by ARN. **Nothing is persisted to disk locally.**
+Credential flow: `setup.sh` **does not collect IM credentials** — it only sets the `enabledPlatforms` flag based on your selection. CDK creates **placeholder** secrets (`notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` / `notiops/slack-bot-token` / `notiops/slack-signing-secret`); after deploy you fill in **all three platforms from the Web Chat admin console → "IM Integration"**, one tab each: four Feishu credentials on one form, one form for DingTalk, and the Slack tab takes two fields — **Bot User OAuth Token** (`xoxb-`) and **Signing Secret**. You can also edit Secrets Manager directly (see §4.2 — webhook mode needs **no** service restart). CDK stacks always reference the secrets by ARN. **Nothing is persisted to disk locally.**
+
+> ⚠️ The two Slack secrets hold a **plain string**, not JSON, and the placeholder CDK creates is a **random value**, not an empty one — so "forgot to fill it in" looks exactly like "filled in wrong" (`invalid_auth` / a 401 on URL verification). The "configured" badge on the IM Integration page is derived from the **shape of the value**, so a placeholder always reads as *not configured*; after saving, hit "Test credentials" to see the workspace / bot name and **each missing scope by name**.
 
 ---
 
 ## 2. Prerequisites
+
+> ✅ **One command covers everything in this section: `bash scripts/preflight.sh`** (read-only,
+> installs nothing). The **specific consequence** of each miss, a fix per item, and the things
+> `setup.sh` does **not** check (boto3 / version floors / interactive terminal / Bedrock model
+> access) are all in **[PREREQUISITES.en.md](PREREQUISITES.en.md)**. This section is the cheat
+> sheet; that page is the long form.
 
 ### 2.1 Required tools
 
@@ -238,8 +246,16 @@ Credential flow: `setup.sh` **does not collect IM credentials** — it only sets
 | Node.js | ≥ 22 | `node --version` *(CDK runtime)* |
 | ~~Container build tool~~ | ~~finch (recommended) / docker~~ | — *(**no longer required** as of 2026-09-03 — see the note below)* |
 | jq | any version | `jq --version` |
-| Python 3.12+ (local builds) | — | `python3 --version` |
+| Python | **≥ 3.10** (3.12+ recommended) | `python3 --version` |
 | **uv** | any version | `uv --version` |
+| **boto3** | in the interpreter setup.sh will use | `python3 -c "import boto3"` — [fix](PREREQUISITES.en.md#3-boto3-the-easiest-one-to-miss) |
+
+> ⚠️ **`setup.sh` only checks whether a command exists — it never compares versions.** Every floor
+> above is a real runtime requirement, but the preflight uses `command -v`, so an old version sails
+> through and fails mid-deploy (half the cloud resources already created). `scripts/preflight.sh`
+> closes exactly that gap. The Python floor is **3.10**, not "present": building the Lambda
+> dependency layer makes `pip` validate each wheel's `Requires-Python` against **the running
+> interpreter**, and macOS still ships 3.9.x at `/usr/bin/python3`.
 
 > ⚠️ **uv is not optional** (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or `brew install uv`).
 > `agentcore deploy` invokes `uv pip install` **unconditionally** when it packages the agent's Python
@@ -259,7 +275,9 @@ Credential flow: `setup.sh` **does not collect IM credentials** — it only sets
 > `pip --platform manylinux2014_x86_64 --only-binary=:all:`, which needs no container.
 > Side benefit: `cdk synth` no longer hashes the whole repo root as a Docker build context
 > (measured 594s → 12s).
-> ⚠️ If a Docker asset is ever reintroduced, this note, `setup.sh`'s preflight, and
+> ⚠️ If a Docker asset is ever reintroduced, this note, `setup.sh`'s preflight,
+> `scripts/preflight.sh` (which today has **no** container check at all), the "Container runtime"
+> row in the [prerequisites page](PREREQUISITES.en.md) (which currently says **not needed**), and
 > both root READMEs (one per language) all have to change back together.
 
 ### 2.2 AWS account preparation
@@ -277,7 +295,7 @@ Different components have different region constraints — plan ahead:
 |---|---|---|
 | **AWS DevOps Agent service** | **`us-east-1` only** | AWS service constraint (single-region preview) |
 | **Shared backend Lambda stack** | **strongly recommended `us-east-1`** | Polls DevOps Agent journal API; cross-region adds latency and IAM complexity |
-| **Feishu / Slack IM stack (`ImStack`)** | any AWS region | No hard constraint; pick what's nearest your users. The webhook HTTP API lives in this region |
+| **IM stack (`ImStack`; Feishu / Slack / DingTalk)** | any AWS region | No hard constraint; pick what's nearest your users. The webhook HTTP API lives in this region |
 | **Bedrock** | any region with `claude-sonnet-4-6` enabled | Override via `BedrockRegion` parameter; can differ from the runtime region |
 | **DDB / S3** | follows the Lambda region | Created in the same region as the stack |
 
@@ -287,11 +305,64 @@ Different components have different region constraints — plan ahead:
 
 ### 2.4 IAM deployment permissions
 
-The deploying IAM user / role needs:
-- `cloudformation:*` (deploy / rollback)
-- `iam:*` + `ecr:*` + `ecs:*` + `lambda:*` (create stack resources)
-- `secretsmanager:*` (create secrets)
-- `dynamodb:CreateTable`, `s3:CreateBucket`, `events:PutRule`
+`setup.sh` needs permissions in **three** stages. The substantive difference from Method A (one-click CFN, see [DEPLOYMENT_ONECLICK.en.md §1.1](DEPLOYMENT_ONECLICK.en.md#11-an-aws-account-and-console-permissions-to-create-the-stack)) is only in the **third** stage.
+
+#### (1) `cdk bootstrap` — once per account + region
+
+Before deploying, `setup.sh` runs `npx cdk bootstrap` (without `--cloudformation-execution-policies`). That creates a stack named `CDKToolkit` containing: an asset bucket `cdk-hnb659fds-assets-<account>-<region>` plus a KMS key, an ECR repository `cdk-hnb659fds-container-assets-…`, five roles `cdk-hnb659fds-{deploy,cfn-exec,file-publishing,image-publishing,lookup}-role-<account>-<region>`, and an SSM parameter recording the bootstrap version.
+
+For this stage your identity needs: `cloudformation:*` (to create `CDKToolkit`), `iam:CreateRole` / `PutRolePolicy` / `AttachRolePolicy`, `s3:CreateBucket` + `PutBucketPolicy`, `kms:CreateKey`, `ecr:CreateRepository`, `ssm:PutParameter`.
+
+> ⚠️ **This stage bakes administrator permissions into the account.** We do not pass `--cloudformation-execution-policies`, so CDK uses its default of `arn:aws:iam::aws:policy/AdministratorAccess` and attaches it to `cdk-hnb659fds-cfn-exec-role`. Every later `cdk deploy` creates resources as that role. To narrow it you would have to bootstrap by hand with a tighter policy ARN — but we have **not validated** any narrower policy, it will most likely fail to install everything, and we don't recommend it.
+
+#### (2) `cdk deploy --all` — creates the three stacks
+
+This stage does **not** require your identity to have write access to the individual services. `setup.sh` passes no `--role-arn`, so `cdk deploy` assumes the bootstrap roles from (1) and the resources are actually created by `cdk-hnb659fds-cfn-exec-role` (which holds AdministratorAccess). Your identity only needs:
+
+| Action | Resource |
+|---|---|
+| `sts:AssumeRole` | `arn:aws:iam::<account>:role/cdk-hnb659fds-*` |
+| `cloudformation:DescribeStacks` / `GetTemplate` and other reads | `*` |
+| `ssm:GetParameter` | `/cdk-bootstrap/hnb659fds/version` |
+
+The service scope of the resources inside the stacks is essentially the same as Method A — see [DEPLOYMENT_ONECLICK.en.md §1.1 (2)](DEPLOYMENT_ONECLICK.en.md#11-an-aws-account-and-console-permissions-to-create-the-stack).
+
+> **`ecs:*` is not needed**, and neither is docker / finch: the only container-building stack, the legacy `BotStack`, was retired on 2026-09-03, so a normal deploy pushes no image assets. `ecr:CreateRepository` is only used when bootstrap assets were deleted out-of-band and have to be repaired.
+
+#### (3) The AWS APIs `setup.sh` calls directly — **these run as you**
+
+This is the **biggest difference** from Method A. Method A hands the same work to the stack's `StagerOrgSetup` Lambda, which uses its own execution role (so a Method A installer does not need these permissions). `setup.sh` calls them from your terminal, so **your identity must have them**.
+
+Always called:
+
+| Service | Actions | What for |
+|---|---|---|
+| `sts` | `GetCallerIdentity` | Confirm account / identity |
+| `cloudformation` | `DescribeStacks` / `ListStackResources` / `GetTemplate` / `DeleteStack` | Status checks, retiring old stacks |
+| `s3` | `CreateBucket` / `HeadBucket` / `PutBucketTagging` / `PutBucketPolicy` / `PutObject` | Asset bucket; syncing member-account onboarding templates into `notiops-data-*` |
+| `lambda` | `Invoke` / `GetFunctionConfiguration` | Post-deploy self-checks |
+| `dynamodb` | `GetItem` / `PutItem` | Writing `notiops-config` |
+| `cognito-idp` | `ListUsers` / `AdminCreateUser` / `AdminAddUserToGroup` | Creating the first administrator |
+| `secretsmanager` | `DescribeSecret` / `DeleteSecret` | Checking IM credential secrets, cleaning up retired ones |
+| `ssm` | `GetParameter` | Reading the bootstrap version |
+| `events` | `DescribeEventBus` | Event bus check |
+| `sns` | `GetTopicAttributes` | Alarm topic check |
+| `iam` | `GetRole` / `ListRolePolicies` / `ListAttachedRolePolicies` / `GetRolePolicy` / `DetachRolePolicy` / `DeleteRolePolicy` / `DeleteRole` / `ListInstanceProfilesForRole` / `RemoveRoleFromInstanceProfile` | Cleaning up roles left behind by retired stacks |
+
+Only called when the corresponding feature is on — **these are exactly the groups Method A does not need and Method B does**:
+
+| Trigger | Service | Actions |
+|---|---|---|
+| `--multi-account` (cross-account within an org) | `organizations` | `DescribeOrganization` / `ListAccounts` / `EnableAWSServiceAccess` / `RegisterDelegatedAdministrator` / `ListDelegatedAdministrators` |
+| Same (rolling out member stacks via StackSets) | `cloudformation` | `CreateStackSet` / `UpdateStackSet` / `DescribeStackSet` / `CreateStackInstances` / `ActivateOrganizationsAccess` / `DescribeOrganizationsAccess` |
+| Same (reusing an existing OAM Sink) | `oam` | `ListSinks` |
+| Security inspection's org-wide view | `securityhub` | `EnableOrganizationAdminAccount` / `CreateFindingAggregator` |
+| Billing detail (CUR + Athena) | `cur` | `PutReportDefinition` / `DescribeReportDefinitions` |
+| Same (the one-shot T+25h finalizer) | `scheduler` | `CreateSchedule` |
+
+> Signing in with IAM Identity Center also runs `aws sso login` — that is local credential acquisition and needs no in-account IAM permissions.
+
+> ⚠️ **As with Method A, the installer on this path is effectively an account administrator.** `iam:CreateRole` from (1) plus the AdministratorAccess on `cdk-hnb659fds-cfn-exec-role` together amount to privilege escalation. "Least privilege" here can only mean **narrowing the service scope**; it can never mean "let a non-administrator install this". Once installed, **day-to-day use of NotiOps needs no AWS permissions at all** — users only sign in to Cognito — so you can install with a temporary identity and then retire it.
 
 > 💡 **Production safety**: every AWS resource created by this project carries the `auto-delete=no` tag by default to protect it from automated cleanup jobs.
 
@@ -406,33 +477,47 @@ Later put this `chat_id` into the Feishu secret's `notify_chat_ids` (or configur
    - Request URL is filled in after deploy
 6. **Install App → Install to Workspace**, grab the Bot Token (`xoxb-...`)
 7. **Save** the Bot Token + Signing Secret — `setup.sh` does **not** ask for credentials;
-   after deploy, put them into the `notiops/slack-bot-token` /
-   `notiops/slack-signing-secret` secrets. See §4 / §5 and
-   [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §2
+   after deploy, enter them under **admin console → "IM Integration" → Slack tab** (the
+   "View detailed setup steps" drawer on that page walks all 8 steps, each doable entirely
+   in a browser); the backend writes them into the `notiops/slack-bot-token` /
+   `notiops/slack-signing-secret` secrets. You can also edit Secrets Manager yourself —
+   see §4 / §5 and [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §2
 8. In the target channel run `/invite @YourBot`, then open the channel settings panel to copy the **Channel ID** (`C...`). To enable proactive push, put this Channel ID in the notification settings (it is **not** a `setup.sh` prompt)
 
-### 3.3 DingTalk Internal H5 App — **v2 only**
+### 3.3 DingTalk Internal App
 
-> ⏳ **DingTalk is not exposed in v1**. `setup.sh` doesn't show a DingTalk option; even if you register the app following the steps below, there's nowhere to paste the credentials. The instructions stay here as v2 preview reading.
+> Same shape as Feishu / Slack: a **Lambda webhook** (supported on both deployment paths
+> since 2026-09-08). The `setup.sh` IM prompt lists it as `3) DingTalk`; on the
+> one-click path it is `InstallOption=web+dingtalk`. As in §3.1, **the message-receive
+> URL is filled in only after the deploy finishes.**
 >
-> Adapter code + sender are fully preserved in `platforms/dingtalk/` and `shared/report_delivery/dingtalk_sender.py`. v2 unlocks `setup.sh` interactive credential capture + dual-robot configuration automation.
+> The full walkthrough (where the URL comes from, how to debug it) is
+> [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §3 — and **every step there can be
+> done in the browser alone**: admin console → "IM Integration" → DingTalk tab → "View
+> detailed setup steps" in the top right.
 
-1. Visit [open-dev.dingtalk.com](https://open-dev.dingtalk.com/) → pick your enterprise → **应用开发 → 钉钉应用** (App Development → DingTalk Apps)
-2. **Create app**: choose **Internal H5 app** type. Do NOT pick "custom robot — webhook only" — that's a one-way robot that can't receive replies.
-3. In the app detail page:
-   - **Credentials & Basic Info** → copy **AppKey** / **AppSecret** (⏳ v2 only: you'll put these into a manually-created DingTalk secret then; v1 `setup.sh` collects no IM credentials)
-   - **Capabilities → Robot** → enable → set message-receive mode to **Stream Mode**
-   - **Permissions** → add at minimum: `Robot receive messages` / `Robot send messages` / `IM group message read/write`
-4. **Publish the app** (visible inside your enterprise is enough; no need to publish to the marketplace)
-5. **Add the robot to the target group**: in the group → group settings → group robots → add robot → pick the app you just published
-6. **(Optional but required for Lambda → DingTalk report writeback)** Add a SECOND robot — a **custom robot** (自定义机器人) — to the same group, coexisting with the H5-app robot:
-   - In the target group: **群设置 → 群机器人 → 添加机器人 → 自定义** (group settings → group robots → add → custom)
-   - Pick **加签 (HMAC sign)** as the security setting (recommended) — copy the generated secret
-   - Copy the webhook URL + (recommended) the 加签 secret — `./setup.sh` will prompt for both at deploy time, just paste them in (⏳ v2 only; v2 writes them to the manually-created DingTalk secret)
-   - **Skipping this step**: Phase 1 chat / dispatch still works, but **investigation reports won't auto-write back to the DingTalk group**; users must visit Operator Home directly.
-   - Why TWO robots: DingTalk splits inbound vs outbound across two robot classes. The **H5-app Stream-Mode robot** receives + replies (using the per-message `session_webhook`); the **custom robot** receives the AWS Lambda push (using its own webhook URL). Both live in the same group; from the user's perspective it's one bot.
+1. Visit [open-dev.dingtalk.com](https://open-dev.dingtalk.com/) → **应用开发 → 企业内部应用 → 创建应用** (App Development → Internal App → Create). Name and description are enough — you do **not** need to declare server egress IPs.
+2. Left nav **机器人 (Robot)** → enable the robot capability, give it a name and icon → save. Unlike Feishu, DingTalk needs **no** per-scope permission ticking — send/receive rides the robot capability's own channel, which is not the same thing as Feishu's `im:` / `cardkit:` scopes.
+3. Left nav **凭证与基础信息 (Credentials & Basic Info)** → copy **AppKey** / **AppSecret** (AppSecret only appears after you click it).
+   ⚠️ DingTalk has **only this one secret**: AppSecret both exchanges for an access token *and* verifies the inbound `sign` header. So there is **no** Feishu-style Encrypt Key / Verification Token — the two missing form fields are **deliberate**, not an omission.
+4. **消息接收模式 (message-receive mode) → pick "HTTP 模式" (HTTP mode)**. DingTalk defaults to **Stream mode**, and you **must change it**.
+   ⚠️ Left on Stream mode, DingTalk never sends a request to your URL at all and the bot simply never answers — the single most expensive step on this path. For **消息接收地址 (message-receive URL)**, use the `DingtalkWebhookUrl` deploy output (**keep the trailing `/`**), filled in after the deploy completes.
+5. **版本管理与发布 (Version & Release) → publish a version** — without a published version the robot cannot be added to a group.
+6. Group settings → **智能群助手 → 添加机器人** (group assistant → add robot) → pick the app robot you just published.
+7. **Save** AppKey + AppSecret — `setup.sh` does **not** ask for credentials; after deploy, enter them in the **Web Chat admin console → "IM Integration" → DingTalk tab**, which writes them to the `notiops/im-bot-dingtalk` secret (the secret name is identical on both deployment paths; you can also edit that secret directly, see §5). ⚠️ **Order matters: store the credentials first, then fill in the message-receive URL** — the ingress function hard-validates both on cold start and refuses to start if either is missing (better a dead ingress than a public URL anyone can forge requests to).
+8. **(Optional) server-initiated push**: to have investigation reports / proactive observations pushed back into the DingTalk group from Lambda, add a second robot to the group — a **custom robot** (群设置 → 群机器人 → 添加机器人 → 自定义, security setting **加签 / HMAC sign**) — and put its webhook URL in the same secret's `webhook_url` key. ⚠️ It points the **opposite direction** from step 4's message-receive URL and the two are easy to confuse: this one is us **sending to** DingTalk (it is a credential), that one is DingTalk **sending to** us (it is a public ingress address). Skipping this affects only proactive push; chat and investigation dispatch are unaffected.
 
-> The DingTalk robot **needs no public ingress**: Stream Mode is an outbound long-poll initiated by the bot. ⚠️ But the thing that used to host that long poll (`BotStack`'s ECS task) was retired on 2026-09-03 — landing DingTalk now requires a webhook adapter first (M4, not done yet).
+> ⚠️ **DingTalk validates nothing when you save the message-receive URL** — there is no
+> Feishu-style URL challenge, so nothing turns green and nothing errors. That means **one
+> wrong character in the URL** and **credentials not yet stored** look exactly the same:
+> the bot never answers. The only reliable way in is the two log groups
+> (`notiops-im-ingress-dingtalk` / `notiops-im-worker-dingtalk`), see
+> [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §3.5 — whether the ingress saw a
+> request at all separates "DingTalk never sent it" from "we didn't recognise it".
+>
+> This path **does require public ingress** (API Gateway HTTP API), same as Feishu /
+> Slack. The old "Stream Mode outbound long-poll, no public ingress needed" shape
+> (`BotStack`'s ECS task) was retired on 2026-09-03.
 
 ---
 
@@ -449,14 +534,14 @@ CDK deployment doesn't need `bootstrap.env` — `./setup.sh` walks you through t
 | | Region | 6 options (`ap-northeast-1` [default] / `us-east-1` / `us-west-2` / `eu-west-1` / `ap-southeast-1` / custom input); DevOps Agent service capabilities assume `us-east-1`, other stacks can be anywhere |
 | **Push (PHD)** | Deploy PHD event forwarding | Defaults to `Y`; the `--phd` flag handles linked-account-side forwarding |
 | **Multi-account** | Business account allowlist | Triggered separately via `--multi-account`; single-account by default |
-| **IM platforms** (optional, skipped by default) | Choice | `0` skip (default, web UI only) / `1` Feishu / `2` Slack (multi-select). **Only sets the `enabledPlatforms` flag — no credential prompt** |
+| **IM platforms** (optional) | Choice | `1` Feishu / `2` Slack / `3` DingTalk (multi-select, e.g. `1,3`) / `0` skip (default on a **first install only**, web UI only). On a **re-run** the default is to keep the live platforms as-is (`keep`); if the live state cannot be read and there is no TTY, it **exits with an error** rather than continuing on a default. **Only sets the `enabledPlatforms` flag — no credential prompt** |
 
 > **Agent Space id is not a prompt** — CDK auto-creates `notiops-devops-<account>` (see §5.3.5); you don't supply one.
 
 ### 4.2 Where IM credentials live / when you fill them
 
 At deploy time CDK creates **empty** IM secrets; you fill the credentials in **after deploy**, two ways (the script's completion banner also points here):
-- **Option A (recommended)**: log in to Web Chat (admin) → left menu "More → Inspections & Reports" opens the console → "Settings → Notifications" → fill them in
+- **Option A (recommended)**: log in to Web Chat (admin) → left nav "Inspection" opens the Inspections & Reports console → "Settings → Notifications" → fill them in
 - **Option B**: update the secret below directly. **Nothing needs restarting** — IM runs on
   Lambda and reads credentials at cold start, so a secret change takes effect on the next
   cold start (to force it now, wait a few minutes or touch a Lambda environment variable to
@@ -472,10 +557,11 @@ CDK stacks always reference the secrets by ARN. **No credential files on the loc
 | `notiops/slack-bot-token` | Slack bot token (`xoxb-`) |
 | `notiops/slack-signing-secret` | Slack signing secret — **the only request-authentication mechanism in webhook mode**; required |
 | `notiops/slack-app-token` | Slack app-level token (`xapp-`, Socket Mode). **Unused** in webhook mode; only needed if you roll back to the `BotStack` long connection |
+| `notiops/im-bot-dingtalk` | DingTalk bot credentials (single secret, JSON: `app_key` / `app_secret` / `webhook_url`). `app_key` / `app_secret` are **required** — miss either and the ingress function crashes on cold start; `webhook_url` (the group's custom-robot URL) is **optional**, needed only for server-initiated pushes (scheduled digests / inspections / Push) |
 | `notiops/bedrock-api-key` | Bedrock API Key (cross-account model-invocation auth; populated manually post-deploy, leave empty to use IAM) |
 | `notiops/litellm-config` | LiteLLM credentials (JSON: `base_url` / `api_key` / `default_model`; only if you use LiteLLM) |
 
-> DingTalk secrets (`notiops/dingtalk-app-key` / `notiops/dingtalk-app-secret`) are **NOT created by CDK** — bot-stack references them but you must `create-secret` manually (⏳ v2 wires this into `setup.sh`). There is **no `bot-stack-*/` secret prefix, and no `notiops/devops-agent-config`** (Agent Space id and other metadata live in the DDB onboard record + CDK context, not a secret).
+> The DingTalk secret is the `notiops/im-bot-dingtalk` row above, on **the same mechanism as Feishu / Slack** — CDK creates it (empty) and you fill the JSON in after deploy; **no manual `create-secret`**. There is **no `bot-stack-*/` secret prefix, and no `notiops/devops-agent-config`** (Agent Space id and other metadata live in the DDB onboard record + CDK context, not a secret).
 
 ### 4.3 Optional overrides (change defaults)
 
@@ -538,7 +624,7 @@ After §2 prerequisites (and §3 IM-app registration only if you want IM), this 
 3. `aws sts get-caller-identity` to detect the account, prompts you to confirm
 4. Lets you pick a deploy region from 6 options (default `ap-northeast-1`; includes a "custom input" choice)
 5. (Optional) asks whether to deploy PHD event forwarding (default `Y`)
-6. Asks which IM platforms to deploy (**default `0` = skip, web UI only**; `1` Feishu / `2` Slack, multi-select). **Only sets the `enabledPlatforms` flag — does not collect credentials**
+6. Asks which IM platforms to deploy (`1` Feishu / `2` Slack / `3` DingTalk, multi-select such as `1,3`; `0` skips it — the default on a **first install only**). On a **re-run** the default is to keep the live platforms as-is, so pressing Enter cannot freeze a running bot on old code. **Only sets the `enabledPlatforms` flag — does not collect credentials**
 7. **`[1/4]` Build the frontend** — builds only the Web Chat frontend (`frontend/chat-app`). The old admin console (`frontend/frontend-app`) and the old REST API behind it were retired on 2026-09-04 in this release; the directory no longer exists in the repo and `setup.sh` no longer builds it. This step also copies `config/capabilities.json` / `config/eol-dates.json` into `bff/web-chat/` (the capability manifest's single source of truth lives in `config/`, but the Lambda only packages `bff/web-chat/`) and installs the BFF dependencies (`npm ci --omit=dev`)
 8. **Deploy the Web Chat Agent** — runs `scripts/deploy_agent.sh` to deploy the Strands agent onto AgentCore Runtime and get the Runtime ARN (injected into WebChatStack via `-c agentRuntimeArn`; `SKIP_AGENT=true` skips it and the BFF falls back to echo)
 9. **`[2/4]` Install Lambda deps** (boto3 / powertools / jinja2, `--platform manylinux2014_x86_64` for Linux binaries). **If you selected IM**, it also runs `scripts/build_im_layer.sh` to build the IM dependency layer (`lark-oapi` / `slack-sdk` / `boto3`, manylinux wheels too). A failure here **aborts on the spot** rather than skipping quietly — with packages missing from the layer, `ImStack` fails at synth time anyway
@@ -568,7 +654,7 @@ npx cdk deploy --all
 
 # Deploy a single stack
 npx cdk deploy NotiOpsBackendStack
-npx cdk deploy ImStack       # IM side (Feishu / Slack webhook + Lambda)
+npx cdk deploy ImStack       # IM side (Feishu / Slack / DingTalk webhook + Lambda)
 
 # Diff to see what would change
 npx cdk diff --all
@@ -696,22 +782,22 @@ Run these immediately after deploying:
 
 1. Open the **Web Chat URL** printed in the script's completion banner (or `jq -r '.WebChatStack.ChatUrl' infra/cdk-outputs.json`)
 2. Log in as `admin` / the temp password the script printed (change it on first login)
-3. Confirm the left nav shows: Notifications / Investigate / FinOps / Cases / Skills / More
+3. Confirm the left nav shows: Notifications / Investigate / Cost / Cases / Inspection / Skills / Admin (there is **no** "More" group, and **no** "Security" item — the security dashboards open from the "Security posture" pill above the Investigate composer)
 4. Send a question or investigation request (e.g. "investigate EC2 in IAD") — a reply within seconds means success
 
 For the fuller Web Chat smoke test, see §12.6.
 
 ### 6.1 The webhook endpoint is alive (only if you enabled IM)
 
-> §6.1-6.3 **apply only if you enabled an IM platform (Feishu / Slack)**. For web-only deploys you can skip all of them.
+> §6.1-6.3 **apply only if you enabled an IM platform (Feishu / Slack / DingTalk)**. For web-only deploys you can skip all of them.
 
 IM runs on an **API Gateway HTTP API + Lambda webhook** — there is no long-lived container to look
 at, so the criterion is "the URL exists + there are logs":
 
 ```bash
-# The URL (this is exactly what you paste into the Feishu / Slack console)
+# The URL (this is exactly what you paste into the Feishu / Slack / DingTalk console)
 aws cloudformation describe-stacks --stack-name ImStack --region $AWS_REGION \
-  --query 'Stacks[0].Outputs[?OutputKey==`FeishuWebhookUrl`||OutputKey==`SlackWebhookUrl`]' \
+  --query 'Stacks[0].Outputs[?OutputKey==`FeishuWebhookUrl`||OutputKey==`SlackWebhookUrl`||OutputKey==`DingtalkWebhookUrl`]' \
   --output table
 ```
 
@@ -730,8 +816,8 @@ aws cloudformation describe-stacks --stack-name ImStack --region $AWS_REGION \
 
 ### 6.2 A message was received and processed
 
-`@bot` something in a group, then read both Lambda log groups (Feishu shown; for Slack
-replace `feishu` with `slack`):
+`@bot` something in a group, then read both Lambda log groups (Feishu shown; for Slack /
+DingTalk replace `feishu` with `slack` / `dingtalk`):
 
 ```bash
 aws logs tail /aws/lambda/notiops-im-ingress-feishu --region $AWS_REGION --since 5m
@@ -743,7 +829,7 @@ aws logs tail /aws/lambda/notiops-im-worker-feishu  --region $AWS_REGION --since
 | both have logs | ✅ working |
 | ingress yes, worker no | signature check passed but the async handoff failed — read the ingress error |
 | `401 (signature/token)` in ingress | the two keys do not match the console; back to [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §1.2 |
-| neither has logs | Feishu / Slack never sent it — is the delivery mode still on long connection / Socket Mode? |
+| neither has logs | The platform never sent it — Feishu / Slack: is the delivery mode still on long connection / Socket Mode? DingTalk: is the message-receive mode still on Stream mode (the default, which must be changed to HTTP mode)? |
 
 ### 6.3 End-to-end
 
@@ -770,6 +856,14 @@ Then try a plain question that is **not** an investigation (it goes to the DevOp
    [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §7.2)
 7. When it finishes (possibly minutes later) the card settles into the answer plus two buttons
 
+> ℹ️ **The DingTalk criteria are different (platform primitives, not unfinished work)**: DingTalk cannot
+> edit a message it has already sent and its card buttons can only be links, so there is **no** 🚀 Start
+> Investigation edit card and **no** "Dispatch Investigation" button — one sentence dispatches it directly;
+> progress does **not** refresh in place on one card either, it arrives as **at most 2 appended** "still
+> running" messages (a hard cap). On DingTalk the criteria are: an ack immediately → 0–2 progress messages
+> → the answer / report as the last one. Comparison table in
+> [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §3.6.
+
 ⚠️ "It took several minutes to answer" is **not** a failure. There is exactly one criterion:
 **did the thinking card show up immediately after you sent the question?** The user-facing wording is in
 [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §7 — don't file it as a regression.
@@ -793,6 +887,11 @@ language zh     # switch back to Chinese
 
 ### 7.1 Enable push (fill in the chat ID)
 `setup.sh` **does not ask** for a push target chat id (it only asks whether to deploy PHD event forwarding). To turn push on, put the target group into the `notify_chat_ids` field of the `notiops/im-bot-feishu` secret, or configure it under Web Chat admin → "IM Integration". Empty = the Lambda short-circuits and posts no card.
+
+> ℹ️ **DingTalk does not route by chat id**: its push target is the `webhook_url` field of the
+> `notiops/im-bot-dingtalk` secret (the group's custom-robot URL, see §3.3 step 8), and it supports
+> **exactly one** target (`SINGLE_SINK_PLATFORMS` — a platform limit). With `webhook_url` empty, nothing
+> is pushed to DingTalk (chat and investigation dispatch are unaffected).
 
 <!-- Corrected 2026-09-06: this section used to point at a set of push toggle keys in
      infra/cdk.json — the code never reads those keys (repo-wide grep hits docs only),
@@ -973,7 +1072,7 @@ All tunable parameters live under the `context` block in `infra/cdk.json`. After
 > `AWS_MCP_MODE=docs_only`, `AWS_MCP_PRICING_ENABLED=false` / `AWS_MCP_COST_ENABLED=false` — there is no
 > sidecar for a Lambda to talk to). **Model** is resolved at runtime: per-chat / per-DM `@bot model <alias>`
 > → the DDB model catalogue's `default_model` (`core/llm_pref_resolver.py`, see
-> [USER_GUIDE.en.md §7](USER_GUIDE.en.md#7-model-selection-bot-model)); **locale** comes from
+> [USER_GUIDE.en.md §15](USER_GUIDE.en.md#15-model-and-chat-object)); **locale** comes from
 > `core/locale_resolver.py`'s user / DM / thread / incident records, falling back to `en` when there is
 > none (`DEFAULT_LOCALE` is not injected). Passing these `-c` flags neither errors nor takes effect —
 > that is **silently ineffective**, which is exactly why they're listed here.
@@ -1087,7 +1186,16 @@ The **persistent inbox** of Web Chat's "Notifications" topic is fed by EventBrid
 
 ```
 1. Open the Web Chat frontend URL in a browser → sign in via Cognito
-2. Confirm the left nav shows: Notifications / Investigate / FinOps / Cases / Skills / More
+2. Confirm the left nav shows: Notifications / Investigate / Cost /
+   Cases / Inspection / Skills / Admin
+   (there is **no** "More" group — it was retired; "Admin" is top-level)
+   (there is also **no "Security" item** — Security folded into Investigate,
+    and its dashboards open only from a pill)
+   (Investigate / Cost / Cases each carry a pill row **above** the composer,
+    **left-aligned with the chat box** and with **no** leading "Dashboards"
+    label: Investigate = ⟨Operations overview⟩ ⟨Security posture⟩,
+    Cost = ⟨Spend & savings⟩, Cases = ⟨Case progress⟩. Each opens the same
+    dashboard tree as before, with a Back button at the top left)
 3. Send an investigation request (e.g. "investigate EC2 in IAD"):
    → the main chat surfaces a "View investigation steps" entry; the right-side
      "Investigation Steps" docked panel grows in real time

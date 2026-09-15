@@ -147,7 +147,7 @@ _HELP_RE = re.compile(
 )
 _LANGUAGE_RE = _cmd("language", "lang", "语言", "語言")
 _MODEL_RE = _cmd("model", "模型")
-# `/agent notiops|devops` — 选这一轮对话由谁来答（见 core/im_prefs.py）。
+# `/agent notiops|devops|starops` — 选这一轮对话由谁来答（见 core/im_prefs.py）。
 # 「助手」故意**不**收进词表：`助手 帮我查一下` 这种叫法太常见，收了就会把一句正常
 # 的提问吃成一次开关切换。「智能体」没有这个歧义。
 _AGENT_RE = _cmd("agent", "智能体", "智能體")
@@ -177,10 +177,26 @@ _ACCOUNT_RE = _cmd("account", "accounts", "acct",
 # 这道门只管 `agent` / `web` / `account` —— 它们的触发词恰好是运维日常词汇。
 # `model` / `case` 有同形状的问题（「模型 部署最佳实践」→ model、「case study for eks」
 # → case），但那是既有行为，改动面更大，单独处理（见 §B.1）。
+#
+#: ⚠️ 这份词表与 `platforms/common/pref_commands.py::_AGENT_ALIASES` 必须**同步扩**：
+#: 这里少一个词 → 裸词形式（`agent starops`）压根不算命令，掉给模型烧 token；
+#: 那边少一个词 → 命令认了但参数认不出来，用户只拿到一句「用法: …」。
+#: 两种漏法的症状完全不同，所以加 agent 时两边都要改
+#: （`tests/test_im_pref_commands.py::test_every_agent_arg_the_reply_layer_knows_also_routes`
+#: 一条断言在比这两份词表；STAROps 那几个词另有一条在
+#: `tests/test_im_starops_agent.py::test_the_two_word_tables_are_word_for_word_equal`）。
+#:
+#: STAROps 这一支**单独导出**：客户脑子里这条路叫「阿里云」而不是产品名，所以词表里必须
+#: 有中文；而 `pref_commands.py` 故意**不在** `scripts/lint_i18n.py` 的 CJK 允许清单里
+#: （那边加豁免会掩盖真实的漏翻译）。让它从本模块取词、自己一个中文字都不写，两边的规矩
+#: 就都不用破。
+AGENT_STAROPS_WORDS: frozenset[str] = frozenset({
+    "starops", "star", "starops-agent", "aliyun", "阿里云", "阿里雲",
+})
 AGENT_ARG_WORDS: frozenset[str] = frozenset({
     "devops", "dev", "devops-agent", "notiops", "noti", "notiops-agent",
     "default", "clear", "reset", "auto",
-})
+}) | AGENT_STAROPS_WORDS
 #: on / off 两侧分开导出 —— `pref_commands` 要分别判断，合起来它就没法知道用户要哪边。
 WEB_ON_WORDS: frozenset[str] = frozenset({
     "on", "1", "true", "yes", "enable", "enabled", "开", "打开", "开启",
@@ -978,7 +994,13 @@ HELP_COMMANDS: tuple[tuple[str, str, str], ...] = (
     # (feature, "en command(s)", "zh command(s)")
     ("investigate", "/investigate <text>", "/调查 <内容>"),
     ("case",        "/case · /cases",       "/案例 · /工单"),
-    ("agent",       "/agent notiops|devops", "/智能体 notiops|devops"),
+    # ⚠️ 这一格列的是**路由真的认得的档位**（要与 `_AGENT_ARG_WORDS` 一致），不是发给
+    #    客户的菜单文案 —— 6 个渲染点全都只用 `feature`，把 en/zh 这两列丢掉（它们现在
+    #    只被 tests 用来反查"菜单里承诺的命令真的能打"）。所以这里**留着 starops 是对的**：
+    #    `/agent starops` 依旧能打通。客户菜单里那一行是 `help.row.agent`，由
+    #    `core/multicloud.py` 的 `VISIBLE` 门控（2026-09-15 起不含 starops）—— 别看到
+    #    "菜单里没有"就顺手把这里的 starops 删掉，那会把还在用它的部署弄坏。
+    ("agent",       "/agent notiops|devops|starops", "/智能体 notiops|devops|starops"),
     ("web",         "/web on|off",          "/联网 on|off"),
     ("account",     "/account <id>",        "/账号 <账号 id>"),
     ("model",       "/model · /model list", "/模型 · /模型 list"),

@@ -436,7 +436,10 @@ def poll_investigation(execution_id: str, task_id: str, agent_space_id: str,
                        account_id: str | None = None, seen_ids: set | None = None,
                        locale: str = "zh") -> dict:
     """**轮询一次**：拉自上次以来的新 journal 记录 + 当前任务状态。供上层循环驱动"实时显示"。
-    返回 {ok, status, terminal(bool), new_lines:[str], seen_ids(set)}；失败 {error,message}。
+    返回 {ok, status, status_unknown(bool), records_error(str), terminal(bool),
+    new_lines:[str], seen_ids(set)}；整轮失败 {error,message}。
+    `status_unknown=True` = **这一轮没查到状态**（不是"在跑"）；`records_error` = 拉 journal
+    的异常类型名（空串 = 正常）。两者都不该被调用方当成"没有新进展"吞掉。
     无状态化：调用方持有 seen_ids（已展示过的 recordId），传进来做增量。
 
     `locale`（"zh" / "en"）只影响进度行的固定前缀；agent 正文一律原样透传、不翻译
@@ -456,10 +459,12 @@ def poll_investigation(execution_id: str, task_id: str, agent_space_id: str,
     seen = set(seen_ids or set())
     new_lines: list[str] = []
     # 1) 拉全部新记录（按时间升序，老的先展示）
+    records_error = ""
     try:
         records = _list_all_records(client, space, execution_id)
     except Exception as e:  # noqa: BLE001
         records = []
+        records_error = type(e).__name__
         logger.warning("poll_investigation list records failed: %s", _safe_err(e))
     for rec in records:
         rid = rec.get("recordId")
@@ -470,13 +475,20 @@ def poll_investigation(execution_id: str, task_id: str, agent_space_id: str,
         if line:
             new_lines.append(line)
     # 2) 查任务状态（判断是否终态）
-    status = "IN_PROGRESS"
+    # ⚠️ 这里**不许**默认 "IN_PROGRESS"。get_backlog_task 挂掉时假报"在跑"，上层循环就会
+    # 一直转到等待上限，然后告诉用户"调查仍在 AWS 侧继续跑"—— 而真实情况可能是我们连都连
+    # 不上、或者调查早就 FAILED 了。查不到就说查不到：status="" + status_unknown=True，
+    # 由调用方决定重试几次、以及怎么如实告知。
+    status, status_unknown = "", False
     try:
         t = client.get_backlog_task(agentSpaceId=space, taskId=task_id).get("task", {})
-        status = t.get("status") or status
+        status = t.get("status") or ""
     except Exception as e:  # noqa: BLE001
         logger.warning("poll_investigation get_backlog_task failed: %s", _safe_err(e))
-    return {"ok": True, "status": status, "terminal": status in _TERMINAL,
+    if not status:
+        status_unknown = True
+    return {"ok": True, "status": status, "status_unknown": status_unknown,
+            "records_error": records_error, "terminal": status in _TERMINAL,
             "new_lines": new_lines, "seen_ids": seen}
 
 

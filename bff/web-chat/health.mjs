@@ -25,6 +25,8 @@ import { HealthClient, DescribeEventsCommand, DescribeEventDetailsCommand, Descr
 // Health 全局 API 端点固定 us-east-1(即便部署主区不同)。
 const health = new HealthClient({ region: "us-east-1" });
 import { credsFor } from "./xacct.mjs";
+// safeErr：异常一律压成"类型名/错误码"再进响应体（见 safe_err.mjs）。
+import { safeErr } from "./safe_err.mjs";
 // 跨账号（eos.mjs 同款模式）：请求级客户端变量，Lambda 同容器同一时刻单请求，安全。
 // getHealthDashboard 入口按 accountId 设置，入口处 **总是** 先重置回默认，
 // 保证 count/detail 等其它入口(部署账号视角)不受上一请求影响。
@@ -140,7 +142,7 @@ export async function getHealthDashboard(accountId) {
       nextToken = r.nextToken;
     } while (nextToken && events.length < 300);
   } catch (e) {
-    const msg = String(e?.name || e?.message || e);
+    const msg = safeErr(e); // 只剩"类型名/错误码"；/Subscription/i 仍能命中异常名
     if (/Subscription/i.test(msg)) {
       // 无 Business+ Support 计划 → 优雅降级,前端显示"需 Business+ 计划 + 控制台链接"。
       return { available: false, reason: "subscription_required", links: consoleLinks };
@@ -192,7 +194,7 @@ export async function getHealthOpenIssueCount() {
     }));
     return { available: true, openIssues: (r.events || []).length };
   } catch (e) {
-    const msg = String(e?.name || e?.message || e);
+    const msg = safeErr(e); // 只剩"类型名/错误码"；/Subscription/i 仍能命中异常名
     if (/Subscription/i.test(msg)) return { available: false, openIssues: 0 };
     return { available: false, openIssues: 0, error: msg };
   }
@@ -237,7 +239,7 @@ export async function getHealthEventDetail(arn) {
       affectedEntities: entities,
     };
   } catch (e) {
-    const msg = String(e?.name || e?.message || e);
+    const msg = safeErr(e); // 只剩"类型名/错误码"；/Subscription/i 仍能命中异常名
     if (/Subscription/i.test(msg)) return { available: false, reason: "subscription_required" };
     return { available: false, reason: "error", message: msg };
   }

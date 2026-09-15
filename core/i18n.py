@@ -648,7 +648,7 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
                "\n建议切到稳定模型重试这一句:\n"
                "• `@bot model claude` → Claude Sonnet 5(内部测试中较稳定)\n"
                "• `@bot model nova` → Amazon Nova Pro(合规白名单友好)\n"
-               "\n(所有模型均经 Amazon Bedrock 访问;GPT-5.6 Terra 当前为 experimental,见 USER_GUIDE §7.3。)"),
+               "\n(所有模型均经 Amazon Bedrock 访问;GPT-5.6 Terra 当前为 experimental,见 USER_GUIDE §15.3。)"),
         "en": ("⚠️ The current model (GPT-5.6 Terra) had its reply blocked by "
                "the output sanitizer this turn (suspected protocol "
                "fragment or low-quality token leak). Skipped so you "
@@ -659,7 +659,7 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
                "• `@bot model nova` → Amazon Nova Pro (compliance-list "
                "friendly)\n"
                "\n(All models are accessed through Amazon Bedrock. "
-               "GPT-5.6 Terra is currently experimental, see USER_GUIDE §7.3.)"),
+               "GPT-5.6 Terra is currently experimental, see USER_GUIDE §15.3.)"),
     },
     # 凭证被拒（401/403）。刻意不说成"临时故障、请重试"—— 它不会自愈，重试只是白等。
     # 也刻意不透露任何凭证细节（spec R5.5）：只说是凭证问题，以及谁能修。
@@ -813,6 +813,13 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "NotiOps Agent(走模型 · 会消耗 token)",
         "en": "NotiOps Agent (uses the model · consumes tokens)",
     },
+    # ⚠️ 标签里必须写「阿里云」：这条路 NotiOps 侧同样 0 token,但它看的是**阿里云**资源。
+    # 只写 "STAROps(直连 · 无模型消耗)" 的下场是客户拿它问 EC2、得到"查不到",
+    # 然后归因成产品坏了 —— 那是这三个标签里最贵的一种误解。
+    "agent.label.starops": {
+        "zh": "STAROps 数字员工(阿里云 · 直连 · 不消耗 NotiOps token)",
+        "en": "STAROps digital employee (Alibaba Cloud · direct · no NotiOps tokens)",
+    },
     "agent.current": {
         "zh": "🧭 当前对话由 **{label}** 回答(来源: {source})",
         "en": "🧭 Chat is answered by **{label}** (source: {source})",
@@ -833,26 +840,75 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "⚠️ 切换失败(DDB 写入错误),请稍后再试 —— 当前仍然是原来那个。",
         "en": "⚠️ Switch failed (DDB write error); please try again — still on the previous one.",
     },
+    # ⚠️ 下面这一对（以及 `agent.usage` / `help.row.agent` 那两对）是**孪生文案**：
+    #   · 基线 key = 当前发给客户的那份，**不含 starops**；
+    #   · `<key>.multicloud` = 含 starops 的原文，逐字保留。
+    # 选哪一份由 `core/multicloud.py` 的 `VISIBLE` 决定（2026-09-15 产品决策：多云先不
+    # 对外，只藏文案、执行路径全留）。所以：**改基线的时候要顺手改孪生那份**，否则以后
+    # 把多云翻回来，客户看到的是一份漂移了半年的旧文案。一致性由
+    # `tests/test_multicloud_gate.py` 钉住（两份都必须存在、都必须双语）。
     "agent.unknown": {
         "zh": "⚠️ 未知的 agent `{arg}`。可用: `notiops` · `devops`",
         "en": "⚠️ Unknown agent `{arg}`. Available: `notiops` · `devops`",
+    },
+    "agent.unknown.multicloud": {
+        "zh": "⚠️ 未知的 agent `{arg}`。可用: `notiops` · `devops` · `starops`",
+        "en": "⚠️ Unknown agent `{arg}`. Available: `notiops` · `devops` · `starops`",
     },
     "agent.token_notice": {
         "zh": "⚠️ NotiOps Agent 走大模型,每一轮问答都会消耗 token。想回到不花钱的那条:`agent devops`。",
         "en": "⚠️ The NotiOps Agent calls the model — every turn consumes tokens. "
               "To go back to the free path: `agent devops`.",
     },
+    # 孪生文案，见上面 `agent.unknown` 那段注释。
     "agent.usage": {
         "zh": "用法:`agent` 查看 · `agent notiops` 切到 NotiOps Agent(走模型) · "
               "`agent devops` 切回直连(无模型消耗) · `agent default` 清除偏好",
         "en": "Usage: `agent` to view · `agent notiops` for the NotiOps Agent (uses the model) · "
-              "`agent devops` for the direct path (no model usage) · `agent default` to clear",
+              "`agent devops` for the direct path (no model usage) · "
+              "`agent default` to clear",
+    },
+    "agent.usage.multicloud": {
+        "zh": "用法:`agent` 查看 · `agent notiops` 切到 NotiOps Agent(走模型) · "
+              "`agent devops` 切回直连(无模型消耗) · `agent starops` 切到阿里云 STAROps "
+              "数字员工(问阿里云资源) · `agent default` 清除偏好",
+        "en": "Usage: `agent` to view · `agent notiops` for the NotiOps Agent (uses the model) · "
+              "`agent devops` for the direct path (no model usage) · `agent starops` for the "
+              "Alibaba Cloud STAROps digital employee (asks about Alibaba Cloud resources) · "
+              "`agent default` to clear",
     },
     "agent.not_configured": {
         "zh": "⚠️ 这套部署没有接 NotiOps Agent(缺 `AGENT_RUNTIME_ARN`),切不过去。"
               "当前仍然是 DevOps Agent 直连。",
         "en": "⚠️ This deployment has no NotiOps Agent wired in (missing `AGENT_RUNTIME_ARN`), "
               "so the switch was not applied. Still on the DevOps Agent direct path.",
+    },
+    # ⚠️ 与 `agent.not_configured` 同一条口径:**拒绝且不写偏好**。这里要说清楚"去哪儿配"
+    # 与"缺的是两样东西",否则客户只填了 AccessKey 就回来重试,又被拒一次。
+    # 缺**哪一项**的精确话术在 `core/starops_chat.not_configured_text()`(对话时给),
+    # 这里是切换时的拒绝 —— 只给去处,不重复那张表。
+    "agent.starops_not_configured": {
+        "zh": "⚠️ 还没配好阿里云 STAROps,切不过去。请到管理后台 →「多云」→ 阿里云,"
+              "填好 **AccessKey**(ID + Secret)和 **数字员工 ID**,再切一次。"
+              "当前仍然是原来那个 agent。",
+        "en": "⚠️ Alibaba Cloud STAROps is not configured yet, so the switch was not applied. "
+              "Go to Admin -> Multi-cloud -> Alibaba Cloud, fill in the **AccessKey** "
+              "(ID + Secret) and the **digital employee ID**, then switch again. "
+              "Still on the previous agent.",
+    },
+    # 切过去时的一次性提醒。两件事都必须说(理由同 `agent.token_notice`:IM 是被动入口):
+    #   1. 问的是**阿里云**资源,不是 AWS;
+    #   2. NotiOps 侧 0 token,但烧客户自己的阿里云 AI 额度。
+    # `{employee}` 是数字员工 **ID**(不是显示名称)—— 一个阿里云账号可以有多个数字员工,
+    # 纳管范围与答案质量完全不同,所以这是读答案时的必要坐标。
+    "agent.starops_notice": {
+        "zh": "ℹ️ 这条路直连你自己的阿里云 STAROps 数字员工 `{employee}`,问的是**阿里云**"
+              "资源(不是 AWS)。NotiOps 侧不消耗 token,但会消耗你阿里云账号的 AI 额度。"
+              "想回到问 AWS 的那条:`agent devops`。",
+        "en": "ℹ️ This path talks directly to your own Alibaba Cloud STAROps digital employee "
+              "`{employee}` and answers about **Alibaba Cloud** resources (not AWS). It uses no "
+              "NotiOps tokens, but it does consume your Alibaba Cloud AI quota. "
+              "To go back to asking about AWS: `agent devops`.",
     },
 
     # ── NotiOps Agent 那条路**跑起来之后**的失败话术（core/agent_chat.py）──────
@@ -1084,6 +1140,9 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
     # 能打的说法）。不给"大白话"示例是有意的：`agent` / `web` / `account` 是开关，猜错的
     # 代价是悄悄开了计费、悄悄关了联网,或者**把整个群问到另一个 AWS 账号上**,宁漏不误。
     # 引号样式仍要中英各一条（见上面那段）。
+    # ⚠️ 这一行要与 `agent.usage` 列的取值**一致**：菜单里没写的档位等于没有这个功能
+    #    （客户不会去猜 `/agent starops`）。所以这一对与 `agent.usage` 那一对是**同进
+    #    同退**的 —— 孪生机制见上面 `agent.unknown` 那段注释。
     "help.row.agent": {
         "zh": "🧭 **谁来回答** — `/agent notiops|devops`、`/智能体 notiops|devops`;"
               "默认是 DevOps Agent 直连(无模型消耗),说「智能体 notiops」换成走模型的 "
@@ -1091,6 +1150,19 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "🧭 **Who answers** — `/agent notiops|devops`, `/智能体 notiops|devops`; "
               "defaults to the DevOps Agent (no model usage). Say “agent notiops” for the "
               "model-backed NotiOps Agent, or in Chinese 「智能体 devops」",
+    },
+    # starops 那一格必须点明是**阿里云** —— 不写「阿里云」的话，用户会以为它是另一个问
+    # AWS 的档位，问一句 AWS 得到一句「查不到这个实例」，然后当成产品坏了。
+    "help.row.agent.multicloud": {
+        "zh": "🧭 **谁来回答** — `/agent notiops|devops|starops`、`/智能体 notiops|devops`;"
+              "默认是 DevOps Agent 直连(无模型消耗),说「智能体 notiops」换成走模型的 "
+              "NotiOps Agent,英文 “agent devops” 一样认;`/agent starops` 切到**阿里云** "
+              "STAROps 数字员工(问阿里云资源,NotiOps 侧也不消耗 token)",
+        "en": "🧭 **Who answers** — `/agent notiops|devops|starops`, `/智能体 notiops|devops`; "
+              "defaults to the DevOps Agent (no model usage). Say “agent notiops” for the "
+              "model-backed NotiOps Agent, or in Chinese 「智能体 devops」; `/agent starops` "
+              "switches to your **Alibaba Cloud** STAROps digital employee (asks about "
+              "Alibaba Cloud resources, also no NotiOps tokens)",
     },
     "help.row.web": {
         "zh": "🌐 **联网搜索** — `/web on|off`、`/联网 on|off`;默认关,只对 NotiOps Agent 生效,"
@@ -1204,6 +1276,26 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         # 一行字,带上"(默认)"就太长了。
         "zh": "账号: {account}(部署账号)",
         "en": "Account: {account} (deployment account)",
+    },
+    # ── 第三条路(阿里云 STAROps,2026-09-14)的落款两段 ────────────────────────
+    # 为什么不复用 `router.direct_no_token`:那句的**字面**是「直连 DevOps Agent」。
+    # 判据只写 `agent != "notiops"` 的话,STAROps 这条路会顶着 DevOps Agent 的名字 ——
+    # "不会宣称花钱"和"名字是对的"是两件事(见 im_footer.route_line 的 ⚠️)。
+    # "NotiOps 侧"这三个字必须留:这条路对我们免费,但**会烧客户自己的阿里云 AI 额度**,
+    # 一句光秃秃的"无模型消耗"是在暗示"完全不花钱"。
+    "router.direct_starops": {
+        "zh": "⚡ 直连阿里云 STAROps · NotiOps 侧无模型消耗",
+        "en": "⚡ Direct to Alibaba Cloud STAROps · no NotiOps model usage",
+    },
+    # 🔴 这一段**顶替**上面 `router.account*`(而不是并列):STAROps 答的是阿里云资源,
+    #    在同一行里再盖一个 12 位 AWS 账号号是跨云假信息 —— 客户会以为这份阿里云结论
+    #    "是关于那个 AWS 账号的"。互斥逻辑在 `im_footer.usage_footer` 一处。
+    # ⚠️ 值是数字员工 **ID**(不是显示名称):一个阿里云账号可以有多个数字员工,纳管范围
+    #    与答案质量完全不同,而客户要拿这个值回控制台/工单里对 —— 能唯一定位的是 ID。
+    # 与 `router.account` 同口径:不加反引号(落款是一行灰色小字,加底色方块是噪音)。
+    "router.employee": {
+        "zh": "数字员工: {employee}",
+        "en": "Digital employee: {employee}",
     },
 
     # =====================================================================
@@ -2898,15 +2990,21 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "Hi 👋 给我一条指令吧,例如:`查 IAD 所有 EC2 信息`",
         "en": "Hi 👋 Send me a command, e.g. `list all EC2 in us-east-1`",
     },
-    "dingtalk.phase2_not_yet": {
-        "zh": ("👷 这个意图(skill 编排 / 主动观察等)在钉钉端属于后续 Phase "
-               "计划,目前先用飞书或 Slack。基础调查 / 概念问答 / Support "
-               "case 管理 / 模型切换 / 语言切换 都已经可用。"),
-        "en": ("👷 This intent (skill orchestration / push observation, "
-               "etc.) is on the DingTalk later-phase roadmap. Use Feishu "
-               "or Slack for now. Basic investigation, concept Q&A, "
-               "Support case management, and model / language switching "
-               "already work."),
+    # 只被 `platforms/dingtalk/app/main.py`(已退役的 Stream 模式长连接形态)调用。
+    # 现网钉钉走 HTTP 回调 Lambda 通道,那条路径上 case / push / 调查全都可用 ——
+    # 所以这条文案**不能**说「钉钉还没做」,也不能把客户劝去飞书 / Slack。
+    "dingtalk.legacy_stream_path_unsupported": {
+        "zh": ("👷 这个意图在当前这条**长连接(Stream 模式)**通道上没有实现 —— "
+               "它是已退役的回滚形态。现网的钉钉接入走 HTTP 回调模式,在那条通道上 "
+               "调查派发 / 概念问答 / Support case 管理 / 主动推送 / 模型与语言切换 "
+               "都可用。请联系管理员确认钉钉后台的「消息接收模式」是否为 HTTP 模式。"),
+        "en": ("👷 This intent is not implemented on this long-connection "
+               "(Stream mode) channel — a retired fallback shape. The shipped "
+               "DingTalk integration uses HTTP callback mode, where "
+               "investigation dispatch, concept Q&A, Support case management, "
+               "proactive push, and model / language switching all work. Ask "
+               "your administrator to confirm DingTalk's message-receive mode "
+               "is set to HTTP mode."),
     },
     # ----- DingTalk conversational case-create flow -----
     "dingtalk.case.create.prompt_title": {
@@ -3419,6 +3517,14 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "NotiOps Agent 回答",
         "en": "NotiOps Agent answer",
     },
+    # 第三条路(2026-09-14)。标题里必须带**阿里云**:这张卡的正文说的是阿里云资源,
+    # 而它长得和上面两张一模一样 —— 客户在同一个群里三条路来回切,标题是唯一的分辨点。
+    # 只写 "STAROps 回答" 不够:STAROps 这个产品名客户未必认,「阿里云」三个字才是他脑子里
+    # 的那条路(同一条理由让 `_AGENT_ALIASES` 收了「阿里云」这个别名)。
+    "im.chat.card_title.starops": {
+        "zh": "阿里云 STAROps 回答",
+        "en": "Alibaba Cloud STAROps answer",
+    },
     # 「边想边看」三条 —— 见 platforms/common/live_card.py。
     # 立刻回一张这个标题的卡（不等答案），用户才知道"收到了、要等一会儿"：实测一个
     # 「列出所有 S3 桶及其大小」的问题跑了 347 秒，M1 那版全程静默，看着像后台挂了。
@@ -3509,6 +3615,42 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "收到了，正在查。NotiOps Agent 挖得深一些需要几分钟。",
         "en": "Got it, looking into this now. A deeper dig by the NotiOps Agent "
               "needs a few minutes.",
+    },
+    # 同样 5 条，给 `/agent starops` 那条路（2026-09-14）—— 换的不只是名字，还有**云**。
+    #
+    # 为什么必须单独一套而不是复用上面十条里的任意一套：这条路问的是**阿里云**资源。
+    # 一句「正在让 DevOps Agent 分析」出现在一个阿里云问题上，客户等几分钟拿到一份
+    # 阿里云答案时会先怀疑自己切错了；更糟的是他拿 AWS 的问题过来问，ack 说得像 AWS
+    # 那条路、结果答"查不到"，然后归因成产品坏了。所以这五条里「阿里云」三个字是**必须**
+    # 出现的（英文同理 Alibaba Cloud）—— 它是这一轮唯一的早期纠错信号。
+    #
+    # ⚠️ 这五条**不提 token / 额度**：切换那一刻已经用 `agent.starops_notice` 说过
+    # 「NotiOps 侧不消耗 token，但会消耗你阿里云账号的 AI 额度」。每一轮再说一遍就变成
+    # 噪音，而客户真正会漏读的是"这条路问的是哪家云"（上面那条）。
+    "im.chat.ack_body.starops.1": {
+        "zh": "已收到，正在让阿里云 STAROps 数字员工分析。复杂问题可能要跑几分钟。",
+        "en": "Got it — the Alibaba Cloud STAROps digital employee is working on "
+              "this. Complex questions can take a few minutes.",
+    },
+    "im.chat.ack_body.starops.2": {
+        "zh": "收到，阿里云 STAROps 数字员工已经开始查了。复杂一点的问题要跑几分钟。",
+        "en": "On it — the Alibaba Cloud STAROps digital employee has started "
+              "digging. Anything non-trivial takes a few minutes.",
+    },
+    "im.chat.ack_body.starops.3": {
+        "zh": "这个问题交给阿里云 STAROps 数字员工了，正在翻数据。可能要等几分钟。",
+        "en": "Handed this to the Alibaba Cloud STAROps digital employee — it is "
+              "pulling the data now. This can take a few minutes.",
+    },
+    "im.chat.ack_body.starops.4": {
+        "zh": "好，阿里云 STAROps 数字员工接手了。查得细的时候会慢一点，可能要几分钟。",
+        "en": "Sure — the Alibaba Cloud STAROps digital employee has picked this "
+              "up. A thorough look takes a bit longer, maybe a few minutes.",
+    },
+    "im.chat.ack_body.starops.5": {
+        "zh": "收到了，正在查阿里云。STAROps 数字员工挖得深一些需要几分钟。",
+        "en": "Got it, looking into Alibaba Cloud now. A deeper dig by the "
+              "STAROps digital employee needs a few minutes.",
     },
     # 去处句 —— 飞书 / Slack：同一张卡原地刷新。
     "im.chat.ack_tail.card": {

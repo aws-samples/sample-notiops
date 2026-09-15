@@ -58,16 +58,20 @@ _ANSWER_TITLES = {
     "thinking": "im.chat.thinking_title",
 }
 
-#: 终态标题按"谁答的"分两套。**与 Slack 那份 `im_blocks._FINAL_TITLES` 逐字对齐**。
+#: 终态标题按"谁答的"分三套。**与 Slack 那份 `im_blocks._FINAL_TITLES` 逐字对齐**。
+#: `starops` 那条标题必须点明**阿里云** —— 三条路的卡片长得一模一样，标题是用户区分
+#: "这答案是关于哪家云的"最快的一眼。
 _FINAL_TITLES = {
     "devops": "im.chat.card_title",
     "notiops": "im.chat.card_title.notiops",
+    "starops": "im.chat.card_title.starops",
 }
 
 
 def usage_footer(locale: str, *, agent: str = "devops", usage=None,
-                 account: str = "", deploy: str = "") -> str:
-    """卡片落款 —— 「这一轮是哪条路、哪个模型、问的哪个账号」。
+                 account: str = "", deploy: str = "",
+                 employee: str = "") -> str:
+    """卡片落款 —— 「这一轮是哪条路、哪个模型、问的哪个账号 / 哪个数字员工」。
 
     ⚠️ 实现整个在 `platforms.common.im_footer` 里，**与 Slack 共用同一份**（不再是
     两份逐字对齐的副本 —— 理由见那个模块的文件头）。这里只保留入口：`caps.py` 的
@@ -75,28 +79,38 @@ def usage_footer(locale: str, *, agent: str = "devops", usage=None,
 
     口径（都在 `im_footer` 的 docstring 里）：直连说"无模型消耗"、走模型的那条报
     **实际生效**的模型 id、拿不到模型 id 也不许退成"无模型消耗"、用量只统计不显示、
-    账号号拿不到就整段不显示。
+    账号号拿不到就整段不显示；`agent="starops"` 时 AWS 账号那一段**整段消失**、换成
+    阿里云数字员工 ID（跨云假信息，见 `im_footer` 文件头 🔴 那一段）。
     """
     return im_footer.usage_footer(locale, agent=agent, usage=usage,
-                                  account=account, deploy=deploy)
+                                  account=account, deploy=deploy,
+                                  employee=employee)
 
 
 def answer_card(reply: str, locale: str, *,
                 steps=None, state: str = "final", elapsed: int = 0,
                 report_url: str = "", sources=None,
                 agent: str = "devops", usage=None,
-                account: str = "", deploy: str = "") -> dict:
-    """对话问答的答案卡 —— 「思考中」与「答完」**共用**这一张，两个 agent 也共用。
+                account: str = "", deploy: str = "",
+                employee: str = "") -> dict:
+    """对话问答的答案卡 —— 「思考中」与「答完」**共用**这一张，三个 agent 也共用。
 
     `agent` ∈ {"devops"（默认，直连客户的 DevOps Agent，NotiOps 侧 0 token）,
-    "notiops"（走模型的 NotiOps Agent）}。它只影响**标题**和**落款**（见
-    `usage_footer`）—— 结构共用一张，是为了不让两条路的卡片各自演进出差异。
+    "notiops"（走模型的 NotiOps Agent）, "starops"（直连阿里云 STAROps 数字员工，
+    NotiOps 侧 0 token，看的是**阿里云**资源）}。它只影响**标题**和**落款**（见
+    `usage_footer`）—— 结构共用一张，是为了不让三条路的卡片各自演进出差异。
     `sources` / `usage` 实际上只有 notiops 那条路有值。
 
     `account` / `deploy` 是落款里「这条回答基于哪个账号」那一段（多账号，2026-09-07）：
     `account` 是本轮目标账号（空 = 部署账号，`ImMessage.account_id` 的契约），
     `deploy` 是部署账号号。**两个都必须由调用方传** —— 渲染函数每几秒被
     `LiveCard.flush` 调一次，在这里解析账号等于把一次 STS 塞进渲染循环。
+
+    `employee` 是 STAROps 那条路上**替代**账号那一段的阿里云数字员工 ID（2026-09-14）。
+    调用方照旧无脑传 `account=` / `deploy=` 即可 —— 互斥判断只在 `im_footer` 一处。
+    ⚠️ 这个值要到本轮**跑完**才知道（`run_starops_chat` 的返回里带），所以进度态渲染时
+    它是空的、落款只有路由那一行；这是刻意的：为了它提前解析等于每轮多打一次
+    Secrets Manager（`core/aliyun_config.py` 无缓存）。
 
     `state` 三态（`platforms/common/live_card.py` 每隔几秒 PATCH 一次时给）：
       · ``"queued"`` —— 还没轮到（同一个会话前一个问题在跑，见 `chat_lease.py`），
@@ -139,7 +153,8 @@ def answer_card(reply: str, locale: str, *,
     elements.append({"tag": "hr"})
     elements.append({"tag": "markdown",
                      "content": usage_footer(locale, agent=agent, usage=usage,
-                                             account=account, deploy=deploy)})
+                                             account=account, deploy=deploy,
+                                             employee=employee)})
     actions: list[dict] = []
     if report_url and final:
         actions.append(_url_btn(i18n.t("report.see_full", locale), report_url))

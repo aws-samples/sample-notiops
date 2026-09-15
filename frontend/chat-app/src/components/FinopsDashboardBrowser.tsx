@@ -48,7 +48,7 @@ const ICONS: Record<string, React.ReactNode> = {
 };
 
 export default function FinopsDashboardBrowser({
-  data, onAsk, initial = "spend", can = () => true, hasCapNode = () => false,
+  data, onAsk, initial = "spend", can = () => true, hasCapNode = () => false, accountId,
 }: {
   data?: FinopsData;
   onAsk?: (q: string) => void;
@@ -57,6 +57,9 @@ export default function FinopsDashboardBrowser({
   can?: (key: string) => boolean;
   /** 服务端能力树里是否真有这个节点（权限 + 数据源双满足，不 fail-open）。 */
   hasCapNode?: (key: string) => boolean;
+  /** 多账号：顶栏选中的看板账号（空 = 组织聚合）。FinopsDashboard 按它取数；
+   *  cur-* 是 payer 级口径，只用它挂一条「不适用」说明。 */
+  accountId?: string;
 }) {
   const { locale } = useLocale();
   const zh = locale !== "en";
@@ -90,8 +93,8 @@ export default function FinopsDashboardBrowser({
           <div style={{ padding: 24, color: "var(--muted)" }}>
             {zh ? "当前账号没有可见的成本仪表盘。" : "No cost dashboards are available for your account."}
           </div>
-        ) : effSel.startsWith("cur-") ? <CurDashboard sheet={effSel} /> :
-        <FinopsDashboard dashboardId={effSel} onAsk={onAsk} data={data} can={can} />}
+        ) : effSel.startsWith("cur-") ? <CurDashboard sheet={effSel} accountId={accountId} /> :
+        <FinopsDashboard dashboardId={effSel} onAsk={onAsk} data={data} can={can} accountId={accountId} />}
       </div>
     </div>
   );

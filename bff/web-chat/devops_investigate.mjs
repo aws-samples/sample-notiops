@@ -47,11 +47,12 @@ function int(v, dflt) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 只记异常类型 + 错误码，绝不外泄原始 message（对齐 docs/LOGGING_STANDARD.md）。
- *  export 是给 devops_chat.mjs（「DevOps 对话」）复用的 —— 同一套日志纪律只留一份实现。 */
-export function safeErr(e) {
-  const code = e?.name || e?.$metadata?.httpStatusCode || "unknown";
-  return `${e?.constructor?.name || "Error"}/${code}`;
-}
+ *  实现已挪到 `safe_err.mjs`（router 也要用，不该为两行工具 import 这个重模块）。
+ *  这里保留 re-export：devops_chat.mjs 的 import 与它的源码级断言都指着这个名字。
+ *  ⚠️ 必须 import 再 export，不能写成 `export { safeErr } from "…"` —— 那种写法
+ *  不会在本模块里建立局部绑定，本文件自己那 14 处 `safeErr(...)` 会全部 ReferenceError。 */
+import { safeErr } from "./safe_err.mjs";
+export { safeErr };
 
 /** DevOps Agent 后台链接。⚠️ deep link 用 **taskId**（不是 executionId）。
  *  export 给 devops_chat.mjs 复用（它只用 home —— 对话没有 taskId，别猜深链）。 */
@@ -551,8 +552,10 @@ function slug(s) {
 /**
  * 渲染 HTML 报告并落 S3，返回可直接点开的链接。
  * ⚠️ 只用 PutObject，**不做 presigned URL 分支**：ReportsCDN 是 CloudFront + OAC，
- * `https://<cdn>/reports/...` 直接可读且**不过期**；退化成 presign 只会得到 12h 有效期，
+ * `https://<cdn>/reports/...` **不带签名**、直接可读；退化成 presign 只会得到 12h 有效期，
  * 比老路径更差。CDN 域名缺失（未配置）时直接返回 null，聊天里只是少一个链接，不报错。
+ * ⚠️ 链接**不是永久的**：桶上有 `expire-reports-7d`（infra/lib/constructs/minimal-base-core.ts）
+ * 把 `reports/` 前缀 7 天后删掉。这里原来写的是"不过期" —— 那是错的，别照它写客户文案。
  */
 async function saveHtmlReport({ markdown, title, meta, status }) {
   if (!REPORTS_BUCKET || !REPORTS_CDN_DOMAIN) {

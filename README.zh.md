@@ -32,7 +32,8 @@ on-call 工程师使用,而无需授予写权限。
 
 | 文档 | 用途 |
 |---|---|
-| 🚀 [一键部署](docs/DEPLOYMENT_ONECLICK.md) | 只要一个浏览器:上传一份 CloudFormation 模板,大约 5 分钟拿到 Web Chat(可选加装一个 IM 机器人:飞书/Lark 或 Slack) |
+| 🚀 [一键部署](docs/DEPLOYMENT_ONECLICK.md) | 只要一个浏览器:上传一份 CloudFormation 模板,大约 5 分钟拿到 Web Chat(可选加装一个 IM 机器人:飞书/Lark、Slack 或钉钉) |
+| ✅ [前置条件](docs/PREREQUISITES.md) | **跑 `./setup.sh` 之前先看这页**:环境要求 + 逐项处方 + 一条命令的自检脚本(走一键部署不需要) |
 | 🛠 [部署指南](docs/DEPLOYMENT.md) | 完整版:从 `./setup.sh` 到首次冒烟测试的分步指南(Web 控制台 + 可选 IM) |
 | 👤 [用户指南](docs/USER_GUIDE.md) | 终端用户手册 + 对话示例 + FAQ |
 | 🏗 [技术设计](docs/TECHNICAL_DESIGN.md) | 模块边界 / 数据流 / 安全 / 只读纵深防线 |
@@ -63,7 +64,7 @@ on-call 工程师使用,而无需授予写权限。
   合规与成本管控),凭证可用 IAM 或 Bedrock API Key
 - 🌍 **双语**:中 / 英自动识别 + 显式切换
 - 🛡 **只读承诺**:硬边界是只读 IAM 角色;之上按入口纵深防御 —— 网页端工具层只读 + 命令级 denylist + 只读 system prompt,IM 端 DevOps Agent 只读 agent + 强变更措辞正则二道门 —— 助手绝不改动你的云
-- 💬 **IM 渠道**:Slack / 飞书 / 钉钉 全功能 —— 提问后**立刻**回一张卡片,过程 / 思考 / 答案都刷在**同一张卡**上(标题里的秒数就是"还在跑"的信号);深度调查跑完后报告卡自动回贴到发起它的那个会话。**两个 agent 可选**:默认 `/agent devops`(直连 DevOps Agent,NotiOps 侧 0 token),`/agent notiops` 切到走模型的那条路(带 `/web on` 联网开关)。每张卡最下面一行落款说清这一轮的三件事:**走的哪条路 / 哪个模型答的 / 问的哪个 AWS 账号** —— 多账号部署里最后这一段尤其要紧,`/account` 是按会话生效的,群里任何人切一次后面所有人都跟着换
+- 💬 **IM 渠道**:Slack / 飞书 / 钉钉 全功能 —— 提问后**立刻**有回应:飞书 / Slack 上过程 / 思考 / 答案都刷在**同一张卡**上(标题里的秒数就是"还在跑"的信号),钉钉改不了已发出的消息,同样的进度是**追加**成新消息发出来;深度调查跑完后报告卡自动回贴到发起它的那个会话。**两个 agent 可选**:默认 `/agent devops`(直连 DevOps Agent,NotiOps 侧 0 token),`/agent notiops` 切到走模型的那条路(带 `/web on` 联网开关)。每张卡最下面一行落款说清这一轮的三件事:**走的哪条路 / 哪个模型答的 / 问的哪个 AWS 账号** —— 多账号部署里最后这一段尤其要紧,`/account` 是按会话生效的,群里任何人切一次后面所有人都跟着换
 
 ---
 
@@ -109,7 +110,10 @@ on-call 工程师使用,而无需授予写权限。
 git clone https://github.com/aws-samples/sample-notiops.git
 cd sample-notiops
 
-# 2. 部署(CDK,一条命令;首次运行为交互式)
+# 2. 环境自检(只读,不装任何东西;强烈建议先跑)
+bash scripts/preflight.sh
+
+# 3. 部署(CDK,一条命令;首次运行为交互式)
 ./setup.sh
 # 首次运行:确认 AWS 账号 → 选区域 → 选 IM 平台(Slack / 飞书 / 钉钉,可多选)→
 # 逐个粘贴凭证(直接写入 Secrets Manager,绝不落盘)→ CDK bootstrap → synth →
@@ -117,6 +121,12 @@ cd sample-notiops
 ```
 
 需要本地有 git / Node.js / Python / uv / AWS CDK,以及一份能部署的 AWS 凭证 —— **不需要容器运行时**。
+
+> ⚠️ 版本下限是真实要求(Python ≥ 3.10、Node ≥ 22、AWS CLI v2 ≥ 2.13),但 `setup.sh` 只检查命令
+> 在不在、**不比版本**;boto3 它完全不检查,缺了会让部署"成功"但少装功能。所以请先跑
+> `bash scripts/preflight.sh` —— 它会真的比版本,并给出逐项处方。
+> 完整清单、每一项不满足的后果与修法:**[docs/PREREQUISITES.md](docs/PREREQUISITES.md)**。
+> (走方式 A 一键部署的话,这些一个都不需要。)
 
 #### 部署模式:单账号(默认) vs 多账号
 
@@ -226,7 +236,8 @@ cd sample-notiops
 > (所以需要确认的操作 —— 开案例、启动调查 —— 在钉钉里**用回复关键词**完成);② 已发出
 > 的消息**改不了**(长任务**追加**一两条进度消息,不像飞书那样刷同一张卡);③ 钉钉保存
 > 回调地址时**不做任何校验**(地址填错不会当场报错,症状只是机器人一句话不回)。
-> **Microsoft Teams 仍然不可用** —— `platforms/teams/` 只有目录没有实现,列为 to-do。
+> **Microsoft Teams 仍然不可用** —— `platforms/` 下只有 feishu / slack / dingtalk 三个适配器,
+> 没有 teams,列为 to-do。
 > 平台对照表在 [docs/IM_WEBHOOK_SETUP.md](docs/IM_WEBHOOK_SETUP.md) 顶部。
 
 > ⁵ **接自己的 CUR 数据源是可选的,两条路径一样。** 上面那行「CUR + Athena 账单明细下钻」

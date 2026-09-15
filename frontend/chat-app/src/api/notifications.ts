@@ -30,6 +30,9 @@ export interface NotificationItem {
 }
 
 export interface NotificationsResponse {
+  /** false = 没拉到（未登录 / HTTP 错误 / 网络断）。空 items 与"收件箱真的空"必须能区分：
+   *  没有它，一次 500 会被界面画成"暂无事件" —— 这条假话会让人以为环境很安静。 */
+  ok?: boolean;
   items: NotificationItem[];
   lastReadTs: number;
   /** 收件箱真实总条数。被截断时由后端聚合得出；null = 查不到（不谎报）。 */
@@ -41,27 +44,35 @@ export interface NotificationsResponse {
   bySource?: Record<string, number> | null;
 }
 
-/** 列出通知（倒序）。失败/未登录 → 空。 */
+/** 列出通知（倒序）。失败/未登录 → `ok:false` + 空列表（**不是**"暂无事件"，见 `ok` 注释）。 */
 export async function listNotifications(): Promise<NotificationsResponse> {
-  const empty = { items: [], lastReadTs: 0, total: 0, truncated: false, bySource: {} };
+  const miss = { ok: false, items: [], lastReadTs: 0, total: 0, truncated: false, bySource: {} };
   const s = await signedClient();
-  if (!s) return empty;
+  if (!s) return miss;
   try {
     const r = await s.aws.fetch(`${s.base}/notifications`, { headers: { "x-notiops-id-token": s.idToken } });
-    if (!r.ok) return empty;
-    return await r.json();
-  } catch { return empty; }
+    if (!r.ok) return miss;
+    return { ok: true, ...(await r.json()) };
+  } catch { return miss; }
 }
 
-/** 未读数（轻量，供 60s 轮询）。失败 → 0。 */
-export async function unreadCount(): Promise<{ unread: number; latestTs: number; total: number }> {
+/**
+ * 未读数（轻量，供 60s 轮询）。
+ *
+ * ⚠️ 失败时带 `ok:false` 回来，调用方必须**保留上一次的计数**，不要写 0。
+ * 原来失败一律回 `{unread:0}`：轮询里任何一次抖动都会把红点**灭掉** —— 用户看到的是
+ * "没有新通知"这句明确的假话，而且不会再点进去看。红点宁可停在旧数字上（陈旧），
+ * 也不能归零（说谎）。
+ */
+export async function unreadCount(): Promise<{ ok: boolean; unread: number; latestTs: number; total: number }> {
+  const miss = { ok: false, unread: 0, latestTs: 0, total: 0 };
   const s = await signedClient();
-  if (!s) return { unread: 0, latestTs: 0, total: 0 };
+  if (!s) return miss;
   try {
     const r = await s.aws.fetch(`${s.base}/notifications/unread`, { headers: { "x-notiops-id-token": s.idToken } });
-    if (!r.ok) return { unread: 0, latestTs: 0, total: 0 };
-    return await r.json();
-  } catch { return { unread: 0, latestTs: 0, total: 0 }; }
+    if (!r.ok) return miss;
+    return { ok: true, ...(await r.json()) };
+  } catch { return miss; }
 }
 
 /** 标记已读到 uptoTs（缺省=现在=全部已读）。 */
@@ -101,25 +112,36 @@ export interface HealthLinks {
   otherNotifications: string; eventLog: string;
 }
 export interface HealthDashboard {
+  /** false = 前端**根本没拿到**响应（未登录 / HTTP 错误 / 网络断）。
+   *  与 `available:false`（后端答了，答案是"用不了"）是两件事，界面必须分开画。 */
+  ok?: boolean;
   available: boolean;
-  reason?: string;            // subscription_required | error
+  reason?: string;            // subscription_required | error | cross_account_unavailable | fetch_failed | http_NNN
   message?: string;
   serviceIssues?: HealthBucket;
   accountIssues?: HealthBucket;
   scheduledChanges?: HealthBucket;
   otherCount?: number;
-  links: HealthLinks;
+  /** 后端只在能给出控制台链接时才带（错误分支里也带，但失败兜底对象没有）。 */
+  links?: HealthLinks;
 }
 
-/** 拉取 Health Dashboard(服务运行状况 / 账户运行状况 / 计划变更)。失败/未登录 → available:false。 */
-export async function getHealthDashboard(accountId?: string): Promise<HealthDashboard | null> {
+/**
+ * 拉取 Health Dashboard(服务运行状况 / 账户运行状况 / 计划变更)。
+ *
+ * 失败**不再**回 null。原来 null 被界面画成"AWS Health 不可用（需 Business/Enterprise
+ * Support）" —— 一次 HTTP 500 就变成"你的支持计划不够"这条**具体且错误**的诊断，
+ * 用户会照着它去查支持计划（甚至去升级支持计划），而真实原因是我们这边没请求成功。
+ * `ok:false` = 没问到（可重试）；`available:false` + `reason` = 问到了，原因在 reason 里。
+ */
+export async function getHealthDashboard(accountId?: string): Promise<HealthDashboard> {
   const s = await signedClient();
-  if (!s) return null;
+  if (!s) return { ok: false, available: false, reason: "not_authenticated" };
   try {
     const r = await s.aws.fetch(`${s.base}/health/dashboard${accountId ? `?account=${encodeURIComponent(accountId)}` : ""}`, { headers: { "x-notiops-id-token": s.idToken } });
-    if (!r.ok) return null;
+    if (!r.ok) return { ok: false, available: false, reason: "http_" + r.status };
     return await r.json();
-  } catch { return null; }
+  } catch { return { ok: false, available: false, reason: "fetch_failed" }; }
 }
 
 export interface HealthAffectedEntity { value: string; status: string; lastUpdatedTime: number }

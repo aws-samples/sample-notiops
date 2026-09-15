@@ -25,9 +25,10 @@ import Logo from "../components/Logo";
 import { unreadCount } from "../api/notifications";
 import { streamChat, warmupChat, listConversations, getMessages, deleteConversationApi, renameConversationApi, setPinnedApi, executeActionApi, getAccountsFull, type SourceItem, type AccountInfo } from "../api/chat";
 import { useLocale, useT } from "../i18n";
-import { topicDef, deepDiveTogglesFor, type ChatMessage, type Conversation, type TopicKey } from "../types";
+import { topicDef, deepDiveTogglesFor, normalizeTopic, type ChatMessage, type Conversation, type TopicKey } from "../types";
+import { loadConvMode, saveConvMode, forgetConvMode, modeOf, fieldsOf, restorableMode } from "../convMode";
 import { defaultModelId, modelDisplayName, refreshModelCatalog, isSelectableModel, useModelCatalog } from "../models";
-import { IconInvestigate, IconFinOps, IconCases, IconSecurity, IconWhatsNew, IconReports, IconDatabase, IconGauge, IconPercent, IconCluster } from "../components/icons";
+import { IconInvestigate, IconFinOps, IconCases, IconSecurity, IconWhatsNew, IconReports, IconDatabase, IconGauge, IconPercent, IconCluster, IconCloud, IconInspection, IconChip, IconHeartPulse, IconFileText } from "../components/icons";
 
 // 通用对话主页（Codex 式空态）的启动卡片池：每次进入随机抽 4 个。
 // 每张卡片只有一句话描述（descKey，直接作为填入 prompt），点击=填入输入框、停留在通用对话、不切主题。
@@ -57,6 +58,18 @@ const DEVOPS_HOME_CARDS: { key: string; Icon: React.FC<{ size?: number }>; descK
   { key: "dv-change",  Icon: IconReports,     descKey: "obj.dv.card.change" },
 ];
 
+// 选中「阿里云 STAROps」这个对话对象时的启动卡片（同上，固定 4 张）。**同样不能复用**上面
+// 任何一组：那两组问的都是 AWS 资源（EC2 / RDS / CloudWatch），拿它们引导等于让客户去问
+// STAROps 一个它根本看不到的环境 —— 答案必然是空的，而客户会以为是产品坏了。
+// 第一张刻意是「发起巡检」：STAROps 不另设「深度调查」开关，发起调查就是一句自然语言的事
+// （这正是 STAROps 控制台里的做法），第一张卡就得把这个用法示范出来。
+const STAROPS_HOME_CARDS: { key: string; Icon: React.FC<{ size?: number }>; descKey: string }[] = [
+  { key: "so-inspect", Icon: IconInspection,  descKey: "obj.so.card.inspect" },
+  { key: "so-ecs",     Icon: IconChip,        descKey: "obj.so.card.ecs" },
+  { key: "so-alarm",   Icon: IconHeartPulse,  descKey: "obj.so.card.alarm" },
+  { key: "so-log",     Icon: IconFileText,    descKey: "obj.so.card.log" },
+];
+
 // 主题空态主页（与通用主页同一套视觉：脉冲 N logo + 主题标题 + 每主题独立 prompt 池随机 4 卡）。
 // prompt 池复用 Composer 的 chip.* i18n key（既是显示文案也是填入内容），保证与聊天内推荐一致。
 const TOPIC_LANDING: Record<string, { headlineKey: string; pool: { key: string; Icon: React.FC<{ size?: number }>; promptKey: string }[] }> = {
@@ -77,14 +90,9 @@ const TOPIC_LANDING: Record<string, { headlineKey: string; pool: { key: string; 
     { key: "summary",    Icon: IconReports,     promptKey: "chip.cases.summary" },
     { key: "create",     Icon: IconCases,       promptKey: "chip.cases.create" },
   ] },
-  security: { headlineKey: "home.h.security", pool: [
-    { key: "findings",     Icon: IconSecurity, promptKey: "chip.sec.findings" },
-    { key: "publics3",     Icon: IconSecurity, promptKey: "chip.sec.publics3" },
-    { key: "opensg",       Icon: IconSecurity, promptKey: "chip.sec.opensg" },
-    { key: "iamreview",    Icon: IconSecurity, promptKey: "chip.sec.iamreview" },
-    { key: "mfa",          Icon: IconSecurity, promptKey: "chip.sec.mfa" },
-    { key: "bestpractice", Icon: IconReports,  promptKey: "chip.sec.bestpractice" },
-  ] },
+  // 调查池 = 原调查 6 条 + 原安全 6 条（2026-09-11「安全」不再是聊天主题，并入「调查」）。
+  // 与 Composer 的 CHIP_POOL.investigate 必须**同步维护** —— 两处各存一份是既有结构
+  // （这里给主题主页的 4 张卡，那里给对话内的 3 个 chip），改一处不改另一处会漂。
   investigate: { headlineKey: "home.h.investigate", pool: [
     { key: "resource",     Icon: IconInvestigate, promptKey: "chip.inv.resource" },
     { key: "ec2reboot",    Icon: IconInvestigate, promptKey: "chip.inv.ec2reboot" },
@@ -92,6 +100,12 @@ const TOPIC_LANDING: Record<string, { headlineKey: string; pool: { key: string; 
     { key: "connectivity", Icon: IconInvestigate, promptKey: "chip.inv.connectivity" },
     { key: "cwalarms",     Icon: IconReports,     promptKey: "chip.inv.cwalarms" },
     { key: "rootcause",    Icon: IconInvestigate, promptKey: "chip.inv.rootcause" },
+    { key: "findings",     Icon: IconSecurity, promptKey: "chip.sec.findings" },
+    { key: "publics3",     Icon: IconSecurity, promptKey: "chip.sec.publics3" },
+    { key: "opensg",       Icon: IconSecurity, promptKey: "chip.sec.opensg" },
+    { key: "iamreview",    Icon: IconSecurity, promptKey: "chip.sec.iamreview" },
+    { key: "mfa",          Icon: IconSecurity, promptKey: "chip.sec.mfa" },
+    { key: "bestpractice", Icon: IconReports,  promptKey: "chip.sec.bestpractice" },
   ] },
   "whats-new": { headlineKey: "home.h.whatsnew", pool: [
     { key: "recent",  Icon: IconWhatsNew, promptKey: "chip.wn.recent" },
@@ -103,9 +117,11 @@ const TOPIC_LANDING: Record<string, { headlineKey: string; pool: { key: string; 
   ] },
 };
 
-// 顶栏主题 tag 图标（与侧边栏一致）
+// 顶栏主题 tag 图标（与侧边栏一致）。
+// 只列 TOPICS 里真实存在的主题：这是 Record<string,…>，写一个已退役的 key（如 security）
+// 不会有编译错误，会一直留着骗人 —— 而它的唯一读取处先过 `topicDef()`，那里已经查不到了。
 const TOPBAR_TOPIC_ICON: Record<string, React.FC<{ size?: number }>> = {
-  investigate: IconInvestigate, finops: IconFinOps, cases: IconCases, security: IconSecurity,
+  investigate: IconInvestigate, finops: IconFinOps, cases: IconCases,
   "whats-new": IconWhatsNew,
 };
 
@@ -114,6 +130,10 @@ const ExpandIcon = () => (
     <rect x="3" y="4" width="18" height="16" rx="2.5" /><line x1="9" y1="4" x2="9" y2="20" />
   </svg>
 );
+
+// 主区视图 key。抽成命名类型，是为了让「记住从哪个视图进的看板」那个 state
+// （dashReturn）能复用同一个联合，而不是把这一长串再抄一遍。
+type ViewKey = "chat" | "skills" | "customize" | "notifications" | "finops" | "cases" | "admin" | "security" | "investigate" | "inspection";
 
 let idSeq = 0;
 const newId = (p: string) => `${p}-${Date.now()}-${idSeq++}`;
@@ -124,8 +144,8 @@ function greeting(topic: TopicKey | undefined, locale: string): string {
   switch (topic) {
     case "cases": return en ? "How can I help with your support cases?" : "需要我帮你处理哪个 Support case？";
     case "finops": return en ? "Let's optimize your cloud costs." : "一起来优化你的云成本吧。";
-    case "investigate": return en ? "What resource should we investigate?" : "想排查哪个资源？";
-    case "security": return en ? "What security topic is on your mind?" : "有什么安全方面的问题？";
+    // 调查主题现在也承接安全提问（「安全」主题已并入），所以问候语不再只说"资源"。
+    case "investigate": return en ? "What should we look into — a resource, an alarm, a security finding?" : "想查什么？资源、告警，还是安全风险？";
     case "whats-new": return en ? "What's new at AWS — and what matters to you." : "看看 AWS 有什么新发布，以及哪些对你有用。";
     default: return en ? "What's on your mind today?" : "今天想聊点什么？";
   }
@@ -151,7 +171,8 @@ function emptyConversation(locale: string, topic: TopicKey = "general"): Convers
     messages: [],
     updatedAt: Date.now(),
     // DevOps Agent 深度调查开关：所有主题**默认关闭**，由用户按需手动打开
-    // （深度调查耗时/耗算力，不宜默认强制走；investigate/finops/security 主题会显示该开关）。
+    // （深度调查耗时/耗算力，不宜默认强制走；investigate/finops 主题会显示该开关 ——
+    //  口径是 types.ts 的 topicHasDevopsAgent「默认给、按例外排除」，不是这里写死的清单）。
   };
 }
 
@@ -162,7 +183,17 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   const [activeId, setActiveId] = useState<string>(conversations[0].id);
   // 主区视图：chat（默认）| skills（独立 Skills 页）| customize（定制页：连接器/插件）
   // | notifications（通知收件箱）。非对话页切到它时主区换渲染。
-  const [view, setView] = useState<"chat" | "skills" | "customize" | "notifications" | "finops" | "cases" | "admin" | "security" | "investigate" | "inspection">("chat");
+  // ⚠️ 这是**视图**联合，与 TopicKey 是两回事。"security" 仍然是一个合法视图（安全看板还在），
+  //    但它已经不再是一个聊天主题（见 types.ts 的 TopicKey）—— 别把两者混起来。
+  const [view, setView] = useState<ViewKey>("chat");
+  // 从「仪表盘」胶囊进看板时记下"从哪来"，看板左上角的返回按钮据此回去（回对话 / 回主题主页）。
+  // null = 不是从胶囊进来的（走侧栏进的），那就不显示返回按钮 —— 与 view==="inspection"
+  // 这种本来就没有主页的看板一致。
+  //
+  // 刻意**不用** `switchTo()` 回去：那个函数无条件 setView("chat")（回不到主题主页），
+  // 而且如果离开的那条会话是空的又没落库，它会把会话**删掉** —— 从对话里点开看板再返回，
+  // 会发现刚开的新对话没了。
+  const [dashReturn, setDashReturn] = useState<ViewKey | null>(null);
   // 「Skills」一级入口点击信号：每次点都自增。已在 skills 视图内（可能停在某个 skill 详情/编辑器）
   // 时，CustomizePanel 据此重置回列表首页——无修改直接回、有未保存修改先确认。见 skillsHome 透传。
   const [skillsHome, setSkillsHome] = useState(0);
@@ -276,6 +307,8 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   const [casesDash, setCasesDash] = useState<string | null>(null);
   const [casesData, setCasesData] = useState<CasesDashboardData | null>(null);
   const accountIdRef = useRef("");
+  /** 正在执行的写操作（键 = `${msgId}#${idx}`）—— 见 confirmAction 上的说明。 */
+  const execingRef = useRef<Set<string>>(new Set());
   const [securityDash, setSecurityDash] = useState<string | null>(null);
   const [securityData, setSecurityData] = useState<SecurityDashboardData | null>(null);
   const [investigateDash, setInvestigateDash] = useState<string | null>(null);
@@ -486,12 +519,16 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   // 「DevOps 对话」：直连 DevOps Agent 控制面对话 API，由**客户自己的 DevOps Agent** 回答
   // （NotiOps 侧 0 token）。仅故障调查主题显示。
   const devopsChat = active.devopsChat ?? false;
-  /** 三个 DevOps 开关是**单选**（three-way exclusive）：点亮一个自动灭其余两个。
-   *  同时开的后果不是"更强"，而是同一个问题被送上两三条互不相干的链路。
-   *  写成显式三个布尔（而不是计算 key 的展开）是为了让 TS 精确校验字段名。 */
-  const setDevopsMode = (mode: "agent" | "direct" | "chat" | "off") =>
+  // 「阿里云 STAROps」：BFF 直连**阿里云** STAROps 数字员工（CreateChat + SSE），由客户自己的
+  // 数字员工回答（计他的阿里云 AI 额度，NotiOps 侧 0 token）。仅通用会话的「对话对象」可选。
+  const starops = active.starops ?? false;
+  /** 四个"谁来答"的字段是**单选**（four-way exclusive）：点亮一个自动灭其余三个。
+   *  同时开的后果不是"更强"，而是同一个问题被送上几条互不相干的链路 —— 其中 starops
+   *  那条还会把问题原文送到**另一朵云**上，而界面上完全看不出来。
+   *  写成显式四个布尔（而不是计算 key 的展开）是为了让 TS 精确校验字段名。 */
+  const setDevopsMode = (mode: "agent" | "direct" | "chat" | "starops" | "off") =>
     setConversations((prev) => prev.map((c) => (c.id === activeId
-      ? { ...c, devopsAgent: mode === "agent", devopsAgentDirect: mode === "direct", devopsChat: mode === "chat" }
+      ? { ...c, devopsAgent: mode === "agent", devopsAgentDirect: mode === "direct", devopsChat: mode === "chat", starops: mode === "starops" }
       : c)));
   const toggleDevopsAgent = () => setDevopsMode(devopsAgent ? "off" : "agent");
   /** 「深度调查（直连）」有**两种语义**，按会话类型分：
@@ -511,6 +548,21 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     setDevopsMode(devopsAgentDirect ? "off" : "direct");
   };
   const toggleDevopsChat = () => setDevopsMode(devopsChat ? "off" : "chat");
+
+  // 选中的模式**跟着会话留下来**（跨刷新）。
+  //
+  // 为什么要有这一段：三个开关只活在前端的 Conversation 对象里，后端不存 ——
+  // 刷新后 `listConversations()` 重建列表时它们一律回落 false。客户报的现象是
+  // 「在调查会话里选了 DevOps 对话、发过问、刷新一下选择就没了」，而且不报错：
+  // 接着追问会静默换成 NotiOps 来答。落盘细节与取舍见 convMode.ts。
+  //
+  // 挂在 effect 上而不是塞进 setDevopsMode：模式还有别的写入口（落地页草稿随
+  // startFromNotification 带进新会话、水合时按历史 via 回锁），逐个去 hook 必然漏一个。
+  // 只看 active 是够的 —— 非当前会话的模式没有任何入口能改。
+  useEffect(() => {
+    if (!active) return;
+    saveConvMode(active.id, modeOf(active));
+  }, [active]);
 
   // ── 主题 landing 页的开关草稿（per-topic，互不影响）──
   // BUG 修复：各主题 landing 页共用同一个 active 会话，直接读写 active.webSearch 会导致
@@ -564,7 +616,11 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     let stop = false;
     const tick = () => {
       if (view === "notifications") { setNotifUnread(0); return; }
-      unreadCount().then((u) => { if (!stop) setNotifUnread(u.unread || 0); }).catch(() => {});
+      // ⚠️ 只在**问到了**的时候才写计数（u.ok）。原来是无条件 `u.unread || 0`，而失败
+      // 分支回的就是 `{unread: 0}` —— 轮询里任何一次抖动都会把红点灭掉，用户看到的是
+      // "没有新通知"这句明确的假话，而且不会再点进去看。红点宁可停在旧数字上（陈旧），
+      // 也不能归零（说谎）。
+      unreadCount().then((u) => { if (!stop && u.ok) setNotifUnread(u.unread || 0); }).catch(() => {});
     };
     tick();
     const id = setInterval(tick, 60000);
@@ -581,14 +637,24 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     listConversations()
       .then((list) => {
         if (cancelled || !list.length) return;
-        const loaded: Conversation[] = list.map((c) => ({
-          id: c.id,
-          title: c.title || (locale === "en" ? "New chat" : "新对话"),
-          topic: (c.topic as TopicKey) || "general",
-          messages: [], // 消息懒加载：选中时再拉
-          updatedAt: c.updatedAt,
-          pinned: c.pinned, // 置顶状态从后端读回（刷新不再丢失）
-        }));
+        const loaded: Conversation[] = list.map((c) => {
+          // 唯一的 topic 水合口 —— 退役主题在**这里**归一（security → investigate）。
+          // 库里那些 topic:"security" 永远不会被改写（写入带 attribute_not_exists(SK)，
+          // 也没有任何接口能改 topic），所以必须读时归一，不能指望"下次发消息自愈"。
+          // 以前这里是 `c.topic as TopicKey` —— 硬转，TypeScript 一个字都拦不住。
+          const topic = normalizeTopic(c.topic);
+          return {
+            id: c.id,
+            title: c.title || (locale === "en" ? "New chat" : "新对话"),
+            topic,
+            messages: [], // 消息懒加载：选中时再拉
+            updatedAt: c.updatedAt,
+            pinned: c.pinned, // 置顶状态从后端读回（刷新不再丢失）
+            obj: c.obj || undefined, // 最后一轮谁答的（侧栏 tag 用）；空串→undefined，别标成 NotiOps
+            // 回答模式从本地记忆读回（刷新不再丢失）。后端不存这三个字段，见 convMode.ts。
+            ...fieldsOf(restorableMode(topic, loadConvMode(c.id))),
+          };
+        });
         loaded.forEach((c) => persistedRef.current.add(c.id)); // 后端来的都算已持久化
         setConversations(loaded);
         setActiveId(loaded[0].id);
@@ -619,7 +685,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
       });
     };
     getMessages(activeId)
-      .then((msgs) => {
+      .then(({ messages: msgs, truncated, limit }) => {
         if (!msgs.length) return;
         const mapped: ChatMessage[] = msgs.map((m, i) => ({
           id: `${activeId}-h${i}`,
@@ -631,17 +697,33 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
           usage: m.usage,
           accountId: m.account_id,  // 历史回复的账号徽标(刷新后仍显示)
           via: m.via,               // 答案来源(devops-agent → 署名行显示 "AWS DevOps Agent")
+          staropsEmployee: m.starops_employee, // 阿里云那条：页脚显示当时那个数字员工 ID
         }));
         // 「对话对象」的锁要**跨刷新**成立：devopsChat 只活在前端内存里，刷新后回落 false ——
         // 那样一个由客户自己的 DevOps Agent 答过的会话，接着问会**静默换成 NotiOps 来答**
         // （客户看不出来，只会觉得答案风格突然变了）。历史消息里的 via="devops-agent" 是
         // 持久化的事实（store.mjs 存了这个字段），用它把锁恢复回来。
         // 只恢复通用会话：故障调查主题仍是"每轮开关"语义，这里一行不动。
+        // ⚠️ 历史被截断时这个锁也会跟着丢：`via="devops-agent"` 只存在于被丢掉的
+        // 那些早期轮次里 → relock=false → 接着问会静默换回 NotiOps 来答。所以下面那条
+        // 截断提示不只是"少显示了几条"，它同时是这个锁失效的唯一线索。
+        //
+        // STAROps 同理，但**必须是独立的一条锁**，绝不能与上面那条合并成"有 via 就锁 devopsChat"：
+        // 那样刷新后一段阿里云会话会被锁成 AWS DevOps Agent，接着问就把问题原文送去了
+        // 另一朵云 —— 界面上只是署名行变了一行字，客户几乎不可能发现。
+        // 两条锁互斥，STAROps 优先（与 modeOf / BFF 的一选一同序）。
         const relock = mapped.some((m) => m.via === "devops-agent");
+        const relockSo = mapped.some((m) => m.via === "starops");
         setConversations((prev) => prev.map((c) => {
           if (c.id !== activeId) return c;
-          const lock = relock && (c.topic ?? "general") === "general";
-          return { ...c, messages: mapped, ...(lock ? { devopsChat: true, devopsAgent: false, devopsAgentDirect: false } : {}) };
+          const general = (c.topic ?? "general") === "general";
+          const lockSo = relockSo && general;
+          const lock = !lockSo && relock && general;
+          return {
+            ...c, messages: mapped, historyTruncated: truncated, historyLimit: limit,
+            ...(lockSo ? { starops: true, devopsChat: false, devopsAgent: false, devopsAgentDirect: false }
+              : lock ? { devopsChat: true, starops: false, devopsAgent: false, devopsAgentDirect: false } : {}),
+          };
         }));
       })
       .catch(() => { /* ignore */ })
@@ -765,7 +847,10 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     // 「DevOps 对话」开着时这轮由客户自己的 DevOps Agent 回答 —— 从第一帧就署名成
     // "AWS DevOps Agent"（否则流式期间会先挂着本地模型名，答完才跳变）。
     const sendDevopsChat = targetConv?.devopsChat ?? (conversations.find(findConv)?.devopsChat) ?? false;
-    const botMsg: ChatMessage = { id: botId, role: "assistant", text: "", ts: Date.now(), thinking: true, thinkElapsed: 0, streaming: true, model: modelDisplayName(sendModel), accountId: sendAccountId, via: sendDevopsChat ? "devops-agent" : undefined };
+    // 同理的第四个对象：阿里云 STAROps 数字员工。第一帧就要署名成它 —— 这条链路一个字都不经
+    // Bedrock，先挂上本地模型名等于在流式那几秒里对客户撒谎（还是"答案来自哪朵云"这种谎）。
+    const sendStarops = targetConv?.starops ?? (conversations.find(findConv)?.starops) ?? false;
+    const botMsg: ChatMessage = { id: botId, role: "assistant", text: "", ts: Date.now(), thinking: true, thinkElapsed: 0, streaming: true, model: modelDisplayName(sendModel), accountId: sendAccountId, via: sendStarops ? "starops" : sendDevopsChat ? "devops-agent" : undefined };
 
     // upsert:通常会话已在列表里(map 命中);但从通知卡发起时,新会话可能还没被
     // React flush 进 conversations（setConversations 与本 setTimeout 的时序不定）——
@@ -777,6 +862,14 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
         title: c.messages.length === 0 ? text.slice(0, 24) : c.title,
         messages: [...c.messages, userMsg, botMsg],
         updatedAt: Date.now(),
+        // 侧栏 tag 立刻跟上（服务端 `obj` 只在下次 listConversations 才读得到，
+        // 不本地置位的话：刚在通用会话里选了 STAROps 发第一句，顶栏已经是「阿里云 STAROps」
+        // 而侧栏那条还什么都没有 —— 同一段会话两处说法不一致）。
+        // 判定与 botMsg.via **同源**（也就是 BFF 落库那份的同一组条件），不是另猜一遍：
+        //   starops → "starops"、DevOps 对话 → "devops"、其余（含内置回答）→ "notiops"。
+        // 唯一会与服务端不一致的是「转人工支持」那种回落到我们 agent 的轮次（BFF 会记
+        // "notiops"）—— 下次刷新即以服务端为准，这里不猜它。
+        obj: sendStarops ? "starops" : sendDevopsChat ? "devops" : "notiops",
       });
       if (exists) return prev.map((c) => (c.id === convId ? apply(c) : c));
       // 不在列表(新会话尚未 flush):用传入的 target 作基插入到最前。
@@ -814,7 +907,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
 
     try {
       await streamChat(
-        { conversationId: convId, text, model: sendModel, locale, webSearch: (conversations.find(findConv)?.webSearch) ?? false, finopsAgent: (conversations.find(findConv)?.finopsAgent) ?? false, devopsAgent: targetConv?.devopsAgent ?? (conversations.find(findConv)?.devopsAgent) ?? false, devopsAgentDirect: targetConv?.devopsAgentDirect ?? (conversations.find(findConv)?.devopsAgentDirect) ?? false, devopsChat: sendDevopsChat, topic: convTopic, accountId: targetConv?.accountId ?? (conversations.find(findConv)?.accountId) ?? "", skillId },
+        { conversationId: convId, text, model: sendModel, locale, webSearch: (conversations.find(findConv)?.webSearch) ?? false, finopsAgent: (conversations.find(findConv)?.finopsAgent) ?? false, devopsAgent: targetConv?.devopsAgent ?? (conversations.find(findConv)?.devopsAgent) ?? false, devopsAgentDirect: targetConv?.devopsAgentDirect ?? (conversations.find(findConv)?.devopsAgentDirect) ?? false, devopsChat: sendDevopsChat, starops: sendStarops, topic: convTopic, accountId: targetConv?.accountId ?? (conversations.find(findConv)?.accountId) ?? "", skillId },
         {
           onToken: (delta) => {
             if (firstToken) { firstToken = false; clearInterval(tk); }
@@ -857,7 +950,11 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
           // 答案来源标记（"builtin" = agent 的内置确定性回答，未调模型、0 token）：
           // 把这条的署名行从「AWS Bedrock (某模型)」换成 NotiOps。agent 在正文之前发这一帧，
           // 所以署名不会先按模型渲染再跳变。
-          onVia: (via) => patchMsgIn(convId, botId, { via }),
+          // staropsEmployee 只有阿里云那条路径会带（页脚显示"哪个数字员工答的"）。
+          // 用 ...(x ? {} : {}) 而不是直接写进对象：别让别的路径把它 patch 成 undefined
+          // 覆盖掉已有值。
+          onVia: (via, staropsEmployee) =>
+            patchMsgIn(convId, botId, { via, ...(staropsEmployee ? { staropsEmployee } : {}) }),
           // 服务端换了模型（本会话记的那个已被管理员下架）：把会话选择和本条署名都纠正过来，
           // 并重拉一次候选集 —— 说明本地目录已过期。不纠正的话用户会一直看到一个再也用不了的名字。
           onModelSubstituted: (info) => {
@@ -965,11 +1062,18 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   const confirmAction = async (msgId: string, idx: number,
                                editedParams?: Record<string, unknown>,
                                pickedAccount?: string) => {
+    // 🔴 真正的去重在这里，不在卡上。卡上的 disabled 只是第一道（而且卡一重挂就丢）；
+    //    `action.done` 要等下面 await 回来才置上，那段窗口里第二次点击会**再发一次真的
+    //    写请求** —— 建案 = 两个案例、回复 = 两条回复，而界面只留后一次的结果。
+    //    用 ref 而不是 state：state 更新是异步的，挡不住同一个 tick 里的第二次点击。
+    const inflightKey = `${msgId}#${idx}`;
+    if (execingRef.current.has(inflightKey)) return;
     const conv = conversations.find((c) => c.messages.some((m) => m.id === msgId));
     const convId = conv?.id ?? activeId;
     const msg = conv?.messages.find((m) => m.id === msgId);
     const action = msg?.actions?.[idx];
     if (!action || action.done) return;
+    execingRef.current.add(inflightKey);
     // create_case_form(可编辑) / create_case_review(只读预览) → 都转成 create_case 执行。
     // 关键：必须带上 action.account_id —— 否则跨账号(linked account)建案会丢目标账号，
     // BFF 回退到部署账号,case 误落到部署账号(而非用户选中的账号)。见 support.mjs 的
@@ -985,12 +1089,21 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
       ? { type: "create_case" as const, params: editedParams ?? action.params,
           account_id: pickedAccount !== undefined ? pickedAccount : action.account_id }
       : action;
-    const result = await executeActionApi(toExec);
-    patchMsgIn(convId, msgId, {
-      actions: (msg?.actions ?? []).map((a, i) => (i === idx ? { ...a, done: true, params: editedParams ?? a.params, result } : a)),
-    });
+    try {
+      const result = await executeActionApi(toExec);
+      patchMsgIn(convId, msgId, {
+        actions: (msg?.actions ?? []).map((a, i) => (i === idx ? { ...a, done: true, params: editedParams ?? a.params, result } : a)),
+      });
+    } finally {
+      // finally 而不是写在 await 后面：executeActionApi 目前自己兜住了所有异常，但
+      // 一旦它哪天会抛，漏了 finally 就把这张卡永久锁死（done 也没置上）。
+      execingRef.current.delete(inflightKey);
+    }
   };
   const cancelAction = (msgId: string, idx: number) => {
+    // 正在执行的写操作不许被"取消"盖掉 —— 那会在一次**已经发出去**的建案上画
+    // 「未执行：已取消」，用户于是不去控制台看，而案例真的开了。取消只能在发出前生效。
+    if (execingRef.current.has(`${msgId}#${idx}`)) return;
     const conv = conversations.find((c) => c.messages.some((m) => m.id === msgId));
     const convId = conv?.id ?? activeId;
     const msg = conv?.messages.find((m) => m.id === msgId);
@@ -1105,6 +1218,8 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   const deleteConv = (id: string) => {
     void deleteConversationApi(id); // 后端立即删除（含消息）
     loadedRef.current.delete(id);
+    forgetConvMode(id);             // 连它记住的回答模式一起清掉，别留孤儿条目
+
     if (unreadIds.has(id)) setUnreadIds((prev) => { const next = new Set(prev); next.delete(id); return next; });
     setConversations((prev) => {
       const next = prev.filter((c) => c.id !== id);
@@ -1114,13 +1229,84 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     });
   };
 
+  // 从仪表盘返回。`dashReturn` 记的是"从哪儿进来的"（输入框上方的仪表盘胶囊会写它）。
+  // 没有值 = 走侧栏进的看板，本来就没有"上一步"，调用方不会渲染返回按钮。
+  // ⚠️ 不要改成 switchTo()：见 dashReturn 声明处那段注释（会回不到主题主页 + 删空会话）。
+  // ⚠️ 四棵看板树的"当前页"全在这里清。漏一棵的后果是静默的：返回后 view 变了但那棵树的
+  //    dash state 还留着，下次点它的胶囊会直接落在上次那一页上（而不是胶囊指定的首页）。
+  const backFromDash = () => {
+    const back = dashReturn;
+    setDashReturn(null);
+    setSecurityDash(null);
+    setInvestigateDash(null);
+    setFinopsDash(null);
+    setCasesDash(null);
+    if (back) setView(back);
+  };
+
+  // 输入框上方那排「仪表盘」胶囊。刻意**粗粒度**：一颗 = 一整棵看板树的入口，
+  // 点进去才是原来那棵树（告警总览 / 当前告警 / 最近变更 / Backup 健康；TA 安全检查 /
+  // Security Hub / 安全公告 / GuardDuty；成本各页；案例各页）。以后往树里加面板不用动
+  // 这里 —— 否则每加一个面板输入框上方就多一颗胶囊，很快就挤爆一行。
+  //
+  // 2026-09-11：成本 / 案例两个主题原来走的是另一套入口（紧贴输入框左上角那个
+  // 「打开 Dashboard」标签，Composer 的 `onOpenDashboard` prop + `.cbox-tab`），
+  // 现在统一到这一行；那条 prop 与它的三条 CSS 已删。有看板的主题**只有这一套入口**。
+  //
+  // 门禁与侧栏**逐字一致**，否则会出现"侧栏没有这个入口、输入框上方却有"这种矛盾：
+  //   - 运行概览：`!capsLoaded || can("nav:investigate")` —— fail-open（能力没加载完先给）
+  //   - 支出与优化：`!capsLoaded || can("nav:finops")`      —— 同 fail-open
+  //   - 案例进展：`!capsLoaded || can("nav:cases")`       —— 同 fail-open
+  //   - 安全态势：`isAdmin || (capsLoaded && can("nav:security"))` —— fail-closed
+  // ⚠️ 安全这颗是**唯一没有侧栏兄弟**的：2026-09-11 起「安全」不在侧栏里了（产品要求），
+  //    它的看板只能从这颗胶囊进。所以那条门禁表达式在本文件里只出现一次，不再是两次。
+  // nav:security 是管理员可关的模块（level:"tab"），关掉时必须**整颗不渲染**，
+  // 不能渲染成 disabled —— 那等于告诉客户"这里有个功能，只是你不能用"。
+  const dashPillsFor = (topicKey: TopicKey) => {
+    const pills: { key: string; label: string; Icon: React.FC<{ size?: number }>; onClick: () => void }[] = [];
+    // go() 会记下 dashReturn = 当前视图，这样看板里的「返回」知道该回哪儿：
+    // 从主题主页进 → 回主题主页；从会话里进 → 回那条会话。
+    const go = (v: ViewKey, open: () => void) => () => {
+      setDashReturn(view);
+      open();
+      setSrcOpen(false);
+      setThinkOpen(false);
+      setView(v);
+      collapseIfMobile();
+    };
+    if (topicKey === "investigate") {
+      if (!capsLoaded || can("nav:investigate")) {
+        pills.push({ key: "ops", label: t("dash.pill.ops"), Icon: IconInvestigate,
+          onClick: go("investigate", () => setInvestigateDash("alarm-overview")) });
+      }
+      if (isAdmin || (capsLoaded && can("nav:security"))) {
+        pills.push({ key: "security", label: t("dash.pill.security"), Icon: IconSecurity,
+          onClick: go("security", () => setSecurityDash("ta-security")) });
+      }
+    } else if (topicKey === "finops") {
+      if (!capsLoaded || can("nav:finops")) {
+        pills.push({ key: "cost", label: t("dash.pill.cost"), Icon: IconFinOps,
+          onClick: go("finops", () => setFinopsDash("spend")) });
+      }
+    } else if (topicKey === "cases") {
+      if (!capsLoaded || can("nav:cases")) {
+        pills.push({ key: "cases", label: t("dash.pill.cases"), Icon: IconCases,
+          onClick: go("cases", () => setCasesDash("overview")) });
+      }
+    }
+    // 其余主题（通用 / What's new）没有看板 → undefined，Composer 里
+    // `!!dashPills?.length` 直接不渲染那一行（返回空数组会渲染出一行只有「仪表盘」
+    // 三个字、后面什么都没有的空标签）。
+    return pills.length ? pills : undefined;
+  };
+
   // 主题空态主页（统一设计）：脉冲 N hero + 主题标题 + 每主题随机 4 卡（点=填入 composer）
-  //   + 底部 composer（发起该主题新会话）+ 顶部可选「Dashboard」超链接（跳该主题仪表盘详情页）。
+  //   + 底部 composer（发起该主题新会话）。
   // 与通用主页同一套 .empty-center.home 视觉；主题各自的 prompt 池 / 标题来自 TOPIC_LANDING。
-  // openDash：点「Dashboard」的回调（whats-new 无 dashboard → 不传即不渲染）。
-  //   作为**紧贴输入框左上角的一体化标签**传给 Composer（onOpenDashboard），与聊天框连成一体，
-  //   不再是浮在 hero 上方的独立超链接。
-  const renderThemeLanding = (topicKey: TopicKey, openDash?: () => void) => {
+  // ⚠️ 看板入口**不在这里**：统一走输入框上方 dashPillsFor() 那排粗粒度胶囊（每个主题该有
+  //    哪几颗、门禁怎么写都在那个函数里）。2026-09-11 之前这里还有第二个参数 openDash，
+  //    成本 / 案例走它渲染成「打开 Dashboard」标签 —— 已删，别再加回来：同一位置两套入口。
+  const renderThemeLanding = (topicKey: TopicKey) => {
     const cfg = TOPIC_LANDING[topicKey];
     const cards = themeCards(topicKey);
     return (
@@ -1151,7 +1337,8 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
           devopsAgent={lt(topicKey).devopsAgent ?? false} onToggleDevopsAgent={() => setLt(topicKey, { devopsAgent: !(lt(topicKey).devopsAgent ?? false), devopsAgentDirect: false, devopsChat: false })}
           devopsAgentDirect={lt(topicKey).devopsAgentDirect ?? false} onToggleDevopsAgentDirect={() => setLt(topicKey, { devopsAgentDirect: !(lt(topicKey).devopsAgentDirect ?? false), devopsAgent: false, devopsChat: false })}
           devopsChat={lt(topicKey).devopsChat ?? false} onToggleDevopsChat={() => setLt(topicKey, { devopsChat: !(lt(topicKey).devopsChat ?? false), devopsAgent: false, devopsAgentDirect: false })}
-          onStop={stopGen} topic={topicKey} onOpenDashboard={openDash} convKey={"landing:" + topicKey} accountId={dashAccountId}
+          onStop={stopGen} topic={topicKey} dashPills={dashPillsFor(topicKey)}
+          convKey={"landing:" + topicKey} accountId={dashAccountId}
           onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
       </div>
     );
@@ -1186,10 +1373,13 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
         finopsActive={view === "finops"}
         onCases={() => { setCasesDash(null); setView("cases"); collapseIfMobile(); }}
         casesActive={view === "cases"}
-        onSecurity={() => { setSecurityDash(null); setView("security"); collapseIfMobile(); }}
-        securityActive={view === "security"}
-        showSecurity={isAdmin || (capsLoaded && can("nav:security"))}
-        onInvestigate={() => { setInvestigateDash(null); setView("investigate"); collapseIfMobile(); }}
+        // ⚠️ 这里**没有** onSecurity / securityActive / showSecurity —— 2026-09-11 产品要求
+        // 侧栏去掉「安全」这一项，Sidebar 那三条 prop 也一起删了。安全看板的唯一入口是
+        // 「调查」输入框上方的「安全态势」胶囊（dashPillsFor）。
+        //
+        // 侧栏进来 = 没有"上一步"，必须清 dashReturn，否则上一次从胶囊进看板留下的值
+        // 会让返回按钮继续挂着，点一下把人送回一个他并不是从那儿来的地方。
+        onInvestigate={() => { setDashReturn(null); setInvestigateDash(null); setView("investigate"); collapseIfMobile(); }}
         investigateActive={view === "investigate"}
         onInspection={() => { setInspectionDash(null); setView("inspection"); collapseIfMobile(); }}
         inspectionActive={view === "inspection"}
@@ -1240,11 +1430,17 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               {collapsed && (
                 <button className="panel-btn topbar-expand" onClick={() => setCollapsed(false)}><ExpandIcon /></button>
               )}
-              <button className="dash-back" onClick={() => setFinopsDash(null)} title={locale === "en" ? "Back to Cost" : "返回成本主页"}>← {locale === "en" ? "Back" : "返回"}</button>
+              {/* 走 backFromDash（不是裸 setFinopsDash(null)）：2026-09-11 起这棵树只能从
+                  输入框上方的「支出与优化」胶囊进，而胶囊会记下 dashReturn —— 从会话里点进来的
+                  就该回那条会话，裸清 dash 只会把人扔到成本主页上。 */}
+              <button className="dash-back" onClick={backFromDash}
+                title={dashReturn === "chat"
+                  ? (locale === "en" ? "Back to chat" : "返回对话")
+                  : (locale === "en" ? "Back to Cost" : "返回成本主页")}>← {locale === "en" ? "Back" : "返回"}</button>
               <div className="title">{t("topic.cost")} · {locale === "en" ? "Dashboards" : "仪表盘"}</div>{dashAcctPickerRight}{finopsBadge}
             </div>
             <FinopsDashboardBrowser data={finopsData ?? undefined} initial={finopsDash}
-              can={can} hasCapNode={hasCapNode}
+              can={can} hasCapNode={hasCapNode} accountId={dashAccountId}
               onAsk={(q) => { setFinopsDash(null); startFromNotification(q, "finops"); }} />
           </>
         ) : view === "finops" ? (
@@ -1255,7 +1451,8 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               )}
               <div className="title">{t("topic.cost")}</div>{dashAcctPickerRight}{finopsBadge}
             </div>
-            {renderThemeLanding("finops", () => { setFinopsDash("spend"); setSrcOpen(false); setThinkOpen(false); })}
+            {/* 看板入口走输入框上方的「支出与优化」胶囊（dashPillsFor）*/}
+            {renderThemeLanding("finops")}
           </>
         ) : view === "cases" && casesDash ? (
           /* 案例仪表盘两栏浏览器(仿通知/成本主题) */
@@ -1264,7 +1461,11 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               {collapsed && (
                 <button className="panel-btn topbar-expand" onClick={() => setCollapsed(false)}><ExpandIcon /></button>
               )}
-              <button className="dash-back" onClick={() => setCasesDash(null)} title={locale === "en" ? "Back to Cases" : "返回案例主页"}>← {locale === "en" ? "Back" : "返回"}</button>
+              {/* 同上：走 backFromDash，别退回裸 setCasesDash(null)。 */}
+              <button className="dash-back" onClick={backFromDash}
+                title={dashReturn === "chat"
+                  ? (locale === "en" ? "Back to chat" : "返回对话")
+                  : (locale === "en" ? "Back to Cases" : "返回案例主页")}>← {locale === "en" ? "Back" : "返回"}</button>
               <div className="title">{t("topic.cases")} · {locale === "en" ? "Dashboards" : "仪表盘"}</div>{dashAcctPickerRight}
             </div>
             <CasesDashboardBrowser data={casesData ?? undefined} initial={casesDash}
@@ -1278,31 +1479,34 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               )}
               <div className="title">{t("topic.cases")}</div>{dashAcctPickerRight}
             </div>
-            {renderThemeLanding("cases", () => { setCasesDash("overview"); setSrcOpen(false); setThinkOpen(false); })}
-          </>
-        ) : view === "security" && securityDash ? (
-          /* 安全仪表盘两栏浏览器(仿通知/成本/案例主题:左列表+右内容) */
-          <>
-            <div className="topbar">
-              {collapsed && (
-                <button className="panel-btn topbar-expand" onClick={() => setCollapsed(false)}><ExpandIcon /></button>
-              )}
-              <button className="dash-back" onClick={() => setSecurityDash(null)} title={locale === "en" ? "Back to Security" : "返回安全主页"}>← {locale === "en" ? "Back" : "返回"}</button>
-              <div className="title">{t("topic.security")} · {locale === "en" ? "Dashboards" : "仪表盘"}</div>{dashAcctPickerRight}
-            </div>
-            <SecurityDashboardBrowser data={securityData ?? undefined} initial={securityDash} can={can}
-              accountId={dashAccountId} accounts={accounts} onAccountChange={setDashAccountId}
-              onInvestigate={(text) => startFromNotification(text, "investigate", { accountId: dashAccountId })} />
+            {/* 看板入口走输入框上方的「案例进展」胶囊（dashPillsFor）*/}
+            {renderThemeLanding("cases")}
           </>
         ) : view === "security" ? (
+          /* 安全看板两栏浏览器（左目录 + 右内容）。
+             2026-09-11「安全」不再是聊天主题（聊天并入「调查」），所以这里和 view==="inspection"
+             一样：**没有主题落地页**，点进来直接是目录，initial 缺省落「TA 安全检查」。
+             返回按钮只在 dashReturn 有值时给 —— 那代表用户是从「调查」输入框上方的
+             「安全态势」胶囊进来的，回得去；从侧栏直接点进来没有上一步，给了就是死按钮。 */
           <>
             <div className="topbar">
               {collapsed && (
                 <button className="panel-btn topbar-expand" onClick={() => setCollapsed(false)}><ExpandIcon /></button>
               )}
-              <div className="title">{t("topic.security")}</div>{dashAcctPickerRight}
+              {dashReturn && (
+                <button className="dash-back" onClick={backFromDash}
+                  title={dashReturn === "chat"
+                    ? (locale === "en" ? "Back to chat" : "返回对话")
+                    : (locale === "en" ? "Back to Investigation" : "返回调查主页")}>← {locale === "en" ? "Back" : "返回"}</button>
+              )}
+              <div className="title">{t("topic.security")} · {locale === "en" ? "Dashboards" : "仪表盘"}</div>{dashAcctPickerRight}
             </div>
-            {renderThemeLanding("security", () => { setSecurityDash("ta-security"); setSrcOpen(false); setThinkOpen(false); })}
+            {/* 不传 onAccountChange：切账号走顶栏那个 dashAcctPickerRight（唯一入口）。
+                看板内部原来那个"组织概览点行下钻"已随缩略卡落地页一起删了。 */}
+            <SecurityDashboardBrowser data={securityData ?? undefined} initial={securityDash ?? "ta-security"} can={can}
+              accountId={dashAccountId} accounts={accounts}
+              onInvestigate={(text) => startFromNotification(text, "investigate", { accountId: dashAccountId })}
+              onReload={() => setSecurityData(null)} />
           </>
         ) : view === "investigate" && investigateDash ? (
           /* 调查仪表盘两栏浏览器(仿通知/成本/案例主题:左列表+右内容) */
@@ -1311,14 +1515,22 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               {collapsed && (
                 <button className="panel-btn topbar-expand" onClick={() => setCollapsed(false)}><ExpandIcon /></button>
               )}
-              <button className="dash-back" onClick={() => setInvestigateDash(null)} title={locale === "en" ? "Back to Investigation" : "返回调查主页"}>← {locale === "en" ? "Back" : "返回"}</button>
+              <button className="dash-back" onClick={backFromDash}
+                title={dashReturn === "chat"
+                  ? (locale === "en" ? "Back to chat" : "返回对话")
+                  : (locale === "en" ? "Back to Investigation" : "返回调查主页")}>← {locale === "en" ? "Back" : "返回"}</button>
               <div className="title">{t("topic.investigate")} · {locale === "en" ? "Dashboards" : "仪表盘"}</div>{dashAcctPickerRight}
             </div>
+            {/* 不传 accounts / onAccountChange：切账号走顶栏那个 dashAcctPickerRight（唯一入口）。
+                看板内部原来那个"组织概览点行下钻"已随缩略卡落地页一起删了。 */}
             <InvestigationDashboardBrowser data={alarmData ?? undefined} initial={investigateDash} can={can}
-              accountId={dashAccountId} accounts={accounts} onAccountChange={setDashAccountId}
-              onInvestigate={(q, opts) => startFromNotification(q, "investigate",
-                opts?.deep ? deepDiveTogglesFor("investigate") : undefined)}
-              onNotify={(q) => startFromNotification(q, "general")} />
+              accountId={dashAccountId}
+              onReload={() => setAlarmData(null)}
+              onInvestigate={(q, opts) => startFromNotification(q, "investigate", {
+                accountId: dashAccountId,
+                ...(opts?.deep ? deepDiveTogglesFor("investigate") : {}),
+              })}
+              onNotify={(q) => startFromNotification(q, "general", { accountId: dashAccountId })} />
           </>
         ) : view === "investigate" ? (
           <>
@@ -1328,12 +1540,14 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               )}
               <div className="title">{t("topic.investigate")}</div>{dashAcctPickerRight}
             </div>
-            {renderThemeLanding("investigate", () => { setInvestigateDash("alarm-overview"); setSrcOpen(false); setThinkOpen(false); })}
+            {/* 调查的两个看板走输入框上方的「仪表盘」胶囊（dashPillsFor）*/}
+            {renderThemeLanding("investigate")}
           </>
         ) : view === "inspection" ? (
           /* 巡检看板：两栏浏览器（左目录 + 右内容），**没有主题落地页**。
-             ⚠️ 其他仪表盘（finops / cases / security / investigate）走
+             ⚠️ 其他仪表盘（finops / cases / investigate）走
              `renderThemeLanding` 是因为它们同时是**聊天主题** ——
+             （security 也没有：它 2026-09-11 已不是聊天主题，和巡检一样直接进目录）
              落地页的作用是「发起该主题的新会话」。巡检不是聊天主题：
              硬塞一个会让它出现在侧栏的会话分组里，而那里永远是空的
              （`TopicKey` 与会话分组同源，见 types.ts 的 TOPICS）。
@@ -1388,13 +1602,16 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
             无成员账号时 headerAcctPicker 为 null，退回原来的"仅悬浮展开钮"。
             水合中用 showLanding（而非 isEmpty）：会话标题在列表接口里就有，拉历史时
             直接显示真实标题栏，避免"标题栏先空后有"的第二次跳动。 */}
+        {/* `!starops` 与下面会话态那一处同源：对象已经切到阿里云 STAROps 时，右上角那个
+            **AWS** 账号下拉一并撤掉 —— 发第一条消息前就切好对象是常见路径，只在会话态藏
+            等于"发出去之前还在误导"。 */}
         {showLanding ? (
-          (accounts.length > 0 || collapsed) ? (
+          ((accounts.length > 0 && !starops) || collapsed) ? (
             <div className="topbar">
               {collapsed && (
                 <button className="panel-btn topbar-expand" onClick={() => setCollapsed(false)}><ExpandIcon /></button>
               )}
-              {accounts.length > 0 && (
+              {accounts.length > 0 && !starops && (
                 <div className="title" style={{ color: "var(--muted)", fontWeight: 600, fontSize: 13, marginLeft: "auto", display: "inline-flex", alignItems: "center" }}>
                   {locale === "en" ? "Account" : "账号"}{headerAcctPicker}
                 </div>
@@ -1422,11 +1639,19 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                 而"谁在答"恰恰是这类会话唯一会变的东西 —— 翻回一个旧会话时靠它一眼认出这段是
                 NotiOps 答的还是客户自己的 DevOps Agent 答的。输入框上方那条身份条已按产品要求
                 去掉，所以锁定之后**只剩这个 tag** 承担身份说明。
-                ⚠️ 水合中（历史还没到）不渲染：devopsChat 不落库，锁是靠历史里的 via="devops-agent"
-                恢复的（见上面的 relock），历史到达前渲染出来必然是 "NotiOps" —— 对一段 DevOps
-                会话就是**标错**，比不标更糟。 */}
+                ⚠️ 水合中（历史还没到）不渲染：devopsChat / starops 都不落库，锁是靠历史里的
+                via="devops-agent" / via="starops" 恢复的（见上面的 relock），历史到达前渲染出来
+                必然是 "NotiOps" —— 对一段 DevOps / STAROps 会话就是**标错**，比不标更糟。
+                STAROps 排在最前，与 modeOf / BFF 的一选一同序。
+                STAROps 那枚用 --link（深色 #5aa7ff / 浅色 #006ce0）而不是 --blue：--blue 是
+                品牌蓝、只有一个值，在近黑背景上暗到接近正文色；--ok 那一枚已被 DevOps 占了，
+                两个对象必须一眼能分开。 */}
             {(active.topic ?? "general") === "general" && !hydratingIds.has(active.id) && (
-              devopsChat ? (
+              starops ? (
+                <span className="topbar-topic" style={{ color: "var(--link)" }} title={t("obj.tag.starops.hint")}>
+                  <IconCloud size={13} />{t("obj.tag.starops")}
+                </span>
+              ) : devopsChat ? (
                 <span className="topbar-topic" style={{ color: "var(--ok)" }} title={t("obj.tag.devops.hint")}>
                   <IconInvestigate size={13} />{t("obj.tag.devops")}
                 </span>
@@ -1438,8 +1663,13 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
             )}
             {/* 会话账号选择器：与 landing 一致的下拉，让用户在会话中也能看到/切换当前账号。
                 切换后本会话后续消息即用新账号(每条消息发送时读会话当前 accountId)。
-                右上角对齐(仿 AWS 控制台;逻辑不变,仅位置)。多账号可用时才显示。 */}
-            {headerAcctPickerRight}
+                右上角对齐(仿 AWS 控制台;逻辑不变,仅位置)。多账号可用时才显示。
+                ⚠️ STAROps 会话**不显示**：这个下拉是「本会话对着哪个 **AWS** 账号」，而这段对话
+                问的是客户自己的**阿里云**数字员工 —— 摆一个选了也不生效的 AWS 账号在右上角，
+                客户会以为"这条阿里云结论对应这个 AWS 账号"。与页脚删掉 AWS 账号 ID 是同一件事
+                （见 Message.tsx 里的 🔴）：拿不到阿里云账号就**不显示**，不显示错的那个。
+                只藏不清值：切回 NotiOps / DevOps 对象时，原来选的账号原样回来。 */}
+            {!starops && headerAcctPickerRight}
           </div>
         )}
         {/* 有对话：消息流在上、输入框在下（原布局）。
@@ -1449,6 +1679,15 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
           <>
             <div className="stream" ref={attachStream}>
               <div className="thread">
+                {/* 🔴 历史被截断 —— 与"这个会话本来就这么短"必须能区分开。
+                    见上面 relock 那段注释：截断还会顺带丢掉「对话对象」的锁。 */}
+                {active.historyTruncated && (
+                  <div className="thread-truncated">
+                    {locale === "en"
+                      ? `Showing the most recent ${active.historyLimit || 0} messages; earlier ones are not loaded.`
+                      : `只显示最近 ${active.historyLimit || 0} 条消息，更早的部分未加载。`}
+                  </div>
+                )}
                 {active.messages.map((m) => (
                   <Message key={m.id} m={m} onOpenSources={openSources}
                     onOpenThinking={openThinking}
@@ -1473,7 +1712,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                 ))}
               </div>
             </div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id} accountId={accountId}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} starops={starops} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id} accountId={accountId} dashPills={dashPillsFor(active.topic ?? "general")}
 
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
           </>
@@ -1497,26 +1736,28 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                 </div></div>
               </div>
             </div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id} accountId={accountId}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} starops={starops} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id} accountId={accountId} dashPills={dashPillsFor(active.topic ?? "general")}
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
           </>
         ) : (active.topic ?? "general") === "general" ? (
           /* 通用对话主页（Codex 式）：居中 logo + 项目化标题 + 「对话对象」分段控件 + 4 张启动卡片，
              composer 停在下方。
-             对话对象（ChatObjectPicker）= 这段对话由谁来答：NotiOps 自己的 agent，还是客户自己的
-             DevOps Agent（我们侧 0 token）。**可跳过**：不选直接打字就是 NotiOps（老用户零回归）；
+             对话对象（ChatObjectPicker）= 这段对话由谁来答：NotiOps 自己的 agent、客户自己的
+             DevOps Agent，还是客户自己在**阿里云**上的 STAROps 数字员工（后两条我们侧都 0 token）。
+             **可跳过**：不选直接打字就是 NotiOps（老用户零回归）；
              发出第一句后本会话就固定（锁定后由标题栏的「对话对象」tag 说明谁在答）。
              启动卡片按选中的对象换池子：DevOps Agent 那条路径不做成本/案例/Skills，
-             拿 NotiOps 那 4 张引导等于把客户带到答不了的问题上。
+             拿 NotiOps 那 4 张引导等于把客户带到答不了的问题上；STAROps 更远 —— 它连
+             EC2/RDS/CloudWatch 都看不到，必须用它自己那一组（阿里云资源）。
              卡片点击 = 把代表性 prompt 填入输入框（停留在通用对话，不切主题），用户可再改写后发送。 */
           <div className="empty-center home">
             <div className="home-hero">
               <div className="home-logo"><Logo size={104} variant="hero" /></div>
               <div className="home-headline">{t("home.headline")}</div>
-              <ChatObjectPicker devopsChat={devopsChat} accountId={accountId}
-                onPick={(obj) => setDevopsMode(obj === "devops" ? "chat" : "off")} />
+              <ChatObjectPicker devopsChat={devopsChat} starops={starops} accountId={accountId}
+                onPick={(obj) => setDevopsMode(obj === "devops" ? "chat" : obj === "starops" ? "starops" : "off")} />
               <div className="home-cards">
-                {(devopsChat ? DEVOPS_HOME_CARDS : homeCards).map((c) => {
+                {(starops ? STAROPS_HOME_CARDS : devopsChat ? DEVOPS_HOME_CARDS : homeCards).map((c) => {
                   const desc = t(c.descKey);
                   return (
                     <button key={c.key} type="button" className="home-card"
@@ -1528,7 +1769,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                 })}
               </div>
             </div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} onStop={stopGen} topic={active.topic ?? "general"} prefill={homePrefill[active.id]} convKey={active.id} accountId={accountId}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} starops={starops} onStop={stopGen} topic={active.topic ?? "general"} prefill={homePrefill[active.id]} convKey={active.id} accountId={accountId}
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
           </div>
         ) : (active.topic ?? "general") === "whats-new" ? (
@@ -1552,13 +1793,13 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                 })}
               </div>
             </div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} onStop={stopGen} topic={active.topic ?? "general"} prefill={homePrefill[active.id]} convKey={active.id} accountId={accountId}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} starops={starops} onStop={stopGen} topic={active.topic ?? "general"} prefill={homePrefill[active.id]} convKey={active.id} accountId={accountId}
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
           </div>
         ) : (
           <div className="empty-center">
             <div className="empty-greeting">{greeting(active.topic, locale)}</div>
-            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={true} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id} accountId={accountId}
+            <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={true} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} starops={starops} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id} accountId={accountId} dashPills={dashPillsFor(active.topic ?? "general")}
 
               onManageSkills={() => { setView("skills"); collapseIfMobile(); }} />
             {(() => {

@@ -26,11 +26,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 from botocore.config import Config as _BotoConfig
 from botocore.exceptions import ClientError
 
 from core.aws_session import get_session
+
+# 默认区域跟着**运行时所在区域**走,不写死 us-east-1 —— 写死会让"没查到"变成"客户没有",
+# 而部署默认区域并不是 us-east-1(setup.sh 默认 ap-northeast-1)。
+# 与 core/resources.py / core/investigation_mcp.py / core/aws_api_mcp.py 同一取法。
+_DEFAULT_REGION = (os.environ.get("AWS_REGION")
+                   or os.environ.get("AWS_DEFAULT_REGION")
+                   or "us-east-1")
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +75,7 @@ def aws_readonly_call(service: str, operation: str, account_id: str,
       operation: 只读 API(boto3 方法名 snake_case,如 "list_buckets"/"describe_instances").
                  非只读动词一律拒绝。
       account_id: 12 位目标账号(必填;调用方从 _resolve_acct() 传入,已过可见性门禁).
-      region: 区域(默认 us-east-1;S3/IAM 等全局服务可留空).
+      region: 区域(默认 = 本运行时所在区域;S3/IAM 等全局服务可留空).
       params: API 入参 dict(如 {"MaxResults": 50}).
 
     Returns: {"ok": bool, "service","operation","account_id", "result"|"error"}.
@@ -90,7 +98,7 @@ def aws_readonly_call(service: str, operation: str, account_id: str,
                 "error": f"账号 {acct} 跨账号访问不可用(未接入 NotiOps / 无 role_arn / 被安全闸门拒绝)。"}
 
     try:
-        client = sess.client(svc, region_name=(region or "us-east-1"),
+        client = sess.client(svc, region_name=(region or _DEFAULT_REGION),
                              config=_BotoConfig(retries={"max_attempts": 2}))
         method = op.strip().replace("-", "_")
         if not hasattr(client, method):

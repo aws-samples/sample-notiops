@@ -706,6 +706,94 @@ def clear_im_chat_session(platform: str, chat_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# STAROps 会话（imsochat#）—— 阿里云数字员工的 threadId
+# ---------------------------------------------------------------------------
+# 与上面 `imchat#`（DevOps Agent 的 execution_id）是**同一个用意、不同的一朵云**：
+# STAROps 的对话历史挂在 `threadId` 上，"接着上一句问"必须复用它。
+#
+# ⚠️ **为什么单开一行而不是往 `imchat#` 上加字段**：`put_im_chat_session` 在
+#    `execution_id` 为空时**整个跳过**（上面第一行判空就 return）。STAROps 这条路上根本
+#    不存在 execution_id，塞进去就是"存了个啥都没存"，而且症状是静默的 —— 每一轮都当
+#    新会话，多轮上下文永久丢失，客户只会觉得"这个机器人记不住话"。
+#    另一半理由与 `imchat#` 同：那是整行 `put_item`（后写覆盖前写），两条路径写同一行会
+#    互相擦掉对方的字段。
+#
+# ⚠️ `employee` / `region` 必须**一起**存并在复用前**一起**校验：数字员工或接口地域被
+#    改过之后，旧 threadId 在新目标上根本不存在，拿去问只会换来一个语义不明的 404。
+#    与 `bff/web-chat/store.mjs::getStarOpsThread` 逐字同构（那边是 web 侧同一件事）。
+#
+# 🔒 这一行里**没有任何凭据**：threadId 是阿里云侧的会话标识，employee 是客户在 Admin
+#    页明文填的员工 ID。**`workspace` 不存在这里** —— 它的值内嵌阿里云账号 UID，属管理员
+#    专属值，只在请求体里出现一次（见 core/aliyun_config.py 文件头）。
+_IM_STAROPS_TTL_SECONDS = 12 * 3600
+
+
+def _k_im_starops(platform: str, chat_id: str) -> str:
+    return f"imsochat#{platform}:{chat_id}"
+
+
+def get_im_starops_session(platform: str, chat_id: str) -> dict | None:
+    """取该会话的 STAROps thread（`threadId` + 当时用的 employee / region）。"""
+    if not (platform and chat_id):
+        return None
+    try:
+        resp = _table.get_item(Key={"lookup_key": _k_im_starops(platform, chat_id)},
+                               ConsistentRead=False)
+    except Exception as e:
+        logger.warning("get_im_starops_session (%s) failed: %s", chat_id, _safe_err(e))
+        return None
+    item = resp.get("Item")
+    if not item:
+        return None
+    if int(item.get("ttl", 0)) < int(time.time()):
+        return None
+    return {
+        "thread_id": str(item.get("thread_id") or ""),
+        "employee": str(item.get("employee") or ""),
+        "region": str(item.get("region") or ""),
+    }
+
+
+def put_im_starops_session(platform: str, chat_id: str, session: dict,
+                           ttl_seconds: int = _IM_STAROPS_TTL_SECONDS) -> None:
+    """落库该会话的 threadId。空 thread_id 视为"没会话可存"，直接跳过。
+
+    归属口径与 `put_im_chat_session` 一致：**一个 chat 一个会话**（群里大家看同一个
+    排查过程，按用户拆会让 A 问的上下文对 B 不可见）。
+    """
+    if not (platform and chat_id):
+        return
+    tid = str((session or {}).get("thread_id") or "")
+    if not tid:
+        return
+    now = int(time.time())
+    try:
+        _table.put_item(Item={
+            "lookup_key": _k_im_starops(platform, chat_id),
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": tid,
+            "employee": str((session or {}).get("employee") or ""),
+            "region": str((session or {}).get("region") or ""),
+            "updated_at": now,
+            "ttl": now + ttl_seconds,
+        })
+    except Exception as e:
+        logger.warning("put_im_starops_session (%s) failed: %s", chat_id, _safe_err(e))
+
+
+def clear_im_starops_session(platform: str, chat_id: str) -> None:
+    """显式清会话（`/new`、或阿里云侧告诉我们这个 thread 已经没了）。"""
+    if not (platform and chat_id):
+        return
+    try:
+        _table.delete_item(Key={"lookup_key": _k_im_starops(platform, chat_id)})
+    except Exception as e:
+        logger.warning("clear_im_starops_session (%s) failed: %s",
+                       chat_id, _safe_err(e))
+
+
+# ---------------------------------------------------------------------------
 # NotiOps Agent 会话（imagent#）—— 只存"这个 chat 现在用哪个 runtimeSessionId"
 # ---------------------------------------------------------------------------
 # `core/agent_chat.py` 那条路径（`/agent notiops`）的多轮上下文由 AgentCore 服务端按

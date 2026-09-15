@@ -47,6 +47,7 @@ from core import im_prefs
 from core import llm_pref_resolver
 from core import locale_resolver
 from core import model_catalog
+from core import starops_chat
 from platforms.common import (ack_variants, chat_lease, long_answer,
                               pref_commands)
 from platforms.common.im_types import Caps, ImMessage
@@ -110,9 +111,10 @@ class DingtalkCaps(Caps):
         markdown 消息（`dt_messages` 只有这一种形态）。所以也没有"卡片发失败退纯
         文本"的分支：退无可退，两者是同一条路。
         """
-        from core import nl_router
+        from core import multicloud, nl_router
+        # `multicloud.help_row_key` = 「这一行发哪份文案」，见 `core/multicloud.py`。
         rows = "\n".join(
-            i18n.t(f"help.row.{feat}", msg.locale)
+            i18n.t(multicloud.help_row_key(feat), msg.locale)
             for feat, _en, _zh in nl_router.HELP_COMMANDS
         )
         body = (f"{i18n.t('help.intro', msg.locale)}\n\n{rows}\n\n"
@@ -200,7 +202,7 @@ class DingtalkCaps(Caps):
         self.reply_text(msg, i18n.t(key, msg.locale, label=entry.label))
 
     def agent(self, msg: ImMessage, arg: str) -> None:
-        """`/agent [notiops|devops|default]` —— 这个会话的对话由谁答（0 token）。
+        """`/agent [notiops|devops|starops|default]` —— 这个会话的对话由谁答（0 token）。
 
         与另外两家**同一份**逻辑和文案（`platforms.common.pref_commands`）；三边
         各写一遍必然漂移，见那个模块的文件头。
@@ -406,10 +408,14 @@ class DingtalkCaps(Caps):
           · `notiops` → `core.agent_chat.run_agent_chat`，走我们的 AgentCore
             runtime，**会消耗 token**。多轮上下文靠 `imagent#<conversation_id>`
             存的 runtime session id（6 小时轮换）。
+          · `starops` → `core.starops_chat.run_starops_chat`，直连**阿里云**
+            STAROps 数字员工，**NotiOps 侧 0 token**（烧客户自己的阿里云 AI
+            额度）。多轮上下文靠 `imsochat#<conversation_id>` 存的 `thread_id`。
+            2026-09-14 加。
 
-        ⚠️ 与另外两家**逐段对齐**（分流只影响 ack 文案 / 调哪个 runner / 消息上
-        `agent=` `sources=` `usage=` 三个参数），排队、心跳、终版、截断落报告、
-        兜底全部共用下面这一份。
+        ⚠️ 与另外两家**逐段对齐**（分流只影响 ack 文案 / 读哪一行会话 / 调哪个
+        runner / 消息上 `agent=` `sources=` `usage=` `employee=` 那几个参数），
+        排队、心跳、终版、截断落报告、兜底全部共用下面这一份。
 
         ── 唯一的结构差异：进度是**追加**不是刷新 ──────────────────────────
         另外两家先发一条消息拿到 id，再按节流**改同一条**（`LiveCard`）。钉钉拿不
@@ -446,17 +452,28 @@ class DingtalkCaps(Caps):
             platform=PLATFORM, chat_id=msg.chat_id, user_id=msg.user_id,
             is_dm=msg.is_direct)
         notiops = agent == im_prefs.AGENT_NOTIOPS
+        starops = agent == im_prefs.AGENT_STAROPS
 
         # 落款里的账号那一段（多账号）—— **这一轮只解析一次**（org 模式下底下是
         # STS，而落款会被每条追加消息渲染一次）。与另外两家同一个做法。
+        # ⚠️ STAROps 那条路上这个值**不会显示**（换成数字员工 ID，见 `im_footer`
+        #    的 🔴），但照旧解析：互斥判断只在 `im_footer` 一处。
         deploy_acct = im_accounts.deploy_account_id()
 
-        session = ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
+        # 会话行按路分段（`imchat#` / `imsochat#`；notiops 那条不读这一行）。用闭包
+        # 读是因为「排队转正」之后还要重读一次 —— 与另外两家同一个做法。
+        def _load_session() -> dict:
+            if starops:
+                return ddb_state.get_im_starops_session(PLATFORM,
+                                                        msg.chat_id) or {}
+            return ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
+
+        session = _load_session()
         question = (text or msg.text or "").strip()
 
-        # 来源 / 用量要等这一轮跑完才知道，而 `AppendProgress` 的 `render` 回调只
-        # 透传五个固定 kwarg。所以放一个可变盒子让 `render=` 的闭包读。
-        extra: dict = {"sources": [], "usage": {}}
+        # 来源 / 用量 / 数字员工 ID 要等这一轮跑完才知道，而 `AppendProgress` 的
+        # `render` 回调只透传五个固定 kwarg。所以放一个可变盒子让闭包读。
+        extra: dict = {"sources": [], "usage": {}, "employee": ""}
 
         # 第 0 步：抢这个会话的"轮次"。`acquire()` 不阻塞 —— 先把消息发出去再等，
         # 否则用户在排队的那几分钟里一个字都看不到。
@@ -489,7 +506,8 @@ class DingtalkCaps(Caps):
                 steps=kw["steps"], state=kw["state"], elapsed=kw["elapsed"],
                 report_url=kw["report_url"],
                 agent=agent, sources=extra["sources"], usage=extra["usage"],
-                account=msg.account_id, deploy=deploy_acct),
+                account=msg.account_id, deploy=deploy_acct,
+                employee=extra["employee"]),
             send=self._send,
         )
         # 心跳是**唯一**的驱动源：`emit` 在这个平台上只累积不发送（见
@@ -508,9 +526,9 @@ class DingtalkCaps(Caps):
                 live.set_ack(i18n.t("im.dt.progress.still_running", msg.locale))
                 live.set_state("thinking")
                 live.flush(force=True)
-                # 前一轮很可能刚写过 execution_id，重新读一遍才是最新的上下文。
-                session = ddb_state.get_im_chat_session(PLATFORM,
-                                                        msg.chat_id) or {}
+                # 前一轮很可能刚写过 execution_id / thread_id，重新读一遍才是最新的
+                # 上下文。
+                session = _load_session()
 
             # 第 3 步：跑。
             if notiops:
@@ -537,6 +555,25 @@ class DingtalkCaps(Caps):
                 extra["sources"] = result.get("sources") or []
                 extra["usage"] = result.get("usage") or {}
                 # 这条路**不写 `imchat#`**：会话连续性由 `imagent#` 那行负责。
+            elif starops:
+                # 直连阿里云 STAROps 数字员工。**NotiOps 侧 0 token**，但这一轮烧的
+                # 是客户自己的阿里云 AI 额度。与另外两家**逐字对齐**（含两条 ⚠️）。
+                # ⚠️ `text` 是**位置参数** —— 与 `run_devops_chat(text=…)` 刻意不同。
+                result = starops_chat.run_starops_chat(
+                    question, locale=msg.locale,
+                    session=session,
+                    emit=live.emit,
+                )
+                # 落款上「哪个数字员工答的」那一位（必须在 `finish()` 之前填）。
+                extra["employee"] = str(result.get("employee") or "")
+                # ⚠️ 判断顺序与下面 devops 那支**相反**：`run_starops_chat` 在
+                #    `reset_session=True` 时**照样带着那个已经死掉的 thread_id
+                #    返回**。先判 thread_id 会把死 thread 存回去、下一轮原样再坏一次。
+                sess = result.get("session") or {}
+                if result.get("reset_session"):
+                    ddb_state.clear_im_starops_session(PLATFORM, msg.chat_id)
+                elif sess.get("thread_id"):
+                    ddb_state.put_im_starops_session(PLATFORM, msg.chat_id, sess)
             else:
                 result = devops_chat.run_devops_chat(
                     text=question, locale=msg.locale,
@@ -578,7 +615,8 @@ class DingtalkCaps(Caps):
         self._send(dt_messages.text_message(
             body + "\n\n" + dt_messages.usage_footer(
                 msg.locale, agent=agent, usage=extra["usage"],
-                account=msg.account_id, deploy=deploy_acct),
+                account=msg.account_id, deploy=deploy_acct,
+                employee=extra["employee"]),
             msg.locale), at_user=at)
 
 

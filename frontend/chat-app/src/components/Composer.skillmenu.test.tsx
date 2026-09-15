@@ -8,9 +8,12 @@
  *   · 打到没匹配时菜单**不消失**，如实说"没有匹配的 Skill"（消失会被读成"我打错字了"）；
  *   · ↑/↓ + Enter 能选中高亮那一行 —— 列表几十行且要滚，"Enter=第一个匹配"不够用；
  *   · 芯片上的「DevOps Agent」标记 = 这一轮**谁在执行这个 skill**，所以三条交给客户自己
- *     DevOps Agent 的路径都要打上（深度调查 / 深度调查（直连）/ DevOps 对话）。
- *     以前只认第一条，勾了「深度调查（直连）」的客户在界面上看不出 skill 会被交出去；
- *   · 未发布提示分两句：转交路径（深度调查）说"不会被激活、请先发布"；两条**直连**路径
+ *     DevOps Agent 的路径都要打上（`devopsAgent` 转交 / `devopsAgentDirect` 直连 /
+ *     `devopsChat` 对话）。以前只认第一条，勾了直连的客户在界面上看不出 skill 会被交出去；
+ *     ⚠️ 2026-09-13 起按**字段**而不是按界面标签描述这三条：`devopsAgent`（转交）在界面上
+ *     已经没有开关了，界面上那枚叫「深度调查」的是 `devopsAgentDirect`（直连）。字段与 BFF
+ *     侧那条链路都还活着，所以这里三条仍要各测一遍 —— 别看到"界面上没有"就删掉那一条；
+ *   · 未发布提示分两句：转交路径（`devopsAgent`）说"不会被激活、请先发布"；两条**直连**路径
  *     说"正文会内联过去、无需发布，只有 references/ 取不到" —— 后者套用前一句是在说
  *     一件不成立的事（BFF 明确内联了正文，见 bff/web-chat/devops_skill.mjs）。
  *
@@ -145,6 +148,9 @@ describe("激活芯片：这一轮谁来执行这个 skill", () => {
   }
 
   it("三条交给 DevOps Agent 的路径都打「DevOps Agent」标记", async () => {
+    // `devopsAgent` 这一轮从 2026-09-13 起在界面上没有开关（只能由历史会话恢复出来，而
+    // convMode.restorableMode 也已经把它挡成 off）。**仍然要测**：字段、Composer 的芯片
+    // 逻辑、BFF 那条链路一行没改，删掉这一条就等于把还活着的通路变成没人看着的通路。
     for (const flag of ["devopsAgent", "devopsAgentDirect", "devopsChat"] as const) {
       cleanup();
       renderComposer({ [flag]: true });
@@ -159,7 +165,7 @@ describe("激活芯片：这一轮谁来执行这个 skill", () => {
     expect(chip.querySelector(".skill-active-mode")).toBeNull();
   });
 
-  it("未发布 + 深度调查（转交）→ 说「不会被激活、请先发布」", async () => {
+  it("未发布 + devopsAgent（转交，界面已无入口）→ 说「不会被激活、请先发布」", async () => {
     renderComposer({ devopsAgent: true });
     await pickFirst();
     const tx = document.querySelector(".skill-needs-devops")?.textContent || "";

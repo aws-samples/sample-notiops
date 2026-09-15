@@ -12,6 +12,8 @@ import {
   S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand,
 } from "@aws-sdk/client-s3";
 import { inflateRawSync } from "node:zlib";
+// userError：把手写的校验提示显式标记成"可以回给用户看"（见 safe_err.mjs 的判据说明）。
+import { userError, safeErr } from "./safe_err.mjs";
 import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -92,7 +94,7 @@ function _bumpPatch(ver) {
 
 /** 列出全部 active skills（每个读一次 meta.json）。返回精简列表供前端展示。 */
 export async function listSkills() {
-  if (!BUCKET) throw new Error("SKILLS_BUCKET not configured");
+  if (!BUCKET) throw userError("SKILLS_BUCKET not configured", "config_error");
   // 首次访问自动注入预置 skills（每个容器只尝试一次，幂等且非致命）——保证客户开箱即见官方 skill，
   // 不必等管理员手动 seed；已存在则 seedPresetSkills 内部会跳过，成本极低。
   await _ensurePresetsSeeded();
@@ -133,7 +135,7 @@ export async function listSkills() {
  *  locale 给定且该 skill 有对应语言的本地化正文（meta.body_i18n 含该语言）→ 返回译文正文，
  *  否则返回规范正文（英文/原文）。仅预置 skill 会有本地化正文；客户自建照原文。 */
 export async function getSkill(skillId, version, locale) {
-  if (!BUCKET) throw new Error("SKILLS_BUCKET not configured");
+  if (!BUCKET) throw userError("SKILLS_BUCKET not configured", "config_error");
   const meta = await _getJson(metaKey(skillId));
   if (!meta) return null;
   const ver = version || meta.latest_version || "1.0.0";
@@ -166,7 +168,7 @@ export async function getSkill(skillId, version, locale) {
 
 /** 版本历史（最新在前）：[{version, changelog, created_at, created_by, is_latest}]。 */
 export async function listVersions(skillId) {
-  if (!BUCKET) throw new Error("SKILLS_BUCKET not configured");
+  if (!BUCKET) throw userError("SKILLS_BUCKET not configured", "config_error");
   const meta = await _getJson(metaKey(skillId));
   if (!meta) return [];
   const latest = meta.latest_version;
@@ -181,11 +183,11 @@ export async function listVersions(skillId) {
 
 /** 回滚：把 latest_version 指向某个历史版本（正文不动，只改指针）。 */
 export async function rollbackSkill(skillId, version) {
-  if (!BUCKET) throw new Error("SKILLS_BUCKET not configured");
+  if (!BUCKET) throw userError("SKILLS_BUCKET not configured", "config_error");
   const meta = await _getJson(metaKey(skillId));
-  if (!meta) throw new Error("skill not found");
+  if (!meta) throw userError("skill not found");
   if (!(meta.versions || []).some((v) => v.version === version)) {
-    throw new Error(`version not found: ${version}`);
+    throw userError(`version not found: ${version}`);
   }
   meta.latest_version = version;
   meta.updated_at = _now();
@@ -205,14 +207,14 @@ export async function skillExists(skillId) {
 /** 新建或更新（按 skill_id upsert，写一个新版本 + 更新 meta）。返回保存后的精简对象。
  * mode='create' 时若 id 已存在则报错（防止覆盖别人的 skill）；mode='update' 才允许覆盖。 */
 export async function saveSkill({ skill_id, name, description, body, author = "web", mode = "", i18n, body_i18n, forceAuthor = false }) {
-  if (!BUCKET) throw new Error("SKILLS_BUCKET not configured");
+  if (!BUCKET) throw userError("SKILLS_BUCKET not configured", "config_error");
   const id = (skill_id && ID_RE.test(skill_id)) ? skill_id : slugify(name);
-  if (!ID_RE.test(id)) throw new Error("invalid skill_id (need lowercase a-z, 0-9, -)");
-  if (!body || body.trim().length < 20) throw new Error("prompt too short (min 20 chars)");
+  if (!ID_RE.test(id)) throw userError("invalid skill_id (need lowercase a-z, 0-9, -)");
+  if (!body || body.trim().length < 20) throw userError("prompt too short (min 20 chars)");
 
   const existing = await _getJson(metaKey(id));
   if (mode === "create" && existing) {
-    throw new Error(`skill_id 已存在：${id}（换个 ID 或改为编辑现有 skill）`);
+    throw userError(`skill_id 已存在：${id}（换个 ID 或改为编辑现有 skill）`);
   }
   const version = existing ? _bumpPatch(existing.latest_version) : "1.0.0";
 
@@ -273,8 +275,8 @@ export async function saveSkill({ skill_id, name, description, body, author = "w
 
 /** 删除整个 skill（meta + 所有版本）。 */
 export async function deleteSkill(skillId) {
-  if (!BUCKET) throw new Error("SKILLS_BUCKET not configured");
-  if (!ID_RE.test(skillId)) throw new Error("invalid skill_id");
+  if (!BUCKET) throw userError("SKILLS_BUCKET not configured", "config_error");
+  if (!ID_RE.test(skillId)) throw userError("invalid skill_id");
   // 列出该 skill 前缀下所有对象，批量删除
   const keys = [];
   let token;
@@ -313,12 +315,12 @@ function _findEocd(buf) {
 }
 
 function _unzip(buf) {
-  if (buf.length > MAX_ZIP_BYTES) throw new Error(`zip 过大（>${MAX_ZIP_BYTES >> 20}MB）`);
+  if (buf.length > MAX_ZIP_BYTES) throw userError(`zip 过大（>${MAX_ZIP_BYTES >> 20}MB）`);
   const eocd = _findEocd(buf);
-  if (eocd < 0) throw new Error("不是有效的 zip（找不到中央目录）");
+  if (eocd < 0) throw userError("不是有效的 zip（找不到中央目录）");
   const total = buf.readUInt16LE(eocd + 10);          // 条目总数
   let cd = buf.readUInt32LE(eocd + 16);               // 中央目录起始偏移
-  if (total > MAX_ENTRIES) throw new Error(`zip 条目过多（>${MAX_ENTRIES}）`);
+  if (total > MAX_ENTRIES) throw userError(`zip 条目过多（>${MAX_ENTRIES}）`);
 
   const files = {};
   let totalOut = 0;
@@ -335,7 +337,7 @@ function _unzip(buf) {
     cd += 46 + nameLen + extraLen + commentLen;        // 移到下一条中央目录项
 
     if (name.endsWith("/")) continue;                  // 目录项
-    if (uncompSize > MAX_FILE_UNCOMPRESSED) throw new Error(`zip 内文件过大：${name}`);
+    if (uncompSize > MAX_FILE_UNCOMPRESSED) throw userError(`zip 内文件过大：${name}`);
     // 本地头的 name/extra 长度可能与中央目录不同，按本地头重新定位数据起点。
     if (lho + 30 > buf.length || buf.readUInt32LE(lho) !== LFH_SIG) continue;
     const lNameLen = buf.readUInt16LE(lho + 26);
@@ -351,7 +353,7 @@ function _unzip(buf) {
       continue;  // 单条目解压失败（含超限）不致命，跳过
     }
     totalOut += out.length;
-    if (totalOut > MAX_TOTAL_UNCOMPRESSED) throw new Error("zip 解压后总大小超限");
+    if (totalOut > MAX_TOTAL_UNCOMPRESSED) throw userError("zip 解压后总大小超限");
     files[name] = out;
   }
   return files; // { "<path>": Buffer }
@@ -426,12 +428,15 @@ export function buildSkillMd({ skill_id, name, description, body }) {
  * assets/ 等非可执行文档一并存到 skills/<id>/files/（供世界 B 打包 zip 上传 DevOps Agent）；
  * scripts/ 与可执行文件被**剥离**（暂不支持），返回里报告剥离数量。 */
 export async function importSkillZip(base64, { skillId = "", author = "web" } = {}) {
-  if (!BUCKET) throw new Error("SKILLS_BUCKET not configured");
+  if (!BUCKET) throw userError("SKILLS_BUCKET not configured", "config_error");
   let files;
   try {
     files = _unzip(Buffer.from(base64, "base64"));
   } catch (e) {
-    throw new Error(`无法解析 zip：${e.message}`);
+    // 只回异常名 + 我们自己写的处置建议：JSZip 的 message 是第三方散文，而
+    // userError 的契约是「文案必须是仓库里手写的」（见 safe_err.mjs）。
+    throw userError(`无法解析 zip（${safeErr(e)}）—— 请确认这是一个标准 zip 包，`
+      + `不是 rar / 7z，也不是加密压缩包。`);
   }
   // 找 SKILL.md（优先根层，其次任意层级；大小写不敏感）。
   // 过滤 macOS 打包噪声（__MACOSX/、._ 资源派生文件）与隐藏文件，避免选错。
@@ -441,11 +446,11 @@ export async function importSkillZip(base64, { skillId = "", author = "web" } = 
   });
   let mdKey = keys.find((k) => /(^|\/)SKILL\.md$/i.test(k));
   if (!mdKey) mdKey = keys.find((k) => /\.md$/i.test(k)); // 兜底：第一个 .md
-  if (!mdKey) throw new Error("zip 里没有 SKILL.md（Agent Skills 开放标准要求一个 SKILL.md）");
+  if (!mdKey) throw userError("zip 里没有 SKILL.md（Agent Skills 开放标准要求一个 SKILL.md）");
   const text = files[mdKey].toString("utf-8");
   const parsed = _parseSkillMd(text);
   const name = parsed.name || mdKey.split("/").pop().replace(/\.md$/i, "");
-  if (parsed.body.trim().length < 20) throw new Error("SKILL.md 正文太短（min 20 chars）");
+  if (parsed.body.trim().length < 20) throw userError("SKILL.md 正文太短（min 20 chars）");
   const id = (skillId && ID_RE.test(skillId)) ? skillId : slugify(name);
 
   // 附属文件：把 SKILL.md 所在目录作为 skill 根，收集根下（除 SKILL.md 外）的其它文件。
@@ -523,7 +528,7 @@ async function _loadSkillFiles(id) {
 /** 给一个 skill 打上/更新 devops_agent 上传状态（幂等 patch meta，不动版本）。 */
 export async function setSkillDevopsStatus(id, status) {
   const meta = await _getJson(metaKey(id));
-  if (!meta) throw new Error("skill not found");
+  if (!meta) throw userError("skill not found");
   meta.devops_agent = { ...(meta.devops_agent || {}), ...status };
   meta.updated_at = _now();
   await s3.send(new PutObjectCommand({
@@ -588,7 +593,7 @@ async function _ensurePresetsSeeded() {
  * 内容变了才 bump 版本，否则跳过；从不覆盖客户自建（author != notiops-system）的同名 skill。
  * force=true 时无条件重写正文。返回 { seeded, skipped, kept, details }。 */
 export async function seedPresetSkills({ force = false } = {}) {
-  if (!BUCKET) throw new Error("SKILLS_BUCKET not configured");
+  if (!BUCKET) throw userError("SKILLS_BUCKET not configured", "config_error");
   if (!existsSync(PRESET_DIR)) return { seeded: 0, skipped: 0, kept: 0, details: [], note: "no preset dir" };
   const ids = readdirSync(PRESET_DIR).filter((d) => {
     try { return statSync(join(PRESET_DIR, d)).isDirectory() && ID_RE.test(d); } catch { return false; }

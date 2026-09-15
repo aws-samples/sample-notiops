@@ -69,9 +69,11 @@ export interface StreamCallbacks {
   // 思考/处理过程的一步（agent 侧的工具调用与返回摘要）→ 右侧「思考过程」面板。
   onThinkingStep?: (step: ThinkingStep) => void;
   onUsage?: (usage: TokenUsage) => void;
-  // 答案来源标记（目前只有 "builtin"：agent 的内置确定性回答，未调模型、0 token）。
-  // 收到即把该条消息的署名行从「AWS Bedrock (某模型)」换成 NotiOps，见 types.ts::ChatMessage.via。
-  onVia?: (via: string) => void;
+  // 答案来源标记（"builtin"：agent 的内置确定性回答，未调模型、0 token；"starops"：客户
+  // 自己的阿里云数字员工）。收到即把该条消息的署名行从「AWS Bedrock (某模型)」换成对应
+  // 来源，见 types.ts::ChatMessage.via。
+  // 第二个参数只有 STAROps 那条路径会给：**这一轮**回答的数字员工 ID，页脚要显示它的值。
+  onVia?: (via: string, staropsEmployee?: string) => void;
   // 服务端把本轮模型换掉了（客户端点的那个已不在管理员启用集内）。
   // 静默替换会让用户以为自己还在用原来的模型，所以必须回传并纠正选择器。
   onModelSubstituted?: (info: { requested?: string; effective?: string; reason?: string }) => void;
@@ -87,7 +89,7 @@ export interface StreamCallbacks {
  * 头已被 SigV4 占用；BFF 从 body 校验 idToken 拿 sub 做会话隔离。
  */
 export async function streamChat(
-  params: { conversationId?: string; text: string; model?: string; locale?: string; webSearch?: boolean; finopsAgent?: boolean; devopsAgent?: boolean; devopsAgentDirect?: boolean; devopsChat?: boolean; topic?: string; accountId?: string; skillId?: string; skillVersion?: string },
+  params: { conversationId?: string; text: string; model?: string; locale?: string; webSearch?: boolean; finopsAgent?: boolean; devopsAgent?: boolean; devopsAgentDirect?: boolean; devopsChat?: boolean; starops?: boolean; topic?: string; accountId?: string; skillId?: string; skillVersion?: string },
   cb: StreamCallbacks,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -123,6 +125,11 @@ export async function streamChat(
     // 「DevOps 对话」：BFF 直连 DevOps Agent 控制面对话 API，由客户自己的 DevOps Agent 回答
     // （NotiOps 侧 0 token），与上面两个开关三方互斥。
     devops_chat_direct: params.devopsChat === true,
+    // 「STAROps 对话」：BFF 直连**阿里云** STAROps 数字员工（CreateChat + SSE），由客户自己的
+    // 数字员工回答（计他的阿里云 AI 额度，NotiOps 侧 0 token）。与上面三个**四方互斥**，
+    // 且 BFF 侧 STAROps 优先（index.mjs 的一选一）。这里不做兜底纠正 —— 互斥由
+    // convMode.ts 的枚举在类型层面保证，`fieldsOf` 出来的四个布尔恒定只有一个为真。
+    starops_chat: params.starops === true,
     topic: params.topic || "general",
     account_id: params.accountId || "",
     skill_id: params.skillId || "",
@@ -194,8 +201,11 @@ export async function streamChat(
 
 /* ───────────────── 会话持久化 API（SigV4 签名的普通 JSON 请求）───────────────── */
 
-export interface ConversationSummary { id: string; title: string; updatedAt: number; topic?: string; pinned?: boolean; }
-export interface StoredMessage { role: "user" | "assistant"; text: string; ts: number; model?: string; sources?: SourceItem[]; usage?: TokenUsage; account_id?: string; via?: string; }
+// obj = 最后一轮的「对话对象」（"notiops" | "devops" | "starops"，老会话是空串）。
+// 服务端唯一事实来源（store.mjs 的 touchConversation 每轮写）；侧栏 tag 只认它，
+// **不要**改成本地推断 —— 本地那份 convMode 是 per-浏览器 的，换台机器就成了空。
+export interface ConversationSummary { id: string; title: string; updatedAt: number; topic?: string; pinned?: boolean; obj?: string; }
+export interface StoredMessage { role: "user" | "assistant"; text: string; ts: number; model?: string; sources?: SourceItem[]; usage?: TokenUsage; account_id?: string; via?: string; starops_employee?: string; }
 
 /** 取 SigV4 客户端 + base + idToken（与 streamChat 同源）。未登录返回 null。 */
 export async function signedClient() {
@@ -268,17 +278,22 @@ export async function listConversations(): Promise<ConversationSummary[]> {
   }
 }
 
-/** 取某会话的全部消息（按时间正序）。 */
-export async function getMessages(conversationId: string): Promise<StoredMessage[]> {
+/** 取某会话的消息（按时间正序）。
+ *
+ * `truncated` = 后端只回了最近 N 条、更早的没读（store.mjs 的 HISTORY_LIMIT）。
+ * 必须一路带到界面上：一条长会话被截断时，用户看到的是"我早先问的那些不见了"，
+ * 而界面上没有任何区别于"这个会话本来就这么短"的信号。所有失败路径都回
+ * `truncated: false` —— 请求都没成功，声称"有更早的历史"是另一种撒谎。 */
+export async function getMessages(conversationId: string): Promise<{ messages: StoredMessage[]; truncated: boolean; limit: number }> {
   const s = await signedClient();
-  if (!s) return [];
+  if (!s) return { messages: [], truncated: false, limit: 0 };
   try {
     const r = await s.aws.fetch(`${s.base}/conversations/${encodeURIComponent(conversationId)}`, { headers: { "x-notiops-id-token": s.idToken } });
-    if (!r.ok) return [];
+    if (!r.ok) return { messages: [], truncated: false, limit: 0 };
     const j = await r.json();
-    return (j.messages ?? []) as StoredMessage[];
+    return { messages: (j.messages ?? []) as StoredMessage[], truncated: !!j.truncated, limit: Number(j.limit) || 0 };
   } catch {
-    return [];
+    return { messages: [], truncated: false, limit: 0 };
   }
 }
 
@@ -336,7 +351,7 @@ export async function getCasesSummary(): Promise<CasesSummary> {
 }
 
 /** 执行一个已被用户确认的写操作（创建/回复/关闭 case）。返回执行结果（含回查验证）。 */
-export async function executeActionApi(action: ProposedAction): Promise<{ ok: boolean; verified?: boolean; status?: string; code?: string; message?: string; caseId?: string; displayId?: string }> {
+export async function executeActionApi(action: ProposedAction): Promise<{ ok: boolean; verified?: boolean; status?: string; code?: string; message?: string; caseId?: string; displayId?: string; duplicate?: boolean }> {
   const s = await signedClient();
   if (!s) return { ok: false, message: "未登录" };
   try {
@@ -439,6 +454,38 @@ export async function getDeepInvestigationAvailability(accountId = ""): Promise<
   } catch { return { available: true }; }
 }
 
+/**
+ * 「对话对象」里的 **STAROps** 能不能选：管理员填过阿里云 AK 与数字员工名了吗。
+ *
+ * **不与上面那条合并**：那条查的是 AWS DevOps Agent 的 Agent Space 接入，与阿里云配置
+ * 毫无关系。合成一条的后果是任一朵云没配就把两个对话对象都藏掉。
+ *
+ * 与上面同一个取舍：拿不到答案（网络抖动 / 老版本 BFF 没这条路由 → 404）时**当可用**，
+ * 让用户点进去看到 BFF 那句更具体的真实报错，而不是入口凭空消失。
+ *
+ * ⚠️ `reason` 是**机器码**（no_credentials / no_employee / bad_employee / bad_region /
+ *    bad_workspace / bad_project），由前端映射成"缺哪一项、去哪儿填"的话术 ——
+ *    不要直接把它渲染给用户。BFF 保证这条响应里没有凭据、也没有 workspace
+ *    （那个值嵌着阿里云账号 UID）。
+ */
+export interface StarOpsAvailability { available: boolean; reason?: string; employee?: string; region?: string }
+export async function getStarOpsAvailability(): Promise<StarOpsAvailability> {
+  const s = await signedClient();
+  if (!s) return { available: true };
+  try {
+    // 没有 `?account=` —— STAROps 是**阿里云侧**的数字员工，与当前选的 AWS 账号无关。
+    const r = await s.aws.fetch(`${s.base}/features/starops`, { headers: { "x-notiops-id-token": s.idToken } });
+    if (!r.ok) return { available: true };
+    const j = await r.json();
+    return {
+      available: j?.available !== false,
+      reason: j?.reason ? String(j.reason) : undefined,
+      employee: j?.employee ? String(j.employee) : undefined,
+      region: j?.region ? String(j.region) : undefined,
+    };
+  } catch { return { available: true }; }
+}
+
 /** 重命名会话。 */
 export async function renameConversationApi(conversationId: string, title: string): Promise<void> {
   const s = await signedClient();
@@ -486,7 +533,7 @@ function routeEvent(event: string, data: any, cb: StreamCallbacks) {
       if (data?.usage) cb.onUsage?.(data.usage);
       break;
     case "via":
-      if (data?.via) cb.onVia?.(String(data.via));
+      if (data?.via) cb.onVia?.(String(data.via), data?.employee ? String(data.employee) : undefined);
       break;
     case "model_substituted":
       cb.onModelSubstituted?.(data ?? {});

@@ -15,6 +15,8 @@ import {
   SecretsManagerClient, GetSecretValueCommand, UpdateSecretCommand, CreateSecretCommand,
 } from "@aws-sdk/client-secrets-manager";
 import { ApiGatewayV2Client, GetApisCommand } from "@aws-sdk/client-apigatewayv2";
+// safeErr：异常一律压成"类型名/错误码"再进响应体（见 safe_err.mjs）。
+import { safeErr } from "./safe_err.mjs";
 
 const SECRET_ID = process.env.FEISHU_SECRET_NAME || "notiops/im-bot-feishu";
 let sm = new SecretsManagerClient({});
@@ -194,6 +196,8 @@ export async function apiTestNotificationSend(body) {
     if (j.code === 0) return { success: true, message: "Test message sent successfully" };
     return { success: false, message: `Feishu API error: code=${j.code} ${j.msg || ""}` };
   } catch (e) {
-    return { success: false, message: `Failed to send test message: ${e?.message || e}` };
+    // 这段 message 会原样显示在「测试通知」的结果里。fetch 的异常 message 可能带完整
+    // 请求 URL（webhook 本身就是凭证），所以只回异常名。
+    return { success: false, message: `Failed to send test message: ${safeErr(e)}` };
   }
 }

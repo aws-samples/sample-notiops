@@ -119,8 +119,20 @@ def _is_allowed_url(url: str) -> bool:
 # ---------------------------------------------------------------------------
 # Public types
 # ---------------------------------------------------------------------------
-def _empty_search_result() -> dict[str, Any]:
-    return {"hits": [], "queried": ""}
+# "The docs service did not answer" vs "the docs service answered: nothing matched".
+# Both used to look identical to callers (`{"hits": []}`), and every caller downstream
+# read that as "AWS has no documentation on this" -- so a transient transport failure
+# turned into the model answering the AWS technical question **from memory**, with no
+# signal to the user that the authoritative source was never consulted. That is the
+# single worst failure mode of a grounded-answer tool: it is indistinguishable from a
+# grounded answer. Every result therefore carries an explicit `error`: empty string
+# means "the lookup really did run and really found nothing".
+_ERR_UNAVAILABLE = "docs_service_unavailable"   # transport / RPC / unparseable reply
+_ERR_URL_NOT_ALLOWED = "url_not_allowed"        # our own host allowlist rejected it
+
+
+def _empty_search_result(error: str = "") -> dict[str, Any]:
+    return {"hits": [], "queried": "", "error": error}
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +239,7 @@ def _coerce_text_blocks(result: dict[str, Any] | None) -> str:
 def search_documentation(query: str, *, limit: int = _MAX_SEARCH_HITS) -> dict[str, Any]:
     """Search AWS knowledge sources for ``query``.
 
-    Returns ``{"hits": [...], "queried": query}``. Each hit is::
+    Returns ``{"hits": [...], "queried": query, "error": ""}``. Each hit is::
 
         {
             "title": str,
@@ -236,7 +248,9 @@ def search_documentation(query: str, *, limit: int = _MAX_SEARCH_HITS) -> dict[s
             "source": str,        # e.g. "docs" / "blog" / "what's new"
         }
 
-    Returns an empty hit list on any failure. Never raises.
+    Returns an empty hit list on any failure. Never raises. ``error`` is
+    non-empty **only** when the lookup itself failed -- callers must not
+    treat that case as "AWS has no docs on this" (see `_ERR_UNAVAILABLE`).
     """
     query = (query or "").strip()
     if not query:
@@ -252,9 +266,10 @@ def search_documentation(query: str, *, limit: int = _MAX_SEARCH_HITS) -> dict[s
         # reference / troubleshooting hits.
         "topics": ["general", "reference_documentation", "troubleshooting"],
     })
-    text = _coerce_text_blocks(result)
-    if not text:
-        return _empty_search_result()
+    # `_mcp_call` already logged the reason and returned None; an empty text
+    # block means the server replied without content. Neither is "no hits".
+    if result is None or not (text := _coerce_text_blocks(result)):
+        return _empty_search_result(_ERR_UNAVAILABLE)
 
     # The hosted server returns search hits as either a JSON array or a
     # JSON object with a "results" / "hits" key. Try both shapes.
@@ -270,8 +285,12 @@ def search_documentation(query: str, *, limit: int = _MAX_SEARCH_HITS) -> dict[s
                 break
             except _json.JSONDecodeError:
                 continue
-    if not data:
-        return _empty_search_result()
+        if data is None:
+            # Nothing in the reply parsed as JSON -> we never learned what the
+            # docs service thinks. Distinct from `data == []` (a real "nothing
+            # matched"), which falls through to the extraction below.
+            logger.warning("aws_docs_mcp: search_documentation unparseable reply")
+            return _empty_search_result(_ERR_UNAVAILABLE)
 
     # Hosted server wraps the list two layers deep:
     #   {"content": {"result": [ ... ]}}
@@ -314,7 +333,7 @@ def search_documentation(query: str, *, limit: int = _MAX_SEARCH_HITS) -> dict[s
         if len(hits) >= limit:
             break
 
-    return {"hits": hits, "queried": query}
+    return {"hits": hits, "queried": query, "error": ""}
 
 
 def recommend_documentation(url: str) -> dict[str, Any]:
@@ -333,17 +352,17 @@ def recommend_documentation(url: str) -> dict[str, Any]:
     if not url:
         return _empty_search_result()
     if not _is_allowed_url(url):
-        return _empty_search_result()
+        return _empty_search_result(_ERR_URL_NOT_ALLOWED)
 
     result = _mcp_call("recommend", {"url": url})
-    text = _coerce_text_blocks(result)
-    if not text:
-        return _empty_search_result()
+    if result is None or not (text := _coerce_text_blocks(result)):
+        return _empty_search_result(_ERR_UNAVAILABLE)
 
     try:
         data = _json.loads(text)
     except _json.JSONDecodeError:
-        return _empty_search_result()
+        logger.warning("aws_docs_mcp: recommend unparseable reply")
+        return _empty_search_result(_ERR_UNAVAILABLE)
 
     # The hosted server returns recommendations as a flat list of
     # `{url, title, context}` items, double-wrapped:
@@ -404,7 +423,7 @@ def recommend_documentation(url: str) -> dict[str, Any]:
         if len(hits) >= _MAX_SEARCH_HITS:
             break
 
-    return {"hits": hits, "queried": url}
+    return {"hits": hits, "queried": url, "error": ""}
 
 
 def list_regions() -> list[dict[str, str]]:
@@ -473,6 +492,35 @@ def get_regional_availability(*, regions: list[str], resource_type: str,
         return {"raw": text[:_MAX_SNIPPET_CHARS]}
 
 
+def read_documentation_ex(url: str, *, max_chars: int = 4000) -> dict[str, Any]:
+    """`read_documentation` plus **why it came back empty**.
+
+    Returns ``{"content": str, "error": str}``. An empty string used to be the
+    only answer for three very different situations -- we refused the URL, the
+    docs service was unreachable, and the page genuinely had no body -- so the
+    caller could only guess, and every caller guessed "just answer anyway".
+    `error` is one of ``""`` / `_ERR_URL_NOT_ALLOWED` / `_ERR_UNAVAILABLE`.
+    """
+    if not _is_allowed_url(url):
+        return {"content": "", "error": _ERR_URL_NOT_ALLOWED}
+
+    # Hosted server takes a `requests` array (batch read). We send one
+    # request and pull its body.
+    result = _mcp_call("read_documentation", {
+        "requests": [{"url": url, "max_length": max_chars}],
+    })
+    if result is None:
+        return {"content": "", "error": _ERR_UNAVAILABLE}
+    text = _coerce_text_blocks(result)
+    if not text:
+        # The server answered but handed us no body -- still not something we
+        # can answer from, so it is a failure, not "this page is empty".
+        return {"content": "", "error": _ERR_UNAVAILABLE}
+    if len(text) > max_chars:
+        text = text[:max_chars]
+    return {"content": text, "error": ""}
+
+
 def read_documentation(url: str, *, max_chars: int = 4000) -> str:
     """Fetch the full text of a single AWS doc page via the MCP server.
 
@@ -480,21 +528,11 @@ def read_documentation(url: str, *, max_chars: int = 4000) -> str:
     empty string on failure. Always validates the URL against the
     host allowlist first — even our own search results have to pass it
     again because the input may have come from elsewhere.
-    """
-    if not _is_allowed_url(url):
-        return ""
 
-    # Hosted server takes a `requests` array (batch read). We send one
-    # request and pull its body.
-    result = _mcp_call("read_documentation", {
-        "requests": [{"url": url, "max_length": max_chars}],
-    })
-    text = _coerce_text_blocks(result)
-    if not text:
-        return ""
-    if len(text) > max_chars:
-        text = text[:max_chars]
-    return text
+    Kept for callers that only want the text; use `read_documentation_ex`
+    when "empty" and "failed" must be told apart (they almost always must).
+    """
+    return read_documentation_ex(url, max_chars=max_chars)["content"]
 
 
 # ---------------------------------------------------------------------------

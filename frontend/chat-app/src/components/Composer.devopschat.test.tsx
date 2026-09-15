@@ -1,28 +1,37 @@
 /**
- * 「DevOps 对话」在 Composer 里的门控契约。
+ * 工具条上「谁来答这一轮」那一小排开关在 Composer 里的门控契约。
+ *
+ * 🔁 2026-09-13 整份重写：产品把「回答模式」下拉拆回**平铺 pill**，同时撤掉「深度调查
+ * （转交）」与成本主题那项永久置灰的「FinOps」，并把「联网」改成只留图标。上一版这份测试
+ * 钉的全是下拉的结构（`.modepick` / `.modemenu` / `role=option` / 「不启用」那一项），
+ * 那些 DOM 现在一个都不存在了 —— 所以是重写而不是改几行断言。理由与四件事的清单见
+ * ModePicker.tsx 的文件头。
  *
  * 都是产品**明确指定**的、且改错了不会报错只会显示错的东西：
- *   · 形态：它和「深度调查」「深度调查（直连）」「FinOps」在状态上本来就是**单选**
- *     （ChatApp 的 setDevopsMode 一次写三个字段），所以界面上收成**一个**「回答模式」下拉
- *     （ModePicker），不再是一排各自独立的平铺 pill —— 单选画成复选既占三倍宽，也让客户
- *     以为能同时开；
- *   · 位置：那枚收拢按钮紧跟在「联网搜索」**之后**（不是塞进 `/` 菜单，也不是排到右侧）；
- *   · 可见性：「DevOps 对话」这一项**只有故障调查**这一个主题有。通用会话（新对话）已经改成
- *     落地页上的「对话对象」分段控件（见 ChatObjectPicker.test.tsx），那里**不能**再出现它 ——
+ *   · 形态：**平铺 pill**，一个主题最多两枚（DevOps 对话 / 深度调查）。它们在状态上是
+ *     单选（ChatApp 的 setDevopsMode 一次写四个字段），但两枚以内平铺不会让人误以为
+ *     能同时开，反而省掉一层点击；
+ *   · 位置：紧跟在「联网」**之后**（不是塞进 `/` 菜单，也不是排到右侧）；
+ *   · 「联网」**只有图标没有文字** —— 因此它必须带 `aria-label`，否则读屏软件念到的是
+ *     一个空按钮。这一条用 DOM 断言钉住（视觉上看不出来）；
+ *   · 界面上只剩**一个**「深度调查」，点它走 `onToggleDevopsAgentDirect`（直连、0 token）。
+ *     以前还有一枚同名的"经我们的 agent 转交"（`onToggleDevopsAgent`）—— 那一枚已撤掉，
+ *     这里**反向断言**它不会再被调用：留两个入口，客户没有依据去选，选错只是更慢更贵；
+ *   · 成本主题**没有**「FinOps」那一项（永久置灰的占位已删）；
+ *   · 「DevOps 对话」这一项**只有故障调查**这一个主题有。通用会话（新对话）已经改成落地页
+ *     上的「对话对象」分段控件（见 ChatObjectPicker.test.tsx），那里**不能**再出现它 ——
  *     一个页面上两个入口管同一个状态，客户会以为它们是两件事；
- *   · 默认「不启用」：所有模式默认关（关着时前端不传对应字段，后端行为逐字节不变）；
- *   · 账号没接入 DevOps Agent 时该项置灰**并写出原因**，同时把已经打开的开关自动关掉
- *     （否则用户带着一个必然失败的开关继续发）；
- *   · 开着它时输入框提示语换成"跟 DevOps Agent 对话"：答话的不是 NotiOps；
- *   · 通用会话选中 DevOps Agent 后（objMode）工具栏要瘦身：**联网搜索与模型选择器**不渲染
+ *   · 默认全关：所有模式默认关（关着时前端不传对应字段，后端行为逐字节不变）；
+ *   · 账号没接入 DevOps Agent 时置灰**并写出原因**（tooltip + 「未接入」徽标），同时把已经
+ *     打开的开关自动关掉（否则用户带着一个必然失败的开关继续发）；
+ *   · 开着「DevOps 对话」时输入框提示语换成"跟 DevOps Agent 对话"：答话的不是 NotiOps；
+ *   · 通用会话选中 DevOps Agent 后（objMode）工具栏要瘦身：**联网与模型选择器**不渲染
  *     —— 这条路径由客户自己的 Agent 答，这两样点了都不生效。
  *     `/`（skill）**必须保留**：BFF 会把 skill 正文内联进发给 DevOps Agent 的那段话
  *     （bff/web-chat/devops_skill.mjs），所以它是真生效的，藏掉等于白丢一个能力。
  *     （输入框上方的身份条已按产品要求去掉：锁定后的身份说明只留标题栏的 tag。）
  *   · objMode 下**唯一保留**的开关是「深度调查」（每轮修饰，默认不勾）：勾上这一轮才让
- *     DevOps Agent 发起一次直连深度调查。它**不进**「回答模式」下拉 —— 那里的每一项都是
- *     "这段对话由谁来答"，而它只修饰这一轮，折进去等于说错话。默认勾上的后果是每句话都要
- *     等几分钟。
+ *     DevOps Agent 发起一次直连深度调查。默认勾上的后果是每句话都要等几分钟。
  *
  * 运行：cd frontend/chat-app && npm test
  */
@@ -59,100 +68,126 @@ function renderComposer(props: Partial<React.ComponentProps<typeof Composer>> = 
   );
 }
 
-/** 工具栏上**平铺**按钮的可见文案顺序（联网 + objMode 的深度调查；模型选择器在右侧不算）。 */
-const toggleLabels = () =>
-  Array.from(document.querySelectorAll("button.websearch-toggle"))
+/** 「联网」那一枚：**只有图标**，所以按 class 取而不是按文字（它没有文字）。 */
+const webBtn = () =>
+  document.querySelector("button.websearch-toggle.icon-only") as HTMLButtonElement | null;
+/** 带文字的那些 pill 的可见文案，按 DOM 顺序（= 模式 pill，以及 objMode 下那枚「深度调查」）。
+ *  刻意排掉 `.icon-only`：联网那一枚没有文字，混进来会变成一个空串项，让每条断言都要带上它。 */
+const pillLabels = () =>
+  Array.from(document.querySelectorAll("button.websearch-toggle:not(.icon-only)"))
     .map((b) => (b.textContent || "").trim());
-/** objMode 里那枚「深度调查」勾选（objMode 下工具栏只剩它，故按文案精确匹配即可）。 */
-const deepBtn = () =>
-  Array.from(document.querySelectorAll("button.websearch-toggle"))
-    .find((b) => (b.textContent || "").trim() === "深度调查") as HTMLButtonElement;
+/** 按可见文案取一枚 pill。置灰时项名后面还挂着「未接入」徽标，所以用前缀匹配。 */
+const pill = (name: string) =>
+  Array.from(document.querySelectorAll("button.websearch-toggle:not(.icon-only)"))
+    .find((b) => (b.textContent || "").trim().startsWith(name)) as HTMLButtonElement | undefined;
 
-/** 「回答模式」收拢按钮。主题一个模式都没有时这个控件整体不渲染 → 返回 null。 */
-const modeBtn = () => document.querySelector("button.modepick") as HTMLButtonElement | null;
-/** 点开下拉，返回菜单里的每一项（role=option）。裸 .click() 的 setState 不是同步落地的，要等。 */
-async function openModeMenu(): Promise<HTMLButtonElement[]> {
-  const btn = modeBtn();
-  expect(btn, "「回答模式」按钮没渲染").toBeTruthy();
-  btn!.click();
-  await waitFor(() => expect(document.querySelector(".modemenu")).toBeTruthy());
-  return Array.from(document.querySelectorAll('.modemenu [role="option"]')) as HTMLButtonElement[];
-}
-/** 菜单每一项的项名（置灰项名后面还挂着「未接入」小徽标，所以用前缀匹配取项）。 */
-const modeNames = (items: HTMLButtonElement[]) =>
-  items.map((el) => (el.querySelector(".mode-name")?.textContent || "").trim());
-const modeItem = (name: string, items: HTMLButtonElement[]) =>
-  items.find((el) => (el.querySelector(".mode-name")?.textContent || "").trim().startsWith(name))!;
-
-describe("Composer 的「DevOps 对话」（收进「回答模式」下拉）", () => {
+describe("Composer 工具条上的「DevOps 对话 / 深度调查」（平铺 pill）", () => {
   beforeEach(() => { availability = { available: true }; cleanup(); });
 
-  it("紧跟在「联网搜索」之后：一枚收拢按钮，不是一排平铺 pill", async () => {
+  it("紧跟在「联网」之后平铺；不再有任何下拉", async () => {
     renderComposer();
-    await waitFor(() => expect(modeBtn()).toBeTruthy());
-    // 平铺的只剩「联网」这一枚（DevOps/FinOps 那几枚都进了下拉）。
-    expect(toggleLabels()).toEqual(["联网"]);
-    // DOM 顺序：联网 → 回答模式。
+    await waitFor(() => expect(pill("深度调查")).toBeTruthy());
+    // 故障调查主题就这两项（顺序也是产品指定：先"直接问答"，再"发起调查"）。
+    expect(pillLabels()).toEqual(["DevOps 对话", "深度调查"]);
+    // 🔴 下拉整体退役：`.modepick` 出现就说明有人把它加回来了，而两枚 pill 藏进一个
+    //    要点开的下拉是纯负收益（多一层点击、不省宽度）。
+    expect(document.querySelector(".modepick")).toBeNull();
+    expect(document.querySelector(".modemenu")).toBeNull();
+    // DOM 顺序：联网（图标）→ DevOps 对话 → 深度调查。
     const bar = document.querySelector(".cbar")!;
-    const order = Array.from(bar.querySelectorAll("button.websearch-toggle, button.modepick"));
-    expect(order[0].className).toContain("websearch-toggle");
-    expect(order[1].className).toContain("modepick");
-    // 关着时按钮显示的是控件名，而不是某个模式名（不能让客户以为已经开了什么）。
-    expect((modeBtn()!.textContent || "")).toContain("回答模式");
+    const order = Array.from(bar.querySelectorAll("button.websearch-toggle"));
+    expect(order[0].className).toContain("icon-only");
+    expect((order[1].textContent || "").trim()).toBe("DevOps 对话");
+    expect((order[2].textContent || "").trim()).toBe("深度调查");
   });
 
-  it("「DevOps 对话」只在故障调查出现；通用会话交给落地页的分段控件，其余主题一律没有", async () => {
-    renderComposer({ topic: "investigate" });
-    await waitFor(() => expect(modeBtn()).toBeTruthy());
-    expect(modeNames(await openModeMenu())).toContain("DevOps 对话");
+  it("「联网」只留图标 —— 因此必须有 aria-label（读屏软件唯一能念的那句）", async () => {
+    renderComposer();
+    await waitFor(() => expect(webBtn()).toBeTruthy());
+    const b = webBtn()!;
+    // 产品要求：去掉「联网」这两个字，只留地球仪。
+    expect((b.textContent || "").trim()).toBe("");
+    expect(b.querySelector("svg")).toBeTruthy();
+    // 没有文字的按钮如果连 aria-label 都没有，读屏软件念出来就是个空按钮。
+    expect(b.getAttribute("aria-label")).toBe("联网搜索");
+    // tooltip 仍然要把完整那句给到（鼠标用户看这个）。
+    expect(b.getAttribute("title") || "").toContain("联网搜索");
+  });
 
-    // 有别的模式的主题（finops 3 项 / security 等 2 项）：下拉在，但里面没有「DevOps 对话」。
-    for (const topic of ["finops", "security"]) {
+  it("界面上只有**一个**「深度调查」，点它走直连（转交那一枚已撤掉）", async () => {
+    const onToggleDevopsAgent = vi.fn();
+    const onToggleDevopsAgentDirect = vi.fn();
+    renderComposer({ topic: "investigate", onToggleDevopsAgent, onToggleDevopsAgentDirect });
+    await waitFor(() => expect(pill("深度调查")).toBeTruthy());
+    // 同名两枚 = 客户没有依据去选，而选错的那一枚只是更慢更贵。
+    expect(pillLabels().filter((s) => s.startsWith("深度调查"))).toHaveLength(1);
+    pill("深度调查")!.click();
+    expect(onToggleDevopsAgentDirect).toHaveBeenCalledTimes(1);
+    // 🔴 反向断言：撤掉的是**界面入口**，字段与 BFF 那条链路都还活着 —— 一旦有人把
+    //    这枚 pill 接回 onToggleDevopsAgent，客户会拿到一条先烧 token 再转交的慢路径。
+    expect(onToggleDevopsAgent).not.toHaveBeenCalled();
+  });
+
+  it("「DevOps 对话」只在故障调查出现；其余主题只剩深度调查，三个排除主题一枚都没有", async () => {
+    renderComposer({ topic: "investigate" });
+    await waitFor(() => expect(pillLabels()).toContain("DevOps 对话"));
+
+    // 还提供深度调查、但没有「DevOps 对话」的主题。
+    // 2026-09-11 起这里只剩 finops —— 原来还列了 "security"，而「安全」已经不是聊天主题
+    // （并入 investigate，只留看板入口），拿它当用例等于在钉一段**产品里不存在**的行为；
+    // 真要覆盖"未知主题"的回落，看 types.normalizeTopic 的测试。
+    for (const topic of ["finops"]) {
       cleanup();
       renderComposer({ topic });
-      // 等工具栏渲染完（深度调查探测是异步的），再断言这一项不在菜单里。
-      await waitFor(() => expect(modeBtn()).toBeTruthy());
-      expect(modeNames(await openModeMenu())).not.toContain("DevOps 对话");
+      // 等工具栏渲染完（深度调查探测是异步的），再断言。
+      await waitFor(() => expect(pill("深度调查")).toBeTruthy());
+      expect(pillLabels()).toEqual(["深度调查"]);
     }
     // 一个模式都没有的主题（general 不给入口；cases 是 Case 生命周期管理、whats-new 与用户
-    // 环境无关，两者都被 DEVOPS_TOPICS_EXCLUDED 排除）→ 整个控件不渲染，
-    // 而不是给一个点开只有「不启用」的空下拉。
+    // 环境无关，两者都被 DEVOPS_TOPICS_EXCLUDED 排除）→ 一枚都不渲染。
     for (const topic of ["general", "cases", "whats-new"]) {
       cleanup();
       renderComposer({ topic });
       await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
-      expect(modeBtn(), `${topic} 不该有「回答模式」下拉`).toBeNull();
-      expect(toggleLabels()).not.toContain("深度调查");
+      expect(pillLabels(), `${topic} 不该有任何模式 pill`).toEqual([]);
     }
   });
 
-  it("默认选中「不启用」——三种模式都不许替客户预先打开", async () => {
+  it("成本主题里没有「FinOps」那一项（永久置灰的占位已删）", async () => {
+    renderComposer({ topic: "finops" });
+    await waitFor(() => expect(pill("深度调查")).toBeTruthy());
+    // 一个永远点不动的项，除了让客户点一下发现点不动之外没有别的作用。
+    expect(pillLabels().some((n) => n.startsWith("FinOps"))).toBe(false);
+    // 顺带钉住"永久置灰"这类占位不许再出现在这一排里。
+    expect(document.querySelector("button.websearch-toggle:not(.icon-only)[disabled]")).toBeNull();
+  });
+
+  it("默认全关 —— 两种模式都不许替客户预先打开", async () => {
     renderComposer({ topic: "investigate" });
-    await waitFor(() => expect(modeBtn()).toBeTruthy());
-    const items = await openModeMenu();
-    expect(modeItem("不启用", items).getAttribute("aria-selected")).toBe("true");
-    for (const name of ["DevOps 对话", "深度调查", "深度调查（直连）"]) {
-      expect(modeItem(name, items).getAttribute("aria-selected")).toBe("false");
+    await waitFor(() => expect(pill("深度调查")).toBeTruthy());
+    for (const name of ["DevOps 对话", "深度调查"]) {
+      expect(pill(name)!.getAttribute("aria-pressed"), name).toBe("false");
+      expect(pill(name)!.className).not.toContain(" on");
     }
   });
 
-  it("点菜单里的「DevOps 对话」走 onToggleDevopsChat（互斥仍由 ChatApp 保证）", async () => {
+  it("点「DevOps 对话」走 onToggleDevopsChat（互斥仍由 ChatApp 保证）", async () => {
     const onToggleDevopsChat = vi.fn();
     renderComposer({ topic: "investigate", onToggleDevopsChat });
-    await waitFor(() => expect(modeBtn()).toBeTruthy());
-    modeItem("DevOps 对话", await openModeMenu()).click();
+    await waitFor(() => expect(pill("DevOps 对话")).toBeTruthy());
+    pill("DevOps 对话")!.click();
     expect(onToggleDevopsChat).toHaveBeenCalledTimes(1);
   });
 
   it("开着它时输入框提示语指向 DevOps Agent，而不是 NotiOps", async () => {
     renderComposer({ devopsChat: true });
-    await waitFor(() => expect(modeBtn()).toBeTruthy());
+    await waitFor(() => expect(pill("DevOps 对话")).toBeTruthy());
     const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
     expect(ta.placeholder).toContain("DevOps Agent");
     expect(ta.placeholder).not.toContain("NotiOps");
     cleanup();
     renderComposer({ devopsChat: false });
-    await waitFor(() => expect(modeBtn()).toBeTruthy());
+    await waitFor(() => expect(pill("DevOps 对话")).toBeTruthy());
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).placeholder).toContain("NotiOps");
   });
 
@@ -161,51 +196,48 @@ describe("Composer 的「DevOps 对话」（收进「回答模式」下拉）", 
     const onToggleDevopsChat = vi.fn();
     renderComposer({ devopsChat: true, onToggleDevopsChat });
     await waitFor(() => expect(onToggleDevopsChat).toHaveBeenCalledTimes(1));
-    const items = await openModeMenu();
-    const it0 = modeItem("DevOps 对话", items);
-    expect(it0.disabled).toBe(true);
-    expect(it0.getAttribute("aria-disabled")).toBe("true");
-    // 置灰要给原因：说明行让给"为什么点不动"，不能只挂一个「未接入」小徽标。
-    expect((it0.querySelector(".mode-desc")?.textContent || "").length).toBeGreaterThan(0);
-    expect(it0.getAttribute("title")).toBeTruthy();
-    // 「不启用」永远可点（否则置灰状态下客户没有退路）。
-    expect(modeItem("不启用", items).disabled).toBe(false);
+    // 两项都靠同一个 Agent Space，所以两项一起置灰（不只「DevOps 对话」）。
+    for (const name of ["DevOps 对话", "深度调查"]) {
+      const b = pill(name)!;
+      expect(b.disabled, name).toBe(true);
+      expect(b.getAttribute("aria-disabled"), name).toBe("true");
+      // 置灰要给原因：tooltip 里必须有"为什么点不动"，不能只挂一个「未接入」徽标。
+      expect((b.getAttribute("title") || "").length, name).toBeGreaterThan("深度调查".length);
+      expect(b.querySelector(".toggle-soon")?.textContent, name).toBe("未接入");
+    }
   });
 
-  it("开着时收拢按钮直接显示当前模式，且 aria-selected 如实反映（前端不传 = 后端行为不变的前提）", async () => {
+  it("开着时 pill 亮起且 aria-pressed 如实反映（前端不传 = 后端行为不变的前提）", async () => {
     renderComposer({ devopsChat: false });
-    await waitFor(() => expect(modeBtn()).toBeTruthy());
-    expect(modeItem("DevOps 对话", await openModeMenu()).getAttribute("aria-selected")).toBe("false");
+    await waitFor(() => expect(pill("DevOps 对话")).toBeTruthy());
+    expect(pill("DevOps 对话")!.getAttribute("aria-pressed")).toBe("false");
 
     cleanup();
     renderComposer({ devopsChat: true });
-    await waitFor(() => expect(modeBtn()).toBeTruthy());
-    // 收起态就能看出这段对话由谁来答，不用点开。
-    expect(modeBtn()!.className).toContain("on");
-    expect(modeBtn()!.textContent || "").toContain("DevOps 对话");
-    const items = await openModeMenu();
-    expect(modeItem("DevOps 对话", items).getAttribute("aria-selected")).toBe("true");
-    expect(modeItem("不启用", items).getAttribute("aria-selected")).toBe("false");
+    await waitFor(() => expect(pill("DevOps 对话")).toBeTruthy());
+    expect(pill("DevOps 对话")!.className).toContain("on");
+    expect(pill("DevOps 对话")!.getAttribute("aria-pressed")).toBe("true");
+    // 另一枚不许跟着亮（单选画成两枚平铺，唯一的风险就是这个）。
+    expect(pill("深度调查")!.getAttribute("aria-pressed")).toBe("false");
   });
 
-  it("FinOps 只在成本主题出现，永久置灰且排在最后（点不动的东西不许挡路）", async () => {
-    renderComposer({ topic: "finops" });
-    await waitFor(() => expect(modeBtn()).toBeTruthy());
-    const items = await openModeMenu();
-    const names = modeNames(items);
-    expect(names.some((n) => n.startsWith("FinOps"))).toBe(true);
-    expect(names[names.length - 1]).toContain("FinOps");
-    expect(modeItem("FinOps", items).disabled).toBe(true);
+  it("再点一次亮着的 pill 就是关（没有「不启用」那一项了，退路只能是它自己）", async () => {
+    const onToggleDevopsChat = vi.fn();
+    renderComposer({ devopsChat: true, onToggleDevopsChat });
+    await waitFor(() => expect(pill("DevOps 对话")).toBeTruthy());
+    pill("DevOps 对话")!.click();
+    // ChatApp 的 toggleDevopsChat 本身就是"再点一次就关"，所以这里只需确认它被调到。
+    expect(onToggleDevopsChat).toHaveBeenCalledTimes(1);
   });
 });
 
 describe("通用会话选了 DevOps Agent 之后的 Composer（objMode）", () => {
   beforeEach(() => { availability = { available: true }; cleanup(); });
 
-  it("工具栏瘦身：联网搜索与模型选择器不渲染", async () => {
+  it("工具栏瘦身：联网与模型选择器不渲染", async () => {
     renderComposer({ topic: "general", devopsChat: true });
     await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
-    expect(toggleLabels()).not.toContain("联网");
+    expect(webBtn()).toBeNull();
     expect(document.querySelector(".modelsel")).toBeNull();
   });
 
@@ -224,7 +256,7 @@ describe("通用会话选了 DevOps Agent 之后的 Composer（objMode）", () =
     renderComposer({ topic: "general", devopsChat: false });
     await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
     expect(document.querySelector("button.cmd-btn")).toBeTruthy();
-    expect(toggleLabels()).toContain("联网");
+    expect(webBtn()).toBeTruthy();
     expect(document.querySelector(".modelsel")).toBeTruthy();
   });
 
@@ -241,13 +273,13 @@ describe("通用会话选了 DevOps Agent 之后的 Composer（objMode）", () =
     expect(document.querySelector(".chint")?.textContent || "").toContain("NotiOps");
   });
 
-  it("保留「深度调查」平铺勾选（不进下拉）：默认不勾，点它走 onToggleDevopsAgentDirect", async () => {
+  it("保留「深度调查」勾选：默认不勾，点它走 onToggleDevopsAgentDirect", async () => {
     const onToggleDevopsAgentDirect = vi.fn();
     renderComposer({ topic: "general", devopsChat: true, onToggleDevopsAgentDirect });
-    await waitFor(() => expect(toggleLabels()).toContain("深度调查"));
-    // 它是**这一轮**的修饰，不是"选谁来答"，所以不能被折进「回答模式」下拉。
-    expect(modeBtn()).toBeNull();
-    const btn = deepBtn();
+    await waitFor(() => expect(pillLabels()).toContain("深度调查"));
+    // objMode 下工具条上只剩它这一枚带文字的按钮。
+    expect(pillLabels()).toEqual(["深度调查"]);
+    const btn = pill("深度调查")!;
     // 默认不勾是产品硬要求：深度调查要跑几分钟，替客户默认选上等于每句话都等几分钟。
     expect(btn.getAttribute("aria-pressed")).toBe("false");
     btn.click();
@@ -256,20 +288,21 @@ describe("通用会话选了 DevOps Agent 之后的 Composer（objMode）", () =
 
   it("勾上后如实反映 aria-pressed（这一轮才走深度调查）", async () => {
     renderComposer({ topic: "general", devopsChat: true, devopsAgentDirect: true });
-    await waitFor(() => expect(toggleLabels()).toContain("深度调查"));
-    expect(deepBtn().getAttribute("aria-pressed")).toBe("true");
+    await waitFor(() => expect(pillLabels()).toContain("深度调查"));
+    expect(pill("深度调查")!.getAttribute("aria-pressed")).toBe("true");
   });
 
   it("对象是 NotiOps 的通用会话里没有这个勾选（那条路径没有直连深度调查）", async () => {
     renderComposer({ topic: "general", devopsChat: false });
     await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
-    expect(toggleLabels()).not.toContain("深度调查");
+    expect(pillLabels()).not.toContain("深度调查");
   });
 
   it("故障调查开着 DevOps 对话时**不**瘦身（那里是每轮开关，不是会话对象）", async () => {
     renderComposer({ topic: "investigate", devopsChat: true });
-    await waitFor(() => expect(modeBtn()).toBeTruthy());
+    await waitFor(() => expect(pill("深度调查")).toBeTruthy());
     expect(document.querySelector("button.cmd-btn")).toBeTruthy();
+    expect(webBtn()).toBeTruthy();
     expect(document.querySelector(".modelsel")).toBeTruthy();
   });
 });

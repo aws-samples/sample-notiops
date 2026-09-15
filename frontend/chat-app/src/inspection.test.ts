@@ -68,7 +68,11 @@ describe("ChatApp wiring", () => {
   const src = read("pages/ChatApp.tsx");
 
   it("the inspection view is in the union", () => {
-    expect(src).toMatch(/\| "inspection">\("chat"\)/);
+    // 2026-09-11：这个联合从 `useState<…>("chat")` 的内联泛型抽成了具名 `type ViewKey`
+    // —— `dashReturn`（从看板返回哪个视图）和 `dashPillsFor` 里的 `go(v: ViewKey, …)`
+    // 都要引用它。断言的意图没变：inspection 必须在**视图**联合里（它与 TopicKey 是两回事）。
+    expect(src).toMatch(/type ViewKey =[^;]*\| "inspection"/);
+    expect(src).toContain('useState<ViewKey>("chat")');
   });
 
   it("★ the inspection view is in the permission gate map", () => {

@@ -30,18 +30,21 @@ const ICONS: Record<string, React.ReactNode> = {
 };
 
 export default function InvestigationDashboardBrowser({
-  data, can, onInvestigate, onNotify, initial = "alarm-overview",
-  accountId, accounts, onAccountChange,
+  data, can, onInvestigate, onNotify, onReload, initial = "alarm-overview",
+  accountId,
 }: {
   data?: AlarmDashboardData;
   can?: (key: string) => boolean;
   // opts 原样转给 ChatApp：事件收件箱卡片会带 { deep: true } 要求开「深度调查（直连）」。
   onInvestigate?: (query: string, opts?: { deep?: boolean }) => void;
   onNotify?: (query: string) => void;
+  /** 告警数据由上层托管（data prop）时，「重试」要请上层重取；不传则内容组件本地重拉。 */
+  onReload?: () => void;
   initial?: string;
+  /** 多账号：转给内容组件（Backup / Health / EOL 按该账号视角）。
+   *  切账号只有一个入口 —— 顶栏的账号选择器；看板内部原来那个「组织概览点行下钻」
+   *  已随缩略卡落地页一起删了，所以这里不再需要 accounts / onAccountChange。 */
   accountId?: string;
-  accounts?: { accountId: string; accountName?: string }[];
-  onAccountChange?: (id: string) => void;
 }) {
   const { locale } = useLocale();
   const zh = locale !== "en";
@@ -66,7 +69,7 @@ export default function InvestigationDashboardBrowser({
       {/* 右侧:选中仪表盘的完整内容 */}
       <div className="notif-content">
         <InvestigationDashboard dashboardId={sel} data={data} can={can} onInvestigate={onInvestigate} onNotify={onNotify}
-          accountId={accountId} accounts={accounts} onAccountChange={onAccountChange} />
+          onReload={onReload} accountId={accountId} />
       </div>
     </div>
   );

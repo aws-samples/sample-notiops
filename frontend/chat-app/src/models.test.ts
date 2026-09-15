@@ -88,7 +88,7 @@ describe("source=ddb（管理员配置的目录）", () => {
     await refreshModelCatalog();
     expect(modelCatalog()).toEqual([]);          // 不得用 MODELS 顶上
     expect(canSendMessage()).toBe(false);        // 要管理员去改配置
-    // 但**不需要模型**的发送路径必须放行。目前是「深度调查（直连）」：BFF 直连
+    // 但**不需要模型**的发送路径必须放行。目前是「深度调查」（`devopsAgentDirect`）：BFF 直连
     // DevOps Agent API，全程 0 token、不碰 Bedrock。拿模型目录拦它的话，管理员取消勾选
     // 全部 webchat 模型后，唯一不需要模型的功能反而用不了，提示语还指向无关的配置项。
     expect(canSendMessage({ needsModel: false })).toBe(true);

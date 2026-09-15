@@ -110,6 +110,39 @@ export function subtabsOf(tabKey) {
   return out;
 }
 
+/**
+ * 可被 Admin「模块」页开关的顶层 tab。
+ *
+ * 排除三类：
+ *   - `alwaysOn`（nav:chat）—— 关掉它等于关掉整个产品；
+ *   - `adminOnly`（nav:admin）—— 关掉它就再也打不开这一页去开回来；
+ *   - `moduleToggle: false` —— 「是个 tab，但不是客户眼里的一个模块」。今天只有
+ *     `nav:security`：它已经不在侧栏里，只是「运行概览」下的一颗看板胶囊。
+ *
+ * ⚠️ 这三类的语义**互不相同**，别用 `alwaysOn` 去实现第三类：`alwaysOn` 在
+ *    authorize() 里是「任何登录用户放行」，那会把安全看板放给 viewer。
+ */
+export function toggleableTabs() {
+  return NODES.filter((n) => n.level === "tab" && !n.alwaysOn && !n.adminOnly && n.moduleToggle !== false);
+}
+
+/**
+ * 该 key 是否**显式声明**了不参与模块开关（`moduleToggle: false`）。
+ *
+ * 🔴 authz 侧必须用它把存量 disabled 记录里的这类 key 剔掉，否则会留下一个**改不回来**
+ *    的状态：某个管理员在 2026-09-12 之前关掉了「安全」→ `tenantcfg#modules` 里躺着
+ *    `nav:security` → 开关行没了 → 界面上再也没有地方把它打开，而看板永久隐身、
+ *    没有任何提示。宁可让它恢复显示（权限门禁 nav:security 照旧管着谁能看）。
+ *
+ * ⚠️ 只剔这一类，**不**剔 alwaysOn / adminOnly：那两类同样不可写入，但「模块开关优先于
+ *    个人权限（含 admin）」是一条被测试钉住的既有顺序语义（authz.test.mjs 用
+ *    `disabledModules:["nav:admin"]` 守它），这次改动不该顺手动它。
+ */
+export function isModuleToggleOptOut(key) {
+  const n = byKey.get(key);
+  return !!n && n.moduleToggle === false;
+}
+
 /** 全部节点（供 /api/me/capabilities 过滤 + 前端下发）。 */
 export function allNodes() {
   return NODES;

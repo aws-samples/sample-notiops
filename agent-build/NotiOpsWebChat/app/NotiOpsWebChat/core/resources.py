@@ -20,6 +20,7 @@ skill 提供"查什么/怎么判断"的方法论，本模块提供"实际去查"
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Any
 
@@ -29,7 +30,15 @@ from botocore.exceptions import ClientError, BotoCoreError
 logger = logging.getLogger(__name__)
 
 _CFG = Config(retries={"max_attempts": 3, "mode": "standard"})
-_DEFAULT_REGION = "us-east-1"
+# 默认区域必须跟着**运行时所在的区域**走，不能写死 us-east-1。
+# 写死过的代价（这就是本行存在的理由）：setup.sh 的默认部署区域是 ap-northeast-1，客户的
+# RDS/EC2 也都在那儿；巡检却只查 us-east-1、查不到，而 main.py 的 system prompt 有一条铁律
+# 说「列表为空就如实说当前账号没有实例」—— 于是 agent **断言**客户没有资源。假否定比"查不到"
+# 恶劣得多：客户会据此下结论。core/investigation_mcp.py 与 core/aws_api_mcp.py 一直是这么
+# 取区域的，本模块是唯一的例外。
+_DEFAULT_REGION = (os.environ.get("AWS_REGION")
+                   or os.environ.get("AWS_DEFAULT_REGION")
+                   or "us-east-1")
 _MAX_ITEMS = 100
 
 # AccessDenied 消息里解析"缺哪条 action"用：
@@ -47,6 +56,27 @@ def _client(service: str, account_id: str | None, region: str | None):
     if sess is None:
         return None
     return sess.client(service, region_name=region, config=_CFG)
+
+
+def _scoped(region: str | None, items: list, key: str) -> dict:
+    """列表类工具的统一返回 —— 把「只查了哪一个区域」写进结果里。
+
+    只查一个区域是本模块的设计（不做全区 fan-out：describe_regions 之后 30+ 次调用又慢又
+    贵，且大多数客户资源集中在一两个区域）。但**不能把"这一个区域没有"讲成"这个账号
+    没有"**：main.py 的 system prompt 有一条铁律要求「列表为空就如实说没有实例」，两者相乘
+    就是 agent **断言**客户没有资源 —— 假否定，客户会据此下结论。
+    所以区域范围随结果一起返回；空结果时再附一句 scope_note，模型据此说「在 xx 区域没找到、
+    要不要查别的区域」。文案是**给模型看的**，所以是英文（与本模块其余对用户的中文不同）。
+    """
+    r = region or _DEFAULT_REGION
+    out: dict = {"region": r, "regions_queried": [r], "count": len(items), key: items}
+    if not items:
+        out["scope_note"] = (
+            f"Only region {r} was queried; no other region was checked. This empty result "
+            f"does NOT mean the account has none — say \"none found in {r}\" and offer to "
+            f"check another region."
+        )
+    return out
 
 
 def _cross_account_error(account_id: str | None) -> dict:
@@ -94,7 +124,7 @@ def rds_list_instances(*, account_id: str | None = None, region: str | None = No
                     break
             if len(out) >= _MAX_ITEMS:
                 break
-        return {"region": region or _DEFAULT_REGION, "count": len(out), "instances": out}
+        return _scoped(region, out, "instances")
     except (ClientError, BotoCoreError, Exception) as e:  # noqa: BLE001
         return _err(e)
 
@@ -276,7 +306,7 @@ def ec2_list_instances(*, account_id: str | None = None, region: str | None = No
                     out.append(_brief_ec2(inst))
                     if len(out) >= _MAX_ITEMS:
                         break
-        return {"region": region or _DEFAULT_REGION, "count": len(out), "instances": out}
+        return _scoped(region, out, "instances")
     except (ClientError, BotoCoreError, Exception) as e:  # noqa: BLE001
         return _err(e)
 

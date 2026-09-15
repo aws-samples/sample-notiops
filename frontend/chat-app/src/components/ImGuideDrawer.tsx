@@ -16,6 +16,15 @@
  * ⚠️ 同一时刻只挂**一个**抽屉:`imd-webhook-url` 是固定 id，两个抽屉同时在 DOM 里
  * 会撞 id（复制退路 `getElementById` 会拿错那个）。AdminPanel 按当前平台条件渲染，
  * 不要改成两个都常挂。
+ *
+ * 2026-09-12 加「多云」抽屉（AliyunGuideDrawer）时把 `urlLabelKey` / `urlMissingKey`
+ * 放成**可选**:配阿里云是反方向 —— 全程只有「从阿里云控制台复制到本页」，我们这边没有
+ * 任何要交给对方的回调地址，所以那份内容里**没有** `webhookUrl` 块，也就没有这两条文案。
+ * 原来做成必填的话只能编两条永远不显示的 key 去填坑（死 key，而 lint 的孤儿检查恰好
+ * 抓不到 —— 它把"字面量出现过"就算引用过）。
+ * ⚠️ 代价要知道:没接线的 `webhookUrl` 块现在是**静默不渲染**（见 Block 里那一行）。
+ *    所以"某份 guide 该不该有这个块"这件事靠人看抽屉是看不出来的，判据放在内容侧
+ *    的测试里（AdminPanel.aliyun.test.tsx 断言 ALIYUN_GUIDE 里没有 webhookUrl 块）。
  */
 import { useEffect, useState } from "react";
 import { useT } from "../i18n";
@@ -75,7 +84,7 @@ function WebhookUrlBox({ url, labelKey, missingKey }: { url: string; labelKey: s
 }
 
 function Block({ b, webhookUrl, urlLabelKey, urlMissingKey }:
-{ b: GuideBlock; webhookUrl: string; urlLabelKey: string; urlMissingKey: string }) {
+{ b: GuideBlock; webhookUrl: string; urlLabelKey?: string; urlMissingKey?: string }) {
   switch (b.k) {
     case "h":
       return <div className="imd-h">{b.tx}</div>;
@@ -101,12 +110,19 @@ function Block({ b, webhookUrl, urlLabelKey, urlMissingKey }:
         </div>
       );
     case "webhookUrl":
+      // 没接线（调用方没传那两条 key）→ 什么都不画。这条分支对"内容里有这个块"的抽屉
+      // 是走不到的（三个 IM 抽屉都传了）；它只为"内容里根本没有这个块"的抽屉存在，
+      // 免得类型上被迫编两条永不显示的文案 key。见文件头那段 ⚠️。
+      if (!urlLabelKey || !urlMissingKey) return null;
       return <WebhookUrlBox url={webhookUrl} labelKey={urlLabelKey} missingKey={urlMissingKey} />;
   }
 }
 
 /** `webhookUrl` 由 AdminPanel 从 GET /admin/notification-config 拿到后传进来；
- *  没装 IM / 查不到时是空串 —— 抽屉照常打开，那一块退回文字说明（见 WebhookUrlBox）。 */
+ *  没装 IM / 查不到时是空串 —— 抽屉照常打开，那一块退回文字说明（见 WebhookUrlBox）。
+ *
+ *  `urlLabelKey` / `urlMissingKey` 可选:内容里没有 `webhookUrl` 块的抽屉（多云那份）
+ *  不需要它们。三个 IM 抽屉都必须传 —— 漏传的表现是第 3 步那个地址框整块消失，见文件头。 */
 export default function ImGuideDrawer({
   open, onClose, webhookUrl = "", blocks, titleKey, subKey, urlLabelKey, urlMissingKey,
 }: {
@@ -116,8 +132,8 @@ export default function ImGuideDrawer({
   blocks: GuideBlock[];
   titleKey: string;
   subKey: string;
-  urlLabelKey: string;
-  urlMissingKey: string;
+  urlLabelKey?: string;
+  urlMissingKey?: string;
 }) {
   const t = useT();
 

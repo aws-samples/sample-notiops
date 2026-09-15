@@ -48,15 +48,16 @@ with a Copy button — no CloudFormation console, no CLI, and it works the same 
 deployment paths (A and B). The backend resolves it by looking up the IM entry point's
 HTTP API by name, so your stack name does not matter.
 
-> **That page covers Feishu and DingTalk** (separate tabs and separate drawers, each
-> resolving its own entry point). **The Slack URL is only in the Outputs.**
+> **That page covers all three platforms — Feishu, DingTalk and Slack** (separate tabs and
+> separate drawers, each resolving its own entry point; the Slack tab exists as of
+> 2026-09-11).
 >
 > If the box says the URL could not be retrieved, this deployment has no such platform
 > installed (web-only, or Feishu-only while you're looking at the DingTalk tab), or the
 > lookup lacks permission — fall back to the CLI / Outputs below; both places show the
 > same value.
 
-The CLI way (script deployments, automation, and Slack). `ImStack` emits one CfnOutput per
+The CLI way (script deployments, automation). `ImStack` emits one CfnOutput per
 installed platform:
 
 ```bash
@@ -93,10 +94,10 @@ the path — so appending a sub-path still works, but paste it exactly as the ou
 > - **The secret names are identical** (`notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` /
 >   `notiops/slack-bot-token` / `notiops/slack-signing-secret`), so every command in this
 >   document works as-is.
-> - **You create the two Slack secrets yourself** (`aws secretsmanager create-secret`, see
->   §2.2) — the template creates no secrets; the **Feishu and DingTalk** ones are created for
->   you by the backend when you save the credentials on the admin console's "IM integration"
->   page.
+> - **The template creates no secrets at all** — for all three platforms the secret is created
+>   on demand by the backend when you save the credentials on the admin console's "IM
+>   integration" page (that includes the Slack tab, as of 2026-09-11; before that you had to
+>   create those two by hand).
 > - **Your install option must include the platform you're configuring**: a web-only stack has
 >   no such HTTP API, and no `FeishuWebhookUrl` / `SlackWebhookUrl` / `DingtalkWebhookUrl`
 >   output. ⚠️ **Path A installs one IM platform at a time** — `web+feishu` / `web+slack` /
@@ -356,7 +357,27 @@ it, it **says so** and then answers from your sentence alone — never silently.
 > with it on, Slack stops sending requests to your Request URL. You also do not need an
 > App-Level Token (`xapp-...`); that belonged to the long-connection design.
 
-### 2.2 Two secrets
+### 2.2 Two credentials
+
+**Recommended (needs no AWS permissions at all, browser-only):** open Web Chat →
+**admin console → IM integration → Slack tab**, fill the two fields and save:
+
+| Field | Where it comes from | Shape |
+|---|---|---|
+| **Bot User OAuth Token** | OAuth & Permissions page | starts with `xoxb-` |
+| **Signing Secret** | Basic Information → App Credentials | 32 hex characters |
+
+The "View the detailed setup steps" drawer on that page carries the same content as
+§2.1–§2.5 below. After a successful save, hit **"Test credentials"**: it calls `auth.test`,
+reports the workspace / bot name, and **names each missing Bot Token Scope** (derived from
+the `X-OAuth-Scopes` response header).
+
+> ⚠️ "Test credentials" **only validates the bot token**. Slack exposes **no API that can
+> validate a signing secret** — its only verification is saving the Request URL in Slack
+> (§2.3), which makes Slack send a `url_verification` that 401s if the signature is wrong.
+> So a green test button does **not** mean the signing secret is right.
+
+**The equivalent CLI route** (when you do have AWS permissions, or want to script it):
 
 ```bash
 # Bot Token (OAuth & Permissions page, starts with xoxb-)
@@ -368,16 +389,25 @@ aws secretsmanager put-secret-value --secret-id notiops/slack-signing-secret \
   --region <REGION> --secret-string '<signing secret>'
 ```
 
-Two things you must know first:
+Four things you must know first:
 
-1. **`notiops/slack-signing-secret` is created by `NotiOpsBackendStack` (the main
-   stack)**, not by `ImStack`. If you are upgrading an older Socket Mode deployment the
-   secret did not exist before (Socket Mode authenticated with the App Token and had no
-   use for it) — deploying `ImStack` alone is not enough. Deploy the main stack once
-   first, or `put-secret-value` fails with `ResourceNotFoundException`.
+1. Both secrets hold a **plain string**, not JSON. The data plane
+   (`platforms/slack/caps.py`) uses the whole `SecretString` as the value with **no
+   `json.loads`** — writing `{"bot_token":"xoxb-..."}` sends that entire blob to Slack as
+   the token, which yields `invalid_auth` while the admin page looks perfectly fine. Saving
+   from the web page cannot hit this (the backend only ever writes plain strings).
 
-2. ⚠️ **These two secrets are not empty — they hold a CDK-generated random string.**
-   When `new secretsmanager.Secret(...)` is created without a `secretStringValue`,
+2. **On path B (`setup.sh`), `notiops/slack-signing-secret` is created by
+   `NotiOpsBackendStack` (the main stack)**, not by `ImStack`. If you are upgrading an older
+   Socket Mode deployment the secret did not exist before (Socket Mode authenticated with
+   the App Token and had no use for it) — deploying `ImStack` alone is not enough. Deploy
+   the main stack once first, or `put-secret-value` fails with `ResourceNotFoundException`.
+   **Path A (one-click) creates no secret at all**; both are created when you save from the
+   web page — so on path A the web route is the only one that works out of the box (short of
+   running `aws secretsmanager create-secret` yourself).
+
+3. ⚠️ **On path B these two secrets are not empty — they hold a CDK-generated random
+   string.** When `new secretsmanager.Secret(...)` is created without a `secretStringValue`,
    Secrets Manager **generates a random value** (not an empty string). The consequence:
    forgetting to fill them in does not surface as "secret is empty", it surfaces as
    "wrong credential" —
@@ -385,12 +415,18 @@ Two things you must know first:
    - signing secret not filled in → every request fails signature validation with 401 and
      Slack reports that URL verification failed.
 
-   To tell whether they were ever filled in (without printing values): `LastChangedDate`
-   must be clearly later than `CreatedDate`.
-   ```bash
-   aws secretsmanager describe-secret --secret-id notiops/slack-signing-secret \
-     --region <REGION> --query '{Created:CreatedDate,LastChanged:LastChangedDate}'
-   ```
+   **To tell whether they were ever filled in, read the "configured" badge on the admin
+   page's Slack tab.** It is derived from the **shape of the value** (`xoxb-` prefix / a hex
+   string), and a random placeholder satisfies neither — so it always reads *not
+   configured*. Do **not** use "`LastChangedDate` is later than `CreatedDate`" for this: a
+   redeploy that only changes tags also pushes `LastChangedDate` forward, which would
+   misread "never filled in" as "already configured".
+
+4. After changing a credential: the ingress Lambda reads the signing secret **at module
+   load** (cold start), so **execution environments that are still alive keep using the old
+   value**. The web page's save confirmation says so too. Wait for the old environments to
+   be recycled, or change an ingress environment variable to force a fresh batch — see
+   [DEPLOYMENT.en.md](DEPLOYMENT.en.md) §8.2.
 
 ### 2.3 Three Request URL fields — all the same value
 

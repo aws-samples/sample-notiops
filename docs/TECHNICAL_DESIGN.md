@@ -100,26 +100,26 @@ NotiOps 的目标:**让 SRE 随时随地掌控云环境**。主入口是一个 *
 ┌────────────────────────────────────────────────────────────────────┐
 │                          客户 IM 平台                              │
 │  ┌─────────┐  ┌─────────┐  ┌──────────┐  ┌─────────┐              │
-│  │  飞书   │  │  Slack  │  │  钉钉    │  │  Teams  │   ← 待接入   │
-│  └────┬────┘  └────┬────┘  └─────────┘  └─────────┘              │
-└───────┼────────────┼───────────────────────────────────────────────┘
-        │ webhook     │ webhook
+│  │  飞书   │  │  Slack  │  │  钉钉    │  │  Teams  │←Teams 待接入 │
+│  └────┬────┘  └────┬────┘  └────┬────┘  └─────────┘              │
+└───────┼────────────┼────────────┼──────────────────────────────────┘
+        │ webhook     │ webhook   │ webhook(HTTP 模式,不是 Stream)
         │ (HTTPS)     │ (Events / Interactivity / Slash)
-        ▼            ▼
+        ▼            ▼            ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │                    NotiOps (本项目)                        │
 │                                                                    │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐         │
-│  │  Feishu      │    │  Slack       │    │  其他平台    │         │
-│  │  ingress λ   │    │  ingress λ   │    │  (按需扩展)  │         │
-│  │  + worker λ  │    │  + worker λ  │    │              │         │
-│  │  (ImStack)   │    │  (ImStack)   │    │              │         │
-│  └──────┬───────┘    └──────┬───────┘    └──────────────┘         │
+│  │  Feishu      │    │  Slack       │    │  DingTalk    │         │
+│  │  ingress λ   │    │  ingress λ   │    │  ingress λ   │         │
+│  │  + worker λ  │    │  + worker λ  │    │  + worker λ  │         │
+│  │  (ImStack)   │    │  (ImStack)   │    │  (ImStack)   │         │
+│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘         │
 │   ingress: API GW HTTP API 触发，只验签 + 异步 invoke worker         │
 │   (旧的 ECS Fargate 长连接已于 2026-09-03 / M2 退役，只留源码回滚)  │
-│         │                   │                                       │
-│         └─────────┬─────────┘                                       │
-│                   ▼                                                 │
+│         │                   │                   │                   │
+│         └───────────────────┼───────────────────┘                   │
+│                             ▼                                       │
 │  ┌─────────────────────────────────────────────────────┐           │
 │  │            core/ 平台无关公共代码                    │           │
 │  │  • bedrock_intent (意图分类)                         │           │
@@ -154,7 +154,7 @@ NotiOps 的目标:**让 SRE 随时随地掌控云环境**。主入口是一个 *
 
 | 层 | 物理位置 | 职责 | 代码 |
 |---|---|---|---|
-| **L1 平台适配层** | Lambda(每个平台一对:ingress + worker,`ImStack`) | ingress:验签 + 幂等去重 + 异步投递;worker:消息 / 卡片回调路由与处理 | `platforms/{feishu,slack}/lambda_ingress.py` + `lambda_worker.py`(回滚用的长连接入口在 `platforms/*/app/`) |
+| **L1 平台适配层** | Lambda(每个平台一对:ingress + worker,`ImStack`) | ingress:验签 + 幂等去重 + 异步投递;worker:消息 / 卡片回调路由与处理 | `platforms/{feishu,slack,dingtalk}/lambda_ingress.py` + `lambda_worker.py`(回滚用的长连接入口在 `platforms/*/app/`) |
 | **L2 公共业务逻辑** | 跟 L1 同进程或 Lambda 内 | 确定性意图路由(`core/nl_router`,0 token)、对话、进度轮询、case、push、签名派发 | `core/` |
 | **L3 后台任务** | AWS Lambda(无状态) | 接 EventBridge 事件,渲染报告,投递到 IM | `shared/report_delivery/report_handler.py`、`shared/report_delivery/push_handler.py`、`shared/report_delivery/feishu_sender.py`、`shared/report_delivery/slack_sender.py` |
 
@@ -205,7 +205,8 @@ L2 被两类调用方共用 —— IM worker Lambda / 后台 Lambda(CDK 打包�
 ```
 ┌───────────────────────────────────────────────────────────────┐
 │  浏览器 · React / Vite 前端                                    │
-│  • 左侧主题导航:通知 / 调查 / FinOps / 案例 / Skills / 更多    │
+│  • 左侧导航(7 项):通知/调查/成本/案例/巡检/技能/管理           │
+│    (安全已并入调查;调查/成本/案例的看板走输入框上方的胶囊)   │
 │  • 主聊天 + 右侧「Sources / 调查过程」停靠面板                  │
 │  • 多模型切换 · 多账号选择器 · 联网搜索开关 · /命令菜单        │
 └───────────────┬───────────────────────────────────────────────┘
@@ -278,7 +279,17 @@ BFF 把 AgentCore Runtime 的产出转成一条 SSE 事件流,前端按类型分
 
 #### 2.4.5 左侧主题导航(有序)
 
-通知(Notifications) / 调查(Investigate) / FinOps / 案例(Cases) / Skills(一级) / 更多(安全 · 巡检报告外链 · 定制)。新对话默认模型 **Claude Sonnet 5**;另可切 Claude Opus 5、Claude Haiku 4.5、Amazon Nova Pro、DeepSeek V3.2、GPT-5.6(Terra / Sol / Luna)。默认模型与启用集都由管理员在 Admin「模型」页定(真源:`config/llm-model-catalog.json` → DDB `llmcfg`)。每会话记忆模型偏好,每条回复署名所用模型。多账号选择器默认部署账号(团队共享);联网搜索开关默认关。
+通知(Notifications) / 调查(Investigate) / 成本(FinOps) / 案例(Cases) / 巡检(Inspection) / 技能(Skills) / 管理(Admin)。**七项全是一级入口,没有「更多」分组** —— `Sidebar.tsx` 里 `SHOW_MORE_GROUP = false`,「管理」已于 2026-09-11 从「更多」子菜单提为一级。⚠️ 注意「侧栏有几项」≠「有几个对话主题」:侧栏 7 项里,「巡检」是**看板直达入口**、「管理」是控制台,`TOPICS` 只有 **4 条**(investigate / finops / cases / whats-new)。⚠️ **侧栏里没有「安全」** —— 2026-09-11 同日去掉(见下),安全看板只从「调查」输入框上方的「安全态势」胶囊进;`Sidebar.tsx` 连 `showSecurity` / `securityActive` / `onSecurity` 三条 prop 都已删掉,补回入口会让一个已退役的对话主题在导航里复活。
+
+> **2026-09-11:「安全」不再是对话主题,只保留看板。** 它的聊天能力本来就是 investigate 的真子集(agent 侧 `_TOPIC_FOCUS` 没有 `security` 这一项,工具只挂 core 8 个,而 investigate 是 22 个),同一句安全问题在「安全」里问答得更差。改法:
+> - **主题注册表删掉 `security`**,安全类 6 句起手问句整组并入 investigate 的池子(6 → 12);
+> - **侧栏整项去掉**(同日的第二次收口:先改成"看板直达入口",随后判断"留一个同名一级入口会让人以为它还是个独立聊天主题",于是删掉);安全看板只从下面那行胶囊进;
+> - 调查主题在**输入框上方**新增一行**粗粒度**胶囊(`运行概览` / `安全态势`),点哪颗进哪一棵树 —— 刻意只有两颗,以后往树里加面板不会在这一行多出胶囊;单行 `nowrap` + 横向滚动,**不许 `flex-wrap`**(换行会把输入框往下推);这一行**与聊天框左对齐**(`.dashpills` 和 `.cbox` 同为 `.cwrap` 的子节点,靠默认 `flex-start` 对齐,**任何选择器都不许给它加 `justify-content`**,空态也不许居中),且**没有**前导的「仪表盘」图标+文字标签;
+> - 成本 / 案例两个主题**也用同一行胶囊**(`支出与优化` / `案例进展`),取代原来紧贴输入框左上角的「打开 Dashboard」页签 —— `Composer` 的 `onOpenDashboard` prop 与 `.cbox-tabs` / `.cbox-tab` / `.cbox.has-tab` 三条 CSS 已一并删除;
+> - **四颗胶囊的名字刻意不共用同一个词尾**,图标也**不上色**。第一版四个都叫「XX 态势」,客户原话「我发现取的 dashboard 名字都是 XX 态势」—— 整齐,但三个是硬套:`posture` 在安全语境是行业术语(CSPM = Cloud Security **Posture** Management),只有「安全态势」撑得住,`Case posture` 这种在英文里基本不成立。所以第二轮按各自看板的语义内核分别取:`运行概览`(树里 7 项有 6 项是告警/健康/EOL 风险)、`支出与优化`(11 项一半「花了多少」一半「怎么省」)、`案例进展`(4 项全是「现在到哪一步、该谁动」),中英各自读得通就行,不追求词形对齐。已知撞词、刻意接受:「运行概览」与该树第一项「告警总览」语义相近(客户在两个候选里明确选了它)。颜色那条删的是 `.dashpill svg:first-of-type { color: var(--orange) }` —— `icons.tsx` 里没有任何硬编码色值(全是 `currentColor`),看板浏览器左栏图标本来就是 `--muted` / 选中态 `--text`,所以**唯一**能给胶囊图标上色的地方就是这条规则,删掉即全链路无色;主次改由 `.dashpill svg:last-of-type { opacity:.5 }` 拉开。两条都有源码级断言钉在 `topicmerge.test.tsx`;
+> - 库里 `topic:"security"` 的老会话**改不掉**(`ensureConversation` 带 `attribute_not_exists(SK)`,没有任何接口能改 topic),所以归一放在**读**的时候:前端 `normalizeTopic`(水合会话头时)+ BFF `topic.mjs`(`POST /stream` 与 `POST /warmup` **两个入口都要**,因为 agent 侧 LRU 缓存键含 topic,只归一一个会让预热白做)。BFF 侧对未知 topic **原样透传、不做 allowlist**,免得把老客户端打死。
+
+新对话默认模型 **Claude Sonnet 5**;另可切 Claude Opus 5、Claude Haiku 4.5、Amazon Nova Pro、DeepSeek V3.2、GPT-5.6(Terra / Sol / Luna)。默认模型与启用集都由管理员在 Admin「模型」页定(真源:`config/llm-model-catalog.json` → DDB `llmcfg`)。每会话记忆模型偏好,每条回复署名所用模型。多账号选择器默认部署账号(团队共享);联网搜索开关默认关。
 
 > ⚠️ **FinOps Agent 深度分析当前置灰禁用(即将上线,暂未完善)**:DevOps Agent 开关现在在「调查」与「FinOps」两个主题都显示,FinOps 里可开它做成本 / 用量深度分析;但 **FinOps Agent 开关目前置灰禁用**,前端提示"即将上线"。进入 FinOps 主题时该开关默认关(仅「调查」主题默认开)。
 
@@ -1107,7 +1118,7 @@ core.webhook_dispatch.dispatch(query=investigate_query, ...)
 4. **渲染**(三平台分别有 sender):
    - 飞书:紫色 v2 卡片,5-6 个 section,2 个按钮(回复 / 查看完整 case)
    - Slack:Block Kit blocks,suggested_reply 用 `> ` 引用块样式
-   - 钉钉:单条 markdown(Phase 2a 限制),保持 6 段结构 + 控制台 deep link footer
+   - 钉钉:单条 markdown(平台永久限制:消息发出后不可编辑,卡片按钮只能跳 URL、没有按钮回调),保持 6 段结构 + 控制台 deep link footer
 
 **性能特性**:总耗时 5-15 秒(describe_case ~500ms + list_communications ~1-2s + Bedrock invoke ~3-10s),所以 sender 在调用前**先发一条 "正在分析 case xxx…" 的 placeholder 消息**避免用户感觉卡死。
 
@@ -1125,7 +1136,7 @@ core.webhook_dispatch.dispatch(query=investigate_query, ...)
 
 - TTL 7 天自动清理,无需 cron 维护
 - 全部用 `get_item` / `put_item` / `update_item` + ConditionExpression,不依赖二级索引
-- 跨平台共享:飞书 / Slack / 未来钉钉用同一张表,`platform` 字段区分
+- 跨平台共享:飞书 / Slack / 钉钉用同一张表,`platform` 字段区分
 
 #### 4.8.2 lookup_key 前缀清单
 
@@ -1465,9 +1476,10 @@ Web Chat 有自己的部署链路(见 §2.4):
 | Feishu worker | `/aws/lambda/notiops-im-worker-feishu` | 真正处理消息 / 卡片回调 |
 | Slack ingress | `/aws/lambda/notiops-im-ingress-slack` | 同上(Events / Interactivity / Slash 三类都走这里) |
 | Slack worker | `/aws/lambda/notiops-im-worker-slack` | 真正处理消息 / 交互 |
+| DingTalk ingress | `/aws/lambda/notiops-im-ingress-dingtalk` | 同上(钉钉保存回调地址时不做校验,**bot 静默不回话先看这里**:没有请求进来 = 消息接收模式还留在 Stream 模式,要改成 HTTP 模式) |
+| DingTalk worker | `/aws/lambda/notiops-im-worker-dingtalk` | 真正处理消息(会话内回复用入站报文的 `sessionWebhook`) |
 | IM 进度轮询 | `/aws/lambda/notiops-im-progress` | 调查进度卡刷新 |
 | Feishu / Slack bot(回滚路径)| `/ecs/<bot-stack>-{feishu,slack}-bot-*` | 长连接 / Socket Mode 容器,只在回滚时有流量 |
-| DingTalk bot | `/ecs/<bot-stack>-dingtalk-bot-*` | Stream Mode + 自定义机器人回写(⏳ Phase 2) |
 | DevOps Callback | `/aws/lambda/notiops-devops-callback` | 调查结果回调 |
 | Lambda4 Notifier | `/aws/lambda/notiops-notifier` | 定时推送(含 6 事件源) |
 | Health Checker | `/aws/lambda/notiops-health-checker` | AWS Health 巡检 |
@@ -1523,7 +1535,7 @@ push_handler: dispatched feishu-push-<dedupe_key>
 
 ## 8. 扩展到新平台
 
-新增 IM 平台(钉钉 / Teams / 微信企业号 / 任何支持 bot 的平台)只需做三件事,**`core/` 完全不动**。
+新增 IM 平台(Teams / 微信企业号 / 任何支持 bot 的平台)只需做三件事,**`core/` 完全不动**。
 
 > **本节只讲如何新增 IM 补充平台;主入口 Web Chat 是另一条独立的接入面**(见 §2.4):它不是 IM 平台适配层,而是浏览器端的 agentic 助手,自带 AgentCore Runtime + BFF Function URL SSE + React 前端 + Cognito/SigV4 鉴权。它与 IM 侧共享部分后端约束与存储(如 Skills 的 S3 `skills/` 前缀、只读防线理念),但不复用本节的 `core/` + IM 适配层(ingress/worker Lambda)与 sender 契约。
 
@@ -1624,14 +1636,13 @@ class ProgressCardIR:
 | 6 | 多 LLM 切换(Claude / Nova / GPT)| ✅ 已实现 (2026-06-05) | `core/model_catalog.py` 别名表 + `core/llm_pref_resolver.py` per-chat 偏好 + per-model `max_output_tokens`;`@bot model nova` 任意切换 |
 | 7 | 跨调查记忆 / FAQ 库 | ⏳ 长期 | OpenSearch / S3 Vectors |
 | 8 | 通用对话能力 | ✅ 已实现 (2026-05-27) | 三层防御(⚠️ 仅回滚路径,见 §5.3)+ 三档开关 + 17 / 23 / 38 case 单测 |
-| 9 | Skill 编排 | ✅ 飞书 / Slack 已实现 / ⏳ 钉钉 Phase 2c | DevOps Agent skill 选择 + 自助上传(authoring) |
+| 9 | Skill 编排 | 🔴 IM 侧已退役 (2026-09-06) | 三个平台一起去掉(`core/nl_router.py` 里 `_SKILLS_RE` / `Caps.skills` / `KINDS` 的 `"skills"` 全删),不是某个平台缺实现;skill 选择 + 自助上传(authoring)能力完整保留在 Web Chat 端 |
 | 10 | 双语支持 (zh / en) | ✅ 已实现 (2026-05-31) | 自动检测 + 4 层锁定 + `language` 命令 + 自然语切换;详见 §4.9 |
 | 11 | AWS MCP(docs / pricing / cost) | ⚠️ IM 侧只剩 docs (2026-09-03 / M2) | Tier-1 hosted Knowledge MCP 仍在;Pricing/Cost/WA **sidecar 随 `BotStack` 退役**,IM Lambda 显式关掉(Web Chat 侧走进程内 stdio MCP,不受影响) |
-| 12 | 钉钉(DingTalk)平台支持 | ⚠️ Phase 1/1.5/1.6/2a/2b 已实现 (2026-06-05) | 对话 / 调查 / case CRUD(对话式)/ push 投递 / 报告 markdown 回贴。Phase 2c(实时进度卡 / Skill / Next-step 按钮)阻塞于客户在 DingTalk Open Platform 注册 cardTemplateId |
+| 12 | 钉钉(DingTalk)平台支持 | ✅ 已上线 (2026-09-08) | 两条部署路径都可选(`setup.sh` 选项 3 / 一键部署 `InstallOption=web+dingtalk`),与飞书 / Slack 同一个 Lambda webhook 形态。对话 / 调查 / case 全生命周期(bot 回一张纯文本模版,用户整段复制改完发回,再回「确认」)/ push 投递 / 报告 markdown 回贴。永久性平台差异(不是分期):消息发出后不可编辑 → 进度改追加式(仍然送达);卡片按钮只能跳 URL → 没有 Next-step 一键派发;主动推送只能配一个目标 |
 
 ### 9.1 短期(本季度)
 
-- **#9 Skill 编排** —— 让客户自己上传的 DevOps Agent skill 在 IM 里也能选择派发
 - **#5 定时巡检** —— 让 bot 主动干活,补 push 模式被动等告警
 - **#2 enrichment** —— 减少 agent 澄清来回,提升单次调查质量
 - **#4 二期** —— rollup 风暴模式 + 路由表(不同 service 推不同群)+ 跨账号订阅
@@ -1639,7 +1650,6 @@ class ProgressCardIR:
 ### 9.2 中期(下季度)
 
 - **#7 跨调查记忆** —— 同类问题命中相似度,直接给历史结论(节省 agent 重复调查)
-- **#12 钉钉 Phase 2c** —— 实时进度卡 + Skill 编排 + Next-step 按钮(待客户注册 cardTemplateId)
 - **#4 主动观察二期** —— rollup 风暴 / 路由表 / 跨账号
 - **新平台扩展** —— Teams / 微信企业号(钉钉已交付)
 
@@ -1731,16 +1741,24 @@ notiops/
 │   │   │   └── support_flow.py        # 升级 Support 表单卡
 │   │   ├── Dockerfile
 │   │   └── requirements.txt
-│   └── slack/                         # 对称结构
-│       ├── lambda_ingress.py          # ★ Events / Interactivity / Slash 同一入口
-│       ├── lambda_worker.py           # ★
-│       ├── im_blocks.py
-│       ├── app/                       # 回滚路径:Socket Mode bot 进程
-│       │   ├── main.py                # slack_bolt Socket Mode + 路由
-│       │   ├── blocks.py              # Block Kit 工厂方法
-│       │   ├── progress_sender.py
-│       │   ├── case_flow.py
-│       │   └── support_flow.py
+│   ├── slack/                         # 对称结构
+│   │   ├── lambda_ingress.py          # ★ Events / Interactivity / Slash 同一入口
+│   │   ├── lambda_worker.py           # ★
+│   │   ├── im_blocks.py
+│   │   ├── app/                       # 回滚路径:Socket Mode bot 进程
+│   │   │   ├── main.py                # slack_bolt Socket Mode + 路由
+│   │   │   ├── blocks.py              # Block Kit 工厂方法
+│   │   │   ├── progress_sender.py
+│   │   │   ├── case_flow.py
+│   │   │   └── support_flow.py
+│   │   ├── Dockerfile
+│   │   └── requirements.txt
+│   └── dingtalk/                      # 与飞书 / Slack 同一个 Lambda webhook 形态
+│       ├── lambda_ingress.py          # ★ webhook 入口(须在钉钉控制台选 HTTP 模式)
+│       ├── lambda_worker.py           # ★ 真正处理消息(会话内回复用 sessionWebhook)
+│       ├── case_text.py               # 纯文本案例模版 + 「确认」解析(0 token)
+│       ├── append_progress.py         # 追加式进度(消息发出后不可编辑)
+│       ├── app/                       # ⚠️ 已退役(M2):长连接 bot 进程,留作源码回滚
 │       ├── Dockerfile
 │       └── requirements.txt
 ├── sidecars/                          # ⚠️ 已退役(M2):ECS sidecar 镜像(MCP server 包装)

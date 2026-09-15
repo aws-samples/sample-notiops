@@ -93,6 +93,9 @@ _DISABLED = os.environ.get("NOTIOPS_DISABLE_INVESTIGATION_MCP", "").strip().lowe
 _clients = []        # 常驻 MCPClient 单例
 _tools_cache = None  # 合并后的白名单工具列表（缓存）
 _LOAD_LOCK = threading.Lock()  # 守住"子进程只起一次"（_load_all_tools 可能被并发进入）
+# 最近一次启动里没起来的 server。用 list 就地改（不用 `global` 重绑），这样 `main.py`
+# 读到的永远是本轮最新状态。给 `degraded_note()` 用 —— 工具静默消失是最坏的一种失败。
+_degraded_servers: list[str] = []
 
 # 两个官方 server 的启动命令（console script 名 + 模块回退路径）。
 _SERVERS = [
@@ -163,6 +166,23 @@ def get_tools(core_only: bool = False):
     return all_tools
 
 
+def degraded_note() -> str:
+    """本轮有 server 没起来时，返回一句**给模型看**的说明；正常时返回空串。
+
+    为什么非要说出来：这些工具起不来是**静默**的 —— 模型只是看不到工具，于是照着自己的
+    知识回答（"当前告警是…"/"这个账号没有异常"），用户拿不到任何"这次查不了"的信号。
+    假数据比报错恶劣得多。健康时返回空串，所以正常会话的 system prompt 一个字节都不变
+    （prompt 缓存不受影响）。文案是给模型的，故为英文（本模块受 lint_i18n 约束）。
+    """
+    if not _degraded_servers:
+        return ""
+    return ("CloudWatch metrics/logs and CloudTrail event tools are UNAVAILABLE in this session "
+            f"({', '.join(_degraded_servers)} failed to start). Do not answer questions "
+            "about metrics, alarms, logs or API-call history from memory: say that this "
+            "data source failed to start for this session, suggest the user retry in a new "
+            "conversation, and offer call_aws / aws_readonly as the read-only fallback.")
+
+
 def _load_all_tools():
     """拿到全量白名单工具并缓存（只跑一次）。与 finops_mcp._load_all_tools 同构，两条路：
 
@@ -191,7 +211,21 @@ def _load_all_tools():
                         "(from snapshot, no subprocess started)", len(lazy))
             return lazy
         per_server = _start_servers()
-        _tools_cache = _post(per_server)
+        merged = _post(per_server)
+        failed = _snap.failed_servers(per_server)
+        if failed:
+            # **不缓存**这次的残缺结果。`_start_servers()` 给每个 server 预分配槽位、起不来
+            # 就留空列表，而 `[] is not None` —— 无脑缓存等于让一次偶发冷启失败把**这个容器
+            # 余生**的调查能力砍掉，没有异常、没有告警，只有用户觉得"它以前会查 CloudWatch"。
+            # 不缓存 = 同一容器里下一个会话重试启动（多花几秒，但比永久残废好）。
+            # 判据与 `_snap.save` 的闸门①共用一处（见 `failed_servers`）。
+            _degraded_servers[:] = failed
+            logger.error("investigation_mcp: server(s) failed to start: %s (counts %s); NOT "
+                         "caching this tool set, next session in this container retries",
+                         failed, _snap.server_counts(per_server))
+            return merged
+        _degraded_servers[:] = []
+        _tools_cache = merged
         logger.info("investigation_mcp: total %d investigation tools exposed", len(_tools_cache))
         # 存**原始** list_tools 输出（不是过滤/包装后的）：白名单与包装改动因此立刻生效，
         # 不必参与快照指纹。

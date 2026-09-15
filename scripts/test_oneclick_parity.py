@@ -15,6 +15,18 @@
     ⑦ AgentCore Memory（会话记忆）建没建、跨会话那几个开关是不是同时关着
     ⑧ 首次登录交付：部署者拿到临时密码时，是不是同时拿到了 Web Chat 地址
     ⑨ IM（飞书 / Slack）加装项：三件套是不是同一份定义，方式 A 的部署期开关全不全
+    ⑩ 客户自有 CUR 数据源（cost-agent MCP）：可选加装项，但两条路径必须一样可选
+    ⑪ DevOps Agent 调查结果回调：异步链路最后一跳的四处接线
+    ⑫ 阿里云只读凭据：那**一个** secret 的名字五处一致 + BFF 的读写授权 + 卸载清理
+
+⚠️ 这份圈码是**历史插入顺序**，与 `main()` 的调用顺序**并不一致**（⑥⑦⑧⑨ 在 main()
+里的实际次序是 IM → Operator App → Memory → 首登交接），所以任何按 main() 顺序重排的
+外部清单都会与它对不上。**不要**为了"对齐"去重编这些圈码：仓外的回归判据里已经写死了
+一批按旧圈码引用的历史条目，重编会把它们一起改错。解引用时只认**函数名**。维度总数不写死在任何地方 —— `main()` 每次运行
+自己算一遍并打印，且它会先自检「每个 `test_*` 都真的接进了 main()」（见
+`_dimensions_called_in_main`：只 def 不调用的维度在 CI 里一次都不跑，却看不出来）。
+（⑩⑪ 是 2026-09-12 补进这份枚举的 —— 它们的断言早就在跑，只是没人回来更新这段
+文字；⑫ 与它们同一天新增。）
 
 ①②④ 是运行期行为，③ 是部署期数据 —— 三者在两条路径上各写了一份，没有任何一处能
 import 另一处；⑤ 反过来：它现在**只有一份**，两个栈 import 同一个模块，本文件断言的
@@ -57,6 +69,18 @@ retrieval_config）必须逐字对上，对不上时**不报错**，只是永远
        方式 A：notiops-webchat-standalone-stack.ts 的 IM 段（InstallOption 参数 +
        CfnCondition，部署期决定；代码/依赖层走 im-code.zip / im-layer.zip 产物）
        排除清单（两条路径共用）：infra/im-code-exclude.txt
+    ⑩ 两条路径都 import infra/lib/constructs/web-chat-core.ts（预热规则 + 调用授权）
+       方式 B：setup.sh 的前置校验 + notiops-backend-stack.ts 的桶生命周期
+       方式 A：notiops-webchat-standalone-stack.ts 的两个参数 + CfnRule，桶生命周期在
+       infra/lib/constructs/minimal-base-core.ts
+    ⑪ 方式 B：notiops-backend-stack.ts + infra/lib/im-stack.ts 的回调链
+       方式 A：notiops-webchat-standalone-stack.ts 的 DevOpsOnboard / 回调段
+    ⑫ 两条路径都 import infra/lib/constructs/web-chat-core.ts 的 aliyunSecretNames
+       （BFF 授权）；消费方是 bff/web-chat/aliyun_config.mjs 的 SECRET_ID
+       方式 B：notiops-backend-stack.ts 预建那个 secret + teardown.sh 的 SECRETS
+       方式 A：不预建（BFF 首次保存时 CreateSecret）+ notiops-webchat-standalone-stack.ts
+       里那**两份**栈外 secret 清单（TeardownDeleteOwnSecrets 的 resources 与
+       StagerSite 的 SecretNames）
 
 漂移的后果**不是**「功能没做」，而是「界面上有开关、点了静默失败」——
 UI 上那些开关（联网搜索 / FinOps / 深度调查）绝大多数是**无条件**渲染的
@@ -1399,7 +1423,10 @@ def test_cur_dashboard_parity() -> None:
            "但聊天里问客户费用恒失败降级到 CE，症状是「数字口径莫名变了」")
 
 
-# ─────────── 第十个维度：DevOps Agent 调查结果回调（异步链路的最后一跳）───────────
+# ────────── 第十一个维度：DevOps Agent 调查结果回调（异步链路的最后一跳）──────────
+#
+# （原来写作"第十个维度"。CUR 仪表盘那一维没有这种横幅、说明写在它的 docstring 里，
+#  于是它被漏数了一次；⑩ 是 CUR、⑪ 才是这一节，与本文件顶部那份枚举一致。）
 #
 # 这一节是 2026-09-03 在验证账号上实测出来的缺陷补上的：飞书里发起
 # 深度调查，IM 面板一路走到「调查已结束」，而**最终报告与公网访问 URL 永远不来**。
@@ -1570,10 +1597,306 @@ def test_devops_callback_parity() -> None:
            "所有客户拿到同一个值 → 属性永不变化 → 这个 Phase 在升级时根本不重跑")
 
 
+# ───── 第十二个维度：阿里云只读凭据（Admin「多云」板块存的那**一个** secret）─────
+#
+# 为什么它单独算一个维度：这条能力今天的全部落地就是「把一对只读 AK/SK 存进一个
+# Secrets Manager secret」，而那个 secret 的**名字**是一串手写字面量，在五个互不
+# import 的地方各写了一份。前十一个维度结构上都看不见它 —— 读写发生在 BFF 而不是
+# AgentCore runtime，所以既不落在 ①② 的 IAM / env 里，也不是 ③ 的 DynamoDB 数据。
+#
+#   · bff/web-chat/aliyun_config.mjs 的 `SECRET_ID` —— 唯一的消费方
+#   · infra/lib/constructs/web-chat-core.ts 的 `aliyunSecretNames` —— BFF 的授权。
+#     它在**共享构件**里，两条路径都 import 它，所以授权本身天然对等（与 ⑤⑨⑩ 同构：
+#     这里断言的是「没人把它抄回某个栈」，不是「两边写法一样」）
+#   · infra/lib/notiops-backend-stack.ts 的 `AliyunCredentialsSecret` —— 方式 B 预建它
+#   · infra/lib/notiops-webchat-standalone-stack.ts 的**两份**方式 A 清单
+#     （`TeardownDeleteOwnSecrets` 的 resources + `StagerSite` 的 `SecretNames`）
+#   · teardown.sh 的 `SECRETS` —— 方式 B 卸载时补删它
+#
+# 漂移的症状全是静默的，而且比别的维度更难从界面上看出来：前端两条路径**字节相同**，
+# 「已配置」这件事只信后端回的标志位（前端不自己推断），所以界面绝不会露出破绽。
+#   · 名字在某一处被改掉 / 被参数化 → 授权给的是 A、BFF 读的是 B：
+#     GET /admin/aliyun-config 整条 500，PUT 是 AccessDenied，且只坏一条路径。
+#   · 方式 A 那两份清单漏了它 → 卸载留下一个装着客户 AK/SK 的孤儿 secret；更贵的是
+#     名字被 7-30 天恢复期占着，客户重装后第一次点「保存」就撞
+#     `already scheduled for deletion` —— 报错在保存那一下，做错事的是上一次卸载。
+#
+# 已知且**有意**的差异（登记在此，下面有机器判据钉着它仍然成立）：
+#   方式 B 由 notiops-backend-stack.ts 预建这个 secret（`RemovalPolicy.DESTROY`），
+#   理由是 tests/test_teardown_secrets.py 那条双向判据 —— 不在 CDK 里建，teardown.sh
+#   就不许列它，于是方式 B 卸载会永久留下一个装着客户凭据的 secret。方式 A 的一键模板
+#   **不预建任何凭据资源**，secret 由 BFF 在客户首次保存时 CreateSecret 建出来；对价是
+#   共享授权里必须有 CreateSecret + TagResource（栈级 Tags 盖不到栈外资源，而本仓强制
+#   project / auto-delete 标签，缺 TagResource 的症状是**保存直接失败**，不是"标签少了"），
+#   外加那两份"栈外 secret"清理清单。
+#
+# 分工：方式 B 侧「CDK 里每个 DESTROY 的 secret == teardown.sh 的 SECRETS」由
+# tests/test_teardown_secrets.py 双向卡住，本节**不重复**那条判据。本节补的是它看不见的
+# 那半边 —— 方式 A 的两份清单（在本断言之前它们没有任何 CI 校验，ONECLICK 里
+# `TeardownDeleteOwnSecrets` 上方那段注释当时只能写"只能靠这段注释"），以及
+# 「名字的来源在两条路径上是同一种」。
+#
+# ⚠️ 本节只管**凭据的存放**。存进去之后还没有任何东西读它（多云的调用面还没做），
+#    所以别把这里的绿灯读成「多云已经打通」。
+#
+# ⚠️ 触发条件上有个**已知缺口**（照实说，别当它不存在）：`oneclick-template-tests` 那个
+#    job 的 `changes:` 里有本节读的四份源码（web-chat-core.ts / web-chat-stack.ts /
+#    bff/web-chat/** / teardown.sh + 一键栈），但**没有** infra/lib/notiops-backend-stack.ts
+#    —— 只改那一份（方式 B 预建的 secret 名）时，本节在那个 MR 上压根不跑。
+#    兜底是 tests/test_teardown_secrets.py（`pytest-suite`，无 changes 过滤）会因为
+#    「CDK 集合 ≠ SECRETS」而红，但它看不见"名字与另外四处不一致"这件事。
+#    这不是本节引入的：⑤ 与 ⑩ 早就在读那份源码了。
+WEB_CHAT_CORE_TS = "infra/lib/constructs/web-chat-core.ts"
+WEB_CHAT_SETUP_STACK = "infra/lib/web-chat-stack.ts"   # 方式 B 调 createWebChatCore 的那个栈
+ALIYUN_BFF = "bff/web-chat/aliyun_config.mjs"
+TEARDOWN_SH = "teardown.sh"
+
+#: BFF 里那个"留着只为与飞书/钉钉/Slack 三个模块逐字同构"的 env。**今天没有任何部署
+#: 路径注入它**，实际生效的永远是右边的字面名。一旦某条路径开始注入它，另一条还按
+#: 字面名授权与清理 —— 那就是单边漂移，且症状是 AccessDenied / 孤儿 secret。
+ALIYUN_SECRET_ENV = "ALIYUN_SECRET_NAME"
+
+#: 共享授权里必须有的动作。前三条两条路径都要用；后两条是**方式 A 专属的对价**
+#: （模板不预建 secret，首次保存靠 BFF 自己 CreateSecret，且必须带上强制标签）。
+ALIYUN_GRANT_MUST = (
+    "secretsmanager:GetSecretValue",
+    "secretsmanager:UpdateSecret",
+    "secretsmanager:DescribeSecret",
+    "secretsmanager:CreateSecret",
+    "secretsmanager:TagResource",
+)
+
+
+def _aliyun_names_shared() -> list[str]:
+    """共享构件里那份名字清单 —— 两条路径的 BFF 授权都由它算出 ARN。
+
+    提取的是**引号里的字面量**：这正是"来源"判据的一半。若有人把它改成
+    `[someParam.valueAsString]` 或 `[app.node.tryGetContext(...)]`，这里就取不到
+    字面量而**失败**（不是静默通过）—— 那种改法会让一条路径可配、另一条写死，
+    于是授权与 BFF 读的不再是同一个 secret。
+    """
+    src = _strip_comments(_read(WEB_CHAT_CORE_TS))
+    m = re.search(r"const aliyunSecretNames\s*=\s*\[([^\]]*)\]", src)
+    if m is None:
+        raise AssertionError(
+            f"{WEB_CHAT_CORE_TS}: 找不到 `const aliyunSecretNames = [...]` —— "
+            "阿里云凭据的授权清单被改名或挪走了，本节的提取器要跟着改")
+    names = re.findall(r'"([^"]+)"', m.group(1))
+    if not names:
+        raise AssertionError(
+            f"{WEB_CHAT_CORE_TS}: aliyunSecretNames 里没有字面量名字（大概被换成了参数 / "
+            "context）—— 那样一条路径可配、另一条写死，两条路径的 secret 名会分叉")
+    return names
+
+
+def _aliyun_grant_body() -> str:
+    """共享构件里那条 `AliyunCredentialsSecretAccess` 语句的源码段。"""
+    src = _strip_comments(_read(WEB_CHAT_CORE_TS))
+    i = src.find('sid: "AliyunCredentialsSecretAccess"')
+    if i < 0:
+        raise AssertionError(
+            f"{WEB_CHAT_CORE_TS}: 找不到 AliyunCredentialsSecretAccess 语句 —— "
+            "BFF 就没有读写这个 secret 的权限了，而症状是「多云」页整条 500")
+    return src[i: src.index("}),", i)]
+
+
+def _oneclick_external_secret_lists() -> dict[str, list[str]]:
+    """方式 A 的两份"栈外 secret"清单（CFN 不会替我们删它们，只能由 StagerFn 收尾）。
+
+    两份都必须列全：一份是**权限**（删得动），一份是**待删名单**（知道要删谁）。
+    只加一份的症状分别是 AccessDenied（删栈时那个自定义资源失败）和"名字没进名单、
+    悄悄留在账号里"，都不是"少删一个"这么便宜。
+    """
+    src = _strip_comments(_read(ONECLICK))
+    out: dict[str, list[str]] = {}
+
+    i = src.find('sid: "TeardownDeleteOwnSecrets"')
+    if i < 0:
+        raise AssertionError(
+            f"{ONECLICK}: 找不到 TeardownDeleteOwnSecrets 语句 —— 方式 A 的删栈收尾"
+            "不再有删 secret 的权限，或者这条判据的锚点过期了")
+    j = src.index("resources: [", i)
+    out["TeardownDeleteOwnSecrets"] = re.findall(r'"([^"]+)"', src[j: src.index("]", j)])
+
+    k = src.find("SecretNames:")
+    if k < 0:
+        raise AssertionError(
+            f"{ONECLICK}: StagerSite 上找不到 SecretNames 属性 —— 删栈时那批栈外 secret"
+            "就没人知道要删谁了（自定义资源的 Delete 事件只带上一次部署的属性）")
+    b = src.index("[", k)
+    out["SecretNames"] = re.findall(r'"([^"]+)"', src[b: src.index("]", b)])
+
+    for key, names in out.items():
+        if not names:
+            raise AssertionError(
+                f"{ONECLICK}: {key} 里没解析出任何字面量 secret 名 —— 提取器过期了，"
+                "宁可在这里失败，也不要让这份清单从此不被校验")
+    return out
+
+
+def _teardown_secrets_list() -> list[str]:
+    """方式 B 的 `SECRETS=(...)`。取法与 tests/test_teardown_secrets.py 一致。"""
+    m = re.search(r"SECRETS=\(([^)]*)\)", _read(TEARDOWN_SH))
+    if m is None:
+        raise AssertionError(
+            f"{TEARDOWN_SH}: 找不到 SECRETS 数组 —— 改了名要同时改这里和 "
+            "tests/test_teardown_secrets.py")
+    return re.findall(r'"([^"]+)"', m.group(1))
+
+
+def test_aliyun_credentials_parity() -> None:
+    """阿里云只读凭据：同一个 secret 名，且名字的**来源**在两条路径上是同一种。"""
+    print("\ntest_aliyun_credentials_parity")
+    core = _strip_comments(_read(WEB_CHAT_CORE_TS))
+    oneclick = _strip_comments(_read(ONECLICK))
+    backend = _strip_comments(_read(SETUP_BACKEND))
+    setup_webchat = _strip_comments(_read(WEB_CHAT_SETUP_STACK))
+
+    names = _aliyun_names_shared()
+    _check("共享构件里只有一个阿里云 secret 名", len(names) == 1,
+           f"实际是 {names} —— 多于一个就得先决定 BFF 的 SECRET_ID 指哪个，"
+           "下面「五处同名」的判据也要跟着改")
+    name = names[0]
+
+    # ── 1) 消费方读的就是这个字面名 ──
+    # 授权与清理清单都围着这个名字转，唯一真正**用**它的却是 BFF。名字不一致时
+    # GetSecretValue 直接 AccessDenied，而那一页只会显示"加载失败"。
+    bff = _read(ALIYUN_BFF)
+    m = re.search(rf'process\.env\.{ALIYUN_SECRET_ENV}\s*\|\|\s*"([^"]+)"', bff)
+    _check(f"{os.path.basename(ALIYUN_BFF)} 的 SECRET_ID 回落到同一个字面名",
+           m is not None and m.group(1) == name,
+           f"BFF 读的是 {m.group(1)!r} 而两条路径授权/清理的是 {name!r}"
+           if m else f"{ALIYUN_BFF} 里找不到 `process.env.{ALIYUN_SECRET_ENV} || \"…\"` 那一行")
+
+    # ⚠️ 「没有任何部署路径注入这个 env」是上面那条回落生效的前提。哪条路径开始注入它，
+    #    另一条还按字面名授权与清理，就是单边漂移：一边读 A、一边给 B 的权限。
+    injectors = [os.path.basename(rel) for rel, src in (
+        (ONECLICK, oneclick), (SETUP_BACKEND, backend),
+        (WEB_CHAT_CORE_TS, core), (WEB_CHAT_SETUP_STACK, setup_webchat),
+    ) if ALIYUN_SECRET_ENV in src]
+    _check(f"没有任何部署路径注入 {ALIYUN_SECRET_ENV}（两条路径都靠同一个字面名）",
+           not injectors,
+           f"这些地方开始注入它了：{injectors} —— 要注入就必须**两条路径一起**注入同一个值，"
+           "并同时改共享授权与那三份清理清单")
+
+    # ── 2) 授权只有一份，两条路径都从共享构件拿 ──
+    for rel, src in ((ONECLICK, oneclick), (WEB_CHAT_SETUP_STACK, setup_webchat)):
+        _check(f"{os.path.basename(rel)} 走的是同一个 createWebChatCore（授权由它给）",
+               "createWebChatCore(" in src,
+               "绕过共享构件自己建 BFF = 这条授权只在一条路径上存在，"
+               "而症状是那条路径的「多云」页存不进去（AccessDenied）")
+        _check(f"{os.path.basename(rel)} 没有自己的阿里云 secret 授权",
+               "AliyunCredentialsSecretAccess" not in src,
+               "授权被抄回栈里了 —— 抄一份的代价是以后改动作/改名字只在一条路径上生效")
+
+    grant = _aliyun_grant_body()
+    granted = set(_ACTION_RE.findall(grant))
+    missing = [a for a in ALIYUN_GRANT_MUST if not _covers(granted, a)]
+    _check("共享授权覆盖了 BFF 真正会调的那几个动作", not missing,
+           f"少了 {missing}（实际给的是 {sorted(granted)}）。"
+           "CreateSecret / TagResource 少了是**方式 A 专属**的坏法：模板不预建 secret，"
+           "客户第一次点保存就 AccessDenied（强制标签规则要求 CreateSecret 带 Tags）")
+    _check("授权的 resources 由那份名字清单算出来（不是另写一遍 ARN）",
+           re.search(r"resources:\s*aliyunSecretNames\.map\(", grant) is not None,
+           "手写 ARN = 名字在这里又多了一份副本，改名时漏掉它不会有任何报错")
+    # 通配可以从两个地方溜进来：写在这条语句里，或者混进那份名字清单（清单里的名字
+    # 会被 .map() 拼进 ARN，`notiops/*` 一样生效）—— 两边都要看。
+    _check("授权没有退化成通配（既不在语句里，也不在那份名字清单里）",
+           "notiops/*" not in grant and not any("*" in n for n in names),
+           f"清单是 {names}。通配会把本部署里所有 notiops secret（Bedrock API key、"
+           "IM 凭证）一并交给 BFF 改写 —— 爆炸半径与「多云」这一页完全不相称")
+
+    # ── 3) 方式 B 预建这个 secret，用的是同一个名字 ──
+    # 「预建」本身是登记过的**有意差异**（见本节头部）：它是方式 B 能把凭据卸载干净的
+    # 前提（tests/test_teardown_secrets.py 双向卡着 CDK 与 teardown.sh）。
+    m = re.search(r'new secretsmanager\.Secret\(this, "AliyunCredentialsSecret",'
+                  r'[\s\S]{0,400}?secretName:\s*"([^"]+)"', backend)
+    _check("方式 B 预建的 secret 用的是同一个名字",
+           m is not None and m.group(1) == name,
+           f"方式 B 建的是 {m.group(1)!r}，其余四处用的是 {name!r}"
+           if m else f"{SETUP_BACKEND} 里找不到带字面 secretName 的 AliyunCredentialsSecret")
+    # 有意差异的另一半：方式 A **不**预建它。这条不是"方式 A 该补上"，而是"补上就要
+    # 同时改掉本节的登记与那两份清理清单的理由"，所以让它在这里现形。
+    _check("方式 A 仍然不预建凭据资源（BFF 首次保存时 CreateSecret）",
+           "new secretsmanager.Secret(" not in oneclick,
+           "一键模板开始预建 secret 了 —— 那么本节头部登记的那条有意差异、"
+           "以及那两份「栈外 secret」清理清单的理由都要重写（CFN 会自己删它，"
+           "但只是排进 7-30 天恢复期，StagerFn 那一发补删仍然需要）")
+
+    # ── 4) 方式 A 的两份清单（tests/test_teardown_secrets.py 覆盖不到的那半边）──
+    lists = _oneclick_external_secret_lists()
+    for key in sorted(lists):
+        _check(f"方式 A 的 {key} 里有 {name}", name in lists[key],
+               f"实际清单是 {lists[key]}。缺它 = 卸载留下一个装着客户 AK/SK 的孤儿 secret，"
+               "而且名字被恢复期占着，客户重装后第一次保存就 "
+               "`already scheduled for deletion`")
+    a, b = set(lists["TeardownDeleteOwnSecrets"]), set(lists["SecretNames"])
+    _check("方式 A 的两份栈外 secret 清单逐项相等", a == b,
+           f"只在删栈授权里：{sorted(a - b)}；只在 SecretNames 里：{sorted(b - a)} —— "
+           "前者是「有权删但没人点名」（白给权限），后者是「点名了但删不动」"
+           "（DeleteSecret AccessDenied → 自定义资源 Delete 失败 → 整个栈删不掉）")
+
+    # ── 5) 方式 B 的清理清单里是**同一个字符串** ──
+    # 只比这一个名字：「CDK 的 DESTROY 集合 == SECRETS」那条双向判据在
+    # tests/test_teardown_secrets.py 里，这里重复一遍只会多一处要同步的地方。
+    _check(f"{TEARDOWN_SH} 的 SECRETS 里是同一个字符串", name in _teardown_secrets_list(),
+           f"方式 B 的补删清单里没有 {name!r}（集合完整性由 "
+           "tests/test_teardown_secrets.py 双向卡着，这里只对名字本身）")
+
+    # ── 6) 来源必须是同一种：两条路径都是写死的字面量 ──
+    # 上面第 1/3/4 条已经隐含"取到了字面量"，这一条正面拦住"只给一条路径加可配性"：
+    # 方式 A 加个 CfnParameter、方式 B 不加（或反过来），两条路径的 secret 名就此分叉，
+    # 而共享授权只认其中一种写法。
+    _check("方式 A 没有把这个 secret 名做成 CfnParameter",
+           re.search(r'new cdk\.CfnParameter\(this, "[^"]*[Aa]liyun', oneclick) is None,
+           "要让名字可配就得**两条路径一起**可配（方式 A 参数 + 方式 B context），"
+           "并把共享授权、那三份清理清单、BFF 的回落值一起接上")
+    for rel, src in ((WEB_CHAT_CORE_TS, core), (SETUP_BACKEND, backend),
+                     (WEB_CHAT_SETUP_STACK, setup_webchat)):
+        _check(f"{os.path.basename(rel)} 没有把这个 secret 名做成 -c 可配",
+               re.search(r"""tryGetContext\(\s*['"][^'"]*[Aa]liyun""", src) is None,
+               "同上：只有方式 B 可配 = 客户改了名字之后，方式 A 的清理清单指向的还是旧名")
+
+
+def _dimensions_called_in_main() -> set[str]:
+    """从本文件自己的 AST 里取出 `main()` 真正调用的那些 `test_*`。
+
+    为什么要绕一圈读自己：**只 def 不调用的维度在 CI 里一次都不跑，却长得跟跑过一样**。
+    本文件全部的价值就是"这件事有人守着"，一个没接线的维度比没有这个维度更坏 ——
+    它还额外骗走了别人再看一眼的机会。2026-09-12 加第十二维时正好是「12 个 def /
+    11 个调用」这个状态，所以这条自检不是假想的。
+
+    ⚠️ 与此配套，`main()` 里故意保持**一行一个直接调用**（而不是收进一张表再 for
+       循环）：外部的维度个数自检是用文本方式数那种行的
+       （`awk '/^def main\\(/,0' … | grep -c '^ *test_.*()$'`）。改成表驱动会让那条
+       自检恒数到 0 —— 用一处静默失效换来的"优雅"。
+    """
+    with open(__file__, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "main":
+            return {
+                n.func.id for n in ast.walk(node)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id.startswith("test_")
+            }
+    raise AssertionError("本文件里找不到 main() —— 这条自检的解析器要跟着改")
+
+
 def main() -> int:
     print("=" * 72)
     print("方式 A（一键部署）与方式 B（setup.sh）的 web 功能一致性")
+    # 维度总数**算出来**，不写死：写死的数字一定会和现实分叉，而分叉方向永远是
+    # 「清单说有 N 个、实际跑了 N-1 个」。
+    declared = {name for name in globals() if name.startswith("test_")}
+    called = _dimensions_called_in_main()
+    print(f"共 {len(declared)} 个维度")
     print("=" * 72)
+    _check("每个 test_* 维度都接进了 main()", declared == called,
+           f"定义了但没人调用：{sorted(declared - called)}；"
+           f"调用了但没定义：{sorted(called - declared)}。"
+           "前者是**静默不跑**（CI 全绿，而那一维实际没人守）；"
+           "后者会在下面直接 NameError")
     try:
         test_runtime_role_grants_match()
         test_runtime_env_keys_match()
@@ -1586,6 +1909,7 @@ def main() -> int:
         test_first_login_handoff_parity()
         test_cur_dashboard_parity()
         test_devops_callback_parity()
+        test_aliyun_credentials_parity()
     except AssertionError as e:
         # 提取器找不到目标 = 有人改了源码的形态。必须失败而不是静默通过 ——
         # 静默通过的断言比没有断言更糟：它让人以为这件事有人守着。

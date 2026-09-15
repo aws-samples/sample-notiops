@@ -37,6 +37,7 @@ from core import im_prefs
 from core import llm_pref_resolver
 from core import locale_resolver
 from core import model_catalog
+from core import starops_chat
 from platforms.common import (ack_variants, chat_lease, live_card, long_answer,
                               pref_commands)
 from platforms.common.im_types import Caps, ImMessage
@@ -67,9 +68,11 @@ class FeishuCaps(Caps):
         标题进 header，正文（intro + 每行命令 + footer）进 markdown 元素。
         这条同样适用于以后任何带 `**` / 反引号的 i18n 文案。
         """
-        from core import nl_router
+        from core import multicloud, nl_router
+        # `multicloud.help_row_key` = 「这一行发哪份文案」。当前 `/agent` 那行不列
+        # starops（产品决策，见 `core/multicloud.py`）；其余 feature 原样返回基线 key。
         rows = "\n".join(
-            i18n.t(f"help.row.{feat}", msg.locale)
+            i18n.t(multicloud.help_row_key(feat), msg.locale)
             for feat, _en, _zh in nl_router.HELP_COMMANDS
         )
         body = (f"{i18n.t('help.intro', msg.locale)}\n\n{rows}\n\n"
@@ -156,7 +159,7 @@ class FeishuCaps(Caps):
         self.reply_text(msg, i18n.t(key, msg.locale, label=entry.label))
 
     def agent(self, msg: ImMessage, arg: str) -> None:
-        """`/agent [notiops|devops|default]` —— 这个会话的对话由谁答（0 token）。
+        """`/agent [notiops|devops|starops|default]` —— 这个会话的对话由谁答（0 token）。
 
         逻辑与文案全在 `platforms.common.pref_commands`：这两条命令没有任何平台差异，
         两边各写一遍必然漂移（见那个模块的文件头）。
@@ -379,7 +382,7 @@ class FeishuCaps(Caps):
                                         kind=type(e).__name__))
 
     def chat(self, msg: ImMessage, text: str) -> None:
-        """对话问答 —— **两条路，同一张卡**。由 `/agent` 开关（`core.im_prefs`）决定：
+        """对话问答 —— **三条路，同一张卡**。由 `/agent` 开关（`core.im_prefs`）决定：
 
           · `devops`（默认）→ `core.devops_chat.run_devops_chat`，客户 DevOps Agent
             直答，**NotiOps 侧 0 token**。多轮上下文靠 `imchat#<chat_id>` 存的
@@ -388,10 +391,14 @@ class FeishuCaps(Caps):
             **会消耗 token**。多轮上下文靠 `imagent#<chat_id>` 存的 runtime session id
             （6 小时轮换，因为 AgentCore 的 `maxLifetime` 是 8 小时而 IM 的 chat_id 是
             永久的 —— 详见 `core.ddb_state.im_agent_session_id`）。
+          · `starops` → `core.starops_chat.run_starops_chat`，直连**阿里云** STAROps
+            数字员工，**NotiOps 侧 0 token**（烧客户自己的阿里云 AI 额度）。多轮上下文
+            靠 `imsochat#<chat_id>` 存的 `thread_id`。2026-09-14 加。
 
-        ⚠️ 分流**只影响三件事**：ack 文案用哪一套、调哪个 runner、卡片上 `agent=` /
-        `sources=` / `usage=` 三个参数。排队/心跳/终版/截断落报告/兜底全部共用下面这一份
-        —— 两条路各写一遍 `chat()` 是这个文件最容易长出漂移的地方。
+        ⚠️ 分流**只影响四件事**：ack 文案用哪一套、读哪一行会话、调哪个 runner、卡片上
+        `agent=` / `sources=` / `usage=` / `employee=` 那几个参数。排队/心跳/终版/截断落
+        报告/兜底全部共用下面这一份 —— 每条路各写一遍 `chat()` 是这个文件最容易长出漂移
+        的地方（三家平台 × 三条路 = 九份，指望它们不漂是不现实的）。
 
         答案发**卡片**而不是文本：要有状态标题（排队中/思考中/答完 + 计时）、过程行、
         正文超长时的「查看完整报告」外链。纯文本这三样一样都做不到。
@@ -423,20 +430,31 @@ class FeishuCaps(Caps):
             platform=PLATFORM, chat_id=msg.chat_id, user_id=msg.user_id,
             is_dm=msg.is_direct)
         notiops = agent == im_prefs.AGENT_NOTIOPS
+        starops = agent == im_prefs.AGENT_STAROPS
 
         # 卡片落款里的账号那一段（多账号，2026-09-07）。**这一轮只解析一次**：
         # org 模式下 `deploy_account_id()` 底下是 STS，而落款会被 `LiveCard.flush`
         # 每几秒渲染一次（`core.im_accounts` 那边还加了容器级缓存兜第二层）。
+        # ⚠️ STAROps 那条路上这个值**不会显示**（换成数字员工 ID，见 `im_footer` 的 🔴），
+        #    但照旧解析：互斥判断只在 `im_footer` 一处，这里不重复一遍那个 if。
         deploy_acct = im_accounts.deploy_account_id()
 
-        # 群会话按 chat 归属（§15：一个 chat 一个会话，不按用户拆）
-        session = ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
+        # 群会话按 chat 归属（§15：一个 chat 一个会话，不按用户拆）。
+        # 会话行按路分段：devops 用 `imchat#`、starops 用 `imsochat#`（notiops 那条不读
+        # 这一行 —— 它的连续性在 `imagent#` 那行的 session id 上）。用闭包读是因为
+        # 「排队转正」之后还要重读一次，两处各写一遍 `if starops` 就是漂移的起点。
+        def _load_session() -> dict:
+            if starops:
+                return ddb_state.get_im_starops_session(PLATFORM, msg.chat_id) or {}
+            return ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
+
+        session = _load_session()
         question = (text or msg.text or "").strip()
 
-        # 来源 / 用量要等这一轮跑完才知道，而 `LiveCard` 的 `render` 回调只透传五个
-        # 固定 kwarg（body/steps/state/elapsed/report_url）。所以放一个可变盒子让
-        # `render=` 的闭包读 —— 终版之前填好，`finish()` 那一刷就带上了。
-        extra: dict = {"sources": [], "usage": {}}
+        # 来源 / 用量 / 数字员工 ID 要等这一轮跑完才知道，而 `LiveCard` 的 `render` 回调
+        # 只透传五个固定 kwarg（body/steps/state/elapsed/report_url）。所以放一个可变盒子
+        # 让 `render=` 的闭包读 —— 终版之前填好，`finish()` 那一刷就带上了。
+        extra: dict = {"sources": [], "usage": {}, "employee": ""}
 
         # 第 0 步：抢这个会话的"轮次"。`acquire()` 不阻塞 —— 先把卡发出去再等，
         # 否则用户在排队的那几分钟里一个字都看不到（正是本次要修的那种体验）。
@@ -469,7 +487,8 @@ class FeishuCaps(Caps):
                     steps=kw["steps"], state=kw["state"], elapsed=kw["elapsed"],
                     report_url=kw["report_url"],
                     agent=agent, sources=extra["sources"], usage=extra["usage"],
-                    account=msg.account_id, deploy=deploy_acct),
+                    account=msg.account_id, deploy=deploy_acct,
+                    employee=extra["employee"]),
                 update=lambda payload: feishu_utils.update_card(
                     card_message_id, payload),
             )
@@ -498,8 +517,8 @@ class FeishuCaps(Caps):
                         ack_seed, msg.locale, agent, platform=PLATFORM))
                     live.set_state("thinking")
                     live.flush(force=True)
-                # 前一轮很可能刚写过 execution_id，重新读一遍才是最新的上下文。
-                session = ddb_state.get_im_chat_session(PLATFORM, msg.chat_id) or {}
+                # 前一轮很可能刚写过 execution_id / thread_id，重新读一遍才是最新的上下文。
+                session = _load_session()
 
             # 第 3 步：跑，并把过程实时刷回那张卡。
             if notiops:
@@ -528,6 +547,29 @@ class FeishuCaps(Caps):
                 extra["usage"] = result.get("usage") or {}
                 # 这条路**不写 `imchat#`**：会话连续性由 `imagent#` 那行的 session id
                 # 负责，而它的轮换逻辑整个在 `ddb_state.im_agent_session_id` 里面。
+            elif starops:
+                # 直连阿里云 STAROps 数字员工。**NotiOps 侧 0 token**（`usage` 恒为
+                # `{"totalTokens": 0, ...}`），但这一轮烧的是客户自己的阿里云 AI 额度。
+                # ⚠️ `text` 是**位置参数** —— 与上面那支 `run_devops_chat(text=…)` 的签名
+                #    刻意不同，照抄会 TypeError（见 `core/starops_chat.py` 的 docstring）。
+                result = starops_chat.run_starops_chat(
+                    question, locale=msg.locale,
+                    session=session,
+                    emit=(live.emit if live is not None else None),
+                )
+                # 填盒子：落款上「哪个数字员工答的」那一位（必须在 `finish()` 之前）。
+                # 它**替代** AWS 账号那一段 —— 互斥判断在 `im_footer` 一处，这里只管给值。
+                extra["employee"] = str(result.get("employee") or "")
+                # 持久化下一轮的 threadId。
+                # ⚠️ 判断顺序与上面 devops 那支**相反**：`run_starops_chat` 在
+                #    `reset_session=True` 时**照样带着那个已经死掉的 thread_id 返回**
+                #    （`sess_out()` 无条件构造）。先判 thread_id 就会把死 thread 存回去、
+                #    下一轮原样复用、原样再坏一次 —— 正是 `reset_session` 要避免的事。
+                sess = result.get("session") or {}
+                if result.get("reset_session"):
+                    ddb_state.clear_im_starops_session(PLATFORM, msg.chat_id)
+                elif sess.get("thread_id"):
+                    ddb_state.put_im_starops_session(PLATFORM, msg.chat_id, sess)
             else:
                 result = devops_chat.run_devops_chat(
                     text=question, locale=msg.locale,
@@ -572,7 +614,8 @@ class FeishuCaps(Caps):
         card = im_cards.answer_card(body, msg.locale, report_url=report_url,
                                    agent=agent, sources=extra["sources"],
                                    usage=extra["usage"],
-                                   account=msg.account_id, deploy=deploy_acct)
+                                   account=msg.account_id, deploy=deploy_acct,
+                                   employee=extra["employee"])
         resp = feishu_utils.send_card(msg.chat_id, card)
         if not im_cards.message_id_of(resp):
             # 退纯文本丢的只是卡片外观（状态标题 / 过程行 / 报告按钮）。
@@ -583,4 +626,5 @@ class FeishuCaps(Caps):
                          (resp or {}).get("code"))
             self.reply_text(msg, body + "\n\n" + im_cards.usage_footer(
                 msg.locale, agent=agent, usage=extra["usage"],
-                account=msg.account_id, deploy=deploy_acct))
+                account=msg.account_id, deploy=deploy_acct,
+                employee=extra["employee"]))

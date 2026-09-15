@@ -40,14 +40,14 @@
 不用跑 CLI，两条部署路径（方式 A / 方式 B）都一样。地址由后端按名字查 IM 入口的
 HTTP API 得到，所以栈名叫什么都不影响。
 
-> **这一页覆盖飞书和钉钉两个平台**（各有独立的分页和抽屉，取到的是各自那个入口的地址）。
-> **Slack 的地址目前只在 Outputs 里。**
+> **这一页覆盖飞书 / 钉钉 / Slack 三个平台**（各有独立的分页和抽屉，取到的是各自那个入口的
+> 地址；Slack 分页 2026-09-11 起有）。
 >
 > 抽屉里那一块显示「取不到地址」时，说明这个部署没装这个平台（比如只装了 `web`、
 > 或者只装了飞书而你在看钉钉那页），或者查询没有权限 —— 退回下面的 CLI / Outputs
 > 取法即可，两处是同一个值。
 
-下面是 CLI 取法（脚本部署、自动化、以及 Slack 都用这个）。`ImStack` 部署完会按装了哪些平台输出对应的 CfnOutput：
+下面是 CLI 取法（脚本部署、自动化用这个）。`ImStack` 部署完会按装了哪些平台输出对应的 CfnOutput：
 
 ```bash
 aws cloudformation describe-stacks --stack-name ImStack --region <REGION> \
@@ -78,8 +78,8 @@ ingress 按请求体自己分流，不靠路径区分 —— 所以地址后面*
 >   OutputKey 一模一样，另外还多一个 `ImNextSteps` 告诉你还差哪一步。
 > - **secret 名字完全一致**（`notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` /
 >   `notiops/slack-bot-token` / `notiops/slack-signing-secret`），本文所有命令原样可用。
-> - **Slack 那两个 secret 要你手建**（`aws secretsmanager create-secret`，见 §2.2）——
->   模板不建 secret；**飞书和钉钉**那两个在管理控制台「集成 IM」页保存凭证时会由后端自动创建。
+> - **模板不建任何 secret** —— 三个平台的 secret 都是你在管理控制台「集成 IM」页保存凭证时
+>   由后端按需创建的（Slack 分页也一样，2026-09-11 起；在那之前 Slack 那两个要手建）。
 > - **安装选项必须包含你要配的那个平台**：只装 `web` 的栈没有这个 HTTP API，
 >   Outputs 里也不会出现 `FeishuWebhookUrl` / `SlackWebhookUrl` / `DingtalkWebhookUrl`。
 >   ⚠️ **一次只能选一个 IM 平台** —— `web+feishu` / `web+slack` / `web+dingtalk` 是互斥的
@@ -310,7 +310,25 @@ NotiOps 取的是**该 thread 的父消息**（`conversations.replies`，只取�
 > ⚠️ **不要开 Socket Mode**。Socket Mode 与 webhook 互斥，开了 Slack 就不再往
 > Request URL 发请求。也不需要 App-Level Token（`xapp-...`）—— 那是长连接时代的东西。
 
-### 2.2 两个 Secret
+### 2.2 两个凭证
+
+**推荐做法（不需要任何 AWS 权限，全在浏览器里）**：登录 Web Chat →
+**管理控制台 → 集成 IM → Slack 分页**，填两个框然后保存：
+
+| 框 | 从哪拿 | 形状 |
+|---|---|---|
+| **Bot User OAuth Token** | OAuth & Permissions 页 | `xoxb-` 开头 |
+| **Signing Secret** | Basic Information → App Credentials | 32 位十六进制 |
+
+那一页右上角「查看详细配置步骤」把本节 §2.1~§2.5 的内容原样内置了一份。
+保存成功后点 **「测试凭证」**，它会调 `auth.test` 把 workspace 名 / bot 名报回来，
+并且把**缺的 Bot Token Scopes 逐条列出来**（从 `X-OAuth-Scopes` 响应头算的）。
+
+> ⚠️ 「测试凭证」**只验 bot token**。Slack **没有任何 API 能验 signing secret** ——
+> 它唯一的验证方式就是 §2.3 里在 Slack 保存 Request URL（那一刻 Slack 会发
+> `url_verification`，签名不对就 401）。所以按钮显示成功 ≠ signing secret 是对的。
+
+**等价的 CLI 做法**（你有 AWS 权限、或者想脚本化时）：
 
 ```bash
 # Bot Token（OAuth & Permissions 页，xoxb- 开头）
@@ -322,25 +340,35 @@ aws secretsmanager put-secret-value --secret-id notiops/slack-signing-secret \
   --region <REGION> --secret-string '<signing secret>'
 ```
 
-两条**必读的前置**：
+四条**必读的前置**：
 
-1. **`notiops/slack-signing-secret` 由 `NotiOpsBackendStack`（主栈）创建**，不是 `ImStack`。
-   如果你是从 Socket Mode 升级上来的老部署，这个 Secret 原来不存在（Socket Mode 由
-   App Token 鉴权，用不到它）—— 光部 `ImStack` 不够，得先把主栈部一次，
+1. 两个 Secret 存的都是**纯字符串**，不是 JSON。数据面（`platforms/slack/caps.py`）直接把整个
+   `SecretString` 当值用，**没有 `json.loads`** —— 写成 `{"bot_token":"xoxb-..."}` 会把这一整坨
+   当 token 发给 Slack，结果是 `invalid_auth`，而管理页看起来一切正常。走网页保存不会踩这个坑
+   （后端只写纯字符串）。
+
+2. **方式 B（`setup.sh`）里 `notiops/slack-signing-secret` 由 `NotiOpsBackendStack`（主栈）
+   创建**，不是 `ImStack`。如果你是从 Socket Mode 升级上来的老部署，这个 Secret 原来不存在
+   （Socket Mode 由 App Token 鉴权，用不到它）—— 光部 `ImStack` 不够，得先把主栈部一次，
    否则 `put-secret-value` 直接 `ResourceNotFoundException`。
+   **方式 A（一键）根本不建 secret**，两个都由网页保存时创建 —— 所以方式 A 只能走网页那条路
+   （或者自己 `aws secretsmanager create-secret`）。
 
-2. ⚠️ **这两个 Secret 不是空的，是 CDK 生成的随机串。** CDK 的
+3. ⚠️ **方式 B 建出来的这两个 Secret 不是空的，是 CDK 生成的随机串。** CDK 的
    `new secretsmanager.Secret(...)` 不给 `secretStringValue` 时会让 Secrets Manager
    **随机生成**一个值（不是空串）。后果：忘了填不会报「secret 为空」，而是表现成
    「密钥不对」——
    - bot token 没填 → Slack 返回 `invalid_auth`，bot 一句话都发不出；
    - signing secret 没填 → 每个请求验签失败 401，Slack 那边显示 URL 校验不通过。
 
-   判断填过没有（不打印值）：`LastChangedDate` 明显晚于 `CreatedDate` 才算填过。
-   ```bash
-   aws secretsmanager describe-secret --secret-id notiops/slack-signing-secret \
-     --region <REGION> --query '{Created:CreatedDate,LastChanged:LastChangedDate}'
-   ```
+   **判断填过没有：看管理页 Slack 分页的「已配置」徽标。** 它是按**值的形状**判断的
+   （`xoxb-` 前缀 / 十六进制串），随机占位值两条都不满足，所以只会显示「未配置」。
+   *不要*用 `LastChangedDate` 晚于 `CreatedDate` 来判断 —— 一次纯改 tag 的重新部署也会
+   把 `LastChangedDate` 推后，那样会把「没填」误读成「填过了」。
+
+4. 改完凭证后：ingress Lambda 是在**模块加载时**（冷启动）读 signing secret 的，
+   **还活着的执行环境会继续用旧值**。网页保存成功后的提示里也写了这一点。等旧环境自然回收，
+   或者改一下 ingress 的环境变量强制换一批 —— 见 [DEPLOYMENT.md](DEPLOYMENT.md) §8.2。
 
 ### 2.3 三处 Request URL —— 全填同一个
 

@@ -23,7 +23,6 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import { CostAndUsageReportServiceClient, DescribeReportDefinitionsCommand } from "@aws-sdk/client-cost-and-usage-report-service";
 import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
-import { getEdpCommitmentMock } from "./edp_mock.mjs";
 import { getDailyAnomalies } from "./daily_anomaly.mjs";
 import { getPotentialSavings } from "./potential_savings.mjs";
 import { getCostExplorerDashboard, currentPayerAccountId, setAccountScope, listCostAllocationTagKeys, listCostAllocationTagValues, getCostByTag } from "./cost_explorer.mjs";
@@ -446,8 +445,6 @@ export async function devOpsAgentCostSummary(curStatus) {
  * 新增（cost_executive_summary_dashboard_template.html 布局对齐）：
  *   - costExplorer: Spend Overview（6月趋势）+ Marketplace + Support + MoM Movers
  *     （固定查询模板，见 cost_explorer.mjs，与 LLM 无关，口径每次一致）
- *   - edpCommitment: EDP 承诺达成率 —— demo mock 数据（见 edp_mock.mjs 头部注释，
- *     计算口径复刻自 TAM 团队现有 EDP 追踪脚本，真实客户接入时换数据源不换公式）
  */
 /* ───────────────── Cost Deep Dive（option 2：BFF 跑 Athena Named Query → grounded rows → Bedrock 出 insight/chart）───────────────── */
 // 场景 → Athena 保存查询名（SQL 单一真源在 Athena，可在控制台改）
@@ -676,17 +673,16 @@ export async function getFinopsDashboard(accountId, { visible = null } = {}) {
   if (curStatus.status === "READY") {
     devOpsAgentCost = await devOpsAgentCostSummary(curStatus);
   }
-  const edpCommitment = getEdpCommitmentMock();
   // 透明度：告诉前端这些数字实际来自哪个账号（动态发现的 payer，还是回退到部署
   // 账号自身视角）——避免用户看到数字却不知道口径，见之前"<deployment-account> 的成本
   // 为什么没出现"的排查过程。
   const costDataSourceAccountId = currentPayerAccountId() || (await _accountId());
   return {
-    budgetAlerts, curStatus, devOpsAgentCost, costExplorer, edpCommitment, potentialSavings, costDataSourceAccountId,
+    budgetAlerts, curStatus, devOpsAgentCost, costExplorer, potentialSavings, costDataSourceAccountId,
     dailyAnomaly,
     accountScope: String(accountId || ""),
     // ⚠️ `dailyAnomaly` 不在 orgOnlySections：它的行带 account_id，
     //    选中成员账号时按账号过滤，是真的账号级口径。
-    orgOnlySections: ["budgetAlerts", "potentialSavings", "devOpsAgentCost", "edpCommitment", "anomalies", "coverage"],
+    orgOnlySections: ["budgetAlerts", "potentialSavings", "devOpsAgentCost", "anomalies", "coverage"],
   };
 }

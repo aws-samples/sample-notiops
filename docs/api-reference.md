@@ -14,7 +14,7 @@ NotiOps **没有 API Gateway REST API**。可达的接口面一共三处，另�
 | # | 接口面 | 载体 | 调用方 | 鉴权 |
 |---|---|---|---|---|
 | 1 | Web Chat BFF | **Lambda Function URL**（响应流式），函数 `notiops-web-chat-bff` | 浏览器里的 `frontend/chat-app` | Function URL `AuthType=AWS_IAM`（SigV4）**＋** Cognito id token，两道都必须过 |
-| 2 | IM Webhook | **API Gateway HTTP API** + ingress Lambda，每个启用的平台一个 | 飞书 / Slack 平台侧回调 | API Gateway 层不鉴权；签名 / 加密校验在 ingress Lambda 内 |
+| 2 | IM Webhook | **API Gateway HTTP API** + ingress Lambda，每个启用的平台一个 | 飞书 / Slack / 钉钉平台侧回调 | API Gateway 层不鉴权；签名 / 加密校验在 ingress Lambda 内 |
 | 3 | Agent Runtime | Bedrock AgentCore `InvokeAgentRuntime` | 仅 BFF，不对外暴露 | IAM |
 | 4 | CUR 看板预热 | EventBridge cron → 直接 invoke BFF 函数 | EventBridge | IAM（不经 Function URL） |
 | 5 | DevOps Agent 调查回调 | EventBridge 事件（`source = aws.aidevops`）→ `notiops-devops-callback` | AWS DevOps Agent | IAM（不是 HTTP webhook） |
@@ -245,7 +245,7 @@ CloudFront Function 把其它前缀一律 403）。
 
 ---
 
-## 2. IM Webhook（飞书 / Slack）
+## 2. IM Webhook（飞书 / Slack / 钉钉）
 
 每个启用的平台建一个 **API Gateway HTTP API**，`$default` 路由 catch-all 打到该平台的
 ingress Lambda（定义在 `infra/lib/constructs/im-core.ts`）：
@@ -254,6 +254,7 @@ ingress Lambda（定义在 `infra/lib/constructs/im-core.ts`）：
 |---|---|---|
 | 飞书 | `FeishuWebhookUrl` | `https://<id>.execute-api.<region>.amazonaws.com/` |
 | Slack | `SlackWebhookUrl` | 同上 |
+| 钉钉 | `DingtalkWebhookUrl` | 同上 |
 
 - **catch-all 是刻意的**：飞书的「事件订阅」与「卡片回调」、Slack 的 Events API /
   Interactivity / Slash commands 都填**同一个地址**，路径由平台自己决定，
@@ -271,15 +272,25 @@ ingress Lambda（定义在 `infra/lib/constructs/im-core.ts`）：
   （飞书的 `card.action.trigger` 还没有「再点一次」这个补救动作），而 ingress 冷启动会撞穿
   10s init 上限、端到端落到 ~22s（`im-core.ts` 里记着 2026-09-03 的实测值）。因此
   **每个启用的平台各有一条** EventBridge `rate(4 minutes)` 保活规则常驻打它自己的 ingress
-  （`FeishuIngressKeepAlive` / `SlackIngressKeepAlive`）。
-  progress 则是**两个平台共用一个** `ImProgress` 函数 + 一条 `rate(1 minute)` 规则
-  （`ImProgressSchedule`），扫 `imtask#` 行、增量 PATCH 进度卡片。
+  （`FeishuIngressKeepAlive` / `SlackIngressKeepAlive` / `DingtalkIngressKeepAlive`，
+  刻意不是一条规则挂多个 target）。
+  progress 则是**飞书与 Slack 共用一个** `ImProgress` 函数 + 一条 `rate(1 minute)` 规则
+  （`ImProgressSchedule`），扫 `imtask#` 行、增量 PATCH 进度卡片；**钉钉不在这个门里**
+  —— 它发出去的消息改不了、压根不写 `imtask#` 行，进度由 worker 自己以追加消息的形式发出
+  （`platforms/dingtalk/append_progress.py`），所以只装钉钉时 `ImProgress` 根本不创建
+  （`im-core.ts` 那个 `if (feishu || slack)` 门）。
 - 平台控制台里具体填什么：[IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md)
   （English: [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md)）；
   交互形式见 [im-bot-interaction.md](im-bot-interaction.md)。
 
-钉钉走的是长连接（Fargate 常驻），**没有** webhook 入口；承载它的 `BotStack` 已于
-IM 重构 M2 退役、不再实例化（`infra/bin/app.ts`）。当前 IM 侧只有 webhook 这一条路径。
+钉钉与飞书 / Slack 是**同一个 webhook 形态**：自己的 API Gateway HTTP API（栈输出
+`DingtalkWebhookUrl`）+ `platforms/dingtalk/lambda_ingress.py` 验签去重后异步交给 worker。
+验签基串是 `f"{timestamp}\n{appSecret}"`（**不含 body**，只防伪造来源），`timestamp` 是**毫秒**、
+窗口按官方口径取 1 小时，`app_secret` 冷启动读不到就 crash；失败同样是 **401 空 body**。
+⚠️ 钉钉控制台的「消息接收模式」**默认是 Stream 模式，必须手动改成 HTTP 模式**再填这个地址：
+钉钉保存回调地址时不做任何校验，留在 Stream 模式的表现就是钉钉永远不 POST、bot 静默不回话。
+承载旧长连接形态的 `BotStack` 已于 IM 重构 M2（2026-09-03）退役、不再实例化（`infra/bin/app.ts`），
+当前 IM 侧只有 webhook 这一条路径。
 
 ---
 
@@ -328,17 +339,17 @@ IM 重构 M2 退役、不再实例化（`infra/bin/app.ts`）。当前 IM 侧只
 
 | 维度 | 方式 A | 方式 B |
 |---|---|---|
-| IM 平台开关 | 部署期 `CfnCondition`：`InstallOption` 参数**三选一**（`web` / `web+feishu` / `web+slack`） | 合成期布尔：`-c enabledPlatforms=…`（逗号分隔，**可以是 `feishu,slack`**） |
+| IM 平台开关 | 部署期 `CfnCondition`：`InstallOption` 参数**四选一**（`web` / `web+feishu` / `web+slack` / `web+dingtalk`） | 合成期布尔：`-c enabledPlatforms=…`（逗号分隔，**可以是 `feishu,slack,dingtalk`**） |
 | IM / 回调 Lambda 物理名 | 带 `${AWS::StackName}-` 前缀（同账号可与 setup.sh 部署共存） | 写死 `notiops-im-*` / `notiops-devops-callback` |
 | 栈输出 | **不输出** `ChatBffUrl` —— 客户不需要它，前端自己从 `config.json` 的 `chatApiBase` 读同一个值，手点它只会 403 | 输出 `ChatBffUrl`，给运维排障用 |
 | DevOps 回调的事件总线 | **只有 default bus 那一条规则**（`DevOpsCallbackDefaultRule`），不建 custom bus | default bus **加** custom bus `notiops-devops-events` 两条规则 |
 
 BFF 函数名两条路径都是 `notiops-web-chat-bff`；`ChatUrl`（Web Chat 前端地址）两条路径都输出。
 
-第一行那个「三选一」有一处真实后果，写清楚而不是含糊过去：**方式 A 的一个栈里最多只有
-一个 IM 平台的 HTTP API** —— 想让飞书和 Slack 同时在线，只能走方式 B
-（`-c enabledPlatforms=feishu,slack`）。这**不是**「某条路由只有一边有」：两个平台的
-ingress 与 webhook 定义都在 `im-core.ts` 里逐字同源，差的只是一次部署能不能把两套一起建。
+第一行那个「四选一」有一处真实后果，写清楚而不是含糊过去：**方式 A 的一个栈里最多只有
+一个 IM 平台的 HTTP API** —— 想让其中两家（或三家）同时在线，只能走方式 B
+（`-c enabledPlatforms=feishu,slack,dingtalk`）。这**不是**「某条路由只有一边有」：三个平台的
+ingress 与 webhook 定义都在 `im-core.ts` 里逐字同源，差的只是一次部署能不能把几套一起建。
 方式 A 事后换平台的代价见 [DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md) §2.11
 （`web+feishu` → `web+slack` 会删掉飞书那套，HTTP API 地址不保留，得回飞书后台重填）。
 

@@ -169,7 +169,7 @@ detect_stackset_call_as
 #    tests/test_teardown_retained_tables.py 把两边钉在一起，加表先加那边判据。
 TABLES_RETAINED=("notiops-config" "notiops-conversations" "notiops-web-chat" "notiops-inspection")
 # ⚠️ 这个清单必须与 CDK 里 `new secretsmanager.Secret` 建的**每一个** secret 一一对应
-#    （现在是七个，全都 RemovalPolicy.DESTROY，见 infra/lib/notiops-backend-stack.ts）。
+#    （现在是八个，全都 RemovalPolicy.DESTROY，见 infra/lib/notiops-backend-stack.ts）。
 #    少一个的后果不是「少删一个」，而是**下次装不上**：CFN 删 secret 只是把它排进
 #    7-30 天恢复期，名字仍然被占着 —— 重装时同名 CreateSecret 直接
 #    `InvalidRequestException: ... already scheduled for deletion` → 主栈
@@ -180,7 +180,8 @@ TABLES_RETAINED=("notiops-config" "notiops-conversations" "notiops-web-chat" "no
 #    tests/test_teardown_secrets.py 把两边钉在一起，加 secret 先加那边判据。
 SECRETS=("notiops/im-bot-feishu" "notiops/im-bot-dingtalk" "notiops/slack-bot-token" \
          "notiops/slack-app-token" "notiops/slack-signing-secret" \
-         "notiops/bedrock-api-key" "notiops/litellm-config")
+         "notiops/bedrock-api-key" "notiops/litellm-config" \
+         "notiops/aliyun-credentials")
 # 日志组:WebChatStack 走 logRetention(Lambda 自建 log group)、ECS/AgentCore 也各自建,
 # 删栈后会剩下孤儿。这几个前缀都是本项目独占(栈名前缀 / notiops 前缀),不会误伤别人。
 LOG_PREFIXES=("/aws/lambda/notiops" "/aws/vendedlogs/RUMService_notiops" \

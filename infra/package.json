@@ -28,7 +28,7 @@
   },
   "overrides": {
     "minimatch": "^9.0.7",
-    "fast-xml-parser": "^5.7.0"
+    "js-yaml": "^3.15.2"
   },
   "jest": {
     "testEnvironment": "node",

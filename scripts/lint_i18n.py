@@ -368,6 +368,23 @@ CJK_ALLOWLIST = {
     # （告诉维护者为什么这条判据存在:客户 2026-08-26 那次静默降级）。其中还引用了
     # 客户实际看到的那句回显文案作为 fixture。Developer-facing only。
     "scripts/test_setup_agent_gate.py",
+    # agent 依赖的**符号级**验证器/金丝雀（真装一遍 + import + hasattr，见 §3.219）。
+    # 与 `export_retire_plan.py` / `check_cfn_exports.py` 同类：**开发者 / CI 工具** ——
+    # MR 上改 agent 依赖清单时阻断式跑，定时流水线里带 `--latest` 当金丝雀，
+    # 输出只出现在开发者终端与 CI 日志里，没有用户、也没有 locale 可以 thread。
+    #
+    # ⚠️ 它**故意只用标准库**：要在任何东西装好之前就能跑（它自己去建临时 venv），
+    #    所以不能 import core/i18n.py —— 那会把产品代码变成这个门禁的前置依赖，
+    #    等于让"依赖坏了"这件事把"检查依赖坏没坏"的工具一起带走。
+    #
+    # ⚠️ 中文有两处是护栏，必须紧贴代码：
+    #    ① 失败正文要长且具体才有用。「symbol missing」等于没说；有价值的是
+    #      「`strands.experimental.hooks.events` 里没有 `BidiAfterInvocationEvent`
+    #      —— bedrock_agentcore 在 import 阶段就要它，容器 100% 起不来」——
+    #      症状 + 谁需要它 + 后果。压成键名就没了。
+    #    ② `PROBE` 是**嵌到子进程里执行的源码字符串**，本 linter 会把它当普通字面量
+    #      扫（`:112` 那条就是）。它连"文案"都不是。
+    "scripts/verify_agent_deps.py",
     # Sanitizer denylist — internal blocklist of OpenAI ChatML
     # protocol fragments + Chinese SEO/gambling spam tokens that
     # must NEVER reach end users. These strings are pattern fixtures,

@@ -9,6 +9,7 @@ import { getSupportServices, type SupportService, type AccountInfo } from "../ap
 // id（如 "deepseek-v3-2"）。两种都归一成显示名 —— 归一逻辑已挪到 models.ts，
 // 因为候选集现在由管理员在服务端决定，不再是编译期常量。
 import { modelDisplayName } from "../models";
+import { SHOW_TOKEN_USAGE } from "../featureFlags";
 
 // 署名文案："AWS Bedrock (DeepSeek V3.2) · 1,234 tokens"
 // 所有模型均经 Amazon Bedrock 提供（GPT-5.6 经 Bedrock Mantle），故 provider 统一。
@@ -37,8 +38,10 @@ function modelSignature(model: string | undefined, usage: ChatMessage["usage"], 
   const name = modelDisplayName(model);
   if (!name) return "";
   let base = `AWS Bedrock (${name})`;
+  // token 用量当前**只藏显示**（`SHOW_TOKEN_USAGE = false`），`usage` 本身照旧收、照旧落库。
+  // 开关的完整理由与消费点清单写在 featureFlags.ts 那个常量上。
   const tot = usage?.totalTokens;
-  if (typeof tot === "number" && tot > 0) base += ` · ${tot.toLocaleString()} tokens`;
+  if (SHOW_TOKEN_USAGE && typeof tot === "number" && tot > 0) base += ` · ${tot.toLocaleString()} tokens`;
   return base;
 }
 

@@ -549,7 +549,7 @@ CDK 栈始终通过 ARN 引用这些 secret,**本地不落任何凭据文件**�
 | `opsAlertEmail` | (空) | 运维告警邮箱(SNS 订阅) |
 | `webBaseUrl` | (空) | 巡检推送正文里「查看详情 / 查看全部」深链的站点根;空 = 不带深链 |
 | `reportsCdnDomain` | (空) | 报告下载走自有 CDN 域名;空 = 回退 presigned URL(12h 后失效) |
-| `skipPhd` | `false` | `true` = 不建 PHD 转发器 |
+| `skipPhd` | `false` | `true` = 不建 PHD 转发器。默认建 —— `setup.sh` 不再问这一项,想关就 `ENABLE_PHD=false ./setup.sh`(见下方说明) |
 | `phdLinkedAccounts` | (空) | PHD 要关注的成员账号(逗号分隔) |
 | `oamSinkArn` | (空) | 复用已有 OAM sink,而不是新建一个 |
 | `costAgentMcpUrl` / `costAgentFunctionArn` | (空) | 客户自建 cost-agent MCP —— FinOps 里四张 CUR 报表的数据源;不配则这四个入口整个不出现(见 `requiresEnv`) |
@@ -559,6 +559,20 @@ CDK 栈始终通过 ARN 引用这些 secret,**本地不落任何凭据文件**�
 IM 侧的 `enabledPlatforms` / `imAllowedChatIds` 见 §14 的 `ImStack` context 表。
 `infra/cdk.json` 的 `context` 段里**没有**这些 key 的条目 —— 想改就在命令行 `-c` 传,
 或自己往 `cdk.json` 里加。
+
+**AWS Health 事件转发(PHD)默认启用,`setup.sh` 不提问。**
+
+| | |
+|---|---|
+| 它做什么 | 把 AWS Health 事件经 Bedrock 摘要后**额外**推一条到飞书群 |
+| 没配飞书时 | 什么都不推,而且**不调 Bedrock**(转发器在摘要之前先判 `notify_chat_ids`),成本只剩一次 Lambda 调用 |
+| 与 Web 通知收件箱的关系 | **无关**。Health 事件本来就会进 Web Chat 的通知收件箱,那条路不受这个开关影响 |
+| 怎么关 | `ENABLE_PHD=false ./setup.sh`,或手工 `cdk deploy` 时传 `-c skipPhd=true` |
+| 目前支持的 IM | 只有飞书(`phd_event_forwarder/notifier.py` 走 `shared.feishu_sender`);钉钉 / Slack 尚未接 |
+| 部署路径 | 只有**方式 B**(`setup.sh` / CDK)有这个转发器;方式 A(一键 CloudFormation)不含 PHD |
+
+旧版本会在选完区域后问一句「是否额外把 AWS Health 事件推送到飞书 IM 群?」——
+那个问题排在「选 IM 平台」**之前**,客户在那个位置无法回答,已删除。
 
 > 🔴 **这张表以前列的 7 个 key 里有 6 个压根不存在**(`bedrockModelId` /
 > `agenticChatMode` / `awsMcpMode` / `enableMcpPricing` / `defaultLocale` /

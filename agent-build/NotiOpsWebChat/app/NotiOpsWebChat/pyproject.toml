@@ -20,15 +20,38 @@ requires-python = ">=3.10"
 # minor,因为 0.x 的破坏性变更走 minor)。这样既挡住下一次大版本重写,又不把今天能装上的
 # 版本挡在外面。抬上界的前提是在验证账号真跑一遍 setup.sh 且 agent 能回答。
 #
+# ⚠️ **例外清单:上游不遵守 semver 的依赖 —— 上界必须取到下一个 minor,不是 major。**
+# 上面那条二分规则(>=1.0 → major / 0.x → minor)假定包遵守 semver。下面这两个不遵守,
+# 按 0.x 的规格对待:
+#   · **strands-agents** —— 版本号是 1.x,行为是 0.x。1.56.0(2026-09-15 发布)在一个
+#     **minor** 里删掉了公开符号 `BidiAfterInvocationEvent`,而 bedrock-agentcore
+#     1.23.0 的 memory/integrations/strands/session_manager.py:14 会 import 它 ⇒
+#     装到 1.56.0 的 agent 容器 100% 在 import 阶段崩溃。症状极具误导性:四个 CFN 栈
+#     全绿、runtime `status: READY`(它只表示配置/ARN 已注册,**不代表容器健康**)、
+#     聊天永久返回"服务仍在启动中,请再发送一次消息"。1.55.1 已实测可用。
+#     我们还 import 了它的**私有**模块(core/mcp_snapshot.py 的
+#     `strands.types._events`),这类符号连"公开 API 不破坏"的承诺都没有。
+#   · **bedrock-agentcore** —— 它对 strands 只声明 `>=1.46.0`(**无上界**),且 import
+#     的是 strands 的 `experimental` 子包。它自己抬一个 minor 就可能开始 import 我们
+#     钉住的 strands 里还没有的符号。这对包是**双向**耦合,两边都得钉到 minor。
+#
+# 这份清单不是注释里的自觉:由 **tests/test_agent_dep_bounds.py** 强制(纯离线,跟着
+# pytest-suite 每个 MR 都跑)—— 清单里的包上界退回 major、或者放开一个已知坏版本,
+# 测试直接红。抬上界时先跑 `./scripts/verify_agent_deps.py`(真装真 import 一遍我们
+# 代码用到的每个 strands / bedrock_agentcore 符号),再去验证账号跑 setup.sh。
+#
 # 2026-08-26 实测解析结果(`uv pip compile pyproject.toml --python-version 3.13`):
 #   aws-opentelemetry-distro 0.19.0 · bedrock-agentcore 1.22.0 · botocore 1.43.80
 #   mcp 1.29.1 · strands-agents 1.53.0 · defusedxml 0.7.1 · openai 3.3.1
 #   aws-bedrock-token-generator 1.1.0 · aws-pricing 1.0.34 · billing-cost-mgmt 0.0.33
 #   cloudwatch 0.1.8 · cloudtrail 0.0.18 · aws-api 1.5.1
+# 2026-09-16 收紧上界后的解析结果(只列被改动的两条):
+#   strands-agents 1.55.1 · bedrock-agentcore 1.23.0 —— 该组合已实测 import 通过。
 dependencies = [
     # 只影响可观测性(OTel 上报),坏了不影响问答,所以上界放到 major 而不是 minor。
     "aws-opentelemetry-distro < 1.0.0",
-    "bedrock-agentcore >= 1.9.1, < 2.0.0",
+    # 上界取到 **minor** —— 见文件头「不遵守 semver 的依赖」例外清单第 2 条。
+    "bedrock-agentcore >= 1.9.1, < 1.24.0",
     "botocore[crt] >= 1.35.0, < 2.0.0",
     "mcp >= 1.19.0, < 2.0.0",
     # >= 1.52.0：两个硬需求叠在一起。
@@ -42,7 +65,9 @@ dependencies = [
     #     启动 5 个 server（各自 `MCPClient(...)`），在无锁的版本上会重复叠加 wrapt
     #     wrapper。所以这条下限不是"顺手抬高"，是并行启动的前置条件。
     # load.py 仍有守卫导入兜底。
-    "strands-agents >= 1.52.0, < 2.0.0",
+    # < 1.56.0：上界取到 **minor**，不是 major —— 见文件头「不遵守 semver 的依赖」例外
+    # 清单第 1 条（1.56.0 删掉 `BidiAfterInvocationEvent`，容器 100% import 崩溃）。
+    "strands-agents >= 1.52.0, < 1.56.0",
     # 安全:解析 AWS RSS feed 用 defusedxml 防 XXE(见 core/whats_new.py)。
     # 这个包多年一个版本,上界给到 major 就够。
     "defusedxml >= 0.7.1, < 1.0.0",

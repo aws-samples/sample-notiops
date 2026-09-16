@@ -203,14 +203,14 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 | AWS 服务 | 用途 |
 |----------|------|
 | DynamoDB × 5 | 后台 4 张(`NotiOpsBackendStack`):`notiops-conversations`(IM / 跨链路状态)+ `notiops-inspection`(资源巡检)+ `notiops-config`(配置 / 调查 / 成本单表)+ `notiops-metrics`(老 idle 巡检遗留);再加 Web Chat 的 `notiops-web-chat` 单表(`WebChatStack`) |
-| Lambda × 10~11 | 业务计算:Notifier / CostAnalyzer / CurFinalizer / 巡检四个(scheduler + executor + reconciler + push)/ DevOpsCallback / PushHandler / WebNotifHandler / PHDForwarder(可选,`-c skipPhd=true` 时不建),另有 CDK 自管的 Custom Resource Lambda(seed-data / auto-onboard) |
+| Lambda × 10~11 | 业务计算:Notifier / CostAnalyzer / CurFinalizer / 巡检四个(scheduler + executor + reconciler + push)/ DevOpsCallback / PushHandler / WebNotifHandler / PHDForwarder(**默认建**,`-c skipPhd=true` / `ENABLE_PHD=false ./setup.sh` 时不建;没配飞书时它在调 Bedrock 之前就早退),另有 CDK 自管的 Custom Resource Lambda(seed-data / auto-onboard) |
 | Lambda — IM (ImStack) | 每平台 ingress + worker 一对 + 进度轮询;ingress 由 HTTP API 触发收 webhook |
 | ~~ECS Fargate + ECR~~ | ❌ 2026-09-03(M2)退役 —— IM 已全量走 Lambda,pricing/cost MCP sidecar 也随之下线(IM Lambda 侧显式 `AWS_MCP_PRICING_ENABLED=false` / `AWS_MCP_COST_ENABLED=false`) |
 | API Gateway | **只剩 IM webhook 的 HTTP API**(每平台一个;方式 B 在 `ImStack`,方式 A 在单栈里由 `InstallOption` 选装)。老的 REST API(Dashboard / MCP 后端)已于 2026-09-04 退役 |
 | Cognito | Web Chat 登录:User Pool `notiops-users`(禁自注册,两条部署路径同名同配置)+ Identity Pool `notiops-web-chat`(拿临时凭证去 SigV4 签 BFF Function URL);另有 `notiops-web-chat-rum` Identity Pool 供前端 RUM |
 | S3 + CloudFront | `ChatCDN`:Web Chat 前端(私有桶 + OAI);`ReportsCDN`:在线报告(CloudFront Function 只放行 `reports/*`) |
 | S3 | 调查报告(`investigations/<task_id>/report.md\|report.html\|trace.html`)+ Onboarding 模板 |
-| EventBridge | **定时**:后台 5 条(巡检 scheduler / push 每 15 分钟 + reconciler 每 1 小时 + 成本分析 01:15 + 通知 02:00)、CUR 仪表盘预热 1 条(22:00 UTC,配了 CUR 数据源才建)、IM ingress 保活(选了 IM 才建,每平台 1 条 / 每 4 分钟)与调查进度轮询 1 条(每 1 分钟)。**事件路由**:AWS Health → PHD SNS 1 条(`-c skipPhd=true` 可跳过)、DevOps Agent Callback 2 条(Custom Bus 与 default bus 各一条)、IM 主动推送 5 条(默认 **DISABLED**,要在控制台或 CDK context 里开)、Web 通知收件箱 10 条(默认 5 开 5 关,清单见 `infra/lib/constructs/web-notif-sources.ts`) |
+| EventBridge | **定时**:后台 5 条(巡检 scheduler / push 每 15 分钟 + reconciler 每 1 小时 + 成本分析 01:15 + 通知 02:00)、CUR 仪表盘预热 1 条(22:00 UTC,配了 CUR 数据源才建)、IM ingress 保活(选了 IM 才建,每平台 1 条 / 每 4 分钟)与调查进度轮询 1 条(每 1 分钟)。**事件路由**:AWS Health → PHD SNS 1 条(**默认建**,`-c skipPhd=true` 可跳过)、DevOps Agent Callback 2 条(Custom Bus 与 default bus 各一条)、IM 主动推送 5 条(默认 **DISABLED**,要在控制台或 CDK context 里开)、Web 通知收件箱 10 条(默认 5 开 5 关,清单见 `infra/lib/constructs/web-notif-sources.ts`) |
 | SNS | 闲置告警 + PHD 事件聚合 |
 | Custom Event Bus | DevOps Agent 跨账户事件聚合(`notiops-devops-events`) |
 | SQS | DevOps Agent Callback DLQ |

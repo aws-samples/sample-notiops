@@ -320,56 +320,26 @@ export DEPLOY_REGION="$DEPLOY_REGION"
 export AWS_REGION="$DEPLOY_REGION"
 export AWS_DEFAULT_REGION="$DEPLOY_REGION"
 
-# ─── PHD 事件转发开关(根据当前 Stack 状态智能提示)───
-ENABLE_PHD="${ENABLE_PHD:-}"
-if [ -z "$ENABLE_PHD" ]; then
-  # 检测当前 Stack 是否已部署 PHD 资源
-  PHD_EXISTING=$(aws cloudformation list-stack-resources \
-    --stack-name NotiOpsBackendStack --region "$DEPLOY_REGION" \
-    --query "StackResourceSummaries[?starts_with(LogicalResourceId,'PhdEventsTopic')].ResourceStatus | [0]" \
-    --output text 2>/dev/null || echo "")
-
-  if [ -n "$PHD_EXISTING" ] && [ "$PHD_EXISTING" != "None" ] && [ "$PHD_EXISTING" != "" ]; then
-    # 已部署 PHD — 询问是否保留
-    echo ""
-    echo "$(t "检测到当前 Stack 已部署 AWS Health 事件转发功能. " "Detected AWS Health event forwarding already deployed in the current stack.")"
-    echo ""
-    read -p "$(t "是否保留 PHD 事件转发功能？[Y/n]: " "Keep PHD event forwarding? [Y/n]: ")" PHD_KEEP_CHOICE
-    case "${PHD_KEEP_CHOICE:-Y}" in
-      [nN]*)
-        echo ""
-        echo "  $(t "⚠ 移除 PHD 功能将删除 SNS Topic、Lambda、EventBridge Rule. " "⚠ Removing PHD will delete the SNS Topic, Lambda, and EventBridge Rule.")"
-        echo "  $(t "如果有 Linked Account 正在转发事件, 请先执行:" "If any Linked Account is forwarding events, run this first:")"
-        echo "    ./setup.sh --phd --remove"
-        echo ""
-        read -p "  $(t "确认移除 PHD 功能？[y/N]: " "Confirm removing PHD? [y/N]: ")" PHD_CONFIRM_REMOVE
-        case "${PHD_CONFIRM_REMOVE:-N}" in
-          [yY]*) ENABLE_PHD="false" ;;
-          *) ENABLE_PHD="true"; echo "  $(t "保留 PHD 功能" "Keeping PHD")" ;;
-        esac
-        ;;
-      *) ENABLE_PHD="true" ;;
-    esac
-  else
-    # 未部署 PHD — 询问是否【额外】把 Health 事件推送到飞书 IM。
-    # 说明:AWS Health 事件默认【已经】进入 Web Chat 通知收件箱(见 notiops-backend-stack.ts
-    # 的 webNotif Health source, on:true, 不受此开关控制)。此开关只额外增加一条【飞书 IM 推送】——
-    # PHD 转发器目前仅支持飞书(phd_event_forwarder/notifier.py 走 shared.feishu_sender)。
-    # 因此:不用飞书 IM 就没必要开(Web 收件箱不受影响);故默认跳过(N)。IM 平台在稍后步骤选择。
-    echo ""
-    echo "$(t "是否额外把 AWS Health 事件推送到飞书 IM 群？" "Also push AWS Health events to your Feishu IM group?")"
-    echo "  $(t "说明:AWS Health 事件(服务中断、计划维护等)默认【已经】进入 Web Chat 通知收件箱, " "Note: AWS Health events (outages, planned maintenance, etc.) already land in the Web Chat notification inbox")"
-    echo "  $(t "无论此项是否开启。此项【仅】额外经 Bedrock 生成摘要并推送到你的飞书群。 " "regardless of this choice. This option ONLY adds an extra Bedrock-summarized push to your Feishu group.")"
-    echo "  $(t "生效前提:在稍后的『IM 平台选择』步骤启用飞书,并在部署后回填飞书凭据。 " "It only takes effect if you enable Feishu in the later 'IM Platform Selection' step and fill Feishu credentials after deploy.")"
-    echo "  $(t "如果你不使用飞书 IM,或已有完善的告警机制,直接跳过即可(Web 收件箱不受影响)。 " "If you don't use Feishu IM, or already have solid alerting, just skip it (the web inbox is unaffected).")"
-    echo ""
-    read -p "$(t "推送 Health 到飞书 IM？[y/N]: " "Push Health events to Feishu IM? [y/N]: ")" PHD_CHOICE
-    case "${PHD_CHOICE:-N}" in
-      [yY]*) ENABLE_PHD="true" ;;
-      *) ENABLE_PHD="false" ;;
-    esac
-  fi
-fi
+# ─── PHD 事件转发开关(默认启用,部署时不再提问)───
+#
+# 为什么不再问：这个问题在这个位置**没法回答**。它问的是「要不要把 Health 事件额外推到
+# 飞书群」，而「要不要装飞书」是**后面**才问的 —— 老提示语自己都写着「生效前提:在稍后的
+# 『IM 平台选择』步骤启用飞书」。等于让客户先决定飞书的事，再问他要不要飞书。
+#
+# 为什么默认开：
+#   · 没配飞书时它**什么都不做也几乎不花钱** —— phd_event_forwarder/handler.py 在调
+#     Bedrock **之前**先判 notify_chat_ids，没有收件人就直接返回（那个顺序是刻意的，
+#     函数头有 ⚠️ 说明）。剩下的成本只有一次 Lambda 调用。
+#   · 资源静置不收费：SNS Topic、EventBridge Rule、Lambda 都是按用量计费。
+#   · 配了飞书的客户从此**不需要知道有这个开关**就能拿到推送。
+#
+# 与 Web 收件箱无关（不要混淆）：AWS Health 事件默认【已经】进 Web Chat 通知收件箱
+# （notiops-backend-stack.ts 的 webNotif Health source, on:true），那条路与本开关
+# 完全无关、也不受它影响。本开关只管【额外那条飞书推送】。
+#
+# 仍然可以关：`ENABLE_PHD=false ./setup.sh`（非交互逃生口，见 docs/DEPLOYMENT.md）。
+# 目前只支持飞书（notifier.py 走 shared.feishu_sender），钉钉 / Slack 尚未接。
+ENABLE_PHD="${ENABLE_PHD:-true}"
 
 # ─── Organizations 检测(--multi-account)───
 # 若当前部署账号能驱动 service-managed StackSet,启用 org 模式:
@@ -635,7 +605,12 @@ if [ "$ENABLE_PHD" = "false" ]; then
   SKIP_PHD_FLAG="-c skipPhd=true"
   PHD_ACCOUNTS_FLAG=""
 else
-  echo "  $(t "✓ 将部署 PHD 事件转发功能" "✓ Will deploy PHD event forwarding")"
+  # 默认开 —— 但要说清楚它是什么、以及怎么关，不能让客户在账单/资源列表里
+  # 看到 phd-events 才发现有这么个东西（那就是静默行为）。
+  echo "  $(t "✓ 将部署 AWS Health 事件转发(默认启用)" "✓ Will deploy AWS Health event forwarding (on by default)")"
+  echo "    $(t "作用:把 Health 事件额外经 Bedrock 摘要后推到飞书群。没配飞书就不推,也不调 Bedrock。" "What it does: pushes Health events to your Feishu group with a Bedrock summary. With no Feishu configured it pushes nothing and never calls Bedrock.")"
+  echo "    $(t "与 Web Chat 通知收件箱无关 —— Health 事件本来就会进收件箱,不受此项影响。" "Unrelated to the Web Chat notification inbox — Health events land there regardless.")"
+  echo "    $(t "不想要:ENABLE_PHD=false ./setup.sh" "To opt out: ENABLE_PHD=false ./setup.sh")"
   SKIP_PHD_FLAG=""
 
   # 询问是否需要接收其他账号的 Health 事件

@@ -20,6 +20,7 @@ session_id = 前端 conversationId，把 SSE 透传给浏览器。payload 字段
 import json
 import os
 
+from botocore.config import Config as BotocoreConfig
 from strands import Agent
 from strands.models import BedrockModel
 from bedrock_agentcore import BedrockAgentCoreApp
@@ -106,6 +107,30 @@ _MANTLE_MODELS = {
 }
 
 
+# ── Bedrock 客户端超时（与部署侧同一个数）─────────────────────────────────────
+# **Bedrock 服务端没有客户可配的推理超时**，这条线的超时全部在客户端。一个字都不配时
+# 吃的是 Strands 的 `DEFAULT_READ_TIMEOUT = 120`（strands/models/bedrock.py），而
+# Grok / GLM 这类"先想很久再吐第一个 token"的模型在复杂问题上会直接撞上去，表现是
+# 「⚠️ 模型调用失败（ReadTimeoutError）」。
+#
+# 这个值必须与部署侧逐字相同 —— 本目录是**手写源码权威副本**（见模块 docstring），
+# 部署跑的是 `agent-build/NotiOpsWebChat/app/NotiOpsWebChat/model/load.py` 的
+# `BEDROCK_READ_TIMEOUT_SEC`；两处不一致时，本地跑出来的超时行为就代表不了线上。
+# 现在共**三处**同为 300s（第三处是 IM 侧 `core/bedrock_chat.py` 的
+# `_BEDROCK_TIMEOUT_CONFIG`），改一处要改三处，判据见 tests/test_bedrock_timeouts.py。
+#
+# ⚠️ `max_attempts` 必须同时收紧：botocore 默认 legacy 模式 5 次，300×5=1500s 超出
+# 上游任何一道闸（BFF Lambda 15 分钟 / IM worker 900s），结果不是"超时提示"而是
+# **客户端还在重试、计算体先被杀**，用户只看到「（无响应）」。2 次的最坏值 600s 才安全。
+# 流**中途**的 read timeout 本来就不重试（重试只包响应头那一段），所以收紧不削弱抗抖动。
+BEDROCK_READ_TIMEOUT_SEC = 300
+_BOTO_CLIENT_CONFIG = BotocoreConfig(
+    read_timeout=BEDROCK_READ_TIMEOUT_SEC,
+    connect_timeout=10,          # 建连要么快要么就是网络坏了，没有等 60s 的道理
+    retries={"max_attempts": 2, "mode": "standard"},
+)
+
+
 def _make_mantle_responses_model(cfg: dict):
     """构造走 Bedrock Mantle 的 GPT-5.6（OpenAI Responses API）模型实例。
 
@@ -136,9 +161,10 @@ def _build_agent(model_key: str | None, topic: str | None = None) -> Agent:
         try:
             model = _make_mantle_responses_model(_MANTLE_MODELS[key])
         except Exception:  # noqa: BLE001 — 依赖缺失/区域未开通 → 回退默认，不阻断整轮
-            model = BedrockModel(model_id=_DEFAULT_MODEL)
+            model = BedrockModel(model_id=_DEFAULT_MODEL, boto_client_config=_BOTO_CLIENT_CONFIG)
     else:
-        model = BedrockModel(model_id=_MODEL_MAP.get(key, _DEFAULT_MODEL))
+        model = BedrockModel(model_id=_MODEL_MAP.get(key, _DEFAULT_MODEL),
+                             boto_client_config=_BOTO_CLIENT_CONFIG)
     # 单 agent 全能：Cases 等工具在任何对话都必须可用（用户可在通用对话直接开案例）。
     # 曾按主题裁剪省 token，但会让通用对话无法创建案例 —— 破坏核心能力，已回退。
     return Agent(

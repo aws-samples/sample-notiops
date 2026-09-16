@@ -3,9 +3,17 @@ name = "notiops-web-chat-agent"
 version = "0.1.0"
 description = "NotiOps Web Chat agent on Bedrock AgentCore Runtime (Strands)"
 requires-python = ">=3.10"
+# ⚠️ **打包读的不是这一份** —— `agentcore deploy` / `agentcore package` 跑的是
+#    `agent-build/NotiOpsWebChat/app/NotiOpsWebChat/pyproject.toml`(见那份文件的文件头)。
+#    这一份只在本地跑 agent 时用。但两份的约束必须一致:2026-09-16 的事故里
+#    (strands-agents 1.56.0 删掉 `BidiAfterInvocationEvent`,容器 import 崩溃)这里
+#    是完全裸的 `>=0.1.0`,于是"本地能跑 / 部署后崩"多了一个入口。
+#    tests/test_agent_dep_bounds.py 会断言两份文件对 strands / bedrock-agentcore 的
+#    约束逐字相同,改一份忘改另一份会红。
 dependencies = [
-    "strands-agents>=0.1.0",
-    "bedrock-agentcore>=0.1.0",
+    # 与 agent-build 那份逐字对齐(含"上界取 minor"的例外规则)。
+    "strands-agents >= 1.52.0, < 1.56.0",
+    "bedrock-agentcore >= 1.9.1, < 1.24.0",
     # 下限对齐仓库根 requirements.txt：devops-agent 的 Asset API（读 custom agent 产出的
     # artifact 要用 GetAsset / GetAssetContent）在 1.43.19 里不存在，1.43.30 起才有。
     # 已有的 create_backlog_task / list_recommendations 老版本就有，但混用两个下限会让

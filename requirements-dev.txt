@@ -2,3 +2,6 @@
 pytest>=8.0.0
 hypothesis>=6.100.0
 moto[all]>=5.0.0
+# tests/test_agent_dep_bounds.py 用 SpecifierSet 判「这个约束放不放某个已知坏版本进来」。
+# pytest 本来就会把它拖进来，但那是**传递**依赖：显式写一行，别让依赖门禁自己靠运气。
+packaging>=23.0

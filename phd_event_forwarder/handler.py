@@ -4,10 +4,14 @@ SNS 触发，编排完整处理流程：
   1. 遍历 event["Records"]，解析 SNS 信封
   2. json.loads(record["Sns"]["Message"]) 获取 EventBridge 事件
   3. 提取 PHDEvent dataclass
-  4. 调用 Bedrock 摘要（失败则降级为原始事件转发）
-  5. 格式化消息（emoji + 结构化字段）
-  6. 推送至飞书
-  7. 不抛出未处理异常（避免 SNS 重试导致重复通知）
+  4. 读飞书 Secret，**没有收件人就直接返回**（不调 Bedrock、不烧 token）
+  5. 调用 Bedrock 摘要（失败则降级为原始事件转发）
+  6. 格式化消息（emoji + 结构化字段）
+  7. 推送至飞书
+  8. 不抛出未处理异常（避免 SNS 重试导致重复通知）
+
+第 4 步排在第 5 步之前是刻意的 —— 这条转发器默认启用而只能发飞书，
+详见 _process_record 的函数头。
 
 环境变量：
   - FEISHU_SECRET_ARN: Feishu credentials Secret ARN
@@ -54,7 +58,16 @@ def _load_secret(secret_arn: str) -> dict:
 def _process_record(record: dict) -> None:
     """处理单条 SNS record。
 
-    流程：解析 PHDEvent → Bedrock 摘要（降级） → 格式化 → 推送 IM。
+    流程：解析 PHDEvent → **先判有没有收件人** → Bedrock 摘要（降级） → 格式化 → 推送 IM。
+
+    ⚠️ 「先判收件人」这一步的顺序是**刻意的**，不许挪回 Bedrock 之后。
+       这条转发器是**默认启用**的（见 setup.sh 里 ENABLE_PHD 的默认值），而它目前
+       只能发飞书（notifier.py 走 shared.feishu_sender）。于是一个纯 web、没配飞书的
+       部署，账号里每来一条 AWS Health 事件都会走到这里 —— 如果先摘要再判收件人，
+       就是每条事件真的调一次 Bedrock、真的付一次 token，然后把结果丢掉、
+       打一行「没有收件人」。花钱生成没有任何人会看到的东西。
+       现在的顺序让这种部署的成本只剩一次 Lambda 调用（≈0），这也是「默认启用」
+       能成立的前提。
     """
     from phd_event_forwarder.event_parser import parse_sns_event
     from phd_event_forwarder.formatter import format_fallback_message, format_message
@@ -73,6 +86,21 @@ def _process_record(record: dict) -> None:
         phd_event.eventTypeCategory,
     )
 
+    # Load IM Secret —— 必须排在 Bedrock 摘要之前（见函数头的 ⚠️）
+    feishu_secret_arn = os.environ.get("FEISHU_SECRET_ARN", "")
+    feishu_secret = _load_secret(feishu_secret_arn) if feishu_secret_arn else {}
+    feishu_chat_ids = feishu_secret.get("notify_chat_ids", "") if feishu_secret else ""
+
+    # 没有任何收件人 → 直接返回，一个 token 都不烧。
+    # 这**不是**静默降级：Health 事件本来就已经进了 Web Chat 通知收件箱（那条路
+    # 与本转发器完全无关、不受影响），这里跳过的只是「额外那条飞书推送」。
+    if not feishu_chat_ids.strip():
+        logger.info(
+            "No notify_chat_ids configured, skipping push before summarize: eventArn=%s",
+            phd_event.eventArn,
+        )
+        return
+
     # Bedrock 摘要（失败降级）
     try:
         summary = summarize_event(phd_event)
@@ -81,26 +109,15 @@ def _process_record(record: dict) -> None:
         logger.warning("Bedrock 摘要失败，降级为原始事件转发: %s", e)
         content = format_fallback_message(phd_event)
 
-    # Load IM Secret
-    feishu_secret_arn = os.environ.get("FEISHU_SECRET_ARN", "")
-    feishu_secret = _load_secret(feishu_secret_arn) if feishu_secret_arn else {}
-
     # Push notifications
     result = send_notifications(content, feishu_secret)
 
     total_sent = result["feishu_sent"]
     if total_sent == 0:
-        feishu_chat_ids = feishu_secret.get("notify_chat_ids", "") if feishu_secret else ""
-        has_any_chat_ids = bool(feishu_chat_ids.strip())
-        if has_any_chat_ids:
-            logger.error(
-                "Feishu push failed: eventArn=%s", phd_event.eventArn
-            )
-        else:
-            logger.info(
-                "No notify_chat_ids configured, skipping push: eventArn=%s",
-                phd_event.eventArn,
-            )
+        # 走到这里说明收件人是配了的（上面已经早退过了），所以这是真失败。
+        logger.error(
+            "Feishu push failed: eventArn=%s", phd_event.eventArn
+        )
     else:
         logger.info(
             "PHD event push done: eventArn=%s, feishu=%d",

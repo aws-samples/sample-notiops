@@ -221,6 +221,8 @@ _INLINE_FUNCTION_NAMES = set()
 # ── NotiOps 第一个 tool：AWS Q&A（查官方文档、带出处；包 core/aws_docs_mcp）──
 import os as _os
 import sys as _sys
+import hashlib as _hashlib
+import uuid as _uuid
 _HERE = _os.path.dirname(_os.path.abspath(__file__))
 if _HERE not in _sys.path:
     _sys.path.insert(0, _HERE)  # core/ 部署前由打包脚本 copy 到本目录
@@ -2501,13 +2503,53 @@ def _is_probably_english(text: str) -> bool:
     return not any("一" <= ch <= "鿿" for ch in (text or ""))
 
 
+# ── AgentCore Memory 的两个 id：都**不许**回落到全部署共用的一个字面量 ──────────
+# 事件按 `(memoryId, actorId, sessionId)` 存取（`create_event` / `list_events`，见
+# memory/session.py）。这两个 id 以前的兜底是常量 `default-session` / `default-user`，
+# 而平台只在 JWT（CUSTOM_JWT / OAuth）鉴权下才填 `context.user_id`（取 `sub`）——
+# 我们两条部署路径都是 AWS_IAM + SigV4（BFF 走 `bedrock-agentcore:InvokeAgentRuntime`），
+# 所以 actor 那条兜底是**必然**走到的，也就是说整个部署的所有用户共用一个 actor 池：
+#
+#   · 今天只影响元数据 —— `ListActors` / `ListSessions` 里所有人混在同一格；事件正文
+#     还要按 sessionId 过一道，各人的 sessionId 不同，所以**内容不串**。
+#   · 但它是个雷：一旦恢复 actor 级 strategy（`/users/{actorId}/facts`、
+#     `/users/{actorId}/preferences` —— namespace 里没有 `{sessionId}`），第一轮抽取
+#     就会把所有人的事实汇进同一个 namespace，此后任何人的下一句都可能被注入别人的
+#     历史。客户 2026-09-16 报告里描述的正是这个形态 —— 那是 v1.0.19 及更早的行为，
+#     跨会话记忆已在 v1.0.20（2026-09-01）整体去掉（两条路径都没有 strategy、读取端
+#     也不配 `retrieval_config`，判据见 scripts/test_oneclick_parity.py 维度 ⑦），
+#     所以 v1.0.28 上**复现不出**注入；但常量 actor 这个雷还在，这里把它拆掉。
+#
+# 兜底一律按"这一轮自己"派生，不共享：
+#   · session 缺失 → 随机 uuid。这种情况下本来就没有可用的会话键，落进一个共享的
+#     `default-session` 才是真泄露（不同用户的事件会进同一个 (actor, session) 格）。
+#     代价是这一轮取不回历史 —— 没有键可取，本来就该如此。
+#   · actor 缺失 → 由 session 派生。会话内每轮稳定（`list_events` 取得回来），会话
+#     之间天然隔离，恢复 strategy 也污染不到别人。
+# 用 sha256 前 32 位而不是直接拼 session_id：actorId 有长度上限，而
+# `toSessionId()`（bff/web-chat/agentcore.mjs）最长会给到 256 字符。派生是确定性的，
+# 排查时按同样的算法就能从 session id 反推 actor，不丢可运维性。
+# ⚠️ 升级到本版后，**已有会话**的 actor 变了 ⇒ 那些会话的模型上文读不回来（界面上的
+#    历史存 DynamoDB，不受影响）。这要写进 release notes。
+def _session_id_of(context) -> str:
+    sid = getattr(context, "session_id", None)
+    return sid.strip() if isinstance(sid, str) and sid.strip() else "anon-" + _uuid.uuid4().hex
+
+
+def _actor_id_of(context, session_id: str) -> str:
+    uid = getattr(context, "user_id", None)
+    if isinstance(uid, str) and uid.strip():
+        return uid.strip()
+    return "sess-" + _hashlib.sha256((session_id or "").encode("utf-8")).hexdigest()[:32]
+
+
 @app.entrypoint
 async def invoke(payload, context):
     log.info("Invoking Agent.....")
 
 
-    session_id = getattr(context, 'session_id', 'default-session')
-    user_id = getattr(context, 'user_id', 'default-user')
+    session_id = _session_id_of(context)
+    user_id = _actor_id_of(context, session_id)
 
     # ── P0-B：会话预热（prewarm，**0 token**）────────────────────────────────
     # 首字延迟的大头不是模型，是**这个容器还没准备好**：AgentCore 平台冷启动（拉镜像 +

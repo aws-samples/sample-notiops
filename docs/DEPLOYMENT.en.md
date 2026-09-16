@@ -576,7 +576,7 @@ Edit `infra/cdk.json` directly, or pass `-c key=value` to `cdk deploy`:
 | `opsAlertEmail` | (empty) | Ops alert email (SNS subscription) |
 | `webBaseUrl` | (empty) | Site root for the "view details / view all" deep links in inspection pushes; empty = no deep links |
 | `reportsCdnDomain` | (empty) | Serve report downloads from your own CDN domain; empty = fall back to presigned URLs (dead after 12h) |
-| `skipPhd` | `false` | `true` = do not create the PHD forwarder |
+| `skipPhd` | `false` | `true` = do not create the PHD forwarder. Created by default — `setup.sh` no longer asks; opt out with `ENABLE_PHD=false ./setup.sh` (see below) |
 | `phdLinkedAccounts` | (empty) | Member accounts PHD should watch (comma-separated) |
 | `oamSinkArn` | (empty) | Reuse an existing OAM sink instead of creating one |
 | `costAgentMcpUrl` / `costAgentFunctionArn` | (empty) | Your self-hosted cost-agent MCP — the data source behind the four CUR sheets under FinOps; leave it unset and those four entries do not appear at all (see `requiresEnv`) |
@@ -587,6 +587,21 @@ For the IM side (`enabledPlatforms` / `imAllowedChatIds`) see the `ImStack` cont
 table in §14. `infra/cdk.json`'s `context` block contains **no** entries for any of
 these keys — pass them with `-c` on the command line, or add them to `cdk.json`
 yourself.
+
+**AWS Health event forwarding (PHD) is on by default; `setup.sh` does not ask.**
+
+| | |
+|---|---|
+| What it does | Pushes an **extra** message to your Feishu group for each AWS Health event, summarized by Bedrock |
+| With no Feishu configured | Pushes nothing, and **never calls Bedrock** (the forwarder checks `notify_chat_ids` before summarizing), so the cost is one Lambda invocation |
+| Relation to the Web notification inbox | **None.** Health events land in the Web Chat notification inbox regardless; that path is unaffected by this switch |
+| How to turn it off | `ENABLE_PHD=false ./setup.sh`, or pass `-c skipPhd=true` to a manual `cdk deploy` |
+| IM platforms supported | Feishu only (`phd_event_forwarder/notifier.py` uses `shared.feishu_sender`); DingTalk / Slack are not wired up |
+| Deployment paths | Only **Path B** (`setup.sh` / CDK) has this forwarder; Path A (one-click CloudFormation) does not include PHD |
+
+Older versions asked "push AWS Health events to your Feishu IM group?" right after
+region selection — before the IM platform was even chosen, so the question could not
+be answered at that point. It has been removed.
 
 > 🔴 **Six of the seven keys this table used to list do not exist at all**
 > (`bedrockModelId` / `agenticChatMode` / `awsMcpMode` / `enableMcpPricing` /

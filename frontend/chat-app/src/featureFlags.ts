@@ -44,3 +44,32 @@
  *  · BFF 的 `/features/starops` 与 STAROps 那条对话链路 —— 后端一律不动。前端不去调而已。
  */
 export const MULTICLOUD_UI = false;
+
+/**
+ * 每条回复页脚**署名里那段 token 用量**（"· 137,024 tokens"）在 Web 端的可见性。
+ *
+ * `false` = 只藏这段文字，用量本身**照旧全程存在**：BFF 的 `usage` 事件照发、
+ * `ChatMessage.usage`（`totalTokens` / `cycles`）照落库、老会话里已经存的值一个不动 ——
+ * 翻成 `true` 就原样回来，包括历史消息（署名是每次渲染现算的，不是存下来的字符串）。
+ *
+ * 为什么先藏：这一行是**给客户看**的成本口径，而它现在只数得清一部分 —— 同一个界面里
+ * DevOps Agent / STAROps / 内置回答这三条路径本来就 0 token（用量记在别人账上），
+ * 于是"有的回复有数字、有的没有"看起来像漏统计而不像产品设计。等成本口径统一（比如做成
+ * 一个能把三条路径都说清楚的用量视图）再放出来。
+ *
+ * 消费点（改这个常量只有这一处，但**别改成在渲染处判断**）：
+ *  · `components/Message.tsx::modelSignature` —— 唯一拼这段文字的地方。开关放在这里而不是
+ *    第 794 行的渲染处，是因为 `sig` 为空时那个 `<span className="modelsig">` 整个不渲染；
+ *    若在渲染处剥字符串，`m.model` 存在时 `sig` 仍非空，页脚会剩一个"AWS Bedrock (…)"
+ *    ——那正是我们要保留的部分，剥法反而更容易把它一起弄坏。
+ *
+ * **不**是消费点、有意不动的地方：
+ *  · `usage.cycles`（「N 步」）—— 早就不显示了，与这个开关无关，别顺手扯进来。
+ *  · 深度调查报告卡片、`/admin` 里的用量统计（如有）—— 那些是**运营侧**口径，不是每条回复
+ *    的页脚，客户认知里是两回事。这个开关只管页脚那一段。
+ *
+ * 测试：`Message.footer.test.tsx` 钉 `false`（当前）行为，
+ * `Message.footer.tokens-on.test.tsx` 用 `vi.mock` 翻成 `true` 钉"放出来时长什么样"——
+ * 必须是**两个文件**，`vi.mock` 是整文件级的。
+ */
+export const SHOW_TOKEN_USAGE = false;

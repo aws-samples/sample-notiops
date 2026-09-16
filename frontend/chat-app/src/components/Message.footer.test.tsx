@@ -1,5 +1,10 @@
 /**
- * 回复气泡页脚的契约：**只有一行**，顺序固定为 复制 → Sources → 署名(模型 · tokens) → 账号 ID。
+ * 回复气泡页脚的契约：**只有一行**，顺序固定为 复制 → Sources → 署名(模型) → 账号 ID。
+ *
+ * 本文件钉的是 `SHOW_TOKEN_USAGE = false`（当前发版值）下的样子 —— 署名里**没有** token 用量。
+ * 开关翻成 `true` 的样子由 `Message.footer.tokens-on.test.tsx` 钉（必须是另一个文件：
+ * `vi.mock` 是整文件级的）。两份一起看才是完整契约：这里防的是"藏起来的东西自己漏回来"，
+ * 那边防的是"以后想放出来时发现拼串逻辑已经被删干净了"。
  *
  * 为什么值得钉住：这里全是"改错了也不报错、只是看着不对"的东西，而回归的方向很具体 ——
  *   · 页脚曾经是两行（署名单独一行），谁再往回加一个 <div> 都不会有任何测试失败；
@@ -44,10 +49,16 @@ describe("回复页脚（一行）", () => {
     expect(order()).toEqual(["copy", "sources", "sig", "acct"]);
   });
 
-  it("署名带 tokens，但**不带**「N 步」", () => {
+  // 产品决定（`SHOW_TOKEN_USAGE = false`）：页脚只留模型署名，token 用量先不给客户看。
+  // 这里要钉住的不是"少一段文字"，而是**藏得干净**：后端照旧回 usage、也照旧落库，
+  // 所以只要谁在拼串或渲染处漏一个条件，数字就会自己回到界面上而没有任何报错。
+  // 同时反向钉住署名主体还在 —— 藏 token 不等于把整行署名藏掉（那会让"这条谁答的"没法追）。
+  it("署名只有模型、**不带** tokens（当前隐藏），也不带「N 步」", () => {
     mount({ model: "claude-sonnet-5", usage: { totalTokens: 137024, cycles: 4 } });
     const sig = document.querySelector(".modelsig")!.textContent || "";
-    expect(sig).toContain("137,024 tokens");
+    expect(sig).toBe("AWS Bedrock (Claude Sonnet 5)"); // 署名主体必须还在
+    expect(sig).not.toContain("tokens");
+    expect(sig).not.toContain("137,024"); // 连数字本身也不许漏（防"改了单位没改数"）
     expect(sig).not.toContain("步");
     expect(sig.toLowerCase()).not.toContain("step");
     expect(document.querySelector(".modelsig-steps")).toBeNull();

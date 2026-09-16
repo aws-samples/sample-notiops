@@ -521,7 +521,16 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 /* Sources 面板左侧的可拖拽分割线（对称于左侧栏的 .resize-handle） */
 .src-resize { width: 5px; flex-shrink: 0; cursor: col-resize; background: transparent; margin-right: -3px; z-index: 5; position: relative; }
 .src-resize:hover, .src-resize:active { background: var(--orange); opacity: .5; }
-.src-head { display: flex; align-items: center; justify-content: space-between; padding: 15px 16px; border-bottom: 1px solid var(--line); font-weight: 700; font-size: 15px; color: var(--text); }
+/* 高度必须与 `.topbar`（第 204 行）**逐像素相同**，不是"看着差不多"：右停靠面板与主区
+   顶栏是**并排**的两个 flex 列，两条 border-bottom 在同一水平线上才不会露出台阶。
+   全局 `* { box-sizing: border-box }` 生效，所以 54px 是含那 1px 边框的总高 —— 因此这里
+   写死 `height` 而不是用 padding 撑：撑出来的高度会跟着内容变（这一行里那颗 `.panel-btn`
+   是 32px，`15+32+15+1 = 63px`，正是现网那 9px 台阶的来历），以后谁往这一行里加个图标、
+   或者标题换成两行字，台阶就又回来了。
+   `flex-shrink: 0`：`.src-panel` 是 flex 列且 `.src-body` 带 `flex: 1`，定高元素在列里会被
+   压缩，少了它在内容很长时高度又会漂回去。
+   移动端不受影响：那边 `.src-panel` 是 `position: fixed; top: 0` 的全屏抽屉，压根不与顶栏并排。 */
+.src-head { display: flex; align-items: center; justify-content: space-between; height: 54px; flex-shrink: 0; padding: 0 16px; border-bottom: 1px solid var(--line); font-weight: 700; font-size: 15px; color: var(--text); }
 .src-body { flex: 1; overflow-y: auto; padding: 14px 16px; }
 .src-group { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 6px 0 9px; }
 .src-item { display: flex; gap: 11px; padding: 11px 13px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 9px; }

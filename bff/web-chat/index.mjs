@@ -1564,6 +1564,16 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
       // 于是任何首个产出 >15s 的普通轮次（Grok 先想再连调几个工具很常见）都被谎报成冷启动。
       // 纯瞬态：走 progress 通道 → 前端收到正文即清空，不入库、不置 streamedAny，冷启动重试仍安全。
       let sawAgentOutput = false;   // agent 已有任何真实产出 → 等待结束，停提示
+      // ── "容器到底有没有跑起来" —— 这两个标记跨整个重试周期累计（**必须**声明在循环外）。
+      // 用途不是提示文案（那是 waitHint 的活，而且它 stop() 之后 phase 就变 done，问不出来了），
+      // 而是下面 `if (!reply)` 那个岔路口的**硬判据**：
+      //   · everOpened —— InvokeAgentRuntime 的响应头回来过（平台侧把请求交给容器了）；
+      //   · everReady  —— agent entrypoint 的第一帧到过 = **容器里的 Python 真的跑起来过**。
+      // 2026-09-16 的事故就是缺这个判据：agent 容器每次启动都在 import 阶段崩
+      // （strands-agents 1.56.0 删了 bedrock-agentcore 要 import 的符号），平台把它当
+      // "初始化超时"报出来，报文与真正的空闲冷启动**一模一样**，于是我们连着三次失败
+      // 之后还在劝用户"请再发送一次消息" —— 而我们自己刚刚已经替他发了三次。
+      let everOpened = false, everReady = false;
       const waitHint = createWaitHint({
         locale,
         emit: (text, kind) => {
@@ -1611,11 +1621,11 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
         onRuntimeError: (err) => {
           console.error(`[BFF] /stream agent runtime error frame — type=${err?.type || "?"} model=${model || "-"}`);
         },
-        // ↓ 这两个只切等待期提示的阶段，不产生任何前端事件、不置 streamedAny。
+        // ↓ 这两个只切等待期提示的阶段 + 记一个跨重试的标记，不产生任何前端事件、不置 streamedAny。
         // onOpen  = InvokeAgentRuntime 的响应头到了（平台侧不再是"拉容器"阶段）。
         // onReady = agent entrypoint 的第一帧（容器里的代码真跑起来了，比 onOpen 更硬）。
-        onOpen: () => waitHint.opened(),
-        onReady: () => waitHint.ready(),
+        onOpen: () => { everOpened = true; waitHint.opened(); },
+        onReady: () => { everReady = true; waitHint.ready(); },
       };
       // 冷启动类错误(容器初始化超时/未就绪)才重试；真实业务错误不重试。
       const isColdStart = (e) => {
@@ -1624,8 +1634,10 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
       };
       const MAX_ATTEMPTS = 3;
       let lastErr;
+      let attemptsMade = 0;   // 实际打出去的次数（下面区分"没醒" vs "起不来"要用，循环变量出不了作用域）
       startHeartbeat(); // 冷启动阻塞期间的过程提示（5s 后起，每 10s 一条；见 first token 即停）
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        attemptsMade = attempt;
         try {
           reply = await invokeAgent(
             // allowedAccounts：可见性 RBAC 下发给 agent，防 prompt 点名账号绕过门禁
@@ -1667,13 +1679,40 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
       if (!reply) {
         // 仍无产出——冷启动没醒给明确的下一步建议（区分 vs 真空响应），避免空白气泡。
         // 冷启动失败文案带"再发一次"引导：第二次请求通常已落到预热/已热实例。
-        reply = lastErr && isColdStart(lastErr)
+        //
+        // ⚠️ 但"冷启动没醒"和"容器根本起不来"在平台报文里长得**一模一样**（都是
+        // `Runtime initialization time exceeded` / RuntimeClientError），isColdStart() 分不开。
+        // 2026-09-16 的事故（agent 容器每次启动都在 import 阶段崩）就撞在这上面：客户看到的
+        // 永远是"请再发送一次消息"，而那条建议**可证伪** —— 我们刚替他连试了 MAX_ATTEMPTS 次，
+        // 每次都死在同一处。于是它把一次硬故障伪装成了一次运气不好，客户按提示重发到放弃。
+        //
+        // 判据用后台真实信号，不猜文案：`everReady` = agent entrypoint 的第一帧到过
+        // = 容器里的代码真跑起来过。全部尝试都失败且**一次都没 ready** → 这是部署问题，
+        // 得把话说成部署问题，并指向真正能看到根因的地方。
+        // 为什么还要 `!everOpened`：`ready` 帧是我们自己 agent 发的，老版本 agent 不发它
+        // （见 wait_hint.mjs：「旧版 runtime 不发 ready，仍有 opened 兜底」）—— 只看
+        // everReady 会把一个健康的老 agent 误判成"起不来"。而 onOpen 是 client.send()
+        // resolve 才触发的（agentcore.mjs:124），import 阶段崩溃时平台直接抛错、响应头根本
+        // 不会回来，所以加上这一条在真故障上不丢判据，只挡掉误判。
+        const neverStarted = !!lastErr && isColdStart(lastErr)
+          && attemptsMade >= MAX_ATTEMPTS && !everReady && !everOpened;
+        if (neverStarted) {
+          // 可观测性：这条与普通冷启动必须能在 CloudWatch 里分开数（它意味着"该发版了"，
+          // 不是"该等一等"）。只记类型/次数，不记原始报文（docs/LOGGING_STANDARD.md）。
+          console.error(`[BFF] /stream agent runtime never became ready — attempts=${attemptsMade} `
+            + `errType=${lastErr?.name || "?"} opened=${everOpened} ready=${everReady}`);
+        }
+        reply = neverStarted
           ? (locale === "en"
-              ? "⏳ The service is still starting up and didn't respond in time (cold start after idle).\n\n**Next step:** send your message again — the second request usually lands on an already-warmed instance and responds immediately."
-              : "⏳ 服务仍在启动中，本次未能及时响应（空闲后的冷启动）。\n\n**下一步：** 请再发送一次消息 —— 第二次请求通常会落到已预热的实例，会立即响应。")
-          : lastErr
-            ? modelFailureText(locale, lastErr)
-            : (locale === "en" ? "(no response)" : "（无响应）");
+              ? "⚠️ **The agent service cannot start.** All " + MAX_ATTEMPTS + " attempts stopped during container initialization — the code inside the container never ran once. This is **not** an idle cold start, so sending the message again will not help; it needs whoever deployed this system.\n\n**Next steps (for the operator):**\n1. Open the AgentCore Runtime container logs in CloudWatch Logs — log group prefix `/aws/bedrock-agentcore/runtimes/`. If the container dies while importing, the `ImportError` / `ModuleNotFoundError` is right there.\n2. Do not read the runtime's `status: READY` as a health signal — it only means the configuration and ARN are registered. All-green CloudFormation stacks mean the same thing.\n3. The usual root cause is a Python dependency of the agent broken by a new upstream release. Redeploying the agent (`scripts/deploy_agent.sh`) re-resolves the dependencies — read the logs first to confirm which version broke."
+              : "⚠️ **Agent 服务起不来。** 连续 " + MAX_ATTEMPTS + " 次请求都停在容器初始化阶段，容器里的代码一次都没跑起来。这**不是**空闲后的冷启动 —— 再发一次也不会好，需要部署这套系统的人处理。\n\n**下一步（给部署/运维的人）：**\n1. 去 CloudWatch Logs 看 AgentCore Runtime 的容器日志（日志组前缀 `/aws/bedrock-agentcore/runtimes/`）。容器在 import 阶段崩溃时，`ImportError` / `ModuleNotFoundError` 就在那里。\n2. 别把 runtime 的 `status: READY` 当健康证明 —— 它只表示配置和 ARN 已注册；CloudFormation 四个栈全绿同理不代表容器活着。\n3. 常见根因是 agent 的 Python 依赖被上游的新版本打挂。重新部署 agent（`scripts/deploy_agent.sh`）会重新解析依赖 —— 先看日志确认是哪个版本坏的，再部。")
+          : lastErr && isColdStart(lastErr)
+            ? (locale === "en"
+                ? "⏳ The service is still starting up and didn't respond in time (cold start after idle).\n\n**Next step:** send your message again — the second request usually lands on an already-warmed instance and responds immediately."
+                : "⏳ 服务仍在启动中，本次未能及时响应（空闲后的冷启动）。\n\n**下一步：** 请再发送一次消息 —— 第二次请求通常会落到已预热的实例，会立即响应。")
+            : lastErr
+              ? modelFailureText(locale, lastErr)
+              : (locale === "en" ? "(no response)" : "（无响应）");
         stream.write(sse("token", { delta: reply }));
       }
     } else {

@@ -199,6 +199,40 @@ else:
           f"customer CUR source: {'configured' if cost_mcp else '(empty, cost questions fall back to CE / aws-api)'}")
 PY
 
+# ── 2.9 部署前硬门禁：约束下装出来的组合必须真能 import ──────────────────────
+#
+# 🔴 2026-09-20 现网事故的直接防复发。那天发生的事：`bedrock-agentcore` 发了 1.23.1，
+# 它 import `strands.experimental.bidi.hooks`（strands 1.55.1 里没有那个模块），而我们的
+# 上界允许装出这个组合 ⇒ **agent 容器 100% import 崩、现网聊天全挂约 25 分钟**，
+# 而 `agentcore deploy` 从头到尾**报成功**。
+#
+# ⚠️ 为什么原有的防线不够（三条都不够，这是本门禁存在的理由）：
+#   · CI 的 `agent-dep-import-smoke` 有 `changes:` 触发条件 —— 只在**我们自己**改了
+#     agent manifest 时才跑。而坏组合是**上游发新版本**造成的，我们这边一行没动。
+#   · `--latest` 那条金丝雀只在 `$CI_PIPELINE_SOURCE == "schedule"` 时触发，而那个
+#     scheduled pipeline 要人在 GitLab UI 里手工建 —— **依赖人记得点一下的控制是弱控制**，
+#     事故当天它确实没建。
+#   · AgentCore 的 **DEFAULT endpoint 不能指回旧版本**（实测：
+#     `update-agent-runtime-endpoint --agent-runtime-version <旧>` 回
+#     `ConflictException: Default endpoints are managed through agent updates`），
+#     所以这类事故**没有回滚这条路**，只能向前修 —— 那就必须在**上线之前**拦住。
+#
+# 这道门禁把风险从「时间维度」搬回「动作维度」：**每一次部署**都重新验证一次，
+# 而不是指望某个定时任务。代价约 60 秒（在临时 venv 里装约束集并逐个 import）。
+# 跳过（只在明确知道自己在干什么时）：SKIP_DEP_VERIFY=true
+if [ "${SKIP_DEP_VERIFY:-false}" != "true" ]; then
+  echo "  $(t "校验依赖约束下装出来的组合能不能 import（约 1 分钟）…" "Verifying that the constrained dependency set actually imports (~1 min)...")"
+  if ! python3 "$PROJECT_ROOT/scripts/verify_agent_deps.py"; then
+    echo "" >&2
+    echo "  $(t "❌ 拒绝部署：当前依赖约束会装出一个 import 不起来的组合。" "❌ Refusing to deploy: the current dependency constraints resolve to a set that fails to import.")" >&2
+    echo "     $(t "这正是 2026-09-20 现网事故的形态 —— 部上去的表现是「四个栈全绿、runtime status READY、" "This is exactly the 2026-09-20 production incident shape -- deploying anyway looks like \"all stacks green, runtime status READY,")" >&2
+    echo "     $(t "聊天永久转圈」，而且 AgentCore 的 DEFAULT endpoint **不能回滚到旧版本**。" "chat spins forever\", and AgentCore's DEFAULT endpoint CANNOT be rolled back to an older version.")" >&2
+    echo "     $(t "修法：按上面点名的那个包收紧 agent/pyproject.toml 与 agent-build/.../pyproject.toml" "Fix: tighten the upper bound of the package named above in BOTH agent/pyproject.toml and")" >&2
+    echo "     $(t "的上界（两份必须逐字一致），再重跑本脚本。" "agent-build/.../pyproject.toml (they must match word for word), then re-run this script.")" >&2
+    exit 1
+  fi
+fi
+
 # ── 3. 部署 ──
 # agentcore deploy 底层用 CDK，需要账号已 bootstrap。setup.sh 的 bootstrap 在更后面，
 # 故这里先幂等 bootstrap 一次（已 bootstrap 则秒过），避免新账号首次部署失败。
@@ -339,3 +373,64 @@ REGION="$REGION" RT_ARN="$ARN" SET_IDLE=3600 UI_LANG="$UI_LANG" \
     "NOTIOPS_ALLOW_CROSS_ACCOUNT=$ALLOW_CROSS_ACCOUNT" \
     "COST_AGENT_MCP_URL=$COST_AGENT_MCP_URL" \
   || echo "  $(t "⚠ env 回填/idle 设置未完成(不阻断);可稍后重跑。" "⚠ env backfill / idle setting did not complete (non-blocking); re-run later.")" >&2
+
+# ── 5. 部署后 smoke：容器**真的起来了**吗 ─────────────────────────────────────
+#
+# 🔴 2026-09-20 现网事故的第二道防复发。那天 `agentcore deploy` 与 runtime 的
+# `status: READY` **都报成功**，而容器每次调用都在 import 阶段崩 —— 因为
+# **容器只在首次调用时才起**，部署流程本身从来不调它一次。
+# 于是"部署成功"与"聊天可用"之间有一整个缺口，而客户是第一个发现的人。
+#
+# 这里发一次最小请求，只看**第一帧**：agent entrypoint 活过 import 才会 yield
+# `{"ready": true}`（BFF 侧的 `onReady` 判据就是它，见 bff/web-chat/wait_hint.mjs）。
+# ⚠️ 判据**不是** `status: READY` —— 那只表示配置与 ARN 已注册，它在事故当天也是 READY。
+# 不阻断（部署已经发生、拦不住了），但必须**大声说**，因为这是唯一能在客户之前
+# 发现"上线即挂"的时机。
+if [ "${SKIP_DEPLOY_SMOKE:-false}" != "true" ]; then
+  echo "  $(t "部署后 smoke:发一次最小请求,确认容器真的能起来…" "Post-deploy smoke: sending one minimal request to confirm the container actually starts...")"
+  if REGION="$REGION" RT_ARN="$ARN" python3 - <<'SMOKE'
+import json
+import os
+import sys
+import uuid
+
+import boto3
+
+arn = os.environ["RT_ARN"]
+c = boto3.client("bedrock-agentcore", region_name=os.environ["REGION"])
+try:
+    r = c.invoke_agent_runtime(
+        agentRuntimeArn=arn,
+        runtimeSessionId=f"deploy-smoke-{uuid.uuid4().hex}{uuid.uuid4().hex}"[:60],
+        payload=json.dumps({"prompt": "ping", "locale": "en"}).encode(),
+    )
+    for raw in r["response"].iter_lines():
+        if not raw:
+            continue
+        line = raw.decode("utf-8", "replace")
+        if line.startswith("data: "):
+            line = line[6:]
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if ev.get("ready"):
+            sys.exit(0)          # 容器活过 import —— 这是我们唯一要确认的事
+    sys.exit(2)                  # 流结束了却没见过 ready 帧
+except Exception as e:           # noqa: BLE001
+    print(f"    ({type(e).__name__})", file=sys.stderr)
+    sys.exit(3)
+SMOKE
+  then
+    echo "  $(t "✓ 容器起来了(收到 agent 的第一帧)" "✓ The container starts (got the agent's first frame)")"
+  else
+    echo "" >&2
+    echo "  $(t "🔴 部署成功了,但容器起不来 —— 聊天现在是坏的。" "🔴 The deploy succeeded but the container does not start -- chat is broken right now.")" >&2
+    echo "     $(t "⚠️ 别看 runtime 的 status: READY —— 那只表示配置已注册,事故当天它也是 READY。" "⚠️ Ignore the runtime status: READY -- it only means the config is registered; it was READY during the incident too.")" >&2
+    echo "     $(t "先看容器日志(前缀):" "Check the container logs (prefix):")" >&2
+    echo "       /aws/bedrock-agentcore/runtimes/" >&2
+    echo "     $(t "最常见的根因是 agent 的 Python 依赖被上游新版本打挂。本地 1 分钟就能精确复现:" "The most common cause is an upstream release breaking the agent's Python deps. Reproduce it locally in ~1 min:")" >&2
+    echo "       python3 scripts/verify_agent_deps.py" >&2
+    echo "     $(t "⚠️ AgentCore 的 DEFAULT endpoint **不能回滚到旧版本**,只能向前修再重部。" "⚠️ AgentCore's DEFAULT endpoint CANNOT be rolled back to an older version -- you must fix forward and redeploy.")" >&2
+  fi
+fi

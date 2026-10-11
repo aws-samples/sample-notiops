@@ -20,13 +20,19 @@ ACK(Slack 的 3s 硬超时)→ 异步投给 worker Lambda 干活。
 ## 与飞书的功能对等
 
 ✅ `@bot 自然语言` / DM / `/devops` 触发,答案回 thread
-✅ 确定性双语路由(0 token):`help` / `language` / `model` / `investigate` / `case` / `chat`
+✅ 确定性双语路由(0 token):`help` / `language` / `model` / `agent` / `web` / `account` / `investigate` / `investigate_status` / `case`,认不出的落到兜底的 `chat`
 ✅ 多轮上下文("再查一下它的安全组")
 ✅ 创建 / 列出 / 查看 / 回复 / 关闭案例(案例表单带案例类型 + 服务名称)
 ✅ 升级到 AWS Support(报告 → 🆘 → Modal)
 ✅ 创建案例时同时启动 Agent 调查(与飞书同一条 `core.devops_agent` 路径)
 ✅ 调查报告 → "📎 同步到 Case" 按钮
-✅ 主动观察(CloudWatch Alarm / Health / Backup / GuardDuty / Cost / Trusted Advisor)推送
+
+> ⚠️ **主动推送还没对等**:每日通知、Health(PHD)和 CloudWatch Alarm / Backup / GuardDuty /
+> Cost Anomaly / Trusted Advisor 这类实时事件推送目前都**不投 Slack**。能投到 Slack channel 的
+> 主动推送只有**巡检推送**(巡检只有 `setup.sh` 部署才有),但本版本**还没有**把 Slack channel
+> 登记成巡检推送目标的途径:没有网页入口(「集成 IM」的 Slack 分页只收 Bot Token 和 Signing
+> Secret),`setup.sh` 不问,发布包里也没有对应的工具。所以这一版的 Slack 只用来和 bot 对话,
+> 巡检结果在 Web Chat「更多 → 巡检」里看。上面那些 ✅ 都是用户先开口的交互,不受影响。
 
 ## 架构
 
@@ -168,11 +174,12 @@ App-Level Token(`xapp-...`),那是长连接时代的东西。
 
 部署完成后再填,两种方式:
 
-1. **(推荐,不需要任何 AWS 权限)** 登录 Web Chat →「管理控制台 → 集成 IM → **Slack** 分页」,
+1. **(推荐,不需要任何 AWS 权限)** 登录 Web Chat(admin)→ 左侧「更多 → 管理」→「集成 IM」→ **Slack** 分页,
    填 **Bot User OAuth Token** 和 **Signing Secret**,保存。那一页的「已配置」徽标是按**值的形状**
    判断的(`xoxb-` 前缀 / 32 位十六进制),所以随机占位值只会显示「未配置」,不会骗你;
    保存后点「测试凭证」会调 `auth.test` 把 workspace / bot 名字和**缺的 scope 逐条**报出来。
-2. 直接更新 Secret(有 AWS 控制台/CLI 权限时的等价做法):
+2. 直接更新 Secret(有 AWS 控制台/CLI 权限时的等价做法;一键部署的模板**不建**这两个 Secret,
+   那条路径下先用第 1 种保存一次):
    ```bash
    aws secretsmanager put-secret-value --secret-id notiops/slack-bot-token \
      --secret-string '<从 OAuth & Permissions 页复制的 bot token>' --region <REGION>
@@ -181,7 +188,7 @@ App-Level Token(`xapp-...`),那是长连接时代的东西。
    `SecretString` 当值用,写成 `{"bot_token":"xoxb-..."}` 会把这一整坨当 token 发出去。
 
 不论走哪条路径:Lambda 是**冷启动时**读 Secret 的,改完等旧执行环境自然回收即可,急的话改一下
-ingress 的环境变量(任意无害的值)强制换一批执行环境 —— 做法和注意点见 `docs/DEPLOYMENT.md` §8.2。
+ingress 的环境变量(任意无害的值)强制换一批执行环境 —— 做法和注意点见 `docs/DEPLOYMENT.md` §8.3。
 
 > `notiops/slack-app-token`(`xapp-...`)是 Socket Mode 时代的东西,webhook 路径**不读它**。
 
@@ -236,8 +243,11 @@ aws logs tail /aws/lambda/notiops-im-worker-slack --region <REGION> --follow
 # 消息停在「正在思考」不动 —— 看进度轮询
 aws logs tail /aws/lambda/notiops-im-progress --region <REGION> --follow
 
-# 改了 Slack 适配器代码后重新部署(在仓库根执行):
-cd ../../infra && npx cdk deploy ImStack
+# 改了 Slack 适配器代码后重新部署(在仓库根执行)—— 重跑 setup.sh,它会带上部署时的全部 -c 参数:
+./setup.sh
+# ⚠️ 别单独跑 `npx cdk deploy ImStack`:不带 setup.sh 平时传的那些 -c,它会按默认值重新合成
+#    (enabledPlatforms 回到 feishu → Slack 的路由和函数被换掉;agentRuntimeArn 变空;多账号部署的
+#    跨账号闸门被重新锁上)。见 docs/DEPLOYMENT.md §8.1。
 ```
 
 | 症状 | 常见原因 |
@@ -275,7 +285,7 @@ cd ../../infra && npx cdk deploy ImStack
 |---|---|
 | [lambda_ingress.py](lambda_ingress.py) | webhook 入口:验签 + challenge + 异步投 worker + 👀 表情 |
 | [lambda_worker.py](lambda_worker.py) | 干活儿的:幂等去重 + locale + 规范化 → `common.router` |
-| [caps.py](caps.py) | `SlackCaps` —— 七个能力在 Slack 上的实现 |
+| [caps.py](caps.py) | `SlackCaps` —— 十条能力在 Slack 上的实现 |
 | [im_blocks.py](im_blocks.py) | Block Kit 渲染(进度、答案、案例表单) |
 | [app/blocks.py](app/blocks.py) | 通用 Block Kit 组件(section / button / modal / input 等) |
 | [app/support_flow.py](app/support_flow.py) | "升级到 Support" Modal + 提交处理 |
@@ -292,8 +302,8 @@ cd ../../infra && npx cdk deploy ImStack
 | [../common/quick_ack.py](../common/quick_ack.py) | 提问后的 👀 表情(三平台共用,永不抛) |
 | [../common/live_card.py](../common/live_card.py) | 自刷新进度卡 |
 | [../common/lambda_progress.py](../common/lambda_progress.py) | 进度轮询 Lambda(扫 `imtask#` 行) |
-| [../../core/nl_router.py](../../core/nl_router.py) | 双语正则意图路由(六条路) |
-| [../../core/bedrock_intent.py](../../core/bedrock_intent.py) | Bedrock 意图总结(只剩案例路径用) |
+| [../../core/nl_router.py](../../core/nl_router.py) | 双语正则意图路由(九条路 + 兜底 `chat`) |
+| [../../core/bedrock_intent.py](../../core/bedrock_intent.py) | 旧的 Bedrock 意图分类;webhook 现网路径已不调它(只剩已退役的长连接 `app/` 引用) |
 | [../../core/case_classifier.py](../../core/case_classifier.py) | AWS Support service/category 分类器 |
 | [../../core/case_management.py](../../core/case_management.py) | Support API 5 个操作 |
 | [../../core/chat_history.py](../../core/chat_history.py) | 滚动会话上下文 |
@@ -301,4 +311,4 @@ cd ../../infra && npx cdk deploy ImStack
 | [../../core/next_steps.py](../../core/next_steps.py) | 报告后 next-step 按钮 |
 | [../../core/push_event.py](../../core/push_event.py) | EventBridge 推送事件归一化 |
 | [../../core/support_logic.py](../../core/support_logic.py) | Support case 创建逻辑 |
-| [../../core/webhook_dispatch.py](../../core/webhook_dispatch.py) | HMAC 派发到 DevOps Agent |
+| [../../core/webhook_dispatch.py](../../core/webhook_dispatch.py) | HMAC 签名的 DevOps Agent generic webhook 派发;现网深度调查不走它(走 `core/devops_agent.py` 的 CreateBacklogTask) |

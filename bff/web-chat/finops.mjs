@@ -20,10 +20,10 @@ import { AthenaClient, StartQueryExecutionCommand, GetQueryExecutionCommand, Get
 import { GlueClient, GetDatabasesCommand, GetTablesCommand } from "@aws-sdk/client-glue";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import { CostAndUsageReportServiceClient, DescribeReportDefinitionsCommand } from "@aws-sdk/client-cost-and-usage-report-service";
 import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
 import { getDailyAnomalies } from "./daily_anomaly.mjs";
+import { invokeInsight } from "./insight_llm.mjs";
 import { getPotentialSavings } from "./potential_savings.mjs";
 import { getCostExplorerDashboard, currentPayerAccountId, setAccountScope, listCostAllocationTagKeys, listCostAllocationTagValues, getCostByTag } from "./cost_explorer.mjs";
 import { findPayerAccount, getAssumedCredentialsForAccount } from "./devops_agent_accounts.mjs";
@@ -473,30 +473,12 @@ async function _runQueryFull(sql, database) {
 // 仅对【已 grounded 的 Athena 行】做归纳/选图；数值不经模型手 → 不幻觉。
 async function _deepDiveInsight(scenario, rows, period) {
   try {
-    const bedrock = new BedrockRuntimeClient({ region: process.env.AWS_REGION || "us-east-1" });
     const prompt = `You are a FinOps analyst. The JSON below is the exact result of a Cost & Usage Report (CUR) Athena query for scenario "${scenario}", covering ${period || "the current calendar month to date"}. Using ONLY these rows — never invent numbers — return STRICT JSON:
 {"insight":"<2-3 sentences on the biggest cost drivers, cite the real numbers, and state the time window (${period || "month to date"})>","recommendations":["<specific, actionable cost-optimization action tied to the data — e.g. reduce/consolidate/rightsize/change tier, name the driver and roughly how much it could save>","<2 to 4 items total, most impactful first>"],"chart":{"type":"bar"|"pie","labelKey":"<grouping column name from the rows>","valueKey":"<numeric cost column name, e.g. cost_usd>","title":"<short title>"}}
 Rows (top 40): ${JSON.stringify(rows.slice(0, 40))}
 Return ONLY the JSON object, no markdown, no prose.`;
-    const resp = await bedrock.send(new ConverseCommand({
-      // 注：这里的 model 是**硬编码**、不走 llmcfg 目录 —— 它是 dashboard 洞察生成，
-      // 不是用户可选的对话模型。已与目录口径对齐到 global.*（决策 2026-07）；
-      // 2026-09-01 随产品默认模型一起改成 Grok 4.6（= 目录的 default_model）。
-      // 若要纳入 Admin 管理，应作为一类 backend_task 加进目录（现有的只有
-      // phd_translate / devops_report_summarize 两个），而不是在这里各自写死。
-      modelId: "global.xai.grok-4.6",
-      messages: [{ role: "user", content: [{ text: prompt }] }],
-      // **不要传 temperature**（换成 Grok 之后这条依然成立，别"顺手加回来"）。
-      // 教训来自 Sonnet 5：它弃用了该参数（adaptive thinking 常驻），传了整个请求
-      // ValidationException:「`temperature` is deprecated for this model」—— 而这一段的
-      // 异常被兜进 aiError，界面表现只是"洞察是空的"，没有任何报错。实测 2026-08-26
-      // 确认：带 temperature 必失败，去掉即正常。这里的模型是可改的（见上），所以不能
-      // 依赖"当前这个模型接受 temperature"；确定性也不靠采样参数，靠提示词里的
-      // STRICT JSON 约束。同一个坑在 llm_config.mjs 的探测里踩过一次，那次至少有
-      // 枚举态可查，这里连状态都没有。
-      inferenceConfig: { maxTokens: 1000 },
-    }));
-    const txt = resp.output?.message?.content?.[0]?.text || "";
+    // 用哪个模型、多大预算、为什么不是产品默认模型、为什么不传 temperature：见 insight_llm.mjs。
+    const txt = await invokeInsight(prompt);
     const parsed = JSON.parse(txt.slice(txt.indexOf("{"), txt.lastIndexOf("}") + 1));
     return {
       insight: String(parsed.insight || ""),
@@ -566,7 +548,6 @@ export async function getDeepDive(scenario) {
 async function _tagCostInsight(tagKey, tagValue, rows, totalUsd, period) {
   try {
     if (!rows || rows.length === 0) return { insight: "", recommendations: [] };
-    const bedrock = new BedrockRuntimeClient({ region: process.env.AWS_REGION || "us-east-1" });
     const scope = tagValue == null
       ? `all values of cost-allocation tag "${tagKey}"`
       : (tagValue === "" ? `resources with NO value for tag "${tagKey}" (untagged)` : `tag ${tagKey}=${tagValue}`);
@@ -574,25 +555,8 @@ async function _tagCostInsight(tagKey, tagValue, rows, totalUsd, period) {
 {"insight":"<2-3 sentences on which services dominate this tag's cost, cite the real numbers and the time window>","recommendations":["<specific, actionable cost-optimization action tied to the data>","<1 to 3 items total, most impactful first>"]}
 Rows (top 40): ${JSON.stringify(rows.slice(0, 40))}
 Return ONLY the JSON object, no markdown, no prose.`;
-    const resp = await bedrock.send(new ConverseCommand({
-      // 注：这里的 model 是**硬编码**、不走 llmcfg 目录 —— 它是 dashboard 洞察生成，
-      // 不是用户可选的对话模型。已与目录口径对齐到 global.*（决策 2026-07）；
-      // 2026-09-01 随产品默认模型一起改成 Grok 4.6（= 目录的 default_model）。
-      // 若要纳入 Admin 管理，应作为一类 backend_task 加进目录（现有的只有
-      // phd_translate / devops_report_summarize 两个），而不是在这里各自写死。
-      modelId: "global.xai.grok-4.6",
-      messages: [{ role: "user", content: [{ text: prompt }] }],
-      // **不要传 temperature**（换成 Grok 之后这条依然成立，别"顺手加回来"）。
-      // 教训来自 Sonnet 5：它弃用了该参数（adaptive thinking 常驻），传了整个请求
-      // ValidationException:「`temperature` is deprecated for this model」—— 而这一段的
-      // 异常被兜进 aiError，界面表现只是"洞察是空的"，没有任何报错。实测 2026-08-26
-      // 确认：带 temperature 必失败，去掉即正常。这里的模型是可改的（见上），所以不能
-      // 依赖"当前这个模型接受 temperature"；确定性也不靠采样参数，靠提示词里的
-      // STRICT JSON 约束。同一个坑在 llm_config.mjs 的探测里踩过一次，那次至少有
-      // 枚举态可查，这里连状态都没有。
-      inferenceConfig: { maxTokens: 700 },
-    }));
-    const txt = resp.output?.message?.content?.[0]?.text || "";
+    // 用哪个模型、多大预算、为什么不是产品默认模型、为什么不传 temperature：见 insight_llm.mjs。
+    const txt = await invokeInsight(prompt);
     const parsed = JSON.parse(txt.slice(txt.indexOf("{"), txt.lastIndexOf("}") + 1));
     return {
       insight: String(parsed.insight || ""),

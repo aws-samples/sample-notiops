@@ -14,17 +14,19 @@
 —— 全程在网页里完成,无需切到 AWS 控制台。
 
 同一个助手也能**接入团队已在用的聊天工具(Slack / 飞书 / 钉钉)**:在告警群里 `@` 机器人
-即可发起调查,并直接在告警落地的地方读报告。除了即时提问,它还能对 10 类 AWS 信号源
-做**主动推送**(CloudWatch、AWS Health、Backup、GuardDuty、成本异常、Trusted Advisor、
-EC2 Spot 中断预警、Auto Scaling 启动失败、RDS、Config),每类可独立开关。
+即可发起调查,并直接在告警落地的地方读报告。除了即时提问,它还会把 10 类 AWS 信号源
+(CloudWatch、AWS Health、Backup、GuardDuty、成本异常、Trusted Advisor、EC2 Spot 中断预警、
+Auto Scaling 启动失败、RDS、Config)的事件**主动推送**到 Web Chat 的「通知」收件箱,每类可独立开关。
 
 所有模型都通过 **Amazon Bedrock** 接入(托管的安全、合规与成本管控),可按会话切换
-模型,并自动做中英文本地化。**只读承诺**的硬边界是**只读 IAM 角色**(两条入口访问
-你账号用的都是它,对你的基础设施从不授予写权限),之上再按入口做纵深防御:网页端是工具层只读
-+ 命令级 denylist(拦 `get-secret-value` 这类「是只读但不该读」的动作)+ 严格只读的
+模型,并自动做中英文本地化。**只读承诺**的硬边界是 **IAM 权限**:两条入口访问你账号用的
+角色对你的基础设施只读,改资源的写操作拿不到权限;NotiOps 自己的资源(表、桶等)之外,
+它们唯一的写权限是 AWS Support 工单的建 / 回 / 关,而且只在你确认预览之后才执行(成员账号的
+角色可用模板参数 `EnableSupportCaseWrite=false` 收成严格只读)。之上再按入口做纵深防御:
+网页端是工具层只读 + 命令级 denylist(拦 `get-secret-value` 这类「是只读但不该读」的动作)+ 严格只读的
 system prompt;IM 端直连 AWS DevOps Agent 的只读 agent,NotiOps 侧再加一条强变更
 措辞正则作二道门。助手只读取、只推理,绝不改动你的云环境 —— 因此可放心交给
-on-call 工程师使用,而无需授予写权限。
+on-call 工程师使用,而无需给他们对基础设施的写权限。
 
 ---
 
@@ -32,6 +34,7 @@ on-call 工程师使用,而无需授予写权限。
 
 | 文档 | 用途 |
 |---|---|
+| 📝 [AWS 官方博客(中文)](https://aws.amazon.com/cn/blogs/china/using-agentic-ai-assistant-notiops-build-aws-operations/) | 产品介绍文章:为什么做 NotiOps、它怎么用、架构与只读边界 |
 | 🚀 [一键部署](docs/DEPLOYMENT_ONECLICK.md) | 只要一个浏览器:上传一份 CloudFormation 模板,大约 5 分钟拿到 Web Chat(可选加装一个 IM 机器人:飞书/Lark、Slack 或钉钉) |
 | ✅ [前置条件](docs/PREREQUISITES.md) | **跑 `./setup.sh` 之前先看这页**:环境要求 + 逐项处方 + 一条命令的自检脚本(走一键部署不需要) |
 | 🛠 [部署指南](docs/DEPLOYMENT.md) | 完整版:从 `./setup.sh` 到首次冒烟测试的分步指南(Web 控制台 + 可选 IM) |
@@ -54,16 +57,16 @@ on-call 工程师使用,而无需授予写权限。
   大模型直连 API,同样不耗 token(代价:调查描述按你的原话透传,不做智能改写)
 - 🛎️ **主动观测**:10 类 EventBridge 信号源(CloudWatch / Health / 成本异常 /
   Trusted Advisor / GuardDuty / Backup / EC2 Spot 中断预警 / Auto Scaling 启动失败 /
-  RDS / Config),每类可独立开关 —— 其中 5 类默认开启
+  RDS / Config)进 Web Chat 的「通知」收件箱,每类可独立开关 —— 其中 5 类默认开启
 - 📋 **完整 AWS Support 工单管理**:创建 / 列表 / 查看 / 回复 /
   **智能分析**(对工单会话做 LLM 归纳) / 解决
 - 💬 **AWS 概念问答**:Bedrock + Knowledge MCP 检索官方文档,答案带 📚 来源引用
-- 🤖 **多模型切换**:由运维方管理的模型目录 —— 在 Admin 控制台里勾选本部署对外提供
+- 🤖 **多模型切换**:由运维方管理的模型目录 —— 在「更多 → 管理 → 模型」里勾选本部署对外提供
   哪些模型、设默认模型、指定后端任务用哪个模型,改完即时生效无需重新部署;用户侧
   仍按会话保存自己的模型偏好。所有模型均通过 **Amazon Bedrock** 接入(托管的安全、
   合规与成本管控),凭证可用 IAM 或 Bedrock API Key
 - 🌍 **双语**:中 / 英自动识别 + 显式切换
-- 🛡 **只读承诺**:硬边界是只读 IAM 角色;之上按入口纵深防御 —— 网页端工具层只读 + 命令级 denylist + 只读 system prompt,IM 端 DevOps Agent 只读 agent + 强变更措辞正则二道门 —— 助手绝不改动你的云
+- 🛡 **只读承诺**:硬边界是 IAM 权限(对你的基础设施只读;NotiOps 自身资源之外,唯一的写权限是 Support 工单的建 / 回 / 关,确认预览后才执行);之上按入口纵深防御 —— 网页端工具层只读 + 命令级 denylist + 只读 system prompt,IM 端 DevOps Agent 只读 agent + 强变更措辞正则二道门 —— 助手绝不改动你的云
 - 💬 **IM 渠道**:Slack / 飞书 / 钉钉 全功能 —— 提问后**立刻**有回应:飞书 / Slack 上过程 / 思考 / 答案都刷在**同一张卡**上(标题里的秒数就是"还在跑"的信号),钉钉改不了已发出的消息,同样的进度是**追加**成新消息发出来;深度调查跑完后报告卡自动回贴到发起它的那个会话。**两个 agent 可选**:默认 `/agent devops`(直连 DevOps Agent,NotiOps 侧 0 token),`/agent notiops` 切到走模型的那条路(带 `/web on` 联网开关)。每张卡最下面一行落款说清这一轮的三件事:**走的哪条路 / 哪个模型答的 / 问的哪个 AWS 账号** —— 多账号部署里最后这一段尤其要紧,`/account` 是按会话生效的,群里任何人切一次后面所有人都跟着换
 
 ---
@@ -87,8 +90,8 @@ on-call 工程师使用,而无需授予写权限。
 
 - **安装选项**(`InstallOption`,默认 `web`)—— 下拉四选一:`web` / `web+feishu` /
   `web+slack` / `web+dingtalk`。**四个都装 Web Chat**,后三个再加**一个** IM 机器人(群里 @ 它或私聊它;
-  部署完还要在 IM 平台侧填一次请求地址、把凭证写进 Secrets Manager)。部署完也能 update
-  栈换成另一个值。
+  部署完还要先在 Web Chat「更多 → 管理 → 集成 IM」里填凭证(保存即写进 Secrets Manager),
+  再到 IM 平台侧填一次请求地址)。部署完也能 update 栈换成另一个值。
 - **深度调查**(AWS DevOps Agent,默认开,闲置不计费,区域不支持时自动跳过而不是让栈失败)。
 - **部署模式**(默认单账号;选多账号并填组织 id,就能跨组织内其它账号做只读排查 ——
   部署身份要么是 **AWS Organizations 管理账号**,要么是一个已注册的 **CloudFormation
@@ -96,9 +99,9 @@ on-call 工程师使用,而无需授予写权限。
   [docs/DEPLOYMENT_ONECLICK.md §2.6.1](docs/DEPLOYMENT_ONECLICK.md#261-硬性前置管理账号或-stacksets-委派管理员);
   两种都不是时栈会在第一分钟内失败,并在失败原因里给出注册命令与管理账号号)。
 
-⚠️ 一键部署装的是 **Web Chat + 可选一个 IM 机器人**,**不含**定时巡检与主动推送、
-巡检看板里的数据与阈值配置、CUR/Athena FinOps,一个栈也只能装一个 IM 平台 ——
-要这些请用下面的方式 B。
+⚠️ 一键部署装的是 **Web Chat + 可选一个 IM 机器人**,**不含**定时巡检、往 IM 群里的主动推送
+(方式 B 上也只有飞书收得到,见下面的功能对比)、巡检看板(连同巡检范围与阈值配置,侧栏里不出现
+这一项),一个栈也只能装一个 IM 平台 —— 要这些请用下面的方式 B。(CUR/Athena 账单明细两条路径都有:一键部署是可选项,开栈时选 `ProvisionCur=yes`。)
 前提条件(区域与 Bedrock 模型开通)、参数逐条说明、资源与成本构成、升级 / 回滚、
 一键删除,见 [docs/DEPLOYMENT_ONECLICK.md](docs/DEPLOYMENT_ONECLICK.md);IM 那两步配置见
 [docs/IM_WEBHOOK_SETUP.md](docs/IM_WEBHOOK_SETUP.md)。
@@ -116,8 +119,10 @@ bash scripts/preflight.sh
 # 3. 部署(CDK,一条命令;首次运行为交互式)
 ./setup.sh
 # 首次运行:确认 AWS 账号 → 选区域 → 选 IM 平台(Slack / 飞书 / 钉钉,可多选)→
-# 逐个粘贴凭证(直接写入 Secrets Manager,绝不落盘)→ CDK bootstrap → synth →
-# 构建依赖 Layer(pip,无需容器)→ cdk deploy --all。重复运行只增量更新。
+# 构建依赖 Layer(pip,无需容器)→ CDK bootstrap → synth → cdk deploy --all。
+# 重复运行只增量更新。
+# IM 凭据 Secret 创建时为空;启用了 IM 的话,部署完按完成横幅在
+# Web Chat「更多 → 管理 → 集成 IM」里填(保存即写进 Secrets Manager)。
 ```
 
 需要本地有 git / Node.js / Python / uv / AWS CDK,以及一份能部署的 AWS 凭证 —— **不需要容器运行时**。
@@ -159,7 +164,7 @@ bash scripts/preflight.sh
 | 本地要装的东西 | 无(只要浏览器) | git / Node / Python / **uv** / CDK(**不需要容器运行时**) |
 | 需要长期 access key | 不需要 | 需要一份能部署的凭证 |
 | 部署耗时 | 大约 5 分钟 | 十几分钟(含本地构建) |
-| 一键删除整个环境 | ✅ 删栈时选 `KeepData` / `DeleteEverything` | ✅ `./teardown.sh`(默认保数据 / `--delete-everything` 全删) |
+| 一键删除整个环境 | ✅ 栈参数 `TeardownMode`:`KeepData` / `DeleteEverything`(要在删栈**之前**先 update 设好,见下文) | ✅ `./teardown.sh`(默认保数据 / `--delete-everything` 全删) |
 | **聊天与调查** | | |
 | 网页 Web Chat(只读问答) | ✅ | ✅ |
 | AWS 概念问答(官方文档检索 + 引用) | ✅ | ✅ |
@@ -173,7 +178,7 @@ bash scripts/preflight.sh
 | 跨会话记忆(把偏好与事实带到下一个会话) | ❌ 见下方注 ³ | ❌ 见下方注 ³ |
 | **成本 / FinOps** | | |
 | FinOps 仪表盘(Cost Explorer 口径) | ✅ 仅部署账号 | ✅ 可跨账号 |
-| CUR + Athena 账单明细下钻 | ❌ | ✅ |
+| CUR + Athena 账单明细下钻 | ✅ 可选(参数 `ProvisionCur=yes`,默认关) | ✅ |
 | 每日成本异常扫描(自建基线,每天 01:15 UTC 跑) | ❌ FinOps 页那张「每日异常扫描」卡整个不出现,不是一张空卡 | ✅ |
 | 接自己的 CUR 数据源(4 个仪表盘 sheet + 聊天里问那份账单) | ✅ 可选,见下方注 ⁵ | ✅ 可选,见下方注 ⁵ |
 | **工单与 Skills** | | |
@@ -187,12 +192,12 @@ bash scripts/preflight.sh
 | IM 渠道(Slack / 飞书 / 钉钉) | ✅ 一个栈一个平台,见下方注 ⁴ | ✅ 三个可同时开 |
 | IM 里两个 agent 可选(`/agent devops` 默认 0 token \| `/agent notiops` 走模型)+ `/web` 联网开关 | ✅ | ✅ |
 | IM 里换「问哪个账号」(`/account`) | ✅ | ✅ |
-| 主动推送**到 IM**(10 类 EventBridge 信号源) | ❌ | ✅ |
+| 主动推送**到 IM** | ❌ | ⚠️ 只有飞书:每日运维通知(资源巡检 + 每日成本异常扫描 + 过去 24h 的调查)与 AWS Health 事件,发到「更多 → 管理 → 集成 IM」(平台选「飞书 / Lark」)里填的「推送群组 Chat ID」。CloudWatch 告警 / Backup / GuardDuty / Cost Anomaly Detection / Trusted Advisor 的实时推送本版本**哪条路径都不进 IM**(在 Web「通知」里看);Slack / 钉钉收不到主动推送 |
 | 定时自动巡检(高负载 / 闲置与成本 / 结构性风险) | ❌ | ✅ |
-| 通知收件箱(同样这 10 类信号源,进 Web 收件箱) | ✅ | ✅ |
-| 巡检看板(巡检总览 / 高负载 / 闲置与成本 / 结构性风险 / 巡检范围 / 阈值与定时) | ❌ 方式 A 没有巡检后端,所以侧栏里**根本不出现**这个入口(不是"点进去报错");直接打 API 会明确告诉你需要方式 B | ✅ |
+| 通知收件箱(10 类 EventBridge 信号源,进 Web 收件箱) | ✅ | ✅ |
+| 巡检看板(高负载 / 闲置与成本 / 巡检范围 / 阈值与定时) | ❌ 方式 A 没有巡检后端,所以侧栏里**根本不出现**这个入口(不是"点进去报错");直接调 `/inspection/*` 接口拿到的是明确的 `inspection_not_deployed`(这套部署不含巡检) | ✅ |
 | **范围** | | |
-| 多账号(AWS Organizations 跨账号)—— 两条路径都接受**管理账号**或**已注册的 StackSets 委派管理员**成员账号(自动探测);⚠️ CFN 从不把 StackSet 下发到管理账号本身,要巡检它得手工部一次成员模板 | ✅ 开栈时选 `DeployMode=MultiAccount` + 填组织 id | ✅ `--multi-account` |
+| 多账号(AWS Organizations 跨账号)—— 两条路径都接受**管理账号**或**已注册的 StackSets 委派管理员**成员账号(自动探测);⚠️ CFN 从不把 StackSet 下发到管理账号本身:从委派管理员部署时,要查管理账号**只用** Web Chat「更多 → 管理 → 账户」里的「手动接入账号」(那个栈连采集角色一起建;方式 A 要先把与栈同版本(看栈输出 `InstalledRelease`)的 `infra/member-devops-agent.yaml` 传到 `s3://notiops-data-<账号>-<区域>/onboarding-templates/`,否则「生成链接」报 `template not found`,见 [docs/DEPLOYMENT_ONECLICK.md §2.6.1](docs/DEPLOYMENT_ONECLICK.md#261-硬性前置管理账号或-stacksets-委派管理员)),**别再**手工部 `infra/member-account-onboarding.yaml` —— 两个栈建同名角色,后部的那个 `EntityAlreadyExists`、整栈回滚;已经部过的话,在 quick-create 页把 `CreateCollectionRole` 改成 `no`(那个栈开了事件转发的话,`DevOpsEventBusArn` 也清空,否则每个调查事件投两次)。从管理账号本身部署时什么都不用做,它就是部署账号 | ✅ 开栈时选 `DeployMode=MultiAccount` + 填组织 id | ✅ `--multi-account` |
 | 升级 | 换新版模板 update 栈(~1 分钟) | 重跑 `./setup.sh` |
 
 > ¹ **所有 DevOps Agent 相关能力(深度调查、深度调查(直连)、DevOps 对话、把 Skill 发布到
@@ -227,9 +232,11 @@ bash scripts/preflight.sh
 > `web+slack` / `web+dingtalk`,默认只装 web)。装出来的机器人和网页用的是**同一个只读后端**,群里 @ 它、
 > 或者私聊它就能问;命中「查资源 / 发起调查 / 看进度 / 切模型 / 切语言」这些是确定性路由,
 > **不花 token**。两处差别:① 一个栈只能装**一个**平台(两个都要走方式 B);② 部署完还有
-> 两步在你手上 —— 凭证写进 Secrets Manager、请求地址填回 IM 平台(顺序不能反,栈输出
-> `ImNextSteps` 会提醒你),步骤见 [docs/IM_WEBHOOK_SETUP.md](docs/IM_WEBHOOK_SETUP.md)。
-> 注意这只是**问答**;把每日巡检报告和告警**主动推**到群里那一路仍然只有方式 B 有。
+> 两步在你手上 —— 在 Web Chat「更多 → 管理 → 集成 IM」填凭证(保存即写进 Secrets Manager)、
+> 再把请求地址填回 IM 平台(顺序不能反,栈输出 `ImNextSteps` 会提醒你),步骤见
+> [docs/IM_WEBHOOK_SETUP.md](docs/IM_WEBHOOK_SETUP.md)。
+> 注意这只是**问答**;往群里**主动推**的那几样(每日运维通知与 AWS Health 事件,只发飞书)
+> 仍然只有方式 B 有,见上表「主动推送到 IM」那一行。
 >
 > ⚠️ **本版本支持的 IM 是飞书 / Lark、Slack、钉钉**(钉钉 2026-09-08 起,两条路径都支持)。
 > 钉钉有三处**平台能力**差异,我们写出来而不是靠"没提到"暗示:① 卡片按钮**只能是链接**
@@ -241,24 +248,36 @@ bash scripts/preflight.sh
 > 平台对照表在 [docs/IM_WEBHOOK_SETUP.md](docs/IM_WEBHOOK_SETUP.md) 顶部。
 
 > ⁵ **接自己的 CUR 数据源是可选的,两条路径一样。** 上面那行「CUR + Athena 账单明细下钻」
-> 说的是**本部署账号自己的**账单(方式 B 自动建);这一行说的是**另一份 CUR 表**(比如你负责的
-> 客户、或多个付款账号),数据经**你自己部署的一个 cost-agent MCP Lambda** 来 —— 它不在这个
-> 仓库里。接上之后 FinOps 页多出 4 张表(费用趋势 / Credit / 扩展支持 / Savings Plans),
-> 聊天里也能直接问那份账单。**怎么给**:方式 A 填参数 `CostAgentMcpUrl` + `CostAgentFunctionArn`,
-> 方式 B 传环境变量 `COST_AGENT_MCP_URL` + `COST_AGENT_FN_ARN`。**两个值必须一起给**:Function URL
-> 里不含函数 ARN,而调用授权只能按资源给,只填一半会得到一个"看起来装好了、每次调用 403"的
-> 数据源 —— 所以两条路径都会在**动手之前**拒掉半配置(方式 A 的栈根本不会创建)。**不填**:那 4 张
-> 表的入口直接不出现,其余功能不受影响。**填了之后它挂掉也不会拖垮工具**:仪表盘只有那 4 张表
-> 写「暂时不可用」,聊天会自动退到 Cost Explorer、再退到 AWS 只读 API,并**明确告诉你换了数据源**
-> (口径不同,别直接拿去对账)。部署那个 Lambda 的步骤见
+> 说的是**本部署账号自己的**账单(方式 B 自动建;方式 A 选 `ProvisionCur=yes` 时也会建);这一行说的是
+> 在**某一份 CUR 表**上接一个 cost-agent MCP server(45 个只读成本分析工具)。接上之后 FinOps 页多出
+> 4 张表(费用趋势 / Credit / 扩展支持 / Savings Plans),聊天里也能直接问那份账单。两种接法,
+> **二选一**(两个都填会在部署任何东西之前被拒):
+> - **自建**(推荐):NotiOps 用本仓库的 `cost_mcp/` 替你把这个 server 部署在你的账号里(专用 Athena
+>   workgroup,单次查询的扫描量有上限)。方式 A 选 `ProvisionCur=yes`(连 CUR 一起建),或者填
+>   `CurTable` + `CurBucketName`(用你已有的那份 CUR);方式 B 跑 `COST_MCP_SELF_HOST=true ./setup.sh`
+>   (默认用上面那行说的本账号那份 CUR,还没有的话同一次运行里一起建好;要换成你已有的另一份,
+>   再带上 `CUR_TABLE=<库>.<表> CUR_BUCKET_NAME=<桶>`)。自己带表时,那张表连同它的 Glue 库和桶
+>   都必须在部署 NotiOps 的这个账号、这个区域里(查询就在这里跑)。**CUR 在另一个账号暂不支持**:
+>   方式 A 的 `CurRoleArn`、方式 B 的 `CUR_ROLE_ARN` 填了都会在部署任何东西之前被拒。要么把 NotiOps
+>   部署在 CUR 所在的账号,要么用下面的外接。
+> - **外接**(只用于你自己已经在跑的那个 cost-agent MCP Lambda):方式 A 填参数 `CostAgentMcpUrl` +
+>   `CostAgentFunctionArn`,方式 B 传环境变量 `COST_AGENT_MCP_URL` + `COST_AGENT_FN_ARN`。
+>   **两个值必须一起给**:Function URL 里不含函数 ARN,而调用授权只能按资源给,只填一半会得到一个
+>   "看起来装好了、每次调用 403"的数据源 —— 所以两条路径都会在**部署任何东西之前**拒掉半配置(方式 A 的栈
+>   根本不会创建)。
+>
+> **都不填**:那 4 张表的入口直接不出现,其余功能不受影响。**接上之后它挂掉也不会拖垮工具**:
+> 仪表盘只有那 4 张表写「暂时不可用」,聊天会自动退到 Cost Explorer、再退到 AWS 只读 API,并
+> **明确告诉你换了数据源**(口径不同,别直接拿去对账)。两种接法各要给哪些值,见
 > [docs/DEPLOYMENT.md §14](docs/DEPLOYMENT.md#14-客户-cur-仪表盘--cost-agent-mcp可选)。
 
 > 📋 **AWS Support 相关功能(建案 / 查案 / 回复 / 解决)需要账号开通 Business、
 > Enterprise On-Ramp 或 Enterprise 支持计划** —— 这是 AWS Support API 本身的要求,
 > 与用哪种部署方式无关。Basic / Developer 计划下服务列表会是空的。
 
-**两条路径可以先后走**:先用方式 A 试用,之后想要 IM 推送和自动巡检,再跑方式 B
-(两边建的管理员用户名都是 `admin`,不会打架)。
+**两条路径可以先后走**:先用方式 A 试用,之后想要自动巡检(以及飞书群里的每日运维通知),
+再跑方式 B。但同一账号同一区域里两条路径用的是同一套表 / 桶名,不能同时存在:要先把方式 A 的栈
+按 `DeleteEverything` 删掉(数据不会带过去;删法见下面「删除整个环境」),或者把方式 B 装到另一个区域。
 
 ### 升级到新版本 / 删除整个环境
 
@@ -274,28 +293,56 @@ bash scripts/preflight.sh
    上传刚下的模板。
 3. 参数页**什么都不用改**,一路选 **Use existing value** → 下一步到底 → **Submit**。
 
-升级**不会**动这些:不重发邀请邮件、管理员邮箱和密码不变、你在 Admin 里改过的配置不变、
-聊天历史不清空。想回退就用**旧版本的模板**再 update 一次。
+⚠️ 栈现在是 v1.0.20–v1.0.29、装了 IM 机器人、产物走默认的 GitHub 来源的话:**Submit 之前**先读
+[docs/DEPLOYMENT_ONECLICK.md §5](docs/DEPLOYMENT_ONECLICK.md#5-升级到新版本) 里 🔴 那一条,并在
+**Stack failure options** 里选 **Preserve successfully provisioned resources** —— 这几个版本的
+`im-code.zip` 已经撤下,升级万一失败,自动回滚会停在 `UPDATE_ROLLBACK_FAILED`。
+
+多账号模式:v1.0.30 之前,「更多 → 管理 → 账户」里「第二步: DevOps Agent」的「一键关联」可能因
+`EntityAlreadyExists` 让成员账号的栈整栈回滚。升级之后对这些账号再点一次「一键关联」即可(每次升级都会把
+两个成员账号 StackSet 重新下发一遍,见 [docs/DEPLOYMENT_ONECLICK.md §5](docs/DEPLOYMENT_ONECLICK.md#5-升级到新版本))。
+
+升级**不会**动这些:不重发邀请邮件、管理员邮箱和密码不变、你在「更多 → 管理」里改过的配置不变、
+聊天历史不清空。想回退就用**旧版本的模板**再 update 一次 —— 但装了 IM 的栈回退不到
+v1.0.20–v1.0.29(原因同上:回退要重新下载那个版本的 `im-code.zip`,而它已经撤下)。
 
 **删除整个环境** —— 栈有一个 `TeardownMode` 参数,两档:
 
 | | 保留什么 |
 |---|---|
-| `KeepData`(默认) | 保留配置表、聊天记录表、数据桶(里面有你的 Skill 和报告);装过 IM 的话,IM 凭证 secret 也留着 |
-| `DeleteEverything` | 全删,不留东西(**含 IM 凭证 secret,不可恢复**) |
+| `KeepData`(默认) | 保留配置表、聊天记录表、数据桶(里面有你的 Skill 和报告);装过 IM、或在「更多 → 管理 → 模型」存过 Bedrock API Key 的话,这些凭证 secret 也留着 |
+| `DeleteEverything` | 其余全删(**含这些凭证 secret,不可恢复**),只有两类除外:选了 `ProvisionCur=yes` 时建的 CUR 相关资源,以及选了多账号模式时的两个成员账号 StackSet,见下 |
 
 ⚠️ **两个必须注意的点:**
 
 1. **要删干净,顺序不能错** —— 先做一次 **Update**,把 `TeardownMode` 改成
-   `DeleteEverything`(约 45 秒),**然后**再 **Delete stack**(约 3 分钟)。
+   `DeleteEverything`(约 45 秒),**然后**再 **Delete stack**(实测约 6 分 47 秒,比按 `KeepData`
+   删要久,见 [docs/DEPLOYMENT_ONECLICK.md §6.3](docs/DEPLOYMENT_ONECLICK.md#63-删除))。
    在删除对话框里改这个参数是**没有用的**:CloudFormation 用的是最后一次成功部署时的参数值。
    如果直接删,就是按 `KeepData` 删的。
 2. **两种模式都会删掉 Cognito 用户池** —— `KeepData` 保的是**数据**,不是**账号**。
    重新装完之后,用户需要重新邀请。
 
-删完之后可能还剩下(不产生费用,想清就手工删):`KeepData` 模式保下来的两张 DynamoDB 表和
-数据桶;一个名字像 `/aws/vendedlogs/RUMService_<栈名>-web-chat<随机串>` 的日志组
-(0 字节,30 天自动过期)。
+删完之后可能还剩下(只有很少的存储费用,想清就手工删):`KeepData` 模式保下来的两张 DynamoDB 表和
+数据桶;一个名字像 `/aws/vendedlogs/RUMService_notiops-web-chat<随机串>` 的日志组
+(0 字节,30 天自动过期;名字是固定的,不跟栈名走);偶尔还有某个函数的日志组 —— 删栈最后几秒
+恰好有调用时,晚到的日志会把它重新建出来(按完整名字删掉即可,见
+[docs/DEPLOYMENT_ONECLICK.md §6.4](docs/DEPLOYMENT_ONECLICK.md#64-会留下的东西孤儿要不要管))。
+
+开栈时选了 `ProvisionCur=yes` 的话,还有一组是**故意留下**的,两种模式都不删:CUR 报告、
+它的交付桶、Athena 集成栈(`notiops-cur-athena-<账号>`),以及 `NotiOps - ` 开头的几条 Athena
+保存查询。那是你的账单历史(AWS 不补发过去的月份),留着也能让重装后由下一次每 4 小时一次的
+检查接上(约 4 小时内),而不必再等约 24 小时的首次交付。报告会继续往那个桶里交付,所以会有少量
+S3 存储费用。不要了就自己删,顺序是:先删 `notiops-cur-athena-<账号>` 栈,再在 Billing 控制台删掉
+报告,最后清空并删掉那个桶(保存查询不收费,在 Athena 控制台里删)。栈输出 `DataRetentionOnDelete`
+会逐个点名这四样。
+
+选了多账号模式(`DeployMode=MultiAccount`)的话,两个成员账号 StackSet(`notiops-member-onboarding` /
+`notiops-member-devops-agent`,各成员账号里的跨账号角色就是它们建的)和 Organizations 对 StackSets 的
+信任访问,两种模式也都**故意不删**:删 StackSet 等于抹掉每个成员账号里的这些角色,这种跨账号的动作
+不该由「删一个栈」顺手触发;信任访问是组织级开关,组织里别的 StackSet 也可能在用。不要了就先删
+StackSet 里的实例、再删 StackSet 本身(多账号模式下 `DataRetentionOnDelete` 也会点名这几样),见
+[docs/DEPLOYMENT_ONECLICK.md §6.4](docs/DEPLOYMENT_ONECLICK.md#64-会留下的东西孤儿要不要管)。
 
 #### 方式 B(`setup.sh`)
 
@@ -309,13 +356,13 @@ bash scripts/preflight.sh
   除非显式设了 `IM_PLATFORM_CHOICE`,否则一律自动保留。真要下掉 IM 是单独一件事,
   走 `./teardown.sh`。
 - **删除**:跑仓库根目录的 **`./teardown.sh`**,它按依赖倒序把 `setup.sh` 建的东西删干净
-  (含 CDK 之外的收尾:CUR 报告定义、一次性 EventBridge Scheduler、WebSearch Gateway、
-  Secrets 的 30 天恢复期)。和方式 A 一样是两档语义:
+  (含 CDK 之外的收尾:一次性 EventBridge Scheduler、WebSearch Gateway、
+  Secrets 的 30 天恢复期;CUR 报告、交付桶与 Athena 集成栈一律保留,见下)。和方式 A 一样是两档语义:
 
   ```bash
   ./teardown.sh --dry-run          # 先看清单,什么都不删(强烈建议先跑这个)
-  ./teardown.sh                    # 保数据:删栈与运行时,保留三张 RETAIN 表
-  ./teardown.sh --delete-everything # 全删:连表、CUR 报告 / CUR 桶、Athena 保存查询、残留日志组
+  ./teardown.sh                    # 保数据:删栈与运行时,保留四张 RETAIN 表
+  ./teardown.sh --delete-everything # 全删:连表、残留日志组。⚠️ CUR 相关一律【保留】(账单数据,且重装可直接复用)
   ```
 
   删除需要输入 12 位账号号码确认(`--delete-everything` 还要再输一次 `DELETE EVERYTHING`)。

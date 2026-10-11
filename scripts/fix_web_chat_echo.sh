@@ -400,6 +400,28 @@ REPORTS_CDN="$(aws cloudformation describe-stacks --region "$REGION" --stack-nam
 COST_MCP="${COST_AGENT_MCP_URL:-$(aws lambda get-function-configuration --region "$REGION" --function-name "$BFF_FN" \
   --query 'Environment.Variables.COST_AGENT_MCP_URL' --output text 2>/dev/null || true)}"
 [ "$COST_MCP" = "None" ] && COST_MCP=""
+if [ -n "$COST_MCP" ] && [ -z "${COST_AGENT_MCP_URL:-}" ]; then
+  # 🔴 现网那个可能是**我们自己**部的成本 MCP server（SelfHosted 态）。照下面 External 的写法传
+  #    costAgentMcpUrl 重部，CDK 会把自建的 notiops-cost-mcp 整套删掉（没有 costMcpSelfHosted 上下文），
+  #    BFF / agent 指向一个已删掉的 URL —— 报的却是成功（2026-10-10 发版前审查）。本脚本不复刻自建那一
+  #    整套上下文：认出来就停下，交给 setup.sh（它会沿用现网的自建配置）。读不到就不猜。
+  if _own_url="$(aws cloudformation describe-stacks --region "$REGION" --stack-name WebChatStack \
+       --query "Stacks[0].Outputs[?OutputKey=='CostMcpUrl'].OutputValue | [0]" --output text 2>/dev/null)"; then
+    if [ -n "$_own_url" ] && [ "$_own_url" != "None" ] && [ "${_own_url%/}" = "${COST_MCP%/}" ]; then
+      echo "$(t "❌ 这套部署的成本 MCP server 是 NotiOps 自建的（WebChatStack 的 CostMcpUrl 输出与现网 BFF 一致）。" \
+                "❌ This deployment's cost MCP server is hosted by NotiOps (the WebChatStack CostMcpUrl output matches the live BFF).")" >&2
+      echo "$(t "   本脚本按「你自带的 server」重部会把它删掉 —— 拒绝继续。改用：COST_MCP_SELF_HOST=true ./setup.sh" \
+                "   Redeploying it as 'your own server' would delete it -- refusing to continue. Use: COST_MCP_SELF_HOST=true ./setup.sh")" >&2
+      exit 1
+    fi
+  else
+    echo "$(t "❌ 读不到 WebChatStack 的输出，分不清现网的成本 MCP server 是自建的还是你自带的 —— 拒绝继续。" \
+              "❌ Could not read the WebChatStack outputs, so it is unclear whether NotiOps hosts the cost MCP server or you do -- refusing to continue.")" >&2
+    echo "$(t "   你自带的：COST_AGENT_MCP_URL=$COST_MCP COST_AGENT_FN_ARN=<函数ARN> bash scripts/fix_web_chat_echo.sh --region ${REGION}；NotiOps 自建的：COST_MCP_SELF_HOST=true ./setup.sh" \
+              "   Your own server: COST_AGENT_MCP_URL=$COST_MCP COST_AGENT_FN_ARN=<function-arn> bash scripts/fix_web_chat_echo.sh --region $REGION. Hosted by NotiOps: COST_MCP_SELF_HOST=true ./setup.sh")" >&2
+    exit 1
+  fi
+fi
 if [ -n "$COST_MCP" ]; then
   COST_FN_ARN="${COST_AGENT_FN_ARN:-}"
   if [ -z "$COST_FN_ARN" ]; then

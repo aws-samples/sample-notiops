@@ -32,7 +32,7 @@ export interface ChatMessage {
   sources?: SourceItem[];
   actions?: ProposedAction[]; // 待确认写操作（cases 写操作的确认卡）
   followups?: Followup[];  // 快捷后续按钮（点击=发送 prompt，如调查后的 生成缓解/转人工）
-  investigationSteps?: InvestigationStep[]; // 调查分析过程（走右侧「调查过程」面板，不在气泡里）
+  investigationSteps?: InvestigationStep[]; // DevOps Agent 的调查步骤（边流边写；带 text 的同时并进 thinkingSteps，走右侧「思考过程」面板，不在气泡里）。步骤不落库，刷新后为空
   investigationConsoleUrl?: string;         // 本次调查的 DevOps Agent 后台深链（面板顶部）
   thinkingSteps?: TimelineStep[];           // 思考/处理过程时间线（走右侧「思考过程」面板；任意长任务通用）
   usage?: TokenUsage;    // 本轮 token 用量（显示在署名行）
@@ -53,7 +53,6 @@ export interface ChatMessage {
   thinking?: boolean;    // 思考态（尚无 token）
   thinkElapsed?: number; // 思考已用秒
   progress?: string;     // 处理中的临时状态行（"正在做什么"，工具调用等）——瞬态，收到正文即清空
-  reasoning?: string;    // 思考过程（模型 reasoning，累积）——可折叠灰字，默认折叠
 }
 
 // 会话主题：general=通用（默认，不打 tag）；其余对应侧边栏主题入口。
@@ -65,7 +64,8 @@ export interface ChatMessage {
 //    investigate 是 22 个，且独有 `lake_query`（CloudTrail Lake）/ `analyze_metric` /
 //    `execute_cwl_insights_batch`。也就是说客户在「安全」里问安全问题，拿到的能力
 //    **比在「调查」里问同一句更差**。安全看板（TopicKey 之外的 `view === "security"`）
-//    保留，改由侧栏入口与调查输入框上方那行「仪表盘」pill 进入。
+//    保留，唯一入口是调查输入框上方那行胶囊里的「安全态势」（侧栏的「安全」那一项同一天
+//    也去掉了，见 Sidebar.tsx）。
 //    老会话里存着的 topic:"security" 由 `normalizeTopic` 读时改写（见下）。
 export type TopicKey = "general" | "investigate" | "finops" | "cases" | "whats-new";
 
@@ -277,7 +277,7 @@ export interface Conversation {
 
 // 新对话默认模型的**兜底**值。真值由 GET /models 下发（管理员在「管理 → 模型」里定），
 // 见 models.ts 的 defaultModelId()。这里保留是为了首帧渲染和接口读不到时不至于没模型可用。
-export const DEFAULT_MODEL = "xai-grok-4-6";
+export const DEFAULT_MODEL = "moonshot-kimi-k3";
 
 export interface ModelOption {
   id: string;
@@ -292,17 +292,17 @@ export interface ModelOption {
 //
 // 顺序**必须与种子里 webchat 启用集的顺序一致**（不再按首字母排）：下拉框直接按数组顺序
 // 渲染，而服务端 `/models` 是原样保留种子/DDB 的数组顺序的 —— 这里自己排一遍的话，
-// 降级前后列表会重排，看起来像"模型换了一批"。默认模型放第一位（2026-09-03 用户要求：
-// Grok 置顶、GLM 次之，其余相对顺序不动）。
+// 降级前后列表会重排，看起来像"模型换了一批"。默认模型放第一位（2026-10-10：Kimi K3 成为默认后置顶；
+// 2026-09-03 时是 Grok 置顶、GLM 次之）。
 export const MODELS: ModelOption[] = [
-  { id: "xai-grok-4-6", name: "Grok 4.6", descKey: "model.desc.grok" },
-  { id: "zai-glm-5", name: "GLM 5", descKey: "model.desc.glm" },
-  { id: "claude-sonnet-5", name: "Claude Sonnet 5", descKey: "model.desc.claude" },
-  { id: "claude-opus-5", name: "Claude Opus 5", descKey: "model.desc.opus" },
-  { id: "amazon-nova-pro", name: "Amazon Nova Pro", descKey: "model.desc.nova" },
+  { id: "moonshot-kimi-k3", name: "Kimi K3", descKey: "model.desc.kimi" },
+  { id: "xai-grok-4-7", name: "Grok 4.7", descKey: "model.desc.grok" },
+  { id: "zai-glm-5-3", name: "GLM 5.3", descKey: "model.desc.glm" },
+  { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", descKey: "model.desc.claude" },
+  { id: "claude-opus-5-5", name: "Claude Opus 5.5", descKey: "model.desc.opus" },
   { id: "deepseek-v3-2", name: "DeepSeek V3.2", descKey: "model.desc.deepseek" },
   { id: "gpt-5-6", name: "GPT-5.6 Terra", descKey: "model.desc.gpt" },
-  { id: "gpt-5-6-sol", name: "GPT-5.6 Sol", descKey: "model.desc.gptSol" },
+  { id: "gpt-6-sol", name: "GPT-6 Sol", descKey: "model.desc.gpt6Sol" },
 ];
 
 // 已从 Web 列表下架、但**历史消息里还留着**的模型。只用于把落款上的 id 还原成显示名
@@ -312,4 +312,11 @@ export const MODELS: ModelOption[] = [
 export const RETIRED_MODELS: ModelOption[] = [
   { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", descKey: "model.desc.haiku" },
   { id: "gpt-5-6-luna", name: "GPT-5.6 Luna", descKey: "model.desc.gptLuna" },
+  // 2026-10-10 升级退役：前五个被同族新版本替代，Nova Pro 是全局去掉（它的 apac. 档案在美区根本调不通）。
+  { id: "xai-grok-4-6", name: "Grok 4.6", descKey: "model.desc.grok" },
+  { id: "zai-glm-5", name: "GLM 5", descKey: "model.desc.glm" },
+  { id: "claude-sonnet-5", name: "Claude Sonnet 5", descKey: "model.desc.claude" },
+  { id: "claude-opus-5", name: "Claude Opus 5", descKey: "model.desc.opus" },
+  { id: "gpt-5-6-sol", name: "GPT-5.6 Sol", descKey: "model.desc.gptSol" },
+  { id: "amazon-nova-pro", name: "Amazon Nova Pro", descKey: "model.desc.nova" },
 ];

@@ -9,7 +9,7 @@ import {
 } from "../api/skills";
 
 // Customize 页：连接器 / 插件（均占位"即将上线"）。
-// Skills 已提为左侧一级入口（only="skills" 渲染），故这里不再重复 Skills 标签。
+// Skills 是单独一页（侧栏「更多 → 技能」，only="skills" 渲染），故这里不再重复 Skills 标签。
 type Tab = "connectors" | "plugins";
 
 const SearchIcon = () => (
@@ -19,7 +19,8 @@ const SearchIcon = () => (
 );
 
 // only="skills" → 独立 Skills 视图（不含「定制」左侧子导航，直接是 Skills 管理页）；
-// 缺省 → 完整「定制」页（Skills / 连接器 / 插件 三标签）。
+// 缺省 → 完整「定制」页（只有 连接器 / 插件 两个标签；
+//        侧栏入口目前由 Sidebar 的 SHOW_CUSTOMIZE_ITEM 关着）。
 // homeSignal：左侧「Skills」入口每次点击自增。已在 Skills 视图时（可能停在某 skill 详情/编辑器），
 // 据此回到列表首页——无未保存修改直接回，有则先确认。
 export default function CustomizePanel({ only, homeSignal }: { only?: "skills"; homeSignal?: number } = {}) {
@@ -35,7 +36,7 @@ export default function CustomizePanel({ only, homeSignal }: { only?: "skills"; 
     );
   }
 
-  // 完整「定制」页：仅连接器 / 插件（Skills 已独立为一级入口，不在此重复）。
+  // 完整「定制」页：仅连接器 / 插件（Skills 是单独一页、入口在侧栏「更多」里，不在此重复）。
   return (
     <div className="cz">
       {/* 左侧子导航 */}

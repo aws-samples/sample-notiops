@@ -635,7 +635,6 @@ export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAct
   const t = useT();
   const { locale } = useLocale();
   const [copied, setCopied] = useState(false);
-  const [showReasoning, setShowReasoning] = useState(false); // 思考过程默认折叠
 
   const copy = () => {
     if (navigator.clipboard) navigator.clipboard.writeText(m.text).catch(() => {});
@@ -665,8 +664,9 @@ export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAct
   // 普通对话的过程展示，样式和行为尽量一致）。差别只在点开哪份数据：
   // DevOps Agent 的 investigationSteps 与通用的 thinkingSteps 都进**同一个** ThinkingPanel
   // （见 ChatApp），所以面板里的图标、「进行中」脉冲、自动滚底、自动弹出也天然一致。
-  // 计数取两者的最大值：新消息两者都有（DevOps 的调查步骤也写进了思考时间线），改版前存下来的
-  // 老消息只有 investigationSteps —— 那时刷新后这条回复的过程入口就靠它。
+  // 计数取两者的最大值：DevOps 那条路径两者边流边写（带 text 的调查步骤也写进了思考时间线），
+  // 不带 text 的只进 investigationSteps。步骤不落库（store.mjs 不存、ChatApp 的历史映射也不带），
+  // 所以刷新后拉回来的历史回复两者都为空、没有这个入口。
   // 四条规矩，都是踩过的，别改回去：
   //   1) **自己独占一行**（外面套 .think-entry-row）—— .thinking 与 .think-entry 都是 inline-flex，
   //      不套块级容器就会和「… 正在思考 · 3s」挤到同一行。
@@ -674,6 +674,10 @@ export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAct
   //      正文/思考态**留够间距**（见 .think-entry-row 的 margin），贴太近很难看。
   //   3) 一条回复**只出一个**入口 —— 两个同名按钮客户分不清该点哪个（曾经是「查看调查过程」+
   //      「查看思考过程」两个，一个在正文下一个在正文上，样式还不一样）。
+  //      **模型思考（reasoning）同样只进侧边栏**：气泡里原来还有一个折叠灰字的「查看思考过程」，
+  //      和这个入口同名、内容还是同一份（onReasoning 同时写两处）。Grok 的思考链是加密的、一直
+  //      被丢弃，所以没人看见；2026-10-10 默认换成 Kimi K3 后（GLM 5.3 也一样）明文思考流了出来，
+  //      每条回复都出现两个「查看思考过程」。已删掉气泡里那份，别再加回来。
   //   4) 样式要**低调**（.think-entry 纯文字灰链），不用带边框的卡片气泡 —— 客户反馈太抢眼。
   const entryCount = Math.max(m.thinkingSteps?.length ?? 0, m.investigationSteps?.length ?? 0);
   const thinkEntry = entryCount > 0 ? (
@@ -694,21 +698,6 @@ export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAct
     <div className="row bot">
       <div className="msg">
         <div className="ts">{fmtTime(m.ts, locale)}</div>
-
-        {/* 思考过程（reasoning）：可折叠灰字，默认折叠。处理中与出答案后都可见（放 ternary 之上）。
-            语言随本轮（后端已按本轮提问语言锁定，中问中答、英问英答）。 */}
-        {m.reasoning && m.reasoning.trim() && (
-          <div className="reasoning">
-            <button type="button" className="reasoning-toggle"
-                    onClick={() => setShowReasoning((v) => !v)}>
-              <svg className={"reasoning-caret" + (showReasoning ? " open" : "")} viewBox="0 0 24 24"
-                   width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2.2"
-                   strokeLinecap="round" strokeLinejoin="round"><path d="m9 18 6-6-6-6" /></svg>
-              {showReasoning ? t("reasoning.hide") : t("reasoning.show")}
-            </button>
-            {showReasoning && <div className="reasoning-body">{m.reasoning}</div>}
-          </div>
-        )}
 
         {thinkEntry}
 
@@ -805,7 +794,7 @@ export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAct
                     部署·management=蓝"这唯一一条颜色信息。 */}
                 {/* 🔴 **STAROps 那条不显示账号**（2026-09-13）：这一行的账号是 **AWS** 账号 ID，
                     而这条回答来自客户自己的**阿里云**数字员工。两个云的账号挨着写在同一行，
-                    读出来就是「这条阿里云回答对应 AWS 账号 5337…」—— 是**假信息**，而且是
+                    读出来就是「这条阿里云回答对应 AWS 账号 1234…」—— 是**假信息**，而且是
                     "发出去就改不了"的那一类（客户会拿这个 ID 去核对 / 贴进工单）。
                     阿里云账号 UID 这条路径上**拿不到**，也不该拿：唯一带着它的是 STAROps 的
                     workspace 值，而那个值是**管理员专属**、不回给非管理员的。

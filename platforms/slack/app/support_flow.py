@@ -590,10 +590,10 @@ def _build_sync_body(ctx: dict) -> str:
         "",
     ]
     if report_url:
-        parts += ["Full report (HTML, presigned, valid 7 days):",
+        parts += ["Full report (HTML, presigned link, expires within about 12 hours):",
                   report_url, ""]
     if trace_url:
-        parts += ["Investigation trace (HTML, presigned, valid 7 days):",
+        parts += ["Investigation trace (HTML, presigned link, expires within about 12 hours):",
                   trace_url, ""]
     parts += ["=== Investigation summary ===", "", summary]
     body = "\n".join(parts)

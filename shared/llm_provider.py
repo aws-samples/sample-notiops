@@ -635,9 +635,14 @@ def _invoke_litellm(
     base_url = cfg["base_url"]
     api_key = cfg["api_key"]
     if not base_url or not api_key:
+        # 别再指向「Dashboard → AI 认证 → LiteLLM」：那个页面随旧管理台 2026-09-04 退役，
+        # 而现在的「更多 → 管理 → 模型」只支持 Bedrock（`llm_config.mjs` 会拒掉 litellm）。
         raise LiteLLMConfigError(
             "LiteLLM is selected as provider but base_url/api_key not configured "
-            "in Secrets Manager. Fill them in Dashboard → AI 认证 → LiteLLM."
+            "in Secrets Manager (notiops/litellm-config). The Web Chat UI cannot "
+            "set LiteLLM yet (More -> Admin -> Models is Bedrock-only): write "
+            "base_url/api_key into that secret directly, or set the provider "
+            "back to bedrock (SSM /notiops/llm/provider)."
         )
     _validate_base_url(base_url)
 

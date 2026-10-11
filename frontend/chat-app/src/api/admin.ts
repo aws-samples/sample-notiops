@@ -140,7 +140,13 @@ export interface MemberAccountRec {
    * ⚠️ 后端在 `regions` 为空时返回 `["us-east-1"]`（读时默认，不改库）。
    */
   regions: string[];
-  /** 第二步（DevOps Agent 关联）状态：'' | pending | template_generated | payload_saved | tested | enabled */
+  /**
+   * 第二步（DevOps Agent 关联）状态，即 `da#<id>` 行的 `onboarding_status`。
+   * 现在会写进来的只有 `''` | `provisioning`（一键关联已发起）| `active`（终态）| `failed`
+   * （成员栈部署失败，可重试）—— 见 bff/web-chat/member_accounts.mjs 列表处的注释。
+   * `enabled` 是早期误写进库的历史值（列表对账也会回它），按 active 兼容显示；
+   * 其余值是 2026-09-04 退役的老向导留下的，没有代码再写。
+   */
   devopsAgentStatus?: string;
   /**
    * 这个账号需不需要**重新部署 CFN 栈**才能做巡检判读。
@@ -175,7 +181,11 @@ export interface MemberAccountRec {
    * 即使它在被 target 的 OU 里（AWS 官方限制）。渲染的后果不是报错而是**假成功** ——
    * `CreateStackInstances` 返回成功、操作变 SUCCEEDED、账号被翻成「已接入」，
    * 而那个账号里什么都没建，之后每一次跨账号提问都 AssumeRole 失败。
-   * 唯一出路是在管理账号里手工部一次 `member-account-onboarding.yaml` + 手动接入登记。
+   * 唯一出路是**只走**「手动接入账号」（生成链接 → 用管理账号登录部署 → 回填 Outputs），
+   * 采集角色由那个栈一并建好。⚠️ 2026-10-11 前这里写的是「先手工部一次
+   * `member-account-onboarding.yaml` 再手动接入登记」—— 照做必回滚：手动接入的链接写死
+   * `CreateCollectionRole=yes`，两份模板建同名采集角色 ⇒ EntityAlreadyExists
+   * （见 i18n.ts 的 `admin.accounts.mgmtAcctHint`）。
    */
   isOrgManagementAccount?: boolean;
   /**

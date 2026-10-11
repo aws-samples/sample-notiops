@@ -32,6 +32,15 @@ bff/**
 tests/**
 docs/**
 .kiro/**
+# Claude Code 的 worktree 隔离把整份仓库检出放在 .claude/worktrees/<名字>/ ——
+# .gitignore 忽略它，但打包走文件系统（2026-10-10 实测混进了 857 个文件）。
+.claude/**
+# 所有点开头的路径（任意深度）—— 本地工具的配置与日志、CI 配置之类都不该进代码包，
+# 而一键部署的 im-code.zip 是公开发布的。CDK 的 GLOB 里 `*` 不匹配点名，必须显式写。
+.*
+.*/**
+**/.*
+**/.*/**
 lambda_layer/**
 lambda_layer_im/**
 cdk.out/**
@@ -91,3 +100,11 @@ phd_event_forwarder/**
 # 容器时代的产物，Lambda 路径用不到。
 platforms/*/Dockerfile
 sidecars/**
+
+# 成本 MCP server（客户 CUR 查询）—— IM 侧一行都不用。
+# ⚠️ 这两条是**防静默膨胀**的：cost_mcp/ 是新增的顶层目录，而 fromAsset("../") 打的是
+# 仓库根 —— 不排掉它，1902 行源码会进 im-code.zip；lambda_layer_cost/ 更糟（64MB 解压），
+# 会把 IM 解压体积从 42.9% 推到约 69% 的 250MB 上限。**仍在硬限和 85% 告警之下，
+# 所以没有任何门禁会报**，只有这条排除能挡住。
+cost_mcp/**
+lambda_layer_cost/**

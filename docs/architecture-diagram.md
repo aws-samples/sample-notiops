@@ -30,8 +30,8 @@
 **用途**：内部技术评审 / 后端编排介绍。
 
 **关键标注**：
-- IM 机器人(补充入口)是 **API Gateway HTTP API + ingress/worker Lambda**(`ImStack`,见 `im-core.ts`),worker 直接 `import core/` 处理确定性路由 / 对话,进度由 `notiops-im-progress` Lambda 每分钟刷；**这条 IM 路径不使用 AgentCore Runtime / Memory / Gateway / Agent 容器**。⚠️ 2026-09-03(M2)之前这里是常驻 **ECS Fargate** 进程,已退役、只留源码作回滚路径。主入口 Web Chat 则相反 —— 跑在 Bedrock **AgentCore Runtime** 上,经 BFF Lambda + Function URL(SSE)对外(见 WebChatStack,`web-chat-stack.ts`)
-- 对话工具调用：`core.bedrock_chat` 通过 hosted AWS Knowledge MCP（`knowledge-mcp.global.api.aws`）检索官方数据（`sidecars/` 的 pricing / cost MCP 是 Fargate sidecar，随 `BotStack` 于 2026-09-03 一起退役；IM Lambda 侧显式关掉）
+- IM 机器人(补充入口)是 **API Gateway HTTP API + ingress/worker Lambda**(`ImStack`,见 `im-core.ts`),worker 直接 `import core/` 处理确定性路由 / 对话,进度由 `notiops-im-progress` Lambda 每分钟刷；IM 侧自己不跑 agent 容器:默认的 `/agent devops` 直连 DevOps Agent、不经 AgentCore Runtime,用户发 `/agent notiops` 之后 worker 经 `bedrock-agentcore:InvokeAgentRuntime` 调用 Web Chat 那**同一个** AgentCore Runtime(窄集主题 `im-chat`)。⚠️ 2026-09-03(M2)之前这里是常驻 **ECS Fargate** 进程,已退役、只留源码作回滚路径。主入口 Web Chat 则相反 —— 跑在 Bedrock **AgentCore Runtime** 上,经 BFF Lambda + Function URL(SSE)对外(见 WebChatStack,`web-chat-stack.ts`)
+- 对话工具调用：IM 默认的问答由 `core.devops_chat` 直连 DevOps Agent（NotiOps 侧不调模型、不挂工具）；`/agent notiops` 之后由 AgentCore Runtime 里的 agent 经 hosted AWS Knowledge MCP（`knowledge-mcp.global.api.aws`）检索官方文档。`core.bedrock_chat` 那条「Bedrock + Knowledge MCP」对话只在已退役的长连接 app（回滚路径）上跑（`sidecars/` 的 pricing / cost MCP 是 Fargate sidecar，随 `BotStack` 于 2026-09-03 一起退役；IM Lambda 侧显式关掉）
 - 后台巡检与调查回调走 Lambda，结果落 **DynamoDB**（无 RDS）
 
 **配套文字说明**：左侧黄色便签解释各路径分类（同步 + 异步）和配套资源角色。
@@ -44,7 +44,7 @@
 - ① System → Target（黄色粗线）：STS AssumeRole 只读采集
 - ② System → Business（紫色粗线）：STS AssumeRole 触发调查
 - ③ Business → System（紫色粗线）：Forwarder Role 跨账户 PutEvents 回调
-- Bus Policy 白名单（红色框）：基于 `aws:SourceAccount` 的业务账户白名单
+- Bus Policy 允许清单（红色框）：基于 `aws:SourceAccount` 的业务账户允许清单
 
 **架构决策**：每个业务账户独立部署 Agent Space（`AccountType=monitor`），不采用官方 `SourceAws` 共享模式。图中已明确标注此约束。
 
@@ -54,16 +54,16 @@
 
 **分三段**：
 - Part A（步骤 1-20）：IM 对话流程，含飞书流式卡片伪流式、`core.ddb_state` 条件写幂等去重（`event#` 行）、ingress → worker 的**异步 Lambda 投递**（M2 之前是 ECS 进程内异步）
-- Part B（步骤 21-31）：DevOps Agent 调查的**两种触发路径**（IM 机器人 @bot 派发 + Lambda4 每日自动触发）
-- Part C（步骤 32-42）：调查完成后的跨账户回调 + 拉一次 long_report → S3 单源（report.md / report.html + trace.html）+ Bedrock 精简 summary_card + 写 DynamoDB `invst#` 行
+- Part B（步骤 21-31）：DevOps Agent 调查的触发路径 —— 现网只剩 IM 机器人 @bot 明说要深挖之后的派发（`core.devops_agent.start_investigation` → CreateBacklogTask）。图里那条「Lambda4 每日自动触发」分支已删除：现在的 Lambda4 只读调查记录拼进每日运维通知，不再发起调查
+- Part C（步骤 32-42）：调查完成后的跨账户回调 + 拉一次 long_report → S3 单源（report.md / report.html + trace.html）+ summary_card（DA 报告的确定性切片，0 token，2026-09-05 起不调 Bedrock）+ 写 DynamoDB `invst#` 行
 
 **当前架构关键点**（参见图右下方蓝色便签）：
-1. IM 机器人(补充入口)是 webhook + ingress/worker Lambda(`ImStack`)，worker import `core/`，这条 IM 路径不使用 AgentCore Runtime;主入口 Web Chat 反之运行在 Bedrock AgentCore Runtime 上(WebChatStack)
-2. 机器人派发走 `core.webhook_dispatch` → DevOps Agent generic webhook（HMAC 签名）
-3. 跨账户调查与采集锁定在部署账户（`shared/account_scope.py`）
+1. IM 机器人(补充入口)是 webhook + ingress/worker Lambda(`ImStack`)，worker import `core/`;默认的 `/agent devops` 不经 AgentCore Runtime,`/agent notiops` 之后调用 Web Chat 那同一个 Runtime;主入口 Web Chat 始终运行在 Bedrock AgentCore Runtime 上(WebChatStack)
+2. 机器人派发走 `core.devops_agent.start_investigation` → DevOps Agent `CreateBacklogTask`（0 token；`core.webhook_dispatch` 那条 HMAC 签名的 generic webhook 派发现网已不用）
+3. 跨账户调查与采集锁定在部署账户（`shared/account_scope.py`；单账号模式，`--multi-account` 部署时解锁，覆盖范围由 config 表里启用的账号决定）
 4. 飞书流式卡片伪流式 UX
 5. Callback 写 DynamoDB `summary_card` + S3 指针，**不内联 summary_raw**；调查类事件**不推** notify_chat_ids（该机制保留给 PHD / Lambda4 日报）
-6. Lambda4 定时自动触发分支
+6. ~~Lambda4 定时自动触发分支~~ 已删除：Lambda4 现在只推每日运维通知（飞书，`setup.sh` 部署），不再发起调查
 
 ---
 
@@ -74,15 +74,15 @@
 | 图表元素 | 对应代码路径 |
 |---------|-------------|
 | 各业务路径（定时 + 事件） | `infra/lib/notiops-backend-stack.ts`（EventBridge Rule + Lambda） |
-| IM 机器人（webhook + Lambda） | `infra/lib/im-stack.ts` + `infra/lib/constructs/im-core.ts` + `platforms/{feishu,slack}/lambda_{ingress,worker}.py`（已退役的长连接版：`infra/lib/bot-stack.ts` + `platforms/*/app/main.py`） |
+| IM 机器人（webhook + Lambda） | `infra/lib/im-stack.ts` + `infra/lib/constructs/im-core.ts` + `platforms/{feishu,slack,dingtalk}/lambda_{ingress,worker}.py`（已退役的长连接版：`infra/lib/bot-stack.ts` + `platforms/*/app/main.py`） |
 | IM Bot 去重/幂等 | `core/ddb_state.py`（`event#` 行条件写）+ 各平台 `lambda_worker.py` |
-| 机器人派发 DevOps Agent | `core/webhook_dispatch.py` + `shared/devops_agent.py` |
+| 机器人派发 DevOps Agent | `platforms/*/caps.py::investigate` + `core/devops_agent.py`（`start_investigation` → CreateBacklogTask） |
 | 对话工具调用（MCP） | `core/aws_docs_mcp.py` + `core/mcp_http_client.py`（`sidecars/` 已随 `BotStack` 退役） |
-| LLM Provider 切换 | `shared/llm_provider.py` + `api/routes/system_config.py`（SSM `/notiops/llm/provider`） |
+| LLM Provider 切换 | `shared/llm_provider.py`（读 SSM `/notiops/llm/provider`；原来写它的 `api/routes/system_config.py` 已随老 REST API 于 2026-09-04 删除） |
 | 跨账户 AssumeRole + 锁定 | `shared/devops_agent.py::_get_cross_account_credentials` + `shared/account_scope.py`（部署账户锁定） |
 | Callback 事件处理 | `devops_agent_callback/handler.py` |
 | 报告管道（S3 单源 + summary_card） | `shared/report_delivery/report_handler.py::build_investigation_report` |
-| Lambda4 健康告警触发 | `lambda4_notifier/handler.py::_trigger_health_investigations_per_account` |
-| 数据存储（DynamoDB × 3） | `shared/queries/*.py` + `infra/lib/notiops-backend-stack.ts`（表定义） |
-| 部署账户 AgentSpace / IAM | `infra/lib/notiops-backend-stack.ts`（业务账户 onboarding 模板生成见 `api/routes/devops_agent.py`，本期 deferred） |
+| Lambda4 每日运维通知 | `lambda4_notifier/handler.py`（读巡检 / 成本异常 / 调查记录拼日报；原来的「健康告警自动触发调查」已删除） |
+| 数据存储（DynamoDB × 5：后台 4 张 + Web Chat 1 张） | `shared/queries/*.py` + `infra/lib/notiops-backend-stack.ts` + `infra/lib/constructs/web-chat-core.ts`（表定义） |
+| 部署账户 AgentSpace / IAM | `infra/lib/notiops-backend-stack.ts`（成员账号接入的模板与链接由 Web Chat BFF 下发 / 生成：`bff/web-chat/member_accounts.mjs`，模板 `infra/member-account-onboarding.yaml` / `infra/member-devops-agent.yaml`） |
 | Web Chat（AgentCore Runtime + BFF + 前端） | `infra/lib/web-chat-stack.ts` + agent 运行时代码 + `frontend/chat-app/` |

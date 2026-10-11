@@ -47,11 +47,27 @@ requires-python = ">=3.10"
 #   cloudwatch 0.1.8 · cloudtrail 0.0.18 · aws-api 1.5.1
 # 2026-09-16 收紧上界后的解析结果(只列被改动的两条):
 #   strands-agents 1.55.1 · bedrock-agentcore 1.23.0 —— 该组合已实测 import 通过。
+#
+# 🔴 2026-09-20 同一个路口**反方向**又撞了一次,而且是在现网:
+#   `bedrock-agentcore` 发了 **1.23.1**,它的 `memory/integrations/strands/session_manager.py`
+#   import `strands.experimental.bidi.hooks.BidiAgentStopEvent` —— 那个**模块**在
+#   strands 1.55.1 里不存在。于是 `< 1.24.0` 的上界让 pip 装出
+#   「bedrock-agentcore 1.23.1 + strands 1.55.1」这个坏组合,agent 容器 100% import 崩,
+#   现网聊天全挂(客户侧看到的是「Agent 服务起不来」那条文案)。
+#   ⇒ 上界收到 `< 1.23.0`(装到 1.22.0),verify_agent_deps.py 实测 16 个符号全部 import 成功。
+#
+#   ⚠️ 教训不是"再钉紧一点":`bedrock-agentcore` 对 strands 只声明 `>=1.46.0`、**没有上界**,
+#   所以这类撞车会**反复发生**,而且两个方向都会来 ——
+#     · strands 删符号 → 收 strands 上界(v1.0.29 那次)
+#     · bedrock-agentcore 要更新的 strands → 收 bedrock-agentcore 上界(这次)
+#   唯一能提前发现的手段是 `scripts/verify_agent_deps.py --latest` 那条**金丝雀**,
+#   而它只在 `$CI_PIPELINE_SOURCE == "schedule"` 时触发 —— **那个 scheduled pipeline
+#   到本次事故为止一直没建**,所以这次是我们自己在现网先撞上的。
 dependencies = [
     # 只影响可观测性(OTel 上报),坏了不影响问答,所以上界放到 major 而不是 minor。
     "aws-opentelemetry-distro < 1.0.0",
     # 上界取到 **minor** —— 见文件头「不遵守 semver 的依赖」例外清单第 2 条。
-    "bedrock-agentcore >= 1.9.1, < 1.24.0",
+    "bedrock-agentcore >= 1.9.1, < 1.23.0",
     "botocore[crt] >= 1.35.0, < 2.0.0",
     "mcp >= 1.19.0, < 2.0.0",
     # >= 1.52.0：两个硬需求叠在一起。

@@ -430,7 +430,7 @@ def send_report(chat_id: str, root_message_id: str, status: str,
     if trace_url:
         link_lines.append(f"[{i18n.t('report.see_trace', locale)}]({trace_url})")
     # ⚠️ 这里**没有**「🔬 查看本次调查」（DevOps Agent 控制台深链）：上面
-    # 两条都是预签名链接、7 天内免登录，而控制台深链必须登录 AWS 控制台。
+    # 两条都是预签名链接、免登录（数小时内有效，最长约 12 小时），而控制台深链必须登录 AWS 控制台。
     # 混在同一行 `·` 分隔的链接里，底下那句说明就只能同时写「无需登录」和
     # 「需要登录」——2026-09-05 现网就是这么自相矛盾的。少一个入口换一句
     # 不骗人的说明；进度卡上那颗保留（那里深链是唯一的链接）。

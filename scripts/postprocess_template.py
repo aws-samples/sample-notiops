@@ -37,6 +37,11 @@ import re
 import sys
 from pathlib import Path
 
+# 发布产物清单的唯一真源（同目录）。本脚本一律以 `python3 scripts/postprocess_template.py`
+# 方式运行，scripts/ 因此在 sys.path[0]；test_postprocess_template.py 也显式把它加进了
+# sys.path，所以裸 import 在两种上下文下都成立。
+from artifacts import STAGING_ORDER
+
 # 与 infra/lib/notiops-webchat-standalone-stack.ts 里的占位值一一对应。
 # 两边任何一个改了，另一边的断言会立刻失败 —— 这是有意的耦合。
 RELEASE_TAG_PLACEHOLDER = "0.0.0-UNPROCESSED"
@@ -47,10 +52,9 @@ DEFAULT_BASE_URL_TEMPLATE = "https://github.com/aws-samples/sample-notiops/relea
 # `Default: {Tag, BaseUrl}` 会被判模板格式错误。cdk synth 不报，validate-template 才报。
 RELEASE_MAP_KEY = "Current"
 
-# 六个 Release 产物。名字就是 Release 里的资产文件名，StagerFn 用
-# `<BaseUrl>/<name>` 拼下载地址。
-# 顺序 = StagerFn 的搬运顺序：小的先搬。144 MiB 的 agent zip 放最后，
-# 前面任何一个失败都能在几秒内暴露，而不是等它传完才发现。
+# Release 产物。名字就是 Release 里的资产文件名，StagerFn 用 `<BaseUrl>/<name>`
+# 拼下载地址。**清单与顺序的唯一真源是 scripts/artifacts.py** —— 下面这些常量只是
+# 给本文件里那些按名字取 key 的地方一个可读的别名，别在这里改名字或改顺序。
 BFF_ARTIFACT = "bff.zip"
 CHAT_DIST_ARTIFACT = "chat-dist.zip"
 # 「通知」生产端。名字与 infra/lib/constructs/web-notif-sources.ts 的
@@ -62,6 +66,15 @@ NOTIF_ARTIFACT = "web-notif.zip"
 IM_CODE_ARTIFACT = "im-code.zip"
 IM_LAYER_ARTIFACT = "im-layer.zip"
 AGENT_ARTIFACT = "agent-code.zip"
+# CUR 自建（`ProvisionCur=yes`）。**必须以 `cur-provisioner` 开头** —— StagerFn 在客户
+# 没选自建时按这个前缀跳过它（infra/lambda/stager/index.py `_artifacts_upsert`）。
+# 这一个 zip 里装了两个 handler：阶段一的 custom resource + 阶段二的 finalizer。
+CUR_PROVISIONER_ARTIFACT = "cur-provisioner.zip"
+# 自建成本 MCP server（客户 CUR 查询）：业务代码 + 依赖层。**必须以 `cost-mcp-` 开头**
+# —— 与 IM 同一个机制：stager 按产物名前缀决定要不要下载（没填 CUR 表的客户不用为
+# 那 ~25MB 的层等下载，见 infra/lambda/stager/index.py 的 `skip_prefixes`）。
+COST_MCP_CODE_ARTIFACT = "cost-mcp-code.zip"
+COST_MCP_LAYER_ARTIFACT = "cost-mcp-layer.zip"
 
 # CDK 默认 bootstrap 限定词（qualifier）。出现在资产桶名里。
 BOOTSTRAP_MARKERS = ("cdk-hnb659fds", "cdk-bootstrap")
@@ -86,6 +99,25 @@ PLACEHOLDER_ACCOUNT_IDS = frozenset({
 # 传 S3（`--template-url` / 控制台 "Upload a template file"）上限 1 MB。
 INLINE_TEMPLATE_LIMIT = 51_200
 S3_TEMPLATE_LIMIT = 1_000_000
+
+
+def _is_whole_gib_in_bytes(token: str) -> bool:
+    """这个 12 位数字是不是「整数个 GiB 的字节数」。
+
+    为什么需要这道排除：Athena 的 `BytesScannedCutoffPerQuery` **只收字节**，而客户面的
+    参数是 GiB（CloudFormation 没有算术，所以换算靠一张 Mapping）。于是「100 GiB 换算出来的
+    那个字节数」必然出现在模板里，而它恰好是 12 位 —— 被上面那条「疑似账号 id」判据命中。
+    （⚠️ 这里刻意**不写出那串数字** —— 发布扫描里还有一套独立的、只认 12 位数字的
+    account id 判据，写出来会把这个文件自己卡住。实测踩过一次。）
+
+    这不是给判据开后门（与 `PLACEHOLDER_ACCOUNT_IDS` 那段注释同一个道理）：判据要抓的是
+    **我们自己的账号号码被写死进模板**，而「恰好是 1024³ 的整数倍」把误报面缩到了可以忽略
+    —— 一个真实账号 id 同时满足这个条件是十亿分之一量级，而且还得**正好是我们的**账号。
+    反过来，不做这道排除的唯一"修法"是把扫描量上限从客户可配变成写死，或者去挑几个字节数
+    不是 12 位的 GiB 取值 —— 两者都是让判据把产品设计拖下水。
+    """
+    n = int(token)
+    return n % (1024 ** 3) == 0
 
 
 class PostprocessError(RuntimeError):
@@ -221,7 +253,7 @@ def set_release(template: dict, tag: str, base_url: str) -> None:
 
 
 def build_manifest(template: dict, sums: dict[str, str]) -> list[dict]:
-    """从模板里读出四个产物的 S3 key，配上 sha256，组成 StagerFn 要的清单。
+    """从模板里读出全部产物（名单与顺序见 scripts/artifacts.py 的 STAGING_ORDER）的 S3 key，配上 sha256，组成 StagerFn 要的清单。
 
     key **一律从模板里读**、不在这里重新拼一遍。理由：模板是唯一真源 —— BFF 的
     key 是 CDK 算的资产 hash，agent / 前端的 key 是栈里用 tag 拼的。在脚本里复述
@@ -252,14 +284,40 @@ def build_manifest(template: dict, sums: dict[str, str]) -> list[dict]:
     im_layer_id = _logical_id_by_cdk_path(resources, "/ImDepsLayer/Resource")
     im_layer_key = _resolve(resources[im_layer_id]["Properties"]["Content"]["S3Key"], mappings)
 
+    # 自建成本 MCP server（可选加装项）。代码与层都从 staging 桶取 —— 与 IM 同构。
+    cost_code_id = _logical_id_by_cdk_path(resources, "/CostMcpFunction/Resource")
+    cost_code_key = _resolve(resources[cost_code_id]["Properties"]["Code"]["S3Key"], mappings)
+    cost_layer_id = _logical_id_by_cdk_path(resources, "/CostMcpLayer/Resource")
+    cost_layer_key = _resolve(resources[cost_layer_id]["Properties"]["Content"]["S3Key"], mappings)
+
+    # CUR 自建（可选加装项）。阶段一与阶段二**同一个 zip**，所以读哪个函数都一样 ——
+    # 取阶段一那个，它是这条路上第一个建的资源。
+    cur_prov_id = _logical_id_by_cdk_path(resources, "/CurProvisionerFn/Resource")
+    cur_prov_key = _resolve(resources[cur_prov_id]["Properties"]["Code"]["S3Key"], mappings)
+
+    keys = {
+        BFF_ARTIFACT: bff_key,
+        CHAT_DIST_ARTIFACT: dist_key,
+        NOTIF_ARTIFACT: notif_key,
+        COST_MCP_CODE_ARTIFACT: cost_code_key,
+        COST_MCP_LAYER_ARTIFACT: cost_layer_key,
+        CUR_PROVISIONER_ARTIFACT: cur_prov_key,
+        IM_CODE_ARTIFACT: im_code_key,
+        IM_LAYER_ARTIFACT: im_layer_key,
+        AGENT_ARTIFACT: agent_key,
+    }
+    # 顺序**从 STAGING_ORDER 来**，不在这里重新排一遍；同时借它校验「有没有产物
+    # 在清单里但这里没取到 key」——漏一个的症状是客户开栈时 stager 报 NoSuchKey。
+    missing_keys = [n for n in STAGING_ORDER if n not in keys]
+    if missing_keys:
+        raise PostprocessError(
+            f"no template S3 key resolved for {missing_keys} -- scripts/artifacts.py lists them "
+            "but build_manifest does not know where to read their key from")
     manifest = []
-    for name, key in ((BFF_ARTIFACT, bff_key), (CHAT_DIST_ARTIFACT, dist_key),
-                      (NOTIF_ARTIFACT, notif_key),
-                      (IM_CODE_ARTIFACT, im_code_key), (IM_LAYER_ARTIFACT, im_layer_key),
-                      (AGENT_ARTIFACT, agent_key)):
+    for name in STAGING_ORDER:
         if name not in sums:
             raise PostprocessError(f"{name} has no sha256 in the checksum manifest (have: {sorted(sums)})")
-        manifest.append({"name": name, "key": key, "sha256": sums[name]})
+        manifest.append({"name": name, "key": keys[name], "sha256": sums[name]})
     return manifest
 
 
@@ -340,7 +398,8 @@ def assert_clean(template: dict, tag: str) -> None:
     scannable = {k: v for k, v in template.items() if k != "Resources"}
     scannable["Resources"] = {k: v for k, v in template["Resources"].items() if k != "CDKMetadata"}
     for token in re.findall(r"[0-9A-Za-z]+", json.dumps(scannable)):
-        if len(token) == 12 and token.isdigit() and token not in PLACEHOLDER_ACCOUNT_IDS:
+        if len(token) == 12 and token.isdigit() and token not in PLACEHOLDER_ACCOUNT_IDS \
+                and not _is_whole_gib_in_bytes(token):
             raise PostprocessError(
                 f"template contains a literal 12-digit account id {token!r} — "
                 "the one-click template must be account-agnostic (use AWS::AccountId). "
@@ -394,8 +453,10 @@ def assert_clean(template: dict, tag: str) -> None:
 
     # 每个产物在模板里都得真的被引用到 —— 搬一个没人用的 zip 只是白花时间和流量。
     manifest = json.loads(resources["StagerArtifacts"]["Properties"]["Artifacts"])
-    if len(manifest) != 6:
-        raise PostprocessError(f"expected 6 artifacts in the manifest, got {len(manifest)}")
+    if len(manifest) != len(STAGING_ORDER):
+        raise PostprocessError(
+            f"expected {len(STAGING_ORDER)} artifacts in the manifest, got {len(manifest)} "
+            "(the canonical list lives in scripts/artifacts.py)")
     for entry in manifest:
         for field in ("name", "key", "sha256"):
             if not entry.get(field):

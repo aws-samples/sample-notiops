@@ -40,7 +40,8 @@ logger = logging.getLogger("shared.phd_config")
 # entry is ``kind: bedrock_converse``, i.e. natively the Converse path.
 #
 # 2026-09-01: follows the catalogue default from Claude Sonnet 5 to Grok 4.6.
-_DEFAULT_MODEL_ID = "global.xai.grok-4.6"
+# 2026-10-10: and from Grok 4.6 to Kimi K3.
+_DEFAULT_MODEL_ID = "global.moonshotai.kimi-k3"
 
 _ENV_MODEL_ID = "MODEL_ID"
 

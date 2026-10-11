@@ -8,7 +8,8 @@
  *
  * 后台其实一直在发东西，只是都被当成**瞬态**处理、彼此覆盖：
  *   · `progress` —— 一行"正在做什么"（工具调用等），前端下一条就把上一条盖掉；
- *   · `reasoning` —— 模型思考增量（Grok 的明文那部分；加密链 redactedContent 拿不到也不该拿）；
+ *   · `reasoning` —— 模型思考增量（只有明文那部分：Kimi K3 / GLM 5.3 是明文；Grok 是加密链
+ *     redactedContent，拿不到也不该拿）。2026-10-10 起它**只**进这条时间线，气泡里不再另有一份；
  *   · `thinking_step` —— 本次新增，agent 侧把工具调用（含入参摘要）与工具返回摘要发出来。
  * 这里把三路合并成一条**持久**时间线，供右侧面板展示，长任务结束后还能回看。
  *
@@ -28,6 +29,16 @@ export const MAX_THINKING_STEPS = 500;
 
 /** 单段思考文本的上限：超了就掐掉（面板只是过程回看，不是全文存档）。 */
 const MAX_THOUGHT_CHARS = 8000;
+
+/** 掐断时留在末尾的标记 —— 让人知道「后面还有、只是没收」。2026-10-10 起思考只在这个面板里展示
+ *  （气泡里那份不封顶的折叠灰字已删），无声截断会让人以为模型就想到这儿。 */
+export const THOUGHT_TRUNCATED_MARK = " …";
+
+/** 把一段思考收进上限；超了就截到「上限 − 标记长度」再补标记，结果长度恰好等于上限。 */
+const clampThought = (text: string): string =>
+  text.length > MAX_THOUGHT_CHARS
+    ? text.slice(0, MAX_THOUGHT_CHARS - THOUGHT_TRUNCATED_MARK.length) + THOUGHT_TRUNCATED_MARK
+    : text;
 
 /** 时间线里的一步。`repeat` 是"这行连续出现了几次"（1 不显示）。 */
 export type TimelineStep = ThinkingStep & { repeat?: number };
@@ -87,11 +98,14 @@ export function appendReasoning(
   if (!delta) return steps as TimelineStep[];
   const last = steps[steps.length - 1];
   if (last && last.kind === "thought") {
-    const text = (last.text + delta).slice(0, MAX_THOUGHT_CHARS);
-    if (text === last.text) return steps as TimelineStep[]; // 已到上限，别白造新数组
-    return [...steps.slice(0, -1), { ...last, text }];
+    // 已截断过（到上限且带标记）→ 后面的增量一律丢，别白造新数组。只看长度不够：恰好拼到上限、
+    // 还没超的那一刻没有标记，下一个增量来了才知道后面还有 —— 那时要补上标记，而不是悄悄丢掉。
+    if (last.text.length >= MAX_THOUGHT_CHARS && last.text.endsWith(THOUGHT_TRUNCATED_MARK)) {
+      return steps as TimelineStep[];
+    }
+    return [...steps.slice(0, -1), { ...last, text: clampThought(last.text + delta) }];
   }
-  const text = delta.slice(0, MAX_THOUGHT_CHARS).trimStart();
+  const text = clampThought(delta.trimStart());
   if (!text) return steps as TimelineStep[];
   return cap([...steps, { text, kind: "thought", ts }]);
 }

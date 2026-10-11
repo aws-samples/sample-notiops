@@ -825,7 +825,8 @@ async function writeAudit(prevItem, nextCfg, actor) {
  *   · DevOps 报告精简那半边后端零改（shared/summarizer_config.py 已在读这个键）
  *   · Lambda 侧不必再养第三份 alias→model_id 解析逻辑
  *   · llmcfg 损坏也不会让 PHD 停推（Lambda 仍有自己的降级链）
- * 代价：appconfig#* 成为派生值，老巡检 UI 直接改会被下次保存覆盖 —— 那个 UI 正在下线。
+ * 代价：appconfig#* 成为派生值，绕过 Admin 直接改库会被下次保存覆盖（当年会这么改的老巡检
+ * UI 已于 2026-09-04 退役）。
  */
 const TASK_PROJECTION = {
   phd_translate: "appconfig#phd",
@@ -842,7 +843,7 @@ const PROJECTION_SK = "bedrock_model_id";
  * Converse，于是「对话里能用的模型，后端任务绑不了」。
  *
  * 拆成独立 SK 而不是把三者塞进一行 JSON：`bedrock_model_id` 这行是**早已在线**的契约
- * （shared/summarizer_config.py、老巡检 UI 都在读它的 `config_value`），改成 JSON 会
+ * （shared/summarizer_config.py、shared/phd_config.py 都在读它的 `config_value`），改成 JSON 会
  * 让存量读取方拿到一个它不认识的字符串。新增行则是纯加法，老读取方不受影响。
  */
 const PROJECTION_SK_KIND = "bedrock_model_kind";
@@ -871,10 +872,11 @@ async function projectBackendTasks(cfg, actor = {}) {
 
     if (!modelId) {
       // 未绑定 / 绑定项已消失。**不能无条件写空串**：`appconfig#devops_agent` 是一条
-      // 早已在线的行，老巡检 UI（frontend-app 的 AI 设置页）还在直接写它。第一次
-      // Admin 保存若把它清空，DevOps 报告精简会静默退回 env / 硬编码默认，而管理员
-      // 只是保存了一次模型目录、完全不知道动了那个功能。
-      // 只清空**我们自己投影过**的行（带 projected_from 标记），手填值原样保留。
+      // 早已在线的行 —— 方式 B 部署时 SeedDataResource 会预置一份默认值（put-if-absent），
+      // 老巡检 UI（frontend-app 的 AI 设置页，已于 2026-09-04 退役）当年也直接写过它，存量
+      // 部署里可能还留着那份预置值或手填值。第一次 Admin 保存若把它清空，DevOps 报告精简会
+      // 静默退回 env / 硬编码默认，而管理员只是保存了一次模型目录、完全不知道动了那个功能。
+      // 只清空**我们自己投影过**的行（带 projected_from 标记），预置值 / 手填值原样保留。
       let ours = false;
       try {
         const r = await ddb.send(new GetCommand({

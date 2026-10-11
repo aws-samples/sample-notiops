@@ -540,7 +540,8 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
           <Label>{zh ? "DevOps Agent 调用额度" : "DevOps Agent — Credit Usage"}</Label>
           {curStatus.status === "not_configured" ? (
             <div style={{ fontSize: 12, color: "var(--muted)" }}>
-              {zh ? "未配置 CUR/Athena 数据源。重跑 setup.sh 即可自动配置。" : "CUR/Athena not configured. Re-run setup.sh to set it up."}
+              {zh ? "未配置 CUR/Athena 数据源。完整部署（setup.sh）重跑一次即可自动配置；一键部署在栈更新里把 ProvisionCur 设为 yes。"
+                  : "CUR/Athena not configured. On a setup.sh deployment, re-run setup.sh to set it up; on one-click, update the stack with ProvisionCur=yes."}
             </div>
           ) : curStatus.status === "PENDING" || curStatus.status === "DELAYED" ? (
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -548,7 +549,8 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
               <span style={{ fontSize: 12, color: "var(--muted)" }}>{zh ? "数据初始化中，预计 24 小时后可用" : "Initializing data, ready in ~24h"}</span>
             </div>
           ) : curStatus.status === "FAILED" || curStatus.status === "error" ? (
-            <div style={{ fontSize: 12, color: "#d13212" }}>{zh ? "数据源配置失败，请检查后重跑 setup.sh" : "Data source setup failed"}</div>
+            <div style={{ fontSize: 12, color: "#d13212" }}>{zh ? "数据源配置失败。完整部署（setup.sh）检查后重跑一次；一键部署会每 4 小时自动重试一次。"
+                  : "Data source setup failed. On a setup.sh deployment, check and re-run setup.sh; one-click retries every 4 hours."}</div>
           ) : !dac?.available ? (
             <div style={{ fontSize: 12, color: "var(--muted)" }}>{dac?.note || (zh ? "查询未就绪，请稍后刷新" : "Not ready — refresh shortly")}</div>
           ) : (() => {

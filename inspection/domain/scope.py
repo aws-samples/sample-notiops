@@ -73,7 +73,7 @@ class ScopeLevel(str, Enum):
 class ExclusionEntry:
     """一条排除记录。
 
-    `expires_at` 语义与既有 `shared/queries/whitelist.py` 保持一致：
+    `expires_at` 语义沿用老版排除名单（`shared/queries/whitelist.py`，2026-09-04 随老系统退役）：
     **该日起失效，不含当日** —— `today >= expires_at` 即视为失效。
     ⚠️ 这里只比到日期（不比时刻）。日粒度巡检下够用，且误差方向是安全的：
     偏早失效 = 该资源被重新纳入巡检 = 客户多看见一条，而不是漏掉一条。

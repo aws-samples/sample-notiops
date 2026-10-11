@@ -296,7 +296,7 @@ def _post(per_server: list) -> list:
     merged: list = []
     for console_script, tools in per_server:
         kept = [t for t in tools if t.tool_name in _WHITELIST]
-        logger.info("finops_mcp: %s → %d/%d tools kept (whitelist)",
+        logger.info("finops_mcp: %s → %d/%d tools kept (allowlist)",
                     console_script, len(kept), len(tools))
         merged.extend(kept)
     return merged

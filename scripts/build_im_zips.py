@@ -147,10 +147,41 @@ def excluded(rel_posix: str, patterns: list[str]) -> bool:
     return False
 
 
+#: im-code.zip **只**从这几个包里取文件 —— 它们就是一键部署那 8 个 IM handler 的 import 闭包
+#: （2026-10-10 实测：129 个 .py，恰好落在这五个顶层包里；第三方依赖全在 im-layer.zip）。
+#:
+#: 为什么是允许清单而不是「仓库根减排除清单」：这个 zip 挂在**公开**的 GitHub Release 上，
+#: 而排除清单是按名字列的，永远追不上「仓库里又多了什么」—— v1.0.20–v1.0.29 的 im-code.zip
+#: 就因此带出了不该发布的本机与内部文件（已撤下）。允许清单只认「运行时要什么」。
+#: 五个包都在 `publish/include.txt` 里 ⇒ im-code.zip 是公开仓库快照的子集。
+#: 方式 B（`infra/lib/im-stack.ts` 的 `fromAsset`）不走这里，资产只进客户自己的账号。
+IM_PACKAGES = ("core", "platforms", "shared", "inspection", "devops_agent_callback")
+
+
+def _tracked_files() -> set[str]:
+    """git 跟踪的文件（仓库内相对路径）。没被跟踪的本机文件一个都不许进公开的 zip。"""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "-C", str(PROJECT_ROOT), "ls-files", "-z", "--", *IM_PACKAGES],
+                             capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        sys.exit(f"refusing to build im-code.zip: cannot list git-tracked files ({type(exc).__name__}) —— "
+                 "这个 zip 会公开发布，确认不了哪些是仓库里的文件就不打")
+    return {p.decode() for p in out.split(b"\0") if p}
+
+
 def collect_code(patterns: list[str]) -> list[tuple[Path, str]]:
-    """走仓库根，返回 (绝对路径, zip 内路径)。命中的目录整棵剪掉（不递归进去）。"""
+    """只走 IM_PACKAGES，返回 (绝对路径, zip 内路径)。命中排除清单的目录整棵剪掉；只收 git 跟踪的文件。"""
+    tracked = _tracked_files()
     files: list[tuple[Path, str]] = []
-    for dirpath, dirnames, filenames in os.walk(PROJECT_ROOT):
+    for top in IM_PACKAGES:
+        files.extend(_walk_package(PROJECT_ROOT / top, patterns, tracked))
+    return files
+
+
+def _walk_package(pkg_root: Path, patterns: list[str], tracked: set[str]) -> list[tuple[Path, str]]:
+    files: list[tuple[Path, str]] = []
+    for dirpath, dirnames, filenames in os.walk(pkg_root):
         rel_dir = Path(dirpath).relative_to(PROJECT_ROOT).as_posix()
         # 就地改 dirnames = 剪枝。不剪只靠逐文件过滤的话，光走一遍 .venv 和
         # frontend/node_modules 就要几十秒，而且会跟着符号链接乱跑。
@@ -163,7 +194,7 @@ def collect_code(patterns: list[str]) -> list[tuple[Path, str]]:
             if excluded(rel, patterns):
                 continue
             path = Path(dirpath) / name
-            if path.is_file():
+            if path.is_file() and rel in tracked:
                 files.append((path, rel))
     return files
 
@@ -191,6 +222,12 @@ def collect_layer() -> list[tuple[Path, str]]:
     pyc = 0
     files: list[tuple[Path, str]] = []
     for dirpath, dirnames, filenames in os.walk(LAYER_DIR):
+        # ⚠️ 跳过 `python/bin/`：pip 装出来的 console-script 包装器第一行是**构建机 venv 的绝对路径**
+        # （从主检出打包时就是本机用户名 + 目录结构），而这个 zip 挂在公开的 GitHub Release 上；
+        # 在 Lambda 里它们也毫无用处（没人执行 /opt/python/bin）。判据：
+        # scripts/check_artifacts_no_local_paths.py 在打包末尾扫全部产物。
+        if Path(dirpath) == LAYER_DIR / "python":
+            dirnames[:] = [d for d in dirnames if d != "bin"]
         dirnames[:] = sorted(dirnames)
         for name in sorted(filenames):
             if name == ".DS_Store":
@@ -259,6 +296,19 @@ def main() -> None:
         offenders = [n for n in code_names if n.startswith(junk) or f"/{junk}" in n]
         if offenders:
             sys.exit(f"im-code.zip 里混进了 {junk}（{len(offenders)} 个文件，例如 {offenders[0]}）")
+    # 点开头的路径一个都不许有 —— im-code.zip 会挂到**公开**的 GitHub Release 上，而本地工具
+    # （编辑器、agent、CI）的点目录会不断冒出新的，按名字列的排除清单永远追不上。这条不认名字，
+    # 只认「点开头」，清单再漏也出不了门。
+    dotted = sorted(n for n in code_names if any(part.startswith(".") for part in n.split("/")))
+    if dotted:
+        sys.exit(f"im-code.zip 里混进了 {len(dotted)} 个点开头的路径（例如 {dotted[0]}）—— 这个 zip "
+                 f"会公开发布，在 {EXCLUDE_FILE.name} 里排掉")
+    # 白名单之外的一个都不许有（见 IM_PACKAGES 的注释）。collect_code 本来就只走这几个包，
+    # 这一条防的是以后有人「顺手」往 collect_code 里加一棵树。
+    outside = sorted(n for n in code_names if n.split("/", 1)[0] not in IM_PACKAGES)
+    if outside:
+        sys.exit(f"im-code.zip 里有 {len(outside)} 个文件不在 IM 运行时的包里（例如 {outside[0]}）—— "
+                 "这个 zip 会公开发布，只许放 IM_PACKAGES")
 
     code_zip = out_dir / "im-code.zip"
     code_unzipped = write_zip(code_zip, code_files)

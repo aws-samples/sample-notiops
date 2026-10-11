@@ -3,14 +3,15 @@
 # teardown.sh —— 删除 ./setup.sh 部署出来的整套 NotiOps 环境
 # =============================================================================
 # 和 setup.sh 一一对应:setup.sh 建了什么,这里就删什么 —— 顺序按依赖倒序,
-# 并把 setup.sh 用 boto3/CLI 直建的「非 CDK 资源」(CUR 报告、CUR 桶、
+# 并把 setup.sh 用 boto3/CLI 直建的「非 CDK 资源」(CUR 相关的**不删**,见下;
 # EventBridge Scheduler、WebSearch Gateway、Secrets 的恢复期)一起收尾。
 #
 # 两档语义(与一键部署的 TeardownMode 对齐):
 #   默认(保数据)          删栈与运行时,保留四张 RETAIN 表(notiops-config /
 #                         notiops-conversations / notiops-web-chat /
-#                         notiops-inspection)与 CUR 报告/CUR 桶。
-#   --delete-everything   连表、CUR 报告、CUR 桶、Athena 保存查询、残留日志组一起删。
+#                         notiops-inspection)。CUR 报告/CUR 桶/Athena 集成栈**一概保留**。
+#   --delete-everything   连表、残留日志组一起删。⚠️ **不含 CUR**:报告定义 / 交付桶 /
+#                         Athena 集成栈 / 保存查询都保留 —— 那是账单数据,而且留着重装可直接复用。
 #
 # ⚠️ 数据桶 notiops-data-<账号>-<区域> 在 setup.sh 这条路径上是 DESTROY +
 #    autoDeleteObjects,**两档都会随主栈消失**(Skills、长报告都在里面)。所以本脚本
@@ -28,7 +29,7 @@
 #   --region <r>                部署区域(默认取 AWS_REGION / AWS_DEFAULT_REGION,再问)
 #   --profile <p>               AWS CLI profile(默认取 AWS_PROFILE / default)
 #   --dry-run                   只盘点并打印将要执行的删除,不改任何东西
-#   --delete-everything         连数据一起删(表 / CUR / 保存查询 / 残留日志组)
+#   --delete-everything         连数据一起删(表 / 残留日志组;**CUR 相关一律保留**)
 #   --backup-dir <dir>          备份目录(默认 ./notiops-teardown-backup-<时间戳>)
 #   --no-backup                 不做任何备份(数据桶随栈消失,不可恢复)
 #   --delete-member-stacksets   删两个成员账号 StackSet 及其实例(跨账号,默认跳过)
@@ -184,9 +185,24 @@ SECRETS=("notiops/im-bot-feishu" "notiops/im-bot-dingtalk" "notiops/slack-bot-to
          "notiops/aliyun-credentials")
 # 日志组:WebChatStack 走 logRetention(Lambda 自建 log group)、ECS/AgentCore 也各自建,
 # 删栈后会剩下孤儿。这几个前缀都是本项目独占(栈名前缀 / notiops 前缀),不会误伤别人。
+# 🔴 每一项都必须是**完整的日志组名前缀**,不能写栈名。
+#
+# `aws logs describe-log-groups --log-group-name-prefix` 是**字面前缀匹配**,而 CDK 给
+# Lambda 生成的日志组叫 `/aws/lambda/<栈名>-<逻辑id><hash>` —— 所以写裸栈名
+# (`NotiOpsBackendStack`)永远匹配 **0** 条。
+#
+# 这个 bug 的形态值得记一笔:它**不报错**。`--delete-everything` 跑完退出码 0、脚本还
+# 自报「本脚本负责的资源都没了」,而账号里实际留着 20 个日志组(v1.0.29 实测:
+# `/aws/lambda/NotiOpsBackendStack-*` 10 个 + `/aws/lambda/WebChatStack-*` 10 个)。
+# 前 3 项带了正确前缀、确实删掉了,这正好反证问题出在缺前缀而不是权限或 API。
+#
+# ⚠️ `ImStack` 是**当前**的 IM 栈名,`BotStack` 是旧名 —— 两个都留着:前者管新部署,
+#    后者给老部署兜底。漏掉 `ImStack` 曾经没被观察到,只是因为那次它恰好没产生日志组。
 LOG_PREFIXES=("/aws/lambda/notiops" "/aws/vendedlogs/RUMService_notiops" \
               "/aws/bedrock-agentcore/runtimes/NotiOpsWebChat" \
-              "NotiOpsBackendStack" "WebChatStack" "BotStack" "AgentCore-NotiOpsWebChat")
+              "/aws/lambda/NotiOpsBackendStack" "/aws/lambda/WebChatStack" \
+              "/aws/lambda/ImStack" "/aws/lambda/BotStack" \
+              "/aws/lambda/AgentCore-NotiOpsWebChat")
 
 # ─── 小工具 ───
 stack_status() {  # $1=栈名;不存在返回空
@@ -319,8 +335,8 @@ step "$(t "确认" "Confirm")"
 warn "$(t "即将删除账号 ${ACCOUNT} / ${REGION} 里的 NotiOps 环境。这是不可逆的。" \
          "About to delete the NotiOps environment in account ${ACCOUNT} / ${REGION}. This is irreversible.")"
 if [ "$DELETE_EVERYTHING" = true ]; then
-  warn "$(t "--delete-everything:四张 RETAIN 表、CUR 报告与 CUR 桶、Athena 保存查询、残留日志组也会删。" \
-           "--delete-everything: the four RETAIN'd tables, the CUR report and CUR bucket, Athena saved queries and leftover log groups will also be deleted.")"
+  warn "$(t "--delete-everything:四张 RETAIN 表与残留日志组也会删。CUR 相关(报告定义/交付桶/Athena 集成栈/保存查询)【保留】—— 账单数据,且重装可直接复用。" \
+           "--delete-everything: the four RETAIN'd tables and leftover log groups are also deleted. Everything CUR-related (report definition, delivery bucket, Athena integration stack, saved queries) is KEPT -- it is billing data, and a reinstall reuses it.")"
 fi
 if [ "$ASSUME_YES" = false ]; then
   printf "%s" "$(t "请输入 12 位账号号码确认: " "Type the 12-digit account id to confirm: ")"
@@ -370,6 +386,40 @@ fi
 # =============================================================================
 # 4. 删除(按依赖倒序)
 # =============================================================================
+# ─── CUR 相关的东西:**一概不删**(2026-09-20 产品决策)──────────────────────────
+#
+# 包括 CUR 报告定义、CUR 交付桶(连里面的 Parquet)、`notiops-cur-athena-<账号>` 那个
+# 官方 Athena 集成栈(Glue 库/表/crawler)、以及 lambda6 下发的 Athena 保存查询。
+#
+# 两个理由,后一个才是决定性的:
+#   ① 那是客户的**账单历史**,而 AWS **不补发**过去的月份 —— 删掉就永久断档。
+#   ② **留着能让重装立刻可用**。新建 CUR 到首次交付有 ~24h 硬延迟;而如果这些东西还在,
+#      重装后 `lambda6_cur_finalizer` 会走「复用既有 CUR」的快路(它按 S3 路径去 Glue
+#      **动态发现**已有表,不靠命名约定),**几分钟**就翻 READY,客户不用再等一天。
+#      反过来说:删了它们,重装的客户要重新等 24 小时 —— 这是纯粹的损失。
+#
+# ⚠️ **两种模式下都保留**,所以这个报告在 `--delete-everything` 与保数据模式下都要打 ——
+#    它既不属于「保数据模式保留、加个参数就能删」那一类,也不该出现在「删完清点」的
+#    「仍在 …」列表里(那会让客户以为没删干净,而那恰恰是设计意图)。
+#    脚本的 --help、确认提示、以及四份 README 都已按这个口径改过,别只改一处。
+report_cur_kept() {
+  local any=false
+  [ -n "$CUR_FOUND" ] && [ "$CUR_FOUND" != "None" ] && any=true
+  bucket_exists "$BUCKET_CUR" && any=true
+  [ "$any" = true ] || return 0
+  echo ""
+  info "$(t "CUR 相关资源【故意保留】(账单数据,且重装时可直接复用):" \
+           "CUR resources are deliberately KEPT (billing data, and a reinstall reuses them):")"
+  [ -n "$CUR_FOUND" ] && [ "$CUR_FOUND" != "None" ] && echo "    · $(t "CUR 报告定义: " "CUR report definition: ")$CUR_REPORT"
+  bucket_exists "$BUCKET_CUR" && echo "    · $(t "CUR 交付桶: " "CUR delivery bucket: ")$BUCKET_CUR"
+  aws cloudformation describe-stacks --stack-name "$STACK_CUR_ATHENA" --region "$REGION" >/dev/null 2>&1 \
+    && echo "    · $(t "Athena 集成栈: " "Athena integration stack: ")$STACK_CUR_ATHENA"
+  echo "    $(t "重装 NotiOps 时 finalizer 会自动发现并复用它们(几分钟,不用再等 24 小时首次交付)。" \
+               "On reinstall the finalizer discovers and reuses them within minutes -- no second 24h wait for first delivery.")"
+  echo "    $(t "真要删:先在 Billing 控制台删报告定义,再删桶 —— 注意账单历史 AWS 不补发。" \
+               "To really remove them: delete the report definition in the Billing console, then the bucket -- note that AWS does not backfill billing history.")"
+}
+
 delete_stack_wait() {  # $1=栈名
   local name="$1" st
   st="$(stack_status "$name")"
@@ -420,7 +470,21 @@ PY
 
 step "$(t "1/8 AgentCore Runtime(agent 本体)" "1/8 AgentCore Runtime (the agent itself)")"
 AGENT_DIR="$(cd "$(dirname "$0")" && pwd)/agent-build/NotiOpsWebChat"
-if command -v agentcore >/dev/null 2>&1 && [ -d "$AGENT_DIR" ]; then
+# ⚠️ **先探测 `destroy` 子命令是否存在,再决定走哪条路** —— 别直接调。
+#
+# 实测(2026-09-20,agentcore CLI 当前版本):**根本没有 `destroy` 这个子命令**
+# (help 里是 `invoke` / `remove` / `archive` / `export`)。于是原来那句无条件调用
+# **每次必失败一次**:CLI 对未知子命令的反应是打完整 usage,于是日志里先灌进约 60 行
+# help,再跟一条 `[warn] agentcore destroy 失败,回退删栈`。
+#
+# 结果是对的(回退删栈能删干净),所以这不是功能缺陷 —— 但它是**运维可读性**缺陷:
+# 那 60 行噪音 + 一条 warn 会把**真正的**失败(比如权限不足)盖掉,看日志的人分不清
+# 「这是已知的无害回退」还是「这次真出问题了」。
+#
+# 探测而不是直接删掉这条路:万一某个版本的 CLI 有 `destroy`,它仍然是更合适的入口
+# (它维护自己那个同名 CDK 栈)。
+if command -v agentcore >/dev/null 2>&1 && [ -d "$AGENT_DIR" ] \
+   && agentcore --help 2>/dev/null | grep -qE '^[[:space:]]+destroy\b'; then
   info "$(t "用 agentcore CLI 删(它维护同名 CDK 栈)…" "Using the agentcore CLI (it owns the same-named CDK stack)…")"
   if [ "$DRY_RUN" = true ]; then
     echo "    ${YEL}would run:${RST} (cd $AGENT_DIR && AWS_REGION=$REGION agentcore destroy -y)"
@@ -431,7 +495,10 @@ if command -v agentcore >/dev/null 2>&1 && [ -d "$AGENT_DIR" ]; then
     delete_stack_wait "$STACK_AGENT"
   fi
 else
-  info "$(t "没有 agentcore CLI(或没有 agent-build 目录),直接删栈" "No agentcore CLI (or no agent-build dir) — deleting the stack directly")"
+  # 这是**当前 CLI 版本下的正常路径**(它没有 `destroy` 子命令),所以用 info 而不是 warn ——
+  # 措辞里也不再暗示"少了什么"。删栈本身就能把 runtime / endpoint 一起删干净。
+  info "$(t "agentcore CLI 没有 destroy 子命令(或没装 CLI / 没有 agent-build 目录),直接删栈" \
+           "The agentcore CLI has no destroy subcommand (or the CLI / agent-build dir is absent) -- deleting the stack directly")"
   delete_stack_wait "$STACK_AGENT"
 fi
 # CLI 走完也确认栈真没了(agentcore 版本差异:destroy / delete 行为不完全一致)。
@@ -455,7 +522,9 @@ delete_stack_wait "$STACK_MAIN"
 step "$(t "5/8 CUR → Athena 集成栈" "5/8 CUR → Athena integration stack")"
 # 这个栈是 lambda6_cur_finalizer 用官方 crawler-cfn.yml 建的,里面含 Glue 数据库
 # athenacurcfn_*(随栈删)。Glue 数据库 cid_cur 属于别的项目,本脚本绝不碰。
-delete_stack_wait "$STACK_CUR_ATHENA"
+# ⚠️ **不删** `notiops-cur-athena-<账号>` —— 它装的是 Glue 库/表/crawler,即「CUR 配置」,
+# 留着才能让重装走「复用既有 CUR」快路(见下面 --delete-everything 段的说明)。
+# 原来这里是 `delete_stack_wait "$STACK_CUR_ATHENA"`,2026-09-20 按产品决策去掉。
 
 step "$(t "6/8 非 CDK 收尾(Scheduler / Gateway / Secrets)" "6/8 Non-CDK cleanup (scheduler / gateway / secrets)")"
 if [ -n "$(awsq scheduler get-schedule --name "$SCHEDULE_CUR" --query Name)" ]; then
@@ -505,28 +574,6 @@ if [ "$DELETE_EVERYTHING" = true ]; then
         warn "$(t "删表失败: " "Table deletion failed: ")$tb"
     fi
   done
-  if [ -n "$CUR_FOUND" ] && [ "$CUR_FOUND" != "None" ]; then
-    info "$(t "删 CUR 报告定义 " "Deleting CUR report definition ")$CUR_REPORT"
-    # cur API 端点固定在 us-east-1(CUR 是全局服务),这里不能用部署区。
-    run aws cur delete-report-definition --report-name "$CUR_REPORT" --region us-east-1 >/dev/null 2>&1 || \
-      warn "$(t "删 CUR 报告失败(可手工在 Billing 控制台删)" "Deleting the CUR report failed (delete it in the Billing console)")"
-  fi
-  if bucket_exists "$BUCKET_CUR"; then
-    info "$(t "删 CUR 桶 " "Deleting CUR bucket ")$BUCKET_CUR"
-    empty_bucket "$BUCKET_CUR"
-    run aws s3 rb "s3://$BUCKET_CUR" --region "$REGION" >/dev/null 2>&1 || \
-      warn "$(t "CUR 桶删除失败,需手工清: " "CUR bucket deletion failed; clean up manually: ")$BUCKET_CUR"
-  fi
-  # Athena 保存查询(lambda6 下发的 6 条,名字都以 "NotiOps - " 开头)。
-  for qid in $(awsq athena list-named-queries --query 'NamedQueryIds[]'); do
-    [ -n "$qid" ] && [ "$qid" != "None" ] || continue
-    qname="$(awsq athena get-named-query --named-query-id "$qid" --query 'NamedQuery.Name')"
-    case "$qname" in
-      "NotiOps - "*)
-        info "$(t "删 Athena 保存查询: " "Deleting Athena saved query: ")$qname"
-        run aws athena delete-named-query --named-query-id "$qid" --region "$REGION" >/dev/null 2>&1 || true ;;
-    esac
-  done
   # 残留日志组(WebChatStack 的 Lambda 自建、ECS、AgentCore、RUM)。
   for pfx in "${LOG_PREFIXES[@]}"; do
     for lg in $(awsq logs describe-log-groups --log-group-name-prefix "$pfx" --query 'logGroups[].logGroupName'); do
@@ -539,11 +586,13 @@ else
   echo "$(t "保数据模式:以下保留(需要时用 --delete-everything 或手工删)" \
            "Keep-data mode: the following are preserved (use --delete-everything, or delete manually)")"
   for tb in "${TABLES_RETAINED[@]}"; do table_exists "$tb" && echo "  · DynamoDB $tb"; done
-  [ -n "$CUR_FOUND" ] && [ "$CUR_FOUND" != "None" ] && echo "  · CUR report $CUR_REPORT"
-  bucket_exists "$BUCKET_CUR" && echo "  · S3 $BUCKET_CUR"
-  echo "  · $(t "Athena 保存查询「NotiOps - *」、残留日志组(见下面的收尾清单)" \
-                "Athena saved queries \"NotiOps - *\", leftover log groups (see the follow-up list below)")"
+  # ⚠️ CUR 相关的不列在这里 —— 这一段的语义是「保数据模式保留、`--delete-everything`
+  #    就会删」,而 CUR 是**两种模式下都保留**的。混在一起会让人以为加个参数就能删掉。
+  #    它由下面那段单独报(措辞是「故意保留」)。
+  echo "  · $(t "残留日志组(见下面的收尾清单)" "leftover log groups (see the follow-up list below)")"
 fi
+# 两种模式都报一次 —— CUR 相关的东西与 --delete-everything 无关,一律保留。
+report_cur_kept
 
 step "$(t "8/8 多账号:成员账号 StackSet" "8/8 Multi-account: member-account StackSets")"
 # 跨账号删除影响别人的账号,默认只打印命令。--delete-member-stacksets 才真删。
@@ -602,11 +651,15 @@ fi
 # =============================================================================
 step "$(t "删完清点" "Post-deletion inventory")"
 LEFT=false
-for s in "$STACK_AGENT" "$STACK_IM" "$STACK_BOT" "$STACK_WEBCHAT" "$STACK_MAIN" "$STACK_CUR_ATHENA"; do
+# ⚠️ `$STACK_CUR_ATHENA` 与 `$BUCKET_CUR` **不在这个清点里** —— 它们是**故意保留**的
+# (见上面 --delete-everything 段:账单数据 + 重装可直接复用)。把它们留在这里会让每次
+# teardown 都报「仍在 …」⇒ 客户以为没删干净,而那恰恰是设计意图。
+# 它们由上面那段单独、明确地报出来,措辞是「故意保留」而不是「仍在」。
+for s in "$STACK_AGENT" "$STACK_IM" "$STACK_BOT" "$STACK_WEBCHAT" "$STACK_MAIN"; do
   st="$(stack_status "$s")"
   if [ -n "$st" ] && [ "$st" != "None" ]; then echo "  · $(t "仍在: " "still there: ")$s ($st)"; LEFT=true; fi
 done
-for b in "$BUCKET_FRONTEND" "$BUCKET_CHAT_FRONTEND" "$BUCKET_DATA" "$BUCKET_CUR"; do
+for b in "$BUCKET_FRONTEND" "$BUCKET_CHAT_FRONTEND" "$BUCKET_DATA"; do
   bucket_exists "$b" && { echo "  · $(t "仍在: " "still there: ")S3 $b"; LEFT=true; }
 done
 for tb in "${TABLES_RETAINED[@]}"; do
@@ -631,7 +684,50 @@ $(t "· Glue 数据库 cid_cur(属 Cloud Intelligence Dashboards)、以及任何
      "· Glue database cid_cur (belongs to Cloud Intelligence Dashboards) and anything NotiOps did not create.")
 $(t "· Bedrock 模型访问权限、Organizations 的服务访问设置 —— 别的项目可能也在用。" \
      "· Bedrock model access and AWS Organizations service-access settings — other projects may rely on them.")
+$(t "· 一键部署(方式 A)留下的产物镜像桶 notiops-oneclick-mirror-<账号>-<区>:" \
+     "· The one-click (method A) artifact mirror bucket notiops-oneclick-mirror-<account>-<region>:")
+  $(t "  不是 setup.sh 建的,所以本脚本不动它。但它装着整套发布产物(约 330 MB)且**一直计费**。" \
+       "  setup.sh did not create it, so this script leaves it alone. It holds a full set of release artifacts (~330 MB) and keeps costing money.")
+  $(t "  「先用方式 A 试用、后来转方式 B」是 README 推荐的路径,所以这个桶很常见 —— 自己删:" \
+       "  Trying method A first and then moving to method B is a documented path, so this bucket is common. Delete it yourself:")
+  aws s3 rb s3://notiops-oneclick-mirror-$ACCOUNT-$REGION --force
 EOF
+
+# ─── StackSet **实例栈**(StackSet-notiops-member-*)—— 只报,绝不删 ──────────────
+#
+# 为什么要单独扫一遍:上面的盘点查的是**父 StackSet**(`describe-stack-set`),而
+# StackSet 下发到本账号的**实例栈**叫 `StackSet-<名字>-<uuid>`,是一个普通 CFN 栈 ——
+# `list-stack-sets` / `describe-stack-set` 查不到它,`describe-stacks` 才查得到。
+# 于是 v1.0.29 实测出现过:盘点报「StackSet: notiops-member-onboarding —— 不存在」,
+# 而账号里那个实例栈**跑完 teardown 依然在**(里面 5 个资源:两条事件转发规则 + 三个角色)。
+#
+# 🔴 **为什么只报不删**(这点比"检测到"更重要):
+#    实例栈存在通常**不是**因为父 StackSet 被删了变成孤儿,而是因为**父 StackSet 在另一个
+#    账号里**(组织管理账号 / 委派管理员)——它还活着,只是本账号看不到(见本文件开头
+#    `SS_CALL_AS` 那段说明)。此时本地删掉这个实例栈是**错的**:等于把那套多账号接入
+#    从这个账号摘掉,而 StackSets 侧还会检测到漂移。
+#    该由谁删:在**管理账号**上删对应的 StackSet 实例,或跑 `./setup.sh --phd --remove`。
+#
+# ⚠️ 但**必须报出来**,因为 `infra/member-account-onboarding.yaml` 里那些资源名是
+#    **确定性的**(`notiops-devops-forwarder-role-<账号>`、`notiops-phd-events-forward` …),
+#    所以留着它会让**本账号后续的** `./setup.sh --multi-account` / `--phd` 撞"资源已存在"
+#    而失败 —— 而用户如果只看到「不存在」,根本不会知道要先处理它。
+ORPHAN_SS="$(awsq cloudformation describe-stacks \
+  --query 'Stacks[?starts_with(StackName, `StackSet-notiops-member-`)].StackName' 2>/dev/null || true)"
+if [ -n "$ORPHAN_SS" ] && [ "$ORPHAN_SS" != "None" ]; then
+  echo ""
+  warn "$(t "本账号里还有 StackSet 下发的实例栈(本脚本【故意】不删,见下):" \
+           "This account still has StackSet-deployed instance stacks (this script deliberately does NOT delete them):")"
+  for s in $ORPHAN_SS; do echo "    · $s"; done
+  echo "    $(t "它们的父 StackSet 很可能在【另一个账号】(组织管理账号/委派管理员)里、且仍然活着 ——" \
+               "Their parent StackSet most likely lives in ANOTHER account (the org management account / delegated admin) and is still alive --")"
+  echo "    $(t "在本账号删掉它们等于把多账号接入摘掉,而 StackSets 侧会检测到漂移。" \
+               "deleting them here would remove this account's onboarding while StackSets still tracks it as drift.")"
+  echo "    $(t "⚠️ 但留着它们会让本账号后续的 ./setup.sh --multi-account / --phd 撞「资源已存在」而失败。" \
+               "WARNING: leaving them will make a later ./setup.sh --multi-account / --phd in THIS account fail on already-existing resource names.")"
+  echo "    $(t "正确做法:在管理账号上删对应的 StackSet 实例,或跑 ./setup.sh --phd --remove。" \
+               "The right fix: delete the matching StackSet instance from the management account, or run ./setup.sh --phd --remove.")"
+fi
 
 echo ""
 if [ "$DO_BACKUP" = true ] && [ -n "${BACKUP_DIR:-}" ] && [ -d "$BACKUP_DIR" ]; then

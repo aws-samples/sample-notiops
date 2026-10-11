@@ -12,7 +12,7 @@ Triggered by EventBridge when a DevOps Agent investigation completes or fails.
 
 Environment Variables:
   S3_BUCKET:                  S3 bucket name (required; deploy-injected unique name, no hardcoded default)
-  PRESIGN_EXPIRY:             Pre-signed URL expiry in seconds (default: 604800)
+  PRESIGN_EXPIRY:             Pre-signed URL expiry in seconds (default: 604800; an upper bound only: temporary-credential signatures die within ~12h)
   FEISHU_CONVERSATIONS_TABLE: DynamoDB table written by the feishubot stack
   FEISHU_APP_ID_ARN:          Secrets Manager ARN of Feishu App ID
   FEISHU_APP_SECRET_ARN:      Secrets Manager ARN of Feishu App Secret
@@ -444,7 +444,7 @@ def _resolve_report_title(explicit: str, incident_id: str, task_id: str) -> str:
 
 # ⚠️ 这里曾有一个 `_console_deep_link(agent_space_id, task_id)`，给最终报告卡
 # 拼「🔬 查看本次调查」（DevOps Agent 控制台深链）那颗按钮用。2026-09-05 加上、
-# 当天按用户要求去掉：报告卡上其余链接都是预签名的 S3 / CDN URL（7 天内有效、
+# 当天按用户要求去掉：报告卡上其余链接都是预签名的 S3 / CDN URL（签名凭证一过期就失效，最长约 12 小时；
 # 免登录），控制台深链却必须先登录 AWS 控制台，两种混在一排按钮里，底下那行
 # 说明就只能同时写「无需登录」和「需要登录」——现网真的这么显示过。
 #
@@ -1584,8 +1584,9 @@ def _persist_support_context(incident_id: str, task_id: str, agent_space_id: str
                              platform: str, account_id: str = "") -> None:
     """Stash the report content under a `support#<incident_id>` key so the
     originating platform bot's support handler can retrieve it when the user
-    clicks 'Ask for human support' on the report card. TTL matches the
-    presigned URL expiry (7 days).
+    clicks 'Ask for human support' on the report card. TTL is 7 days
+    (`PRESIGN_EXPIRY`); the presigned links themselves die sooner (temporary
+    credentials, at most about 12 hours).
 
     `account_id`（2026-09-07 多账号，空 = 部署账号）：这次调查查的是哪个账号，也就是
     「🆘 升级到 Support」/「📎 同步到 case」应该开 / 写**哪个账号**的工单。它跟着这一行

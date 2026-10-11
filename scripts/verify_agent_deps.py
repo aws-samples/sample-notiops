@@ -42,8 +42,19 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
+
+# tomllib 只有 Python ≥ 3.11 才有，而文档与 setup.sh 前置检查认的最低版本是 3.10
+# （docs/PREREQUISITES.md §2.1）。之前这里直接 `import tomllib` → 3.10 上 deploy_agent.sh
+# 报「Refusing to deploy」退出，setup.sh 整个失败（2026-10-10 发版前审查实测）。
+# 退路的顺序：tomllib → tomli（装了就用）→ 下面那个只认 `[project].dependencies` 的严格解析。
+try:
+    import tomllib as _toml
+except ModuleNotFoundError:  # Python 3.10
+    try:
+        import tomli as _toml  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        _toml = None
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 APP_DIR = REPO_ROOT / "agent-build" / "NotiOpsWebChat" / "app" / "NotiOpsWebChat"
@@ -64,11 +75,56 @@ def _normalize(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def _project_dependencies_minimal(text: str) -> list[str]:
+    """不靠 TOML 库取 `[project]` 表里的 `dependencies = [...]`（只给 Python 3.10 且没装 tomli 时用）。
+
+    只认这个 manifest 实际的写法：双引号字符串数组，可跨行、可带 `#` 注释。逐字符扫，只有
+    **字符串外面**的 `]` / `#` 才算语法 —— 依赖串里本来就有方括号（`botocore[crt]`）。
+    任何意外形状（没找到、转义、单引号、数组没闭合、解析出 0 条）一律报错退出：宁可停下，
+    也不能拿着残缺的依赖清单去「验证」然后放行部署。
+    """
+    table = re.search(r"(?ms)^\[project\][ \t]*$(.*?)(?=^\[|\Z)", text)
+    if not table:
+        sys.exit("[verify-deps] pyproject.toml 里找不到 [project] 表")
+    body = table.group(1)
+    head = re.search(r"(?m)^dependencies\s*=\s*\[", body)
+    if not head:
+        sys.exit("[verify-deps] pyproject.toml 里找不到 [project].dependencies")
+    deps: list[str] = []
+    i = head.end()
+    while True:
+        if i >= len(body):
+            sys.exit("[verify-deps] pyproject.toml: [project].dependencies 数组没有闭合")
+        c = body[i]
+        if c == "#":                       # 注释到行尾
+            j = body.find("\n", i)
+            i = len(body) if j < 0 else j
+        elif c == '"':
+            j = body.find('"', i + 1)
+            if j < 0:
+                sys.exit("[verify-deps] pyproject.toml: dependencies 里有没闭合的字符串")
+            item = body[i + 1:j]
+            if "\\" in item:
+                sys.exit("[verify-deps] pyproject.toml: dependencies 里出现了转义 —— 装 tomli 或用 Python ≥ 3.11 再跑")
+            deps.append(item)
+            i = j + 1
+        elif c == "'":
+            sys.exit("[verify-deps] pyproject.toml: dependencies 里出现了单引号字符串 —— 装 tomli 或用 Python ≥ 3.11 再跑")
+        elif c == "]":
+            break
+        else:
+            i += 1
+    if not deps:
+        sys.exit("[verify-deps] pyproject.toml: [project].dependencies 解析出 0 条")
+    return deps
+
+
 def manifest_requirements() -> dict[str, str]:
     """{归一化包名: 完整 PEP 508 依赖串}，直接取 manifest 原文。"""
-    data = tomllib.loads(BUILD_MANIFEST.read_text(encoding="utf-8"))
+    text = BUILD_MANIFEST.read_text(encoding="utf-8")
+    deps = _toml.loads(text)["project"]["dependencies"] if _toml else _project_dependencies_minimal(text)
     out: dict[str, str] = {}
-    for raw in data["project"]["dependencies"]:
+    for raw in deps:
         req = raw.split(";", 1)[0].strip()
         m = _NAME_RE.match(req)
         if not m:

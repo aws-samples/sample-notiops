@@ -1,5 +1,7 @@
 /**
- * 飞书机器人通知配置（Admin「通知」板块）。
+ * 飞书机器人通知配置（Admin「集成 IM」页的飞书分页，即左侧「更多 → 管理 → 集成 IM」）。
+ * 老 Dashboard 的「设置 → 通知设置」页（/settings/notifications + /api/notification-config）
+ * 已于 2026-09-04 随老控制台退役，这一页就是它的接替。
  *
  * GET  /admin/notification-config       读配置（敏感字段脱敏 ****后4位）
  * PUT  /admin/notification-config       写配置（脱敏字段回传不覆盖原值）
@@ -7,7 +9,7 @@
  *
  * 存储 = Secrets Manager 单 secret `notiops/im-bot-feishu`（通知基础设施的数据面：
  * 每日推送/DevOps 回调/PHD/push handler/飞书 bot 都按名读它）。**按字面名引用、
- * 不做跨栈 CFN import** —— 老管理前端(frontend-app)及其 API 未来 sunset 时本模块零影响。
+ * 不做跨栈 CFN import** —— 所以 2026-09-04 老管理前端(frontend-app)及其 API 退役时本模块零影响。
  * 测试发送用 Feishu OpenAPI 原生实现（tenant_access_token + im/v1/messages），
  * 不依赖老 Python shared/feishu_sender.py。
  */

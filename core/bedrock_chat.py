@@ -75,6 +75,7 @@ logger = logging.getLogger(__name__)
 # globally routed for the very same alias. Unified on `global.*` (decision 2026-07).
 #
 # 2026-09-01: follows the catalogue default from Claude Sonnet 5 to Grok 4.6.
+# 2026-10-10: and from Grok 4.6 to Kimi K3.
 # ⚠️ **Never read this constant directly** — use `_default_model_pair()` below.
 # `_invoke` / `_invoke_with_tools` dispatch on `model_kind`, and a model id
 # without its matching kind is a torn pair: a Grok id reaching the
@@ -83,7 +84,7 @@ logger = logging.getLogger(__name__)
 # ValidationException. That is precisely the class of bug this env var used to
 # invite, which is why the raw value is no longer usable on its own.
 _BEDROCK_MODEL_ID_ENV = os.environ.get("BEDROCK_MODEL_ID", "").strip()
-BEDROCK_MODEL_ID = _BEDROCK_MODEL_ID_ENV or "global.xai.grok-4.6"
+BEDROCK_MODEL_ID = _BEDROCK_MODEL_ID_ENV or "global.moonshotai.kimi-k3"
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
 
 # Hard input cap so a malicious / very long prompt can't blow up cost or
@@ -652,7 +653,7 @@ def respond(user_text: str, *, command: str,
                 resolve the per-chat model preference set via
                 `@bot model X`. Optional — when omitted the bot falls
                 back to the catalogue's admin-managed `default_model`
-                (Claude Sonnet 5 today). The old `DEFAULT_LLM_PROVIDER` /
+                (Kimi K3 since 2026-10-10). The old `DEFAULT_LLM_PROVIDER` /
                 SSM levels were removed in 2026-08 (spec R8.2) because
                 they silently out-ranked the admin default; see
                 `core/llm_pref_resolver.py`.
@@ -1315,9 +1316,11 @@ def _invoke_with_tools(user_text: str, locale: str = "en",
 
     `model_id` / `model_kind` come from the resolver in `respond()`.
     Three kinds today, each with its own dispatcher below:
-      - ``bedrock_anthropic`` (Claude — default): Anthropic Messages
+      - ``bedrock_anthropic`` (Claude): Anthropic Messages
         body via Bedrock InvokeModel
-      - ``bedrock_converse`` (Amazon Nova): Bedrock Converse API
+      - ``bedrock_converse`` (the catalogue default Kimi K3 and the other
+        non-Claude, non-Mantle models; first written for Amazon Nova):
+        Bedrock Converse API
       - ``bedrock_mantle_responses`` (GPT-5.x): SigV4-signed POST to
         bedrock-mantle.<region>.api.aws/openai/v1/responses (OpenAI
         Responses API protocol, with stateful previous_response_id
@@ -1725,7 +1728,8 @@ def _invoke(user_text: str, locale: str = "en",
 
     Three kinds (see `_invoke_with_tools` docstring):
       - ``bedrock_anthropic``: Anthropic Messages body via InvokeModel
-      - ``bedrock_converse``: Bedrock Converse API (Nova family)
+      - ``bedrock_converse``: Bedrock Converse API (Kimi K3 and the other
+        non-Claude, non-Mantle models)
       - ``bedrock_mantle_responses``: OpenAI Responses API on
         bedrock-mantle endpoint (GPT-5.x family)
     """

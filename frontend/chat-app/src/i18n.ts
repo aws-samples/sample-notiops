@@ -143,9 +143,11 @@ export const STRINGS: Dict = {
     zh: "读不到调查日志，无法证明 skill 加载过 —— 可能调查还在跑，也可能是我们权限不足；「无法证明」不等于「没问题」",
     en: "the investigation journal was unreadable, so skill loading cannot be proven; the run may still be in flight, or our permissions may be insufficient. Unproven is not the same as fine",
   },
+  // 路径从「更多」写起：2026-10-10 起「管理」收进侧栏「更多」（默认收起），一级导航里看不到它。
+  // 落点是该账号那一行底下的 InspectionCrossAccountSection 第②步（AdminPanel.tsx）。
   "insp.gate.no_data_access": {
-    zh: "AI 拿不到这个账号的数据（Agent Space 少了账号关联）—— 报告格式完好但里面没有真实分析，去管理页把该账号关联进巡检 space",
-    en: "the agent could not read this account's data (the agent space is missing the account association); the report looks complete but contains no real analysis. Link the account in the admin page",
+    zh: "AI 拿不到这个账号的数据（Agent Space 少了账号关联）—— 报告格式完好但里面没有真实分析，去「更多 → 管理 → 账户」把该账号关联进巡检 space（该账号的「巡检的跨账号前置」→「一键关联」）",
+    en: "the agent could not read this account's data (the agent space is missing the account association); the report looks complete but contains no real analysis. Link the account into the inspection agent space under More → Admin → Accounts (that account's \"Cross-account prerequisites for inspection\" → \"Link now\")",
   },
   // 后四档：方法论**已生效**，只是有折扣（trustworthy=true）
   "insp.gate.compaction": {
@@ -644,7 +646,8 @@ export const STRINGS: Dict = {
   "admin.models.defaultTip": { zh: "新对话的默认模型,必须已启用且通过连通性测试", en: "Default model for new chats; must be enabled and pass the connectivity test" },
   "admin.models.capTip": { zh: "该模型的输出 token 硬上限(取自模型文档);设太低会静默截断回复", en: "The model's hard output-token cap from its docs; too low silently truncates replies" },
   "model.degradedNotice": { zh: "⚠ 暂时读不到模型目录，当前用的是内置备用清单;稍后会自动重试。", en: "\u26a0 The model catalogue is temporarily unavailable; using the built-in fallback list. Retrying automatically." },
-  "model.noneEnabled": { zh: "管理员尚未为 Web 对话启用任何模型,暂时无法发送消息。请联系管理员在「管理 → 模型」中启用。", en: "No model has been enabled for web chat yet, so messages cannot be sent. Ask an administrator to enable one under Admin \u2192 Models." },
+  // 路径从「更多」写起：2026-10-10 起「管理」收进侧栏「更多」（默认收起），一级导航里看不到它。
+  "model.noneEnabled": { zh: "管理员尚未为 Web 对话启用任何模型,暂时无法发送消息。请联系管理员在「更多 → 管理 → 模型」中启用。", en: "No model has been enabled for web chat yet, so messages cannot be sent. Ask an administrator to enable one under More \u2192 Admin \u2192 Models." },
   "model.loading": { zh: "正在读取可用模型…", en: "Loading available models…" },
   "model.fallbackNotice": { zh: "⚠ 这是打包内置的备用清单 —— 未能读取管理员配置的模型目录，实际可用模型可能与此不同。", en: "\u26a0 Built-in fallback list \u2014 the administrator's model catalogue could not be loaded, so the models actually available may differ." },
   "admin.models.cap": { zh: "最大输出", en: "Max output" },
@@ -758,7 +761,13 @@ export const STRINGS: Dict = {
   "admin.notif.tokenHint": { zh: "飞书「加密策略」页直接给出,复制过来。仅显示后 4 位。", en: "Shown on the Feishu Encryption Strategy page — copy it here. Only last 4 chars shown." },
   "admin.notif.keysRequired": { zh: "Webhook 模式下这两把钥匙是必填项:缺任一,IM 入口会在冷启动时直接失败(飞书那边显示「校验失败」)。必须先在这里保存,再去飞书填请求地址。", en: "Both keys are required in webhook mode: if either is empty the IM entry point fails at cold start (Feishu shows a verification failure). Save them here BEFORE setting the request URL in Feishu." },
   "admin.notif.chatIds": { zh: "推送群组 Chat ID", en: "Target group chat IDs" },
-  "admin.notif.chatIdsHint": { zh: "出方向:每日报告、告警推送、调查回调发到这些群。群里 @机器人 的收方向不用在这里登记,由飞书的事件订阅决定。", en: "Outbound only: daily reports, alerts and investigation callbacks go to these chats. Inbound (@mention in a chat) needs no entry here — it is driven by the Feishu event subscription." },
+  // 🔴 2026-10-11 改：原文说「每日报告、告警推送、调查回调」都发到这些群，三样里两样不对。
+  //    `notify_chat_ids` 只有 lambda4_notifier（每日运维通知，02:00 UTC）和 phd_event_forwarder
+  //    （AWS Health）读，两个都只在 NotiOpsBackendStack（setup.sh）里建；告警类实时推送
+  //    （shared/report_delivery/push_handler.py）只认自己的 PUSH_TARGET_* 环境变量，哪条部署路径都不设；
+  //    调查回调早就不推这里（devops_agent_callback/handler.py：_notify_im 已删）；巡检推送读的是
+  //    `inspchat#target` 行（inspection/domain/targets.py），也不读这份列表。
+  "admin.notif.chatIdsHint": { zh: "出方向:每日运维通知(每天 02:00 UTC)和 AWS Health 事件通知发到这些群。这两样只有完整部署(setup.sh)才有 —— 一键部署里这份列表收不到任何推送。调查结果回贴发起调查的那个会话,不发到这里;巡检推送也不读这份列表。群里 @机器人 的收方向不用在这里登记,由飞书的事件订阅决定。", en: "Outbound only: the daily notification (02:00 UTC) and AWS Health event notifications go to these chats. Both exist only on the full (setup.sh) deployment — on a one-click deployment this list receives nothing. Investigation results are posted back to the conversation that started them, not here, and inspection push does not read this list. Inbound (@mention in a chat) needs no entry here — it is driven by the Feishu event subscription." },
   // 页面上的四步速览 + 打开右侧抽屉的超链接。详细步骤内容在 content/feishuGuide.ts。
   "admin.notif.steps.title": { zh: "在飞书开放平台要做的四步", en: "Four steps in the Feishu console" },
   "admin.notif.steps.s1": { zh: "创建/打开自建应用,开通机器人能力与 im / cardkit 权限,创建版本并发布。", en: "Create or open a custom app, enable the bot capability plus the im / cardkit scopes, then publish a version." },
@@ -797,10 +806,20 @@ export const STRINGS: Dict = {
   "admin.notif.dt.appKeyHint": { zh: "钉钉开放平台 →「应用开发 → 企业内部应用 → 你的应用 → 凭证与基础信息」里的 AppKey。不是凭证(单独拿它换不到 token),所以明文显示,方便你核对填的是哪个应用。", en: "The AppKey from DingTalk Open Platform → App development → Internal app → your app → Credentials & Basic Info. It is not a secret on its own (a token needs both key and secret), so it is shown in full to let you confirm which app you configured." },
   "admin.notif.dt.secretHint": { zh: "与 AppKey 同一页的 AppSecret。钉钉用它同时做两件事:换 access token、以及校验入站请求的 sign 头 —— 不像 Slack 另有一个签名密钥。仅显示后 4 位。", en: "The AppSecret from that same page. DingTalk uses it for two things at once: fetching access tokens and verifying the inbound `sign` header — unlike Slack there is no separate signing secret. Only last 4 chars shown." },
   "admin.notif.dt.pushUrl": { zh: "自定义机器人推送地址(可选)", en: "Custom-robot push URL (optional)" },
-  "admin.notif.dt.pushUrlHint": { zh: "只给出方向用:巡检广播、主动通知。群里 @机器人 的问答**不需要**它。形如 https://oapi.dingtalk.com/robot/send?access_token=… —— 这串本身就是凭证(谁拿到都能往那个群发消息),所以只显示后 4 位、只接受这一个地址形态。", en: "Outbound only: inspection broadcasts and proactive notifications. In-chat Q&A does NOT need it. Looks like https://oapi.dingtalk.com/robot/send?access_token=… — that URL IS a credential (anyone holding it can post to that group), so only the last 4 chars are shown and only this exact shape is accepted." },
-  "admin.notif.dt.pushUrlPh": { zh: "留空则不启用主动推送", en: "Leave empty to disable proactive push" },
+  // 🔴 2026-10-11 改（连同下面的 pushUrlPh / noChatIds）：原文说这个地址用于「巡检广播、主动通知」、
+  //    留空「不启用主动推送」—— 与代码不符。读它的只有 shared/report_delivery/dingtalk_sender.py：
+  //    ① 报告回贴的兜底（`_deliver_to_chat`：服务端 API 投不出去才落到这里）；
+  //    ② `send_markdown`（巡检推送），而巡检推送目标（`inspchat#target` 行）本版本没有任何客户能用的
+  //       登记途径；
+  //    ③ push heads-up —— 可 push_handler 的 `_push_configured()` 只认 PUSH_TARGET_* /
+  //       DINGTALK_PUSH_WEBHOOK_URL 环境变量，哪条部署路径都不设 ⇒ 恒为 disabled。
+  //    lambda4 日报与 PHD 转发只发飞书。口径与 docs/im-bot-interaction.md「钉钉交互方式」那段一致。
+  //    另：这条 hint 是纯文本渲染（SecretField 直接 `{hint}`），原文里的 `**不需要**` 会把星号原样
+  //    显示出来，所以改写时去掉了。
+  "admin.notif.dt.pushUrlHint": { zh: "只给出方向用,而且这一版只有两处会用到它:① 调查报告回贴的兜底 —— 正常走服务端 API 投回发起调查的会话,投不出去才改发到这个群;② 巡检推送 —— 但巡检只有完整部署(setup.sh)才有,而本版本还没有把群登记成巡检推送目标的途径。每日通知、Health 和实时事件推送都不投钉钉。群里 @机器人 的问答不需要它。形如 https://oapi.dingtalk.com/robot/send?access_token=… —— 这串本身就是凭证(谁拿到都能往那个群发消息),所以只显示后 4 位、只接受这一个地址形态。", en: "Outbound only, and in this release only two things use it: (1) the fallback for investigation reports — they normally go back to the conversation that started them through the server API, and land in this group only when that fails; (2) inspection push — but inspection exists only on the full (setup.sh) deployment, and this release has no way yet to register a group as an inspection push target. The daily notification, Health and real-time event pushes are not sent to DingTalk. In-chat Q&A does NOT need it. Looks like https://oapi.dingtalk.com/robot/send?access_token=… — that URL IS a credential (anyone holding it can post to that group), so only the last 4 chars are shown and only this exact shape is accepted." },
+  "admin.notif.dt.pushUrlPh": { zh: "可留空:对话不受影响,只是报告回贴少了兜底", en: "Optional: chat is unaffected; reports just lose their fallback route" },
   "admin.notif.dt.keysRequired": { zh: "AppKey / AppSecret 是必填项:缺任一,IM 入口会在冷启动时直接失败。钉钉**没有** URL 校验这一步 —— 顺序反了不会当场报错,机器人只是不回话,所以务必先在这里保存,再去钉钉填消息接收地址。", en: "AppKey and AppSecret are both required: if either is empty the IM entry point fails at cold start. DingTalk has NO URL challenge — getting the order wrong raises no error, the robot simply stays silent, so save them here BEFORE setting the callback URL in DingTalk." },
-  "admin.notif.dt.noChatIds": { zh: "钉钉这里没有「推送群组」列表:群里 @机器人 的回复走钉钉回调里带的一次性会话地址(sessionWebhook),不需要登记群 id;主动推送用上面那个自定义机器人地址。", en: "There is no \"target group chats\" list for DingTalk: replies to an @mention use the one-time session webhook carried in DingTalk's own callback, so no chat id needs registering; proactive pushes use the custom-robot URL above." },
+  "admin.notif.dt.noChatIds": { zh: "钉钉这里没有「推送群组」列表:群里 @机器人 的回复走钉钉回调里带的一次性会话地址(sessionWebhook),调查报告回贴走服务端 API 投回发起调查的会话,都不需要登记群 id;上面那个自定义机器人地址眼下实际只用作报告投不出去时的兜底(巡检推送本版本配不起来)。", en: "There is no \"target group chats\" list for DingTalk: replies to an @mention use the one-time session webhook carried in DingTalk's own callback, and investigation reports go back to the conversation that started them through the server API, so no chat id needs registering; in practice the custom-robot URL above only serves as the fallback for reports that cannot be delivered that way (inspection push cannot be set up in this release)." },
   "admin.notif.dt.test": { zh: "测试凭证", en: "Test credentials" },
   "admin.notif.dt.testing": { zh: "校验中…", en: "Checking…" },
   "admin.notif.dt.testTip": { zh: "用 AppKey / AppSecret 换一次 access token(凭证是否正确的权威判据);填了推送地址的话再往那个群发一条", en: "Fetches one access token with the AppKey/AppSecret (the authoritative check); if a push URL is set, also posts one message to that group" },
@@ -1095,7 +1114,10 @@ export const STRINGS: Dict = {
     zh: "🔴 读不到巡检 Agent Space ID —— 主栈的 InspectionAgentSpaceId 没注入到 BFF，重新部署 NotiOpsBackendStack 与 WebChatStack。",
     en: "🔴 Inspection agent space ID unavailable — the main stack's InspectionAgentSpaceId is not wired into the BFF. Redeploy NotiOpsBackendStack and WebChatStack.",
   },
-  "admin.xpayer.desc": { zh: "两种情况都走这条：① 账号不在本组织；② 在同一组织但你没有管理账号权限（例如 partner-resold，手里只有 linked account）。流程：输入账号 ID → 生成 CloudFormation 链接 → 用**那个账号**登录控制台部署 → 把 Outputs 回填到这里。全程不需要 Organizations 权限。", en: "Use this for either case: (1) the account is outside this organization, or (2) it is in the same organization but you lack management-account access (e.g. partner-resold, you only hold linked accounts). Flow: enter account ID → generate a CloudFormation link → sign in AS THAT ACCOUNT and deploy → paste the Outputs back here. No Organizations permissions required." },
+  // ③ 是 2026-10-11 补的：组织管理账号那一行的 `admin.accounts.mgmtAcctHint` 把人指到这里，
+  //    这句却说「两种情况」，两段文案互相打架。纯文本渲染（AdminPanel 直接 `{t(...)}`），
+  //    原来 zh 里的 `**那个账号**` 会把星号原样显示，顺手去掉。
+  "admin.xpayer.desc": { zh: "这几种情况都走这条：① 账号不在本组织；② 在同一组织但你没有管理账号权限（例如 partner-resold，手里只有 linked account）；③ 委派管理员部署时的组织管理账号本身（StackSets 下发不到它，那一行没有「一键接入」）。流程：输入账号 ID → 生成 CloudFormation 链接 → 用那个账号登录控制台部署 → 把 Outputs 回填到这里。全程不需要 Organizations 权限。", en: "Use this in any of these cases: (1) the account is outside this organization; (2) it is in the same organization but you lack management-account access (e.g. partner-resold, you only hold linked accounts); (3) it is the organization's management account itself in a delegated-administrator deployment (StackSets cannot deploy to it, so its row has no \"Onboard\" button). Flow: enter account ID → generate a CloudFormation link → sign in AS THAT ACCOUNT and deploy → paste the Outputs back here. No Organizations permissions required." },
   "admin.xpayer.acctLabel": { zh: "目标账号 ID (12 位)", en: "Target account ID (12 digits)" },
   "admin.xpayer.invalidId": { zh: "账号 ID 格式错误(需 12 位数字)", en: "Invalid account ID (must be 12 digits)" },
   "admin.xpayer.genBtn": { zh: "生成链接", en: "Generate link" },
@@ -1245,18 +1267,32 @@ export const STRINGS: Dict = {
   //    CloudFormation **不会**把 stack 部署到管理账号（即使它在被 target 的 OU 里），
   //    所以一键接入按钮对它不渲染 —— 而不渲染必须解释，否则运维看到的是
   //    「这一行有账号、有区域、没有按钮」，会当成界面坏了。
+  // 🔴 2026-10-11 改：原文让人「先在管理账号里手工部署 member-account-onboarding.yaml，再用
+  //    「手动接入账号」登记」—— 照做必回滚。手动接入的链接写死 `param_CreateCollectionRole=yes`
+  //    （bff/web-chat/member_accounts.mjs::generateLaunchStackUrl），member-devops-agent.yaml 于是也建
+  //    `notiops-idle-detection-role-<系统账号>`，与 onboarding 那份**同名** ⇒ 后部的那个
+  //    EntityAlreadyExists、整栈回滚；两份的事件转发规则名字不同、不报错，但都建会把每个调查事件
+  //    投两次。口径与 docs/DEPLOYMENT.md §0.1.2 那段 🔴、setup.sh 委派管理员分支的提示一致。
   "admin.accounts.mgmtAcct": { zh: "管理账号", en: "Management account" },
   "admin.accounts.mgmtAcctHint": {
     zh: "这是本组织的 AWS Organizations 管理账号。CloudFormation StackSets 不会把栈部署到"
       + "管理账号（即使它在下发范围里），所以一键接入对它不可用，那个按钮不显示。"
-      + "要让 NotiOps 查这个账号：在管理账号里手工部署一次 member-account-onboarding.yaml"
-      + "（参数与本部署一致），然后用下方「手动接入账号」登记它。",
+      + "要让 NotiOps 查这个账号，只用下方「手动接入账号」：「生成链接」→ 用管理账号登录部署"
+      + "那个栈 → 回填 Stack Outputs →「测试连接」→「保存并激活」，采集角色由那个栈一并建好。"
+      + "别再手工部署 member-account-onboarding.yaml：两个栈建同名采集角色，后部署的那个会报"
+      + " EntityAlreadyExists、整栈回滚。已经部署过的话，在 quick-create 页把 CreateCollectionRole"
+      + " 改成 no；那个栈建了事件转发的话，DevOpsEventBusArn 也清空（否则每个调查事件投两次）。",
     en: "This is the AWS Organizations management account. CloudFormation StackSets never "
       + "deploys a stack to the management account (even when it is in the target scope), "
       + "so one-click onboarding is unavailable and that button is hidden. To let NotiOps "
-      + "query this account, deploy member-account-onboarding.yaml manually in the "
-      + "management account (same parameters as this deployment), then register it with "
-      + "\"Manual onboarding\" below.",
+      + "query this account, use \"Manual onboarding\" below and nothing else: \"Generate "
+      + "link\" → deploy that stack while signed in to the management account → paste the "
+      + "Stack Outputs back → \"Test connection\" → \"Save & activate\"; that stack creates "
+      + "the collection role too. Do not also deploy member-account-onboarding.yaml by "
+      + "hand: both stacks create a collection role with the same name, so the second one "
+      + "fails with EntityAlreadyExists and rolls back. If it is already deployed there, set "
+      + "CreateCollectionRole to no on the quick-create page; if that stack forwards events, "
+      + "also clear DevOpsEventBusArn (otherwise every investigation event is delivered twice).",
   },
   // ⚠️ 提示里必须给**具体步骤**，因为 CloudFormation 的 quick-create 链接
   //    只支持「创建」（官方文档确认没有更新栈的形式），我们给不了一键链接。
@@ -1319,10 +1355,16 @@ export const STRINGS: Dict = {
     //    infra/member-account-onboarding.yaml」—— 那句**现在是错的**：
     //    采集角色已经合并进 member-devops-agent.yaml，手动接入只部署一个栈，
     //    而且那条路有 UI 入口（下面那个折叠区），不需要人去翻仓库里的 yaml。
-    zh: "一键接入不可用 —— 它要 CloudFormation StackSets，只有以**多账号模式**"
-      + "部署才有：要么在**组织管理账号**上，要么在管理账号已注册为 StackSets "
-      + "委派管理员的成员账号上。要启用：在这两类账号之一上重新部署一次 "
-      + "`./setup.sh --multi-account`。\n"
+    //
+    // ⚠️ 两条部署路径各有各的开法（2026-10-11）：原来只写了 `./setup.sh --multi-account`，
+    //    一键部署的客户照着做等于被支去装另一条路径。一键部署的开法与模板输出
+    //    `DeployModeStatus` 同一个口径：更新栈，DeployMode=MultiAccount + 组织 id。
+    //    这个 div 按纯文本渲染（`pre-line`），所以文案里不写 `**` 加粗。
+    zh: "一键接入不可用 —— 它要 CloudFormation StackSets，只有以多账号模式"
+      + "部署才有：要么在组织管理账号上，要么在管理账号已注册为 StackSets "
+      + "委派管理员的成员账号上。要启用：完整部署（setup.sh）在这两类账号之一上重新跑一次 "
+      + "`./setup.sh --multi-account`；一键部署在这两类账号之一上更新栈，"
+      + "把 DeployMode 改成 MultiAccount 并填上组织 id（o-xxxx）。\n"
       + "不想动部署的话用下面的「手动接入账号」：生成一条 CloudFormation 链接，"
       + "让账号所有者在自己账号里点一下部署，回填两个值即可 —— "
       + "不需要任何组织权限，也不需要重新部署。",
@@ -1330,8 +1372,9 @@ export const STRINGS: Dict = {
       + "which requires a multi-account deployment either from the organization "
       + "management account or from a member account the management account has "
       + "registered as a StackSets delegated administrator. "
-      + "To enable it, redeploy with `./setup.sh --multi-account` from one of "
-      + "those accounts.\n"
+      + "To enable it from one of those accounts: on a setup.sh deployment, "
+      + "re-run `./setup.sh --multi-account`; on a one-click deployment, update "
+      + "the stack with DeployMode=MultiAccount and your organization id (o-xxxx).\n"
       + "If you would rather not touch the deployment, use \"Manual onboarding\" "
       + "below: we generate a CloudFormation link, the account owner deploys it in "
       + "their own account, and you paste two values back - no organization "
@@ -1389,7 +1432,14 @@ export const STRINGS: Dict = {
   "admin.accounts.daMissing": { zh: "未关联（无法对该账号发起深度调查）", en: "Not associated (deep investigations unavailable)" },
   "admin.accounts.daGuideBtn": { zh: "一键关联", en: "Associate" },
   "admin.accounts.daAssociating": { zh: "关联中（建 Agent Space）…", en: "Associating (creating agent space)…" },
-  "admin.accounts.daGuideTip": { zh: "数据采集已就绪；深度调查还需在 Idle 控制台完成「DevOps Agent 账户」4 步向导（生成模板 → 成员账号部署 → 回填 → 启用）", en: "Data collection is ready; deep investigations also require the 4-step DevOps Agent wizard in the Idle console (generate template → deploy in member account → paste payload → enable)" },
+  // `failed` 由 BFF 的 devopsAgentAssocStatus / 列表对账写入（成员栈部署失败）。2026-10-11 之前
+  // 它落进 daBadge 的兜底分支、显示成上面那个「关联进行中」—— 失败的账号看起来永远在跑。
+  "admin.accounts.daFailed": { zh: "关联失败", en: "Association failed" },
+  // 🔴 2026-10-11 改：原文指向「Idle 控制台」的 4 步向导，那个控制台 2026-09-04 已退役。
+  //    现在第二步 = 同一行的「一键关联」（associateDevopsAgent → notiops-member-devops-agent
+  //    StackSet 实例），而且一键接入成功后 BFF 会自动发起一次（onboardStatus，失败不阻断）。
+  //    只在这一行还有那颗按钮时作为 title 出现（AdminPanel.tsx daBadge 的 showGuide）。
+  "admin.accounts.daGuideTip": { zh: "数据采集已就绪；深度调查还需完成第二步：在这个账号建 Agent Space 并关联。一键接入成功后会自动发起这一步；还没完成或失败了，点旁边的「一键关联」重试 —— 仍失败的话，看 StackSet notiops-member-devops-agent 里这个账号那个实例的状态原因。", en: "Data collection is ready; deep investigations also need step 2: creating and linking an agent space in this account. It starts automatically once one-click onboarding succeeds; if it has not completed or has failed, click \"Associate\" next to this to retry. If it keeps failing, check the status reason of this account's instance in the notiops-member-devops-agent StackSet." },
   "admin.accounts.offboardConfirm": { zh: "下线将删除该账号内的采集角色与事件转发（StackSet 实例），并从登记中移除。再次输入账号 ID 确认：", en: "Offboarding deletes the collection role and event forwarding (StackSet instances) in that account and removes the registration. Re-type the account ID to confirm:" },
   "admin.eol.hint": { zh: "手动覆盖资源版本的 EOS 日期（优先级最高）。RDS/EKS 默认走实时 API，其余服务走内置表——此处覆盖对所有服务生效。日期格式 YYYY-MM-DD。", en: "Manually override a version's EOS date (highest priority). RDS/EKS use live APIs by default, others use the built-in table — overrides here apply to all services. Date format YYYY-MM-DD." },
   "admin.eol.service": { zh: "服务", en: "Service" },
@@ -1610,10 +1660,11 @@ export const STRINGS: Dict = {
     zh: "用 Skills、连接器和插件，塑造 NotiOps 为你工作的方式。",
     en: "Skills, connectors, and plugins shape how NotiOps works for you.",
   },
-  // 侧栏一级导航那一项（也复用作 Skills 页的顶栏标题，见 ChatApp.tsx 的 view==="skills"）。
+  // 侧栏「更多」里那一项（2026-10-10 起与 巡检 / 管理 一起收进「更多」，不再是一级导航；
+  // 也复用作 Skills 页的顶栏标题，见 ChatApp.tsx 的 view==="skills"）。
   //
   // ⚠️ zh 是「技能」、**不要**改回原文 "Skills"（2026-09-11 产品决定）：这一栏是**导航标签**，
-  //    与它并列的兄弟全是中文（连接器 / 插件 / 通知 / 调查 / 成本 / 安全 / 案例 / 巡检 / 更多），
+  //    与它并列的兄弟全是中文（「更多」里的 巡检 / 管理，一级的 通知 / 调查 / 成本 / 案例 / 更多），
   //    夹一个英文词进去是这一列里唯一的异类。英文界面照旧 "Skills"。
   //    产品**功能名**仍然叫 Skill / Skills（`cz.skills.title`、`cmd.skills.*`、
   //    「新建 Skill」等都保持原文）—— 只有这一条导航标签本地化。
@@ -1659,9 +1710,10 @@ export const STRINGS: Dict = {
     zh: "发布后，DevOps Agent 在做**深度调查**时会按 skill 的描述自动决定是否使用它。仅上传文档（不含脚本），只读边界不受影响。\n\n⚠️ 这里发布的 skill **不影响资源巡检的 AI 判读** —— 巡检用的是另一个专属 Agent Space，它的判读 skill 随代码发布（`inspection/skills/`），刻意与调查隔离，避免互相误激活。",
     en: "Once published, DevOps Agent decides whether to use this skill during DEEP INVESTIGATIONS, based on its description. Documents only (no scripts); the read-only boundary is unaffected.\n\n⚠️ Skills published here do NOT affect resource-inspection AI analysis — inspection uses a separate dedicated Agent Space whose judgement skills ship with the code (`inspection/skills/`), deliberately isolated to avoid cross-activation.",
   },
+  // 路径从「更多」写起：2026-10-10 起「管理」收进侧栏「更多」（默认收起），一级导航里看不到它。
   "cz.da.noTargets": {
-    zh: "暂无可用的 Agent Space。请先在「管理 → 账户」里接入 DevOps Agent。",
-    en: "No Agent Space available. Onboard DevOps Agent first under Admin → Accounts.",
+    zh: "暂无可用的 Agent Space。请先在「更多 → 管理 → 账户」里接入 DevOps Agent。",
+    en: "No Agent Space available. Onboard DevOps Agent first under More → Admin → Accounts.",
   },
   "cz.da.scope.self": { zh: "本账号", en: "This account" },
   "cz.da.scope.cross": { zh: "成员账号", en: "Member account" },
@@ -1689,9 +1741,11 @@ export const STRINGS: Dict = {
   "cz.skill.bodyPh": { zh: "用 Markdown 写清楚步骤、规范或专业知识…", en: "Write the steps, norms, or expertise in Markdown…" },
   // Composer：开了「深度调查」（经我们的 agent 转交 DevOps Agent）但选中的 skill 尚未发布到
   // DevOps Agent 时的行内提示 —— 那条路径不传正文，未发布就真的不会被激活。
+  // 2026-09-13 起这条转交路径没有界面入口（见 Composer.tsx 里渲染它的那段注释），文案照样按
+  // **当前**侧栏位置写：Skills 在「更多」里、中文标签是「技能」—— 入口加回来时这句直接能用。
   "composer.skill.notPublished": {
-    zh: "该 Skill 尚未发布到 DevOps Agent，深度调查时不会被激活。到左侧「Skills」里发布后即可生效。",
-    en: "This skill isn't published to DevOps Agent yet, so it won't be activated in deep investigation. Publish it from the Skills tab in the sidebar to enable.",
+    zh: "该 Skill 尚未发布到 DevOps Agent，深度调查时不会被激活。到左侧「更多 → 技能」里发布后即可生效。",
+    en: "This skill isn't published to DevOps Agent yet, so it won't be activated in deep investigation. Publish it from More → Skills in the sidebar to enable.",
   },
   // 两条**直连**路径（「深度调查（直连）」/「DevOps 对话」）：BFF 会把 skill 正文内联进发给
   // DevOps Agent 的那段话（bff/web-chat/devops_skill.mjs），所以未发布也生效 —— 不能套用上面
@@ -1934,30 +1988,32 @@ export const STRINGS: Dict = {
   },
   // ── STAROps 那一段置灰时的原因（逐个映射，不回一句笼统的"未配置"）──
   // 这几种缺失的**修法完全不同**，所以必须分开说清"缺哪一项"。全部指向同一个落点：
-  // 管理 →「多云」→ 阿里云。reason 取值由 BFF 的 loadStarOpsConfig 给出。
+  // 更多 → 管理 →「多云」→ 阿里云。reason 取值由 BFF 的 loadStarOpsConfig 给出。
+  // 这一段眼下随 MULTICLOUD_UI 关着、看不到；路径仍按**当前**侧栏写（2026-10-10 起「管理」收进
+  // 「更多」）—— 开关翻回 true 时这几句直接能用。
   "obj.starops.na.creds": {
-    zh: "尚未登记阿里云凭据 —— 请管理员在「管理 → 多云 → 阿里云」中填写 AccessKey",
-    en: "No Alibaba Cloud credentials yet -- an admin needs to add an AccessKey under Admin -> Multi-cloud -> Alibaba Cloud",
+    zh: "尚未登记阿里云凭据 —— 请管理员在「更多 → 管理 → 多云 → 阿里云」中填写 AccessKey",
+    en: "No Alibaba Cloud credentials yet -- an admin needs to add an AccessKey under More -> Admin -> Multi-cloud -> Alibaba Cloud",
   },
   "obj.starops.na.employee": {
-    zh: "尚未指定 STAROps 数字员工 —— 请管理员在「管理 → 多云 → 阿里云」中填写数字员工 ID",
-    en: "No STAROps digital employee set -- an admin needs to fill in its ID under Admin -> Multi-cloud -> Alibaba Cloud",
+    zh: "尚未指定 STAROps 数字员工 —— 请管理员在「更多 → 管理 → 多云 → 阿里云」中填写数字员工 ID",
+    en: "No STAROps digital employee set -- an admin needs to fill in its ID under More -> Admin -> Multi-cloud -> Alibaba Cloud",
   },
   "obj.starops.na.badEmployee": {
-    zh: "STAROps 数字员工 ID 格式不合法 —— 请管理员在「管理 → 多云 → 阿里云」中更正",
-    en: "The STAROps digital-employee ID is malformed -- an admin needs to correct it under Admin -> Multi-cloud -> Alibaba Cloud",
+    zh: "STAROps 数字员工 ID 格式不合法 —— 请管理员在「更多 → 管理 → 多云 → 阿里云」中更正",
+    en: "The STAROps digital-employee ID is malformed -- an admin needs to correct it under More -> Admin -> Multi-cloud -> Alibaba Cloud",
   },
   "obj.starops.na.badRegion": {
-    zh: "STAROps 地域取值不合法（仅支持 cn-beijing 与 ap-southeast-1）—— 请管理员在「管理 → 多云 → 阿里云」中更正",
-    en: "Invalid STAROps region (only cn-beijing and ap-southeast-1 are supported) -- an admin needs to correct it under Admin -> Multi-cloud -> Alibaba Cloud",
+    zh: "STAROps 地域取值不合法（仅支持 cn-beijing 与 ap-southeast-1）—— 请管理员在「更多 → 管理 → 多云 → 阿里云」中更正",
+    en: "Invalid STAROps region (only cn-beijing and ap-southeast-1 are supported) -- an admin needs to correct it under More -> Admin -> Multi-cloud -> Alibaba Cloud",
   },
   "obj.starops.na.badVars": {
-    zh: "STAROps 工作空间/项目取值不合法 —— 请管理员在「管理 → 多云 → 阿里云」中更正",
-    en: "The STAROps workspace/project value is malformed -- an admin needs to correct it under Admin -> Multi-cloud -> Alibaba Cloud",
+    zh: "STAROps 工作空间/项目取值不合法 —— 请管理员在「更多 → 管理 → 多云 → 阿里云」中更正",
+    en: "The STAROps workspace/project value is malformed -- an admin needs to correct it under More -> Admin -> Multi-cloud -> Alibaba Cloud",
   },
   "obj.starops.na.other": {
-    zh: "STAROps 暂不可用 —— 请管理员检查「管理 → 多云 → 阿里云」的配置",
-    en: "STAROps is unavailable -- an admin should check the settings under Admin -> Multi-cloud -> Alibaba Cloud",
+    zh: "STAROps 暂不可用 —— 请管理员检查「更多 → 管理 → 多云 → 阿里云」的配置",
+    en: "STAROps is unavailable -- an admin should check the settings under More -> Admin -> Multi-cloud -> Alibaba Cloud",
   },
   // 标题栏的「对话对象」tag：通用会话没有主题 tag，而"谁在答"恰恰是这类会话唯一会变的东西。
   // 锁定后**只靠这个 tag** 说明身份（输入框上方那条身份条已按产品要求去掉）。
@@ -2077,9 +2133,10 @@ export const STRINGS: Dict = {
     zh: "本部署账号里没有 AWS DevOps Agent 的 Agent Space，凡是靠它的都用不了。请在本账号创建 Agent Space（或重新部署 NotiOps 让它自动创建）后再用。",
     en: "This deployment account has no AWS DevOps Agent Agent Space, so anything backed by it is unavailable. Create one in this account (or redeploy NotiOps, which creates it automatically) and try again.",
   },
+  // 路径从「更多」写起：2026-10-10 起「管理」收进侧栏「更多」（默认收起），一级导航里看不到它。
   "composer.devops.na.account": {
-    zh: "所选账号尚未接入 AWS DevOps Agent，凡是靠它的都用不了。请在「管理 → 账户」里给该账号完成 DevOps Agent 接入，或切回部署账号。",
-    en: "The selected account isn't onboarded to AWS DevOps Agent, so anything backed by it is unavailable. Onboard it under Admin → Accounts, or switch back to the deployment account.",
+    zh: "所选账号尚未接入 AWS DevOps Agent，凡是靠它的都用不了。请在「更多 → 管理 → 账户」里给该账号完成 DevOps Agent 接入，或切回部署账号。",
+    en: "The selected account isn't onboarded to AWS DevOps Agent, so anything backed by it is unavailable. Onboard it under More → Admin → Accounts, or switch back to the deployment account.",
   },
   // Nova Pro 在成本主题不推荐:它对「大量工具 + 大成本明细结果」处理易超限/失败(输出上限仅 5K),
   // Claude / DeepSeek 更稳。见 D 诊断。
@@ -2089,8 +2146,6 @@ export const STRINGS: Dict = {
   "msg.regenerate": { zh: "重新生成", en: "Regenerate" },
   "msg.sources": { zh: "Sources", en: "Sources" },
   "thinking": { zh: "思考中", en: "Thinking" },
-  "reasoning.show": { zh: "查看思考过程", en: "Show reasoning" },
-  "reasoning.hide": { zh: "隐藏思考过程", en: "Hide reasoning" },
   "model.desc.opus": { zh: "最强推理 · 深度分析/复杂根因 · 经 Bedrock", en: "Most capable · deep analysis & complex RCA · via Bedrock" },
   "model.desc.claude": { zh: "推理与编码均衡 · 全能 · 经 Bedrock", en: "Balanced reasoning & coding · all-rounder · via Bedrock" },
   "model.desc.haiku": { zh: "快速轻量 · 支持提示缓存 · 经 Bedrock", en: "Fast & lightweight · prompt caching · via Bedrock" },
@@ -2101,6 +2156,8 @@ export const STRINGS: Dict = {
   "model.desc.gptLuna": { zh: "OpenAI GPT-5.6 Luna · 经 Bedrock", en: "OpenAI GPT-5.6 Luna · via Bedrock" },
   "model.desc.grok": { zh: "xAI 旗舰 · 500K 上下文 · 长任务/agentic · 经 Bedrock", en: "xAI flagship · 500K context · long-running agentic work · via Bedrock" },
   "model.desc.glm": { zh: "Z.AI 旗舰 · 工具调用强 · 经 Bedrock", en: "Z.AI flagship · strong tool use · via Bedrock" },
+  "model.desc.kimi": { zh: "Moonshot AI 旗舰 · 工具调用 · 经 Bedrock", en: "Moonshot AI flagship · tool use · via Bedrock" },
+  "model.desc.gpt6Sol": { zh: "OpenAI GPT-6 Sol · 经 Bedrock", en: "OpenAI GPT-6 Sol · via Bedrock" },
   // 管理员手工添加的模型没有 desc_key，用这句通用描述兜底（避免把 i18n key 原样漏到界面上）
   "model.desc.generic": { zh: "由管理员添加 · 经 Bedrock", en: "Added by an administrator · via Bedrock" },
   "model.flag.exp": { zh: "实验", en: "experimental" },

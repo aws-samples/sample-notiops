@@ -2,9 +2,9 @@
 
 > 本文是资源清单视角的系统架构。组件模型与数据流的权威说明见 [TECHNICAL_DESIGN.md](TECHNICAL_DESIGN.md)。
 
-NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS 运维 agent(Strands / Bedrock **AgentCore Runtime**)对话,做调查 / FinOps / 案例 / Skills,经 **BFF Lambda + Function URL(SSE 流式)** 驱动,状态落 `notiops-web-chat` DynamoDB 单表,配 notif 收件箱 handler 与 **Cognito Identity Pool** 鉴权。作为必要补充,NotiOps 同时把 **AWS DevOps Agent**(`aidevops` API)接入企业 IM(飞书 / Slack / 钉钉),让用户在告警群里 `@bot 一句话` 也能调起调查、看实时进度、收本地化报告。系统还附带一条 **资源巡检 / 成本异常 / AWS Health** 的后台流水线(`notiops-inspection-*` 四个 Lambda + SQS `notiops-inspection-tasks` + `notiops-inspection` 表,外加 Lambda4 通知与 Lambda5 成本异常两条 cron),巡检结论投递到 IM 群,而巡检看板与管理页都在 Web Chat 站内。**老的 React 管理控制台和它背后的 API Gateway REST API 已于 2026-09-04 退役。**
+NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS 运维 agent(Strands / Bedrock **AgentCore Runtime**)对话,做调查 / FinOps / 案例 / Skills,经 **BFF Lambda + Function URL(SSE 流式)** 驱动,状态落 `notiops-web-chat` DynamoDB 单表,配 notif 收件箱 handler 与 **Cognito Identity Pool** 鉴权。作为必要补充,NotiOps 同时把 **AWS DevOps Agent**(`aidevops` API)接入企业 IM(飞书 / Slack / 钉钉),让用户在告警群里 `@bot 一句话` 也能调起调查、看实时进度、收本地化报告。系统还附带一条 **资源巡检 / 成本异常 / AWS Health** 的后台流水线(`notiops-inspection-*` 四个 Lambda + SQS `notiops-inspection-tasks` + `notiops-inspection` 表,外加 Lambda4 通知与 Lambda5 成本异常两条 cron),巡检结论可以按投递目标推到 IM 群(本版本还没有登记投递目标的途径,所以实际在 Web Chat 的巡检看板里看),巡检看板与管理页都在 Web Chat 站内。**老的 React 管理控制台和它背后的 API Gateway REST API 已于 2026-09-04 退役。**
 
-数据层 **全部使用 DynamoDB**(后台 4 张核心表:`notiops-conversations` / `notiops-config` / `notiops-inspection` / `notiops-metrics`,另加 Web Chat 的 `notiops-web-chat` 单表),**没有任何 RDS / PostgreSQL / SQL**。**IM 机器人** 走 **API Gateway HTTP API + Lambda webhook**(`ImStack`:每平台一个 HTTP API + ingress + worker,worker 直接 `import core/`;旧的 ECS Fargate 长连接容器已于 2026-09-03(M2)退役、只作为源码级回滚路径留在仓库里),这条 IM 路径**不使用** AgentCore Runtime / Agent 容器;**Web Chat 主入口则相反** —— 它跑在 Bedrock **AgentCore Runtime** 上,经 BFF Lambda + Function URL(SSE)对外(见下方「部署栈」的 WebChatStack)。
+数据层 **全部使用 DynamoDB**(后台 4 张核心表:`notiops-conversations` / `notiops-config` / `notiops-inspection` / `notiops-metrics`,另加 Web Chat 的 `notiops-web-chat` 单表),**没有任何 RDS / PostgreSQL / SQL**。**IM 机器人** 走 **API Gateway HTTP API + Lambda webhook**(`ImStack`:每平台一个 HTTP API + ingress + worker,worker 直接 `import core/`;旧的 ECS Fargate 长连接容器已于 2026-09-03(M2)退役、只作为源码级回滚路径留在仓库里),IM 侧自己不跑任何 agent 容器:默认的 `/agent devops` 直连 DevOps Agent、不经 AgentCore Runtime;用户发 `/agent notiops` 切过去之后,worker 经 `bedrock-agentcore:InvokeAgentRuntime` 调用 Web Chat 那**同一个** AgentCore Runtime(窄集主题 `im-chat`,授权在 `infra/lib/constructs/im-core.ts`,两条部署路径共用)。**Web Chat 主入口**则始终跑在 Bedrock **AgentCore Runtime** 上,经 BFF Lambda + Function URL(SSE)对外(见下方「部署栈」的 WebChatStack)。
 
 ## 架构图
 
@@ -25,15 +25,16 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 │                                                       │                                      │
 │  ── 路径 A：后台巡检流水线 ──                          │                                      │
 │                                                       │                                      │
-│  EventBridge (2 条 cron + 3 条 rate 规则)             ▼                                      │
+│  EventBridge (2 条 cron + 4 条 rate 规则)             ▼                                      │
 │    ├─ 01:15 UTC ─▶ Lambda5-CostAnalyzer (512MB/15min)                                        │
 │    ├─ 02:00 UTC ─▶ Lambda4-Notifier ──▶ 飞书群(notify_chat_ids)                              │
 │    ├─ 每 15 分钟 ─▶ notiops-inspection-scheduler ──SQS──▶ notiops-inspection-executor        │
 │    ├─ 每 15 分钟 ─▶ notiops-inspection-push(巡检结论投 IM 群)                                │
-│    └─ 每 1 小时  ─▶ notiops-inspection-reconciler(对账超时 / 丢单)                           │
+│    ├─ 每 1 小时  ─▶ notiops-inspection-reconciler(对账超时 / 丢单)                           │
+│    └─ 每 4 小时  ─▶ Lambda6-CurFinalizer (256MB/10min,CUR 阶段二自愈)                        │
 │                                                                                              │
 │  Lambda5 与巡检 4 λ 的结果 ──▶ DynamoDB notiops-inspection / notiops-config                  │
-│  各 Lambda 的 AI 分析走 shared/llm_provider.py(Bedrock ↔ LiteLLM,SSM 切换)                │
+│  巡检的 AI 判读派给 DevOps Agent(CreateBacklogTask);Lambda5 是统计算法,不调模型              │
 │                                                                                              │
 │  ── 路径 B：AWS Health 事件转发（PHD）──                                                     │
 │                                                                                              │
@@ -41,18 +42,21 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 │  (可选跨账号) Linked Account EventBridge ──▶ 同一 SNS Topic                                  │
 │  phd_event_forwarder ──LLM 翻译(shared/llm_provider)──▶ 飞书群(notify_chat_ids)            │
 │                                                                                              │
-│  ── 路径 C：IM 机器人（HTTP API + Lambda webhook，ImStack）──                                            │
+│  ── 路径 C：IM 机器人（HTTP API + Lambda webhook，ImStack）──                                │
 │                                                                                              │
 │  飞书 ──webhook──┐   ingress λ（验签+去重+异步投递）                                          │
 │  Slack ──webhook─┤──▶ ─────────────────────────▶ worker λ (import core/)                     │
 │  钉钉 ──webhook──┘   （三家同形态、各自一套 HTTP API；钉钉须选 HTTP 模式）                   │
 │                           ├─ core.nl_router       确定性意图路由（0 token）                  │
-│                           ├─ core.bedrock_intent  意图分类(只剩案例路径用)                  │
-│                           ├─ core.bedrock_chat    通用对话 + AWS Docs MCP（仅回滚路径）      │
-│                           ├─ core.webhook_dispatch HMAC 签名派发 DevOps Agent generic webhook│
+│                           ├─ core.devops_chat     默认对话:直连 DevOps Agent(0 token)        │
+│                           ├─ core.agent_chat      切到 /agent notiops 后:InvokeAgentRuntime  │
+│                           │                       ──▶ 路径 E 那同一个 Runtime(im-chat,走模型)│
+│                           ├─ core.devops_agent    深度调查:CreateBacklogTask(0 token)        │
 │                           ├─ notiops-im-progress λ 轮询 aidevops:ListJournalRecords          │
 │                           ├─ core.case_management  Support case 增删改查 + case_analyze      │
-│                           ├─ core.ddb_state        读写 notiops-conversations 表           │
+│                           ├─ core.ddb_state        读写 notiops-conversations 表             │
+│                           ├─ core.bedrock_intent  旧 LLM 意图分类(现网路由已不用它)          │
+│                           ├─ core.bedrock_chat    通用对话 + AWS Docs MCP（仅回滚路径）      │
 │                           └─ MCP sidecar 已随 BotStack 退役（IM Lambda 侧显式关闭）          │
 │                                                                                              │
 │  ── 路径 D：DevOps Agent 调查回调 ──                                                         │
@@ -63,7 +67,7 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 │                                ├─ AssumeRole 跨账户拉一次 long_report（ListJournalRecords）   │
 │                                ├─ shared/report_delivery::build_investigation_report          │
 │                                │    写 S3: investigations/<task_id>/report.md|html|trace.html │
-│                                │    Bedrock 精简成 summary_card                               │
+│                                │    summary_card = DA 报告的确定性切片(0 token,不调 Bedrock)  │
 │                                └─ UPSERT notiops-config(invst#<task_id>)               │
 │                                     只存 summary_card + S3 指针,不内联 summary_raw           │
 │                                （报告卡发回发起会话的线程;调查类事件不推 notify_chat_ids）   │
@@ -88,22 +92,22 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 |-------|------|
 | `WebChatStack`(主入口) | Web Chat:Strands / Bedrock **AgentCore Runtime** agent + BFF Lambda(`notiops-web-chat-bff`)+ Function URL(`AWS_IAM`,SSE 流式)+ DynamoDB 单表 `notiops-web-chat`(会话 / 消息 + notif 收件箱段)+ Cognito Identity Pool。收件箱的**写侧** `notiops-web-notif-handler` 不在本栈,在 `NotiOpsBackendStack` |
 | `NotiOpsBackendStack` | 后台 Lambda(10~11 个业务 Lambda:Notifier / CostAnalyzer / CurFinalizer / 巡检 4 个 / DevOpsCallback / PushHandler / WebNotifHandler / PHDForwarder(可选))+ DynamoDB × 4(`notiops-conversations` / `notiops-config` / `notiops-inspection` / `notiops-metrics`)+ S3 共用数据桶 + Reports CloudFront(在线报告)+ EventBridge + SNS/SQS + Cognito User Pool + Custom Event Bus + Onboarding 资源。**不再有 API Gateway REST API** —— 随老控制台一起退役(2026-09-04) |
-| `ImStack`(选了 IM 才建) | **IM 的正式运行路径**:每平台一个 **API Gateway HTTP API**(公网入口,`$default` catch-all,阶段级限流 50 rps)+ 一对 Lambda —— ingress(平台签名校验 + `reservedConcurrentExecutions=10`)+ worker(900s)、共用依赖 Layer、事件去重表、进度轮询 Lambda。Outputs 里的 `FeishuWebhookUrl` / `SlackWebhookUrl` 就是要填进 IM 平台控制台的请求地址 |
+| `ImStack`(选了 IM 才建) | **IM 的正式运行路径**:每平台一个 **API Gateway HTTP API**(公网入口,`$default` catch-all,阶段级限流 50 rps)+ 一对 Lambda —— ingress(平台签名校验 + `reservedConcurrentExecutions=10`)+ worker(900s)、共用依赖 Layer、事件去重表、进度轮询 Lambda。Outputs 里的 `FeishuWebhookUrl` / `SlackWebhookUrl` / `DingtalkWebhookUrl` 就是要填进 IM 平台控制台的请求地址 |
 | ~~`BotStack`~~ | ❌ **2026-09-03(M2)已退役,不再部署**。原来是 IM 的长连接实现:VPC + ECS Fargate Cluster + ECR(bot 镜像)+ 每平台一个 Fargate Service + MCP sidecar。`infra/bin/app.ts` 不再实例化它;`infra/lib/bot-stack.ts` 与三个 Dockerfile **故意留在仓库里**当源码级回滚路径(回滚要重建 VPC/ECS + 重新构建镜像,~20 分钟,见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §1.6)。它**没有任何 CFN Export**,所以删掉不会影响别的栈 |
 
 有**两条**部署路径,**Web Chat 侧的功能必须逐条对等**:
 
-- **方式 A —— 一键 CloudFormation(单栈)**:合成入口 `infra/bin/standalone.ts` → `infra/lib/notiops-webchat-standalone-stack.ts`(CDK stack id `NotiOps`,发布成客户下载的 `notiops-webchat.template.json`,部署时的栈名由部署者自选)。**免本地环境、免 access key** —— 在 CloudFormation 控制台上传模板就能开栈。它建的是 Web Chat 那一套(前端 + BFF + AgentCore Runtime agent),外加一份「最小底座」(`notiops-config` 表 / Cognito 用户池 `notiops-users` / 共享数据桶 / ReportsCDN,见 `infra/lib/constructs/minimal-base-core.ts`),以及参数页 `InstallOption` 可选装的一个 IM 机器人(飞书 / Lark 或 Slack)。详见 [DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md)。
+- **方式 A —— 一键 CloudFormation(单栈)**:合成入口 `infra/bin/standalone.ts` → `infra/lib/notiops-webchat-standalone-stack.ts`(CDK stack id `NotiOps`,发布成客户下载的 `notiops-webchat.template.json`,部署时的栈名由部署者自选)。**免本地环境、免 access key** —— 在 CloudFormation 控制台上传模板就能开栈。它建的是 Web Chat 那一套(前端 + BFF + AgentCore Runtime agent),外加一份「最小底座」(`notiops-config` 表 / Cognito 用户池 `notiops-users` / 共享数据桶 / ReportsCDN,见 `infra/lib/constructs/minimal-base-core.ts`),以及参数页 `InstallOption` 可选装的一个 IM 机器人(飞书 / Lark、Slack 或钉钉);v1.0.30 起还可以选装成本 MCP(填 `CurTable` 接已有的 CUR 表,或 `ProvisionCur=yes` 让栈连 CUR + 官方 Athena 集成一起建)。详见 [DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md)。
 - **方式 B —— `./setup.sh`(全量)**:交互式,内部编排 AgentCore Runtime 部署 + `cdk deploy --all`,建出上表的 `WebChatStack` 与 `NotiOpsBackendStack`(选了 IM 再加 `ImStack`)。
 
-两条路径跑的是**同一份** agent 代码(`agent-build/NotiOpsWebChat`,`scripts/deploy_agent.sh` 与一键模板的产物打包都指向它)与**同一个**前端(`frontend/chat-app`);Web Chat 的资源都由同一份 `infra/lib/constructs/web-chat-core.ts` 建,IM 三件套(ingress / worker / 进度轮询)都由同一份 `infra/lib/constructs/im-core.ts` 建 —— 方式 A 在**部署期**按 `InstallOption` 选装,方式 B 在**合成期**按 `-c enabledPlatforms` 决定。对等性由 `scripts/test_oneclick_parity.py` 逐条断言(runtime 授权 / 环境变量 / 出厂数据 / 生命周期 / 通知生产端 / Operator App / AgentCore Memory / 首登交付 / IM 加装项 / CUR 仪表盘 / DevOps 回调)。
+两条路径跑的是**同一份** agent 代码(`agent-build/NotiOpsWebChat`,`scripts/deploy_agent.sh` 与一键模板的产物打包都指向它)与**同一个**前端(`frontend/chat-app`);Web Chat 的资源都由同一份 `infra/lib/constructs/web-chat-core.ts` 建,IM 三件套(ingress / worker / 进度轮询)都由同一份 `infra/lib/constructs/im-core.ts` 建 —— 方式 A 在**部署期**按 `InstallOption` 选装,方式 B 在**合成期**按 `-c enabledPlatforms` 决定。对等性由 `scripts/test_oneclick_parity.py` 逐条断言(runtime 授权 / 环境变量 / 出厂数据 / 生命周期 / 通知生产端 / Operator App / AgentCore Memory / 首登交付 / IM 加装项 / CUR 仪表盘 / 替客户建 CUR / DevOps 回调 / 阿里云只读凭据)。
 
-差异落在**后台流水线**上。方式 A **不建**这些:每日自动巡检(`notiops-inspection-*` 四个 Lambda + SQS `notiops-inspection-tasks` + 它们的 EventBridge 定时规则,连 `notiops-inspection` 表也不建)、Lambda4 通知与 Lambda5 成本异常这两条 cron、CUR Finalizer、往 IM 群的**主动推送**(装了 IM 也只是群里被动应答)、CUR + Athena 账单明细数据源的搭建(已经有一个的话可以在参数页接进来,见 [DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md) §2.12)、成员账号侧的 CloudWatch OAM Sink 与跨账号事件回流。逐条清单见 [DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md) §0.1。
+差异落在**后台流水线**上。方式 A **不建**这些:每日自动巡检(`notiops-inspection-*` 四个 Lambda + SQS `notiops-inspection-tasks` + 它们的 EventBridge 定时规则,连 `notiops-inspection` 表也不建)、Lambda4 通知与 Lambda5 成本异常这两条 cron、往 IM 群的**主动推送**(装了 IM 也只是群里被动应答)、成员账号侧的 CloudWatch OAM Sink 与跨账号事件回流。逐条清单见 [DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md) §0.1。CUR + Athena **不在**这张清单里:v1.0.30 起方式 A 也能建(`ProvisionCur=yes`;阶段一是 custom resource `CurProvision`,阶段二是每 4 小时自愈一次的 `CurFinalizerFn`,与方式 B 共用 `cur_provisioner/spec.py` 的报告规格),已有 CUR 则填 `CurTable` 接进来,见 [DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md) §2.12。
 
 这些缺的后台会在 Web Chat 界面上留下两处**说得清**的差别(不是「功能可能不可用」):
 
 - **FinOps 的「每日异常扫描」这张卡在方式 A 上整个不下发。** 方式 A 没有 `notiops-cost-analyzer`,`infra/lib/constructs/web-chat-core.ts` 因此把 BFF 的 `COST_ANALYZER_FUNCTION` 置成空串;而 `config/capabilities.json` 给 `nav:finops:daily-anomaly` 声明了 `requiresEnv: COST_ANALYZER_FUNCTION`,于是这个节点从 `/capabilities` 树里消失、前端连入口都不渲染。这是刻意收口:留着它会永远显示「近 3 天没有扫描记录(每日 01:15 UTC 跑)」(`frontend/chat-app/src/components/FinopsDashboard.tsx` 里那句),而那条路上没有任何东西在 01:15 UTC 跑。
-- **「巡检」那一组页面(巡检总览 / 高负载 / 闲置与成本 / 结构性风险 / 资源清单 / 巡检范围 / 阈值与定时)两条路径都渲染** —— `config/capabilities.json` 是两条路径共用的同一份,这些节点没有 `requiresEnv`。但方式 A 既没有 `notiops-inspection` 表也没有那四个 Lambda,所以页面里没有数据、「立即巡检」按钮也发不出去(它 invoke 的是 `notiops-inspection-scheduler`)。要巡检就走方式 B。
+- **「巡检」整个 tab(`nav:inspection` 连同它的全部子页)在方式 A 上也整个不下发。** 方式 A 既没有 `notiops-inspection` 表也没有那四个 Lambda,`infra/lib/constructs/web-chat-core.ts` 因此把 BFF 的 `INSPECTION_TABLE` 置成空串;而 `config/capabilities.json` 给 `nav:inspection` 声明了 `requiresEnv: INSPECTION_TABLE`,于是这个 tab 从 `/capabilities` 树里消失,子页随它一起被剔除(`bff/web-chat/authz.mjs` 的祖先补全遇到 `requiresEnv` 不满足的父节点就停,子页不会把 tab 补回来),侧栏「更多」里就没有「巡检」这一项。「更多」里于是只剩当前用户有权限的「技能」/「管理」;两样都没有时(预置角色里除 `role:admin` 与 `role:developer` 外默认都是)连「更多」按钮本身都不渲染(`frontend/chat-app/src/components/Sidebar.tsx` 的 `hasMoreItems`)。绕过前端直接打 `/inspection/*` 的请求(脚本、或浏览器里缓存着的旧前端包)由 `bff/web-chat/index.mjs` 里一道门统一挡掉,回 `inspection_not_deployed` 而不是 `ddb_error`,前端认这个码并提示改用方式 B。这道闸门是 2026-09-07 加的;在那之前这组页面两条路径都渲染,方式 A 上点进去是「加载失败 (ddb_error)」。要巡检就走方式 B。
 
 **没有 SAM,`deploy.sh` 已下线。**
 
@@ -147,7 +151,7 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 |------|------|
 | Secrets Manager | IM 平台凭据(飞书 / Slack / 钉钉)+ DevOps Agent webhook secret + Bedrock API Key / LiteLLM 配置。DevOps Agent 业务账户配置存在 DynamoDB `da#<account_id>` 行,不用 Secret |
 | Cognito User Pool | `notiops-users`,禁止自注册 |
-| 跨账户锁定 | `shared/account_scope.py` 用 `LOCKED_ACCOUNT_ID = cdk.Aws.ACCOUNT_ID` 把后台采集 / 调查锁死在部署账户;AssumeRole 还校验 `trigger_role_arn` 账号 == 目标账号 |
+| 跨账户锁定 | `shared/account_scope.py` 用 `LOCKED_ACCOUNT_ID = cdk.Aws.ACCOUNT_ID` 把后台采集 / 调查锁死在部署账户(单账号模式;`--multi-account` / `-c organizationId` 部署时不注入它 = 解锁,实际覆盖范围由 config 表里启用的账号决定);AssumeRole 还校验 `trigger_role_arn` 账号 == 目标账号 |
 
 ### 计算
 
@@ -156,13 +160,13 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 | Lambda — Inspection Scheduler (`lambda_inspection_scheduler`) | 256MB / 120s(`notiops-inspection-scheduler`),每 15 分钟读 DynamoDB 里的定时配置,判定这一刻该给哪些「类型 × 账号」派巡检 → fan-out 到 SQS `notiops-inspection-tasks`(改巡检时刻不需要重新部署) |
 | Lambda — Inspection Executor (`lambda_inspection_executor`) | 1024MB / 15min(`notiops-inspection-executor`),SQS 消费(`batchSize=1`、`maxConcurrency=3`),一条消息 = 一个账号一整轮巡检:采集 → 判定 → finding 落 `notiops-inspection` |
 | Lambda — Inspection Reconciler (`lambda_inspection_reconciler`) | 256MB / 5min(`notiops-inspection-reconciler`),每 1 小时对账已派发判读任务的终态(补 EventBridge 事件丢失)并检查采集覆盖缺口 |
-| Lambda — Inspection Push (`lambda_inspection_push`) | 512MB / 5min(`notiops-inspection-push`),每 15 分钟醒一次,只在推送时段窗口内把当日巡检结论按投递目标投给各 IM 群 |
+| Lambda — Inspection Push (`lambda_inspection_push`) | 512MB / 5min(`notiops-inspection-push`),每 15 分钟醒一次,只在推送时段窗口内把当日巡检结论按投递目标投给各 IM 群(投递目标是 `notiops-inspection` 表里的登记行,本版本还没有面向客户的登记途径:没有网页入口、`setup.sh` 不问) |
 | Lambda — Notifier (`lambda4_notifier`) | 256MB / 10min(`notiops-notifier`),定时推送每日汇总(资源巡检段 + 成本异常段 + 过去 24h 调查汇总);PHD 事件由独立的 PHD Forwarder 处理,不在此 |
 | Lambda — CostAnalyzer (`lambda5_cost_analyzer`) | 512MB / 15min,每日 Cost Explorer 异常分析 |
-| Lambda — CUR Finalizer (`lambda6_cur_finalizer`) | 256MB / 10min,CUR 首次交付后自动部署 Athena 集成(由 EventBridge Scheduler 在 T+25h 一次性触发,非常驻) |
-| Lambda — Push Handler (`notiops-push-handler`) | 256MB / 60s,`shared.report_delivery.push_handler`,把 AWS 事件规范化后推到 IM 群 |
+| Lambda — CUR Finalizer (`lambda6_cur_finalizer`) | 256MB / 10min,CUR 首次交付后自动部署 Athena 集成。两个触发:`setup.sh` 建的 T+25h 一次性 EventBridge Scheduler(快速路)+ 常驻的 `notiops-cur-finalizer-selfheal` 每 4 小时一次(自愈:交付晚了、crawler 没爬完也能补上;已 `READY` 或根本没建 CUR 时一次 GetItem 就返回) |
+| Lambda — Push Handler (`notiops-push-handler`) | 256MB / 60s,`shared.report_delivery.push_handler`,把 AWS 事件规范化后推到 IM 群。⚠️ 本版本推不出任何东西:发不发只看它自己的 `PUSH_TARGET_CHAT_ID`(钉钉是 `PUSH_TARGET_PLATFORM=dingtalk` + `DINGTALK_PUSH_WEBHOOK_URL[_ARN]`),而本栈与 `setup.sh` 都不设,所以每个事件只记一行「Push disabled」就返回(方式 A 根本不建这个函数);同样的事件在 Web 收件箱里照常可见(见下一行) |
 | Lambda — Web Notif Handler (`notiops-web-notif-handler`) | 256MB / 60s,`shared.report_delivery.web_push_handler`,把同样的事件写进 `notiops-web-chat` 表的 `notif#` 段(Web Chat 站内收件箱);**两条部署路径都建**,共用 `infra/lib/constructs/web-notif-sources.ts` 这一份事件源定义 |
-| Lambda — DevOps Callback (`devops_agent_callback`) | 256MB / 120s,跨账户拉一次长报告 → S3 + Bedrock 精简 summary_card → 入 `invst#` 行 |
+| Lambda — DevOps Callback (`devops_agent_callback`) | 256MB / 120s,跨账户拉一次长报告 → S3 + summary_card(DA 报告按上限确定性切一段,0 token,2026-09-05 起不调 Bedrock;`CardMode` 那一档的值仍叫 `BEDROCK`,只为兼容已落库的配置)→ 入 `invst#` 行 |
 | Lambda — PHD Forwarder (`phd_event_forwarder`) | 128MB / 90s,AWS Health 事件 LLM 翻译,SNS 触发 |
 | Lambda — IM ingress (`platforms/{feishu,slack,dingtalk}/lambda_ingress.py`) | 2048MB / 20s,只验签 + 幂等去重 + 异步 invoke worker;由 HTTP API 触发,`reservedConcurrentExecutions=10`。内存给到 2048MB 是为了压住冷启动 —— Lambda 的 INIT 阶段有 10s 硬上限(不受函数 timeout 约束),内存给小了 init 就会超时并挪到首次 invoke 里重跑,见 `infra/lib/constructs/im-core.ts` 里那段实测记录 |
 | Lambda — IM worker (`platforms/{feishu,slack,dingtalk}/lambda_worker.py`) | 900s,真正处理消息 / 卡片回调,import `core/` |
@@ -178,16 +182,16 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 | Custom Event Bus | `notiops-devops-events`,接收业务账户跨账户转发的 `aws.aidevops` 事件(允许清单 + source 条件双重校验) |
 | EventBridge (Callback) | Custom Bus → `devops_agent_callback` Lambda(带 DLQ + 重试) |
 | SQS DLQ | DevOps Agent Callback 投递失败队列 |
-| S3 (Onboarding) | 业务账户 onboarding CFN 模板托管（桶已就绪；模板自动生成功能本期 deferred，当前用手工回填流程） |
+| S3 (Onboarding) | 不是单独的桶,是共享数据桶的 `onboarding-templates/` 前缀。Web Chat「更多 → 管理 → 账户」的「手动接入账号」点「生成链接」时,BFF 把成员账号模板(`member-devops-agent.yaml`;跨组织接入另有 `member-account-onboarding.yaml`)按账号写到这个前缀下,再生成一个 12 小时有效的 Launch Stack 链接(`bff/web-chat/member_accounts.mjs::generateLaunchStackUrl`)。组织内的账号走 StackSets(「一键接入」),不经这里。手动接入时还要人做的只有两步:在成员账号里点链接部署,再把栈的 Outputs 回填到页面上 |
 
-> 每个业务账户独立部署一个 AgentSpace(`AccountType=monitor`),不采用官方系统账户单一 AgentSpace 模式。这是刻意的架构决策:让每个业务账户各自持有 Agent 服务角色与信任边界,跨账户只经允许清单校验的事件回调聚合,避免单一共享 AgentSpace 成为跨账户权限的集中风险点。IM bot 与调查回调这条路径不依赖 AgentCore Runtime / Memory / Gateway(Web Chat 主入口则运行在 AgentCore Runtime 上)。
+> 每个业务账户独立部署一个 AgentSpace(`AccountType=monitor`),不采用官方系统账户单一 AgentSpace 模式。这是刻意的架构决策:让每个业务账户各自持有 Agent 服务角色与信任边界,跨账户只经允许清单校验的事件回调聚合,避免单一共享 AgentSpace 成为跨账户权限的集中风险点。IM bot 默认的 `/agent devops` 与调查回调这条路径不依赖 AgentCore Runtime / Memory / Gateway;用户在 IM 里切到 `/agent notiops` 之后,worker 经 `bedrock-agentcore:InvokeAgentRuntime` 调用 Web Chat 那**同一个** AgentCore Runtime(见文首)。Web Chat 主入口则始终运行在 AgentCore Runtime 上。
 
 ### API 与调度
 
 | 资源 | 说明 |
 |------|------|
 | Lambda Function URL(`notiops-web-chat-bff`) | Web Chat 的对外入口,`AWS_IAM` + SigV4(浏览器经 Cognito Identity Pool 拿临时凭证签名),SSE 流式。**整套系统已经没有 API Gateway REST API** —— 老的 Dashboard / MCP 后端 REST API 已于 2026-09-04 随老控制台一起退役 |
-| EventBridge 定时规则 × 5(`NotiOpsBackendStack`) | cron 两条:`notiops-daily-cost-analysis` 01:15 UTC 成本异常分析、`notiops-daily-notification` 02:00 UTC 通知;rate 三条:`notiops-inspection-scheduler` 每 15 分钟、`notiops-inspection-push` 每 15 分钟、`notiops-inspection-reconciler` 每 1 小时 —— 具体巡检时刻与推送窗口存 DynamoDB,改时间不用重新部署。`ImStack` 的 ingress 保活(每平台一条,每 4 分钟)、进度轮询(每 1 分钟)与 `WebChatStack` 的 CUR 仪表盘预热(22:00 UTC,配了 CUR 数据源才建)不计在这 5 条里 |
+| EventBridge 定时规则 × 6(`NotiOpsBackendStack`) | cron 两条:`notiops-daily-cost-analysis` 01:15 UTC 成本异常分析、`notiops-daily-notification` 02:00 UTC 通知;rate 四条:`notiops-inspection-scheduler` 每 15 分钟、`notiops-inspection-push` 每 15 分钟、`notiops-inspection-reconciler` 每 1 小时、`notiops-cur-finalizer-selfheal` 每 4 小时(CUR 阶段二自愈)—— 具体巡检时刻与推送窗口存 DynamoDB,改时间不用重新部署。`ImStack` 的 ingress 保活(每平台一条,每 4 分钟)、进度轮询(每 1 分钟)与 `WebChatStack` 的 CUR 仪表盘预热(22:00 UTC,配了 CUR 数据源才建)不计在这 6 条里 |
 | EventBridge (Health) | `aws.health` 事件规则 → PHD SNS Topic |
 | SNS Topic | 闲置告警 / PHD 事件聚合(支持跨账号 Publish) |
 
@@ -210,13 +214,13 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 | Cognito | Web Chat 登录:User Pool `notiops-users`(禁自注册,两条部署路径同名同配置)+ Identity Pool `notiops-web-chat`(拿临时凭证去 SigV4 签 BFF Function URL);另有 `notiops-web-chat-rum` Identity Pool 供前端 RUM |
 | S3 + CloudFront | `ChatCDN`:Web Chat 前端(私有桶 + OAI);`ReportsCDN`:在线报告(CloudFront Function 只放行 `reports/*`) |
 | S3 | 调查报告(`investigations/<task_id>/report.md\|report.html\|trace.html`)+ Onboarding 模板 |
-| EventBridge | **定时**:后台 5 条(巡检 scheduler / push 每 15 分钟 + reconciler 每 1 小时 + 成本分析 01:15 + 通知 02:00)、CUR 仪表盘预热 1 条(22:00 UTC,配了 CUR 数据源才建)、IM ingress 保活(选了 IM 才建,每平台 1 条 / 每 4 分钟)与调查进度轮询 1 条(每 1 分钟)。**事件路由**:AWS Health → PHD SNS 1 条(**默认建**,`-c skipPhd=true` 可跳过)、DevOps Agent Callback 2 条(Custom Bus 与 default bus 各一条)、IM 主动推送 5 条(默认 **DISABLED**,要在控制台或 CDK context 里开)、Web 通知收件箱 10 条(默认 5 开 5 关,清单见 `infra/lib/constructs/web-notif-sources.ts`) |
+| EventBridge | **定时**:后台 6 条(巡检 scheduler / push 每 15 分钟 + reconciler 每 1 小时 + 成本分析 01:15 + 通知 02:00 + CUR 阶段二自愈每 4 小时)、CUR 仪表盘预热 1 条(22:00 UTC,配了 CUR 数据源才建)、IM ingress 保活(选了 IM 才建,每平台 1 条 / 每 4 分钟)与调查进度轮询 1 条(每 1 分钟)。**事件路由**:AWS Health → PHD SNS 1 条(**默认建**,`-c skipPhd=true` 可跳过)、DevOps Agent Callback 2 条(Custom Bus 与 default bus 各一条)、IM 主动推送 5 条(默认 **DISABLED**,没有 CDK context 开关、只能在 EventBridge 控制台里开;而且开了也推不出去 —— push handler 没有接推送目标,见上面「计算」表)、Web 通知收件箱 10 条(默认 5 开 5 关,清单见 `infra/lib/constructs/web-notif-sources.ts`) |
 | SNS | 闲置告警 + PHD 事件聚合 |
 | Custom Event Bus | DevOps Agent 跨账户事件聚合(`notiops-devops-events`) |
 | SQS | DevOps Agent Callback DLQ |
 | Secrets Manager | IM 凭据 + webhook secret + Bedrock/LiteLLM 配置 |
 | SSM Parameter Store | LLM Provider 切换(`/notiops/llm/provider`)等 |
-| Bedrock / LiteLLM Proxy | AI 分析(Lambda4/5 / PHD / Callback + IM 对话);通过 `shared/llm_provider.py` 跟随 SSM `/notiops/llm/provider` 切换 |
+| Bedrock / LiteLLM Proxy | 后台 Lambda 里只有 PHD 翻译调模型(Lambda4 / Lambda5 / Callback 都不调);IM 侧是案例智能分析与建案时的服务分类。这两处都经 `shared/llm_provider.py` 跟随 SSM `/notiops/llm/provider` 切换。`/agent notiops` 的 IM 对话与 Web Chat 走 AgentCore Runtime 里的 agent,不经这一层 |
 | AWS Knowledge MCP | bot 对话引用官方文档,hosted host `knowledge-mcp.global.api.aws` |
 
 ## 技术栈
@@ -258,7 +262,7 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 │   └── devops_agent.py           #   DevOps Agent 跨账户调用
 ├── devops_agent_callback/        # DevOps Agent 调查结果回调 Lambda
 ├── phd_event_forwarder/          # AWS Health 事件 LLM 翻译转发 Lambda
-├── lambda6_cur_finalizer/        # CUR 首次交付后自动部署 Athena 集成（T+25h 一次性）
+├── lambda6_cur_finalizer/        # CUR 首次交付后自动部署 Athena 集成（T+25h 一次性快速路 + 每 4 小时自愈）
 ├── frontend/chat-app/            # Web Chat 前端（React 19 + Vite）
 ├── infra/                        # CDK 基础设施（两条部署路径的栈与共享 construct，见下）
 ├── scripts/                      # 工具脚本（i18n lint / pre-commit / 部署与对等性断言 等）

@@ -307,7 +307,7 @@ function fieldValue(input, key) {
   lib.DynamoDBDocumentClient.prototype.send = async () => ({ Item: { enabled: true } });
   try {
     let threw = null;
-    try { await member.setAccountAlias("67727609931", "x"); }
+    try { await member.setAccountAlias("12345678901", "x"); }
     catch (e) { threw = e; }
     ok("★★★ 非 12 位账号号要拒（11 位）",
       threw && /invalid_account_id/.test(threw.message));

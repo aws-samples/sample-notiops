@@ -247,7 +247,7 @@ def _post(per_server: list) -> list:
             kept = [_cap(t) for t in kept]
         except Exception as _e:  # noqa: BLE001 — 包装不可用就用原工具，不阻断
             logger.warning("investigation_mcp: result-cap wrap unavailable: %s", _safe_err(_e))
-        logger.info("investigation_mcp: %s → %d/%d tools kept (whitelist, result-capped)",
+        logger.info("investigation_mcp: %s → %d/%d tools kept (allowlist, result-capped)",
                     console_script, len(kept), len(tools))
         merged.extend(kept)
     return merged

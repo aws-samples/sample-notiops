@@ -21,7 +21,7 @@ import { roleArnAccount } from "./role_guard.mjs";
 import { fillAccountNames } from "./accounts.mjs";
 // safeErr：异常一律压成"类型名/错误码"再进响应体（见 safe_err.mjs）。
 import { safeErr } from "./safe_err.mjs";
-import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
+import { invokeInsight } from "./insight_llm.mjs";
 import { createHash } from "node:crypto";
 
 // 多账号基座（BFF 侧）：按目标账号拿 SupportClient。
@@ -309,30 +309,12 @@ export async function getCasesTrends(accountId) {
 /** 对 6 个月 case 聚合出 service-manager 视角的洞察 + 建议（grounded，只用真实计数）。 */
 async function _casesTrendInsight(agg) {
   try {
-    const bedrock = new BedrockRuntimeClient({ region: process.env.AWS_REGION || "us-east-1" });
     const prompt = `You are an AWS Support operations analyst advising a Service Manager focused on process quality and vendor management. Below is a 6-month aggregation of this account's AWS Support cases (real counts, never invent numbers). Return STRICT JSON:
 {"insight":"<2-3 sentences: which services and severities dominate the support load over the 6 months, cite the real counts, note any month-over-month trend and the pending-customer ratio>","recommendations":["<actionable recommendations for a service manager: e.g. concentrated <service> cases -> invest team enablement/training in that area; high pending-customer ratio -> tighten internal response process; recurring high-sev -> architecture review with the service team. 2-4 items, most impactful first, tie each to a real number>"]}
 Data: ${JSON.stringify(agg)}
 Return ONLY the JSON object, no markdown.`;
-    const resp = await bedrock.send(new ConverseCommand({
-      // 注：这里的 model 是**硬编码**、不走 llmcfg 目录 —— 它是 dashboard 洞察生成，
-      // 不是用户可选的对话模型。已与目录口径对齐到 global.*（决策 2026-07）；
-      // 2026-09-01 随产品默认模型一起改成 Grok 4.6（= 目录的 default_model）。
-      // 若要纳入 Admin 管理，应作为一类 backend_task 加进目录（现有的只有
-      // phd_translate / devops_report_summarize 两个），而不是在这里各自写死。
-      modelId: "global.xai.grok-4.6",
-      messages: [{ role: "user", content: [{ text: prompt }] }],
-      // **不要传 temperature**（换成 Grok 之后这条依然成立，别"顺手加回来"）。
-      // 教训来自 Sonnet 5：它弃用了该参数（adaptive thinking 常驻），传了整个请求
-      // ValidationException:「`temperature` is deprecated for this model」—— 而这一段的
-      // 异常被兜进 aiError，界面表现只是"洞察是空的"，没有任何报错。实测 2026-08-26
-      // 确认：带 temperature 必失败，去掉即正常。这里的模型是可改的（见上），所以不能
-      // 依赖"当前这个模型接受 temperature"；确定性也不靠采样参数，靠提示词里的
-      // STRICT JSON 约束。同一个坑在 llm_config.mjs 的探测里踩过一次，那次至少有
-      // 枚举态可查，这里连状态都没有。
-      inferenceConfig: { maxTokens: 900 },
-    }));
-    const txt = resp.output?.message?.content?.[0]?.text || "";
+    // 用哪个模型、多大预算、为什么不是产品默认模型、为什么不传 temperature：见 insight_llm.mjs。
+    const txt = await invokeInsight(prompt);
     const parsed = JSON.parse(txt.slice(txt.indexOf("{"), txt.lastIndexOf("}") + 1));
     return {
       insight: String(parsed.insight || ""),
@@ -379,7 +361,7 @@ async function verifyCase(cli, caseId, opts = {}) {
 
 // AWS Support 的 ResolveCase / AddCommunicationToCase 只认**内部长 caseId**
 // (形如 case-<12位账号>-mu..-<年>-...)，但用户/agent 常给的是**显示短 ID**(纯数字, 如
-// 178307825600138)。这里把给定 id 统一解析成内部 caseId:
+// 177968247000414)。这里把给定 id 统一解析成内部 caseId:
 //  - 已是内部格式(含连字符/以 case- 开头)→ 原样用;
 //  - 纯数字(displayId)→ 用 DescribeCases 的 displayId 过滤查回内部 caseId。
 // 解析不到 → 返回原值(让底层报错, 附带清晰信息)。

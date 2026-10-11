@@ -606,3 +606,81 @@ describe("部署账号固定行（巡检范围可配，2026-09-07）", () => {
     expect(screen.queryByText("部署账号") || screen.queryByText("Deployment account")).toBeNull();
   });
 });
+
+describe("第二步（DevOps Agent 关联）徽标（2026-10-11）", () => {
+  /* 🔴 成员栈部署失败时 BFF 把 da# 行写成 `failed`（devopsAgentAssocStatus / 列表对账）。
+   *    此前 daBadge 没有这一档，`failed` 落进兜底分支、显示「关联进行中」—— 失败的账号
+   *    看起来永远在跑（一键部署多账号模式的成员栈撞同名采集角色回滚时，客户看到的就是这句）。
+   *    title（daGuideTip）此前还指向 2026-09-04 已退役的「Idle 控制台」向导。 */
+  const withDa = (s: string) => ({ ...OK, devopsAgentStatus: s }) as MemberAccountRec;
+
+  it("★★★ failed → 「关联失败」而不是「关联进行中」；同一处有「一键关联」，title 说的就是它", async () => {
+    const { STRINGS } = await import("./i18n");
+    vi.mocked(admin.fetchMemberAccounts).mockResolvedValue(resp([withDa("failed")]) as never);
+    render(<AccountsView />);
+    const label = await waitFor(() => {
+      const el = screen.queryByText(/关联失败|Association failed/);
+      expect(el, "failed 没有显示成「关联失败」—— 客户会以为还在跑、一直干等").not.toBeNull();
+      return el!;
+    });
+    expect(screen.queryByText(/关联进行中|Association in progress/)).toBeNull();
+    const badge = label.parentElement!;
+    expect(badge.querySelector("button")?.textContent || "",
+      "失败了却没有重试入口").toMatch(/一键关联|Associate/);
+    const tip = STRINGS["admin.accounts.daGuideTip"];
+    expect([tip.zh, tip.en]).toContain(badge.getAttribute("title"));
+  });
+
+  it("★★★ active → 不挂「还需完成第二步」的 title、也没有按钮（那件事已经做完了）", async () => {
+    vi.mocked(admin.fetchMemberAccounts).mockResolvedValue(resp([withDa("active")]) as never);
+    render(<AccountsView />);
+    const label = await waitFor(() => {
+      const el = screen.queryByText(/调查能力已启用|Investigations enabled/);
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    expect(label.parentElement!.getAttribute("title")).toBeNull();
+    expect(label.parentElement!.querySelector("button")).toBeNull();
+  });
+
+  it("★★★ daGuideTip 指向同一行的「一键关联」，不再指向已退役的 Idle 控制台向导", async () => {
+    const { STRINGS } = await import("./i18n");
+    const tip = STRINGS["admin.accounts.daGuideTip"];
+    const btn = STRINGS["admin.accounts.daGuideBtn"];
+    expect(tip.zh).not.toMatch(/Idle|向导/);
+    expect(tip.en).not.toMatch(/Idle|wizard/i);
+    expect(tip.zh).toContain(`「${btn.zh}」`);
+    expect(tip.en).toContain(`"${btn.en}"`);
+  });
+});
+
+describe("组织管理账号徽标的提示（2026-10-11）", () => {
+  /* 🔴 原提示让人「先在管理账号里手工部署 member-account-onboarding.yaml，再用「手动接入账号」
+   *    登记」—— 照做必回滚：手动接入的链接写死 CreateCollectionRole=yes，两份模板建同名采集角色
+   *    ⇒ EntityAlreadyExists。现在的口径（与 DEPLOYMENT §0.1.2、setup.sh 一致）：只走手动接入；
+   *    已经部过 onboarding 那份的，在 quick-create 页把 CreateCollectionRole 改成 no。 */
+  const MGMT = { ...OK, accountId: "444455556666", isOrgManagementAccount: true,
+                 onboarded: false, enabled: false, orgOnboardStatus: "" } as MemberAccountRec;
+
+  it("★★★ 徽标 title 只给「手动接入账号」这一条路，并带上 CreateCollectionRole=no 的出路", async () => {
+    const { STRINGS } = await import("./i18n");
+    vi.mocked(admin.fetchMemberAccounts).mockResolvedValue(resp([MGMT]) as never);
+    render(<AccountsView />);
+    const el = await waitFor(() => {
+      const hit = screen.queryByText("管理账号") || screen.queryByText("Management account");
+      expect(hit).not.toBeNull();
+      return hit!;
+    });
+    const title = el.getAttribute("title") || "";
+    const hint = STRINGS["admin.accounts.mgmtAcctHint"];
+    expect([hint.zh, hint.en]).toContain(title);
+    for (const s of [hint.zh, hint.en]) {
+      expect(s).toContain("CreateCollectionRole");
+      expect(s).toContain("DevOpsEventBusArn");
+      expect(s, "又回到了「先部 onboarding 再登记」那条必回滚的老路")
+        .not.toMatch(/然后用下方「手动接入账号」登记它|then register it with/);
+    }
+    expect(hint.zh).toContain("「手动接入账号」");
+    expect(hint.en).toContain("\"Manual onboarding\"");
+  });
+});

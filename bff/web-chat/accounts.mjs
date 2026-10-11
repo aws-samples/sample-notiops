@@ -1,8 +1,16 @@
 /**
  * 多账号：从 notiops 的 config 表读已注册账号，供前端账号选择器。
  *
- * 复用 idle 的 onboard 机制：账号经 idle Dashboard onboard 进 config 表
- * （PK=account#<id>, GSI1PK="accounts"），并在目标账号部署 notiops-idle-detection-role。
+ * 登记沿用 idle 时代的 config 表布局（PK=account#<id>, GSI1PK="accounts"）。成员账号的写侧现在是
+ * Web Chat「更多 → 管理 → 账户」（member_accounts.mjs：组织内一键接入 / 手动接入；目标账号里的
+ * 采集角色由接入时部署的 CloudFormation 栈建出）。
+ * 部署账号默认不在这份登记里：部署时（CDK 的 AutoOnboardResource / 一键部署的 stager）只写它的
+ * da# 行（GSI1PK="da#accounts"，listAccounts 那条 GSI 查询读不到）。它的 account# 行通常只在管理员
+ * 给部署账号配巡检 region 时由 member_accounts.mjs::setAccountRegions 建出；有人对部署账号走过
+ * 「手动接入账号」时 member_accounts.mjs::manualPayloadSave 也会写这一行（那个函数不拒部署账号）；
+ * 2026-09-04 退役的老 Dashboard「目标账户管理」可以手工登记任意账号，存量部署里也可能留着一行。
+ * 这几种写法都带 GSI1PK="accounts" —— 所以下面列表时仍按 selfAccountId 排除。
+ * 老 idle Dashboard 的接入页已于 2026-09-04 随老控制台退役。
  * 这里只**读** enabled 账号，绝不改。表名由环境变量 CONFIG_TABLE 注入（CDK）。
  */
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";

@@ -741,9 +741,9 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
         // 里 `os.environ.get("SLACK_BOT_TOKEN_ARN")` 那条读取 —— 那个模块 worker 复用。
         SLACK_BOT_TOKEN_ARN: slackTokenSecret,
         SLACK_SIGNING_SECRET_ARN: slackSigningSecret,
-        // Slack 侧的群白名单变量名是 `ALLOWED_CHANNEL_IDS`（飞书那边叫
+        // Slack 侧的群允许清单变量名是 `ALLOWED_CHANNEL_IDS`（飞书那边叫
         // ALLOWED_CHAT_IDS）—— 沿用 platforms/slack/app/main.py:110 的既有口径，
-        // 别为了"统一"改名：改了等于给 Fargate 回滚路径埋一个空白名单。
+        // 别为了"统一"改名：改了等于给 Fargate 回滚路径埋一个空的允许清单。
         ALLOWED_CHANNEL_IDS: props.allowedChatIds,
       },
       description: "NotiOps Slack IM worker -- shares platforms/common/router.py with the Feishu worker",

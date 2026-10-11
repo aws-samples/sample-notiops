@@ -258,7 +258,7 @@ export function extract(evt) {
   // 快捷后续按钮（agent yield {"followups":[{label,prompt}]}）——点击=向对话发这句 prompt。
   const followups = Array.isArray(evt.followups) ? evt.followups : [];
 
-  // 调查**分析过程**行（agent yield {"investigation_step":{text,console_url?}}）——收进右侧「调查过程」面板。
+  // 调查**分析过程**行（agent yield {"investigation_step":{text,console_url?}}）——收进右侧「思考过程」面板。
   const investigationStep = (evt.investigation_step && typeof evt.investigation_step === "object")
     ? evt.investigation_step : null;
 
@@ -274,7 +274,7 @@ export function extract(evt) {
   // 不是内容、不发给浏览器 —— 只用于等待期提示的阶段切换（见 wait_hint.mjs）。
   const ready = evt.ready === true;
 
-  // 思考过程增量（agent yield {"reasoning":{text}}）——前端可折叠灰字，收到正文即隐藏。
+  // 思考过程增量（agent yield {"reasoning":{text}}）—— 前端右侧「思考过程」面板的思考段（thinking.ts::appendReasoning）。
   const reasoning = (evt.reasoning && typeof evt.reasoning === "object") ? evt.reasoning : null;
 
   // 本轮 token 用量（agent 收尾 yield {"usage":{inputTokens,outputTokens,totalTokens}}）。

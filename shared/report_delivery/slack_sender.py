@@ -424,7 +424,7 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
             tail.append(_actions(*ns_buttons))
 
     # Exactly one escalation button. ⚠️ 报告卡上**没有**「🔬 查看本次调查」
-    # (控制台深链):这张卡上其余链接都是预签名、7 天免登录,而深链要求登录
+    # (控制台深链):这张卡上其余链接都是预签名、免登录(数小时内有效,最长约 12 小时),而深链要求登录
     # AWS 控制台 —— 两者并排会逼着底下的说明同时写「无需登录」和「需要
     # 登录」。2026-09-05 加过当天去掉。进度卡上那颗保留(见 `progress_sender`)。
     action_row: list = []

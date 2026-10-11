@@ -34,6 +34,12 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 os.environ.setdefault("CONVERSATIONS_TABLE", "test")
 os.environ.setdefault("EVENTS_TABLE", "test")
+# 只比「种子 vs 仓库里的代码」，不读任何 DynamoDB。`mc.*` 走 `llm_config.get_config()`，它默认
+# 读 `notiops-config` —— 本机有凭证时读到的是那个账号里已 seed 的那份，判定就取决于那张表此刻
+# 的数据（2026-10-10 实测：默认 profile 指向现网，读到旧目录报了 7 条与代码无关的红；反方向 ——
+# 内置目录坏了、被库里那份盖住 —— 是假绿）。已部署环境里的那一份由发布前的人工回归核对。
+# 用赋值而不是 setdefault：开发者 shell 里留着 LLMCFG_ENABLED=1 也不该让它去读库。
+os.environ["LLMCFG_ENABLED"] = "0"
 
 from core import model_catalog as mc  # noqa: E402
 
@@ -85,7 +91,13 @@ def test_seed_im_surface_claims_are_real():
     im_aliases = set(mc.list_aliases())
     im_model_ids = {e.model_id for e in mc.all_entries()}
     for m in SEED["models"]:
-        if "im" not in m["surfaces"]:
+        # 只看**启用**的条目。`core/model_catalog.py` 的契约就是「禁用即从 `@bot model list`
+        # 里移除、存量偏好在下一条消息时失效」，所以一个 enabled=false 的条目在 IM 目录里
+        # 解析不到是**正确**的，不是故障。
+        # 以前这条判据没区分 enabled，一直没撞上只是因为旧的禁用条目恰好都只写了 webchat；
+        # 2026-10-10 升级时退役的几条（grok-4-6 / glm-5 / sonnet-5 / opus-5 / gpt-5-6-sol /
+        # nova）保留了 ["webchat","im"] —— 管理员在控制台把它们重新启用时，两端都应该回来。
+        if "im" not in m["surfaces"] or not m.get("enabled"):
             continue
         resolvable = (
             m["alias"] in im_aliases

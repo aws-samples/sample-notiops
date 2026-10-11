@@ -66,7 +66,7 @@ export function createMinimalBase(scope: Construct): MinimalBase {
     projectionType: dynamodb.ProjectionType.ALL,
   });
 
-  // ─── Cognito：认证统一（web chat 与控制台同一个池）───
+  // ─── Cognito：Web Chat 的登录用户池（与后端栈同名同形，见文件头第 1、3 条）───
   const userPool = new cognito.UserPool(scope, "IdleDetectorUserPool", {
     userPoolName: "notiops-users",
     selfSignUpEnabled: false, // 管理员创建用户；一键部署里第一个管理员由 StagerFn 建

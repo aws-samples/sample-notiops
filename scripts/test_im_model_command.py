@@ -56,7 +56,7 @@ def _check(name: str, cond: bool, detail: str = "") -> None:
         print(f"  {FAIL} {name}" + (f" :: {detail}" if detail else ""))
 
 
-def _install(models: list[dict], default_model: str = "claude-sonnet-5") -> None:
+def _install(models: list[dict], default_model: str = "claude-sonnet-5-5") -> None:
     """Pin the catalogue `llm_config` hands out, bypassing DynamoDB."""
     cfg = {
         "generation": 1,
@@ -111,7 +111,7 @@ def test_disabling_a_model_removes_it_everywhere() -> None:
     """One console toggle must hit the list, the hint and admission together."""
     print("test_disabling_a_model_removes_it_everywhere")
     models = _seed_models()
-    victim = next(m for m in _im_enabled(models) if m["alias"] != "claude-sonnet-5")
+    victim = next(m for m in _im_enabled(models) if m["alias"] != "claude-sonnet-5-5")
     short = victim.get("short") or victim["alias"]
 
     _install(models)
@@ -155,7 +155,7 @@ def test_retired_preference_falls_back_not_pins() -> None:
     """A pref for a since-disabled model resolves to the default, not to itself."""
     print("test_retired_preference_falls_back_not_pins")
     models = _seed_models()
-    victim = next(m for m in _im_enabled(models) if m["alias"] != "claude-sonnet-5")
+    victim = next(m for m in _im_enabled(models) if m["alias"] != "claude-sonnet-5-5")
     short = victim.get("short") or victim["alias"]
     for m in models:
         if m["alias"] == victim["alias"]:
@@ -167,7 +167,7 @@ def test_retired_preference_falls_back_not_pins() -> None:
            entry.model_id != victim["model_id"], f"still={entry.model_id}")
     _check("retired preference resolves to the default instead",
            entry.model_id == next(m["model_id"] for m in models
-                                  if m["alias"] == "claude-sonnet-5"),
+                                  if m["alias"] == "claude-sonnet-5-5"),
            f"got={entry.model_id}")
 
 
@@ -181,7 +181,10 @@ def test_disabled_model_keeps_its_output_cap() -> None:
     """
     print("test_disabled_model_keeps_its_output_cap")
     models = _seed_models()
-    victim = next(m for m in _im_enabled(models) if m["alias"] == "amazon-nova-pro")
+    # 选谁当 victim 有讲究：要**启用中**的 IM 模型、非 Anthropic（Anthropic id 会被宽松兜底
+    # 合成一个条目，把 bug 盖住）、上限既不是兜底 3000 也不是默认模型的 6000。原来用的是
+    # Nova Pro（5000），2026-10-10 它全局停用了，换成 GPT-5.6 Terra（8000）。
+    victim = next(m for m in _im_enabled(models) if m["alias"] == "gpt-5-6")
     want_cap = (victim.get("output_override") or {}).get("im")
     for m in models:
         if m["alias"] == victim["alias"]:
@@ -259,12 +262,14 @@ def test_catalogue_outage_still_serves_a_model() -> None:
     try:
         entries = _mc.all_entries()
         _check("outage still yields candidates", len(entries) >= 1, str(len(entries)))
+        # 量上限要挑一个「≠ IM 目标值 6000」的启用模型，否则量不出"按模型"还是"一刀切"。
+        # 原来是 Nova Pro（5000）；2026-10-10 它全局停用，`get("nova")` 会被换成默认模型。
         _check("outage keeps short aliases working (builtin has them)",
-               _mc.is_known("claude") and _mc.is_known("nova"),
+               _mc.is_known("claude") and _mc.is_known("gpt"),
                "builtin catalogue is missing short/aliases_legacy")
-        _check("outage keeps per-model output caps (nova != the surface target)",
-               _mc.get("nova").max_output_tokens == 5000,
-               f"got={_mc.get('nova').max_output_tokens}")
+        _check("outage keeps per-model output caps (gpt != the surface target)",
+               _mc.get("gpt").max_output_tokens == 8000,
+               f"got={_mc.get('gpt').max_output_tokens}")
         _check("outage get() still resolves", bool(_mc.get("claude").model_id))
     except Exception as e:  # noqa: BLE001
         _check("outage does not raise", False, repr(e))

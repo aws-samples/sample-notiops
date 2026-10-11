@@ -42,7 +42,7 @@ the IM platform console**, and it is the step you do **after the deployment fini
 
 ## 0. Get the webhook URL first
 
-**The easy way: admin console → "IM integration" → switch to your platform's tab →
+**The easy way: Web Chat's left nav "More → Admin → IM Integration" → switch to your platform's tab →
 "View the detailed setup steps" → step 3.** This deployment's real URL is shown right there
 with a Copy button — no CloudFormation console, no CLI, and it works the same on both
 deployment paths (A and B). The backend resolves it by looking up the IM entry point's
@@ -95,8 +95,8 @@ the path — so appending a sub-path still works, but paste it exactly as the ou
 >   `notiops/slack-bot-token` / `notiops/slack-signing-secret`), so every command in this
 >   document works as-is.
 > - **The template creates no secrets at all** — for all three platforms the secret is created
->   on demand by the backend when you save the credentials on the admin console's "IM
->   integration" page (that includes the Slack tab, as of 2026-09-11; before that you had to
+>   on demand by the backend when you save the credentials on Web Chat's "More → Admin →
+>   IM Integration" page (that includes the Slack tab, as of 2026-09-11; before that you had to
 >   create those two by hand).
 > - **Your install option must include the platform you're configuring**: a web-only stack has
 >   no such HTTP API, and no `FeishuWebhookUrl` / `SlackWebhookUrl` / `DingtalkWebhookUrl`
@@ -173,8 +173,8 @@ for k in sorted(d):
 
 2. Store both values (**do this before filling in the request URL**). Two ways — pick one:
 
-   **Recommended · admin console** (no CLI, no credentials): in the web UI, go to
-   **Admin → IM Integration** and fill in `Encrypt Key` / `Verification Token` (same form as
+   **Recommended · admin console** (no CLI, no credentials): in Web Chat's left nav, go to
+   **More → Admin → IM Integration** and fill in `Encrypt Key` / `Verification Token` (same form as
    `App ID` / `App Secret`), then Save. That page also carries the four-step summary of the
    Feishu-side work plus a "View the detailed setup steps" right-hand drawer whose content
    mirrors this document — this is the path for customers who only have a browser.
@@ -360,7 +360,7 @@ it, it **says so** and then answers from your sentence alone — never silently.
 ### 2.2 Two credentials
 
 **Recommended (needs no AWS permissions at all, browser-only):** open Web Chat →
-**admin console → IM integration → Slack tab**, fill the two fields and save:
+**More → Admin → IM Integration → Slack tab**, fill the two fields and save:
 
 | Field | Where it comes from | Shape |
 |---|---|---|
@@ -426,7 +426,7 @@ Four things you must know first:
    load** (cold start), so **execution environments that are still alive keep using the old
    value**. The web page's save confirmation says so too. Wait for the old environments to
    be recycled, or change an ingress environment variable to force a fresh batch — see
-   [DEPLOYMENT.en.md](DEPLOYMENT.en.md) §8.2.
+   [DEPLOYMENT.en.md](DEPLOYMENT.en.md) §8.3.
 
 ### 2.3 Three Request URL fields — all the same value
 
@@ -518,8 +518,8 @@ Two Slack-specific gotchas:
 > DingTalk's only previous runtime was the retired Fargate long-connection stack; this
 > path is a Lambda webhook.
 >
-> **Every step below can be done in a browser alone**: admin console → "IM integration" →
-> switch to the **DingTalk** tab → "View the detailed setup steps" in the top right. The
+> **Every step below can be done in a browser alone**: Web Chat's left nav "More → Admin → IM
+> Integration" → switch to the **DingTalk** tab → "View the detailed setup steps" in the top right. The
 > drawer has the same steps and gives you this deployment's callback URL with a Copy
 > button. It maps one-to-one onto this section (source:
 > [`content/dingtalkGuide.ts`](../frontend/chat-app/src/content/dingtalkGuide.ts)).
@@ -554,7 +554,7 @@ requests to). So the order is: **store the credentials first, then paste the URL
 
 ### 3.3 Store the credentials in the secret
 
-**Option 1 (recommended, browser only)**: admin console → "IM integration" → DingTalk tab
+**Option 1 (recommended, browser only)**: "More → Admin → IM Integration" → DingTalk tab
 → fill in AppKey / AppSecret → Save. The backend creates the secret if it does not exist.
 After saving, the page echoes only the **last 4 chars** of the AppSecret (`****xxxx`);
 **sending a masked value back means "keep unchanged"**, so later edits to the push URL do
@@ -633,7 +633,7 @@ different here. We **write these out** rather than implying them by omission:
 | **Card buttons can only be links** | Every DingTalk ActionCard button is a URL jump — there is no "click posts back to the server" interaction. Actions that need confirmation (opening a case, starting an investigation) are therefore **confirmed by replying with a keyword**. |
 | **Sent messages cannot be edited** | DingTalk has no message-update API, so instead of Feishu's self-updating progress card there are **one or two appended** progress messages for long tasks. |
 | **Robots cannot add reactions** | There is no 👀 / 👍 instant acknowledgement when a command arrives; a short **text receipt** takes its place. |
-| **Proactive pushes need a second URL** | The robot's own reply channel is the **one-time session webhook** DingTalk hands us in the callback (`sessionWebhook`, valid for roughly **90 minutes** after a message), so it cannot carry scheduled pushes. For those, see §3.7. |
+| **The robot's own reply channel is one-time** | It is the **one-time session webhook** DingTalk hands us in the callback (`sessionWebhook`, valid for roughly **90 minutes** after a message). Investigation reports therefore do not use it; they go back to the conversation that started them through the server API, with nothing extra to configure. The daily notification, Health and real-time event pushes are not sent to DingTalk in this release — that is this release's scope, not a DingTalk platform limit; for what the custom-robot URL is used for, see §3.7. |
 
 The command surface is **the same** as the other two platforms: `/devops`, `/agent`,
 `/web`, `/account`, `/investigate`, `/case`, `/model`, `/language` and `/help` all work, as
@@ -710,12 +710,37 @@ The other case actions are one-liners too, and each is a **single verb-noun word
 (closing also needs a **confirm** reply). The Chinese synonyms all work as well:
 `/案例`, `/查看案例`, `/分析案例`, `/回复案例`, `/关闭案例`.
 
-### 3.7 Proactive push (optional: a custom robot)
+### 3.7 Custom-robot push URL (optional)
 
-For pushes nobody asked for first — inspection broadcasts, alerts, scheduled reports —
-DingTalk requires a "custom robot": Group settings → Group assistant → Add robot →
-**Custom** → copy its webhook URL → paste it into the "Custom-robot push URL" field on the
-admin console's DingTalk tab (or the `webhook_url` key of the JSON in §3.3).
+This is the webhook of a separate DingTalk "custom robot" added to the group: Group settings → Group
+assistant → Add robot → **Custom** → copy its webhook URL → paste it into the "Custom-robot push
+URL" field on the DingTalk tab of Web Chat's "More → Admin → IM Integration" (or the `webhook_url`
+key of the JSON in §3.3).
+
+In this release only two things use it:
+
+- **The fallback for investigation reports** — a report normally goes back to the conversation
+  that started it through the server API, and lands in this group only when that fails;
+- **Inspection push** — but inspection exists only on `setup.sh` deployments, and the group must
+  first be registered as an inspection push target, which this release has **no way** to do yet
+  (no web setting, `setup.sh` does not ask, and the release ships no tool for it), so it cannot
+  actually be set up in this release.
+
+The daily ops notification, Health events and real-time alert pushes are **not sent to DingTalk**;
+filling this in does not change that (see [DEPLOYMENT.en.md](DEPLOYMENT.en.md) §7).
+
+> ⚠️ **In this release none of the custom robot's three security settings (DingTalk requires at
+> least one) can guarantee delivery**:
+> - 加签 (HMAC sign) needs a signing secret that neither deployment path has anywhere to store — the
+>   messages we send carry no signature and DingTalk rejects them (Test credentials, below, then
+>   reports that the push webhook rejected the message);
+> - a custom keyword must appear in every message, and the reports we send are not guaranteed to
+>   contain it — the Test credentials message contains `NotiOps`, so a passing test does **not**
+>   prove that real reports get through;
+> - an IP address (range) needs a fixed egress IP, which these Lambdas do not have.
+>
+> The URL only serves the two uses above (and the second one cannot be set up in this release yet),
+> so **you can leave this field empty**.
 
 > ⚠️ **That URL IS a credential** — anyone holding it can post into that group, and report
 > delivery POSTs the **full text** of long reports through it. So: the admin console echoes
@@ -728,7 +753,9 @@ from DingTalk's own callback, with zero extra configuration. Leaving it empty is
 
 Once filled, click **Test credentials** on the admin console: it first fetches one access
 token with the AppKey / AppSecret (the **authoritative** credential check), then, if a push
-URL is set, posts a real message to that group.
+URL is set, posts a real message to that group. A pass there only shows that the push URL and its
+security setting accepted **that** test message; with a custom keyword it does not prove that
+real reports get through (see above).
 
 > DingTalk has **no** API to post a test message into an arbitrary group. So with no push
 > URL configured, that button **only validates credentials and sends nothing** — and the
@@ -739,17 +766,28 @@ URL is set, posts a real message to that group.
 
 ## 4. Chat allowlist (optional, all three platforms)
 
-Restrict the bot to specific groups / channels:
+Restrict the bot to specific groups / channels.
 
-```bash
-cd infra && npx cdk deploy ImStack --output ../.cdk-out --region <REGION> \
-  -c imAllowedChatIds="oc_xxx,C0123ABC"
+**Path B (`setup.sh`)**: add one line to the `context` block of `infra/cdk.json`, then re-run
+`./setup.sh`:
+
+```json
+"imAllowedChatIds": "oc_xxx,C0123ABC"
 ```
+
+`setup.sh` does not pass this key itself, so it has to live in `cdk.json` for every later re-run
+to keep it. Don't take the shortcut of a bare `cdk deploy ImStack -c imAllowedChatIds=…`: that run
+carries none of the other `-c` flags `setup.sh` normally passes, so the stack is synthesized with
+defaults (see the warning at the end of [DEPLOYMENT.en.md](DEPLOYMENT.en.md) §8.1), and the next
+`./setup.sh` run clears the list again.
+
+**Path A (one-click)**: the **IM chat/channel allow list (optional)** parameter — update the
+stack with it (see [DEPLOYMENT_ONECLICK.en.md](DEPLOYMENT_ONECLICK.en.md) §2.3).
 
 Feishu takes chat ids starting with `oc_`, Slack takes channel ids starting with `C` or
 `D`, DingTalk takes the `conversationId` (read it out of the worker log after one
-@-mention), comma-separated. Leave it empty for no restriction (same behaviour as the
-long-connection design).
+@-mention), comma-separated, no spaces. Leave it empty for no restriction (same behaviour
+as the long-connection design).
 
 > 📌 **On DingTalk this check lives in the worker, not the ingress** (Feishu and Slack
 > enforce it in both). The reason: DingTalk's `conversationId` is only decodable **after**
@@ -758,7 +796,7 @@ long-connection design).
 > replies. The cost is one extra worker cold start for a request that gets dropped, which
 > is negligible at IM volumes. The env var name differs for the same reason (DingTalk
 > `ALLOWED_CONVERSATION_IDS`, Feishu `ALLOWED_CHAT_IDS`, Slack `ALLOWED_CHANNEL_IDS`) —
-> but the **deploy parameter `-c imAllowedChatIds` is shared by all three**, so there is
+> but the **deploy parameter `imAllowedChatIds` is shared by all three**, so there is
 > nothing extra to fill in.
 
 ### 4.1 Two bots in one group (a test env and a production env)
@@ -843,7 +881,7 @@ Three things worth stating plainly, because they are easy to misread:
 > the group allowlist in §4 above** to keep the bot in groups that should see those accounts.
 > The last line against over-reach is on the agent side (only "deployment account + enabled
 > accounts" is allowed, and when that list can't be read the answer is **refuse**, not
-> open up) plus the trust policy on the read-only role in the target account itself.
+> open up) plus the trust policy on the cross-account role in the target account itself.
 
 ---
 
@@ -1085,8 +1123,8 @@ runs it in the background, **without occupying your chat**. You get two cards:
    buttons underneath (📊 View full report / 🔍 Investigation trace /
    🆘 Escalate to AWS Support). The "🔬 Open this investigation" console deep link lives on
    the **progress card** only — every other link on the report card is presigned and needs no
-   login, so adding one that requires a console session would force the footnote beneath them
-   to claim "no login required" and "login required" at once.
+   login (but is time-limited, see below), so adding one that requires a console session would
+   force the footnote beneath them to claim "no login required" and "login required" at once.
 
 > 🔴 **As of v1.0.22 there is only one report card.** It used to be two ("📝 Report Summary"
 > + "✅ NotiOps Report"), and the first one's body came from an LLM summary — once the default
@@ -1095,8 +1133,10 @@ runs it in the background, **without occupying your chat**. You get two cards:
 > occasionally nothing at all. It is now one card whose body is the DevOps Agent's own text,
 > which makes the whole deep-investigation path **0 token**.
 >
-> ⚠️ The report link is an **S3 presigned URL valid for 7 days** — not a permanent link, and
-> not a CloudFront URL. Download the file if you need to keep it.
+> ⚠️ The report link is an **S3 presigned URL** that the callback function signs with its own
+> **temporary credentials** — not a permanent link, and not a CloudFront URL. Such a link cannot
+> outlive the credentials that signed it: it stops working when they expire, at most about 12 hours
+> later, not 7 days. Download the file if you need to keep it.
 >
 > ⚠️ When the report does not fit on the card, the body ends with "⚠️ This card shows only the
 > beginning of the report — full content via *📊 View full report*". The content behind that

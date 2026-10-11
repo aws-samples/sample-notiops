@@ -11,7 +11,7 @@
  *   浏览器 ──SSE── BFF ── agent runtime ── Bedrock       （烧 token 的那条）
  *
  * 因此 SSE 事件与既有路径同形（token / progress / investigation_step / usage），前端渲染、
- * 右侧「调查过程」面板全部零改动复用；`usage` 恒为 `{totalTokens:0, direct:true}`。
+ * 右侧「思考过程」面板全部零改动复用；`usage` 恒为 `{totalTokens:0, direct:true}`。
  *
  * ── 责任划分（三个文件，一个都不许合并）────────────────────────────────
  *   [aliyun_signer.mjs](aliyun_signer.mjs)  签名（ACS3-HMAC-SHA256），纯函数，有官方测试向量
@@ -54,7 +54,7 @@
  *   · `requestId` / `traceId` 可关联到具体请求 → 只在面板里给用户自己看，不进日志
  *   · 用户问题原文不进日志
  *
- * ARCC 未查询（MCP server 本次会话连不上）—— 按标准做法处理：凭据只读内存、只走 HTTPS、
+ * 按标准做法处理：凭据只读内存、只走 HTTPS、
  * 地域取值限定在枚举内（endpoint 主机名是拼出来的，见 starOpsHost 那段 SSRF 说明）。
  */
 import { signRequest, roaPath, buildUrl } from "./aliyun_signer.mjs";
@@ -368,10 +368,11 @@ export function buildVariables({ locale, region, workspace, project, now }) {
 }
 
 /**
- * 读并校验 STAROps 所需的配置。返回 `null` = 没配好（调用方必须**当场失败**并把客户
- * 指到 Admin「多云」页，不许"跳过阿里云那部分继续答" —— 那是静默降级）。
+ * 读并校验 STAROps 所需的配置。返回 `{ ok: false, reason }` = 没配好（调用方必须**当场失败**
+ * 并说清缺哪一项 —— 见 `notConfiguredText`，多云可见时顺带指到「多云」页；不许"跳过阿里云
+ * 那部分继续答" —— 那是静默降级）。
  *
- * 返回 `{ creds, region, employee, workspace, project, inspectRegion }`。
+ * 配好时返回 `{ ok: true, creds, region, employee, workspace, project, inspectRegion }`。
  */
 export async function loadStarOpsConfig() {
   const c = await loadAliyunCredentials();
@@ -427,12 +428,35 @@ export async function starOpsAvailability() {
   }
 }
 
+/**
+ * 多云（阿里云 STAROps）入口在 **Web 端**是否可见。它只决定 `notConfiguredText` **往哪儿指路**，
+ * 不决定这条链路能不能走 —— 与 `core/multicloud.py::VISIBLE` 同一个口径（只管说什么，不管能做什么）。
+ *
+ * ⚠️ 三处必须**一起翻**：本常量、`frontend/chat-app/src/featureFlags.ts` 的 `MULTICLOUD_UI`、
+ *    `core/multicloud.py` 的 `VISIBLE`。BFF 读不到前端那个编译期常量（另一个运行时、另一份产物），
+ *    所以这里单留一份，三者是否一致由 tests/starops_chat.test.mjs 核对。只翻了前端那份的症状是
+ *    「多云」页回来了、这句话却还说「暂未开放」；只翻了这份，就是把人指到一个左导航里没有的页面。
+ * ⚠️ 那条核对只在 `npm test`（CI 里是 bff-tests 这个 job）里跑，而 bff-tests 只在 MR 改到
+ *    `bff/web-chat/**` 或 `config/llm-model-catalog.json` 时才触发（.gitlab-ci.yml 里它的
+ *    `rules: changes:`，2026-10-11 核对）。所以**只**翻了前端或 core 那一份、没碰 bff/ 的 MR，
+ *    CI 上拦不住 —— 翻这个开关时在本地跑一次 `cd bff/web-chat && npm test`。
+ *
+ * 为什么关着时这句话仍然发得出去：前端藏掉的只是**新建** STAROps 会话的入口。已经有 STAROps
+ * 历史的会话（多云藏起来之前用过 STAROps 的部署里就有）刷新后，ChatApp 按历史里的 via="starops"
+ * 把对话对象的锁恢复回来，接着问就带着 `starops_chat: true` 走到 `runStarOpsChat` —— 那时阿里云
+ * 配置要是不全，回的就是这句。
+ */
+export const MULTICLOUD_VISIBLE = false;
+
 /** 「去配一下」的话术。**说清楚缺哪一项** —— 一句笼统的"未配置"会让客户把已经填好的
- *  AccessKey 又重填一遍。 */
-function notConfiguredText(reason, en) {
-  const where = en
-    ? "Admin → Multi-cloud → Alibaba Cloud"
-    : "管理后台 →「多云」→ 阿里云";
+ *  AccessKey 又重填一遍。
+ *
+ *  `core/starops_chat.py::not_configured_text` 是它的 IM 侧孪生：两支（多云可见 / 关着）的
+ *  文案改一边必须同时改另一边。只有退路不同 —— IM 是 `/agent devops`；Web 是开一个「新对话」
+ *  （Web 会话的对话对象发出第一句后就固定了，同一个会话里换不回去）。
+ *
+ *  `multicloudVisible` 只是测试接缝，调用方一律不传。 */
+export function notConfiguredText(reason, en, { multicloudVisible = MULTICLOUD_VISIBLE } = {}) {
   const what = {
     no_credentials: [
       "还没有填阿里云 AccessKey（AccessKey ID + Secret 两个都要）",
@@ -457,6 +481,18 @@ function notConfiguredText(reason, en) {
     bad_workspace: ["填的 workspace 名称格式不对", "the workspace name has an invalid format"],
     bad_project: ["填的 project 名称格式不对", "the project name has an invalid format"],
   }[reason] || ["阿里云配置不完整", "the Alibaba Cloud configuration is incomplete"];
+  if (!multicloudVisible) {
+    // 多云关着：「多云」页不在左导航里（AdminPanel 的 NAV_VISIBLE），指过去就是死路。只说缺哪一项
+    // + 现在没有能改它的页面 + 退路 —— 不给退路，这个会话每一轮都回同一句。
+    return en
+      ? `\n⚠️ Cannot talk to STAROps yet: ${what[1]}. Multi-cloud is not available yet, so the web app has no page to change this -- start a “New chat” to switch back to the standard chat for now.\n`
+      : `\n⚠️ 还不能跟 STAROps 对话：${what[0]}。多云暂未开放，Web 端目前没有能改这一项的页面 —— 可以先开一个「新对话」换回普通对话。\n`;
+  }
+  // 路径按**当前**侧栏写（2026-10-10 起「管理」收进「更多」），与前端 i18n 的 obj.starops.na.*
+  // 同一个落点。
+  const where = en
+    ? "More → Admin → Multi-cloud → Alibaba Cloud"
+    : "更多 → 管理 →「多云」→ 阿里云";
   return en
     ? `\n⚠️ Cannot talk to STAROps yet: ${what[1]}. Set it in **${where}**, then ask again.\n`
     : `\n⚠️ 还不能跟 STAROps 对话：${what[0]}。请到 **${where}** 填好后再问一次。\n`;
@@ -473,21 +509,23 @@ function notConfiguredText(reason, en) {
  * 抽成纯函数是为了**能被测到** —— `runStarOpsChat` 要真跑起 Secrets Manager + 三个阿里云
  * 接口才走得到那个分支，单测里驱动不动，所以文案必须有一个不依赖传输层的入口。
  * `core/starops_chat.py::create_thread_fail_text` 是这个函数的**逐行对照实现**，改一边必须
- * 同时改另一边。
+ * 同时改另一边。只有退路的**做法**不同（与 `notConfiguredText` 同一条规矩）—— IM 是
+ * `/agent devops`；Web 是开一个「新对话」（Web 会话的对话对象发出第一句后就固定了，
+ * 同一个会话里没有能切回去的控件，只说「换回普通对话」客户找不到在哪儿换）。
  *
  * @param {boolean} en    语言
  * @param {string}  code  阿里云错误码（`RAM_ERR_RE` 命中 ⇒ 走"重试不会好"那一句）
  */
 export function createThreadFailText(en, code) {
   if (RAM_ERR_RE.test(String(code || ""))) {
-    // 退路（换回普通对话）**必须留着** —— 去掉的只有那句"稍后重试"。
+    // 退路（开「新对话」换回普通对话）**必须留着** —— 去掉的只有那句"稍后重试"。
     return en
-      ? `\n⚠️ Failed to create the STAROps thread (${code}) -- this is a PERMISSIONS problem, so retrying will not help. You can switch back to the standard chat for now.\n`
-      : `\n⚠️ 创建 STAROps 会话失败（${code}）—— 这是**权限**问题，重试不会好。可以先换回普通对话。\n`;
+      ? `\n⚠️ Failed to create the STAROps thread (${code}) -- this is a PERMISSIONS problem, so retrying will not help. You can start a “New chat” to switch back to the standard chat for now.\n`
+      : `\n⚠️ 创建 STAROps 会话失败（${code}）—— 这是**权限**问题，重试不会好。可以先开一个「新对话」换回普通对话。\n`;
   }
   return en
-    ? `\n⚠️ Failed to create the STAROps thread (${code}). Retry later, or switch back to the standard chat.\n`
-    : `\n⚠️ 创建 STAROps 会话失败（${code}）。请稍后重试，或换回普通对话。\n`;
+    ? `\n⚠️ Failed to create the STAROps thread (${code}). Retry later, or start a “New chat” to switch back to the standard chat.\n`
+    : `\n⚠️ 创建 STAROps 会话失败（${code}）。请稍后重试，或开一个「新对话」换回普通对话。\n`;
 }
 
 /** 官方策略 `AliyunSTAROpsReadOnlyAccess` 把 `starops:CreateThread` / `starops:CreateChat` 的

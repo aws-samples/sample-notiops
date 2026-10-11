@@ -36,7 +36,8 @@ export interface ProposedAction {
 /** 快捷后续按钮：点击=向对话发送 prompt；或 url=新标签打开（如"去 DevOps 后台生成缓解方案"）。 */
 export interface Followup { label: string; prompt?: string; url?: string }
 
-/** 调查分析过程的一步（收进右侧「调查过程」面板；console_url 仅首条带，用于面板顶部后台链接）。 */
+/** DevOps Agent 调查分析过程的一步（与普通对话共用右侧「思考过程」面板 —— 2026-09-04 起只有这一个
+ *  过程面板；console_url 仅首条带，用于面板顶部后台链接）。 */
 export interface InvestigationStep { text: string; console_url?: string }
 
 /**
@@ -60,7 +61,8 @@ export interface StreamCallbacks {
   onToolCall?: (tool: string, args: unknown) => void;
   onToolResult?: (tool: string, summary: string) => void;
   onProgress?: (p: { text?: string; kind?: string; incident_id?: string; elapsed?: number; thinking?: string }) => void;
-  // 思考过程增量（模型 reasoning）：随本轮语言，前端累积成可折叠灰字。
+  // 思考过程增量（模型 reasoning 明文）：随本轮语言，前端**只**并进右侧「思考过程」面板的思考段（thinking.ts::appendReasoning），气泡里不渲染
+  // （2026-10-10 起；以前另有一份折叠灰字，与面板入口同名同内容，见 Message.tsx 入口规矩 3）。
   onReasoning?: (r: { text?: string }) => void;
   onSources?: (sources: SourceItem[]) => void;
   onActions?: (actions: ProposedAction[]) => void;

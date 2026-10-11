@@ -59,7 +59,7 @@ STAROps**：直接跟数字员工说话、让它自己发起巡检/调查、把�
   · `requestId` / `traceId` 只写进卡片给用户自己排查，**不进日志**
   · 用户问题原文不进日志
 
-ARCC 未查询（MCP server 本次会话连不上）—— 按标准做法处理：凭据只读内存、只走 HTTPS、
+按标准做法处理：凭据只读内存、只走 HTTPS、
 地域取值限定在枚举内（endpoint 主机名是拼出来的，见 `starops_host` 那段 SSRF 说明）。
 """
 from __future__ import annotations
@@ -73,6 +73,7 @@ import time
 import urllib.error
 import urllib.request
 
+from core import multicloud
 from core.aliyun_config import (DEFAULT_STAROPS_REGION, STAROPS_REGIONS,
                                 load_aliyun_credentials)
 from core.aliyun_signer import build_url, roa_path, sign_request
@@ -349,8 +350,9 @@ def build_variables(*, locale: str = "", region: str = "", workspace: str = "",
 def load_starops_config() -> dict:
     """读并校验 STAROps 所需的配置。
 
-    失败时回 `{"ok": False, "reason": …}`，调用方必须**当场失败**并把客户指到 Admin
-    「多云」页 —— 不许"跳过阿里云那部分继续答"（那是静默降级）。
+    失败时回 `{"ok": False, "reason": …}`，调用方必须**当场失败**并说清缺哪一项
+    （`not_configured_text`；多云可见时顺带指到 Admin「多云」页）—— 不许"跳过阿里云那部分
+    继续答"（那是静默降级）。
 
     成功时回 `{"ok", "creds", "region", "employee", "workspace", "project",
     "inspect_region"}`。
@@ -417,9 +419,18 @@ def configured() -> bool:
 
 def not_configured_text(reason: str, en: bool) -> str:
     """「去配一下」的话术。**说清楚缺哪一项** —— 一句笼统的"未配置"会让客户把已经填好的
-    AccessKey 又重填一遍。与 web 侧 `notConfiguredText` 逐条对齐。"""
-    where = ("Admin -> Multi-cloud -> Alibaba Cloud" if en
-             else "管理后台 →「多云」→ 阿里云")
+    AccessKey 又重填一遍。
+
+    web 侧孪生是 `bff/web-chat/starops_chat.mjs::notConfiguredText`：两支（多云可见 / 关着）
+    逐条对齐，改一边必须同时改另一边。只有退路不同 —— IM 是 `/agent devops`；Web 是开一个
+    「新对话」（Web 会话的对话对象发出第一句后就固定了）。
+
+    ⚠️ 多云关着（`core/multicloud.py::VISIBLE = False`）时**不指路**（2026-10-10）：Admin 的
+    「多云」页在 Web 端同样藏着（`MULTICLOUD_UI = false`），指过去就是死路。那时只说缺哪一项
+    + 现在没有能改它的页面 + 退路 —— 不给退路，这个会话每一轮都回同一句。
+    多云可见那一支的路径按**当前**侧栏写（2026-10-10 起「管理」收进「更多」），与 web 侧
+    同一个落点。
+    """
     table = {
         "disabled": (
             "STAROps 对话已被运维开关临时关闭（`NOTIOPS_DISABLE_STAROPS`）",
@@ -457,6 +468,15 @@ def not_configured_text(reason: str, en: bool) -> str:
     if reason == "disabled":
         # 这一条不是"去配一下"，别把客户指到 Admin 页去改一个改不了的东西。
         return (f"\n⚠️ {en_txt}.\n" if en else f"\n⚠️ {zh}。\n")
+    if not multicloud.VISIBLE:
+        return (f"\n⚠️ Cannot talk to STAROps yet: {en_txt}. Multi-cloud is not available yet, "
+                "so the web app has no page to change this -- you can switch back with "
+                "`/agent devops` for now.\n"
+                if en else
+                f"\n⚠️ 还不能跟 STAROps 对话：{zh}。多云暂未开放，Web 端目前没有能改这一项的页面"
+                " —— 可以先用 `/agent devops` 回到普通对话。\n")
+    where = ("More -> Admin -> Multi-cloud -> Alibaba Cloud" if en
+             else "更多 → 管理 →「多云」→ 阿里云")
     return (f"\n⚠️ Cannot talk to STAROps yet: {en_txt}. Set it in **{where}**, then ask again.\n"
             if en else
             f"\n⚠️ 还不能跟 STAROps 对话：{zh}。请到 **{where}** 填好后再问一次。\n")

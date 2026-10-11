@@ -368,7 +368,7 @@ a.followup-btn { text-decoration: none; }
 /* 入口**必须**套在这个块级容器里：.think-entry 与 .thinking 都是 inline-flex，不套就会和
    「… 正在思考 · 3s」挤到同一行（现网出过）。下边距也在这里给足 —— 贴着正文/思考态很难看。 */
 .think-entry-row { display: block; margin-bottom: 13px; }
-/* 入口本身要**低调**：纯文字灰链（对齐 .reasoning-toggle 的分量），不用带边框的卡片气泡 ——
+/* 入口本身要**低调**：纯文字灰链（12.5px、#9aa4b0），不用带边框的卡片气泡 ——
    它只是个"想看过程再点"的次要入口，不该比正文抢眼。 */
 .think-entry { display: inline-flex; align-items: center; gap: 6px; margin: 2px 0 0;
   border: none; background: none; padding: 2px 0; cursor: pointer; font-family: inherit;
@@ -482,16 +482,6 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 .typing::after { content: "▋"; color: var(--orange); animation: blink 1s steps(2) infinite; margin-left: 1px; }
 @keyframes blink { 50% { opacity: 0; } }
 
-/* 思考过程（reasoning）：可折叠灰字，默认折叠。低调、不抢正文。 */
-.reasoning { margin: 2px 0 8px; }
-.reasoning-toggle { display: inline-flex; align-items: center; gap: 5px; background: none; border: none;
-  padding: 2px 0; color: #9aa4b0; font-size: 12.5px; cursor: pointer; font: inherit; }
-.reasoning-toggle:hover { color: var(--muted); }
-.reasoning-caret { transition: transform .15s ease; }
-.reasoning-caret.open { transform: rotate(90deg); }
-.reasoning-body { margin-top: 6px; padding: 8px 11px; border-left: 2px solid var(--line);
-  color: #7d8794; font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
-
 /* 消息页脚（一行：复制 / Sources / 署名 / 账号 ID）。
    窄屏放不下就换行(flex-wrap)——挤成一行会把账号徽标压变形或撑出气泡。 */
 .msgbar { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; row-gap: 4px; margin-top: 8px; }
@@ -514,8 +504,9 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
    长得一样 —— 产品要求。
    为什么不写在 `.src-panel` 上：面板关着也一直挂在 DOM 里（只是 `width:0`），而 border
    不受 `overflow:hidden` 裁剪，于是**每个关着的面板都在右缘留一条 1px 竖线**。聊天页同时
-   挂着 Sources 与「调查过程」两个面板 → 现网看到的就是"两条并行的竖线"，而且开着一个时
-   仍有第二条陪着。左侧栏没这个毛病，因为 `.sidebar.collapsed` 显式 `border-right: none`。 */
+   挂着 Sources 与「思考过程」两个面板（写这段时第二个还叫「调查过程」）→ 现网看到的就是
+   "两条并行的竖线"，而且开着一个时仍有第二条陪着。左侧栏没这个毛病，因为
+   `.sidebar.collapsed` 显式 `border-right: none`。 */
 .src-panel.open { /* width 由内联 style 控制（可拖拽） */
   border-left: 1px solid var(--sidebar-border); }
 /* Sources 面板左侧的可拖拽分割线（对称于左侧栏的 .resize-handle） */

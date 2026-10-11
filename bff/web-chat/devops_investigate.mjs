@@ -14,7 +14,8 @@
  * 不重新部署。只需部署 WebChatStack。回滚 = 前端隐掉开关。
  *
  * SSE 事件与老路径同形（token / investigation_step / sources / followups / usage），
- * 因此前端渲染、右侧「调查过程」面板、报告链接全部零改动复用。
+ * 因此前端渲染、右侧「思考过程」面板（2026-09-04 起所有路径共用的唯一过程面板）、报告链接
+ * 全部零改动复用。
  */
 
 import { randomUUID } from "node:crypto";
@@ -391,7 +392,7 @@ function assistantText(content) {
   return "";
 }
 
-// 噪声类型：不进右侧「调查过程」面板（与 agent 侧过滤集完全一致）。
+// 噪声类型：不进右侧「思考过程」面板（与 agent 侧过滤集完全一致）。
 const NOISE_TYPES = new Set([
   "system", "metadata", "context", "checkpoint", "heartbeat", "tool_result", "utilization",
 ]);
@@ -851,7 +852,7 @@ export async function runDirectInvestigation({ text, locale, accountId, skillId,
   const { taskId, executionId, consoleUrl } = started;
 
   // 开场横幅：主聊天只放**结论线**（发起了什么 + 后台链接 + 一句"过程在右侧栏看"）；
-  // 分析过程走 investigation_step → 右侧「调查过程」面板（与老路径一致）。
+  // 分析过程走 investigation_step → 右侧「思考过程」面板（与老路径一致）。
   let open = dv(`\n\n🚀 **深度调查已发起**（直连，0 token）\n\n**${title}**\n\n${userText}${skillLine}\n\n`,
                 `\n\n🚀 **Deep investigation started** (direct, 0 tokens)\n\n**${title}**\n\n${userText}${skillLine}\n\n`);
   // 编号用 taskId 的引用形式：这串**复制去问 DevOps Agent 是查得到的**（execution_id 查不到）。
@@ -861,8 +862,15 @@ export async function runDirectInvestigation({ text, locale, accountId, skillId,
     open += dv(`\n\n🔗 可点开 DevOps Agent 后台实时查看进度：[${consoleUrl}](${consoleUrl})`,
                `\n\n🔗 Watch live progress in the DevOps Agent console: [${consoleUrl}](${consoleUrl})`);
   }
-  open += dv("\n\n_分析过程正在右侧「调查过程」面板实时更新；这里将给出根因结论与报告。_\n",
-             "\n\n_The analysis streams live in the “Investigation” panel on the right; the root-cause conclusion and report will appear here._\n");
+  // 面板名必须与界面逐字一致：2026-09-04 起只有一个过程面板「思考过程」/“Thinking”
+  // （i18n 的 think.panel.title），入口是回复上方唯一的「查看思考过程」/“View thinking”
+  // （think.entry）；「调查过程」面板已删。用户手动关过一次面板后它不再自动弹，所以顺带点出入口。
+  // ⚠️ 入口只承诺到「刷新页面前」：这句开场白随正文落库，过程步骤却不落库（store.mjs 不存
+  //    thinkingSteps / investigationSteps，历史回放时入口不渲染）—— 刷新或换设备打开这段对话，
+  //    入口就没了。别写回无条件的「随时」。
+  // agent 侧 main.py::investigate_live 有同一句开场白和同一条心跳 —— 两边逐字一致，改要一起改。
+  open += dv("\n\n_分析过程正在右侧「思考过程」面板实时更新（刷新页面前，可随时从本条回复上方的「查看思考过程」打开它）；这里将给出根因结论与报告。_\n",
+             "\n\n_The analysis streams live in the “Thinking” panel on the right (until you reload the page, you can open it any time from “View thinking” above this reply); the root-cause conclusion and report will appear here._\n");
   say(open);
 
   // 首条进度事件带 console_url → 前端右侧面板顶部也放一个"后台查看"链接。
@@ -874,6 +882,10 @@ export async function runDirectInvestigation({ text, locale, accountId, skillId,
   // 活跃度心跳（每 ~40s 一条瞬态 progress）：一次调查里常有**几分钟没有任何新 timeline 行**，
   // 那几分钟里用户只看到上面那句"过程在右侧栏实时更新"一动不动，无法区分"在跑"还是"已经断了"。
   // 走 progress 通道 = 纯瞬态（收到正文即清空、不入库），只报"还在跑 + 已用时长"，不编造进展。
+  // 📌 它实际显示在哪：开场横幅已经写进正文，而前端只在气泡**还没有正文**时才显示 progress 行，
+  //    所以这条心跳实际只作为一步进右侧「思考过程」时间线（thinking.ts 的 appendStep 只滤掉
+  //    coldstart/working，kind=investigation 记成 status 步）。文案与 agent 侧 main.py 那条心跳
+  //    逐字一致，要改两边一起改。
   // ⚠️ 这只解决**观感**；防连接被中间跳空闲回收的是 index.mjs 里的全程 keepalive（`: ka`）。
   const HB_EVERY = Math.max(1, Math.floor(40 / Math.max(1, POLL_INTERVAL_SEC)));
   const seen = new Set();
@@ -895,8 +907,8 @@ export async function runDirectInvestigation({ text, locale, accountId, skillId,
     if (++ticks % HB_EVERY === 0) {
       const m = Math.floor(waited / 60), s = waited % 60;
       emit("progress", {
-        text: dv(`深度调查进行中…已用 ${m} 分 ${s} 秒（分析过程见右侧「调查过程」面板）`,
-                 `Deep investigation running… ${m}m ${s}s elapsed (steps stream in the “Investigation” panel)`),
+        text: dv(`深度调查进行中…已用 ${m} 分 ${s} 秒（分析过程见右侧「思考过程」面板）`,
+                 `Deep investigation running… ${m}m ${s}s elapsed (steps stream in the “Thinking” panel)`),
         kind: "investigation",
       });
     }

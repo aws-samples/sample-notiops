@@ -2800,9 +2800,15 @@ export function AccountsView() {
     // "active"=统一后的终态字面量(与老向导/消费方对齐);"enabled"=历史值,兼容显示
     if (st === "active" || st === "enabled") { label = t("admin.accounts.daEnabled"); color = "var(--green)"; showGuide = false; }
     else if (st === "provisioning") { label = t("admin.accounts.daAssociating"); color = "var(--orange)"; showGuide = false; }
+    // 🔴 `failed` 必须单独一档（2026-10-11）：成员栈部署失败时 BFF 写的就是它（devopsAgentAssocStatus /
+    //    列表对账），原来落进下面的兜底分支、显示「关联进行中」—— 失败的账号看起来永远在跑，
+    //    客户只会干等。兜底分支留给老向导写过的历史值。
+    else if (st === "failed") { label = t("admin.accounts.daFailed"); color = RED; }
     else if (st) { label = t("admin.accounts.daPending"); color = "var(--orange)"; }
     return (
-      <span style={{ display: "inline-flex", gap: 6, alignItems: "center" }} title={t("admin.accounts.daGuideTip")}>
+      // ⚠️ title 只在还有「一键关联」按钮时给：daGuideTip 说的是「还需完成第二步」，挂在
+      //    「调查能力已启用」/「关联中」上就是在说一件已经做完或正在做的事。
+      <span style={{ display: "inline-flex", gap: 6, alignItems: "center" }} title={showGuide ? t("admin.accounts.daGuideTip") : undefined}>
         <span style={{ fontSize: 10.5, fontWeight: 600, padding: "1px 8px", borderRadius: 100, color, border: `1px solid ${color}` }}>
           {t("admin.accounts.daStep2")}: {label}
         </span>

@@ -35,7 +35,7 @@
 
 ## 0. 先拿到 Webhook 地址
 
-**最省事的一条：管理控制台 →「集成 IM」→ 切到你的平台分页 →「查看详细配置步骤」→ 第 3 步。**
+**最省事的一条：Web Chat 左侧「更多 → 管理 → 集成 IM」→ 切到你的平台分页 →「查看详细配置步骤」→ 第 3 步。**
 本部署真实的地址就显示在那里，带一个「复制」按钮 —— 不用开 CloudFormation 控制台、
 不用跑 CLI，两条部署路径（方式 A / 方式 B）都一样。地址由后端按名字查 IM 入口的
 HTTP API 得到，所以栈名叫什么都不影响。
@@ -78,7 +78,7 @@ ingress 按请求体自己分流，不靠路径区分 —— 所以地址后面*
 >   OutputKey 一模一样，另外还多一个 `ImNextSteps` 告诉你还差哪一步。
 > - **secret 名字完全一致**（`notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` /
 >   `notiops/slack-bot-token` / `notiops/slack-signing-secret`），本文所有命令原样可用。
-> - **模板不建任何 secret** —— 三个平台的 secret 都是你在管理控制台「集成 IM」页保存凭证时
+> - **模板不建任何 secret** —— 三个平台的 secret 都是你在 Web Chat「更多 → 管理 → 集成 IM」页保存凭证时
 >   由后端按需创建的（Slack 分页也一样，2026-09-11 起；在那之前 Slack 那两个要手建）。
 > - **安装选项必须包含你要配的那个平台**：只装 `web` 的栈没有这个 HTTP API，
 >   Outputs 里也不会出现 `FeishuWebhookUrl` / `SlackWebhookUrl` / `DingtalkWebhookUrl`。
@@ -147,7 +147,7 @@ for k in sorted(d):
 
 2. 把两个值存起来（**必须先做这一步，再去填请求地址**）。两条路，选一条：
 
-   **推荐 · 管理控制台**（不需要 CLI、不需要凭证）：Web 界面 → **管理控制台 → 集成 IM**，
+   **推荐 · 管理控制台**（不需要 CLI、不需要凭证）：Web Chat 左侧 **更多 → 管理 → 集成 IM**，
    填 `Encrypt Key` / `Verification Token`（和 `App ID` / `App Secret` 在同一张表单里），
    点保存。这一页还内置了飞书那一半的四步速览与「查看详细配置步骤」右侧抽屉，
    内容与本文一致 —— 只有浏览器的客户走这条。
@@ -313,7 +313,7 @@ NotiOps 取的是**该 thread 的父消息**（`conversations.replies`，只取�
 ### 2.2 两个凭证
 
 **推荐做法（不需要任何 AWS 权限，全在浏览器里）**：登录 Web Chat →
-**管理控制台 → 集成 IM → Slack 分页**，填两个框然后保存：
+**更多 → 管理 → 集成 IM → Slack 分页**，填两个框然后保存：
 
 | 框 | 从哪拿 | 形状 |
 |---|---|---|
@@ -368,7 +368,7 @@ aws secretsmanager put-secret-value --secret-id notiops/slack-signing-secret \
 
 4. 改完凭证后：ingress Lambda 是在**模块加载时**（冷启动）读 signing secret 的，
    **还活着的执行环境会继续用旧值**。网页保存成功后的提示里也写了这一点。等旧环境自然回收，
-   或者改一下 ingress 的环境变量强制换一批 —— 见 [DEPLOYMENT.md](DEPLOYMENT.md) §8.2。
+   或者改一下 ingress 的环境变量强制换一批 —— 见 [DEPLOYMENT.md](DEPLOYMENT.md) §8.3。
 
 ### 2.3 三处 Request URL —— 全填同一个
 
@@ -448,7 +448,7 @@ Slack 特有的两个坑：
 > 与飞书那节不同，钉钉这边是**新建一个应用**（没有"原地切换"的路 —— 老部署里钉钉跑的是
 > 已退役的 Fargate 长连接形态，现在这条是 Lambda webhook）。
 >
-> **本页每一步都能只在浏览器里做完**：管理台 →「集成 IM」→ 切到**钉钉**分页 → 右上角
+> **本页每一步都能只在浏览器里做完**：Web Chat 左侧「更多 → 管理 → 集成 IM」→ 切到**钉钉**分页 → 右上角
 > 「查看详细配置步骤」，抽屉里是同一份步骤，还直接给出本部署的消息接收地址 + 复制按钮。
 > 内容与本节一一对应（源文件 [`content/dingtalkGuide.ts`](../frontend/chat-app/src/content/dingtalkGuide.ts)）。
 > 下面额外给出 CLI 的做法，供脚本部署和自动化用。
@@ -478,7 +478,7 @@ Slack 特有的两个坑：
 
 ### 3.3 把凭证存进 Secret
 
-**方式一（推荐，只有浏览器就够）**：管理台 →「集成 IM」→ 钉钉分页 → 填 AppKey /
+**方式一（推荐，只有浏览器就够）**：「更多 → 管理 → 集成 IM」→ 钉钉分页 → 填 AppKey /
 AppSecret → 「保存」。Secret 不存在时后端会替你建。保存后页面只回显 AppSecret 的
 **后 4 位**（`****xxxx`）；**回传脱敏值 = 不修改**，所以以后只想改推送地址时不用重填
 AppSecret。这个值在日志里**连长度都不打**。
@@ -550,7 +550,7 @@ aws logs tail /aws/lambda/notiops-im-worker-dingtalk  --region <REGION> --since 
 | **卡片按钮只能是链接** | 钉钉的 ActionCard 按钮全部是 URL 跳转，没有「点一下回传给服务器」这种交互。所以需要确认的操作（开案例、启动调查）在钉钉里**用回复关键词完成**。 |
 | **已发出的消息改不了** | 钉钉没有更新消息的接口，所以没有飞书那种「卡片自己变」的进度条；长任务改成**追加一两条**进度消息。 |
 | **机器人不能给消息贴表情** | 收到指令时没有 👀 / 👍 那种即时反馈，取而代之的是一条**文字回执**。 |
-| **群里主动推送要另配一个地址** | 机器人自己那条回复通道是钉钉在回调里给的**一次性会话地址**（`sessionWebhook`，收到消息后约 **90 分钟**内有效），做不了「定时主动发」。要主动推送见 §3.7。 |
+| **机器人自己的回复通道是一次性的** | 它是钉钉在回调里给的**一次性会话地址**（`sessionWebhook`，收到消息后约 **90 分钟**内有效）。所以调查报告不走它，而是走服务端 API 投回发起调查的那个会话，不用另配。每日通知、Health 和实时事件推送这一版都不投钉钉 —— 这是本版本的范围，不是钉钉平台做不到；§3.7 那个自定义机器人地址的用途见 §3.7。 |
 
 命令入口与另外两个平台**一致**：`/devops`、`/agent`、`/web`、`/account`、`/investigate`、
 `/case`、`/model`、`/language`、`/help` 都能用，中文说法（`/调查`、`/开案例`、`/智能体`、
@@ -618,11 +618,29 @@ aws logs tail /aws/lambda/notiops-im-worker-dingtalk  --region <REGION> --since 
 `/回复案例 <案例号> <内容>`、`/关闭案例 <案例号>`（关闭同样要回 **确认**）。
 英文同义词也都在：`/case`、`/view-case`、`/analyze-case`、`/reply-case`、`/close-case`。
 
-### 3.7 主动推送（可选：自定义机器人）
+### 3.7 自定义机器人推送地址（可选）
 
-巡检广播、告警、定时报告这类**没人先说话**的推送，钉钉必须走「自定义机器人」：
-群设置 → 智能群助手 → 添加机器人 → **自定义** → 复制它的 Webhook 地址 →
-填进管理台钉钉分页的「自定义机器人推送地址」（或 §3.3 那个 JSON 的 `webhook_url` 键）。
+这个地址是群里另加的「自定义机器人」的 Webhook：群设置 → 智能群助手 → 添加机器人 →
+**自定义** → 复制它的 Webhook 地址 → 填进 Web Chat「更多 → 管理 → 集成 IM」钉钉分页的「自定义机器人推送地址」
+（或 §3.3 那个 JSON 的 `webhook_url` 键）。
+
+这一版只有两处用到它：
+
+- **调查报告回贴的兜底** —— 报告正常走服务端 API 投回发起调查的那个会话，投不出去才改发到这个群；
+- **巡检推送** —— 但巡检只有 `setup.sh` 部署才有，而且还要先把群登记成巡检推送目标，本版本**还没有**
+  这一步的途径（没有网页入口、`setup.sh` 不问、发布包里也没有对应的工具），所以这一版实际配不起来。
+
+每日运维通知、Health 事件和告警类的实时事件推送都**不投钉钉**，填了它也收不到
+（见 [DEPLOYMENT.md](DEPLOYMENT.md) §7）。
+
+> ⚠️ **这一版里，自定义机器人的三种安全设置（钉钉要求至少选一种）哪一种都保证不了投递**：
+> - 「加签」要一个签名密钥，而两条部署路径都没有地方保存它 —— 我们发出去的消息不带签名，会被钉钉拒收
+>   （下面的「测试凭证」会显示推送地址拒收了那条消息）；
+> - 「自定义关键词」要求每条消息都含那个词，而我们发出的报告不保证含有 ——「测试凭证」那条测试消息里有
+>   `NotiOps`，所以它通过**不**代表真实报告也能投进去；
+> - 「IP 地址（段）」要固定的出口 IP，而这些 Lambda 没有。
+>
+> 这个地址只管上面那两处兜底与推送（后者本版本还配不起来），所以**这一项可以留空**。
 
 > ⚠️ **那串地址本身就是凭证** —— 谁拿到都能往这个群发消息，而报告投递会把长报告
 > **全文** POST 过去。所以：管理台只回显后 4 位、只接受
@@ -633,7 +651,8 @@ aws logs tail /aws/lambda/notiops-im-worker-dingtalk  --region <REGION> --since 
 零额外配置。留空即可。
 
 填好后点管理台的「**测试凭证**」：它先用 AppKey / AppSecret 换一次 access token
-（凭证是否正确的**权威判据**），填了推送地址的话再往那个群真发一条。
+（凭证是否正确的**权威判据**），填了推送地址的话再往那个群真发一条。那一条通过了，只说明推送地址
+和安全设置收下了**这条**测试消息；用的是「自定义关键词」时，它不代表真实报告也能投进去（见上）。
 
 > 钉钉**没有**「往任意群发一条测试消息」的接口。所以没填推送地址时，这个按钮
 > **只验凭证、什么都不发**，界面上也会**如实这么说**（不假装"已发送到你的群里"）。
@@ -643,22 +662,31 @@ aws logs tail /aws/lambda/notiops-im-worker-dingtalk  --region <REGION> --since 
 
 ## 4. 群允许清单（allowlist，可选，三个平台都支持）
 
-只允许特定群/频道用 bot：
+只允许特定群/频道用 bot。
 
-```bash
-cd infra && npx cdk deploy ImStack --output ../.cdk-out --region <REGION> \
-  -c imAllowedChatIds="oc_xxx,C0123ABC"
+**方式 B（`setup.sh`）**：在 `infra/cdk.json` 的 `context` 块里加一行，然后重跑 `./setup.sh`：
+
+```json
+"imAllowedChatIds": "oc_xxx,C0123ABC"
 ```
 
+`setup.sh` 自己不传这个 key，所以要写进 `cdk.json`，以后每次重跑才会一直带上。别图省事单独跑
+`cdk deploy ImStack -c imAllowedChatIds=…`：那样 `setup.sh` 平时传的其它 `-c` 一个都没有，
+栈会按默认值合成（见 [DEPLOYMENT.md](DEPLOYMENT.md) §8.1 末尾那条警告），而且下一次 `./setup.sh`
+又会把这个清单清空。
+
+**方式 A（一键部署）**：参数页的 **IM chat/channel allow list (optional)**，update 栈即可
+（见 [DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md) §2.3）。
+
 飞书填 `oc_` 开头的 chat id，Slack 填 `C`/`D` 开头的 channel id，
-钉钉填 `conversationId`（群里 @ 一句后从 worker 日志里拿），逗号分隔。
+钉钉填 `conversationId`（群里 @ 一句后从 worker 日志里拿），逗号分隔、不带空格。
 留空 = 不限制（与长连接时代行为一致）。
 
 > 📌 **钉钉这一层落在 worker、不在 ingress**（飞书 / Slack 是两处都拦）。因为钉钉的
 > `conversationId` 在**验签之后**才解得出来 —— ingress 拦不了一个自己还没看见的字段。
 > 对客户的可见行为一样：不在清单里的群，bot 完全不回话。代价是被挡的请求会多花一次
 > worker 的冷启动，量级上可以忽略。变量名也因此不同（钉钉 `ALLOWED_CONVERSATION_IDS`，
-> 飞书 `ALLOWED_CHAT_IDS`，Slack `ALLOWED_CHANNEL_IDS`）—— `-c imAllowedChatIds` 这个
+> 飞书 `ALLOWED_CHAT_IDS`，Slack `ALLOWED_CHANNEL_IDS`）—— `imAllowedChatIds` 这个
 > **部署参数三个平台共用一个**，不用分开填。
 
 ### 4.1 同一个群里装两个 bot（测试环境 + 生产环境）
@@ -725,7 +753,7 @@ bot 在群里是成员时，群里的每一句话都会作为 `im.message.receiv
 > 我们不拿它当授权依据）。控制手段是两条：**在 Web 上只启用真的该被问到的账号**，
 > 以及**用上面 §4 的群允许清单把 bot 限制在该看这些账号的群里**。
 > 越权的最后一道线在 agent 侧（只允许问「部署账号 + 已启用账号」这个集合，
-> 拿不到清单时是**拒绝**而不是放开）和目标账号自己那个只读角色的信任策略上。
+> 拿不到清单时是**拒绝**而不是放开）和目标账号里那个跨账号角色的信任策略上。
 
 ---
 
@@ -928,7 +956,7 @@ aws lambda put-provisioned-concurrency-config \
 2. **最终报告卡** —— 跑完之后回到**同一个会话**：顶部是你当初问的那句话，
    正文是报告开头一段，底下三颗按钮（📊 查看完整报告 / 🔍 调查过程 Trace /
    🆘 升级到 AWS Support）。控制台深链「🔬 查看本次调查」只在**进度卡**上 ——
-   报告卡上其余链接都是预签名的、7 天内免登录，混进一个必须登录控制台的入口，
+   报告卡上其余链接都是预签名的、免登录（但有时限，见下），混进一个必须登录控制台的入口，
    底下那行说明就只能同时写「无需登录」和「需要登录」。
 
 > 🔴 **v1.0.22 起这里只有一张报告卡。** 之前是两张（「📝 Report Summary」+
@@ -937,7 +965,8 @@ aws lambda put-provisioned-concurrency-config \
 > 限制被截断」，偶尔一个字都没有。现在合成一张、正文直接取 DevOps Agent 的原文，
 > **整条深度调查链路 0 token**。
 >
-> ⚠️ 报告链接是 **S3 预签名地址，有效期 7 天**（不是永久链接，也不是 CloudFront）。
+> ⚠️ 报告链接是回调函数用它自己的**临时凭证**签出来的 **S3 预签名地址**（不是永久链接，也不走
+> CloudFront）。这种链接活不过签名用的那份凭证：凭证一过期就打不开，最长约 12 小时，不是 7 天。
 > 要长期留档就把文件下载下来。
 >
 > ⚠️ 卡片正文放不下整份报告时，末尾会多一行「⚠️ 卡片仅展示报告的开头部分 ·

@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 os.environ.setdefault("CONVERSATIONS_TABLE", "test")
 os.environ.setdefault("EVENTS_TABLE", "test")
 from core import bedrock_chat as _bc
+from core import llm_config as _lc
 from core import model_catalog as _mc
 
 PASS = "✅"
@@ -50,10 +51,24 @@ def _check(label: str, cond: bool, detail: str = "") -> None:
         print(f"  {FAIL} {label}{(' :: ' + detail) if detail else ''}")
 
 
+def _nova():
+    """Nova Pro 的条目，**绕过准入**取。
+
+    2026-10-10 起 Nova Pro 全局停用。`_mc.get("nova")` 走准入路径：停用的别名会被换成
+    默认模型（记一次 ModelSubstituted）—— 下面几条判据就会悄悄变成在量 Kimi，而且照样
+    能过一半。停用条目自己的上限仍然得对：`find_by_model_id` 按**全集**反查（在途请求、
+    历史 model_id 都走它），量的就是那条路径。
+    """
+    raw = next(r for r in _lc.entries() if r["alias"] == "amazon-nova-pro")
+    entry = _mc.find_by_model_id(raw["model_id"])
+    assert entry is not None and "nova" in entry.model_id, entry
+    return entry
+
+
 def test_catalogue_caps_are_per_model():
     print("test_catalogue_caps_are_per_model")
     claude = _mc.get("claude")
-    nova = _mc.get("nova")
+    nova = _nova()
     gpt = _mc.get("gpt")
 
     _check("claude cap >= 6000 (room for long markdown)",
@@ -74,7 +89,7 @@ def test_helper_resolves_via_model_id():
     # 用 catalog 实际 model_id(不写死版本号,模型升级后测试仍有效)。
     cases = [
         (_mc.get("claude").model_id, _mc.get("claude").max_output_tokens),
-        (_mc.get("nova").model_id,   _mc.get("nova").max_output_tokens),
+        (_nova().model_id,           _nova().max_output_tokens),
         (_mc.get("gpt").model_id,    _mc.get("gpt").max_output_tokens),
     ]
     for model_id, expected in cases:

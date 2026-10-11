@@ -11,7 +11,7 @@
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { makeSink, consumeEvents, parseAsk, renderUserPrompt } from "../devops_chat.mjs";
+import { makeSink, consumeEvents, parseAsk, renderUserPrompt, createChatFailText } from "../devops_chat.mjs";
 
 let fails = 0;
 let ok = 0;
@@ -430,6 +430,40 @@ await t("失败/卡死的一轮必须删掉会话行，并承诺「再问一次�
   assert.match(SRC, /const canReopen = \(\) => reused && !retried && sink\.reply === prelude;/);
   assert.ok(SRC.includes("直接再问一次"), "中文文案必须明确说「直接再问一次」");
   assert.ok(SRC.includes("just ask again"), "英文文案必须明确说 just ask again");
+});
+
+/* ── CreateChat 失败的退路：只有故障调查主题有「DevOps 对话」平铺开关 ──
+ * 通用会话里 DevOps Agent 是「对话对象」，发出第一句后就固定了、会话里没有开关可关 ——
+ * 叫人「关闭「DevOps 对话」」是一条做不到的指引。CreateChat 失败时 runDevopsChat 自己 say()
+ * 这句并返回非空 reply，index.mjs 那条按主题分的兜底**接不到**它，所以这里单独钉。 */
+await t("CreateChat 失败：通用会话（没有平铺开关）的退路是开一个新对话，绝不叫人关开关", async () => {
+  for (const en of [false, true]) {
+    for (const s of [createChatFailText(en, "AccessDeniedException"),
+                     createChatFailText(en, "AccessDeniedException", { toggleHere: false })]) {
+      assert.ok(en ? s.includes("start a “New chat” to switch back to the standard chat")
+                   : s.includes("开一个「新对话」换回普通对话"), s);
+      assert.ok(!s.includes("关闭「DevOps 对话」") && !s.includes("turn off “DevOps Chat”"), s);
+      assert.ok(s.includes("AccessDeniedException"), "错误码要带上");
+    }
+  }
+});
+
+await t("CreateChat 失败：故障调查主题（有平铺开关）照旧说关掉「DevOps 对话」", async () => {
+  assert.ok(createChatFailText(false, "X", { toggleHere: true }).includes("关闭「DevOps 对话」改用普通对话"));
+  assert.ok(createChatFailText(true, "X", { toggleHere: true }).includes("turn off “DevOps Chat” to use the standard chat"));
+});
+
+await t("CreateChat 失败那句走 createChatFailText，且 index.mjs 把按主题算好的 toggleHere 传进来", async () => {
+  // 只看代码行：注释里为了讲来龙去脉会出现旧说法。
+  const codeOnly = (s) => s.split("\n").filter((l) => !/^\s*(\/\/|\*)/.test(l)).join("\n");
+  assert.match(codeOnly(SRC), /say\(createChatFailText\(en, safeErr\(e\), \{ toggleHere \}\)\)/);
+  assert.match(SRC, /export async function runDevopsChat\(\{[^}]*\btoggleHere = false\b[^}]*\}\)/);
+  const INDEX = readFileSync(new URL("../index.mjs", import.meta.url), "utf8");
+  const call = INDEX.match(/runDevopsChat\(\{[\s\S]{0,400}?\}\)/)?.[0] || "";
+  assert.ok(/\btoggleHere\b/.test(call), "index.mjs 调 runDevopsChat 时没传 toggleHere");
+  // 两处只能有一份判据：toggleHere 在调用之前算好（catch 里的兜底也用它）。
+  const at = INDEX.indexOf('const toggleHere = topic === "investigate";');
+  assert.ok(at > 0 && at < INDEX.indexOf("reply = await runDevopsChat({"), "toggleHere 要在调用 runDevopsChat 之前算好");
 });
 
 console.log(fails ? `\nFAILED: ${fails}` : `\nPASSED: ${ok} ok, 0 failed`);

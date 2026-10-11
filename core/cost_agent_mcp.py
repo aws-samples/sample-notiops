@@ -243,9 +243,43 @@ def get_tools():
                 return json.dumps({"error": r["error"].get("message", "tool error"),
                                    "hint": "fix the arguments and retry once; if it still "
                                            "fails, " + _FALLBACK}, ensure_ascii=False)
-            content = r.get("result", {}).get("content", [])
+            result = r.get("result", {}) or {}
+            content = result.get("content", [])
             text = "".join(c.get("text", "") for c in content if isinstance(c, dict))
-            return text or json.dumps(r.get("result", {}), ensure_ascii=False)
+            # ⚠️ MCP 有**两种**失败形状，上面那个 `"error" in r` 只认其中一种：
+            #   ① JSON-RPC 协议级错误 → 顶层 `error`（工具名写错、参数 schema 不符…）
+            #   ② **工具自身抛异常** → `result.isError == true`，异常文本躺在 `content[].text`
+            # 上游 server 的工具一旦抛异常（CUR_TABLE 没配、Athena 失败、参数校验不过、
+            # 这份 CUR 缺某一列…）走的是 ②，而我们原来把它当**正常结果**原样返回给模型 ——
+            # 于是 fallback 链、熔断、错误脱敏三样全部绕过，模型拿着一段异常文本当数据答题。
+            if result.get("isError"):
+                logger.warning("cost_agent_mcp: tool %s returned isError", tool_name)
+                # 「这份 CUR 没有这一列」不是故障，是**答案** —— 客户账单里就没有那类资源
+                # （没有 Savings Plan ⇒ 没有 `savings_plan_offering_type` 这一列）。
+                # 认的是**我们自己**的错误码 + 一个公开的 CUR schema 列名，不是转发上游报文。
+                # 不这样做的后果:模型只能说"查不到"，而正确答案是「你的账单里没有 SP」。
+                if "column_unavailable_in_this_cur" in text:
+                    col = text.split("column_unavailable_in_this_cur:", 1)[-1].strip() or "a column"
+                    return json.dumps({
+                        "unavailable_in_this_cur": col,
+                        "meaning": "this Cost and Usage Report does not carry that column, which "
+                                   "normally means the account has no such resource at all "
+                                   "(for example no savings_plan_* columns means no Savings Plans, "
+                                   "no product_gpu means no GPU instances).",
+                        "how_to_answer": "Tell the user plainly that their bill has nothing of that "
+                                         "kind, so there is nothing to report. Do NOT report zero "
+                                         "and do NOT call this a failure. Do NOT retry this tool.",
+                    }, ensure_ascii=False)
+                # 不把原文直接给模型：上游异常文本里可能带库名/表名/桶名
+                # （docs/LOGGING_STANDARD.md：绝不带上游 message）。只给一句可操作的判断 +
+                # 降级指令。原文只进日志。
+                return json.dumps({
+                    "error": f"the customer-CUR tool {tool_name} reported an error",
+                    "hint": "check the arguments (month must be YYYY-MM, dimensions must be "
+                            "one of the documented values) and retry once; if it still fails, "
+                            + _FALLBACK,
+                }, ensure_ascii=False)
+            return text or json.dumps(result, ensure_ascii=False)
         except urllib.error.HTTPError as e:
             logger.warning("cost_agent_mcp: call %s HTTP %s", tool_name, e.code)
             # 403 = IAM 没配到（缺 lambda:InvokeFunctionUrl / 资源策略），5xx/超时 = 后端挂了。

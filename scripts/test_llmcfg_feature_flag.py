@@ -136,14 +136,16 @@ def test_disabled_equals_pre_feature_behaviour() -> None:
                 _check(f"{label}: short alias {short!r} still admitted",
                        mod.is_enabled(short))
 
-            # per-model 输出上限：退化成本端统一目标就会重开 2026-06-05 的截断事故
-            nova = mod.resolve("nova") if label == "im" else None
-            if nova is not None:
-                want = (next(m for m in seed["models"] if m["alias"] == "amazon-nova-pro")
+            # per-model 输出上限：退化成本端统一目标就会重开 2026-06-05 的截断事故。
+            # 挑一个上限 ≠ IM 目标值的**启用**模型来量。原来是 Nova Pro（5000）；2026-10-10
+            # 它全局停用后 `resolve("nova")` 会被换成默认模型，这条就量不到东西了。
+            gpt = mod.resolve("gpt") if label == "im" else None
+            if gpt is not None:
+                want = (next(m for m in seed["models"] if m["alias"] == "gpt-5-6")
                         .get("output_override") or {}).get("im")
-                _check("im: nova keeps its own output cap in disabled mode",
-                       nova.max_output_tokens == want,
-                       f"got={nova.max_output_tokens} want={want}")
+                _check("im: gpt keeps its own output cap in disabled mode",
+                       gpt.max_output_tokens == want,
+                       f"got={gpt.max_output_tokens} want={want}")
 
             _check(f"{label}: default model resolves",
                    mod.default_alias() == seed["default_model"],

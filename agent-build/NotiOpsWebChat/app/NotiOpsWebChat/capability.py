@@ -3,8 +3,11 @@
 「你能做什么」几乎是每个新用户的第一句话，而它的答案是**产品事实**，不是模型推理。
 让模型现编一遍要付三笔钱：
 
-  ① ~17K 工具 schema 的 input token —— 当前默认模型 Grok 4.6 走 Converse、不支持
-     `cachePoint`，每轮都重新计费（见 config/llm-model-catalog.json）；
+  ① 整套工具 schema 的 input token，每轮都重发（各主题实测多少，见 main.py
+     `_tools_for_topic` 上方那张表 —— 别在这里抄数字，这里抄过一个错的「~17K」）。
+     默认模型（2026-10-10 起是 Kimi K3）不收显式 `cachePoint`，只能靠服务端的隐式缓存
+     打折，而缓存读也照样计费（见 config/llm-model-catalog.json 里它的
+     `_supports_prompt_cache_note` / `_default_note`）；
   ② 每次编得不一样（同一个问题今天六条能力、明天四条）；
   ③ **会夸大** —— 模型看到一堆工具 schema 就顺口把「能改配置 / 能帮你修」都说了，
      而 NotiOps 的产品承诺是**默认只读**。这一条是安全问题，不只是体验问题。
@@ -27,7 +30,7 @@ pytest）里 import 不了。而「哪些说法算能力问题」和「能力清
 钉住、也最常被改的两样东西 —— 见 tests/test_webchat_capability_fastpath.py。
 
 语言由调用方传入（`main.py` 用它自己的 `_dv` 决定本轮语言，那是该文件唯一的语言口径），
-这个模块不碰 ContextVar。
+这个模块不碰 ContextVar。入口（网页 / IM）同理由调用方传入，见 `SURFACE_WEB` / `SURFACE_IM`。
 """
 
 from __future__ import annotations
@@ -97,13 +100,28 @@ def _pick(locale: str, zh: str, en: str) -> str:
     return en if (locale or "").lower().startswith("en") else zh
 
 
-def capability_answer(locale: str = "zh") -> str:
+# ── 入口（surface）────────────────────────────────────────────────────────────
+# 同一个 runtime 同时服务两种入口，客户能点的东西完全不同：
+#   web  浏览器里的 NotiOps：侧栏、输入框、右下角的模型选择器、右上角的账号选择器；
+#   im   飞书 / Slack / 钉钉里 `/agent notiops` 之后的对话（主题 `im-chat`）：上面那些**全都
+#        没有**，对应的是命令（`/model`、`/investigate <内容>`、`/help` …，见 core/nl_router.py
+#        的 HELP_COMMANDS）。
+# 判定由 main.py 做（主题常量 `_IM_CHAT_TOPIC` 在那边）；这里只认这两个值，不认识的一律按 web ——
+# 与改造前的行为一致。
+SURFACE_WEB = "web"
+SURFACE_IM = "im"
+
+
+def capability_answer(locale: str = "zh", surface: str = SURFACE_WEB) -> str:
     """确定性能力说明。**这里是能力清单的唯一维护点** —— 加了新主题/新能力改这一处，
     不必指望模型自己发现（它也发现不了：它看到的是工具 schema，不是产品边界）。
 
     ⚠️ 只写**产品事实**、不写具体工具名：工具会增删，「能干什么」不会。
     ⚠️ 「默认只读」这句必须留着 —— 它是产品承诺，也是客户安全 review 的第一个问题。
+    ⚠️ 「去哪儿点」按入口写：IM 那份不许出现侧栏 / 输入框 / 右上角（见 `SURFACE_IM`）。
     """
+    if surface == SURFACE_IM:
+        return _im_capability_answer(locale)
     return _pick(
         locale,
         "我是 **NotiOps** —— 面向 AWS 运维的 AI 助手。可以帮你做这些事：\n\n"
@@ -116,8 +134,14 @@ def capability_answer(locale: str = "zh") -> str:
         "- **支持案例** — 查看、创建、回复 AWS Support case。\n"
         "- **What's New** — AWS 最新发布的摘要，或完整列表（可下载）。\n"
         "- **技能（Skills）** — 把你团队的排查手册变成可复用的检查流程。\n\n"
-        "用法：左侧切换主题（安全态势等看板在「调查」输入框上方，或侧栏「安全」直达），"
-        "输入框上方可选目标 AWS 账号与模型。"
+        # 「用法」里的每个位置都要对得上**现在**的界面，客户是照着这句去找的：
+        #   · 侧栏**没有**「安全」（2026-09-11 删的），安全看板唯一的入口是「调查」输入框上方的
+        #     「安全态势」胶囊（ChatApp.tsx 的 dashPillsFor）—— 别再写「侧栏「安全」直达」；
+        #   · 模型选择器在输入框工具栏**最右**（Composer.tsx 的 .cbar-right），不在输入框上方 ——
+        #     输入框上方那一行是看板胶囊；
+        #   · 账号选择器在对话顶栏右侧，**只有接入了成员账号才出现**（ChatApp.tsx 的 acctPickerFor）。
+        "用法：左侧切换主题（安全态势等看板在「调查」输入框上方），"
+        "输入框右下角可选模型；接入了成员账号时，右上角还可切换目标 AWS 账号。"
         "**默认全程只读**；需要写操作（比如提一个 case）我会先把要做的事列给你、等你确认。\n\n"
         "直接说事就行，例如「i-0abc 为什么停了」「这个月成本涨在哪」「帮我开一个 case」。",
 
@@ -131,13 +155,59 @@ def capability_answer(locale: str = "zh") -> str:
         "- **Support cases** — view, create and reply to AWS Support cases.\n"
         "- **What's New** — a digest of the latest AWS launches, or the full list (downloadable).\n"
         "- **Skills** — turn your team's runbooks into reusable checks.\n\n"
-        "How to use it: switch topics on the left (security posture and the other dashboards sit "
-        "above the Investigation input box, or straight from \"Security\" in the sidebar); pick the "
-        "target AWS account and model above the "
-        "input box. **Everything is read-only by default** — if something needs a write (opening a "
+        "How to use it: switch topics on the left (dashboards such as Security posture sit above "
+        "the Investigation input box); pick the model at the bottom right of the input box, and "
+        "once member accounts are connected you can also switch the target AWS account at the top "
+        "right. **Everything is read-only by default** — if something needs a write (opening a "
         "case, say), I'll show you exactly what I'm about to do and wait for your confirmation.\n\n"
         "Just tell me what you need, e.g. \"why did i-0abc stop\", \"where did cost go up this "
         "month\", \"open a support case for me\".",
+    )
+
+
+def _im_capability_answer(locale: str) -> str:
+    """IM 那份能力说明。为什么要单独一份（而不是让 IM 跳过这条快路径、交给模型答）：
+
+    IM 侧 `core/nl_router.py` 的 `_HELP_RE` 只拦得住一部分说法 —— `CAPABILITY_PHRASES`
+    里大半（「你是谁」「介绍一下你自己」「what can you help me with」…）会穿过它落到
+    `chat`，`/agent notiops` 时就到了这里。交给模型答，等于把这条快路径存在的三个理由
+    （花钱 / 每次不一样 / 会夸大）原样搬回 IM —— 而 IM 恰恰是对每轮成本最敏感的入口。
+
+    内容只写 IM 上**真的有**的东西：模型在 IM 只有文档 + 只读查询 + 可选联网这几样工具
+    （main.py 的 `_im_chat_tools`），其余能力是确定性命令（与 main.py
+    `_TOPIC_FOCUS["im-chat"]` 那段 prompt 指的是同一组命令）；网页端才有的能力只说「在网页端」，
+    不写网页里的点击路径。正文有硬上限（飞书 3500 / Slack 2900 / 钉钉 3000 字符，见各平台
+    渲染层的 MAX_BODY），所以要短。
+    """
+    return _pick(
+        locale,
+        "我是 **NotiOps** —— 面向 AWS 运维的 AI 助手。在这里我可以：\n\n"
+        "- **回答 AWS 技术问题** — 先查 AWS 官方文档再答。\n"
+        "- **只读查询你账号里的资源** — describe / list / get 这一类。\n"
+        "- **联网搜索** — 默认关，发 `/web on` 打开。\n\n"
+        "这些事直接发命令：深度调查 `/investigate <内容>` · 支持案例 `/case` · 换模型 `/model` · "
+        "切换谁来回答 `/agent notiops|devops` · 全部命令 `/help`。"
+        "成本分析、What's New 和技能（Skills）在 NotiOps 网页端。\n\n"
+        # ⚠️ 是「**默认**只读」，不是「绝对只读」：上面刚列了 `/case`，而 IM 的 `/case` 会真的
+        #    开 / 回复 / 关闭支持案例 —— 那是本产品唯一的写操作（core/i18n.py 的
+        #    account.case_notice）。只写「不会改任何东西」就是在安全 review 的第一个问题上少报了写。
+        #    也**别**写「在卡片里提交」：钉钉没有回调卡片，开 / 关案例靠回一句「确认」
+        #    （platforms/dingtalk/case_text.py）。
+        "**默认只读**：我在这里只做只读查询；唯一的写操作是开 / 回复 / 关闭支持案例（`/case`），"
+        "每一次都由你自己提交。"
+        "直接说事就行，例如「i-0abc 为什么停了」。",
+
+        "I'm **NotiOps** — an AI assistant for AWS operations. Here I can:\n\n"
+        "- **Answer AWS technical questions** — checking the official AWS documentation first.\n"
+        "- **Look up resources in your account, read-only** — the describe / list / get kind "
+        "of call.\n"
+        "- **Search the web** — off by default; send `/web on` to turn it on.\n\n"
+        "For these, just send a command: deep investigation `/investigate <text>` · support "
+        "cases `/case` · switch models `/model` · choose who answers `/agent notiops|devops` · "
+        "every command `/help`. Cost analysis, What's New and Skills are in the NotiOps web app.\n\n"
+        "**Read-only by default**: here I only run read-only queries; the one write is opening / "
+        "replying to / resolving support cases (`/case`), and you submit each one yourself. "
+        "Just tell me what you need, e.g. \"why did i-0abc stop\".",
     )
 
 

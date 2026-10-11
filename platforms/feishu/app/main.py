@@ -93,7 +93,8 @@ ALLOWED_CHAT_IDS = {
 }
 
 # Resolve credentials at startup (fail fast)
-# Unified credential loading: Dashboard UI → Secrets Manager JSON → env injection
+# Unified credential loading: Web Chat (More → Admin → IM Integration)
+#   → Secrets Manager JSON → env injection
 # Format: {"app_id": "cli_xxx", "app_secret": "xxx", ...}
 _sm = boto3.client("secretsmanager")
 _feishu_secret = json.loads(

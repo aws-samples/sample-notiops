@@ -415,10 +415,12 @@ _SPAM_TOKENS = (
 # bedrock_chat layer keys off this so it can:
 #   1. skip P1 / final-fallback reinvocation (which would just hit the
 #      same model and likely leak again, wasting tokens)
-#   2. surface a precise user-facing message ("GPT output blocked, try
-#      `model claude` or `model nova`") instead of the generic canned
-#      chitchat reply, which made the bot look like it didn't hear the
-#      question.
+#   2. surface a precise user-facing message (`gpt.output_blocked`: "GPT
+#      output blocked, try `model default` or `model claude` (Claude Sonnet
+#      5.5, needs the AWS Marketplace agreement)"; it also offered
+#      `model nova` until Nova Pro was retired on 2026-10-10) instead of the
+#      generic canned chitchat reply, which made the bot look like it didn't
+#      hear the question.
 OUTPUT_BLOCKED_SENTINEL = "_OUTPUT_BLOCKED_BY_AUDIT"
 
 # 同样的机制，用于「凭证被拒」。

@@ -395,10 +395,10 @@ def build_body(ctx: dict, severity: str, extra: str, operator_name: str,
         parts += ["=== Live investigation in DevOps Agent ===", operator_url,
                   "(requires AWS console login)", ""]
     if report_url:
-        parts += ["=== Final report (HTML, presigned, valid 7 days) ===",
+        parts += ["=== Final report (HTML, presigned link, expires within about 12 hours) ===",
                   report_url, ""]
     if trace_url:
-        parts += ["=== Investigation trace (HTML, presigned, valid 7 days) ===",
+        parts += ["=== Investigation trace (HTML, presigned link, expires within about 12 hours) ===",
                   trace_url, ""]
     parts += ["=== Investigation summary ===", "", summary]
 

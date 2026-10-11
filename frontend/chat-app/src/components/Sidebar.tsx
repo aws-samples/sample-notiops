@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Logo from "./Logo";
 import { useT, useLocale } from "../i18n";
 import type { Conversation, TopicKey } from "../types";
@@ -27,7 +27,7 @@ interface Props {
   username: string;
   onSignOut: () => void;
   width?: number;
-  onSkills?: () => void;        // 打开独立 Skills 页（一级入口）
+  onSkills?: () => void;        // 打开独立 Skills 页（收进「更多」，中文标签「技能」）
   skillsActive?: boolean;       // Skills 页当前是否激活（高亮）
   onCustomize?: () => void;     // 打开 Customize（定制）页（收进「更多」）
   customizeActive?: boolean;    // Customize 页当前是否激活（高亮）
@@ -79,30 +79,46 @@ const PanelIcon = () => (
    （nav:inspection 那套是独立入口）。 */
 
 /**
- * 「更多」分组的总开关（2026-09-11 关掉）。
+ * 「更多」折叠组（2026-10-10 用户要求）：收「巡检 / 技能 / 管理」三项，一级导航只留
+ * 通知 / 调查 / 成本 / 案例 四个高频入口。
  *
- * 背景：这个折叠组原本收着「管理」和「定制」两项。**「管理」已提到一级**（Skills 下面），
- * 于是组里只剩「定制」——而「定制」页目前还没有真正的功能，点进去是个空壳。
- * 一个只有一项、且那一项没内容的折叠菜单，对用户来说纯粹是噪音，所以整组先隐藏。
+ * 历史：2026-09-11 曾反过来 —— 把「管理」提到一级（admin 每天要点、新 admin 找不到它），组里只剩
+ * 一个还没内容的「定制」，于是整组隐藏。这次是产品决定收回来；为了不让「找不到」重演，两条规矩：
+ *   · 当前页就是组里某一项时**自动展开** —— 否则人站在「管理」页上，导航里却看不见「管理」；
+ *   · 展开 / 收起由用户决定并**记住**（localStorage）：admin 展开一次，以后一直是展开的。
+ *   （自动展开不写回记忆 —— 那是"当前页需要"，不是用户的偏好。）
+ * 三项都没有权限时连「更多」按钮都不渲染 —— 点开是空盒子比没有这个按钮更糟。
  *
- * ⚠️ **是隐藏，不是删除**：`onCustomize` / `customizeActive` / `showCustomize` 这套 props
- * 与下面的 JSX 一并保留，`ChatApp.tsx` 那边也照旧传。定制页做出来之后把这里改回 `true`
- * 即可恢复，不需要重新接线。改成 `true` 前先确认 `nav.customize` 那一页真有内容 ——
- * 否则又回到「点开是空盒子」。
- *
- * ⚠️ 「管理」**不再**在这个组里，所以关掉它不会影响 admin 的入口（见下面 nav 里那一项）。
+ * 「定制」仍然不显示（页面还没真正的功能）：由 `SHOW_CUSTOMIZE_ITEM` 关着。⚠️ 是隐藏不是删除 ——
+ * `onCustomize` / `customizeActive` / `showCustomize` 与下面的 JSX 一并保留，`ChatApp.tsx` 照旧传；
+ * 定制页做出来后改成 `true` 即可，改之前先确认那一页真有内容。
  */
-const SHOW_MORE_GROUP = false;
+const SHOW_CUSTOMIZE_ITEM = false;
+/** 「更多」展开态的记忆（"1" / "0"）。与会话分组的 notiops.collapsedGroups 同一套做法。 */
+const MORE_OPEN_KEY = "notiops.moreOpen";
 
 export default function Sidebar({ conversations, activeId, busyIds, unreadIds, onSelect, onNew, onRename, onTogglePin, onDelete, collapsed, onToggle, username, onSignOut, width = 264, onSkills, skillsActive, onCustomize, customizeActive, onWhatsNew, onNotifications, notificationsActive, notifUnread = 0, onFinops, finopsActive, onCases, casesActive, onAdmin, adminActive, showFinops = true, showCases = true, showAdmin = false, showNotifications = true, showInvestigation = true, showSkills = true, showCustomize = true, onInvestigate, investigateActive, onInspection, inspectionActive, showInspection = false }: Props) {
   const t = useT();
   const { locale } = useLocale();
-  // "更多"子菜单展开态（现在只剩「定制」一项，且整组被 SHOW_MORE_GROUP 关着）
-  const [moreOpen, setMoreOpen] = useState(false);
-  // 子菜单里到底还剩没剩东西：都没了就连「更多」按钮一起藏，别让用户点开一个空菜单。
-  // 「管理」已提到一级，所以这里**不再**算 showAdmin —— 算进来会让 admin 看到一个
-  // 点开只有「定制」的「更多」，而「管理」明明已经在上面了。
-  const hasMoreItems = SHOW_MORE_GROUP && showCustomize;
+  // 「更多」子菜单的展开态：用户上次的选择（默认收起）。
+  const [moreOpen, setMoreOpen] = useState<boolean>(() => {
+    try { return localStorage.getItem(MORE_OPEN_KEY) === "1"; } catch { return false; }
+  });
+  const toggleMore = () =>
+    setMoreOpen((v) => {
+      const next = !v;
+      try { localStorage.setItem(MORE_OPEN_KEY, next ? "1" : "0"); } catch { /* 忽略：隐私模式等 */ }
+      return next;
+    });
+  // 当前页在组里 → 展开（只在"进入"那一刻展开一次；之后用户再收起就尊重他，不会被反复弹开）。
+  // 每一项都要**连同它的门禁**一起算：无权限的人点了「管理 Skills」这类别处的入口，ChatApp 会先
+  // 置 skillsActive、再在同一轮 effect 里把他弹回聊天页 —— 只看 active 的话，「更多」会被凭空展开，
+  // 而且展开的是一个他看不见那一项的菜单（2026-10-10 独立审查发现）。
+  const moreChildActive = Boolean((showInspection && inspectionActive) || (showSkills && skillsActive)
+    || (showAdmin && adminActive) || (SHOW_CUSTOMIZE_ITEM && showCustomize && customizeActive));
+  useEffect(() => { if (moreChildActive) setMoreOpen(true); }, [moreChildActive]);
+  // 子菜单里到底有没有东西：一项都没有就连「更多」按钮一起藏，别让用户点开一个空菜单。
+  const hasMoreItems = showInspection || showSkills || showAdmin || (SHOW_CUSTOMIZE_ITEM && showCustomize);
 
   // 主题会话分组的收起态：记录**已收起**的组 key（默认全部展开）。持久化到 localStorage，跨刷新保留。
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
@@ -191,37 +207,37 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
             留一个同名一级入口会让人以为它还是个独立的聊天主题）。安全**看板**没删，
             入口是「调查」输入框上方的「安全态势」胶囊。别顺手补回来。 */}
         {showCases && <button className={"navitem" + (casesActive ? " active" : "")} onClick={onCases}><span className="ni-ic"><IconCases /></span>{t("topic.cases")}</button>}
-        {/* 巡检：站内看板（2026-09-04 从「资源巡检」改名并挪到 案例/Skills
-            之间 —— 用户指定的位置；老外链入口已随 idle 控制台退役）。 */}
-        {showInspection && <button className={"navitem" + (inspectionActive ? " active" : "")} onClick={() => onInspection?.()}><span className="ni-ic"><IconInspection /></span>{t("insp.title")}</button>}
-        {/* Skills：独立一级入口。点开进独立 Skills 管理页（非「定制」外壳）。 */}
-        {showSkills && (
-          <button className={"navitem" + (skillsActive ? " active" : "")} onClick={() => onSkills?.()}>
-            <span className="ni-ic"><IconSkill /></span>{t("cz.nav.skills")}
-          </button>
-        )}
-        {/* 管理：仅 admin 可见（后端 nav:admin 门禁 + 前端能力过滤）。角色 / 用户 / 模块。
-            2026-09-11 从「更多」子菜单提到**一级**，紧跟 Skills —— 它是 admin 每天要点的
-            入口，藏在折叠菜单里多一次点击、而且新 admin 根本找不到。 */}
-        {showAdmin && (
-          <button className={"navitem" + (adminActive ? " active" : "")} onClick={() => onAdmin?.()}>
-            <span className="ni-ic"><IconCustomize /></span>{t("nav.admin")}
-          </button>
-        )}
-        {/* 「更多」：可展开子菜单，现在只收「定制」一项。
-            整组由 SHOW_MORE_GROUP 关着（定制页还没内容，见文件头那段注释）；
-            开关打开后仍保留「门禁全挡掉就连「更多」一起藏」的行为 —— 否则用户点开是空盒子。 */}
+        {/* 「更多」：巡检 / 技能 / 管理 收在这里（2026-10-10，见文件头 SHOW_CUSTOMIZE_ITEM 上那段）。
+            三项各自的门禁不变；一项都没有时整个按钮不渲染。 */}
         {hasMoreItems && (
-          <button className={"navitem" + (moreOpen ? " expanded" : "")} onClick={() => setMoreOpen((v) => !v)}>
+          <button className={"navitem" + (moreOpen ? " expanded" : "")} onClick={toggleMore}
+            aria-expanded={moreOpen} aria-controls="sb-more-menu">
             <span className="ni-ic"><IconMore /></span>{t("nav.more")}
             <span className={"ni-caret" + (moreOpen ? " open" : "")}><IconChevronRight size={15} /></span>
           </button>
         )}
         {hasMoreItems && moreOpen && (
-          <div className="sb-submenu">
-            {/* 定制（连接器/插件等）：从一级收进「更多」。
-                ⚠️ 「管理」曾经也在这里，2026-09-11 提到一级了 —— 别再往这里加回来。 */}
-            {showCustomize && (
+          <div className="sb-submenu" id="sb-more-menu">
+            {/* 巡检：站内看板（需 nav:inspection；方式A 没有巡检后端，那里压根不出现）。 */}
+            {showInspection && (
+              <button className={"navitem subitem" + (inspectionActive ? " active" : "")} onClick={() => onInspection?.()}>
+                <span className="ni-ic"><IconInspection /></span>{t("insp.title")}
+              </button>
+            )}
+            {/* 技能（Skills 管理页）：中文导航标签是「技能」，功能名仍叫 Skill。 */}
+            {showSkills && (
+              <button className={"navitem subitem" + (skillsActive ? " active" : "")} onClick={() => onSkills?.()}>
+                <span className="ni-ic"><IconSkill /></span>{t("cz.nav.skills")}
+              </button>
+            )}
+            {/* 管理：仅 admin 可见（后端 nav:admin 门禁 + 前端能力过滤）。角色 / 用户 / 模块。 */}
+            {showAdmin && (
+              <button className={"navitem subitem" + (adminActive ? " active" : "")} onClick={() => onAdmin?.()}>
+                <span className="ni-ic"><IconCustomize /></span>{t("nav.admin")}
+              </button>
+            )}
+            {/* 定制：页面还没内容，SHOW_CUSTOMIZE_ITEM 关着（接线保留）。 */}
+            {SHOW_CUSTOMIZE_ITEM && showCustomize && (
               <button className={"navitem subitem" + (customizeActive ? " active" : "")} onClick={() => onCustomize?.()}>
                 <span className="ni-ic"><IconCustomize /></span>{t("nav.customize")}
               </button>

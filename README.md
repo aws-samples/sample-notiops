@@ -19,23 +19,27 @@ the web UI or touching the AWS Console.
 The same assistant is also available **inside your team's chat tools (Slack /
 Feishu / DingTalk)**: `@mention` the bot in an alert channel to run an
 investigation and read the report where the alert already landed. On top of
-on-demand questions, it does **proactive push** across 10 AWS signal sources
+on-demand questions, it **proactively pushes** events from 10 AWS signal sources
 (CloudWatch, AWS Health, Backup, GuardDuty, Cost Anomaly, Trusted Advisor, EC2
-Spot interruption, Auto Scaling launch failure, RDS, Config), each
-independently switchable.
+Spot interruption, Auto Scaling launch failure, RDS, Config) into the Web Chat
+**Notifications** inbox, each source independently switchable.
 
 All models are served through **Amazon Bedrock** (managed security, compliance,
 and cost controls), with per-session model switching and automatic
-English/Chinese localization. The **zero-change promise** rests on a read-only
-IAM role as its hard boundary — both entry points reach your account through it,
-and no write permission on your infrastructure is ever granted — with defense in depth layered on top,
+English/Chinese localization. The **zero-change promise** rests on IAM as its hard
+boundary: the roles both entry points use to reach your account are read-only on
+your infrastructure, so a call that changes a resource has no permission. Apart from
+the resources NotiOps owns (its tables, buckets and the like), the only write they
+carry is AWS Support case create / reply / resolve, and it runs only after you
+confirm a preview (a member account's role can be made strictly read-only with the
+template parameter `EnableSupportCaseWrite=false`). Defense in depth is layered on top,
 differently per entry point: on the web, tool-level read-only enforcement plus a
 command-level denylist (for actions that are technically reads but shouldn't be,
 such as `get-secret-value`) plus a strictly read-only system prompt; on IM, a
 direct call to the read-only AWS DevOps Agent with a strong-mutation-wording
 regex as a second gate on the NotiOps side. The assistant reads and reasons, but
-never mutates your cloud — safe to hand to on-call engineers without granting
-write access.
+never mutates your cloud — safe to hand to on-call engineers without granting them
+write access to your infrastructure.
 
 ---
 
@@ -43,6 +47,7 @@ write access.
 
 | Doc | Purpose |
 |---|---|
+| 📝 [AWS Blog (English)](https://aws.amazon.com/cn/blogs/china/using-agentic-ai-assistant-notiops-build-aws-operations-en/) | Introductory article: why NotiOps exists, how it is used, architecture and the read-only boundary |
 | 🚀 [One-click Deploy](docs/DEPLOYMENT_ONECLICK.en.md) | Browser only: upload one CloudFormation template, about 5 minutes to a running Web Chat (optionally plus one IM bot — Feishu/Lark, Slack or DingTalk) |
 | ✅ [Prerequisites](docs/PREREQUISITES.en.md) | **Read before running `./setup.sh`**: environment requirements, per-item fixes, and a one-command self-check (not needed for the one-click path) |
 | 🛠 [Deployment Guide](docs/DEPLOYMENT.en.md) | Full install: step-by-step from `./setup.sh` to first smoke test (web console + optional IM) |
@@ -70,23 +75,25 @@ write access.
   passed through as-is, with no smart rewrite)
 - 🛎️ **Proactive observation**: 10 EventBridge sources (CloudWatch / Health /
   Cost Anomaly / Trusted Advisor / GuardDuty / Backup / EC2 Spot interruption /
-  Auto Scaling launch failure / RDS / Config), each independently switchable —
-  five are on by default
+  Auto Scaling launch failure / RDS / Config) feed the Web Chat **Notifications**
+  inbox, each independently switchable — five are on by default
 - 📋 **Full AWS Support case management**: create / list / view / reply /
   **smart-analyze** (LLM rollup of the case thread) / resolve
 - 💬 **AWS concept Q&A**: Bedrock + Knowledge MCP for official-doc retrieval,
   answers carry 📚 source citations
 - 🤖 **Multi-LLM switching**: an operator-managed model catalogue — pick which
   models your deployment offers, set the default, and choose the models used by
-  backend tasks, all from the Admin console with no redeploy. Users keep a
+  backend tasks, all under **More → Admin → Models** with no redeploy. Users keep a
   per-session model preference. Every model is served through **Amazon Bedrock**
   (managed security, compliance, and cost controls), on either IAM or a Bedrock
   API key
 - 🌍 **Bilingual**: Chinese / English auto-detect + explicit switching
-- 🛡 **Zero-Change Promise**: a read-only IAM role as the hard boundary, then
-  defense in depth per entry point — web: tool-level read-only + command denylist
-  + read-only system prompt; IM: the read-only DevOps Agent + a mutation-wording
-  regex second gate — the assistant never mutates your cloud
+- 🛡 **Zero-Change Promise**: IAM as the hard boundary (read-only on your
+  infrastructure; apart from NotiOps's own resources, the only write is Support case
+  create / reply / resolve, run only after you confirm a preview), then
+  defense in depth per entry point — web: tool-level read-only + command
+  denylist + read-only system prompt; IM: the read-only DevOps Agent + a
+  mutation-wording regex second gate — the assistant never mutates your cloud
 - 💬 **IM channels**: Slack / Feishu / DingTalk full-feature — you get a reply **immediately**
   after you ask: on Feishu / Slack progress / thinking / the answer all refresh **in that same
   card** (the seconds in its title are the "still running" signal); DingTalk cannot edit a sent
@@ -123,9 +130,10 @@ Three optional parameters are worth knowing about:
 
 - **What to install** (`InstallOption`, default `web`) — a four-way dropdown: `web` /
   `web+feishu` / `web+slack` / `web+dingtalk`. **All four install Web Chat**; the latter three add **one** IM
-  bot (@-mention it in a group, or DM it — after deploying you still fill in a request URL on
-  the IM platform and put the credentials into Secrets Manager). You can update the stack to
-  a different value later.
+  bot (@-mention it in a group, or DM it — after deploying you still enter its credentials under
+  Web Chat **More → Admin → IM Integration** first (saving writes them to Secrets Manager), and
+  then fill in a request URL on the IM platform). You can update the stack to a different value
+  later.
 - **Deep investigation** (AWS DevOps Agent — on by default, free while idle, and silently
   skipped instead of failing the stack in Regions that don't have it).
 - **Deployment mode** (single account by default; pick multi-account and supply your
@@ -138,9 +146,9 @@ Three optional parameters are worth knowing about:
   register command and the management account id).
 
 ⚠️ One-click deploys **Web Chat plus at most one IM bot**. It does **not** include scheduled
-inspections and proactive push, the data behind the inspection dashboard and its threshold
-settings, or CUR/Athena FinOps, and one stack can only carry one IM platform — use Option B
-for those. Prerequisites (region and Bedrock model access), a parameter-by-parameter
+inspections, proactive push into IM groups (on Option B only Feishu receives it — see the feature
+comparison below), or the inspection dashboard (along with its scope and threshold settings; the
+sidebar shows no such entry), and one stack can only carry one IM platform — use Option B for those. (CUR/Athena billing detail is on both paths: on one-click it is opt-in, choose `ProvisionCur=yes` when you create the stack.) Prerequisites (region and Bedrock model access), a parameter-by-parameter
 walkthrough, the resource and cost breakdown, upgrade/rollback, and one-click teardown are in
 [docs/DEPLOYMENT_ONECLICK.en.md](docs/DEPLOYMENT_ONECLICK.en.md); the two IM setup steps are in
 [docs/IM_WEBHOOK_SETUP.en.md](docs/IM_WEBHOOK_SETUP.en.md).
@@ -158,10 +166,12 @@ bash scripts/preflight.sh
 # 3. Deploy (CDK, one command; interactive on first run)
 ./setup.sh
 # First run: confirm AWS account → pick region → pick IM platforms
-# (Slack / Feishu / DingTalk, multi-select) → paste credentials for each (written
-# straight to Secrets Manager, never to disk) → CDK bootstrap → synth →
-# dependency Layer build (pip, no container) → cdk deploy --all. Re-runs
-# only patch deltas.
+# (Slack / Feishu / DingTalk, multi-select) → dependency Layer build (pip, no
+# container) → CDK bootstrap → synth → cdk deploy --all. Re-runs only patch
+# deltas.
+# IM credential secrets are created empty; if you enabled IM, fill them in after
+# the deploy under Web Chat More → Admin → IM Integration (saving writes them to
+# Secrets Manager), as the completion banner says.
 ```
 
 Requires git, Node.js, Python, uv and the AWS CDK locally, plus credentials that
@@ -215,7 +225,7 @@ mode comparison and how to switch — see
 | Installed locally | nothing (browser only) | git / Node / Python / **uv** / CDK (**no container runtime**) |
 | Long-lived access key required | no | yes, credentials that can deploy |
 | Deploy time | about 5 minutes | 10–20 minutes (includes local builds) |
-| One-click teardown | ✅ pick `KeepData` / `DeleteEverything` on delete | ✅ `./teardown.sh` (keeps data by default, `--delete-everything` for a full wipe) |
+| One-click teardown | ✅ stack parameter `TeardownMode`: `KeepData` / `DeleteEverything` (set it with an update **before** you delete — see below) | ✅ `./teardown.sh` (keeps data by default, `--delete-everything` for a full wipe) |
 | **Chat and investigation** | | |
 | Web Chat (read-only Q&A) | ✅ | ✅ |
 | AWS concept Q&A (official-doc retrieval + citations) | ✅ | ✅ |
@@ -229,7 +239,7 @@ mode comparison and how to switch — see
 | Cross-session memory (carries preferences and facts into the next conversation) | ❌ see note ³ | ❌ see note ³ |
 | **Cost / FinOps** | | |
 | FinOps dashboard (Cost Explorer data) | ✅ deploy account only | ✅ cross-account |
-| CUR + Athena billing-detail drill-down | ❌ | ✅ |
+| CUR + Athena billing-detail drill-down | ✅ optional (parameter `ProvisionCur=yes`, off by default) | ✅ |
 | Daily cost-anomaly scan (self-built baseline, runs 01:15 UTC every day) | ❌ the "Daily Anomaly Scan" card on the FinOps page is not rendered at all — you do not get an empty card | ✅ |
 | Bring your own CUR data source (4 dashboard sheets + ask about that bill in chat) | ✅ optional, see note ⁵ | ✅ optional, see note ⁵ |
 | **Cases and Skills** | | |
@@ -243,12 +253,12 @@ mode comparison and how to switch — see
 | IM channels (Slack / Feishu / DingTalk) | ✅ one platform per stack, see note ⁴ | ✅ all three at once |
 | Two agents in IM (`/agent devops`, the 0-token default \| `/agent notiops`, model-backed) + the `/web` toggle | ✅ | ✅ |
 | Pick which account you ask about, from IM (`/account`) | ✅ | ✅ |
-| Proactive push **to IM** (10 EventBridge sources) | ❌ | ✅ |
+| Proactive push **to IM** | ❌ | ⚠️ Feishu only: the daily operations notification (inspection + the daily cost-anomaly scan + the last 24h of investigations) and AWS Health events, sent to the "Target group chat IDs" you enter under **More → Admin → IM Integration** (platform "Feishu / Lark"). Real-time pushes for CloudWatch alarms / Backup / GuardDuty / Cost Anomaly Detection / Trusted Advisor reach **no IM on either path** in this release (see them under Notifications on the web); Slack / DingTalk get no proactive push |
 | Scheduled inspection (high load / idle & cost / structural risk) | ❌ | ✅ |
-| Notification inbox (the same 10 sources, into the web inbox) | ✅ | ✅ |
-| Inspection dashboard (overview / high load / idle & cost / structural risk / inspection scope / thresholds & schedule) | ❌ Option A has no inspection backend, so the sidebar entry **does not appear at all** (rather than failing once you open it); calling the API directly tells you plainly that this needs Option B | ✅ |
+| Notification inbox (10 EventBridge sources, into the web inbox) | ✅ | ✅ |
+| Inspection dashboard (high load / idle & cost / inspection scope / thresholds & schedule) | ❌ Option A has no inspection backend, so the sidebar entry **does not appear at all** (rather than failing once you open it); calling `/inspection/*` directly returns an explicit `inspection_not_deployed` code (this deployment does not include inspection) | ✅ |
 | **Scope** | | |
-| Multi-account (across an AWS Organization) — both paths accept the **management account** or a registered **StackSets delegated administrator** member account (auto-detected); ⚠️ CloudFormation never rolls a StackSet into the management account itself, so inspecting it needs the member template deployed by hand | ✅ set `DeployMode=MultiAccount` + your organization id | ✅ `--multi-account` |
+| Multi-account (across an AWS Organization) — both paths accept the **management account** or a registered **StackSets delegated administrator** member account (auto-detected); ⚠️ CloudFormation never rolls a StackSet into the management account itself: when you deploy from a delegated administrator, query the management account through **"Manual onboarding" alone**, under Web Chat **More → Admin → Accounts** (that stack creates the collection role too; on Option A, first upload `infra/member-devops-agent.yaml` from the stack's release (see the `InstalledRelease` stack output) to `s3://notiops-data-<account>-<region>/onboarding-templates/`, otherwise "Generate link" fails with `template not found` — see [docs/DEPLOYMENT_ONECLICK.en.md §2.6.1](docs/DEPLOYMENT_ONECLICK.en.md#261-hard-prerequisite-management-account-or-a-stacksets-delegated-administrator)), and do **not** also deploy `infra/member-account-onboarding.yaml` by hand — both stacks create a role with the same name, so the second one fails with `EntityAlreadyExists` and rolls back; if it is already deployed, set `CreateCollectionRole` to `no` on the quick-create page (and if that stack forwards events, clear `DevOpsEventBusArn` too, or every investigation event is delivered twice). When you deploy from the management account itself there is nothing to do — it is the deploy account | ✅ set `DeployMode=MultiAccount` + your organization id | ✅ `--multi-account` |
 | Upgrade | update the stack with the new template (~1 min) | re-run `./setup.sh` |
 
 > ¹ **Every DevOps Agent capability (deep investigation, deep investigation Direct, DevOps
@@ -294,10 +304,12 @@ mode comparison and how to switch — see
 > matches "look at resources / start an investigation / check progress / switch model / switch
 > language" is deterministic routing and costs **no tokens**. Two differences: (1) one stack
 > carries **one** platform (use Option B if you want both); (2) two steps stay with you after
-> deploying — put the credentials into Secrets Manager and paste the request URL back into the
-> IM platform, in that order (the `ImNextSteps` stack output reminds you), as described in
+> deploying — enter the credentials under Web Chat **More → Admin → IM Integration** (saving
+> writes them to Secrets Manager), then paste the request URL back into the IM platform, in
+> that order (the `ImNextSteps` stack output reminds you), as described in
 > [docs/IM_WEBHOOK_SETUP.en.md](docs/IM_WEBHOOK_SETUP.en.md). Note this is **request/response
-> only**; pushing daily inspection reports and alerts into a group is still Option B.
+> only**; what gets **pushed** into a group (the daily operations notification and AWS Health
+> events, Feishu only) is still Option B only — see the "Proactive push to IM" row above.
 >
 > ⚠️ **The IM platforms this release supports are Feishu / Lark, Slack and DingTalk**
 > (DingTalk since 2026-09-08, on both paths). DingTalk has three **platform-capability**
@@ -313,22 +325,36 @@ mode comparison and how to switch — see
 
 > ⁵ **Bringing your own CUR data source is optional, and identical on both paths.** The
 > "CUR + Athena billing-detail drill-down" row above is about **this deploy account's own**
-> bill (Option B provisions it). This row is about **a different CUR table** — a customer
-> you look after, or several payer accounts — reached through **a cost-agent MCP Lambda that
-> you deploy yourself**; that Lambda is not in this repository. Once connected, the FinOps
-> page gains 4 sheets (spend trend / credits / extended support / Savings Plans) and you can
-> ask about that bill in chat. **How you supply it**: Option A takes the parameters
-> `CostAgentMcpUrl` + `CostAgentFunctionArn`; Option B takes the environment variables
-> `COST_AGENT_MCP_URL` + `COST_AGENT_FN_ARN`. **Both values must be supplied together**: a
-> Function URL does not contain the function ARN, and invoke permission can only be granted
-> per resource, so filling in just one gives you a data source that looks installed and 403s
-> on every call — both paths therefore reject a half-configuration **before doing any work**
-> (on Option A the stack is never created). **Leave them empty** and the entry points for
-> those 4 sheets simply don't appear; nothing else is affected. **If it goes down after you
-> connect it, the tool keeps working**: only those 4 sheets say "temporarily unavailable",
-> and chat falls back to Cost Explorer, then to the read-only AWS APIs, **telling you it
-> switched data source** (different basis of measurement — don't reconcile the numbers
-> blindly). Steps for deploying that Lambda are in
+> bill (Option B provisions it; so does Option A with `ProvisionCur=yes`). This row is about
+> putting a cost-agent MCP server (45 read-only cost-analysis tools) on top of **one CUR
+> table**. Once connected, the FinOps page gains 4 sheets (spend trend / credits / extended
+> support / Savings Plans) and you can ask about that bill in chat. There are two ways to
+> connect it — **pick one** (filling in both is rejected before anything is deployed):
+> - **Self-hosted** (recommended): NotiOps deploys the server for you, from this repository's
+>   `cost_mcp/`, into your account (with a dedicated Athena workgroup and a per-query scan
+>   cap). On Option A, pick `ProvisionCur=yes` (NotiOps creates the CUR too) or fill in
+>   `CurTable` + `CurBucketName` (a CUR you already have); on Option B, run
+>   `COST_MCP_SELF_HOST=true ./setup.sh` (by default it uses this account's CUR from the row
+>   above, creating it in the same run if there is none yet; to use a different CUR you
+>   already have, add `CUR_TABLE=<db>.<table> CUR_BUCKET_NAME=<bucket>`). A table you bring
+>   must be in the account and Region you deploy NotiOps to, together with its Glue database
+>   and its bucket (that is where the queries run). **A CUR in another account is not
+>   supported yet**: a value in `CurRoleArn` (Option A) or `CUR_ROLE_ARN` (Option B) is
+>   refused before anything is deployed. Deploy NotiOps in the account that holds the CUR, or
+>   use External below.
+> - **External** (only for a cost-agent MCP Lambda you already run): Option A takes the
+>   parameters `CostAgentMcpUrl` + `CostAgentFunctionArn`; Option B takes the environment
+>   variables `COST_AGENT_MCP_URL` + `COST_AGENT_FN_ARN`. **Both values must be supplied
+>   together**: a Function URL does not contain the function ARN, and invoke permission can
+>   only be granted per resource, so filling in just one gives you a data source that looks
+>   installed and 403s on every call — both paths therefore reject a half-configuration
+>   **before deploying anything** (on Option A the stack is never created).
+>
+> **Leave both unset** and the entry points for those 4 sheets simply don't appear; nothing
+> else is affected. **If it goes down after you connect it, the tool keeps working**: only
+> those 4 sheets say "temporarily unavailable", and chat falls back to Cost Explorer, then to
+> the read-only AWS APIs, **telling you it switched data source** (different basis of
+> measurement — don't reconcile the numbers blindly). What each option needs from you is in
 > [docs/DEPLOYMENT.en.md §14](docs/DEPLOYMENT.en.md#14-customer-cur-dashboard--cost-agent-mcp-optional).
 
 > 📋 **The AWS Support features (create / view / reply / resolve) require the
@@ -337,8 +363,11 @@ mode comparison and how to switch — see
 > deployment path you choose. On Basic / Developer the service list comes back empty.
 
 **The two paths compose**: start with Option A to try it out, then run Option B when
-you want IM push and scheduled inspections (both create an admin named `admin`, so
-they don't collide).
+you want scheduled inspections and, on Feishu, the daily operations notification. In the
+same account and Region, though, the two paths use the same table and bucket names and
+cannot exist side by side: first delete the Option A stack with `DeleteEverything` (its
+data does not carry over; see "Delete the environment" below), or install Option B in
+another Region.
 
 ### Upgrading to a new version / deleting the environment
 
@@ -355,32 +384,73 @@ The two options upgrade and uninstall **differently** — follow the one you act
 3. Change **nothing** on the parameters page — pick **Use existing value** for
    everything, click through, then **Submit**.
 
+⚠️ If your stack is on v1.0.20–v1.0.29, has an IM bot and uses the default GitHub artifact
+source: **before you Submit**, read the 🔴 note in
+[docs/DEPLOYMENT_ONECLICK.en.md §5](docs/DEPLOYMENT_ONECLICK.en.md#5-upgrading), and pick
+**Preserve successfully provisioned resources** under **Stack failure options** — `im-code.zip`
+has been withdrawn from those releases, so if the upgrade fails, the automatic rollback stops in
+`UPDATE_ROLLBACK_FAILED`.
+
+Multi-account mode: before v1.0.30, **Step 2: DevOps Agent** → **Associate** under **More → Admin →
+Accounts** could roll a member account's stack back with `EntityAlreadyExists`. After the upgrade,
+click **Associate** again for those accounts — every upgrade re-applies both member-account StackSets
+(see [docs/DEPLOYMENT_ONECLICK.en.md §5](docs/DEPLOYMENT_ONECLICK.en.md#5-upgrading)).
+
 An upgrade does **not**: resend the invitation email, change the admin email or
-password, revert settings you changed in Admin, or wipe chat history. To roll back,
-run the same update again with the **older** template.
+password, revert settings you changed under **More → Admin**, or wipe chat history. To roll back,
+run the same update again with the **older** template — except that a stack with IM
+cannot roll back to v1.0.20–v1.0.29 (same reason: rolling back downloads that version's
+`im-code.zip` again, and it has been withdrawn).
 
 **Delete the environment** — the stack has a `TeardownMode` parameter with two settings:
 
 | | What survives |
 |---|---|
-| `KeepData` (default) | The config table, the chat-history table, and the data bucket (your Skills and reports); if you installed IM, its credential secrets too |
-| `DeleteEverything` | Nothing — everything goes (**including the IM credential secrets, unrecoverably**) |
+| `KeepData` (default) | The config table, the chat-history table, and the data bucket (your Skills and reports); if you installed IM or saved a Bedrock API key under **More → Admin → Models**, those credential secrets too |
+| `DeleteEverything` | Everything else goes (**including those credential secrets, unrecoverably**), with two exceptions: the CUR resources created by `ProvisionCur=yes`, and the two member-account StackSets of multi-account mode — see below |
 
 ⚠️ **Two things to know:**
 
 1. **For a clean delete, the order matters.** First run an **Update** that sets
-   `TeardownMode` to `DeleteEverything` (~45 s), **then** **Delete stack** (~3 min).
+   `TeardownMode` to `DeleteEverything` (~45 s), **then** **Delete stack** (measured at
+   ~6 min 47 s, longer than a `KeepData` delete; see
+   [docs/DEPLOYMENT_ONECLICK.en.md §6.3](docs/DEPLOYMENT_ONECLICK.en.md#63-delete)).
    Changing the parameter in the delete dialog does **nothing**: CloudFormation uses the
    parameter values from the last successful deployment, so a straight delete behaves
    as `KeepData`.
 2. **Both modes delete the Cognito user pool.** `KeepData` preserves your *data*, not
    your *accounts* — after reinstalling you have to invite users again.
 
-Things that may be left behind afterwards (they cost nothing; delete by hand if you
-want a clean account): the two DynamoDB tables and the data bucket that `KeepData`
-preserved, and one log group named like
-`/aws/vendedlogs/RUMService_<stack>-web-chat<hash>` (0 bytes, expires on its own after
-30 days).
+Things that may be left behind afterwards (only small storage charges; delete them by hand
+if you want a clean account): the two DynamoDB tables and the data bucket that `KeepData`
+preserved; one log group named like
+`/aws/vendedlogs/RUMService_notiops-web-chat<hash>` (0 bytes, expires on its own after
+30 days; the name is fixed and does not depend on the stack name); and, occasionally, one
+function's log group — if that function is invoked in the last seconds of the delete, late
+log lines can re-create it (delete it by its full name; see
+[docs/DEPLOYMENT_ONECLICK.en.md §6.4](docs/DEPLOYMENT_ONECLICK.en.md#64-whats-left-behind-orphans-and-whether-to-care)).
+
+If you chose `ProvisionCur=yes` when creating the stack, one more group is **kept on
+purpose**, in both modes: the CUR report, its delivery bucket, the Athena integration
+stack (`notiops-cur-athena-<account>`), and a few Athena saved queries whose names start
+with `NotiOps - `. That is your billing history (AWS does not backfill
+past months), and keeping it lets a reinstall pick it up at the next 4-hourly check
+(within about 4 hours) instead of waiting another ~24 hours for the first delivery. The
+report keeps delivering into that bucket, so there is a small S3 storage cost. If you
+don't want it, delete it yourself in this order:
+the `notiops-cur-athena-<account>` stack first, then the report in the Billing console, and
+finally empty and delete the bucket (the saved queries cost nothing; delete them in the
+Athena console). The `DataRetentionOnDelete` stack output names all four.
+
+If you chose multi-account mode (`DeployMode=MultiAccount`), the two member-account
+StackSets (`notiops-member-onboarding` / `notiops-member-devops-agent`, which created the
+cross-account roles in each member account) and the Organizations trusted access for
+StackSets are also **left in place on purpose**, in both modes: deleting a StackSet wipes
+those roles from every member account, which a stack delete should not trigger implicitly,
+and trusted access is an organization-wide switch that other StackSets may rely on. If you
+don't want them, delete the StackSet's instances first and then the StackSet itself (in multi-account
+mode the `DataRetentionOnDelete` output names these too); see
+[docs/DEPLOYMENT_ONECLICK.en.md §6.4](docs/DEPLOYMENT_ONECLICK.en.md#64-whats-left-behind-orphans-and-whether-to-care).
 
 #### Option B (`setup.sh`)
 
@@ -399,14 +469,14 @@ preserved, and one log group named like
   Actually removing IM is a separate, deliberate step — run `./teardown.sh`.
 - **Delete**: run **`./teardown.sh`** from the repository root. It deletes what
   `setup.sh` created in reverse dependency order, including the non-CDK leftovers
-  (the CUR report definition, the one-shot EventBridge schedule, the WebSearch
-  gateway, and the 30-day recovery window on the secrets). Same two settings as
-  Option A:
+  (the one-shot EventBridge schedule, the WebSearch gateway, and the 30-day
+  recovery window on the secrets; the CUR report, its delivery bucket and the Athena
+  integration stack are all kept, see below). Same two settings as Option A:
 
   ```bash
   ./teardown.sh --dry-run           # inventory only, deletes nothing (run this first)
-  ./teardown.sh                     # keep data: delete the stacks, keep the three RETAIN'd tables
-  ./teardown.sh --delete-everything  # also delete the tables, CUR report/bucket, Athena saved queries, leftover log groups
+  ./teardown.sh                     # keep data: delete the stacks, keep the four RETAIN'd tables
+  ./teardown.sh --delete-everything  # also delete the tables and leftover log groups. NOTE: everything CUR-related is KEPT
   ```
 
   You have to type the 12-digit account id to confirm (`--delete-everything` also asks

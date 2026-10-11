@@ -53,7 +53,8 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from model.load import BEDROCK_READ_TIMEOUT_SEC, load_model, resolve_model_id
 from memory.session import get_memory_session_manager
 # 能力/元问题的确定性 0-token 应答（判据 + 文案 + 理由都在那个模块里）。
-from capability import builtin_answer_source, capability_answer, is_capability_question
+from capability import (SURFACE_IM, SURFACE_WEB, builtin_answer_source, capability_answer,
+                        is_capability_question)
 # Strands message 事件 → 右侧「思考过程」面板的步骤（工具入参/返回摘要）。零依赖、纯函数。
 from thinking_steps import steps_from_message
 
@@ -693,10 +694,12 @@ def _case_unavailable(cap: dict) -> dict:
             "support:DescribeSeverityLevels, support:DescribeServices, and support:CreateCase to "
             "that role.")
     elif reason == "cross_account_unavailable":
+        # 路径带上「更多」：2026-10-10 起「管理」收进了侧栏「更多」，一级导航里找不到它。
         msg = _dv(
-            "我访问不到这个 AWS 账号，所以开不了 case —— 请确认它已经在 NotiOps 里接入（管理 → 账户）。",
+            "我访问不到这个 AWS 账号，所以开不了 case —— 请确认它已经在 NotiOps 里接入"
+            "（侧栏「更多 → 管理 → 账户」）。",
             "I can't reach this AWS account, so I can't open a case — check that it has been "
-            "onboarded in NotiOps (Admin → Accounts).")
+            "onboarded in NotiOps (sidebar: More → Admin → Accounts).")
     else:
         msg = _dv("这个账号目前开不了 support case：" + str(cap.get("message") or reason),
                   "This account can't open a support case right now: " + str(cap.get("message") or reason))
@@ -1321,9 +1324,18 @@ async def investigate_live(title: str, description: str):
     if console_url:
         _open += _dv(f"\n\n🔗 可点开 DevOps Agent 后台实时查看进度：[{console_url}]({console_url})",
                      f"\n\n🔗 Watch live progress in the DevOps Agent console: [{console_url}]({console_url})")
-    _open += _dv("\n\n_分析过程正在右侧「调查过程」面板实时更新；这里将给出根因结论与报告。_\n",
-                 "\n\n_The analysis streams live in the “Investigation” panel on the right; the root-cause "
-                 "conclusion and report will appear here._\n")
+    # 面板名必须与界面逐字一致：2026-09-04 起只有一个过程面板「思考过程」/"Thinking"
+    # （ThinkingPanel，入口是回复上方唯一的「查看思考过程」/"View thinking"），
+    # 「调查过程」面板已删。BFF 直连那条（bff/web-chat/devops_investigate.mjs）有同一句开场白
+    # 和同一条心跳，两边逐字一致，改要一起改。
+    # ⚠️ 入口只承诺到「刷新页面前」：这句开场白随正文落库，过程步骤却不落库（BFF 的 store.mjs
+    #    不存 thinkingSteps / investigationSteps，历史回放时入口不渲染）—— 刷新或换设备打开这段
+    #    对话，入口就没了。别写回无条件的「随时」。
+    _open += _dv("\n\n_分析过程正在右侧「思考过程」面板实时更新（刷新页面前，可随时从本条回复上方的"
+                 "「查看思考过程」打开它）；这里将给出根因结论与报告。_\n",
+                 "\n\n_The analysis streams live in the “Thinking” panel on the right (until you reload "
+                 "the page, you can open it any time from “View thinking” above this reply); the "
+                 "root-cause conclusion and report will appear here._\n")
     yield _open
     # 首条进度事件带上 console_url，让前端右侧面板顶部也放一个"后台查看"链接。
     yield {"investigation_step": _dv(f"🚀 已发起：{title}", f"🚀 Started: {title}"),
@@ -1388,9 +1400,9 @@ async def investigate_live(title: str, description: str):
         if _ticks % _hb_every == 0:
             _m, _s = divmod(waited, 60)
             yield {"progress": {
-                "text": _dv(f"深度调查进行中…已用 {_m} 分 {_s} 秒（分析过程见右侧「调查过程」面板）",
+                "text": _dv(f"深度调查进行中…已用 {_m} 分 {_s} 秒（分析过程见右侧「思考过程」面板）",
                             f"Deep investigation running… {_m}m {_s}s elapsed "
-                            f"(steps stream in the “Investigation” panel)"),
+                            f"(steps stream in the “Thinking” panel)"),
                 "kind": "investigation"}}
 
     # 轮询连续失败而中断：**不能**复用下面那段"调查仍在 AWS 侧继续跑"的文案 —— 我们此刻
@@ -1459,7 +1471,7 @@ async def investigate_live(title: str, description: str):
     if summary_md:
         # 忠实透传：正文内容全是 DevOps Agent 原文，NotiOps 只按后台的 tab 名分章节
         # （Summary / Root cause / Mitigation plan），不做二次总结。Investigation timeline
-        # 仍然只在右侧「调查过程」面板（上面的 investigation_step 流），不进正文。
+        # 仍然只在右侧「思考过程」面板（上面的 investigation_step 流），不进正文。
         # mitigation 不在此自动生成——「有就展示」（后台生成过就有）；没有则由用户点按钮去后台生成。
         rep_title = _dv(f"DevOps Agent 深度调查报告 - {title[:40]}",
                         f"DevOps Agent Deep Investigation Report - {title[:40]}")
@@ -1921,6 +1933,43 @@ def _date_directive() -> str:
 
 # 主题聚焦指令：topic != general 时按主题注入，让"主题 chat 针对该主题优化"，
 # 但所有工具仍全在 → 主题 chat 也能问任何问题。general 不注入（通用全能）。
+def _cur_focus() -> str:
+    """客户自有 CUR（行级明细）那段主题引导 —— **只在工具真的挂上时**才返回内容。
+
+    为什么必须放在主题聚焦层而不是只靠常驻 system prompt：CUR → CE → call_aws 那条阶梯
+    原来只写在默认 prompt 里，而 `finops` 恰恰是成本问题真正落地的主题，它的聚焦文本
+    （离用户问题最近、命中率最高的那一段）**从头到尾没提过这两个元工具**。
+    实测后果就是模型在成本主题里优先用 CE 聚合数据，而客户自己的 CUR 行级明细闲置。
+
+    ⚠️ 这段文字要同时说清「什么时候**不要**用 CUR」——否则会反向跑偏：推荐/rightsizing/
+    预算/定价这些 CE 才有的东西，以及「本账号最近几天的快速趋势」，用 CUR 是绕远路。
+    """
+    # 判据用 `get_tools()` 是否回了东西 —— 与**真实挂载**是同一个判据（main.py:846 挂的
+    # 就是它），所以不可能出现「注入了引导但工具没挂」。
+    # ⚠️ 别改成检查某个 `configured()` 函数：那个模块里没有这个名字，写错的后果是
+    # 这段引导**永远不注入**，而且被 except 吞掉、一点报错都没有（我第一版就写错了）。
+    try:
+        if not _cost_agent_mcp.get_tools():
+            return ""
+    except Exception:  # noqa: BLE001 — 拿不到就当没配，不要让主题注入变成一次崩溃
+        return ""
+    return (
+        "\n[**本部署接了客户自己的 CUR（Cost and Usage Report）行级明细**，通过两个元工具访问："
+        "`list_cost_tools`（先看目录）与 `call_cost_tool`（按名字调用）。\n"
+        "何时**优先用 CUR**（CE 给不出这些口径）：\n"
+        "  · 要和**发票对账**的金额、按 payer/charge_type/币种的对账总表；\n"
+        "  · **Savings Plan / ODCR** 的利用率、浪费金额、合同明细与到期时间；\n"
+        "  · 资源级/机型级/标签级的**行级**拆分，EC2 里拆出 EBS/NAT/VPC 的 `final_service` 口径；\n"
+        "  · 存储量（S3 的 PiB、EBS 的 GiB）、**流量 GB/TB**（不是费用）、Bedrock token 消耗量。\n"
+        "何时**不要**用 CUR（用上面的 CE/awslabs 工具）：优化建议 / rightsizing / 预算 / 定价，"
+        "以及「最近几天的快速趋势」——那些 CE 更直接，CUR 反而绕远。\n"
+        "⚠️ 工具返回值里的 `caliber_note` 与 `caliber_caveats` 是**口径声明，必须照实转述**："
+        "比如这份 CUR 没有 net 列时金额是**折前**的、某一列这份 CUR 提供不了。"
+        "拿一个口径的数字当另一个口径说，比答不出来糟得多。\n"
+        "⚠️ 金额与合计**一律用工具返回的值**，不要自己加总（返回里已经给了 SQL 直出的合计）。]\n\n"
+    )
+
+
 _TOPIC_FOCUS = {
     "cases": (
         "[当前处于 **Support Cases（案例）主题**。你是用户的 AWS Support 案例 AI 助手，"
@@ -1937,7 +1986,7 @@ _TOPIC_FOCUS = {
         "- 建案工具返回 `case_creation_unavailable` 时（这个账号根本开不了 case：计划不足 / 缺权限 / "
         "账号访问不到）：**把返回里的 message 直接说给用户**（含出路），然后停下 —— 不要重试、"
         "不要改参数再试、不要说「已为你创建确认卡」。\n"
-        "- **case 标识：工具返回里有两个字段——短数字（如 177968533700953，面向控制台）和一个长内部 ID"
+        "- **case 标识：工具返回里有两个字段——短数字（如 177968247000414，面向控制台）和一个长内部 ID"
         "（形如 case-账号-mczh-年-哈希）。一律用那个短数字，绝不展示或链接长的那个（控制台打不开）。**\n"
         "- **面向用户称呼它时一律叫「Case ID / 案例 ID」，绝不要用 `displayId`、`caseId` 这类内部字段名**"
         "（用户读不懂这些技术术语）。\n"
@@ -1969,6 +2018,12 @@ _TOPIC_FOCUS = {
         "和 GroupBy=SERVICE 即可。\n"
         "- 工具偶发报错时**换工具/换参数重试并继续**，最终基于已拿到的数据作答；只有确实拿不到才说明。\n"
         "- 这些都是**只读**查询，安全；不要输出任何变更命令。]\n\n"
+        # ── 客户自有 CUR（行级明细）────────────────────────────────────────────
+        # ⚠️ 只在这两个元工具**真的挂上了**的时候才注入（`_cur_focus()` 读同一份工具集）。
+        # 无条件注入的后果是：没配 CUR 的部署里，模型会去调两个不存在的工具，然后
+        # 把"工具不存在"当成"数据源挂了"来解释 —— 而正确答案是「本部署没有这项能力，
+        # 走 CE」。这正是 core/cost_agent_mcp.py 文件头记的那个占位符 URL 陷阱的同一形状。
+        + _cur_focus()
     ),
     "investigate": (
         "[当前处于 **故障调查（Investigation）主题**。你是用户的 AWS 运维排障助手，目标是"
@@ -2026,7 +2081,8 @@ _TOPIC_FOCUS = {
         "  （想显式控制完整列表也可用 `aws_whats_new_report(...)`，行为一致。）\n"
         "- 始终给**官方链接**作为来源。目标：既帮用户关注新服务，又能学到原理、看到与自己业务的结合点。]\n\n"
     ),
-    # ── IM（飞书 / Slack / 企业微信）里的对话 ────────────────────────────────
+    # ── IM（飞书 / Slack / 钉钉）里的对话 ────────────────────────────────────
+    # （平台名以 `platforms/` 下实际有的三个为准；这里以前写过「企业微信」，那个平台没有接。）
     # 这一段存在的**唯一理由**是：IM 与网页的载体差异会让默认 system prompt 里的几句话
     # 直接变成错话，而"错话"在 IM 上是不可挽回的（用户照着做，发现没有那个界面）：
     #   · DEFAULT_SYSTEM_PROMPT 让模型提示用户「打开输入框下方的联网搜索」—— IM 没有
@@ -2036,7 +2092,7 @@ _TOPIC_FOCUS = {
     #   · IM 侧的工具只有 4~5 个（见 `_im_chat_tools`），不能像网页那样承诺 case / 成本 /
     #     深度调查 —— 那些在 IM 上是**确定性命令**（0 token 直连），得指路而不是假装能做。
     "im-chat": (
-        "[当前你在 **IM 群聊/私聊**（飞书 / Slack / 企业微信）里回答，不是网页控制台。\n"
+        "[当前你在 **IM 群聊/私聊**（飞书 / Slack / 钉钉）里回答，不是网页控制台。\n"
         "- **必须简短**：答案会渲染成一张 IM 卡片，正文超过约 2900 字符的部分会被挪进"
         "一份网页报告、卡片里只留开头加一个链接（内容不丢，但体验差很多）。"
         "默认 300 字以内说清结论，要点用 `-` 列表；**不要输出大表格、不要长代码块**"
@@ -2082,6 +2138,17 @@ def _normalize_topic(topic) -> str:
 
 def _topic_directive(topic) -> str:
     return _TOPIC_FOCUS.get(_normalize_topic(topic), "")
+
+
+def _is_im_topic(topic) -> bool:
+    """这一轮是不是从 IM 来的（飞书 / Slack / 钉钉里 `/agent notiops` 之后的对话，主题 `im-chat`）。
+
+    凡是**不经模型、由我们直接写给客户**的话（P2b 能力说明、模型调用失败的降级答案），
+    只要提到「去哪儿点」，都得先问这一句：IM 没有输入框、模型选择器、开关和侧栏，
+    对应的是 `/model`、`/investigate <内容>`、`/help` 这些命令。模型自己说的话由
+    `_TOPIC_FOCUS["im-chat"]` 那段 prompt 管，管不到这些绕过模型的文案。
+    """
+    return _normalize_topic(topic) == _IM_CHAT_TOPIC
 
 
 def _extract_prompt(payload: dict):
@@ -2143,8 +2210,12 @@ def _is_trivial_greeting(text: str) -> bool:
 #
 # 下面两个包装只做一件事：把「本轮语言」交给它。`_dv` 是本文件唯一的语言口径，
 # 复用它（而不是再读一次 _ui_locale）才不会出现两处语言判断慢慢漂开。
-def _capability_answer() -> str:
-    return capability_answer(_dv("zh", "en"))
+# 能力说明还要知道**入口**：这条快路径对 IM（`im-chat`）同样生效 —— IM 的 `_HELP_RE` 只拦得住
+# 一部分说法（「你是谁」「what can you help me with」这类会穿过去落到这里），而网页那份「左侧切换
+# 主题 / 输入框右下角选模型」在 IM 里全是指向不存在的界面的错话。
+def _capability_answer(topic=None) -> str:
+    return capability_answer(_dv("zh", "en"),
+                             surface=SURFACE_IM if _is_im_topic(topic) else SURFACE_WEB)
 
 
 def _builtin_answer_source() -> dict:
@@ -2397,7 +2468,7 @@ def _stream_events(event, scrubber):
     # 正文增量:最常见的一支,先走(顺带跳过下面的 bytes 扫描)。
     if isinstance(_delta, dict) and isinstance(_delta.get("text"), str):
         return [_scrub_event_text(event, scrubber)]
-    # 思考过程:只有明文 text 才发(前端折叠灰字)。signature / redactedContent 一律丢弃 ——
+    # 思考过程:只有明文 text 才发(前端只并进右侧「思考过程」面板的思考段)。signature / redactedContent 一律丢弃 ——
     # 它们对用户无意义,且 redactedContent 是 bytes(见 _event_has_bytes)。
     _rc = _delta.get("reasoningContent") if isinstance(_delta, dict) else None
     if isinstance(_rc, dict):
@@ -2689,7 +2760,7 @@ async def invoke(payload, context):
             and is_capability_question(_raw_q)):
         _cap_text = ""
         try:
-            _cap_text = _capability_answer()
+            _cap_text = _capability_answer(payload.get("topic"))
         except Exception as e:  # noqa: BLE001 — 拼文案都能出错就老实回落正常路径
             log.warning("capability fast-path failed, falling back: %s", _safe_err(e))
         if _cap_text:
@@ -2806,7 +2877,7 @@ async def invoke(payload, context):
                         f"把下面这个 Skill 的完整意图与步骤作为调查 description 透传给 DevOps Agent 去执行"
                         f"（title 用简述，如「按 Skill：{sk['name']} 执行」；description 带上用户本轮原话 + 该 Skill 的步骤）。"
                         f"**不要**用本地只读工具自己去查。若 `investigate_live` 返回 not_onboarded，如实转达并提示用户"
-                        f"到左侧「Skills」把该 Skill 发布到 DevOps Agent。"
+                        f"到左侧「更多 → 技能」（英文界面是 More → Skills）把该 Skill 发布到 DevOps Agent。"
                         f"开头用一句话说明正在通过 DevOps Agent 执行该 Skill「{sk['name']}」{_vtag}——"
                         f"**这句话以及整条回复都必须用【与用户提问相同的语言】**(用户用英文问就用英文说，"
                         f"如「Running Skill via DevOps Agent: {sk['name']}{_vtag}」；中文问才用中文)。\n"
@@ -2938,7 +3009,7 @@ async def invoke(payload, context):
                 if isinstance(data, str) and data:
                     yield {"event": {"contentBlockDelta": {"delta": {"text": data}, "contentBlockIndex": 0}}}
                 elif isinstance(data, dict) and data.get("investigation_step") is not None:
-                    # 调查**分析过程**行 → 独立事件，前端收进右侧「调查过程」面板（不刷主聊天）。
+                    # 调查**分析过程**行 → 独立事件，前端收进右侧「思考过程」面板（不刷主聊天）。
                     _st = {"text": str(data.get("investigation_step") or "")}
                     if data.get("console_url"):
                         _st["console_url"] = data["console_url"]
@@ -2953,7 +3024,7 @@ async def invoke(payload, context):
                 continue
             # 原始事件 → 发给前端的事件，统一由 _stream_events 决定（与问候快路径同一出口）：
             #   · 工具开始调用 → 一句"正在做什么"进度行（长耗时处理时聊天窗口不再干等）；
-            #   · 思考过程明文 → {reasoning}（前端折叠灰字，收到正文即隐藏；语言已被
+            #   · 思考过程明文 → {reasoning}（前端只并进右侧「思考过程」面板的思考段；语言已被
             #     prompt 末尾 _lang_lock() 锁到本轮语言，与正文/进度行一致）；
             #   · 加密思考链 / 任何含 bytes 的事件 → 丢弃（否则被序列化成 repr 灌进正文）。
             for _out in _stream_events(event, _scrubber):
@@ -2978,39 +3049,72 @@ async def invoke(payload, context):
                   type(e).__name__, _code or "-", _model_id)
         _zh_err = not _is_probably_english(_raw_q)
         _what = _code or type(e).__name__
+        # 下面几条都会叫客户「换一个模型」，超时那条还会叫他去开「深度调查」—— 去哪儿做
+        # **按入口不一样**，说错了客户照着做，会发现根本没有那个东西：
+        #   · IM（主题 `im-chat`，即 `/agent notiops` 之后的对话，同一个 runtime）：没有输入框、
+        #     模型选择器、开关，也没有「新建对话」。换模型是发 `/model`，深度调查是
+        #     `/investigate <内容>` —— 与上面 `_TOPIC_FOCUS["im-chat"]` 那段 prompt 同一套说法；
+        #   · Web：模型选择器在输入框工具栏**最右**（输入框右下角，Composer.tsx 的 .cbar-right），
+        #     **不在**输入框上方（上方那一行是看板胶囊）。「深度调查」开关只有
+        #     `_topic_has_devops` 为真的主题才有 —— general / cases / whats-new 的工具条上没有它
+        #     （ModePicker 直接不渲染），在那几个主题里就不提这一步。也**不**改成「到左侧「调查」
+        #     里开」：那个入口按权限显示（nav:investigate），finops / developer / viewer 等预置角色
+        #     看不到它。
+        # 也**不点名具体模型**：这里写死过「Claude Sonnet 5」，它 2026-10-10 退役后，客户照着
+        # 去选择器里找，找不到。换成 5.5 也不对 ——「更快出字」从没对它测过；而且 5.5 要账号级
+        # 协议，有的账号里它恰恰就是调不通的那个（config/llm-model-catalog.json 里它的
+        # _availability_note）。选择器里列的都是管理员启用的，「换一个」就够了。
+        # BFF 那份（bff/web-chat/index.mjs 的 modelFailureText，只服务网页）也叫客户换模型：它的
+        # 「去哪儿换」（输入框右下角）和「不点名模型」**必须**与这里的 web 分支一致，改这里要一起改。
+        _im = _is_im_topic(payload.get("topic"))
+        _deep_ok = (not _im) and _topic_has_devops(_normalize_topic(payload.get("topic")))
+        _zh_where = "发送 `/model` " if _im else "在输入框右下角"
+        _en_switch = ("send `/model` to switch models" if _im
+                      else "switch models at the bottom right of the input box")
+        _en_switch_to = ("send `/model` to switch to a different model" if _im
+                         else "switch to a different model at the bottom right of the input box")
         if isinstance(e, _MODEL_TIMEOUT_ERRORS):
             # 超时是**另一种病**，给「重试通常就好」是误导：同样的问题给同一个模型，
-            # 大概率再超一次。真正有用的下一步是「把问题拆小」或「换一个吐字更快的模型」。
+            # 大概率再超一次。真正有用的下一步是「把问题拆小」或「换一个模型」（不点名哪个，
+            # 理由见上），再就是把长排查交给专门跑长任务的那条路（深度调查）。
             # 把等待时长写进文案（不是写死的数字，跟着 BEDROCK_READ_TIMEOUT_SEC 走）——
             # 客户才知道系统确实等过、等了多久，而不是以为点了没反应。
             _mins = BEDROCK_READ_TIMEOUT_SEC // 60
+            # 第 3 步因入口而异；没有这一步时，第 2 步就是最后一条，句末换成句号。
+            _deep_zh = ("改发 `/investigate <内容>`" if _im
+                        else "打开「深度调查」开关" if _deep_ok else "")
+            _deep_en = ("send `/investigate <text>` instead" if _im
+                        else "turn on the Deep Dive toggle" if _deep_ok else "")
             _msg = (
                 f"\n\n---\n⏳ 模型在 {_mins} 分钟内没有返回内容，本轮已停止等待。\n\n"
                 "这通常是问题太重、模型在做很长的推理。**下一步：**\n"
                 "1. 把问题拆小一点（比如只问一个服务、缩小时间范围）再发；\n"
-                "2. 或在输入框上方换一个模型（Claude Sonnet 5 通常更快出字）后重试；\n"
-                "3. 若是要做长时间的排查，打开「深度调查」开关 —— 那条路本来就是为长任务设计的。\n"
+                f"2. 或{_zh_where}换一个模型后重试{'；' if _deep_zh else '。'}\n"
+                + (f"3. 若是要做长时间的排查，{_deep_zh} —— 那条路本来就是为长任务设计的。\n"
+                   if _deep_zh else "")
                 if _zh_err else
                 f"\n\n---\n⏳ The model returned nothing within {_mins} minutes, so this turn "
                 "stopped waiting.\n\n"
                 "That usually means the question is heavy and the model is doing a long "
                 "reasoning pass. **Next steps:**\n"
                 "1. Narrow the question (one service, a shorter time range) and send it again;\n"
-                "2. Or switch models above the input box (Claude Sonnet 5 usually starts "
-                "streaming sooner) and retry;\n"
-                "3. For genuinely long investigations, turn on the Deep investigation toggle — "
-                "that path is built for long-running work.\n"
+                f"2. Or {_en_switch} and retry{';' if _deep_en else '.'}\n"
+                + (f"3. For genuinely long investigations, {_deep_en} — "
+                   "that path is built for long-running work.\n"
+                   if _deep_en else "")
             )
         elif _what.startswith("AccessDenied") or _what == "ResourceNotFoundException":
             # 权限/未开通：**重试永远不会好**，给「重试通常就好」是把客户送进无限循环。
             # 这是新客户装完之后最容易撞的第一堵墙 —— 两条安装路径都不预检 Bedrock 模型
-            # 访问权限，而默认模型（Grok）恰恰是需要单独开通的那类。所以这里必须点名
-            # 「要去改配置」，并把改哪儿说清楚。
+            # 访问权限，而默认模型同样得先在 Bedrock 里开通（docs/DEPLOYMENT.md 的前置条件）。
+            # 当前默认是哪个看 config/llm-model-catalog.json 的 default_model，别在这里写名字
+            # —— 这里写过「Grok」，换默认之后就成了错话。所以这里必须点名「要去改配置」，
+            # 并把改哪儿说清楚。
             _msg = (
                 f"\n\n---\n⚠️ 模型调用被拒绝（`{_what}`），本轮未能生成回答。\n\n"
                 f"当前 AWS 账号在本区域**没有这个模型（`{_model_id}`）的可用访问权限**。\n\n"
                 "**重试不会好转，需要改配置：**\n"
-                "1. 最快的办法 —— 在输入框上方**换一个模型**（每个模型的开通状态是独立的）；\n"
+                f"1. 最快的办法 —— {_zh_where}**换一个模型**（每个模型的开通状态是独立的）；\n"
                 "2. 或去开通本模型：Amazon Bedrock 控制台 → **Model access**（模型访问权限）"
                 "→ 勾选该模型 → 提交，通常几分钟生效；\n"
                 "3. 若模型已经开通仍报这个错，是运行角色缺权限 —— 需要给它补上 "
@@ -3022,8 +3126,7 @@ async def invoke(payload, context):
                 "answer.\n\n"
                 f"This AWS account has no usable access to that model (`{_model_id}`) in this "
                 "region. **Retrying will not help — a configuration change is needed:**\n"
-                "1. Fastest fix — switch to a different model above the input box (each model "
-                "is enabled independently);\n"
+                f"1. Fastest fix — {_en_switch_to} (each model is enabled independently);\n"
                 "2. Or enable this one: Amazon Bedrock console → **Model access** → select the "
                 "model → submit; it usually takes effect within minutes;\n"
                 "3. If the model is already enabled and you still see this, the runtime role is "
@@ -3038,38 +3141,51 @@ async def invoke(payload, context):
             # 临时故障。给「重试通常就好」会让客户在同一个死会话里一直撞墙。
             # 换模型 = 新的 agent 缓存键 = 重新从 Memory 恢复历史 = 走一遍
             # core/history_scrub.repair_role_alternation()，所以「换模型」是真的能修。
-            _msg = (
-                f"\n\n---\n⚠️ 模型拒绝了本轮请求（`{_what}`），本轮未能生成回答。\n\n"
-                "这类错误通常是**这个会话的历史被上一次失败弄坏了**，而不是你这句话有问题。\n\n"
-                "**下一步：**\n"
-                "1. **新建一个对话**，把同样的问题再问一次 —— 这是最快的办法；\n"
-                "2. 或在输入框上方**换一个模型** —— 换模型会重建这个会话的上下文，"
-                "系统会顺手把坏掉的历史修好；\n"
-                f"3. 若新对话里仍报同样的错，请把错误码 `{_what}` 反馈给我们。\n"
-                if _zh_err else
-                f"\n\n---\n⚠️ The model rejected this request (`{_what}`), so this turn produced "
-                "no answer.\n\n"
-                "This error almost always means **this conversation's history was corrupted by "
-                "an earlier failure** — not that anything is wrong with your message.\n\n"
-                "**Next steps:**\n"
-                "1. **Start a new conversation** and ask the same question — fastest fix;\n"
-                "2. Or **switch models** above the input box — that rebuilds this session's "
-                "context and repairs the broken history on the way;\n"
-                f"3. If a fresh conversation still fails, report the error code `{_what}` to us.\n"
-            )
+            # IM 没有「新建对话」（会话按群/私聊固定，见 core/ddb_state.im_agent_session_id），
+            # 所以 IM 那份只剩「换模型」这一条路，它就是第 1 步。
+            if _zh_err:
+                _msg = (
+                    f"\n\n---\n⚠️ 模型拒绝了本轮请求（`{_what}`），本轮未能生成回答。\n\n"
+                    "这类错误通常是**这个会话的历史被上一次失败弄坏了**，而不是你这句话有问题。\n\n"
+                    "**下一步：**\n"
+                    + ("1. 发送 `/model` **换一个模型** —— 换模型会重建这个会话的上下文，"
+                       "系统会顺手把坏掉的历史修好；\n"
+                       f"2. 若换了模型仍报同样的错，请把错误码 `{_what}` 反馈给我们。\n"
+                       if _im else
+                       "1. **新建一个对话**，把同样的问题再问一次 —— 这是最快的办法；\n"
+                       "2. 或在输入框右下角**换一个模型** —— 换模型会重建这个会话的上下文，"
+                       "系统会顺手把坏掉的历史修好；\n"
+                       f"3. 若新对话里仍报同样的错，请把错误码 `{_what}` 反馈给我们。\n")
+                )
+            else:
+                _msg = (
+                    f"\n\n---\n⚠️ The model rejected this request (`{_what}`), so this turn produced "
+                    "no answer.\n\n"
+                    "This error almost always means **this conversation's history was corrupted by "
+                    "an earlier failure** — not that anything is wrong with your message.\n\n"
+                    "**Next steps:**\n"
+                    + ("1. Send `/model` to **switch models** — that rebuilds this session's context "
+                       "and repairs the broken history on the way;\n"
+                       f"2. If it still fails after you switch models, report the error code `{_what}` "
+                       "to us.\n"
+                       if _im else
+                       "1. **Start a new conversation** and ask the same question — fastest fix;\n"
+                       "2. Or **switch models** at the bottom right of the input box — that rebuilds "
+                       "this session's context and repairs the broken history on the way;\n"
+                       f"3. If a fresh conversation still fails, report the error code `{_what}` to us.\n")
+                )
         else:
             _msg = (
                 f"\n\n---\n⚠️ 模型调用失败（`{_what}`），本轮未能生成回答。\n\n"
                 "**下一步：**\n"
                 "1. 直接再发一次 —— 这类错误多为模型服务端的临时故障，重试通常就好；\n"
-                "2. 若连续失败，在输入框上方切换到**另一个模型**（如 Claude Sonnet 5）后重试。\n"
+                f"2. 若连续失败，{_zh_where}切换到**另一个模型**后重试。\n"
                 if _zh_err else
                 f"\n\n---\n⚠️ The model call failed (`{_what}`), so this turn produced no answer.\n\n"
                 "**Next steps:**\n"
                 "1. Send the message again — this class of error is usually a transient "
                 "model-service fault and a retry succeeds;\n"
-                "2. If it keeps failing, switch to a different model (e.g. Claude Sonnet 5) "
-                "above the input box and retry.\n"
+                f"2. If it keeps failing, {_en_switch_to} and retry.\n"
             )
         yield {"event": {"contentBlockDelta": {"delta": {"text": _msg}, "contentBlockIndex": 0}}}
         # 尾巴修复 —— 别让这一次失败把整个会话**永久**弄死。

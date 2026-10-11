@@ -38,6 +38,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 import postprocess_template as pp  # noqa: E402
+import artifacts  # noqa: E402  —— 发布产物清单的唯一真源
 
 STANDALONE_TS = os.path.join(ROOT, "infra", "lib", "notiops-webchat-standalone-stack.ts")
 
@@ -57,6 +58,13 @@ SUMS = {
     # 客户会选什么；只装 web 的客户由 stager 按 `im-` 前缀跳过下载。
     "im-code.zip": "f" * 64,
     "im-layer.zip": "0" * 64,
+    # 自建成本 MCP server。同理无条件在清单里 —— 「填不填 CurTable」是部署期参数，
+    # 没选装的客户由 stager 按 `cost-mcp-` 前缀跳过下载。
+    "cost-mcp-code.zip": "1" * 64,
+    "cost-mcp-layer.zip": "2" * 64,
+    # CUR 自建。同理无条件在清单里 —— `ProvisionCur` 也是部署期参数，
+    # 没选的客户由 stager 按 `cur-provisioner` 前缀跳过下载。
+    "cur-provisioner.zip": "3" * 64,
     "agent-code.zip": "c" * 64,
 }
 TAG = "v9.9.9"
@@ -241,6 +249,50 @@ def synth_template() -> dict:
                         "/im-layer.zip"]]},
                 }},
             },
+            # 自建成本 MCP server —— 与 IM 同构：代码 + 层两个产物、都从 staging 桶取、
+            # 都挂部署期条件（客户填了 CurTable 才创建）。
+            "CostMcpFunctionA9B8C7D6": {
+                "Type": "AWS::Lambda::Function",
+                "Condition": "InstallCostMcp",
+                "DependsOn": ["StagerArtifacts"],
+                "Metadata": {"aws:cdk:path": "NotiOps/CostMcpFunction/Resource"},
+                "Properties": {"Code": {
+                    "S3Bucket": {"Ref": "StagingBucket9644C37C"},
+                    "S3Key": {"Fn::Join": ["", [
+                        "cost-mcp/",
+                        {"Fn::FindInMap": ["NotiOpsRelease", pp.RELEASE_MAP_KEY, "Tag"]},
+                        "/cost-mcp-code.zip"]]},
+                }},
+            },
+            # CUR 自建（`ProvisionCur=yes`）。**一个 zip 两个 handler** —— 阶段一的
+            # custom resource 与阶段二的 finalizer 共用 cur-provisioner.zip，所以
+            # 这个 fixture 里只出现阶段一那个函数（postprocess 从它读 key）。
+            "CurProvisionerFnAABBCCDD": {
+                "Type": "AWS::Lambda::Function",
+                "Condition": "ProvisionCurReport",
+                "DependsOn": ["StagerArtifacts"],
+                "Metadata": {"aws:cdk:path": "NotiOps/CurProvisionerFn/Resource"},
+                "Properties": {"Code": {
+                    "S3Bucket": {"Ref": "StagingBucket9644C37C"},
+                    "S3Key": {"Fn::Join": ["", [
+                        "cur/",
+                        {"Fn::FindInMap": ["NotiOpsRelease", pp.RELEASE_MAP_KEY, "Tag"]},
+                        "/cur-provisioner.zip"]]},
+                }},
+            },
+            "CostMcpLayerD6C7B8A9": {
+                "Type": "AWS::Lambda::LayerVersion",
+                "Condition": "InstallCostMcp",
+                "DependsOn": ["StagerArtifacts"],
+                "Metadata": {"aws:cdk:path": "NotiOps/CostMcpLayer/Resource"},
+                "Properties": {"Content": {
+                    "S3Bucket": {"Ref": "StagingBucket9644C37C"},
+                    "S3Key": {"Fn::Join": ["", [
+                        "cost-mcp/",
+                        {"Fn::FindInMap": ["NotiOpsRelease", pp.RELEASE_MAP_KEY, "Tag"]},
+                        "/cost-mcp-layer.zip"]]},
+                }},
+            },
             "AgentRuntime": {
                 "Type": "AWS::BedrockAgentCore::Runtime",
                 "DependsOn": ["StagerArtifacts"],
@@ -289,16 +341,27 @@ _check(f"release tag 写进 Mappings.NotiOpsRelease.{pp.RELEASE_MAP_KEY}",
 manifest = json.loads(out["Resources"]["StagerArtifacts"]["Properties"]["Artifacts"])
 _check("清单是 JSON **字符串**而不是嵌套对象（自定义资源属性到 Lambda 那边全是字符串）",
        isinstance(out["Resources"]["StagerArtifacts"]["Properties"]["Artifacts"], str))
-_check("清单顺序 = 搬运顺序：144MiB 的 agent zip 放最后（前面失败能秒级暴露）",
-       [e["name"] for e in manifest]
-       == ["bff.zip", "chat-dist.zip", "web-notif.zip",
-           "im-code.zip", "im-layer.zip", "agent-code.zip"])
-_check("六个 key 都是从模板里读出来的（intrinsic 求值），不是脚本里重拼的",
-       [e["key"] for e in manifest]
-       == [BFF_KEY, f"frontend/{TAG}/chat-dist.zip", f"notif/{TAG}/web-notif.zip",
-           f"im/{TAG}/im-code.zip", f"im/{TAG}/im-layer.zip",
-           f"agent/{TAG}/agent-code.zip"],
+# 顺序**从 scripts/artifacts.py 派生**，不在这里再抄一份 —— 那正是加第 7/8 个产物时
+# 发现的问题：同一份清单散落在十几处，漏改一处的症状是部署到一半才暴露。
+_check("清单顺序 = 搬运顺序（artifacts.STAGING_ORDER）：144MiB 的 agent zip 放最后",
+       [e["name"] for e in manifest] == list(artifacts.STAGING_ORDER),
+       str([e["name"] for e in manifest]))
+_EXPECTED_KEYS = {
+    "bff.zip": BFF_KEY,
+    "chat-dist.zip": f"frontend/{TAG}/chat-dist.zip",
+    "web-notif.zip": f"notif/{TAG}/web-notif.zip",
+    "cost-mcp-code.zip": f"cost-mcp/{TAG}/cost-mcp-code.zip",
+    "cost-mcp-layer.zip": f"cost-mcp/{TAG}/cost-mcp-layer.zip",
+    "cur-provisioner.zip": f"cur/{TAG}/cur-provisioner.zip",
+    "im-code.zip": f"im/{TAG}/im-code.zip",
+    "im-layer.zip": f"im/{TAG}/im-layer.zip",
+    "agent-code.zip": f"agent/{TAG}/agent-code.zip",
+}
+_check("每个 key 都是从模板里读出来的（intrinsic 求值），不是脚本里重拼的",
+       [e["key"] for e in manifest] == [_EXPECTED_KEYS[n] for n in artifacts.STAGING_ORDER],
        str([e["key"] for e in manifest]))
+_check("所有产物都在 artifacts.py 的清单里（新增产物必须同时进那个唯一真源）",
+       {e["name"] for e in manifest} == set(artifacts.ALL))
 # 两个 im-*.zip 的名字前缀是**跨三处的契约**：这里 / SHA256SUMS / stager 里
 # `name.startswith("im-")` 的跳过逻辑。改名字要三处一起改，否则症状是"只有选了 IM 的
 # 客户开栈失败"（web-only 客户一切正常，发布验证极易漏掉）。
@@ -464,6 +527,9 @@ def _tagless_keys() -> None:
     # 一个产物这条反例就撞不上（而它本身就是"少改一处"的那类 bug）。
     t["Resources"]["FeishuWorkerA1B2C3D4"]["Properties"]["Code"]["S3Key"] = "im/im-code.zip"
     t["Resources"]["ImDepsLayerE5F6A7B8"]["Properties"]["Content"]["S3Key"] = "im/im-layer.zip"
+    t["Resources"]["CostMcpFunctionA9B8C7D6"]["Properties"]["Code"]["S3Key"] = "cost-mcp/cost-mcp-code.zip"
+    t["Resources"]["CostMcpLayerD6C7B8A9"]["Properties"]["Content"]["S3Key"] = "cost-mcp/cost-mcp-layer.zip"
+    t["Resources"]["CurProvisionerFnAABBCCDD"]["Properties"]["Code"]["S3Key"] = "cur/cur-provisioner.zip"
     pp.postprocess(t, TAG, dict(SUMS), "https://example.invalid/x")
 
 
@@ -534,6 +600,9 @@ with tempfile.TemporaryDirectory() as d:
         fh.write(f"{'e' * 64}  web-notif.zip\n")
         fh.write(f"{'f' * 64}  im-code.zip\n")
         fh.write(f"{'0' * 64} *im-layer.zip\n")
+        fh.write(f"{'1' * 64}  cost-mcp-code.zip\n")
+        fh.write(f"{'2' * 64} *cost-mcp-layer.zip\n")
+        fh.write(f"{'3' * 64}  cur-provisioner.zip\n")
         fh.write(f"# 注释行\n\n{'c' * 64}  dist/oneclick/agent-code.zip\n")
     _check("接受 `*` 前缀 / 目录前缀 / 注释与空行，key 取 basename",
            pp._read_sha256sums(pp.Path(good)) == SUMS)
@@ -550,7 +619,7 @@ ts = open(STANDALONE_TS, encoding="utf-8").read()
 _check(f"TS 里写着同一个 tag 占位值 {pp.RELEASE_TAG_PLACEHOLDER!r}", pp.RELEASE_TAG_PLACEHOLDER in ts)
 _check(f"TS 里的 Mappings 顶层键是 {pp.RELEASE_MAP_KEY!r}（不是 CFN 保留的 Default）",
        pp.RELEASE_MAP_KEY in ts and '"Default":' not in ts)
-_check("六个产物名与 TS/StagerFn 侧一致",
+_check(f"{len(artifacts.ALL)} 个产物名与 TS/StagerFn 侧一致",
        all(n in ts or n in json.dumps(out) for n in
            (pp.BFF_ARTIFACT, pp.CHAT_DIST_ARTIFACT, pp.NOTIF_ARTIFACT,
             pp.IM_CODE_ARTIFACT, pp.IM_LAYER_ARTIFACT, pp.AGENT_ARTIFACT)))

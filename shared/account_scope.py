@@ -4,12 +4,14 @@
 
 idle-detactor 原生是【无条件多账号】架构:lambda1 采集 / lambda5 成本 / DevOps Agent
 调查都会遍历 config 表里所有 enabled 账号、逐个 STS AssumeRole 进去。光靠"表里只放一个
-账号"并不等于 disabled —— 一旦 Dashboard 上 onboard 了别的账号就会立刻跨账号。所以这里在
+账号"并不等于 disabled —— 一旦在管理页上 onboard 了别的账号(当时是 Dashboard;它
+2026-09-04 退役后是 Web Chat「更多 → 管理 → 账户」)就会立刻跨账号。所以这里在
 代码层加一道硬闸门。
 
 设计原则:【单一开关 + 默认安全 + 完全可逆】
-  环境变量 ``LOCKED_ACCOUNT_ID`` = 部署账号 ID(CDK 在主栈 lambdaEnv 与 BotStack 容器
-  里统一注入 ``cdk.Aws.ACCOUNT_ID``)。
+  环境变量 ``LOCKED_ACCOUNT_ID`` = 部署账号 ID(CDK 在主栈 lambdaEnv 与 IM 函数
+  ``createImCore`` 里统一注入 ``cdk.Aws.ACCOUNT_ID``,多账号模式部署时注入空串;原先
+  BotStack 容器那一处随 BotStack 退役)。
     * 已设置(默认部署形态):所有后台采集 / 调查只允许该账号,其余账号在执行路径上被
       过滤 / 拒绝。
     * 未设置(留空):退化为 idle-detactor 原始多账号行为。本开关零侵入、可逆——日后要
@@ -17,9 +19,11 @@ idle-detactor 原生是【无条件多账号】架构:lambda1 采集 / lambda5 �
 
 为什么闸门设在"账号加载层 / create_investigation 入口",而不是改
 ``shared.queries.list_accounts``:
-  Dashboard 与 API 需要 list_accounts 列出【全部】账号(含被锁掉的)来做管理与展示,过滤
-  绝不能下沉到通用查询层;只在真正会发起跨账号 AWS 调用的执行路径上设闸门。这样
-  Dashboard 行为不变,而采集/调查被收敛到部署账号。
+  管理与展示需要 list_accounts 列出【全部】账号(含被锁掉的)—— 当时是 Dashboard 与 API
+  (已于 2026-09-04 退役);现在 Python 侧的展示方是 IM 的 ``/account list``
+  (``core/im_accounts.py``;被锁的账号照列,只标明当前切不过去)。所以过滤绝不能下沉到
+  通用查询层;只在真正会发起跨账号 AWS 调用的执行路径上设闸门。这样列表照实展示,而
+  采集/调查被收敛到部署账号。
 """
 
 from __future__ import annotations

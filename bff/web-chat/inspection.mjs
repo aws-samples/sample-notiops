@@ -2902,7 +2902,7 @@ export async function getResources(accountId, { region = "" } = {}) {
     if (!creds) {
       return fail("cross_account_unavailable",
         `AssumeRole ${roleArn} 失败 —— 无法列出账号 ${acct} 的资源。`
-        + "去「管理 → 账户」展开这个账号的「巡检的跨账号前置」，"
+        + "去「更多 → 管理 → 账户」展开这个账号的「巡检的跨账号前置」，"
         + "确认①采集角色已部署并验证通过。");
     }
   }

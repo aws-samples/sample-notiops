@@ -10,7 +10,10 @@
  */
 import { describe, it, expect, beforeEach } from "vitest";
 
-import { loadConvMode, saveConvMode, forgetConvMode, modeOf, fieldsOf, restorableMode } from "./convMode";
+import { loadConvMode, saveConvMode, forgetConvMode, modeOf, fieldsOf, restorableMode, relockFromHistory } from "./convMode";
+// 源码级断言读的是 `?raw` 文本（同 topicmerge.test.tsx）：整个 ChatApp 渲染要 Amplify 会话 +
+// 十几个接口，这里只钉「水合处真的调用了下面那个纯函数」。
+import chatAppSrc from "./pages/ChatApp.tsx?raw";
 
 const KEY = "notiops.convMode";
 const raw = () => JSON.parse(localStorage.getItem(KEY) || "{}") as Record<string, string>;
@@ -160,5 +163,47 @@ describe("恢复前的主题闸门", () => {
     expect(restorableMode("investigate", "off")).toBe("off");
     expect(restorableMode(undefined, "chat")).toBe("off");
     expect(restorableMode(undefined, "agent")).toBe("off");
+  });
+});
+
+describe("拉历史后的回锁（relockFromHistory）", () => {
+  const h = (...vias: (string | undefined)[]) => vias.map((via) => ({ via }));
+
+  it("通用会话里有客户自己 DevOps Agent 的回复 → 锁回 DevOps 对话", () => {
+    expect(relockFromHistory("general", h(undefined, "devops-agent"))).toBe("chat");
+    expect(relockFromHistory(undefined, h("devops-agent")), "topic 缺失按 general").toBe("chat");
+  });
+
+  it("没有 devops-agent / starops 的回复 → 不动（null），不是 off", () => {
+    // null 与 "off" 是两件事：null 不碰会话现有的字段，"off" 会把四个字段全清掉。
+    expect(relockFromHistory("general", h(undefined, "builtin"))).toBeNull();
+    expect(relockFromHistory("general", [])).toBeNull();
+  });
+
+  it("只恢复通用会话：其余主题照旧是每轮开关语义", () => {
+    for (const topic of ["investigate", "cost", "finops", "cases", "whats-new"]) {
+      expect(relockFromHistory(topic, h("devops-agent")), topic).toBeNull();
+      expect(relockFromHistory(topic, h("starops")), topic).toBeNull();
+    }
+  });
+
+  it("🔴 多云关着（`MULTICLOUD_UI` 关）：有 STAROps 历史的会话退回 NotiOps，不锁回 STAROps", () => {
+    // 2026-10-11 之前 ChatApp 的回锁不看开关：选择器只挂在空会话的落地页上，有历史的 STAROps
+    // 会话绕过了它的回退（ChatObjectPicker.hidden.test.tsx 那条「退回 NotiOps」）—— 标题栏仍是
+    // 「阿里云 STAROps」，接着问照样带着 starops_chat:true 走 BFF 那条链路，而 BFF 不校验对象锁。
+    expect(relockFromHistory("general", h("starops"))).toBe("off");
+    expect(relockFromHistory(undefined, h(undefined, "starops"))).toBe("off");
+    // 「开关翻开那天」的口径由 convMode.starops.test.ts 钉（vi.mock 整文件生效）。
+  });
+
+  it("🔴 多云关着、两种 via 都有：退回的是 NotiOps，不是 DevOps Agent", () => {
+    // 互斥按历史事实判（STAROps 优先），不按闸门结果 —— 否则一段阿里云会话会被锁成 AWS DevOps Agent。
+    expect(relockFromHistory("general", h("starops", "devops-agent"))).toBe("off");
+  });
+
+  it("ChatApp 水合处真的调用它，而不是另留一份内联判断", () => {
+    expect(chatAppSrc).toMatch(/relockFromHistory\(c\.topic, mapped\)/);
+    // 原来那份内联判断的形状（不看开关的 `m.via === "starops"`）不许回来。
+    expect(chatAppSrc).not.toMatch(/m\.via === "starops"/);
   });
 });

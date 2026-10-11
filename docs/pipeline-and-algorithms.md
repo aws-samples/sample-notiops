@@ -20,30 +20,24 @@ NotiOps 有两条部署路径，本篇三条流水线**只属于方式 B**：
 | 每日成本异常 | ❌ 不建 `notiops-cost-analyzer`，也没有 `notiops-daily-cost-analysis` 规则 | ✅ |
 | 每日消息推送 | ❌ 不建 `notiops-notifier`，也没有 `notiops-daily-notification` 规则 | ✅ |
 
-> ⚠️ **方式 A 的 BFF 仍然带着 `INSPECTION_TABLE` 环境变量** —— 两条路径共用同一个
-> `infra/lib/constructs/web-chat-core.ts`，那里无条件注入它（还有
-> `INSPECTION_SCHEDULER_FUNCTION` / `INSPECTION_EXECUTOR_FUNCTION`），且巡检相关的
-> 4 条 IAM 语句照样挂在 BFF 角色上。IAM 本身无害（授权一个不存在的 ARN 不产生任何权限），
-> 但**别把它读成「方式 A 支持巡检」**。
+> ⚠️ **方式 A 上「巡检」整块不出现（2026-09-07 起）**。两条路径共用同一个
+> `infra/lib/constructs/web-chat-core.ts`，它在静态模板（方式 A）上把 BFF 的 `INSPECTION_TABLE`
+> 置成空串；`config/capabilities.json` 给 `nav:inspection` 声明了 `requiresEnv: INSPECTION_TABLE`，
+> 于是 `visibleTree()` 把这个 tab 连同全部子页从 `/capabilities` 树里摘掉（`bff/web-chat/authz.mjs`
+> 的祖先补全也不会因为子页可见再把它补回来）。所以方式 A 侧栏「更多」里根本没有「巡检」——
+> 这不是「点进去加载失败」。绕过前端直接调 `/inspection/*` 的请求，通过鉴权后由
+> `bff/web-chat/index.mjs` 里那道 `inspectionConfigured()` 门统一返回 HTTP 200 +
+> `inspection_not_deployed`（这套部署不含巡检），而不是去查一张不存在的表。
+>
+> 仍然留着的只有 IAM 这一层：`INSPECTION_SCHEDULER_FUNCTION` / `INSPECTION_EXECUTOR_FUNCTION`
+> 两个函数名照样写死注入，巡检相关的 4 条 IAM 语句也照样挂在 BFF 角色上，在方式 A 上指向
+> 不存在的资源。IAM 本身无害（授权一个不存在的 ARN 不产生任何权限），但**别把它读成「方式 A 支持巡检」**。
 
 > 📌 「两条路径的 **web 功能**必须完全一致」是本项目的铁律。本篇三条是**后端批处理
-> 流水线**、不是 web 功能，但它们在方式 A 上的缺席**确实**在 web 侧留下一处已知缺口，
-> 这里如实写清而不含糊过去：
->
-> `authz.mjs` 的 `PRESET_ROLES` 里 `role:finops` / `role:support` / `role:viewer` 都含
-> `nav:inspection:*`。`visibleTree()` **确实有**一道数据源可用性判据
-> （`envConfigured(node.requiresEnv)`，`nav:finops:cur-*` 那几个 subtab 就是靠它在没配
-> `COST_AGENT_MCP_URL` 时整块不下发），但 `config/capabilities.json` 里
-> `nav:inspection` 及其全部子节点**都没有声明 `requiresEnv`**；而且即使声明成
-> `INSPECTION_TABLE` 也拦不住 —— 那个变量在两条路径上都被无条件注入。所以方式 A 上
-> 这些角色的用户会看到「资源巡检」tab，点进去是 `ddb_error` 加载失败面板 ——
-> HTTP 200、不是 403，也不会自动隐藏。现成的收口手段是管理页的**模块开关**
-> （`nav:inspection` 是 level=tab 且非 alwaysOn/adminOnly，`admin.mjs` 的
-> `apiGetModules` 已把它列为可关）—— 需要人手关一次。要做成自动的，得先让方式 A 别再
-> 无条件注入那个变量（或换一个能区分拓扑的变量），再给节点声明 `requiresEnv`，并与
-> `authorize()` 同步改，那是一个独立改动。相关注释见 `web-chat-core.ts` 里
-> `INSPECTION_TABLE` 上方那段（⚠️ 那段仍写着「visibleTree 里没有任何 env 判据」，
-> 现在已经有了，判据本身不是缺的那一块）。
+> 流水线**、不是 web 功能；它们在方式 A 上的缺席，在 web 侧只表现为两处「按设计不下发」：
+> 上面那条「巡检」整块不出现，以及 FinOps 里的每日成本异常卡（`nav:finops:daily-anomaly`，
+> `requiresEnv: COST_ANALYZER_FUNCTION`）不出现 —— 都是没有那个后端就整块不给，而不是半通的界面，
+> 见 [api-reference.md](api-reference.md) §5.1。
 >
 > 另一条不构成缺口的差异（方式 A 单栈无跨栈 Export）见 [DEPLOYMENT.md](DEPLOYMENT.md) §5.4。
 
@@ -71,8 +65,9 @@ NotiOps 有两条部署路径，本篇三条流水线**只属于方式 B**：
 
 `notiops-inspection-executor`（1024MB / 15min）**没有定时规则** —— 它是 SQS 消费者。
 CUR finalizer（代码在 `lambda6_cur_finalizer/`，CDK 没给它物理函数名，日志组是
-`/aws/lambda/notiops-cur-finalizer`）也没有 —— 它由一条**一次性** EventBridge Scheduler
-触发（见 §3.3）。
+`/aws/lambda/notiops-cur-finalizer`）不属于这三条流水线：它由 `setup.sh` 建的一条**一次性**
+EventBridge Scheduler 触发，另有一条常驻的 `notiops-cur-finalizer-selfheal`（`rate(4 hours)`）
+兜底自愈（见 §3.3）。
 
 > ⚠️ 定时规则的**周期**写在 CDK 里，但资源巡检的**具体时刻**存 DynamoDB —— 客户改巡检
 > 时间不需要重新部署。代价是调度粒度 = 15 分钟，UI 必须把可选时刻限制成 15 分钟整数倍
@@ -442,9 +437,15 @@ setup.sh 建 CUR ReportDefinition
                     （lambda6_cur_finalizer/athena_saved_queries.py）
 ```
 
-为什么不在 CDK 里静态声明：每个客户账号的触发时间是动态的 T+25h，属于运行时数据而非部署时
-常量。CDK 只负责建好可复用的调用角色（`notiops-cur-finalizer-scheduler-role`）并输出
+为什么这条一次性 schedule 不在 CDK 里静态声明：每个客户账号的触发时间是动态的 T+25h，属于运行时
+数据而非部署时常量。CDK 只负责建好可复用的调用角色（`notiops-cur-finalizer-scheduler-role`）并输出
 `CurFinalizerFunctionArn` / `CurFinalizerSchedulerRoleArn` 两个值给 `setup.sh`。
+
+**另有一条常驻的自愈规则**：`notiops-cur-finalizer-selfheal`（`rate(4 hours)`，后端栈里静态声明、
+无条件创建），只传 `account_id`，桶名 / 报告名一律以 `cur-athena-status` 记录里的值为准。它补的是
+一次性 schedule 不自愈的洞：那一次如果撞上 AWS 交付晚了、或 crawler 还没爬完，状态会停在
+`DELAYED` 而再也没有下一次。没有记录或已经 `READY` 时，handler 一次 DynamoDB GetItem 就返回。
+方式 A 在 `ProvisionCur=yes` 时也有同一条规则（`notiops-webchat-standalone-stack.ts`）。
 
 数据就绪前 FinOps 仪表盘显示「数据初始化中」占位卡片。
 
@@ -470,11 +471,16 @@ setup.sh 建 CUR ReportDefinition
 
 以下路径**不是定时流水线**，只列出来避免误找：
 
-- **事件驱动的主动观察推送**：`notiops-push-*` 系列 EventBridge 规则（Health / CloudWatch 告警 /
-  Cost Anomaly / Trusted Advisor / GuardDuty …）→ `notiops-push-handler` → IM。全部默认
-  `DISABLED`，需显式启用。定义单一来源在 `infra/lib/constructs/web-notif-sources.ts`。
-- **Web 通知收件箱**：同一批事件源的另一个 sink，写 `notiops-web-chat` 表的 `notif#` 段，
-  前端轮询。方式 A 与方式 B 都有。
+- **事件驱动的主动观察推送**：`notiops-push-*` 系列 5 条 EventBridge 规则（CloudWatch 告警 / Backup /
+  GuardDuty / Cost Anomaly / Trusted Advisor）→ `notiops-push-handler`，定义在
+  `infra/lib/notiops-backend-stack.ts` 的 `pushRuleSources`，只有方式 B 有，全部默认 `DISABLED`。
+  ⚠️ 打开了也**不投递 IM**：`shared/report_delivery/push_handler.py` 的 `_push_configured()` 只认
+  环境变量 `PUSH_TARGET_CHAT_ID` / `PUSH_TARGET_PLATFORM`（钉钉另认 `DINGTALK_PUSH_WEBHOOK_URL`），
+  而哪个栈都不设，于是每个事件都记一行 `Push disabled` 就返回（见 [DEPLOYMENT.md](DEPLOYMENT.md) §7）。
+- **Web 通知收件箱**：10 条 `notiops-web-notif-*` 规则（默认开 5 条，比上面多 Health / EC2 Spot /
+  Auto Scaling / RDS / Config）→ `notiops-web-notif-handler`，复用同一个 `core/push_event` 归一化，
+  写 `notiops-web-chat` 表的 `notif#` 段，前端轮询。事件源清单的单一来源是
+  `infra/lib/constructs/web-notif-sources.ts`，方式 A 与方式 B 都有。
 - **AWS Health 事件转发**：`notiops-phd-forwarder`（128MB / 90s）。
 - **IM 机器人**：API Gateway **HTTP** API（`$default` catch-all 路由）+ Lambda ingress，
   见 [im-bot-interaction.md](im-bot-interaction.md) 与 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md)。
@@ -485,5 +491,5 @@ setup.sh 建 CUR ReportDefinition
   （UTC 22:00 = 北京 06:00，与 `cur_dashboard.mjs` 的 UTC+8 缓存 key 基准配套）→ BFF。
   与本篇三条流水线无关。两条路径的建法不同但都不算缺口：方式 A 的 cost-agent MCP URL
   是**部署期参数**（恒真）所以规则恒建，参数留空时预热每天空转一次（BFF 见 URL 为空
-  立即返回 not-configured，不发任何 AWS 调用）；方式 B 只在传了 `-c costAgentMcpUrl`
-  时才建这条规则。
+  立即返回 not-configured，不发任何 AWS 调用）；方式 B 只在接了 CUR 数据源时才建这条规则
+  （外接 `-c costAgentMcpUrl`，或 `COST_MCP_SELF_HOST=true` 自建 —— 两种都会让 `costAgentMcpUrl` 非空）。

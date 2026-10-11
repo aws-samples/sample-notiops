@@ -76,18 +76,30 @@ _BUILTIN_CATALOG: dict = {
     # 2026-09-01：默认从 Claude Sonnet 5 换成 Grok 4.6（用户决策）。理由与取舍、
     # 以及"改这一条要同步哪几处 / 哪几处不许顺手改"，全在种子文件
     # config/llm-model-catalog.json 的 `_default_model_note` 里，别在这里再写一份。
-    "default_model": "xai-grok-4-6",
+    "default_model": "moonshot-kimi-k3",
     "models": [
-        {"alias": "claude-sonnet-5", "short": "claude", "aliases_legacy": ["claude"],
+        # 账号级协议风险：有的账号 5 能用、5.5 还没开通，见种子文件 _availability_note。
+        {"alias": "claude-sonnet-5-5", "short": "claude", "aliases_legacy": ["claude"],
+         "model_id": "global.anthropic.claude-sonnet-5-5", "label": "Claude Sonnet 5.5",
+         "kind": "bedrock_anthropic", "region": None, "hard_output_limit": 128000,
+         "output_override": {"im": 6000}, "supports_prompt_cache": True,
+         "surfaces": ["webchat", "im"], "enabled": True},
+        {"alias": "claude-sonnet-5", "short": None, "aliases_legacy": [],
          "model_id": "global.anthropic.claude-sonnet-5", "label": "Claude Sonnet 5",
          "kind": "bedrock_anthropic", "region": None, "hard_output_limit": 128000,
          "output_override": {"im": 6000}, "supports_prompt_cache": True,
-         "surfaces": ["webchat", "im"], "enabled": True},
-        {"alias": "claude-opus-5", "short": "opus", "aliases_legacy": ["opus"],
-         "model_id": "global.anthropic.claude-opus-5", "label": "Claude Opus 5",
+         "surfaces": ["webchat", "im"], "enabled": False},
+        # 同上。
+        {"alias": "claude-opus-5-5", "short": "opus", "aliases_legacy": ["opus"],
+         "model_id": "global.anthropic.claude-opus-5-5", "label": "Claude Opus 5.5",
          "kind": "bedrock_anthropic", "region": None, "hard_output_limit": 128000,
          "output_override": {"im": 6000}, "supports_prompt_cache": True,
          "surfaces": ["webchat", "im"], "enabled": True},
+        {"alias": "claude-opus-5", "short": None, "aliases_legacy": [],
+         "model_id": "global.anthropic.claude-opus-5", "label": "Claude Opus 5",
+         "kind": "bedrock_anthropic", "region": None, "hard_output_limit": 128000,
+         "output_override": {"im": 6000}, "supports_prompt_cache": True,
+         "surfaces": ["webchat", "im"], "enabled": False},
         {"alias": "claude-sonnet-4-6", "short": None, "aliases_legacy": [],
          "model_id": "global.anthropic.claude-sonnet-4-6", "label": "Claude Sonnet 4.6",
          "kind": "bedrock_anthropic", "region": None, "hard_output_limit": 65536,
@@ -111,7 +123,7 @@ _BUILTIN_CATALOG: dict = {
          "model_id": "apac.amazon.nova-pro-v1:0", "label": "Amazon Nova Pro",
          "kind": "bedrock_converse", "region": None, "hard_output_limit": 5120,
          "output_override": {"im": 5000}, "supports_prompt_cache": False,
-         "surfaces": ["webchat", "im"], "enabled": True},
+         "surfaces": ["webchat", "im"], "enabled": False},
         {"alias": "deepseek-v3-2", "short": "deepseek", "aliases_legacy": [],
          "model_id": "deepseek.v3.2", "label": "DeepSeek V3.2", "kind": "bedrock_converse",
          "region": None, "hard_output_limit": 8192, "output_override": {},
@@ -120,20 +132,30 @@ _BUILTIN_CATALOG: dict = {
         # 也因此**不是全区都有**（us-east-1 / us-west-2 / ap-northeast-1 实测可用，
         # ap-southeast-1 / eu-west-1 / eu-central-1 没有）。所以它只能当用户主动切换的
         # 选项，不能当 default_model；判据见种子文件的 `_default_model_note`。
-        {"alias": "zai-glm-5", "short": "glm", "aliases_legacy": [],
+        # 有 global. profile（GLM 5 没有）；cachePoint 在真实形状下被拒，故 supports_prompt_cache=False。
+        {"alias": "zai-glm-5-3", "short": "glm", "aliases_legacy": [],
+         "model_id": "global.zai.glm-5.3", "label": "GLM 5.3", "kind": "bedrock_converse",
+         "region": None, "hard_output_limit": 128000, "output_override": None,
+         "supports_prompt_cache": False, "surfaces": ["webchat", "im"], "enabled": True},
+        {"alias": "zai-glm-5", "short": None, "aliases_legacy": [],
          "model_id": "zai.glm-5", "label": "GLM 5", "kind": "bedrock_converse",
          "region": None, "hard_output_limit": 202752, "output_override": None,
-         "supports_prompt_cache": False, "surfaces": ["webchat", "im"], "enabled": True},
+         "supports_prompt_cache": False, "surfaces": ["webchat", "im"], "enabled": False},
         {"alias": "gpt-5-6", "short": "gpt", "aliases_legacy": ["gpt"],
          "model_id": "openai.gpt-5.6-terra", "label": "GPT-5.6 Terra",
          "kind": "bedrock_mantle_responses", "region": "us-east-2", "hard_output_limit": 32768,
          "output_override": {"im": 8000}, "supports_prompt_cache": False,
          "surfaces": ["webchat", "im"], "enabled": True},
-        {"alias": "gpt-5-6-sol", "short": "gpt_sol", "aliases_legacy": ["gpt_sol"],
+        # ⚠️ 不在 Mantle 上，走 Converse + global. profile（kind / region 与 5.6 系不同）。
+        {"alias": "gpt-6-sol", "short": "gpt_sol", "aliases_legacy": ["gpt_sol"],
+         "model_id": "global.openai.gpt-6-sol", "label": "GPT-6 Sol", "kind": "bedrock_converse",
+         "region": None, "hard_output_limit": 131072, "output_override": {"im": 8000},
+         "supports_prompt_cache": False, "surfaces": ["webchat", "im"], "enabled": True},
+        {"alias": "gpt-5-6-sol", "short": None, "aliases_legacy": [],
          "model_id": "openai.gpt-5.6-sol", "label": "GPT-5.6 Sol",
          "kind": "bedrock_mantle_responses", "region": "us-east-2", "hard_output_limit": 32768,
          "output_override": {"im": 8000}, "supports_prompt_cache": False,
-         "surfaces": ["webchat", "im"], "enabled": True},
+         "surfaces": ["webchat", "im"], "enabled": False},
         # surfaces 只剩 im（2026-09-03 Web 侧同一代 GPT 三个变体挤在列表里，只留
         # Terra / Sol）。走 surfaces 收窄而不是 enabled=False —— 后者会把 IM 的
         # `@bot model gpt_luna` 一起关掉。同上：必须与种子逐字一致。
@@ -146,12 +168,22 @@ _BUILTIN_CATALOG: dict = {
         # `_*_note`（都是 us-east-1 实测，不是抄文档）：524288 是 Converse 的拒绝阈值，
         # prompt cache 虽被模型卡列为支持、但显式 cachePoint 实测被拒，故为 False。
         # `aliases_legacy` 收的是运维在 Admin 页手工加这个模型时用过的 alias。
-        {"alias": "xai-grok-4-6", "short": "grok",
+        # 默认模型（2026-10-10）。实测与理由见种子文件该条目的 _default_note。
+        {"alias": "moonshot-kimi-k3", "short": "kimi", "aliases_legacy": [],
+         "model_id": "global.moonshotai.kimi-k3", "label": "Kimi K3", "kind": "bedrock_converse",
+         "region": None, "hard_output_limit": 128000, "output_override": None,
+         "supports_prompt_cache": False, "surfaces": ["webchat", "im"], "enabled": True},
+        # ⚠️ 小输出预算（≤2048）时可能一个答案字都不出，见种子文件 _reasoning_note。
+        {"alias": "xai-grok-4-7", "short": "grok", "aliases_legacy": [],
+         "model_id": "global.xai.grok-4.7", "label": "Grok 4.7", "kind": "bedrock_converse",
+         "region": None, "hard_output_limit": 524288, "output_override": None,
+         "supports_prompt_cache": False, "surfaces": ["webchat", "im"], "enabled": True},
+        {"alias": "xai-grok-4-6", "short": None,
          "aliases_legacy": ["global-xai-grok-4-6"],
          "model_id": "global.xai.grok-4.6", "label": "Grok 4.6",
          "kind": "bedrock_converse", "region": None, "hard_output_limit": 524288,
          "output_override": None, "supports_prompt_cache": False,
-         "surfaces": ["webchat", "im"], "enabled": True},
+         "surfaces": ["webchat", "im"], "enabled": False},
     ],
 }
 

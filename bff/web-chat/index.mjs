@@ -6,7 +6,7 @@
  *   GET  /api/chat/conversations     列出我的会话
  *   GET  /api/chat/conversations/{id} 取会话消息
  *
- * 鉴权：所有路由校验 Cognito idToken（与 idle 控制台共享同一 user pool）。
+ * 鉴权：所有路由校验 Cognito idToken（部署自带的那个 user pool，CDK 经 COGNITO_USER_POOL_ID 注入）。
  *
  * Phase 0：/stream 先把用户输入"回显"成 token 流（thinking → tokens →
  * sources → done），验证端到端 SSE 管线。Phase 1 起把这里换成调用
@@ -81,26 +81,31 @@ function modelFailureText(locale, err) {
   const transient = /InternalServer|ServiceUnavailable|Throttl|Timeout|ModelError|ModelNotReady/i.test(kind);
   const permission = /AccessDenied|UnrecognizedClient|InvalidSignature|ExpiredToken|Unauthorized|Forbidden/i.test(kind);
   const badRequest = /Validation|ResourceNotFound|ModelNotFound|Serialization/i.test(kind);
+  // 「去哪儿换模型」与「不点名模型」必须与 agent 侧 main.py 那几条模型失败提示的 web 分支一致：
+  //   · 模型选择器在输入框工具栏**最右**（输入框右下角，Composer.tsx 的 .cbar-right），**不在**
+  //     输入框上方（上方那一行是看板胶囊）；
+  //   · 不点名具体模型：这里写死过「Claude Sonnet 5」，它 2026-10-10 起在模型目录里停用，客户照着
+  //     去选择器里找会找不到。选择器里列的都是管理员启用的，「换一个」就够了。
   if (locale === "en") {
     if (transient) {
-      return `⚠️ The model service returned \`${kind}\` and this turn produced no answer (already retried automatically).\n\n**Next steps:**\n1. Send the message again — this class of error is usually transient;\n2. If it keeps failing, switch to a different model (e.g. Claude Sonnet 5) above the input box and retry.`;
+      return `⚠️ The model service returned \`${kind}\` and this turn produced no answer (already retried automatically).\n\n**Next steps:**\n1. Send the message again — this class of error is usually transient;\n2. If it keeps failing, switch to a different model at the bottom right of the input box and retry.`;
     }
     if (permission) {
       return `🔒 This turn was **denied by permissions** (\`${kind}\`) — resending will not help.\n\n**Next step:** ask your administrator to grant this deployment access to the selected model in **Amazon Bedrock → Model access**, and to check the IAM permissions of the NotiOps agent role. Once that is done, retry.`;
     }
     if (badRequest) {
-      return `⚠️ The model rejected this request (\`${kind}\`) — resending the same message will not help.\n\n**Next steps:**\n1. Switch to a different model above the input box (the selected one may not be available in this Region);\n2. If your message or the conversation is very long, start a new conversation and shorten the question.`;
+      return `⚠️ The model rejected this request (\`${kind}\`) — resending the same message will not help.\n\n**Next steps:**\n1. Switch to a different model at the bottom right of the input box (the selected one may not be available in this Region);\n2. If your message or the conversation is very long, start a new conversation and shorten the question.`;
     }
     return `⚠️ This turn failed (\`${kind}\`) and produced no answer.\n\n**Next step:** send the message again. If it keeps failing, report it to your administrator with the time of this message.`;
   }
   if (transient) {
-    return `⚠️ 模型服务返回 \`${kind}\`，本轮未能生成回答（已自动重试）。\n\n**下一步：**\n1. 直接再发一次 —— 这类错误多为模型服务端的临时故障；\n2. 若连续失败，在输入框上方切换到**另一个模型**（如 Claude Sonnet 5）后重试。`;
+    return `⚠️ 模型服务返回 \`${kind}\`，本轮未能生成回答（已自动重试）。\n\n**下一步：**\n1. 直接再发一次 —— 这类错误多为模型服务端的临时故障；\n2. 若连续失败，在输入框右下角切换到**另一个模型**后重试。`;
   }
   if (permission) {
     return `🔒 本轮被**权限拒绝**（\`${kind}\`），再发一次也不会好。\n\n**下一步：** 请管理员在 **Amazon Bedrock → 模型访问（Model access）** 里为本部署开通所选模型，并检查 NotiOps agent 角色的 IAM 权限；开通后再重试。`;
   }
   if (badRequest) {
-    return `⚠️ 模型拒绝了这次请求（\`${kind}\`），原样重发不会好。\n\n**下一步：**\n1. 在输入框上方**换一个模型**（当前所选可能在本区域不可用）；\n2. 若这条消息或整段对话很长，请新建会话并把问题写短一些。`;
+    return `⚠️ 模型拒绝了这次请求（\`${kind}\`），原样重发不会好。\n\n**下一步：**\n1. 在输入框右下角**换一个模型**（当前所选可能在本区域不可用）；\n2. 若这条消息或整段对话很长，请新建会话并把问题写短一些。`;
   }
   return `⚠️ 本轮处理失败（\`${kind}\`），未能生成回答。\n\n**下一步：** 请再发送一次。若持续失败，请把这条消息的时间点反馈给管理员。`;
 }
@@ -1410,9 +1415,9 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
     //
     // 这里的字面量是**最后一层兜底的别名**（客户端没传 model 且目录也读不出来时才会用到），
     // 必须与 `config/llm-model-catalog.json` 的 `default_model` 一致；2026-09-01 随默认模型
-    // 一起从 claude-sonnet-5 换成 xai-grok-4-6。注意它是 **alias**（不是 model_id）——
+    // 一起从 claude-sonnet-5 换成 xai-grok-4-6，2026-10-10 换成 moonshot-kimi-k3。注意它是 **alias**（不是 model_id）——
     // 下游 runtime 按别名去目录里解析 model_id + kind，写成 `global.xai.grok-4.6` 会解析不到。
-    let model = requestedModel || "xai-grok-4-6";
+    let model = requestedModel || "moonshot-kimi-k3";
     let generation = 0;
     try {
       const picked = await resolveForStream(requestedModel, "webchat");
@@ -1440,7 +1445,7 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
     if (staropsDirect) {
       // ── STAROps 对话：0 token 路径（由**客户自己的阿里云 STAROps 数字员工**回答）──
       // 不经 agent runtime / Bedrock，BFF 直接调阿里云 `CreateChat`（SSE）并把事件流逐 delta
-      // 转成同形 SSE（token/progress/investigation_step/usage）→ 前端渲染与右侧「调查过程」
+      // 转成同形 SSE（token/progress/investigation_step/usage）→ 前端渲染与右侧「思考过程」
       // 面板零改动复用。发起巡检/调查靠自然语言，不另设开关（见上面 staropsDirect 那段）。
       // ⚠️ 排在最前：绝不让一个指向阿里云的问题被 AWS DevOps Agent 接走（跨云串台）。
       let staropsOk = false;
@@ -1463,9 +1468,12 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
         //    **错误码**（不含它回显的客户输入），凭据与 workspace 从不进异常。
         console.error(`[BFF] /stream starops chat failed — ${e?.name || ""}: ${e?.message || e}`, e?.stack || "");
         if (!reply) {
+          // 退路只能是「新对话」：STAROps 只在通用会话里、只能从新对话主页的「对话对象」选
+          // （ChatObjectPicker），发出第一句后本会话的对象就固定了，会话里没有能切回 NotiOps 的
+          // 控件。与 starops_chat.mjs::notConfiguredText 关着那一支同一条退路。
           reply = locale === "en"
-            ? "⚠️ “STAROps Chat” failed to run. Please retry, or switch the chat target back to NotiOps."
-            : "⚠️ 「STAROps 对话」执行失败。请重试，或把对话对象切回 NotiOps。";
+            ? "⚠️ “STAROps Chat” failed to run. Please retry, or start a “New chat” to switch back to the standard chat."
+            : "⚠️ 「STAROps 对话」执行失败。请重试，或开一个「新对话」换回普通对话。";
           stream.write(sse("token", { delta: reply }));
         }
       }
@@ -1498,10 +1506,16 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
       // 把事件流逐 delta 转成 SSE（token/progress/investigation_step），体验对齐"直接开 DevOps
       // Agent 网页聊"。SSE 事件与老路径同形 → 前端渲染/右侧面板零改动复用。
       // ⚠️ 开关关闭时（老客户端不传此字段）本分支永不进入，老路径一行未改。
+      // 失败文案的退路按入口分：工具条上的「DevOps 对话」平铺开关只有故障调查主题有（前端 types.ts 的
+      // DEVOPS_CHAT_TOPICS），那里关掉开关就回到普通对话；通用会话里它是「对话对象」，发出
+      // 第一句后就固定了、会话里没有开关可关 —— 退路只能是开一个「新对话」（同 STAROps 那条）。
+      // 算一次、两处用：下面 catch 里的兜底，和 runDevopsChat 里 CreateChat 失败那一句
+      // （createChatFailText；它说完就返回非空 reply、不抛，走不到这里的兜底 —— 2026-10-11 补传）。
+      const toggleHere = topic === "investigate";
       try {
         const { runDevopsChat } = await import("./devops_chat.mjs");
         reply = await runDevopsChat({
-          text, locale, accountId, conversationId, skillId, skillVersion,
+          text, locale, accountId, conversationId, skillId, skillVersion, toggleHere,
           emit: (evt, data) => {
             if (evt === "usage") usage = data?.usage;
             stream.write(sse(evt, data || {}));
@@ -1511,15 +1525,15 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
         console.error(`[BFF] /stream devops chat failed — ${e?.name || ""}: ${e?.message || e}`, e?.stack || "");
         if (!reply) {
           reply = locale === "en"
-            ? "⚠️ “DevOps Chat” failed to run. Please retry, or turn it off to use the standard chat."
-            : "⚠️ 「DevOps 对话」执行失败。请重试，或关闭该开关改用普通对话。";
+            ? `⚠️ “DevOps Chat” failed to run. Please retry, or ${toggleHere ? "turn it off to use the standard chat" : "start a “New chat” to switch back to the standard chat"}.`
+            : `⚠️ 「DevOps 对话」执行失败。请重试，或${toggleHere ? "关闭该开关改用普通对话" : "开一个「新对话」换回普通对话"}。`;
           stream.write(sse("token", { delta: reply }));
         }
       }
     } else if (directInvestigate) {
       // ── 深度调查（直连）：0 token 路径 ──
       // 不经 agent runtime / Bedrock，BFF 直接调 DevOps Agent API（发起 + 轮询 journal + 读摘要
-      // + 落 HTML 报告）。SSE 事件与老路径同形，故前端渲染/右侧「调查过程」面板零改动复用。
+      // + 落 HTML 报告）。SSE 事件与老路径同形，故前端渲染/右侧「思考过程」面板零改动复用。
       // ⚠️ 老路径（agentRuntimeConfigured 分支）一行未改——新增分支置于其前，互不影响。
       try {
         const { runDirectInvestigation } = await import("./devops_investigate.mjs");
@@ -1542,9 +1556,16 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
           // ⚠️ 2026-09-13：这句以前写的是「关闭「深度调查（直连）」改用普通「深度调查」」——
           //    「普通深度调查」那枚开关已经从界面上撤掉了（只留直连这一条，名字就叫「深度调查」），
           //    所以那是一条客户做不到的指引。退路改成说实话：关掉它，用本主题的只读工具即时排查。
+          // ⚠️ objDevops（通用会话、对话对象是客户自己的 DevOps Agent，「深度调查」是这一轮的修饰）
+          //    时关掉开关回到的是「DevOps 对话」（上面的 chatDirect），**不是** NotiOps —— 那里
+          //    不能说「让 NotiOps 用只读工具排查」。故障调查主题里两者在前端是单选，走不到这一支。
           reply = locale === "en"
-            ? "⚠️ Deep Dive failed to run. Please retry, or turn off “Deep Dive” and let NotiOps triage with its read-only tools."
-            : "⚠️ 深度调查执行失败。请重试，或关闭「深度调查」开关，让 NotiOps 用只读工具做即时排查。";
+            ? (objDevops
+              ? "⚠️ Deep Dive failed to run. Please retry, or turn off “Deep Dive” to ask your own DevOps Agent directly."
+              : "⚠️ Deep Dive failed to run. Please retry, or turn off “Deep Dive” and let NotiOps triage with its read-only tools.")
+            : (objDevops
+              ? "⚠️ 深度调查执行失败。请重试，或关闭「深度调查」开关，直接问你自己的 DevOps Agent。"
+              : "⚠️ 深度调查执行失败。请重试，或关闭「深度调查」开关，让 NotiOps 用只读工具做即时排查。");
           stream.write(sse("token", { delta: reply }));
         }
       }
@@ -1599,7 +1620,7 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
         onActions: (actions) => { streamedAny = true; gotOutput(); stream.write(sse("actions", { actions })); },
         // 快捷后续按钮（如调查完成后的 生成缓解方案/转人工）→ 前端渲染成可点按钮
         onFollowups: (followups) => stream.write(sse("followups", { followups })),
-        // 调查分析过程行 → 前端收进右侧「调查过程」面板（不刷主聊天）
+        // 调查分析过程行 → 前端收进右侧「思考过程」面板（不刷主聊天）
         onInvestigationStep: (step) => { streamedAny = true; gotOutput(); stream.write(sse("investigation_step", { step })); },
         // 思考/处理过程的一步（工具调用及入参摘要、工具返回摘要）→ 前端右侧「思考过程」面板。
         // **不置 streamedAny**：它不是答案正文，只是过程记录，冷启动重试仍安全（与 progress 同理）。
@@ -1608,7 +1629,7 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
         // 非答案内容，冷启动重试(在任何正文 token 之前)仍安全，不会造成重复输出。agent 一冒出进度
         // 就说明已热 → 停冷启动心跳，交还给 agent 自己的进度行。
         onProgress: (p) => { gotOutput(); stream.write(sse("progress", p || {})); },
-        // 思考过程增量 → 前端可折叠灰字（默认折叠，收到正文即隐藏）。同样不置 streamedAny。
+        // 思考过程增量 → 前端右侧「思考过程」面板的思考段（thinking.ts::appendReasoning）。同样不置 streamedAny。
         onReasoning: (r) => { gotOutput(); stream.write(sse("reasoning", r || {})); },
         // 本轮 token 用量 → 前端在消息末尾显示「· N tokens」
         onUsage: (u) => { usage = u; stream.write(sse("usage", { usage: u })); },

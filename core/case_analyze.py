@@ -1,7 +1,11 @@
 """
 LLM-driven AWS Support case analysis.
 
-Triggered by `command=case_analyze` from `bedrock_intent.analyze_intent`.
+Triggered by `command=case_analyze`. On the IM webhook path that command
+comes from `core.nl_router` (kind `case`) and the platform's `caps.py` hands
+it to `start_analyze` (`case_flow` on Feishu / Slack, `case_text` on
+DingTalk); the retired long-connection bot got it from
+`bedrock_intent.analyze_intent`.
 The user types something like "分析 case 12345" / "summarize case 67890" /
 "帮我看 case 5xx 是什么原因", we:
 
@@ -9,11 +13,14 @@ The user types something like "分析 case 12345" / "summarize case 67890" /
      via `core.case_management.describe_case`.
   2. Pull all communications (newest first, capped at 30 to fit Bedrock
      context) via `core.case_management.list_communications`.
-  3. Compose a structured prompt and call Bedrock via `get_bot_model_id()`
-     (SSM `/notiops/agent/model_id`, Claude Sonnet 5 today). This is an
-     internal utility call with a hand-rolled Anthropic-native body, so it
-     deliberately does NOT follow the chat's `@bot model` preference --
-     see `shared/model_config.py`.
+  3. Compose a structured prompt and call Bedrock through `core.bot_llm`
+     (one Converse turn, no tools; the hand-rolled Anthropic-native body
+     went away on 2026-09-01) with the model from `get_bot_model_id()`:
+     SSM `/notiops/agent/model_id`, which the setup.sh stack seeds with
+     `global.moonshotai.kimi-k3`; the one-click stack creates no such
+     parameter, so the lookup falls back to the same id. This is an
+     internal utility call, so it deliberately does NOT follow the chat's
+     `@bot model` preference -- see `shared/model_config.py`.
   4. Return an `AnalyzeResult` dataclass the platform sender renders into
      a card.
 
@@ -28,11 +35,22 @@ one place -- `bedrock_chat.respond()` -- and this module goes through
 `core.bot_llm` instead, which has no audit.
 `bedrock_chat._is_change_request` (L1) is likewise not on this path.
 
-Why that is tolerable but still worth fixing: the hard boundary is the
-read-only IAM role, this path's output is a case summary rather than
-runnable commands, and after M2 this is the *only* capability on the IM
-webhook path that calls an LLM at all. Wiring an outbound audit into
-`bot_llm` is an open item -- see docs/TECHNICAL_DESIGN.md section 5.3.
+Why that is tolerable but still worth fixing: the call has no tools
+(`bot_llm` is one text-in / text-out turn), so nothing the model writes is
+ever executed -- the output is a case summary rendered into a card, not
+runnable commands. Wiring an outbound audit into `bot_llm` is an open
+item -- see docs/TECHNICAL_DESIGN.md section 5.3.
+
+Corrected 2026-10-11: this paragraph used to say (a) the hard boundary is
+"the read-only IAM role" -- the IM worker role is not read-only: it holds
+the Support case write actions (support:CreateCase /
+AddCommunicationToCase / ResolveCase, see infra/lib/constructs/im-core.ts)
+and writes NotiOps's own DynamoDB tables and S3 prefixes; and (b) that
+after M2 this is the *only* capability on the IM webhook path that calls
+an LLM -- `core.case_classifier` calls one the same way when a case is
+opened (unless the form already names the case type and a service found
+in the catalogue), and `/agent notiops` turns are answered by the
+AgentCore runtime.
 
 Output language follows the conversation locale (zh / en) — independent
 of the case's own language (AWS engineers usually reply in English even

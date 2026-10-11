@@ -545,7 +545,7 @@ def _post(per_server: list) -> list:
     for console_script, tools in per_server:
         kept = [t for t in tools if t.tool_name in _WHITELIST]
         wrapped = [_wrap_capped(t) for t in kept]
-        logger.info("aws_api_mcp: %s → %d/%d tools kept (whitelist, result cap=%d chars)",
+        logger.info("aws_api_mcp: %s → %d/%d tools kept (allowlist, result cap=%d chars)",
                     console_script, len(wrapped), len(tools), _MAX_RESULT_CHARS)
         merged.extend(wrapped)
     return merged

@@ -13,7 +13,7 @@ requires-python = ">=3.10"
 dependencies = [
     # 与 agent-build 那份逐字对齐(含"上界取 minor"的例外规则)。
     "strands-agents >= 1.52.0, < 1.56.0",
-    "bedrock-agentcore >= 1.9.1, < 1.24.0",
+    "bedrock-agentcore >= 1.9.1, < 1.23.0",
     # 下限对齐仓库根 requirements.txt：devops-agent 的 Asset API（读 custom agent 产出的
     # artifact 要用 GetAsset / GetAssetContent）在 1.43.19 里不存在，1.43.30 起才有。
     # 已有的 create_backlog_task / list_recommendations 老版本就有，但混用两个下限会让

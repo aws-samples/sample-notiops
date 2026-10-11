@@ -27,6 +27,7 @@ import * as logs from "aws-cdk-lib/aws-logs";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
+import * as athena from "aws-cdk-lib/aws-athena";
 import * as path from "path";
 import * as fs from "fs";
 
@@ -42,6 +43,19 @@ const REPO_ROOT = path.join(INFRA_DIR, "..");
  * 导出而不是各处写字面量：改名时必须一处改、全处跟着走。
  */
 export const WEB_CHAT_TABLE_NAME = "notiops-web-chat";
+
+/**
+ * NotiOps 自建 CUR 时，官方 Athena 集成模板会建出来的 **Glue 库名**。
+ *
+ * 官方 `crawler-cfn.yml` 的命名规则是 `athenacurcfn_` + 报告名（`-` 换成 `_`），
+ * 报告名见 `cur_provisioner/spec.py::DEFAULT_REPORT_NAME`（`notiops-cur-report`）。
+ * 现网实测一致。
+ *
+ * ⚠️ 只用来**收窄 IAM 权限**。运行时到底查哪张表，以 `notiops-config` 里
+ * `lambda6_cur_finalizer` 写的 READY 记录为准 —— 因为猜错库名只是白给一条用不上的
+ * ARN，猜错表名却会让查询打到一张还没爬完的表上、返回**看起来正常的空结果**。
+ */
+export const PROVISIONED_CUR_DB = "athenacurcfn_notiops_cur_report";
 
 export interface WebChatCoreProps {
   userPoolId: string;
@@ -79,6 +93,98 @@ export interface WebChatCoreProps {
   costAgentFunctionArn?: string;
 
   /**
+   * ── 自建成本 MCP server（SelfHosted 态）────────────────────────────────────
+   *
+   * 三态模型（互斥，给了哪个 prop 就是哪个态）：
+   *   Off        —— 什么都不传，零新增资源（默认）
+   *   External   —— 只传 `costAgentMcpUrl` + `costAgentFunctionArn`（客户自带 server，
+   *                 逃生口，README.md 与 docs/DEPLOYMENT.md 已对外承诺，**必须保留**）
+   *   SelfHosted —— 传 `costMcpCode`，本构件自己建 Lambda，`costAgentMcpUrl` /
+   *                 `costAgentFunctionArn` 由它产出，**不再从 -c 读**
+   *
+   * ⚠️ 两条部署路径都走这里（铁律）。唯一的差异是**代码来源**，与 `im-core.ts` 同一套
+   * 做法：方式 B 传 `Code.fromAsset("../")`，方式 A 传从 staging 桶取的 Release 产物。
+   * 别为方式 A 抄一份资源定义 —— 那就是 im-core.ts 文件头警告的「改了 A 忘了 B」。
+   */
+  costMcpCode?: lambda.Code;
+  /** 自建 server 的依赖层（`scripts/build_cost_layer.sh` 的产物）。SelfHosted 态必填。 */
+  costMcpLayer?: lambda.ILayerVersion;
+  /**
+   * 客户 CUR 的 Glue 表，`database.table`。SelfHosted 态必填 —— 缺了 server 启动即 raise。
+   *
+   * 例外是 `curProvisionedByNotiOps`：那条路上这张表**部署时还不存在**，见下。
+   */
+  curTable?: string;
+  /**
+   * NotiOps **自己建** CUR（不是接客户已有的那张表）。
+   *
+   * 传它意味着放弃在部署期知道表名：AWS 建完 CUR 到首次交付有 ~24h 硬延迟，Glue 库表是
+   * 延迟结束后由 `lambda6_cur_finalizer` 发现/创建的。所以这条路上：
+   *   · `curTable` 允许为空；
+   *   · `CUR_TABLE` 环境变量**不设**，server 冷启动时去 `notiops-config` 的
+   *     `cur-athena-status#<账号>` 读（那条记录带 READY 判定，见 cost_mcp/athena.py）；
+   *   · 因此 `configTableName` 变成必填。
+   */
+  curProvisionedByNotiOps?: boolean;
+  /**
+   * `notiops-config` 表名 —— 自建 CUR 时必填（server 要从它读上面那条记录）。
+   */
+  configTableName?: string;
+  /**
+   * CUR 所在的 **Glue 库名**，只用来收窄 IAM 权限。
+   *
+   * 不传则从 `curTable` 切（`database.table` 的前半段）。**方式 A 必须传** ——
+   * 那边 `curTable` 是部署期 token，在合成期切不开（见下面 `curDb` 那段注释）。
+   */
+  curDatabase?: string;
+  /** CUR 分区形态：`flat`(默认) | `year-month` | `billing-period`。填错 server 会报错而不是静默给错答案。 */
+  curPartitionStyle?: string;
+  /** CUR 版本：`1`(默认) | `2`。2.0 支持仍是实验性的（见 columns.py）。 */
+  curVersion?: string;
+  /** CUR 数据所在的 S3 桶名。**同账号**读 CUR 时必填（要给 Athena 读它的权限）。 */
+  curBucketName?: string;
+  /**
+   * 跨账号读 CUR 时的角色 ARN。空 = 用本函数的执行角色读**本账号**的 CUR。
+   *
+   * 🔴 自建态下**暂不支持**（2026-10-10 起）：方式 B 给字面量在合成期就抛错，方式 A 由模板规则
+   * `CostMcpCrossAccountNotSupported` 要求它为空 —— 原因见 createWebChatCore 里 costMcpCode 那段。
+   *
+   * ⚠️ 上游原实现是把 AK/SK 放进 Lambda 环境变量（`CUR_ACCESS_KEY_ID` 那一组）。
+   * 那条路在并入时已删（见 cost_mcp/athena.py 模块 docstring），跨账号只走 AssumeRole。
+   */
+  curRoleArn?: string;
+  /**
+   * 客户自己的 CUR user tag key，逗号分隔（如 `team,owner`）。
+   * 空（默认）= **不提供任何 tag 维度**，工具描述里也不出现 —— 见 cost_mcp/columns.py：
+   * 宣传一个结果必然全是 `(untagged)` 的维度，比少一个维度糟得多。
+   */
+  curTagKeys?: string;
+  /**
+   * 单次 Athena 查询的扫描量上限（字节）。默认 100 GiB。
+   *
+   * ⚠️ 这是**唯一**能挡住"一句话扫掉整段 CUR 历史"的闸门，而且它只能在 workgroup 上设
+   * （`WorkGroupConfiguration.BytesScannedCutoffPerQuery`）—— Athena **没有**逐次调用的
+   * bytes 上限，而且**被取消的查询照样计费**。所以这个数要按客户 CUR 体量调，
+   * 不是装饰。
+   */
+  costMcpBytesScannedCutoff?: number;
+  /**
+   * 「自建成本 MCP 生效」的 CfnCondition —— **只有方式 A 传**。
+   *
+   * 方式 B 是**合成期**决定的（`-c costMcpSelfHosted=true` 才走那个分支，不传就连资源都
+   * 不建）；方式 A 是**部署期**决定的（客户在参数页里填不填 CUR 表），所以：
+   *   · 资源照常创建，由调用方（一键栈）给每个资源打上这个条件；
+   *   · BFF / agent 看到的 `COST_AGENT_MCP_URL` 必须是一个 `Fn::If` —— 选装了用自建的
+   *     URL，没选装则回落到 External 参数。传了这个条件，本构件就按这个口径接线。
+   *
+   * ⚠️ 不传它而在方式 A 上使用 `costMcpCode`，会让 BFF 无条件指向一个**可能不存在**的
+   * 函数（客户没填 CUR 表时那些资源被条件挡掉了）—— 表现是每次调用 403。
+   * 与 `im-core.ts` 那条「平台开关：方式 B 是合成期布尔、方式 A 是部署期 CfnCondition」
+   * 是同一个形状的差异。
+   */
+  costMcpEnabledCondition?: cdk.CfnCondition;
+
+  /**
    * AgentCore Runtime ARN。缺省时读 `-c agentRuntimeArn=...`（CDK / setup.sh 路径：agent 由
    * `agentcore deploy` 单独部署，部署完再把 ARN 传回来）。
    * 一键部署的 standalone 单栈里 Runtime 是**同栈资源**，这里直接传它的 `GetAtt`（一个 CFN
@@ -87,7 +193,7 @@ export interface WebChatCoreProps {
   agentRuntimeArn?: string;
 
   /**
-   * Function URL 的 CORS 白名单。缺省时读 `-c allowedOrigins=a,b`，仍为空则回退 `["*"]` 并告警。
+   * Function URL 的 CORS 允许清单。缺省时读 `-c allowedOrigins=a,b`，仍为空则回退 `["*"]` 并告警。
    * 传值时**不告警**（调用方已经明确表态了）。standalone 单栈传的是一个
    * `CommaDelimitedList` 参数的 `valueAsList`，值在部署期才知道，synth 期无从校验。
    */
@@ -175,6 +281,23 @@ export interface WebChatCore {
   /** `config.json` 的内容（CFN 侧 JSON 字符串，含各资源引用）。
    *  静态模板模式下由 standalone 栈交给 StagerFn 写进网站桶（§6.2）。 */
   configJson: string;
+  /**
+   * 自建成本 MCP server 的资源引用 —— 只有 SelfHosted 态（传了 `costMcpCode`）才有。
+   *
+   * 方式 A 需要拿它们**逐个打 CfnCondition**（一键栈里这一组是「客户在参数页里选装」的）。
+   * ⚠️ 打条件时别漏了角色的**内联策略** —— 那是另一个资源（`AWS::IAM::Policy`），
+   * 只给 Role 打条件会在客户不选装时留下一条引用不存在角色的策略，**直接部署失败**。
+   * 一键栈里已有 `applyCondition()` 这个 helper 专门处理这一对，照用。
+   */
+  costMcp?: {
+    fn: lambda.Function;
+    url: lambda.FunctionUrl;
+    role: iam.Role;
+    workgroup: athena.CfnWorkGroup;
+    resultsBucket: s3.Bucket;
+    /** 只在静态模板模式下有（方式 A）；调用方要给它打上与函数相同的 Condition。 */
+    logGroup?: logs.LogGroup;
+  };
 }
 
 /**
@@ -233,10 +356,15 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   // ─── 客户 CUR 数据源（可选）───
   // 末尾斜杠统一去掉：BFF 侧拼 `${url}/mcp`，双斜杠会 404（与 cur_dashboard.mjs 同样处理，
   // 两边都做是因为客户可能只改一边的值）。
-  const costAgentMcpUrl = (props.costAgentMcpUrl || (scope.node.tryGetContext("costAgentMcpUrl") as string) || "")
+  const externalCostAgentMcpUrl = (props.costAgentMcpUrl || (scope.node.tryGetContext("costAgentMcpUrl") as string) || "")
     .trim().replace(/\/$/, "");
-  const costAgentFunctionArn = (props.costAgentFunctionArn
+  const externalCostAgentFunctionArn = (props.costAgentFunctionArn
     || (scope.node.tryGetContext("costAgentFunctionArn") as string) || "").trim();
+  // SelfHosted 态会在下面把这两个值换成本栈自建 server 的 URL / ARN。
+  let costAgentMcpUrl = externalCostAgentMcpUrl;
+  let costAgentFunctionArn = externalCostAgentFunctionArn;
+  // 自建资源的引用 —— 方式 A 要拿它们打 CfnCondition，所以必须回传（见 WebChatCore）。
+  let costMcpRefs: WebChatCore["costMcp"];
   // 给了 URL 却没给函数 ARN → synth 期就停。放过去的代价是"部署全绿、4 个 sheet 全 403"，
   // 而 403 的根因（缺 lambda:InvokeFunctionUrl）在前端只表现为"数据源暂时不可用"。
   // 静态模板里两个值都是部署期 token（成对由 CFN 参数传入），synth 期无从判断 → 跳过。
@@ -247,6 +375,368 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       + "Pass -c costAgentFunctionArn=arn:aws:lambda:<region>:<account>:function:<name> as well "
       + "(see docs/DEPLOYMENT.md section 14).",
     );
+  }
+
+  // ═══ SelfHosted 态：本部署自己跑一个成本 MCP server ═══════════════════════════
+  //
+  // 触发条件只有一个：给了 `costMcpCode`。给了它就**接管** costAgentMcpUrl /
+  // costAgentFunctionArn —— 所以 External 与 SelfHosted 互斥，同时传是配置错误。
+  //
+  // 两条部署路径走**同一段代码**，唯一差异是 `costMcpCode` 从哪来（方式 B 是
+  // `Code.fromAsset("../")`，方式 A 是 staging 桶里的 Release 产物）。这是 im-core.ts
+  // 立下的规矩：差异只允许通过 props 表达。
+  if (props.costMcpCode) {
+    // ⚠️ `!cdk.Token.isUnresolved` 这一层不是防御性编程，是**方式 A 必须能过**：
+    // 一键栈把 External 的 URL 用 `Fn.conditionIf(...)` 传进来，那是一个部署期 token ——
+    // 它作为字符串**恒真**，不带这层判断会让所有一键部署在 synth 期就炸。
+    // 方式 A 的「两者互斥」由 CfnRule 在**参数校验阶段**保证（那才是能看见真实取值的地方）。
+    if (externalCostAgentMcpUrl && !cdk.Token.isUnresolved(externalCostAgentMcpUrl)) {
+      throw new Error(
+        "costMcpCode (SelfHosted) and costAgentMcpUrl (External) are mutually exclusive. "
+        + "Pick one: either NotiOps runs the cost MCP server (costMcpCode), or you point "
+        + "at your own (costAgentMcpUrl + costAgentFunctionArn).",
+      );
+    }
+    if (!props.curTable && !props.curProvisionedByNotiOps) {
+      // 早失败：server 在 cold start 就 raise（cost_mcp/athena.py），但那时客户看到的是
+      // 「4 个 sheet 转圈后不可用」，根因埋在 CloudWatch 里。synth 期拦住便宜得多。
+      throw new Error(
+        "costMcpCode is set (SelfHosted cost MCP) but curTable is missing. "
+        + "Pass the customer CUR Glue table as database.table -- the server raises on "
+        + "start without it. On the setup.sh path it can be read from the notiops-config "
+        + "record cur-athena-status#<account>. If NotiOps is creating the CUR itself, set "
+        + "curProvisionedByNotiOps instead (the table name does not exist yet at deploy time).",
+      );
+    }
+    if (props.curProvisionedByNotiOps && !props.configTableName) {
+      // 自建 CUR 的表名是**部署后 ~24h** 才由 finalizer 写进 notiops-config 的。
+      // 拿不到那张表就等于这条路根本走不通 —— 必须 synth 期拦住，不能让它部署成功
+      // 之后在 cold start 报 "CUR_TABLE not set"。
+      throw new Error(
+        "curProvisionedByNotiOps needs configTableName: the CUR Glue table only exists "
+        + "~24h after the report is created, so the server resolves it at runtime from the "
+        + "notiops-config record cur-athena-status#<account> (see cost_mcp/athena.py).",
+      );
+    }
+    if (!props.costMcpLayer) {
+      throw new Error(
+        "costMcpCode is set but costMcpLayer is missing. Build it first: "
+        + "bash scripts/build_cost_layer.sh (it pins every dependency from "
+        + "cost_mcp/requirements.txt and verifies each native extension's ABI).",
+      );
+    }
+    // 🔴 跨账号（curRoleArn）在自建态下**暂不支持**（2026-10-10 发版前审查实测）：server 用 assume 来的凭证
+    // 调 Athena，查询跑在 CUR 账号里，却带着只存在于本账号的 workgroup 名 ⇒ 每次都 `WorkGroup does not exist`。
+    // 方式 B（`-c curRoleArn=…`，字面量）在合成期就拒；方式 A 是部署期参数（token），由模板里的
+    // CostMcpCrossAccountNotSupported 规则拒；setup.sh 那一层也拒。三处同一口径。
+    if (props.curRoleArn && !cdk.Token.isUnresolved(props.curRoleArn)) {
+      throw new Error(
+        "curRoleArn (a CUR in another account) is not supported with the self-hosted cost MCP yet: "
+        + "queries would run in the CUR account against a workgroup that only exists here. Deploy "
+        + "NotiOps in the account that holds the CUR, or connect your own server with "
+        + "costAgentMcpUrl + costAgentFunctionArn.",
+      );
+    }
+    if (!props.curRoleArn && !props.curBucketName) {
+      // 同账号读 CUR 必须知道桶名才能给出**按资源**的读权限。给不出来就只剩 `*`，
+      // 那是「为了让它跑起来而放宽权限」—— 正是不许做的那种妥协。
+      // 只给桶名这一条出路：curRoleArn 字面量已在上面被拒（跨账号暂不支持），走到这里的只有
+      // 方式 B 两个都没给的情况（方式 A 的 curRoleArn 是部署期 token、恒真，不进这个分支）。
+      throw new Error(
+        "SelfHosted cost MCP needs curBucketName: the S3 bucket in this account that holds "
+        + "the CUR data (the Athena query reads it). Refusing to grant s3:GetObject on all "
+        + "buckets. A CUR in another account (curRoleArn) is not supported yet.",
+      );
+    }
+
+    // ── ① Athena 结果桶（独立建，不复用共享数据桶）───────────────────────────
+    // 为什么独立：Athena 的查询结果**就是客户的账单明细**（账号 id / 资源 id / tag 值），
+    // 需要自己的生命周期与加密策略。挂在别人管的桶上既加不了 lifecycle，也会让
+    // 「这些对象什么时候被删」变成另一个栈的实现细节。
+    const costResults = new s3.Bucket(scope, "CostMcpResults", {
+      bucketName: props.staticTemplate
+        ? undefined   // 方式 A 不给物理名：可能与 setup.sh 部署共存于同一账号，撞名 = 整栈回滚
+        : `notiops-cost-athena-${stack.account}-${stack.region}`,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      enforceSSL: true,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: !props.staticTemplate,  // 方式 A 禁 cr.Provider（会拉隐式资产）
+      lifecycleRules: [{
+        // 查询结果是**缓存**，不是账本。7 天足够覆盖「同一个问题今天问过明天再问」，
+        // 而留着不删等于把客户账单明细在 S3 里无限期堆着。
+        id: "expire-athena-results-7d",
+        expiration: cdk.Duration.days(7),
+        abortIncompleteMultipartUploadAfter: cdk.Duration.days(1),
+      }],
+    });
+
+    // ── ② 专用 Athena workgroup —— 唯一能挡住「一句话扫掉整段 CUR」的闸门 ────────
+    // ⚠️ 必须是专用的，**不许用 `primary`**：cutoff 是 workgroup 级配置，设在 primary 上会
+    // 影响客户自己的所有查询。而且 `EnforceWorkGroupConfiguration: true` 是关键 ——
+    // 不加的话调用方可以自带 ResultConfiguration 把 cutoff 绕过去。
+    // ⚠️ Athena **没有**逐次调用的 bytes 上限，而且**被取消的查询照样计费** ——
+    // 所以这个数是真正的花费上限，不是提示。
+    const bytesCutoff = props.costMcpBytesScannedCutoff ?? 100 * 1024 * 1024 * 1024;  // 100 GiB
+    const costWorkgroup = new athena.CfnWorkGroup(scope, "CostMcpWorkGroup", {
+      // 静态模板里 stack.stackName 是**合成期**的名字（"NotiOps"），不是客户开栈时起的名字 ——
+      // 同一账号同一区开两个装了成本 MCP 的一键栈就会撞名。用 AWS::StackName 让它跟着栈走。
+      name: props.staticTemplate
+        ? `${cdk.Aws.STACK_NAME}-cost-mcp`
+        : "notiops-cost-mcp",
+      description: "NotiOps: dedicated Athena workgroup for the cost MCP server (CUR queries)",
+      state: "ENABLED",
+      recursiveDeleteOption: true,
+      workGroupConfiguration: {
+        enforceWorkGroupConfiguration: true,
+        bytesScannedCutoffPerQuery: bytesCutoff,
+        publishCloudWatchMetricsEnabled: true,
+        resultConfiguration: {
+          outputLocation: `s3://${costResults.bucketName}/athena-results/`,
+          encryptionConfiguration: { encryptionOption: "SSE_S3" },
+        },
+      },
+    });
+
+    // ── ③ 执行角色 ─────────────────────────────────────────────────────────
+    const costRole = new iam.Role(scope, "CostMcpRole", {
+      roleName: props.staticTemplate ? undefined : "notiops-cost-mcp-role",
+      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+      description: "NotiOps: execution role for the cost MCP server (read-only CUR via Athena)",
+      // 静态模板（方式 A）不挂 AWSLambdaBasicExecutionRole：它带 `logs:CreateLogGroup`（资源 `*`），
+      // 删栈后晚到的异步日志会借它把栈内日志组**重新建出来**（不归栈管、永不过期；2026-10-10
+      // v1.0.30 RC 在 CUR 阶段一那个函数上实测到）。写日志只给自己那个组，见函数下方。
+      // CDK 路径（方式 B）照旧：那边用 logRetention，日志组由 CDK 的 LogRetention 自定义资源在
+      // **部署时**建（不是 Lambda 首次写入时建；aws-cdk-lib 的 log-retention-handler 先
+      // CreateLogGroup 再设保留期），本来就不是栈内资源。
+      managedPolicies: props.staticTemplate ? [] : [
+        iam.ManagedPolicy.fromAwsManagedPolicyName("service-role/AWSLambdaBasicExecutionRole"),
+      ],
+    });
+    // Athena：**限定到我们自己那个 workgroup**。不限定的话 cutoff 形同虚设
+    // （调用方可以指定别的 workgroup）。
+    costRole.addToPolicy(new iam.PolicyStatement({
+      sid: "AthenaQueryOwnWorkgroupOnly",
+      actions: [
+        "athena:StartQueryExecution", "athena:GetQueryExecution",
+        "athena:GetQueryResults", "athena:StopQueryExecution",
+        "athena:GetWorkGroup",
+      ],
+      resources: [`arn:${stack.partition}:athena:${stack.region}:${stack.account}:workgroup/${costWorkgroup.name}`],
+    }));
+    // 结果桶：读写**只给结果前缀**。
+    // ⚠️ 刻意不照抄 infra/member-devops-agent.yaml 里那条跨桶的
+    // `arn:aws:s3:::*/athena-results/*` —— 那等于给了所有桶里该前缀的写权限。
+    costRole.addToPolicy(new iam.PolicyStatement({
+      sid: "AthenaResultsPrefix",
+      actions: ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
+      resources: [`${costResults.bucketArn}/athena-results/*`],
+    }));
+    costRole.addToPolicy(new iam.PolicyStatement({
+      sid: "AthenaResultsList",
+      actions: ["s3:GetBucketLocation", "s3:ListBucket"],
+      resources: [costResults.bucketArn],
+    }));
+    // ⚠️⚠️ 这个分支**不能只看 `props.curRoleArn` 真不真** —— 它在方式 A 上是一个部署期
+    // token（`{"Ref":"CurRoleArn"}`），作为 JS 字符串**恒真**。照着写的后果不是"权限给多
+    // 了"，而是两个都很糟的失败：
+    //   ① 同账号客户（填 CurTable + CurBucketName，最常见的那种）永远走进跨账号分支，
+    //      于是 Glue / CUR 桶**一条读权限都没有** → 每次查询 AccessDenied；
+    //   ② 更早一步就挂：`CurRoleArn` 留空时那条语句的 `Resource` 是空串，IAM 直接
+    //      `MalformedPolicyDocument` → **整栈部署失败**。
+    // 也就是说方式 A 的自建成本 MCP 在同账号这条路上从来没能跑起来过。
+    // （与本文件上面 `externalCostAgentMcpUrl` 那处是同一个坑，那里已经用
+    // `!cdk.Token.isUnresolved` 处理过 —— 这里当时漏了。）
+    //
+    // 正确做法：值是**合成期常量**（方式 B）才二选一；是 token（方式 A）就两组都给，
+    // 且每条的 `Resource` 都不能为空 —— 用不上的那一组指向一个不存在的 ARN，无害。
+    const curRoleIsDeployTimeValue = !!props.curRoleArn && cdk.Token.isUnresolved(props.curRoleArn);
+    const grantAssumeRole = !!props.curRoleArn;
+    const grantSameAccountRead = !props.curRoleArn || curRoleIsDeployTimeValue;
+    if (grantAssumeRole) {
+      // 跨账号：读 CUR 的权限完全由对端角色提供。这条替代了上游那套静态 AK/SK。
+      // （自建态下跨账号暂不支持，见上面；方式 A 的模板规则要求 CurRoleArn 为空，所以这条
+      // 实际总是落到下面那个不存在的角色名上。）
+      costRole.addToPolicy(new iam.PolicyStatement({
+        sid: "AssumeCurReaderRole",
+        actions: ["sts:AssumeRole"],
+        // 方式 A：客户没填跨账号角色时这里是空串，而空 `Resource` 会让 IAM 拒掉整份
+        // 策略文档（部署失败）。所以回落到一个**本账号里不存在**的角色名 —— 语义上等于
+        // "这条权限用不上"，而且名字本身就说明了原因。
+        resources: [curRoleIsDeployTimeValue
+          ? cdk.Fn.conditionIf(
+              new cdk.CfnCondition(scope, "CostMcpHasCurRoleArn", {
+                expression: cdk.Fn.conditionNot(cdk.Fn.conditionEquals(props.curRoleArn!, "")),
+              }).logicalId,
+              props.curRoleArn!,
+              `arn:${stack.partition}:iam::${stack.account}:role/notiops-cross-account-cur-not-configured`,
+            ).toString()
+          : props.curRoleArn!],
+      }));
+    }
+    if (grantSameAccountRead) {
+      // 同账号：Glue 目录只读 + CUR 桶只读。
+      // ⚠️ **一个写动作都不给**（无 glue:Create*/Update*/Delete*、无 athena:UpdateWorkGroup、
+      // 无 athena:CreateNamedQuery）—— SELECT-only 先由 IAM 结构性保证，
+      // cost_mcp/athena.py 里那个校验器是纵深防御，不是唯一防线。
+      // ⚠️ 库名**不能**在这里从 `curTable` 切出来。方式 A 上 `curTable` 是部署期 token，
+      // `"${Token[...]}".split(".")` 切不出任何东西 —— 拿到的是整个 token，于是策略里
+      // 的资源变成 `database/mydb.mytable`（多带了表名）或者 `database/`（自建 CUR 时
+      // CurTable 为空），两种都**授不到真正那个库**，症状是每次查询 AccessDenied。
+      // 与上面 AssumeRole 那处是同一个 token 陷阱。
+      // 所以库名由调用方给：方式 A 传一个 `Fn::If` / `Fn::Select(Fn::Split)` 出来的 CFN
+      // 表达式（它才知道 ProvisionCur 那个条件），方式 B 是真字符串、切一下就行。
+      const curDb = props.curDatabase
+        || (props.curTable ? props.curTable.split(".")[0] : PROVISIONED_CUR_DB);
+      costRole.addToPolicy(new iam.PolicyStatement({
+        sid: "GlueCatalogReadOnly",
+        actions: ["glue:GetDatabase", "glue:GetDatabases", "glue:GetTable", "glue:GetTables",
+                  "glue:GetPartition", "glue:GetPartitions"],
+        resources: [
+          `arn:${stack.partition}:glue:${stack.region}:${stack.account}:catalog`,
+          `arn:${stack.partition}:glue:${stack.region}:${stack.account}:database/${curDb}`,
+          `arn:${stack.partition}:glue:${stack.region}:${stack.account}:table/${curDb}/*`,
+        ],
+      }));
+      costRole.addToPolicy(new iam.PolicyStatement({
+        sid: "CurBucketReadOnly",
+        actions: ["s3:GetObject", "s3:GetBucketLocation", "s3:ListBucket"],
+        resources: [
+          `arn:${stack.partition}:s3:::${props.curBucketName}`,
+          `arn:${stack.partition}:s3:::${props.curBucketName}/*`,
+        ],
+      }));
+    }
+
+    if (props.configTableName) {
+      // 只读 notiops-config，且**只读一条**：`cur-athena-status#<账号>`（自建 CUR 的表名
+      // 在这条记录里）。用 `dynamodb:LeadingKeys` 把它钉死在这个 PK 上 —— 这张表里还有
+      // 平台凭证、IM 配置之类的东西，成本 MCP 没有任何理由能读到它们。
+      costRole.addToPolicy(new iam.PolicyStatement({
+        sid: "ReadCurAthenaStatusOnly",
+        actions: ["dynamodb:GetItem"],
+        resources: [
+          `arn:${stack.partition}:dynamodb:${stack.region}:${stack.account}:table/${props.configTableName}`,
+        ],
+        conditions: {
+          "ForAllValues:StringEquals": {
+            "dynamodb:LeadingKeys": [`cur-athena-status#${stack.account}`],
+          },
+        },
+      }));
+    }
+
+    // ── ④ 函数本体 ─────────────────────────────────────────────────────────
+    // 超时 330s：`get_cost_cube` 自己就给 Athena 280s（cost_mcp/server.py），函数必须
+    // 活得比它长，否则症状是"宽时间窗永远失败"而不是"查询超时"。
+    // 内存 1024：结果分页要在内存里拼 dict（cube 一次约 5 万行）。
+    const costMcpFn = new lambda.Function(scope, "CostMcpFunction", {
+      functionName: props.staticTemplate ? undefined : "notiops-cost-mcp",
+      runtime: lambda.Runtime.PYTHON_3_14,
+      handler: "cost_mcp.lambda_handler.handler",
+      code: props.costMcpCode,
+      layers: [props.costMcpLayer],
+      role: costRole,
+      timeout: cdk.Duration.seconds(330),
+      memorySize: 1024,
+      // 并发上限：一个聊天问题最多并发 4 条 Athena 查询（get_sp_dashboard_daily），
+      // 而每条查询都是真金白银。留 10 是为了挡住"某个循环把账单打穿"这种失控，
+      // 不是为了性能。
+      reservedConcurrentExecutions: 10,
+      description: "NotiOps: cost MCP server -- read-only CUR analysis over Athena (45 tools)",
+      // 日志组口径与 BFF 相同（见 props.staticTemplate 的注释）：CDK 路径用 logRetention，静态
+      // 模板路径用显式 LogGroup —— 栈内资源，删栈一并删，名字交给 CFN 生成。2026-10-10 一次干净的
+      // 方式 A 删栈之后，这个函数（以及 CUR 那两个）首次调用时自建的 /aws/lambda/<名字> 日志组还留在
+      // 账号里、**永不过期**；方式 B 现网那个也是永不过期。
+      logRetention: props.staticTemplate ? undefined : logs.RetentionDays.TWO_WEEKS,
+      logGroup: props.staticTemplate
+        ? new logs.LogGroup(scope, "CostMcpLogs", {
+            retention: logs.RetentionDays.TWO_WEEKS,
+            removalPolicy: cdk.RemovalPolicy.DESTROY,
+          })
+        : undefined,
+      environment: {
+        // ⚠️ 自建 CUR 时**故意不设** `CUR_TABLE`：那张表要等 AWS 首次交付（~24h）之后
+        // 才由 finalizer 建出来，部署这一刻写进去的任何值都是猜的。留空让 server 去
+        // notiops-config 读 finalizer 写的记录 —— 那条记录**带 READY 判定**，能区分
+        // 「表还没爬完」和「表能查了」。猜一个名字填进来的话，未就绪期间查询会返回空
+        // 结果而不报错，客户只会觉得"NotiOps 说我这个月没花钱"。
+        ...(props.curTable ? { CUR_TABLE: props.curTable } : {}),
+        ...(props.configTableName ? {
+          CONFIG_TABLE: props.configTableName,
+          NOTIOPS_ACCOUNT_ID: stack.account,
+        } : {}),
+        ATHENA_WORKGROUP: costWorkgroup.name,
+        PARTITION_STYLE: props.curPartitionStyle || "flat",
+        CUR_VERSION: props.curVersion || "1",
+        CUR_TAG_KEYS: props.curTagKeys || "",
+        ...(props.curRoleArn ? { CUR_ROLE_ARN: props.curRoleArn } : {}),
+        // ⚠️ 不设 `AWS_REGION` —— 它是 Lambda **保留**环境变量，函数配置里设不了。
+        // 跨区 CUR/Athena 用我们自己的 ATHENA_REGION（见 cost_mcp/athena.py）。
+        ATHENA_REGION: stack.region,
+      },
+    });
+    // 结果位置由 workgroup 强制（EnforceWorkGroupConfiguration），所以**不**给
+    // ATHENA_OUTPUT —— 给了反而会让 server 自带 ResultConfiguration，与强制配置冲突。
+    costMcpFn.node.addDependency(costWorkgroup);
+
+    const costMcpUrl = costMcpFn.addFunctionUrl({
+      // SigV4。**唯一**的鉴权手段 —— 客户端（BFF 与 agent runtime）各自签名。
+      authType: lambda.FunctionUrlAuthType.AWS_IAM,
+    });
+
+    // 接管这两个值：下面 BFF 的 env 与 `InvokeCostAgentMcp` 授权都用它们。
+    // `fnUrl.url` 带尾斜杠，但两个客户端都会去掉（core/cost_agent_mcp.py:60 的 rstrip、
+    // bff/web-chat/cur_dashboard.mjs:32 的 replace）—— 核对过，不是假设。
+    //
+    // 方式 A（给了 `costMcpEnabledCondition`）：选装与否是**部署期**才知道的，所以这里
+    // 落成 `Fn::If` —— 选装了用自建的，没选装回落到 External 参数。两条路径的差异就这一处。
+    if (props.costMcpEnabledCondition) {
+      costAgentMcpUrl = cdk.Fn.conditionIf(
+        props.costMcpEnabledCondition.logicalId, costMcpUrl.url, externalCostAgentMcpUrl,
+      ).toString();
+      costAgentFunctionArn = cdk.Fn.conditionIf(
+        props.costMcpEnabledCondition.logicalId, costMcpFn.functionArn, externalCostAgentFunctionArn,
+      ).toString();
+    } else {
+      costAgentMcpUrl = costMcpUrl.url;
+      costAgentFunctionArn = costMcpFn.functionArn;
+    }
+
+    costMcpRefs = {
+      fn: costMcpFn,
+      url: costMcpUrl,
+      role: costRole,
+      workgroup: costWorkgroup,
+      resultsBucket: costResults,
+      logGroup: costMcpFn.logGroup instanceof logs.LogGroup ? costMcpFn.logGroup : undefined,
+    };
+    // 方式 A 的写日志权限：只给自己那个栈内日志组（角色上没有 BasicExecutionRole，见 costRole）。
+    const costMcpOwnLogs = costMcpFn.logGroup instanceof logs.LogGroup ? costMcpFn.logGroup : undefined;
+    if (props.staticTemplate && costMcpOwnLogs) {
+      costRole.addToPolicy(new iam.PolicyStatement({
+        sid: "CostMcpOwnLogStreams",
+        actions: ["logs:CreateLogStream", "logs:PutLogEvents"],
+        resources: [costMcpOwnLogs.logGroupArn, `${costMcpOwnLogs.logGroupArn}:*`],
+      }));
+    }
+
+    // ⚠️ Output 也必须带上同一个条件（方式 A）：它引用的是条件资源，而 Output 本身无条件
+    // ⇒ 客户不选装时**整栈部署失败**。synth 会警告「Reference to ... which is conditional」
+    // 并直接给出这条修法，但 tsc 不报 —— 这类只有真 synth 才能发现的问题，在这个文件里
+    // 已经踩到三处（L1 没有 defaultChild、enforceSSL 生成的 BucketPolicy、这里）。
+    const costUrlOut = new cdk.CfnOutput(scope, "CostMcpUrl", {
+      value: costMcpUrl.url,
+      description: "Cost MCP server Function URL (SigV4 only; used by the BFF and the agent runtime)",
+    });
+    const costArnOut = new cdk.CfnOutput(scope, "CostMcpFunctionArn", {
+      value: costMcpFn.functionArn,
+      description: "Cost MCP server function ARN (needed for lambda:InvokeFunctionUrl grants)",
+    });
+    if (props.costMcpEnabledCondition) {
+      costUrlOut.condition = props.costMcpEnabledCondition;
+      costArnOut.condition = props.costMcpEnabledCondition;
+    }
   }
 
   // ─── Web Chat BFF：streaming Lambda + Function URL ───
@@ -334,6 +824,14 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       // （requiresEnv）摘掉，其余 FinOps 仪表盘与聊天不受影响；挂了则只有这 4 个 sheet 显示
       // 「暂时不可用」（bff/web-chat/cur_dashboard.mjs 的 soft 边界），绝不拖垮别的功能。
       COST_AGENT_MCP_URL: costAgentMcpUrl,
+      // 🔴 超时阶梯必须成层，否则最宽的那个查询**永远**失败而不是超时报错：
+      //     Athena 预算 280s（cost_mcp/server.py::get_cost_cube 显式传的）
+      //   < cost MCP 函数超时 330s
+      //   < BFF 这一侧的 abort 360s
+      // cur_dashboard.mjs 的默认值是 **120000**（比服务端自己的 Athena 预算还短），
+      // 所以宽时间窗 / 冷查询在**任何**模式下都取不回来 —— 这不是自建态引入的问题，
+      // External 态一直就有。在这里显式给值把三层对齐。
+      COST_AGENT_MCP_TIMEOUT_MS: "360000",
       // Admin「集成 IM」→ 抽屉里直接显示飞书 webhook 地址（省掉客户去翻 CloudFormation
       // Outputs 那一趟）。这里给的是 **IM 入口 HTTP API 的名字前缀**，不是地址本身 ——
       // 地址由 BFF 运行时按名字查（apigatewayv2:GetApis，见 bff/web-chat/feishu_config.mjs）。
@@ -366,35 +864,31 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
             executor 的 SQS 入口。那些资源全在 NotiOpsBackendStack 里，
             而 standalone 刻意只装「chat UI + BFF + agent」。
 
-            于是下面这三个环境变量和后面那 4 条 IAM 在 standalone 上
-            **指向不存在的资源**。IAM 本身无害（授权一个不存在的 ARN 不
-            产生任何权限），但**别把它读成「standalone 支持巡检」**。
+            于是后面那 4 条巡检 IAM 里，表读写与 invoke scheduler/executor 那 3 条
+            （`InspectionDashboardReadOnly` / `InspectionScopeAndScheduleWrite` /
+            `InspectionManualRunInvoke`），以及下面写死的 `INSPECTION_SCHEDULER_FUNCTION` /
+            `INSPECTION_EXECUTOR_FUNCTION` 两个函数名，在 standalone 上
+            **指向不存在的资源**（`INSPECTION_TABLE` 2026-09-07 起在 standalone 上
+            是空串，见下面那段）。这 3 条授权一个不存在的 ARN，实际不产生权限；
+            第 4 条 `InspectionResourceInventoryReadOnly` 是只读的 RDS / ElastiCache
+            Describe、资源 `*`，在 standalone 上**照样生效**（其中 3 个动作「生命周期/EOS」
+            那条本来就给了，多出来的只有 `elasticache:DescribeReplicationGroups`）。
+            **别把这些读成「standalone 支持巡检」**。
 
-         ⚠️ 已知缺口，不在这里修：`PRESET_ROLES` 的 `role:finops` /
-            `role:support` / `role:viewer` 都含 `nav:inspection:*`
-            （authz.mjs），所以 standalone 上这些角色的用户会看到
-            「巡检」tab，点进去是 `ddb_error` 加载失败面板 ——
-            HTTP 200、不是 403，也不会自动隐藏。
-            ⚠️ **这里原来写着「visibleTree 里没有任何 env 判据」，那已经
-               不成立**：`visibleTree` 现在压在 `alwaysOn` 之前跑一道
-               `envConfigured(node.requiresEnv)`（authz.mjs），
-               `filterDashboard` 也用同一判据剥响应字段 —— 下面第 381 行的
-               `COST_ANALYZER_FUNCTION` 正是靠它把方式 A 的
-               `nav:finops:daily-anomaly` 整张卡收掉的。
-            **机制有了，巡检这条却仍然收不掉**，原因不在机制而在下面那一行：
-               `INSPECTION_TABLE` 两条路径都**无条件**注入
-               `"notiops-inspection"`，于是 `requiresEnv: "INSPECTION_TABLE"`
-               在方式 A 上照样判「已配置」，闸门空转。真要自动收口，得先让
-               那一行也带 `props.staticTemplate` 条件（空串 = 这条路上没有
-               写侧），再给 `nav:inspection` 加 `requiresEnv` —— 那会动两条
-               路径的模板与 golden fixture，且**必须连带改掉
-               `bff/web-chat/inspection.mjs:51` 的
-               `process.env.INSPECTION_TABLE || "notiops-inspection"`**：
-               那个 `||` 兜底会把空串又填回成表名，闸门照样空转。
-               属独立改动，不该混在这次 merge 里。
-            眼下现成的收口手段仍是管理页的**模块开关**（`nav:inspection` 是
-            level=tab 且非 alwaysOn/adminOnly，admin.mjs 的
-            `apiGetModules` 已把它列为可关）—— 需要人手关一次。 */
+         历史（2026-09-03 记下的缺口，**2026-09-07 已收口**，现状以下面
+            `INSPECTION_TABLE` 那段为准）：当时 `INSPECTION_TABLE` 两条路径都
+            无条件注入 `"notiops-inspection"`、`nav:inspection` 也没有
+            `requiresEnv`，于是 standalone 上带 `nav:inspection:*` 的角色
+            （`PRESET_ROLES` 的 `role:finops` / `role:support` / `role:viewer`，
+            authz.mjs）都看得到「巡检」tab，点进去是 `ddb_error` 加载失败面板
+            （HTTP 200、不是 403、不自动隐藏），唯一的收口手段是管理页的模块开关。
+            现在三处一起生效：standalone 上 `INSPECTION_TABLE` 为空串；
+            `nav:inspection` 带 `requiresEnv: "INSPECTION_TABLE"`（`envConfigured`
+            判据与下面 `COST_ANALYZER_FUNCTION` 收掉方式 A 的 `nav:finops:daily-anomaly`
+            是同一个）；authz.mjs 不再给被 requiresEnv 挡掉的 tab 做祖先补全。
+            ⇒ 方式 A 的侧栏「更多」里没有「巡检」；绕过前端直接调 `/inspection/*`
+            拿到的是 `inspection_not_deployed`（bff/web-chat/index.mjs）。
+            不再需要人手去关模块开关。 */
       // 巡检 space —— 管理页用它引导「把成员账号加为 monitor account」。
       INSPECT_AGENT_SPACE_ID: props.inspectionAgentSpaceId ?? "",
       INSPECT_AGENT_SPACE_NAME: props.inspectionAgentSpaceName ?? "",
@@ -424,7 +918,7 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       //    的字面量：BFF 的兜底串、`notiops-backend-stack.ts` 的 functionName、
       //    以及下面那条 IAM resource ARN。改任一处，「立即巡检」会返回
       //    `invoke_failed`（AccessDenied 或 ResourceNotFoundException）。
-      // ⚠️ 与第 237 行那条 IAM ARN 里的名字**必须一致** —— 那条也写死了同一
+      // ⚠️ 与下面 `InspectionManualRunInvoke` 那条 IAM ARN 里的名字**必须一致** —— 那条也写死了同一
       //    个串。这里注入之后至少 BFF 侧只剩一个来源。
       INSPECTION_SCHEDULER_FUNCTION: "notiops-inspection-scheduler",
       // 按需判读（「深入分析」）直接 invoke 它。硬编码同上一行的惯例 ——
@@ -838,7 +1332,7 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   // ⚠️ 注意本条与 AgentCore runtime 角色的**不对称**：这里是 "*"（全区），
   // agent-build/.../cdk/lib/cdk-stack.ts 按区收窄。所以「保存时探测通过」不等于
   // 「聊天时调得通」—— 探测用的是 BFF 这个角色。两者的区域集必须保持
-  // runtime ⊇ 白名单，由 scripts/test_mantle_regions_consistent.py 守。
+  // runtime ⊇ 允许清单，由 scripts/test_mantle_regions_consistent.py 守。
   bff.addToRolePolicy(
     new iam.PolicyStatement({
       sid: "BedrockMantleConnectivityProbe",
@@ -967,15 +1461,40 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   // 换来的是"客户事后填上参数就能用，不必再动基础设施"。
   if (costAgentMcpUrl) {
     // ① 调 cost-agent MCP 的 Function URL。
-    // ⚠️ 实测坑：这条 identity policy **不能**带 `lambda:FunctionUrlAuthType` Condition ——
-    // 带上会被拒（403），而 403 在前端只表现为"数据源暂时不可用"。目标 Lambda 侧还需要
-    // 一条 resource policy 允许本角色（见 docs/DEPLOYMENT.md §14.3，那一步在客户自己的
-    // cost-agent 部署里，不属于本栈）。
+    //
+    // 🔴 **两个动作都要给** —— `lambda:InvokeFunctionUrl` **和** `lambda:InvokeFunction`。
+    // AWS 在 **2025 年 10 月**改了 Function URL 的鉴权：新建的 Function URL 要求调用方
+    // 同时具备这两个权限（官方文档 https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html
+    // 开头那条 Note）。只给前一个的表现极具误导性：签名有效、身份被正确识别、
+    // IAM 策略模拟器还会告诉你 `allowed`，但请求在**授权阶段**被拒 → HTTP 403，
+    // 而且**请求根本不会到达函数**（函数日志里一片空白，只有 `Url4xxCount` 在涨）。
+    //
+    // 这个坑本仓库其实已经踩过一次并修对了 —— 前端调 BFF 的那条授权（本文件末尾
+    // `authRole` 那两条，注释里引了 pitfalls #33）就是两个动作都给的。但**成本 MCP
+    // 这条链路当时没跟着改**，于是 2026-09-20 在验证账号真部署时才暴露：
+    // 方式 A 自建成本 MCP 后，agent 与 BFF 都拿不到数据，聊天里 45 个 CUR 工具形同不存在。
+    // 实测确认：补上 `lambda:InvokeFunction` 后立刻返回 45 个工具。
+    //
+    // ⚠️ 两条语句的 Condition **必须不同**，不能复制粘贴：
+    //   · `InvokeFunctionUrl` 的授权上下文里有 `lambda:FunctionUrlAuthType`
+    //   · `InvokeFunction` 的授权上下文里**没有**那个键，只有 `lambda:InvokedViaFunctionUrl`
+    //     —— 沿用上面那个条件会因"条件不匹配"再次被拒（与 authRole 那段同一个说明）。
+    // 用 `InvokedViaFunctionUrl` 而不是裸给 `InvokeFunction`：把这条权限限定成
+    // 「只能经由 Function URL 调」，否则等于顺手发了一张直接 InvokeFunction 的通行证。
     bff.addToRolePolicy(
       new iam.PolicyStatement({
         sid: "InvokeCostAgentMcp",
         actions: ["lambda:InvokeFunctionUrl"],
         resources: [costAgentFunctionArn],
+        conditions: { StringEquals: { "lambda:FunctionUrlAuthType": "AWS_IAM" } },
+      }),
+    );
+    bff.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "InvokeCostAgentMcpFn",
+        actions: ["lambda:InvokeFunction"],
+        resources: [costAgentFunctionArn],
+        conditions: { Bool: { "lambda:InvokedViaFunctionUrl": "true" } },
       }),
     );
     // ② 大 payload 的当天缓存落共享数据桶的 cur-dash-cache/ 前缀
@@ -1065,8 +1584,8 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   );
 
   /* ── 资源巡检的 4 条 IAM（2026-09-03 从 web-chat-stack.ts 迁来）──────
-     ⚠️ 在 standalone 单栈上这几条指向不存在的资源 —— 原因与影响见上面
-        `INSPECTION_TABLE` 那一段。别据此认为一键部署那条路支持巡检。
+     ⚠️ 在 standalone 单栈上前 3 条指向不存在的资源，第 4 条（资源清单，Describe on `*`）
+        照样生效 —— 原因与影响见上面「资源巡检」env 那一段。别据此认为一键部署那条路支持巡检。
 
      ⚠️ BFF 角色的内联策略贴着 IAM 的 **10240 字节**上限，CDK 会自动把装不下的
         statement 挪进**溢出 managed policy**（`WebChatBffServiceRoleOverflowPolicy1`）。
@@ -1112,7 +1631,7 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   // 原来不给的理由要一起读，否则下一个人会把它删回去：
   //
   // ```
-  // 原来的理由   R1.4「到期条目保留记录但不生效」是防「白名单越积越多
+  // 原来的理由   R1.4「到期条目保留记录但不生效」是防「排除清单越积越多
   //              没人敢删」的机制，靠的是让它们**可见**。给了删除权限，
   //              UI 上迟早出现「清理已过期」按钮，把审计痕迹一起清掉。
   //
@@ -1128,9 +1647,9 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   //              CloudWatch Logs。「谁在什么时候删了哪条」没丢。
   //
   // 仍然不做      **没有**批量删除、没有「清理已过期」按钮。UI 上只有
-  //              逐行的「挪出白名单」+ 二次确认 —— 那个按钮一次只能
-  //              撤销一条（整账号排除是两条，因为它本来就是一个动作
-  //              写出来的两条）。原来担心的正是批量那一步。
+  //              逐行的移出按钮（i18n 键 `insp.scope.remove`）+ 二次确认 ——
+  //              那个按钮一次只能撤销一条（整账号排除是两条，因为它本来
+  //              就是一个动作写出来的两条）。原来担心的正是批量那一步。
   // ```
   bff.addToRolePolicy(
     new iam.PolicyStatement({
@@ -1419,9 +1938,9 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   // Function URL，response streaming + AWS_IAM 鉴权（不再 world-accessible，
   // 满足安全基线/Epoxy）。前端用 Cognito Identity Pool 拿临时凭证、SigV4 签名调用。
   // 用户身份（idToken→sub）走请求体，由 handler 校验（Authorization 已被 SigV4 占用）。
-  // CORS：优先用部署方通过 `-c allowedOrigins=https://a.com,https://b.com` 指定的可信域名白名单。
+  // CORS：优先用部署方通过 `-c allowedOrigins=https://a.com,https://b.com` 指定的可信域名允许清单。
   // 未指定时回退 ["*"] —— 说明：① 端点已由 AWS_IAM/SigV4 鉴权，浏览器 CORS 不是主要信任边界；
-  // ② 前端 CloudFront 域名每次部署动态生成、部署期未知，示例仓库无法预置固定白名单。
+  // ② 前端 CloudFront 域名每次部署动态生成、部署期未知，示例仓库无法预置固定的允许清单。
   // 生产部署应显式传 allowedOrigins 收窄到自己的前端域名。
   const corsAllowedOrigins = (() => {
     if (props.corsAllowedOrigins?.length) return props.corsAllowedOrigins;
@@ -1429,8 +1948,9 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
     const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
     if (!list.length) {
       cdk.Annotations.of(scope).addWarning(
-        "Function URL CORS allowedOrigins 回退到 ['*']（所有来源）。生产部署请传 " +
-        "`-c allowedOrigins=https://<你的前端域名>` 收窄到可信域名。" +
+        "Function URL CORS allowedOrigins 回退到 ['*']（所有来源）。生产部署请在 infra/cdk.json 的 " +
+        "context 里加 `\"allowedOrigins\": \"https://<你的前端域名>\"`（就是 WebChatStack 输出的 ChatUrl）" +
+        "再重跑 ./setup.sh，收窄到可信域名（一次性的 -c 会被下一次 ./setup.sh 丢掉）。" +
         "端点仍由 AWS_IAM/SigV4 鉴权，但收窄 CORS 是纵深防御的推荐做法。",
       );
       return ["*"];
@@ -1639,7 +2159,7 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
     // `setup.sh` 的排障小节会打印它给运维用，那是内部受众。
     new cdk.CfnOutput(scope, "ChatUrl", { value: `https://${distribution.distributionDomainName}`, description: "Web Chat frontend URL" });
     new cdk.CfnOutput(scope, "WebChatTableName", { value: table.tableName });
-    return { table, bff, fnUrl, siteBucket, distribution, identityPool, rumIdentityPool, rumGuestRole, appMonitor, configJson };
+    return { table, bff, fnUrl, siteBucket, distribution, identityPool, rumIdentityPool, rumGuestRole, appMonitor, configJson, costMcp: costMcpRefs };
   }
 
   const configFn = new lambda.Function(scope, "ChatConfigFunction", {
@@ -1678,5 +2198,5 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   new cdk.CfnOutput(scope, "ChatBffUrl", { value: fnUrl.url, description: "Web Chat BFF Function URL (streaming)" });
   new cdk.CfnOutput(scope, "WebChatTableName", { value: table.tableName });
 
-  return { table, bff, fnUrl, siteBucket, distribution, identityPool, rumIdentityPool, rumGuestRole, appMonitor, configJson };
+  return { table, bff, fnUrl, siteBucket, distribution, identityPool, rumIdentityPool, rumGuestRole, appMonitor, configJson, costMcp: costMcpRefs };
 }

@@ -67,7 +67,16 @@ REPO = Path(__file__).resolve().parent.parent
 # ---------------------------------------------------------------------------
 
 # Anywhere we look for Python source. Extend as new top-level dirs land.
-PY_DIRS = ["core", "platforms", "lambda", "scripts"]
+#
+# `cost_mcp` and `cur_provisioner` were added 2026-09-20. `cost_mcp` is the one that
+# mattered: its 45 `@server.tool(description=...)` strings and its `caliber_note`
+# arguments are read **by the model**, and they were all Chinese. A model-facing
+# description in a language the rest of the tool surface does not use is not a
+# cosmetic problem -- it degrades tool selection, and it reaches every customer.
+# Comments and docstrings in those packages stay Chinese: this linter does not look
+# at them, which is exactly the repo convention (model-facing text English, reasoning
+# in comments Chinese -- same split as core/cost_agent_mcp.py).
+PY_DIRS = ["core", "platforms", "lambda", "scripts", "cost_mcp", "cur_provisioner"]
 
 # Files we deliberately exempt from the CJK-literal check. Reason given
 # inline so reviewers see why.

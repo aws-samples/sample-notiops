@@ -474,7 +474,7 @@ def _action_rows_spec(*, report_url: str, trace_url: str,
 
     ⚠️ 报告卡上**没有**「🔬 查看本次调查」(DevOps Agent 控制台深链)。
     2026-09-05 加过、当天按用户要求去掉:这张卡上其余每个链接都是预签名
-    的、7 天内免登录,而控制台深链**必须登录 AWS 控制台**。两种链接放在
+    的、免登录(数小时内有效,最长约 12 小时),而控制台深链**必须登录 AWS 控制台**。两种链接放在
     一排按钮里,底下那行说明就只能同时写「无需登录」和「需要登录」——
     用户看到的是自相矛盾的一行。少一颗按钮换一句不会骗人的说明。
     「🔍 调查过程 Trace」已经覆盖了「想看这次调查过程」这个需求。
@@ -542,8 +542,8 @@ def _action_rows_spec(*, report_url: str, trace_url: str,
 
 def _note_lines(locale: str) -> list[str]:
     """Footnotes. Exactly one line, and it is unconditionally true: every
-    link left on this card is a presigned S3 / CDN URL — valid 7 days, no
-    console login.
+    link left on this card is a presigned S3 / CDN URL — valid for a few hours
+    (at most about 12: signed with temporary credentials), no console login.
 
     ⚠️ 别再往这里加「需要登录」那句(`progress.link_login_warning`)。
     它当年是为控制台深链加的,而那颗按钮已经从报告卡上去掉了(见

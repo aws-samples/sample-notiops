@@ -14,8 +14,9 @@ GSI1 Query 和一次 STS），不碰任何模型。
                / `notiops`（走模型的 NotiOps Agent，**会烧 token**）
                / `starops`（直连阿里云 STAROps 数字员工，NotiOps 侧 0 token，但**烧客户
                  自己的阿里云 AI 额度**，而且看的是**阿里云**资源不是 AWS。
-                 ⚠️ 2026-09-15 起这一档**不再对客户宣传**：用法行与「可用: …」都不列它
-                 （`core/multicloud.py` 的 `VISIBLE`），但 `/agent starops` 照旧能打通，
+                 ⚠️ 2026-09-15 起这一档**不再对客户宣传**：用法行与「可用: …」都不列它；
+                 2026-10-10 起没配阿里云时的拒绝语也不再指向「多云」页（两者都由
+                 `core/multicloud.py` 的 `VISIBLE` 控制），但 `/agent starops` 照旧能打通，
                  已经配好阿里云的部署不受影响 —— 藏的是文案，不是功能）；
   · `web`    ：联网搜索开关，**只对 `agent=notiops` 生效**（两条直连路上联不联网由
                客户自己那套 agent 决定，我们说不上话）；
@@ -120,8 +121,10 @@ def agent_reply(msg: ImMessage, arg: str, *, platform: str) -> str:
     # 而用户以为自己已经切成功了、只是产品坏了。
     # ⚠️ 这里**只读本地配置、不打阿里云**（见 `core/starops_chat.availability`）—— 代价是
     #    "配了但员工 ID 写错"这里放行，那种错由第一次真实对话报出更具体的话术。
+    # ⚠️ 拒绝语走孪生 key（`core/multicloud.py`）：多云关着时那个「多云」页在 Web 端也藏着，
+    #    基线那份只说"暂未开放"，不把人指到一个点不开的页面。
     if target == im_prefs.AGENT_STAROPS and not starops_chat.configured():
-        return i18n.t("agent.starops_not_configured", msg.locale)
+        return i18n.t(multicloud.agent_starops_not_configured_key(), msg.locale)
 
     if not im_prefs.set_agent(target, **where):
         return i18n.t("agent.set_failed", msg.locale)

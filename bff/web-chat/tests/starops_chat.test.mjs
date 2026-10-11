@@ -26,6 +26,7 @@ import {
   THREAD_GONE_RE, RAM_ERR_RE,
   starOpsHost, buildStarOpsRequest, starOpsErrCode, buildVariables,
   getDigitalEmployee, createThread, stopChat, streamChat, ramHint, createThreadFailText,
+  notConfiguredText, MULTICLOUD_VISIBLE,
 } from "../starops_chat.mjs";
 import { hexSha256 } from "../aliyun_signer.mjs";
 import { STAROPS_WIRE_VERSION } from "../starops_sse.mjs";
@@ -324,6 +325,11 @@ for (const en of [false, true]) {
     en ? /[Rr]etry later/.test(tmp) : tmp.includes("请稍后重试"));
   ok(`${lang}: 非权限错不谎称是权限问题`,
     en ? !/PERMISSIONS problem/.test(tmp) : !tmp.includes("**权限**问题"));
+  // 退路要给出 Web 端**真做得到**的做法：对话对象发出第一句后就固定了，会话里没有能切回去的
+  // 控件 —— 只能开一个新对话。IM 那份（core）是 `/agent devops`，Web 端没有这个命令。
+  ok(`${lang}: 两类错的退路都说清在 Web 端怎么换（开一个新对话），且不拿 IM 命令当退路`,
+    [perm, tmp].every((s) => (en ? s.includes("“New chat”") : s.includes("「新对话」"))
+      && !s.includes("/agent")));
 }
 // `RAM_ERR_RE` 的每一种拼法都要落到"重试不会好"那一句，否则这个修复只挡住了 NoPermission。
 for (const code of ["NoPermission", "Forbidden.RAM", "AccessDenied", "NotAuthorized", "Unauthorized"]) {
@@ -338,6 +344,62 @@ ok("签名错**不算** thread 没了（重建 thread 治不了签名，只会�
   !THREAD_GONE_RE.test("SignatureDoesNotMatch"));
 ok("限流不算", !THROTTLE_IS_THREAD_GONE());
 function THROTTLE_IS_THREAD_GONE() { return THREAD_GONE_RE.test("Throttling"); }
+
+/* ── 5d. notConfiguredText：多云关着时**不许**把人指到一个点不开的页面 ─────────────
+ * 多云关着（`MULTICLOUD_VISIBLE = false`）时「多云」页不在左导航里；可已有 STAROps 历史的
+ * 会话刷新后照样会被锁回 STAROps（ChatApp 的 relockSo），所以这句话**真的发得出去**。
+ * 🔴 判据有两半：关着那支只说缺哪一项 + 现在没有能改的页面 + 一条 Web 端真走得通的退路；
+ *    可见那支照旧指到当前侧栏路径。两支说的「缺哪一项」必须是同一句。 */
+const NOT_CONFIGURED_REASONS = {
+  // reason → [zh 里必须点名的字段, en 里必须点名的字段]（与 core 的 test_each_reason_names_the_field_it_is_about 同一判据）
+  no_credentials: ["AccessKey", "AccessKey"],
+  no_employee: ["数字员工 ID", "digital employee ID"],
+  bad_employee: ["数字员工 ID", "digital employee ID"],
+  bad_region: [STAROPS_REGIONS[0], STAROPS_REGIONS[0]],
+  bad_workspace: ["workspace", "workspace"],
+  bad_project: ["project", "project"],
+  totally_unknown: ["阿里云配置不完整", "configuration is incomplete"],
+};
+for (const en of [false, true]) {
+  const lang = en ? "en" : "zh";
+  for (const [reason, needle] of Object.entries(NOT_CONFIGURED_REASONS)) {
+    const hidden = notConfiguredText(reason, en, { multicloudVisible: false });
+    const shown = notConfiguredText(reason, en, { multicloudVisible: true });
+    ok(`${lang}/${reason}: 两支都点名缺的是哪一项`,
+      hidden.includes(needle[en ? 1 : 0]) && shown.includes(needle[en ? 1 : 0]));
+    ok(`${lang}/${reason}: 关着时不指向「多云」页`,
+      en ? !/Admin|→/.test(hidden) : !/管理|→/.test(hidden));
+    ok(`${lang}/${reason}: 关着时说清现在没有能改这一项的页面`,
+      en ? hidden.includes("Multi-cloud is not available yet") && hidden.includes("no page to change this")
+         : hidden.includes("多云暂未开放") && hidden.includes("没有能改这一项的页面"));
+    // 不给退路，这个会话每一轮都回同一句。Web 会话的对象发出第一句后就固定了 → 退路只能是新会话。
+    ok(`${lang}/${reason}: 关着时给出 Web 端的退路（开一个新对话）`,
+      en ? hidden.includes("“New chat”") : hidden.includes("「新对话」"));
+    ok(`${lang}/${reason}: 关着时不拿 IM 的 /agent 命令当退路（Web 端没有这个命令）`,
+      !hidden.includes("/agent"));
+    ok(`${lang}/${reason}: 可见时指到当前侧栏路径`,
+      shown.includes(en ? "**More → Admin → Multi-cloud → Alibaba Cloud**" : "**更多 → 管理 →「多云」→ 阿里云**"));
+  }
+}
+// 调用方不传第三个参数 → 走的是 MULTICLOUD_VISIBLE 那一支（runStarOpsChat 就是这么调的）。
+for (const en of [false, true]) {
+  eq(`${en ? "en" : "zh"}: 默认取 MULTICLOUD_VISIBLE`, notConfiguredText("no_credentials", en),
+    notConfiguredText("no_credentials", en, { multicloudVisible: MULTICLOUD_VISIBLE }));
+}
+{
+  // 🔴 三处开关必须一起翻（见 starops_chat.mjs 的 MULTICLOUD_VISIBLE）。BFF 读不到前端那个编译期
+  //    常量，只能各留一份 —— 那就在这里核对三份是同一个值：本文件跑起来时，翻漏一处就红。
+  // ⚠️「跑起来」有前提：CI 里只有 bff-tests 跑本文件，而它只在 MR 改到 bff/web-chat/** 或
+  //    config/llm-model-catalog.json 时触发。只改了 featureFlags.ts 或 core/multicloud.py 的 MR
+  //    不会跑到这里，CI 照样是绿的 —— 翻开关时要在本地跑一次 `npm test`。
+  const fs = await import("node:fs");
+  const src = (rel) => fs.readFileSync(new URL(rel, import.meta.url), "utf8");
+  const fe = (src("../../../frontend/chat-app/src/featureFlags.ts")
+    .match(/^export const MULTICLOUD_UI\s*=\s*(true|false)\s*;/m) || [])[1];
+  const py = (src("../../../core/multicloud.py").match(/^VISIBLE\s*=\s*(True|False)\s*$/m) || [])[1];
+  eq("featureFlags.ts 的 MULTICLOUD_UI 与 MULTICLOUD_VISIBLE 一致", fe, String(MULTICLOUD_VISIBLE));
+  eq("core/multicloud.py 的 VISIBLE 与 MULTICLOUD_VISIBLE 一致", py, MULTICLOUD_VISIBLE ? "True" : "False");
+}
 
 /* ══════════════════ 6. variables：空值不发，别覆盖对方的默认规则 ══════════════════ */
 {

@@ -1513,6 +1513,7 @@
             "ATHENA_RESULTS_BUCKET": "notiops-data-444455556666-us-east-1",
             "COGNITO_USER_POOL_ID": "us-east-1_FIXTUREPOOL",
             "CONFIG_TABLE": "notiops-config",
+            "COST_AGENT_MCP_TIMEOUT_MS": "360000",
             "COST_AGENT_MCP_URL": "",
             "COST_ANALYZER_FUNCTION": "notiops-cost-analyzer",
             "DEPLOY_ACCOUNT_ID": "444455556666",

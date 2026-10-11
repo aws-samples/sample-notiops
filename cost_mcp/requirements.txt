@@ -1,0 +1,69 @@
+# cost_mcp（客户 CUR 成本 MCP server）的运行时依赖 —— **全部钉死**。
+#
+# 为什么是 `==` 而不是范围：本仓「依赖必钉版本」（见 docs/DEPLOYMENT.md 前置依赖一节与
+# tests/test_agent_dep_bounds.py 的四条规则）。这里比 agent 那边更严 —— 全等值钉死，
+# 因为构建产物要进一键发布的 sha256 清单，任何浮动都会让同一个 tag 打出不同的 zip。
+#
+# ⚠️ 三个直接依赖（其余 33 个都是传递依赖，列全是为了可复现）：
+#     mcp / mangum / boto3
+#   · `mcp<2.0` **连 import 都不行** —— 2.0 把 `FastMCP` 改名成 `MCPServer`
+#     （cost_mcp/server.py 用的是新名字）。上下界都必须钉。
+#   · `mangum==0.21.0` 不是随便选的：cost_mcp/lambda_handler.py 的 lifespan 手法依赖
+#     mangum 用 `asyncio.get_event_loop()` + `run_until_complete` 去跑 app，从而捡到
+#     handler 模块里显式 set 的那个 loop。任何换成 `asyncio.run()` 的版本都会让**每次**
+#     调用变成 task-group 错误。改这个版本必须跑「同一容器连调两次」的 smoke。
+#   · boto3/botocore **显式带进包里**，不吃 Lambda runtime 自带的那份 —— 与
+#     scripts/build_im_layer.sh 同一口径（runtime 自带版本会随 AWS 静默升，
+#     「客户装到的 = CI 装到的」是本仓的硬要求）。
+#
+# 目标平台（与 scripts/build_cost_layer.sh 里的 pip 参数成契约）：
+#     linux/x86_64, CPython 3.14, manylinux2014
+#   四个带原生扩展的包：cffi / cryptography / pydantic-core / rpds-py。
+#   其中 cryptography 是 `cp311-abi3` —— **稳定 ABI，在 3.14 上能加载**，别看到 311
+#   就以为错了（另外三个是实打实的 cp314）。
+#
+# 版本集来源：2026-09-20 用
+#   pip download mcp==2.0.0 mangum==0.21.0 boto3==1.43.77 \
+#     --platform manylinux2014_x86_64 --implementation cp --python-version 3.14 \
+#     --only-binary=:all:
+# 解出的 36 个 wheel，全部有 manylinux 轮子、无一退回源码构建。
+
+# ── 直接依赖 ────────────────────────────────────────────────────────────────
+mcp==2.0.0
+mangum==0.21.0
+boto3==1.43.77
+
+# ── 传递依赖（钉死以保证可复现；顺序按包名）────────────────────────────────
+annotated-types==0.8.0
+anyio==4.15.1
+attrs==26.1.0
+botocore==1.43.98
+cffi==2.1.1
+click==8.5.0
+cryptography==50.0.1
+h11==0.16.0
+httpcore2==2.13.0
+httpx2==2.13.0
+idna==3.20
+jmespath==1.1.0
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+mcp-types==2.0.0
+opentelemetry-api==1.44.0
+pycparser==3.0
+pydantic==2.13.5
+pydantic-core==2.46.5
+pyjwt==2.14.0
+python-dateutil==2.9.0.post0
+python-multipart==0.0.32
+referencing==0.37.0
+rpds-py==2026.6.3
+s3transfer==0.19.2
+six==1.17.0
+sse-starlette==3.4.11
+starlette==1.6.0
+truststore==0.10.4
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+urllib3==2.8.0
+uvicorn==0.53.0

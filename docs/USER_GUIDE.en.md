@@ -14,13 +14,13 @@
 
 | What you want to do | Use | Why |
 |---|---|---|
-| Sit down and work through one failure, watching the analysis as it happens | **Web Chat** | A live "Investigation" panel on the right; full reports are readable online and downloadable |
+| Sit down and work through one failure, watching the analysis as it happens | **Web Chat** | A live "Thinking" panel on the right; full reports are readable online and downloadable |
 | Cost reviews / security posture / the whole Support case lifecycle | **Web Chat** | These topics come with dashboards and structured cards that exist only on the web |
 | Write / manage / publish your own Skills | **Web Chat only** | Skill intents were retired from the IM side on 2026-09-06 (see §5) |
-| An alarm wakes you up and you want the whole group to see it in place | **IM bot** | Alarm cards land in the group; the investigation is visible to everyone |
+| You're on call and want to ask right in the group chat, with colleagues looking on | **IM bot** | @ the bot to ask or to dispatch a deep investigation; answers and reports are visible to the whole group (note: in this release alarms are **not** pushed into IM groups — they show up under Notifications in the web; see §14) |
 | Ask one quick question from your phone and move on | **IM bot** | No laptop needed |
 
-> Both surfaces are **strictly read-only**, but each guarantees it **its own way** — Web Chat relies on "read-only IAM role (the hard boundary) + read-only tool layer + command-level denylist + read-only system prompt", while IM relies on "the read-only agent and read-only role on the DevOps Agent side, plus one change-wording regex on the NotiOps side". See §8 and "Who guarantees this 'read-only'" in §9. Anything that would change your AWS environment produces a preview for you to confirm on either surface, or sends you to the relevant console instead.
+> Both surfaces are **read-only by default**; the one write is an **AWS Support case** (create / reply / close), and it runs only after you confirm it (§1.5, §12). Each surface guarantees read-only **its own way** — Web Chat relies on "read-only IAM role (the hard boundary) + read-only tool layer + command-level denylist + read-only system prompt"; on IM, the default DevOps Agent direct path relies on "the read-only agent and read-only role on the DevOps Agent side", while after `/agent notiops` the same AgentCore Runtime as Web Chat answers with its read-only role and read-only tools (as in §8.1); on both IM paths NotiOps adds one change-wording regex. See §8 and "Who guarantees this 'read-only'" in §9. Anything that would change your AWS environment produces a preview for you to confirm on either surface, or sends you to the relevant console instead.
 
 ---
 
@@ -82,24 +82,23 @@ Your administrator gives you a URL and an initial account.
 
 ### 1.2 Set language and appearance first
 
-**Click your own name at the bottom-left** to open the user menu. Three things are worth setting on day one:
+**Click your own name at the bottom-left** to open the user menu. It has exactly three items, and the first two are worth setting on day one:
 
 | Menu item | What it does |
 |---|---|
-| **Language** | Exactly two options: `English (United States)` and `中文（简体）`. **A fresh browser defaults to English**; your choice is remembered per browser |
 | **Appearance** | Only **Dark** (the default) and **Light** — there is no "follow system" option |
-| **View changelog** | Opens the public repository's Releases page in a new tab |
-| **Learn more** | Opens the public repository home in a new tab |
-| **Report an issue** | Opens the public repository's Issues page in a new tab |
+| **Language** | Exactly two options: `English (United States)` and `中文（简体）`. **A fresh browser defaults to English**; your choice is remembered per browser |
 | **Sign out** | Returns you to the sign-in card |
 
-> ⚠️ **As of 2026-09-11 there is no "Settings" item in this menu.** It was never implemented — clicking it only popped a "Settings · Coming soon" alert — so the whole item was removed rather than left as a placeholder. The real configuration entries are the sidebar's **Admin** (roles / permissions / models / IM credentials) and **Inspection → Settings** (notification settings); neither is the same thing.
+The GitHub icon to the right of your name (its hover text reads "Star NotiOps on GitHub") opens the public repository home in a new tab — the changelog (Releases) and issue reporting (Issues) are reached from there. The menu's three former external links (View changelog / Learn more / Report an issue) were removed on 2026-09-12.
+
+> ⚠️ **As of 2026-09-11 there is no "Settings" item in this menu.** It was never implemented — clicking it only popped a "Settings · Coming soon" alert — so the whole item was removed rather than left as a placeholder. The real configuration entries are the sidebar's **More → Admin** (roles / permissions / models / IM credentials) and **More → Inspection → Settings** (scope / thresholds & schedule); neither is the same thing.
 
 > The UI language only affects **UI text**. The language of the *answers* follows **the language you ask in** — ask in English, get English.
 
 ### 1.3 The three regions of the screen
 
-- **Left nav**: **New chat** at the top, then the 7 entries (Notifications / Investigation / Cost / Cases / Inspection / Skills / Admin), then your **conversation list** grouped by topic, and at the bottom a **What's New** card plus your user menu. The whole sidebar collapses ("Collapse sidebar" / "Expand sidebar").
+- **Left nav**: **New chat** at the top, then 4 top-level entries (Notifications / Investigation / Cost / Cases) and an expandable **More** (Inspection / Skills / Admin — whether each one shows still depends on your role, the deployment and the Modules switches; it expands by itself when the current page is one of them, and remembers whether you left it open; if none of the three is shown, "More" is not shown at all — see §2.10 for why), then your **conversation list** grouped by topic, and at the bottom a **What's New** card plus your user menu. The whole sidebar collapses ("Collapse sidebar" / "Expand sidebar").
 - **Middle**: the conversation. The topbar shows the title, a topic tag and the **account picker**; messages in the middle; the composer and its toolbar at the bottom.
 - **Right-hand dock**: takes no space until needed, then slides out as either **Sources** (what this answer was based on) or **Thinking** (what it did, step by step). Both share one rail, so only one shows at a time.
 
@@ -146,7 +145,7 @@ Start with the whole picture — the key distinction is which entries are **chat
 | **Cases** | Chat topic **+** 4 dashboards | The whole AWS Support case lifecycle: read, analyse, create, reply, close |
 | **Inspection** | **Dashboards only — not a chat topic** | Reviewing what the automated inspection found (hot / idle resources) and dispatching an AI judgement |
 | **Skills** | Management page | Turn your team's process and standards into Skills so it works your way |
-| **Admin** | Management pages | A top-level entry (the old "More" collapsible group is retired): models, role permissions, account onboarding and other console settings. **Administrators only.** |
+| **Admin** | Management pages | Under "More" (since 2026-10-10): models, role permissions, account onboarding and other console settings. **Administrators only.** |
 | **What's New** card | Chat topic | Track AWS launches, filtered against the services your account actually uses |
 
 > **There is no "Security" item in the sidebar.** Security's **chat** capability was always a subset of Investigation's, so it folded in there; every security **dashboard** is still present, reached from the **Security posture** pill above the Investigation composer (below).
@@ -280,11 +279,16 @@ Headline "Let's optimise your cloud costs". The nav label is **Cost** (never "Fi
 
 > ⚠️ Two boundaries: (1) those MCP servers are mounted **only in the Cost topic** — other topics get 7 core tools; (2) they are **not** mounted when you are browsing a member account (their credentials are pinned to the deployment account), so native read-only boto3 fallbacks substitute, with a slightly narrower reach.
 >
-> In this topic **Amazon Nova Pro** is tagged "Not recommended" in the model menu, noting that Claude / DeepSeek are better for cost analysis.
+> **Amazon Nova Pro** has been disabled by default in the model catalogue since 2026-10-10, so it normally isn't in the model menu at all; if an administrator ticks it back on under More → Admin → Models, it is tagged "Not recommended" in this topic, noting that Claude / DeepSeek are better for cost analysis.
 
-**Dashboards** (reached from the **Spend & savings** pill above the composer): **7 are visible by default** — spend overview, optimisation & risk, key progress, month-over-month movers, cost deep dive, cost by tag, and cost anomalies. Four more **CUR reports** (cost trend / credits / extended support / Savings Plans) only appear when the deployment was given a CUR MCP endpoint; without it the whole block is hidden, and with it the left rail runs to **at most 11 entries**. Those 4 need a CUR data source (a cost-agent MCP) you provide and configure yourself, **on method A and method B alike** — it is not something method B brings with it.
+**Dashboards** (reached from the **Spend & savings** pill above the composer): **7 are visible by default** — spend overview, optimisation & risk, key progress, month-over-month movers, cost deep dive, cost by tag, and cost anomalies. Four more **CUR reports** (cost trend / credits / extended support / Savings Plans) only appear once a **cost MCP server** is connected; without one the whole block is hidden, and with one the left rail runs to **at most 11 entries**. **Neither deployment path connects one by default** — you turn it on at deploy time, in one of two ways:
 
-**Cost Deep Dive** covers 4 scenarios (CloudWatch / data transfer / EC2 compute / S3 storage) over pre-created Athena named queries, producing an "AI insight (please verify)" plus "Download raw data CSV ↓". If the deployment has no such named queries it reports `no_named_queries` / `named_query_not_found` explicitly instead of handing you an empty table.
+- **Let NotiOps deploy one for you** (recommended): on method B, `COST_MCP_SELF_HOST=true ./setup.sh`; on method A, fill in `CurTable=<db>.<table>` (an existing CUR) or pick `ProvisionCur=yes` (NotiOps creates the CUR as well). It only queries a CUR in **the deployment account and Region** — a CUR in another account is not supported yet; use the other way for that.
+- **Point at one you already run**: on method B, `COST_AGENT_MCP_URL` + `COST_AGENT_FN_ARN`; on method A, `CostAgentMcpUrl` + `CostAgentFunctionArn`.
+
+A newly created CUR has to wait for AWS's first delivery (up to 24 hours); until then these 4 reports say the customer-CUR data source is temporarily unavailable, and they switch over on their own once it is ready — no second deployment needed. Details: [DEPLOYMENT.en.md §14.2](DEPLOYMENT.en.md) and [DEPLOYMENT_ONECLICK.en.md §2.12](DEPLOYMENT_ONECLICK.en.md).
+
+**Cost Deep Dive** covers 4 scenarios (CloudWatch / data transfer / EC2 compute / S3 storage) over pre-created Athena named queries, producing an "AI insight (please verify)" plus "Download raw data CSV ↓". NotiOps creates those named queries automatically the moment the CUR is first ready: method B's "CUR + Athena" step (whether it creates a CUR or reuses one) gets there by default; method A only does it when you pick `ProvisionCur=yes` — filling in `CurTable` alone doesn't count (see §8.6). Without those named queries it reports `no_named_queries` / `named_query_not_found` explicitly instead of handing you an empty table.
 
 Every cost page carries the footnote: **excludes support, discounts and tax; cost data lags by roughly 1–2 days**.
 
@@ -313,7 +317,7 @@ The **Investigate** button on each card (and on each row of the TA drill-down ta
 >
 > ⚠️ Permission is enforced **per card**: revoke a card and the BFF strips its data out too, and the left-hand tree stops listing it — you never get a panel that opens onto nothing.
 >
-> ⚠️ Method A has a deploy parameter `AgentReadOnlyAccess` (default Yes). Setting it to No also removes the agent's read-only IAM boundary, and at that point it can't answer security questions either.
+> ⚠️ Method A has a deploy parameter `AgentReadOnlyAccess` (default Yes). It decides how widely the agent **can read**, not whether it can write: Yes attaches the AWS managed `ReadOnlyAccess` policy to the agent's role; No leaves only the curated read-only grants (cost, logs, metrics, RDS / EC2 describe and the like), a narrower set — Security Hub / GuardDuty findings, for example, are then out of its reach, so security questions like these fail in chat for lack of permission. Either way, the agent's role has no write permission on your infrastructure.
 
 ### 2.5 Cases
 
@@ -381,14 +385,14 @@ Opening a finding gives you a **read-only drawer** (closeable three ways). Insid
 When you **trigger an inspection run manually**, the confirmation states the cost verbatim: it really calls GetMetricData and dispatches an AI judgement (both billed), consumes today's run slot, cannot be undone, and skips accounts that already ran successfully today.
 
 > **Two things you must know:**
-> 1. **One-click deployment (method A) has no Inspection at all** — the page says this deployment does not support resource inspection, and that the method-A minimal footprint installs only Web Chat; use the full deployment (method B, `setup.sh`) if you need inspection.
-> 2. The full deployment (method B) installs the inspection pipeline, but **it is dormant on a fresh deployment** — no account is enabled, the scheduler idles, and no tokens are spent. Enable accounts under "Inspection scope" first. Once enabled it runs every 15 minutes and writes findings to its own table.
+> 1. **One-click deployment (method A) has no Inspection at all** — there is no Inspection item under the sidebar's "More" (the whole tab is not delivered; see §2.10). Only a browser still holding an old front-end bundle, or a direct call to the `/inspection/*` API, ever sees the message that resource inspection is not in this deployment and that the one-click minimal base installs Web Chat only — use the full deployment (method B, `setup.sh`) if you need it (the API returns `inspection_not_deployed`).
+> 2. On the full deployment (method B) inspection **runs as soon as it is installed — there is nothing to enable first**: the deployment account is onboarded automatically on every deploy, and both inspection types (high load / idle) run once a day at **02:00 UTC** by default, across all of the deployment account's Regions; the scheduler wakes every 15 minutes only to check whether a run is due. Like a manual run, every run really calls GetMetricData and, when there are findings, dispatches DevOps Agent judgements (both billed). Change the run time under "Thresholds & schedule"; to bring other accounts into scope, onboard them under More → Admin → Accounts (see §6.4); exclude resources you don't want scanned under "Inspection scope". Findings are written to a dedicated table.
 >
 > The scope / schedule / threshold / manual-run actions are granted by **none** of the six preset roles — only an administrator (permission `*`) can use them.
 
 ### 2.7 Skills
 
-Skills is a **first-level nav entry** (not buried under Customize). It lets you write your team's process, standards and domain knowledge into Skills so NotiOps works your way. See §5.
+Skills is an item under the sidebar's **More** group (not buried under Customize). It lets you write your team's process, standards and domain knowledge into Skills so NotiOps works your way. See §5.
 
 ### 2.8 The What's New card
 
@@ -402,10 +406,12 @@ Asking "**what's relevant to my account?**" is genuinely personalised: it takes 
 
 ### 2.9 Admin and Customize
 
-- **Admin** — a 9-page admin console, see §6. It is a **top-level nav entry** (promoted out of the old "More" group on 2026-09-11), sitting right after Skills, and only administrators see it.
-- **Customize** — ⚠️ **currently not rendered at all.** It used to be an item inside the "More" group, and that group is switched off (`SHOW_MORE_GROUP = false` in `Sidebar.tsx`), so the sidebar has neither "More" nor "Customize". Its Connectors and Plugins pages are still "Coming soon" placeholders; it will come back when there is something behind them.
+- **Admin** — an 8-page admin console, see §6. It sits under the sidebar's **More** group, after Inspection and Skills (it was promoted to top level on 2026-09-11 and moved back into "More" on 2026-10-10 at the user's request), and only administrators see it.
+- **Customize** — ⚠️ **currently not rendered at all.** The "More" group now holds Inspection / Skills / Admin, but Customize is still left out of it (`SHOW_CUSTOMIZE_ITEM = false` in `Sidebar.tsx`). Its Connectors and Plugins pages are still "Coming soon" placeholders; it will come back when there is something behind them.
 
 ### 2.10 An entry is missing? That's permissions or deployment method
+
+> First check whether "More" is expanded. **Inspection / Skills / Admin all live in the sidebar's "More" group, and it starts out collapsed** — it only opens by itself when the current page is one of them; otherwise you expand it yourself (it remembers whether you left it open or closed). If the entry still isn't there once it's expanded, read on; if none of the three is available to you (role, deployment, or a Modules switch — see the three reasons below), "More" itself isn't shown. For example, on a method-A deployment a user in the Cognito `member` group (mapped to **Viewer** by default) sees no "More" at all: that role does grant Inspection, but method A doesn't ship it, and Skills and Admin aren't part of that role.
 
 Whether a nav entry renders is decided by a **server-computed capability list** (fetched once after sign-in via `GET /me/capabilities`). Three possible reasons:
 
@@ -413,8 +419,8 @@ Whether a nav entry renders is decided by a **server-computed capability list** 
    - `nav:security` (the security-posture dashboards) is granted only by **Support-Ops** and **Viewer** — added 2026-09-11; before that no preset role had it, which meant "only admins can get into the security dashboards";
    - **No preset role** grants `nav:customize`;
    - **only Developer** grants `nav:skills`;
-   - ⇒ so a default non-admin user can't reach Customize either (and the "More" group that used to hold it is switched off anyway — see §2.9).
-2. **This deployment doesn't ship that feature.** Some nodes depend on deploy-time environment values: all of Inspection depends on the inspection table, the Cost "daily anomaly" card depends on the cost-analyzer function, and the 4 CUR reports depend on the CUR MCP endpoint. **Method A hardcodes the inspection table and the cost-analyzer function to empty**, so those two never appear under method A; the CUR MCP endpoint is an optional method-A parameter you can supply yourself.
+   - ⇒ so a default non-admin user can't reach Customize either (and right now Customize isn't rendered for anyone, administrators included — it is not part of the "More" group; `SHOW_CUSTOMIZE_ITEM = false`, see §2.9).
+2. **This deployment doesn't ship that feature.** Some nodes depend on deploy-time environment values: all of Inspection depends on the inspection table, the Cost "daily anomaly" card depends on the cost-analyzer function, and the 4 CUR reports depend on a cost MCP server's endpoint. **Method A hardcodes the inspection table and the cost-analyzer function to empty**, so those two never appear under method A; a cost MCP server is not connected by default on either path, and appears once you turn it on at deploy time (the two ways are in §2.3).
 3. **An administrator switched the whole tab off on the Modules page.** Module switches **override** individual permissions — off means nobody sees it (except the chat tab, which is always on).
 
 > The loading policy is deliberately split: **Notifications / Investigation / Cost / Cases / Skills** show while capabilities are still loading (fail-open), while **Admin / Inspection** stay hidden while loading (fail-closed). So for an instant after the page opens the nav may be an entry or two short — that's expected. The same rule governs the pill row above the composer: Operational / Cost / Case progress follow their own topic and fail open, while **Security posture** is **fail-closed** — a non-admin won't see it until the capability list arrives.
@@ -429,7 +435,7 @@ The three most common paths, each starting from what you actually have in hand.
 
 ### 3.1 Walkthrough 1: a CloudWatch alarm at 3 a.m. — find the root cause
 
-**What you have**: an alarm card in a Feishu / Slack / DingTalk group, or a red badge on Notifications in the web.
+**What you have**: a red badge on Notifications in the web (in this release no real-time alarm cards reach IM groups; see §14).
 
 1. Open **Notifications** and find the CloudWatch alarm under "Event notifications".
 2. Decide the depth:
@@ -493,10 +499,10 @@ Everything in this section behaves the same in **every** topic. Learn it once.
 ### 4.2 Model selection
 
 - It sits at the **right end of the composer toolbar**, showing the current model name and a caret. The choice applies **to this conversation only**, and is remembered.
-- **The list you see is the set your administrator enabled** under Admin → Models (fetched from the server's `/models`). The bundled fallback catalog is: **Grok 4.6** (the bundled default), GLM 5, Claude Sonnet 5, Claude Opus 5, Amazon Nova Pro, DeepSeek V3.2, GPT-5.6 Terra, GPT-5.6 Sol.
+- **The list you see is the set your administrator enabled** under More → Admin → Models (fetched from the server's `/models`). The bundled fallback catalog is: **Kimi K3** (the bundled default), Grok 4.7, GLM 5.3, Claude Sonnet 5.5, Claude Opus 5.5, DeepSeek V3.2, GPT-5.6 Terra, GPT-6 Sol. A new conversation starts on your administrator's default model (also Kimi K3 unless they changed it).
 - While the catalog loads the menu says it is reading available models; if the administrator enabled none it says so and **the Send button is disabled**. If the server catalog can't be read you get an amber degradation banner — it does not pretend the bundled list is your administrator's list.
-- **Claude Haiku 4.5** and **GPT-5.6 Luna** are retired and unselectable; an old conversation still pinned to one falls back silently to the catalog default.
-- In the **Cost** topic, Amazon Nova Pro is tagged "Not recommended".
+- **Claude Haiku 4.5** and **GPT-5.6 Luna** are retired and unselectable; as of 2026-10-10 **Grok 4.6, GLM 5, Claude Sonnet 5, Claude Opus 5 and GPT-5.6 Sol** have also been replaced by the newer same-family versions above, and **Amazon Nova Pro** is switched off altogether. An old conversation still pinned to any of these falls back silently to the catalog default.
+- If an administrator re-enables Amazon Nova Pro, it is tagged "Not recommended" in the **Cost** topic.
 - When a turn is answered by **your own DevOps Agent**, the model selector **disappears entirely** (that path doesn't go through our Bedrock models), while sending still works.
 
 ### 4.3 Who answers, and how deep
@@ -565,12 +571,10 @@ Both share one right-hand rail, so only one is visible at a time.
 
 **Sources**: every answer's footer has a Sources button with a count; it opens the right-hand "Sources" dock (with a Close button, and "No sources" when empty). `http(s)` sources are clickable, open in a new tab, and show their hostname underneath. **If the answer saved a long report, Sources also carries a "Full report (downloadable)" entry.**
 
-**Thinking**: the step-by-step reasoning and tool-call trail, titled "Thinking", with a "Live" badge while in progress. The entry point is a low-key grey text button "**View thinking · {n} steps**", rendered **above the body of that reply** (not below it), one per reply.
+**Thinking**: the step-by-step reasoning and tool-call trail, titled "Thinking", with a "Live" badge while in progress. The entry point is a low-key grey text button "**View thinking · {n} steps**", rendered **above the body of that reply** (not below it), at most one per reply — it only appears when the reply has process steps, and the steps are not saved, so once you reload the page (or open the conversation on another device) earlier replies no longer have it.
 
 - It **auto-opens on the first thinking step** (collapsing Sources to make room). Once you close it manually it **never auto-opens again** (remembered in browser local storage).
 - **DevOps Agent investigation steps and ordinary model reasoning share this one panel**; during an investigation the panel header gains a "View in the DevOps Agent console" link.
-
-> ⚠️ Known wording inconsistency: both investigation backends still stream a line saying the analysis is updating live in the right-hand "Investigation" panel, while the panel is actually labelled **Thinking**. It's the same panel.
 
 ### 4.8 Long reports: view online, or download
 
@@ -631,7 +635,7 @@ A Skill is how you write down the process in your head — "when we check RDS we
 
 > **Creating, editing and managing Skills only exists in Web Chat.** The skill **management** commands were retired wholesale from the IM side on 2026-09-06 — typing `/skills` in Feishu / Slack / DingTalk now returns the `/help` menu (0 tokens). But IM still **uses** Skills: asking via `/agent notiops` still injects them (both surfaces share the same S3 storage). The difference is that the IM path injects the Skill catalog **with no relevance gate**, while the web filters it per turn against your question.
 
-> ⚠️ **Skills are permission-gated.** You need `nav:skills` to see the entry at all; create/edit, import, rollback and publish-to-DevOps-Agent each additionally need `action:skills:edit` / `:import` / `:rollback` / `:devops-agent`. Of the six preset roles **only Administrator and Developer** get `nav:skills` — `role:viewer` (the default mapping for the Cognito `member` / `read-only` groups), `role:finops`, `role:support` and `role:service-manager` do not. **Granting `action:skills:*` without `nav:skills` does not work** (you can't even list them). If Skills isn't in your sidebar, ask an administrator to add it under Admin → Access control.
+> ⚠️ **Skills are permission-gated.** You need `nav:skills` to see the entry at all; create/edit, import, rollback and publish-to-DevOps-Agent each additionally need `action:skills:edit` / `:import` / `:rollback` / `:devops-agent`. Of the six preset roles **only Administrator and Developer** get `nav:skills` — `role:viewer` (the default mapping for the Cognito `member` / `read-only` groups), `role:finops`, `role:support` and `role:service-manager` do not. **Granting `action:skills:*` without `nav:skills` does not work** (you can't even list them). If Skills isn't under "More" in your sidebar, ask an administrator to add it under More → Admin → Access control.
 
 ### 5.2 Eleven presets, out of the box
 
@@ -668,7 +672,7 @@ Every Skill has a **version history** with **Run with this version** and **Make 
 
 ### 5.6 Publishing to DevOps Agent
 
-**Publish to DevOps Agent** installs the Skill into a DevOps Agent Agent Space (this account or a member account). Once published the card shows a "Published ×N" badge, and supports **Re-publish** and **Remove**. It **uploads documents only, never scripts**, so the read-only boundary is unaffected. With no onboarded Agent Space it tells you to onboard one first under Admin → Accounts.
+**Publish to DevOps Agent** installs the Skill into a DevOps Agent Agent Space (this account or a member account). Once published the card shows a "Published ×N" badge, and supports **Re-publish** and **Remove**. It **uploads documents only, never scripts**, so the read-only boundary is unaffected. With no onboarded Agent Space it tells you to onboard one first under More → Admin → Accounts.
 
 **When a Skill meets a DevOps Agent path, the composer tells you which of two things will happen:**
 
@@ -719,11 +723,15 @@ The Modules page switches features on / off **by tab** (showing Enabled / Disabl
 
 ### 6.4 Accounts: where cross-account comes from
 
-Which accounts a user can pick in the topbar depends on which member accounts are onboarded and enabled on this page. Onboarding a member account **requires the cross-account role ARN**, and that role must carry read-only permissions aligned with the deployment account — see the deployment guide for the procedure.
+Which accounts a user can pick in the topbar depends on which member accounts are onboarded and enabled on this page. "Member account onboarding" has two routes. On a multi-account deployment (method B's `./setup.sh --multi-account`, or method A with `DeployMode=MultiAccount`), click **Onboard** for an account in the organization (deployed through StackSets); step 2, the DevOps Agent association, then starts by itself — if it has not completed or has failed, click **Associate** on that row to retry. Everything else uses **Manual onboarding** on the same page: enter the account ID → Generate link → have that account's administrator sign in **as that account** and deploy → paste the stack Outputs back → Test connection → Save & activate. The collection role in the member account is created by the template — **don't create it by hand**. It carries the AWS managed `ReadOnlyAccess` policy **plus, by default, permission to open / reply to / resolve Support cases** (set the template parameter `EnableSupportCaseWrite=false` to keep it strictly read-only). Full steps: [DEPLOYMENT.en.md §0.1.1](DEPLOYMENT.en.md).
+
+> ⚠️ **One-click (method A) multi-account stacks not yet updated to v1.0.30**: step 2 fails there. Step 1 already created the collection role in the member account, step 2 tries to create a role with the same name → `EntityAlreadyExists` → rollback. Update the stack to the current version first (every update re-runs the step that rolls out the StackSets, which sets `CreateCollectionRole` to `no` on the member DevOps Agent StackSet), then click **Associate**; accounts whose step 2 failed before just need one more click after the update. How to update the stack (and what to know before you do) is in [DEPLOYMENT_ONECLICK.en.md §5](DEPLOYMENT_ONECLICK.en.md).
 
 ### 6.5 Models
 
-The user's model menu equals the set enabled on this page. When none is enabled, users are told explicitly that the administrator hasn't enabled any model for web chat and to ask them to enable one under Admin → Models, and **the Send button is disabled**.
+The user's model menu equals the set enabled on this page. When none is enabled, users are told explicitly that the administrator hasn't enabled any model for web chat and to ask them to enable one under More → Admin → Models, and **the Send button is disabled**.
+
+Claude Sonnet 5.5 / Opus 5.5 and GPT-6 Sol need their AWS Marketplace agreement accepted in the deployment account. If it has not been, see §15 for what to change on this page -- re-enabling Claude Sonnet 5 / Opus 5 alone only fixes Web; IM also needs 5.5 disabled.
 
 ### 6.6 IM integration
 
@@ -731,7 +739,7 @@ Feishu / Slack / DingTalk onboarding is configured here. For how to *use* the IM
 
 ### 6.7 Customize: currently a placeholder
 
-⚠️ Both **Connectors** and **Plugins** under Customize still say "Coming soon" and do nothing. **Skills is not here** — it is a first-level nav entry (§5).
+⚠️ Both **Connectors** and **Plugins** under Customize still say "Coming soon" and do nothing. **Skills is not here** — it is under the sidebar's "More" group (§5).
 
 ---
 
@@ -845,14 +853,14 @@ Use the "<skill name>" skill
 
 Web Chat's read-only property is **four layers** deep — but **the four layers are not equally strong**:
 
-1. **A read-only IAM role** — **this is the only hard boundary**. Even if all three layers above it were bypassed, the permissions themselves don't allow a write. ⚠️ That hard boundary depends on the deploy-time `AgentReadOnlyAccess=Yes` (the default); an administrator who sets it to No removes it.
+1. **A read-only IAM role** — **this is the only hard boundary**. Even if all three layers above it were bypassed, the permissions themselves don't allow a change to your resources: the roles Web Chat uses to reach your account are read-only on your infrastructure; apart from NotiOps' own resources (its tables, buckets and the like), the only write they carry is AWS Support case create / reply / resolve, and that only runs after you confirm it (see the end of this section; a member account's role can be made strictly read-only with the template parameter `EnableSupportCaseWrite=false`). ⚠️ Method A's deploy parameter `AgentReadOnlyAccess` (default Yes) only decides how widely the agent **can read** and doesn't touch this boundary: Yes attaches the AWS managed `ReadOnlyAccess` policy to the agent's role; No leaves only the curated read-only grants (cost, logs, metrics, RDS / EC2 describe and the like), a narrower set. Either way, the agent's role has no permission to change your infrastructure.
 2. **A read-only tool layer** — the tools handed to the model are describe / get / list only.
 3. **A command-level denylist** — it blocks calls that are technically reads but shouldn't happen: `secretsmanager get-secret-value`, `ssm get-parameter --with-decryption`, `kms decrypt`, `ecr get-login-password`. ⚠️ **This layer is only in effect on the deployment-account general-query path** (the global read-only fallback MCP's `call_aws`). Querying a **member account** switches to native read-only APIs behind an assumed role, and that path has only a **read-verb prefix allowlist** and **no command-level denylist on top** — it relies on the member account's own read-only IAM role.
 4. **A read-only system prompt** — it requires evidence before conclusions, **forbids emitting any change command**, forbids invented resource IDs, and only ever shows `describe-*` / `get-*` / `list-*` examples. ⚠️ The source comments say it plainly: **don't over-trust this layer, it is defence in depth, not a security boundary**. The same goes for layers 2 and 4.
 
 > A known residual gap (acknowledged by design): `lambda get-function-configuration` and `ecs describe-task-definition` are legitimate reads, but their responses carry environment variables. Don't put secrets in either place.
 
-> The IM surface guarantees read-only a **different** way (a read-only agent and read-only role on the DevOps Agent side, plus a change-wording regex on the NotiOps side). See "Who guarantees this 'read-only'" in §9.
+> The IM surface's default DevOps Agent direct path guarantees read-only a **different** way (a read-only agent and read-only role on the DevOps Agent side, plus a change-wording regex on the NotiOps side); after `/agent notiops`, IM uses the scheme above (the same AgentCore Runtime and the same read-only role, with only the AWS docs search and read-only query tools mounted, plus web search after `/web on`). See "Who guarantees this 'read-only'" in §9.
 
 **The single exception is writing AWS Support cases** (create / reply / close), which is designed so that:
 
@@ -896,16 +904,16 @@ The caption under the composer ("NotiOps can make mistakes. Verify important fin
 
 Method A is a minimal footprint that installs only Web Chat. Compared with the full deployment (method B, `setup.sh`):
 
-- **No Inspection** — the nav entry doesn't appear, and the page tells you method B is required.
+- **No Inspection** — there is no Inspection item under "More" (the whole tab is not delivered); only a stale front-end bundle or a direct API call ever shows the "use method B" message (see §2.6).
 - **The Cost "daily anomaly scan" card is method-B only**; under method A the whole card is absent (the function it depends on is hardcoded empty). Note this is not the same thing as the "cost anomalies" dashboard, which both paths have.
-- **The 4 Cost Deep Dive scenarios fail when clicked under method A** — they depend on pre-created Athena named queries, which method A does not create, so you get `no_named_queries` / `named_query_not_found` rather than an empty table.
-- **The 4 CUR reports** don't appear by default, and both paths require you to bring your own CUR data source; on method A the CUR MCP endpoint is an **optional parameter** — supply it and they appear.
+- **By default the 4 Cost Deep Dive scenarios fail when clicked under method A** — they depend on pre-created Athena named queries, and those are only created the first time a CUR that NotiOps created is ready. Method A has that step only when you pick `ProvisionCur=yes`, and even then only after AWS's first CUR delivery (up to 24 hours) has been picked up by the check that runs every 4 hours; without it (including when you only filled in `CurTable` for an existing CUR) that step never runs, and clicking a scenario reports `no_named_queries` / `named_query_not_found` rather than an empty table.
+- **The 4 CUR reports work the same on both paths**: hidden by default, shown once a cost MCP server is connected. On method A you either fill in `CurTable` / pick `ProvisionCur=yes` (NotiOps deploys one for you), or fill in `CostAgentMcpUrl` + `CostAgentFunctionArn` (point at your own) — see §2.3.
 - **The notification inbox does not filter out NotiOps' own alarms** — method A's CloudWatch alarm subscription rules don't exclude self-created alarms like `notiops-inspection-*`, so NotiOps' own alarms land in your inbox too.
-- **The DevOps Agent "Credit balance" card stays at "not configured / initialising" forever.**
+- **The "DevOps Agent — Credit Usage" card on the cost dashboard says "not configured" by default** — it reads the CUR that NotiOps creates, which method A only has with `ProvisionCur=yes`: until the first delivery is ready it shows "Initializing data", then real numbers.
 - The 5 default-off notification event sources have to be enabled by hand in the **EventBridge console** under method A (method B takes a `setup.sh` flag).
 - **Skills are identical on both paths** — method A is missing nothing here: all 11 presets, authoring, zip import and version rollback are present.
 
-> **`EnableDeepInvestigation` (default Yes) is a master switch on method A** that governs three things at once: **Deep Dive** (0 tokens, direct), **DevOps Chat**, and **publishing a Skill to DevOps Agent**. Set it to No and all three go away. Separately, in **regions where AWS DevOps Agent is not yet available** it is **silently skipped** even when set to Yes — to tell "I turned it off myself" from "the region doesn't support it", check `DeepInvestigationStatus` in the stack Outputs.
+> **`EnableDeepInvestigation` (default Yes) is a main switch on method A** that governs three things at once: **Deep Dive** (0 tokens, direct), **DevOps Chat**, and **publishing a Skill to DevOps Agent**. Set it to No and all three go away. Separately, in **regions where AWS DevOps Agent is not yet available** it is **silently skipped** even when set to Yes — to tell "I turned it off myself" from "the region doesn't support it", check `DeepInvestigationStatus` in the stack Outputs.
 
 ### 8.7 Known rough edges (they don't affect correctness, but you will see them)
 
@@ -913,7 +921,7 @@ Method A is a minimal footprint that installs only Web Chat. Compared with the f
 - **Connectors and Plugins under Customize** are both "Coming soon".
 - ~~**The FinOps answer mode in the Cost topic** is permanently greyed and labelled "Coming soon".~~ **Fixed (2026-09-13)** — that item was removed from the toolbar (see §4.3).
 - **The composer placeholder mentions `$skill`**, but the `$` trigger isn't implemented — only `/` works.
-- **The investigation backends still say "the right-hand 'Investigation' panel"**, while the panel is actually labelled **Thinking** — it's the same panel.
+- ~~**The investigation backends still say "the right-hand 'Investigation' panel"**, while the panel is actually labelled **Thinking** — it's the same panel.~~ **Fixed (v1.0.30)** — both investigation backends now say "Thinking", matching the panel title.
 - **Notifications has no "mark all read" button and no read/unread filter** — opening the page marks everything read.
 - **The sign-in page is English-only**, and its failure message is a hardcoded Chinese string.
 - A missing UI translation renders **as its raw key** (e.g. `conv.rename`) rather than falling back to the other language. If you hit one, please file an issue.
@@ -933,10 +941,10 @@ Method A is a minimal footprint that installs only Web Chat. Compared with the f
 | Category | Capability | How to use |
 |---|---|---|
 | **Investigate AWS resources** | Analyze CloudWatch metrics / logs / resource configs to find root causes | `@bot what's going on with RDS my-db CPU at 100%` |
-| **Manage Support cases** | Create / list / view / reply to / **smart-analyze** / close AWS Support cases | `@bot open a case for the RDS outage` / `@bot analyze case 12345` |
+| **Manage Support cases** | Create / list / view / reply to / **smart-analyze** / close AWS Support cases | `@bot open a case for the RDS outage` / `@bot analyze case 177968247000414` |
 | **Answer AWS concept questions** | Cite AWS official docs to explain concepts, best practices, API usage | `@bot what's the difference between ALB and NLB` |
-| **Proactive alarm watching** | Six event sources — CloudWatch / Health / Backup / GuardDuty / Cost / TA — auto-dispatch investigations | (No action needed; alarms trigger automatically) |
-| **Multi-LLM switching** | Switch freely between whichever models your admin enabled (default **Claude Sonnet 5**, plus Claude Opus 5 / Haiku 4.5, Amazon Nova Pro, DeepSeek V3.2, GLM 5, Grok 4.6, and the GPT-5.6 family — all accessed via Amazon Bedrock); per-chat / per-DM preference is remembered | `@bot model nova` / `@bot model claude` / `@bot model list` |
+| **Proactive alarm watching** | ⚠️ **Not available in IM groups in this release**: real-time alarm push has no delivery target wired up (see §14); these events show up under Notifications in the web | — |
+| **Multi-LLM switching** | When the chat object is NotiOps Agent (see §15.5), switch freely between whichever models your admin enabled (default **Kimi K3**, plus Grok 4.7, GLM 5.3, Claude Sonnet 5.5 / Opus 5.5, GPT-5.6 Terra and GPT-6 Sol — all accessed via Amazon Bedrock); per-chat / per-DM preference is remembered | `@bot model opus` / `@bot model claude` / `@bot model list` |
 | **Language switching** | Switch between Chinese and English; remembers your preference | `language zh` / `language en` / `please switch to English` |
 
 ### What the bot WILL NOT do ❌
@@ -945,16 +953,21 @@ Method A is a minimal footprint that installs only Web Chat. Compared with the f
 
 - ❌ **Modify your AWS environment**: it will not restart EC2, will not delete S3 objects, will not change IAM policies — any mutation request is rejected
 - ❌ **Run CLI commands for you**: ask "restart i-0123" and the bot refuses; ask "how do I restart i-0123" and the bot will teach you (tutorials count as read-only)
-- ❌ **Bypass IAM**: the resources you can investigate = the resources the AWS DevOps Agent role can read. The bot will not escalate on your behalf
-- ❌ **Store sensitive data beyond 7 days**: chat history is auto-cleared by DDB TTL after 7 days; locale preferences after 90 days
+- ❌ **Bypass IAM**: the resources you can look at = the resources the role of whoever answers you can read (by default the role your AWS DevOps Agent uses; after `/agent notiops`, the NotiOps AgentCore Runtime's read-only role). The bot will not escalate on your behalf
+- ❌ **Store sensitive data beyond 7 days**: chat history is auto-cleared by DDB TTL after 7 days; locale preferences after 90 days. ⚠️ The exception is deep-investigation reports and trace pages: they live under the data bucket's `investigations/` prefix, are **not deleted automatically**, and stay there until the bucket is deleted (see §19 Q3)
 
 > **Who enforces "read-only" (the wording changed on 2026-09-03 — go by the new version)**:
-> on the IM side your question goes **straight to AWS DevOps Agent** with no LLM on the NotiOps
-> side (that's why it costs 0 token), so **refusing mutations is enforced by DevOps Agent plus
+> on the IM side your question **by default goes straight to AWS DevOps Agent** with no LLM on the NotiOps
+> side (that's why it costs 0 token), so on that path **refusing mutations is enforced by DevOps Agent plus
 > the read-only IAM role it assumes** — not by NotiOps spending an LLM call to guess whether you
-> meant to change something. NotiOps keeps exactly one **regex second gate**
+> meant to change something. In a chat / DM that has sent `/agent notiops`, the question is answered
+> with a model by the **same** AgentCore Runtime as Web Chat, and read-only rests on that runtime's scheme:
+> the read-only IAM role (the hard boundary) + a narrow tool set of AWS docs search and read-only queries
+> (see §8.1, §15.5). In front of both paths NotiOps keeps one **regex second gate**
 > (`platforms/common/router.py`) for obvious mutation wording and prompt injection.
-> The net effect is unchanged: **mutation requests still never reach execution.**
+> The net effect: **mutation requests never reach execution.** The one write is an AWS Support case
+> (open / reply / close), and it runs only after you confirm it on the card / form (on DingTalk, by
+> replying "confirm"; see §12).
 > Details in [TECHNICAL_DESIGN.en.md §5 Security design](TECHNICAL_DESIGN.en.md#5-security-design);
 > §4.2's "three-layer defense" describes `core/bedrock_chat.py`, which runs only on the
 > rollback path (the resident ECS apps retired with `BotStack`) — **neither the web console
@@ -1003,66 +1016,56 @@ Later short messages (`why?` / `继续`) won't suddenly flip the whole investiga
 
 ### 11.1 Standard investigation flow
 
-Just @ the bot and describe the problem:
+The bot only opens a deep investigation when you **explicitly ask for one** — with the `/investigate` command (`/调查`), or with wording such as "deep dive", "investigate", "root cause" or "RCA" (Chinese 深度调查 / 深入排查 / 根因分析 / 深挖 work too). ⚠️ The slash in front of the command **is optional**: when the **first word** of your message is `investigate` / `inv` / `investigation` / `调查` / `調查` / `排查` / `深度调查` followed by a space or punctuation, it is dispatched as the command too — `@NotiOps 排查 RDS 慢` or `@NotiOps inv rds slow` opens a deep investigation, while `@NotiOps 排查一下 RDS 慢` (the word runs straight on into other characters) does not:
 
 ```
-@NotiOps help me look at why i-0abc123def456 in IAD has such high CPU
+@NotiOps deep dive into why i-0abc123def456 in IAD has such high CPU
 ```
+
+An ordinary question without such wording (say, "help me look at why i-0abc123def456 in IAD has such high CPU") does **not** open an investigation; it goes straight to this chat's chat object to answer (your own DevOps Agent by default — see §13.4 / §15.5).
 
 The bot will:
 
-1. **Parse intent** (within 1 second in the background, see `intent_classify` log)
-2. **Show the "Start investigation" card directly** (with an editable form)
-3. You can keep the defaults and click **🚀 Dispatch investigation**, or edit first
-4. After dispatch, a **🔭 Investigation started** card appears with deep-link buttons
-5. Every 20 seconds a progress card updates (showing which tool DevOps Agent is calling and what it's currently thinking)
-6. Within 1–3 minutes the full investigation report (👉 markdown summary + HTML report + trace) is pushed back to the channel
+1. **Recognise that you want a deep dive** (a deterministic rule match — 0 tokens, no model call)
+2. **Dispatch to DevOps Agent right away** — there is no edit form and nothing more to click; your message goes over as the investigation description as-is, and NotiOps does not rewrite or summarise it
+3. Post a "**Deep investigation dispatched**" card (see §11.2) with a button that opens this investigation in the DevOps Agent console
+4. From then on that card **refreshes in place about once a minute**, appending DevOps Agent's new progress (see §11.3; DingTalk messages can't be edited, so there is no refresh there — see §17.2)
+5. When it finishes, the card title becomes "✅ Investigation completed · Ns · see report below" (or "⚠️ Investigation failed"), and a **report card** follows in the chat (see §11.4). How long it takes depends on the problem and on the size of the account
 
-### 11.2 Start-investigation card explained
+### 11.2 The "Deep investigation dispatched" card
 
 ```
-📝 Start Investigation
+Deep investigation dispatched
 ─────────────────────
-Investigation request *
-[ Your original question (LLM-rephrased version) ]
+✅ Dispatched. DevOps Agent is investigating.
 
-Starting point (optional)
-[ e.g. an alarm name / log group / metric / any starting point ]
+⚡ Direct to DevOps Agent · no model usage · Account: 111122223333 (deployment account)
 
-💡 DevOps Agent usually needs these dimensions to pinpoint the problem:
-  - AWS account ID
-  - Region
-  - Resource ARN or name
-
-📋 Logs / error snippets (optional)
-[ Paste relevant logs / error messages / JSON ]
-
-[ 🚀 Dispatch investigation ]   [ ❌ Cancel ]
+[ 🔬 Open this investigation ]
 ```
 
-**How to fill it in**:
-- **Quick check**: leave everything blank, click **🚀 Dispatch investigation**
-- **More precise**: put info the LLM didn't ask about but you already have into **Starting point** — DevOps Agent will localize faster
-- **Complex problems**: paste logs into **Logs / error snippets**, the bot wraps them in code blocks automatically so the Agent parses them more cleanly
+- The button opens this investigation in the DevOps Agent console; when there is no deep link for it, it becomes "🌐 Operator home" instead.
+- The footer says **which account** is being investigated — a report on the wrong account looks exactly like one on the right account, so it's worth a glance.
+- **There is no edit form**: NotiOps doesn't ask you for missing dimensions. To help DevOps Agent pinpoint the problem faster, **put them in your message**: account, Region, resource ID / ARN, time window, plus an alarm name or a log / error snippet.
 
 ### 11.3 Progress card explained
 
+Progress isn't a separate card: the card above **refreshes in place** (Feishu / Slack):
+
 ```
-🔭 Investigating · elapsed 45s
+🔍 Investigating · 125s elapsed
 ─────────────────────
-💭 Current thinking
-Analyzing CloudWatch metrics for i-0abc123def456 over the past hour,
-checking CPUUtilization for anomaly spikes...
+(new entries from DevOps Agent's investigation journal, appended one by one)
 
-🔧 Recent calls
-- describe_instances(i-0abc123def456)
-- get_metric_statistics(CPUUtilization, 60s)
-- describe_log_streams(/aws/ec2/...)
+⚡ Direct to DevOps Agent · no model usage · Account: 111122223333 (deployment account)
 
-[ 🔬 View this investigation ]  [ 🌐 Operator home ]
+[ 🔬 Open this investigation ]
 ```
 
-The progress card refreshes every 20 seconds until the Agent finishes.
+- A progress Lambda pulls DevOps Agent's investigation journal **once a minute** and appends any new entries to this card; until the first entry arrives the body reads "⏳ Agent is analyzing the issue and planning steps…".
+- The card always has **one** button ("🔬 Open this investigation", or "🌐 Operator home" when there's no deep link), and it still works after the investigation ends.
+- When it finishes, the title becomes "✅ Investigation completed · Ns · see report below" or "⚠️ Investigation failed · Ns", and the report card follows as a separate message (§11.4).
+- **DingTalk has no refreshing card**: a DingTalk message can't be edited after it is sent, so the acknowledgement says this one won't update itself; follow the link in it to watch progress in the DevOps Agent console, and the finished report is still delivered back to the conversation (see §17.2).
 
 ### 11.4 Report card explained
 
@@ -1088,7 +1091,7 @@ which is too few — many requests are queueing up.
 [ 📊 View full report ]   [ 🔍 Investigation trace ]
 [ 🆘 Escalate to AWS Support ]
 
-🔗 Links valid for 7 days · no console login required
+🔗 Links stay valid for a few hours (at most about 12) · no console login required
 ```
 
 Where the three buttons go:
@@ -1100,12 +1103,15 @@ Where the three buttons go:
 | 🆘 Escalate to AWS Support | Open a Support case from this report (becomes "Sync to Case" once a case is linked) | Yes |
 
 > The report card carries **no** "🔬 Open this investigation" (DevOps Agent console
-> deep link). The first two buttons open presigned links — valid 7 days, no login —
-> whereas a console deep link requires an active AWS Console session. Mixing both
-> into one row of buttons forces the footnote below them to claim "no login required"
-> and "login required" at the same time. If you want the raw console page, the
-> progress card still has its "🔬 Open this investigation" button (see §11.3) and it
-> stays clickable after the investigation finishes.
+> deep link). The first two buttons open presigned links that need no login but
+> **stay valid only for a few hours (at most about 12)** — they are signed with
+> temporary credentials and stop working once those expire, so save the page while
+> the link still works if you need to keep it. A console deep link, by contrast,
+> requires an active AWS Console session. Mixing both into one row of buttons forces
+> the footnote below them to claim "no login required" and "login required" at the
+> same time. If you want the raw console page (including after those links have
+> expired), the progress card still has its "🔬 Open this investigation" button
+> (see §11.3) and it stays clickable after the investigation finishes.
 
 **The card body is the opening slice of the full report.** When the report is longer
 than a card can hold, the body ends with
@@ -1132,7 +1138,7 @@ what you see on the card is the whole thing.
 | EKS pod CrashLoop | `eks cluster prod-cluster pod xyz keeps CrashLoopBackOff` |
 | Cross-service | `ALB → EKS → RDS full-stack timeout, help me trace it` |
 
-> 💡 **Tip**: **questions with concrete resource ID / region** = bot won't ask clarifying questions, it goes straight to investigation. **Vague questions** = bot may suggest dimensions to add in the edit form's hint text.
+> 💡 **Tip**: these phrasings open a **deep investigation** (§11.1) only when you put `/investigate` in front (the slash is optional, see §11.1; or use wording like "deep dive" / "root cause"); otherwise the bot treats them as ordinary questions and answers directly (by default your own DevOps Agent answers, and it reads metrics and logs too). Either way NotiOps **won't** ask you for missing dimensions, so include the resource ID / Region / time window when you send it.
 
 ---
 
@@ -1146,19 +1152,22 @@ The bot doesn't just investigate — it can also **manage AWS Support cases for 
 @NotiOps create a case for RDS my-db restarting frequently
 ```
 
-The bot opens a **create-case card** (Feishu modal / Slack modal), where you can fill in:
+The bot opens a **create-case form**: on Feishu it is a **card form** posted into the conversation; on Slack it is a modal (when you come in from an @-mention, the bot first replies with a "🆘 Open create form" button, and one click opens it). You can fill in:
 
 | Field | Description |
 |---|---|
-| **Subject** | Auto-summarized title from LLM (editable) |
+| **Open in which account** | Only shown when this deployment has ≥2 accounts to choose from; defaults to this conversation's current account (`/account`) |
+| **Subject** | **Pre-filled** from your message with the "create case" / 开案例 wording stripped (a deterministic rule, no model call); editable |
 | **Body** | Detailed description (paste raw logs if needed) |
 | **Severity** | Low / Normal / High / Urgent / Critical |
 | **Language** | English / Japanese / Chinese, etc. (the conversation language inside AWS Support) |
 | **Contact** | Optional, contact info |
 
-Click **Create**, the bot calls the AWS Support API to create the case, and replies with the case ID (`12345...`).
+The Slack modal also asks for service name / category / case type; the Feishu card doesn't ask for these, and the bot works out the service and category itself when you submit.
 
-> 🔥 **Create + dispatch investigation in one go**: the card has a **Create + dispatch investigation** button at the bottom that creates the case first, then auto-dispatches a DevOps Agent investigation framed as "investigate the root cause of this case". One action = "file the ticket + start self-diagnosis".
+Submit it, the bot calls the AWS Support API to create the case, and replies with the case ID (`12345...`).
+
+> 🔥 **Create + dispatch investigation in one go**: the Feishu card has two submit buttons at the bottom — "🚀 Create case only" and "🤖 Create + start Agent investigation"; a Slack modal can only have one submit button, so there it is a choice inside the form (preselected: "🤖 Create case + start Agent investigation (recommended)"). The second option creates the case first, then auto-dispatches a DevOps Agent investigation framed as "investigate the root cause of this case". One action = "file the ticket + start self-diagnosis".
 
 > 📌 **Different shape on DingTalk**: DingTalk has no native modal and no button callbacks, so the same information goes through "bot replies with a plain-text template → you copy the whole block, edit it and send it back → you reply 'confirm'". The template is six lines (Description / Severity / Language / Case type / Service / Subject) and only Description is mandatory; the case that gets filed is identical. See §17.2.
 
@@ -1167,20 +1176,16 @@ Click **Create**, the bot calls the AWS Support API to create the case, and repl
 ```
 @bot my cases
 @bot list my cases
-@bot cases needing my action   # auto-filters status=pending_customer
-@bot unresolved cases          # auto-filters status≠resolved
-@bot cases AWS is working on   # auto-filters status=work_in_progress
-@bot resolved cases            # auto-filters status=resolved
 ```
 
-The bot lists the most recent N cases with status, severity, and last-reply time. Click a case ID to expand.
+The bot lists the **5** cases most recently created in this account over the last 90 days (**any status**, newest first), each with its status, severity and creation date, plus buttons such as "💬 Details" and "✏️ Reply". To see cases by status, use the row of filter buttons at the bottom of the list: 👤 Waiting for me / 🔵 Unresolved / 🛠️ In progress / ✅ Resolved. ⚠️ Writing a status into your message **does not filter** — only those buttons do; DingTalk messages have no buttons, so there you follow the AWS console link at the end of the message to see cases by status.
 
 ### 12.3 View a specific case
 
 ```
 @bot case 177968247000414
 @bot view case 177968247000414
-@bot how's 12345 doing
+@bot how's case 177968247000414 doing
 ```
 
 The bot returns case details + the latest reply history.
@@ -1189,10 +1194,10 @@ The bot returns case details + the latest reply history.
 
 ```
 @bot reply to case 177968247000414 — already upgraded RDS to r5.large, no more restarts
-@bot reply 12345 fixed by upgrading instance class
+@bot reply to case 177968247000414 fixed by upgrading instance class
 ```
 
-> Case ID is required, otherwise the bot will ask you to pick one.
+> The **full** case ID is required (the long number AWS gave the case; a number shorter than 6 digits is not taken as a case ID), otherwise the bot lists your recent cases first so you can pick one.
 
 ### 12.5 Smart case analysis (LLM rollup + next steps)
 
@@ -1200,14 +1205,16 @@ When you want the LLM to read the entire case thread and tell you "what now":
 
 ```
 @bot analyze case 177968247000414
-@bot summarize case 12345
-@bot help me understand case 12345
-@bot what's wrong with case 12345
-@bot what should I reply to case 12345
-@bot 分析 case 12345
-@bot 总结 case 12345
-@bot 复盘 case 12345
+@bot summarize case 177968247000414
+@bot help me analyze case 177968247000414
+@bot analyze case 177968247000414 — what's wrong with it
+@bot summarize case 177968247000414 and suggest a reply
+@bot 分析 case 177968247000414
+@bot 总结 case 177968247000414
+@bot 案例分析 177968247000414
 ```
+
+> Phrasings like "review case …", "help me understand case …" or "what's wrong with case …" do **not** trigger smart analysis — they only open the case's details; use one of the phrasings above, with the full case ID. ⚠️ Also don't ask "what should I reply to case …": it is read as a **reply**, and if anything follows the case ID, that text is sent straight to AWS Support as your reply.
 
 The bot first sends an "Analyzing case xxx…" placeholder, then 5-15s later returns a **purple smart-analysis card** with up to 6 sections:
 
@@ -1228,19 +1235,19 @@ Two action buttons: **💬 Reply to case** / **📋 View full case**.
 
 ```
 @bot close case 177968247000414
-@bot resolve 12345
-@bot 12345 is resolved
+@bot resolve case 177968247000414
+@bot 177968247000414 is resolved, close the case
 ```
 
 ---
 
 ## 13. Ask AWS concept / docs questions
 
-> ⚠️ **Prerequisite**: this feature requires `AgenticChatMode=qa_only` or `enabled` at deploy time (gradual-rollout setting, see [TECHNICAL_DESIGN.en.md §4.2.7](TECHNICAL_DESIGN.en.md)).
+> ℹ️ No deployment switch is involved. Who answers depends on this chat's **chat object** (§15.5): by default your own DevOps Agent answers directly; only after you switch to NotiOps Agent (`@bot agent notiops`) does NotiOps search the official AWS docs and answer with a model.
 
 ### 13.1 How to ask
 
-Just @ the bot — it auto-detects this is a "concept question" rather than an "investigation request":
+Just @ the bot — as long as your message doesn't ask for a deep dive ("deep dive", "root cause", …) and doesn't start with a command word such as "investigate" / 调查 / 排查, it is answered as an ordinary question and no investigation is opened (see §13.4):
 
 ```
 @bot what's the difference between ALB and NLB
@@ -1251,9 +1258,11 @@ Just @ the bot — it auto-detects this is a "concept question" rather than an "
 
 ### 13.2 Answer style
 
-The bot calls **AWS Knowledge MCP** to retrieve official docs, then answers with the chat's current conversational model (**Claude Sonnet 5** by default, see §15), **with verifiable sources attached**:
+When the chat object is **NotiOps Agent** (`@bot agent notiops`, see §15.5), the bot calls **AWS Knowledge MCP** to retrieve official docs, then answers with this chat's current model (**Kimi K3** by default, see §15), **with verifiable sources attached** (sample below). On the default **DevOps Agent direct** path, your own DevOps Agent answers instead (0 NotiOps tokens, no sources block).
 
 ```
+NotiOps Agent answer
+─────────────────────
 ALB (Application Load Balancer) operates at OSI Layer 7 and understands
 HTTP/HTTPS, so it can route based on host / path / header. NLB (Network
 Load Balancer) operates at Layer 4, only sees TCP/UDP, and does not
@@ -1265,23 +1274,25 @@ Key differences:
 3. **Latency**: NLB is lower (no parsing)
 4. **Static IP**: NLB supports it, ALB does not
 5. **WebSocket**: ALB has native support
+─────────────────────
+**Progress**
 
-📚 Sources
+- (the lookup / query steps of this turn, one per line; only the latest 8 are kept)
+─────────────────────
+**Sources**
+
 - [Application Load Balancer overview](https://docs.aws.amazon.com/...)
 - [Network Load Balancer overview](https://docs.aws.amazon.com/...)
 - [Choose between ALB and NLB](https://docs.aws.amazon.com/...)
-
-🔧 MCP tools called
-- aws_docs_search("ALB vs NLB difference")
-- aws_docs_read(...)
-
-By Claude Sonnet 5
+─────────────────────
+Agent: NotiOps | Model: global.moonshotai.kimi-k3 · Account: 111122223333 (deployment account)
 ```
 
 **Key points**:
-- **The "📚 Sources" block** = URLs the LLM actually read, not made-up references
-- **"🔧 MCP tools called"** = transparent display of which tools the LLM used
-- **"By Claude Sonnet 5"** (the signature follows the chat's current model) = explicit signal that this is model-generated, not a hard-coded "official answer"
+- **"Sources"** = what this turn's searches actually brought back (AWS docs search, plus web search after `/web on`), not made-up references; at most 5 are listed, and only on the finished card
+- **"Progress"** = the steps taken this turn, so you can see what it looked at; only the latest 8 are kept
+- **The footer** `Agent: NotiOps | Model: …` (the model id follows this chat's current model; when the bot cannot confirm which model actually answered this turn, it shows just `Agent: NotiOps`, with no model) = explicit signal that this is a model-generated NotiOps Agent answer, not a hard-coded "official answer"; the part after it is the account this turn was about
+- On the default DevOps Agent direct path the card is titled "DevOps Agent answer", has **no** "Sources" section, and its footer reads "⚡ Direct to DevOps Agent · no model usage · Account: …"
 
 ### 13.3 Concept question samples
 
@@ -1295,33 +1306,38 @@ By Claude Sonnet 5
 
 ### 13.4 When the bot routes to investigation vs Q&A
 
-The bot decides **automatically**:
+The bot **doesn't guess** your intent — it goes by the literal rules below:
 
-| What you said | Bot's decision | Path taken |
-|---|---|---|
-| `what is ALB` | Concept question | general_qa (MCP retrieval) |
-| `check 5xx for ALB my-alb` | Investigation request | investigate (dispatch DevOps Agent) |
-| `how do I solve Lambda cold start` | Concept + best practice | general_qa |
-| `lambda foo has bad cold starts, take a look` | Investigation | investigate |
+| What you said | What the bot does |
+|---|---|
+| `what is ALB` | Ordinary Q&A |
+| `check 5xx for ALB my-alb` | Ordinary Q&A — "check" is not a request to dig deep, resource name or not |
+| `排查一下 RDS 慢` | Ordinary Q&A — 排查 runs straight on into other characters, so it is not the command |
+| `how do I solve Lambda cold start` | Ordinary Q&A |
+| `deep dive into lambda foo's cold starts` / `/investigate lambda foo has bad cold starts` | Dispatches a deep investigation (§11) |
+| `inv rds slow` / `排查 RDS 慢` / `调查 RDS 慢` | Dispatches a deep investigation — the first word is a command word followed by a space, i.e. `/investigate` without the slash |
 
-Decision rule: **contains a concrete resource ID / region / time window** → investigation; **pure concept / how-to** → Q&A.
+Decision rule: **only an explicit request to dig deep** dispatches a deep investigation — the `/investigate` / `/调查` command (the slash is optional: the first word of the message is `investigate` / `inv` / `investigation` / `调查` / `調查` / `排查` / `深度调查` followed by a space or punctuation), or wording anywhere in the message such as "deep dive", "investigate", "root cause", "RCA" (Chinese 深度调查 / 深入排查 / 根因分析 / 深挖 too); whether or not the message has a resource ID / Region / time window makes no difference. Everything else is an ordinary question for this chat's chat object (your own DevOps Agent by default, §15.5) — which still reads metrics, logs and configuration as needed. This step is a deterministic rule match: no model call, 0 tokens. ⚠️ The rule is literal: a concept question such as "what is RCA" or 「什么是根因分析」 dispatches an investigation too — to ask about the concept, word it without those terms.
 
 ---
 
 ## 14. Passive scenario: receiving proactive alarm cards
 
+> ⚠️ **In this release no real-time alarm cards reach IM groups.** The push Lambda (`notiops-push-handler`) exists only on `setup.sh` deployments (one-click creates neither the function nor the `notiops-push-*` rules); whether it sends anything depends only on its own environment variables (`PUSH_TARGET_CHAT_ID` and the like), and `setup.sh` doesn't set them — so even with the `notiops-push-*` rules enabled, each event only logs a "Push disabled" line and returns (neither Feishu's `notify_chat_ids` nor DingTalk's `webhook_url` has any say in this). For now, look at these events under **Notifications** in the Web Chat sidebar (both deployment paths have it; 5 sources are on by default, see §2.1). The only proactive messages an IM group **does** receive are, on `setup.sh` deployments, the Feishu daily operations notice ("每日运维通知") and the Health (PHD) event forwarding — see the scheduled-digest section of [im-bot-interaction.md](im-bot-interaction.md) (Chinese only). §14.1 – §14.3 below describe the design of this push path (the code is there; this release just has no delivery target wired up).
+
 ### 14.1 How auto-investigation on alarms works
 
-If your AWS account has push mode enabled (admin config), the bot listens to 6 event sources:
+Once the push path is wired up, the bot listens to 5 event sources (one `notiops-push-<source>` rule each, all created disabled):
 
 | Event source | Trigger condition |
 |---|---|
 | CloudWatch Alarm | Alarm state changes to ALARM |
-| AWS Health | Issue / scheduled change / account notification raised |
 | AWS Backup | Backup job FAILED / EXPIRED / ABORTED |
 | GuardDuty | New finding (default severity ≥ 7) |
 | Cost Anomaly | Anomalous cost change |
 | Trusted Advisor | Check status flips to ERROR |
+
+> AWS Health is not in this table: it has no `notiops-push-*` rule. On `setup.sh` deployments it goes through the separate PHD forwarding instead (into Feishu groups) — see the start of this section.
 
 **On event trigger**:
 
@@ -1347,12 +1363,11 @@ Everything afterwards is the same as the report card flow in §11.
 
 ### 14.3 Silencing
 
-A specific event source too noisy for a channel? Admins can disable it individually:
+A specific event source too noisy for a channel? Admins can switch it off individually by disabling its EventBridge rule — it takes effect immediately, no redeploy:
 
 ```bash
-# Disable a push source (admin-side): tune the enabled event sources,
-# then re-deploy — see DEPLOYMENT.en.md §7 for the exact toggles.
-./setup.sh
+# Disable GuardDuty push (admin-side)
+aws events disable-rule --name notiops-push-guardduty --region <deployment-region>
 ```
 
 Detailed config options in [DEPLOYMENT.en.md §7](DEPLOYMENT.en.md#7-enable--tune-push-mode).
@@ -1367,12 +1382,22 @@ The aliases the bot accepts are whatever your admin enabled for the IM surface i
 
 | alias | model | notes |
 |---|---|---|
-| `claude` | **Claude Sonnet 5** | **Default** (the catalogue's `default_model`). Reliable tool-use and good in Chinese & English in internal testing; supports prompt caching |
-| `grok` | **Grok 4.6** | Bedrock Converse; ⚠️ no explicit prompt caching, so long conversations cost more on input than Claude |
-| `nova` | **Amazon Nova Pro** | Bedrock Converse API; ~1/4 the unit cost of Claude Sonnet (per public Bedrock pricing, as of 2026-07); works for compliance-restricted lists |
-| `gpt` / `gpt_sol` / `gpt_luna` | **GPT-5.6** Terra / Sol / Luna (experimental) | Bedrock Mantle Responses API; tool-use is less reliable than the two above. Suggested for experimentation only. |
+| `kimi` | **Kimi K3** | **Default** (the catalogue's `default_model`). Bedrock Converse; no explicit prompt caching (implicit caching did take effect in internal testing) |
+| `claude` | **Claude Sonnet 5.5** | Reliable tool-use and good in Chinese & English in internal testing; supports prompt caching |
+| `opus` | **Claude Opus 5.5** | The strongest reasoning, for deep analysis / complex root causes; supports prompt caching |
+| `grok` | **Grok 4.7** | Bedrock Converse; ⚠️ no explicit prompt caching, so long conversations cost more on input than Claude |
+| `gpt` | **GPT-5.6 Terra** (experimental) | Bedrock Mantle Responses API; tool-use is less reliable than the ones above. Suggested for experimentation only. |
+| `gpt_sol` | **GPT-6 Sol** | Bedrock Converse (global cross-region inference profile — the same path as Kimi / Grok), not Mantle, so it does not make the separate `us-east-2` call that GPT-5.6 does |
 
-> ⚠️ **GPT-5.6 is currently an experimental tier.** Under tool-use the model occasionally leaks OpenAI internal protocol fragments or low-quality tokens into the reply. The bot ships three layers of hard defenses (output-token cap / JSON-error feedback / output sanitizer) but the residual leak rate is still higher than Claude / Nova. Treat it as a "try out an OpenAI model" tier, and prefer `claude` / `nova` as the default.
+> ⚠️ **`@bot model list` also shows `gpt_luna` (GPT-5.6 Luna, enabled for IM only as shipped) — don't pick it for now.** The NotiOps Agent side doesn't recognise that alias: after switching, every question is actually answered by the default model (Kimi K3 unless your admin changed it), and the card footer shows just `Agent: NotiOps`, with no model (the bot can't confirm which model answered). An administrator can disable it under More → Admin → Models, after which it no longer appears in `@bot model list`, and chats / DMs pinned to it fall back to the default model.
+
+> ⚠️ **Claude Sonnet 5.5 / Opus 5.5 (`claude` / `opus`) and GPT-6 Sol (`gpt_sol`) need their AWS Marketplace agreement accepted once in the deployment account.** Until then, every question on these aliases fails (the NotiOps Agent replies "The model call was denied") — including chats / DMs that were already set to `claude` / `opus` / `gpt_sol` before the upgrade (back then those meant Claude Sonnet 5 / Opus 5 / GPT-5.6 Sol): as long as nobody has saved anything under More → Admin → Models, the upgrade points these aliases at the new versions in the table above, so those chats start failing without anyone switching. For each model whose agreement is not accepted, an administrator picks one of:
+>
+> - **Accept its agreement once in the deployment account**; its alias then works as normal.
+> - **Not accepting Claude 5.5 for now**: under More → Admin → Models in the web console, re-enable **Claude Sonnet 5** / **Claude Opus 5** **and disable** **Claude Sonnet 5.5** / **Claude Opus 5.5**, then tell IM users to switch with `@bot model claude-sonnet-5` / `@bot model claude-opus-5`. Re-enabling 5 without disabling 5.5 **only fixes Web** -- on IM, `claude` / `opus` still point to 5.5. Once 5.5 is disabled, chats / DMs already pinned to `claude` / `opus` fall back to the default model, and sending `@bot model claude` again replies "Unknown model" with the list of options.
+> - **Not accepting GPT-6 Sol for now**: disable **GPT-6 Sol**; chats / DMs pinned to `gpt_sol` likewise fall back to the default model.
+
+> ⚠️ **GPT-5.6 is currently an experimental tier.** Under tool-use the model occasionally leaks OpenAI internal protocol fragments or low-quality tokens into the reply, more often than Claude / Kimi. Treat it as a "try out an OpenAI model" tier, and stay on the default `kimi` or on `claude` for everyday use.
 >
 > Note: all models are accessed through Amazon Bedrock (managed security, compliance monitoring, and cost controls). This is sample code for educational/reference purposes, not production-ready; test and harden it against your organization's security and compliance requirements before any real use.
 
@@ -1381,9 +1406,9 @@ The aliases the bot accepts are whatever your admin enabled for the IM surface i
 ```
 @bot model              # show current model in this chat / DM
 @bot model list         # list all aliases
-@bot model nova         # switch to Nova for the whole chat
-@bot model claude       # switch back to Claude
-@bot model default      # clear preference, fall back to deploy default
+@bot model opus         # switch the whole chat to Claude Opus 5.5
+@bot model claude       # switch to Claude Sonnet 5.5
+@bot model default      # clear preference, back to the admin's default_model (Kimi K3 unless changed)
 ```
 
 ### 15.2 Scope
@@ -1391,33 +1416,34 @@ The aliases the bot accepts are whatever your admin enabled for the IM surface i
 - Sent in a **group chat** → switches the model for **everyone in the channel**.
 - Sent in a **DM** → only affects that DM, doesn't touch any group.
 
-This is how a single bot deployment serves multiple markets: keep
-overseas channels on `claude`, set compliance-restricted teams to
-`nova`, all under one stack.
+This is how a single bot deployment serves several scenarios: everyday
+channels stay on the default `kimi`, while a channel dedicated to deep
+analysis / complex root causes can switch to `opus`, all under one stack.
 
 ### 15.3 Notes on switching to `gpt` (experimental)
 
-GPT-5.6 uses the **Bedrock Mantle Responses API** (OpenAI-compatible
-protocol), which differs from Bedrock InvokeModel / Converse:
+GPT-5.6 Terra (`gpt`) uses the **Bedrock Mantle Responses API** (OpenAI-compatible
+protocol), which differs from the Bedrock InvokeModel / Converse path that Claude / Kimi / Grok use
+(`gpt_sol` is GPT-6 Sol and goes through Converse, so none of the points below are about it):
 
-- **Reliability**: Under tool-use (investigation dispatch / concept Q&A) GPT-5.6 occasionally writes OpenAI internal protocol fragments (`to=functions.<tool>`) or low-quality tokens into the reply. The bot has three hard defenses to intercept that output — when triggered, the user gets the canned chitchat fallback instead of garbage — but the visible "half-broken" rate is still higher than Claude / Nova. **Prefer `claude` or `nova` for serious use**; treat `gpt` as a "try it / compare" tier.
-- **Cross-region call**: GPT-5.6 lives in `us-east-2` (also supported in `us-west-2` and GovCloud-us-west). The bot ECS deployment runs in `us-east-1`, so selecting `gpt` triggers a cross-region HTTPS POST. Latency is ~50ms higher than Claude / Nova but otherwise transparent.
-- **Operator can pin a different region**: the CFN parameter `GptRegion` defaults to `us-east-2`; can be changed to `us-west-2` or `us-gov-west-1`.
-- **Reasoning effort**: GPT-5.x has an explicit reasoning-depth knob, default `medium`. Operators can change `GPT_REASONING_EFFORT` env to `low` / `high`.
-- **Latency**: at `effort=high`, a single reply may take 10-30 seconds. For the chat path, keep `medium`.
-- **Tool use**: Identical surface to Claude / Nova — MCP tools (AWS Knowledge / Pricing / Cost) work via automatic protocol translation.
+- **Reliability**: Under tool-use (concept Q&A / read-only lookups) GPT-5.6 occasionally writes OpenAI internal protocol fragments (`to=functions.<tool>`) or low-quality tokens into the reply, so its "half-broken" rate is higher than Claude / Kimi. **Prefer the default `kimi` or `claude` for serious use**; treat `gpt` as a "try it / compare" tier.
+- **Cross-region call**: GPT-5.6 requests go to the Region recorded on that model's catalogue entry (`us-east-2` as shipped), whichever Region you deployed to. When your deployment Region is not `us-east-2`, selecting `gpt` triggers a cross-region HTTPS POST — from `us-east-1`, latency is ~50ms higher than Claude / Kimi but otherwise transparent.
+- **Region**: no deployment parameter changes it; the model's ⓘ under More → Admin → Models in the web console shows the Region, but it is read-only there.
+- **Reasoning effort**: GPT-5.x has an explicit reasoning-depth knob; NotiOps does not set it (the service default applies), and neither the deployment nor the console offers a way to change it.
+- **Tool use**: Identical surface to Claude / Kimi — the same read-only tools (AWS docs search, read-only AWS queries, plus web search after `/web on`) work via automatic protocol translation.
 
 ### 15.4 Resolution priority
 
 ```
 1. Per-chat preference (set via `@bot model X` in a channel) — 30d TTL
 2. Per-DM preference (set in a DM) — 30d TTL
-3. Deploy default (`DEFAULT_LLM_PROVIDER` env, `DefaultLlmProvider` CFN parameter)
-4. Final fallback: claude
+3. Admin default (the catalogue's default_model, set under More → Admin → Models in the web console; Kimi K3 unless changed)
+4. Final fallback: if the catalogue can't be read, the built-in catalogue, whose default is also Kimi K3
 ```
 
-To permanently switch the deploy-wide default for new chats, an
-operator can update the CFN parameter `DefaultLlmProvider` and redeploy.
+To permanently switch the default for every chat, an administrator
+changes the default model under More → Admin → Models in the web console.
+IM picks the change up within about a minute after saving — **no redeploy**.
 
 ### 15.5 Chat object: `agent` decides who answers in this chat
 
@@ -1440,7 +1466,7 @@ Same concept as the chat-object row on the Web "New chat" home (§1.4): the IM s
 - `/help` lists this row (`/agent notiops|devops`).
 - **Switching objects does not carry history**: the two paths aren't the same upstream at all, so switching does not move the earlier conversation across. To continue a previous turn, switch back first.
 - **`model` / `web` only matter on the NotiOps Agent path**: the AWS DevOps Agent path doesn't go through our Bedrock models. You can still send `model` -- it changes the NotiOps Agent path.
-- **`investigate` / `case` / alert auto-investigation / scheduled digests are all unaffected.** `agent` only decides "who gets this free-form question".
+- **`investigate` / `case` / scheduled digests are all unaffected.** `agent` only decides "who gets this free-form question".
 
 ---
 
@@ -1484,7 +1510,7 @@ Why so complicated? Because:
 
 **Cause**: that message likely happened to be inside a thread, and thread lock outranks everything except user preference.
 
-**Fix**: **user preference is the top layer** and overrides every lock. If `language zh` failed to write (check ECS logs), ask the admin to clear your `locale#user#<uid>` row.
+**Fix**: **user preference is the top layer** and overrides every lock. If `language zh` failed to write (the admin checks the worker log `/aws/lambda/notiops-im-worker-<platform>`; on one-click deployments it is `/aws/lambda/<StackName>-im-worker-<platform>`), ask the admin to clear your `locale#user#<uid>` row.
 
 ---
 
@@ -1497,16 +1523,16 @@ DingTalk runs the **same Lambda webhook shape** as Feishu / Slack and carries th
 | Feature | Available on DingTalk |
 |---|---|
 | @ bot in groups / DM the bot | ✅ |
-| Investigation dispatch (`check i-xxx CPU` / `RDS my-db slow`, …) | ✅ |
+| Deep investigation dispatch (`/investigate i-xxx high CPU` / `deep dive into RDS my-db slow queries`, …; see §13.4) | ✅ |
 | Concept Q&A (`what is EKS` / `ALB vs NLB`) | ✅ |
-| Model switching (`@bot model claude/nova/gpt`) | ✅ |
+| Model switching (`@bot model claude/kimi/gpt`) | ✅ |
 | Chat-object switching (`@bot agent notiops/devops`) | ✅ (one shared implementation across all three platforms -- see §15.5) |
 | Language switching (`language zh/en` / natural language) | ✅ |
 | AWS Support case create / list / view / reply / close / analyze | ✅ |
 | Investigation report markdown writeback | ✅ (the app robot posts the report back into **the conversation that asked** — no extra setup) |
-| Push observation / scheduled daily digest / inspection push | ✅ (**requires** the operator to add a custom robot to the group and store its address in the bot secret's `webhook_url`; see [DEPLOYMENT.en.md §3.3](DEPLOYMENT.en.md) step 8 — skipping it only affects proactive push, not chat or investigation dispatch) |
-| Investigation progress feedback | ✅ (different shape, see §17.2) |
-| Zero-change promise (any mutation request is refused; enforced by DevOps Agent + the read-only role, with a NotiOps-side regex second gate) | ✅ |
+| Proactive push (daily operations notice / real-time alarms / inspection push) | ❌ none of them reaches DingTalk in this release: the daily notice is Feishu-only; real-time alarm push isn't wired up on any platform (§14); inspection push is the only kind that would go to DingTalk (sent to the custom robot added to the group, i.e. the secret's `webhook_url`), but the group must first be registered as a push target, and this release **has no way** to do that (no web entry, `setup.sh` doesn't ask, and no tool ships for it). Chat and investigation dispatch are unaffected |
+| Progress feedback | Partial: ordinary answers append their progress; deep investigations **don't update themselves** (follow the link in the acknowledgement to watch progress in the DevOps Agent console), see §17.2 |
+| Zero-change promise (any mutation request is refused; by default enforced by DevOps Agent + the read-only role, and after `/agent notiops` by the NotiOps AgentCore Runtime's read-only role + read-only tools, with a NotiOps-side regex second gate on both paths; the one write is a Support case that runs only after you confirm it — see §9) | ✅ |
 
 > 📌 **Skills (your own capability packs) are deliberately not in that table**: as of 2026-09-06 skill intents were **retired from the IM side altogether** — Feishu, Slack and DingTalk alike no longer offer skill selection / switching / upload. The full Skills experience lives in Web Chat; see §5.
 
@@ -1514,18 +1540,18 @@ DingTalk runs the **same Lambda webhook shape** as Feishu / Slack and carries th
 
 DingTalk's IM protocol differs from Feishu / Slack in ways we can't paper over. None of these will go away in a later release; the capability is there, it just looks different:
 
-- **Progress is appended, not refreshed in place**: a DingTalk message **cannot be edited once sent**, so there is no Feishu / Slack-style "one card refreshing every 20s". DingTalk appends progress as **new messages** in the conversation, so throttling goes the **opposite** way and gets tighter — at most 2 interim progress messages per run (around 120s and 360s), so progress doesn't bump the whole group's unread badge every time. Progress still arrives, it just scrolls instead of mutating in place.
+- **Progress is appended, not refreshed in place**: a DingTalk message **cannot be edited once sent**, so there is no Feishu / Slack-style card that refreshes in place. For ordinary answers DingTalk appends progress as **new messages** in the conversation, so throttling goes the **opposite** way and gets tighter — at most 2 interim progress messages per run (around 120s and 360s), so progress doesn't bump the whole group's unread badge every time; progress still arrives, it just scrolls instead of mutating in place. **Deep investigations append no progress at all**: the acknowledgement says this one won't update itself; follow its link to watch progress in the DevOps Agent console, and the finished report is delivered back to the conversation.
 - **No next-step one-click dispatch buttons**: DingTalk card buttons can only open a URL — there is **no "button → callback to our server" channel** — so the next-step suggestions at the end of a report appear as **plain text items** on DingTalk and you re-send one as a message. This is a platform limit; the Feishu / Slack one-click buttons cannot exist on DingTalk.
 - **No native modal forms → case creation uses a copy-paste text template**: Feishu / Slack's "open a case form, fill fields" has no DingTalk equivalent. On DingTalk you say "open a case" and the bot replies with **a six-line plain-text template** (Description / Severity / Language / Case type / Service / Subject, fenced by a horizontal rule above and below, each line pre-filled with its default and its options). You **copy the whole block, edit it, and send it back** — only Description is mandatory, everything else can stay at its default. The bot then shows a confirmation card and you reply "**confirm**" for the case to actually be filed. The fence lines are stripped automatically and never end up in the case body.
 - **Dangerous actions are confirmed by replying "confirm", not by clicking**: likewise, write operations such as closing a case take a second confirmation as a reply on DingTalk.
-- **Proactive push targets exactly one destination**: server-initiated push on DingTalk (scheduled digest / inspection / Push) can point at **one** group only; Feishu / Slack accept multiple targets.
+- **Inspection push has at most one target**: the only proactive push that goes to DingTalk is inspection push (not configurable in this release, see §17.1), and its sending address is tied to the group that holds the custom robot, so there can be at most **one** enabled push target; Feishu / Slack can have several.
 - **Markdown tables are not rendered**: DingTalk parses standard markdown but **does not support tables**, so tables in a report are downgraded to readable text lines.
 - **No thread subtopic semantics**: DingTalk has no Slack `thread_ts` analogue — the whole group is the only scope available. So the automatic language lock applies **in 1-on-1 DMs only** on DingTalk (locked for 30 days); inside a group every message is language-detected on its own, because otherwise one English question would flip the entire group to English. Pin the language with `language zh/en` (see §16) — an explicit preference always wins. Simpler inbound, but we lose Feishu / Slack's "follow-up in thread without re-@" trick.
 - **Every inbound is for the bot**: DingTalk bots don't see general group chatter, only @-mentions and DMs. So the bot doesn't have to decide "is this for me?" — it always is. Net: cleaner inbound flow, but no thread-implicit-follow-up.
 
 ### 17.3 Preferences are platform-isolated
 
-`@bot model` and `language` preferences are keyed by `(platform, chat_id)` / `(platform, user_id)`, so **a Feishu preference doesn't carry to DingTalk and vice versa**. The same user can run Claude in a Feishu DM and Nova in a DingTalk group, independently.
+`@bot model` and `language` preferences are keyed by `(platform, chat_id)` / `(platform, user_id)`, so **a Feishu preference doesn't carry to DingTalk and vice versa**. The same user can run Claude in a Feishu DM and Grok in a DingTalk group, independently.
 
 ---
 
@@ -1544,10 +1570,10 @@ The bot supports both Chinese and English — pick whichever you prefer.
 | 看 S3 异常 | `s3://my-bucket 上周空间暴涨, 查异常` |
 | 看跨服务问题 | `从 ALB 到 EKS 到 RDS 全链路超时, 帮我串一下` |
 | 创建 case | `创建一个 case 处理 RDS 故障` / `提一个工单` |
-| 列出 case | `我的 case` / `未解决的 case` |
+| 列出 case | `我的 case` / `列出我的 case` |
 | 查 case | `case 177968247000414` |
-| 回复 case | `回复 case 12345 已经修好` |
-| 关闭 case | `关闭 case 12345` |
+| 回复 case | `回复 case 177968247000414 已经修好` |
+| 关闭 case | `关闭 case 177968247000414` |
 | 概念问题 | `ALB 和 NLB 有什么区别` / `什么是 KMS multi-region key` |
 | 切语言 | `language en` / `请切换到英文` |
 
@@ -1562,10 +1588,10 @@ The bot supports both Chinese and English — pick whichever you prefer.
 | S3 anomaly | `s3 my-bucket size spiked last week` |
 | Cross-service | `ALB → EKS → RDS timeout, help me trace` |
 | Create case | `open a case for RDS issue` / `file a ticket` |
-| List cases | `my cases` / `unresolved cases` |
+| List cases | `my cases` / `list my cases` |
 | View case | `case 177968247000414` |
-| Reply to case | `reply to case 12345 — issue resolved` |
-| Close case | `close case 12345` |
+| Reply to case | `reply to case 177968247000414 — issue resolved` |
+| Close case | `close case 177968247000414` |
 | Concept | `what's the difference between ALB and NLB` / `what is KMS multi-region key` |
 | Switch language | `language zh` / `switch to chinese` |
 
@@ -1581,48 +1607,59 @@ The bot supports both Chinese and English — pick whichever you prefer.
 
 ### Q1: Can I have the bot restart an EC2 for me?
 
-**No**. The bot is read-only — a product-level hard rule that cannot be bypassed, enforced by
-AWS DevOps Agent plus the read-only IAM role it assumes, with a regex second gate on the
-NotiOps side. See [TECHNICAL_DESIGN.en.md §5 Security design](TECHNICAL_DESIGN.en.md#5-security-design).
+**No**. The bot is read-only — a product-level hard rule that cannot be bypassed: by default it is
+enforced by AWS DevOps Agent plus the read-only IAM role it assumes; after `/agent notiops`, by the
+NotiOps AgentCore Runtime's read-only role and read-only tools; on both paths NotiOps adds a regex
+second gate (see §9). See [TECHNICAL_DESIGN.en.md §5 Security design](TECHNICAL_DESIGN.en.md#5-security-design).
 
 Workaround: **ask the bot how to restart it** (tutorial-style), and it will teach you the CLI commands. You review them, then run them yourself.
 
 ### Q2: How does the bot know about my AWS resources?
 
-The bot **does not call AWS APIs directly**. Every investigation is dispatched to **AWS DevOps Agent**. The Agent reads your resources using the role you authorized for it. The bot's task role only has minimal permissions (send messages, call Bedrock, write DDB).
+The bot **does not read** resources such as your CloudWatch / EC2 / RDS itself. By default it hands questions and investigations to your own **AWS DevOps Agent**, which reads your resources using the role you authorized for it; once the chat object is switched with `/agent notiops` (§15.5), free-form questions are answered by the NotiOps AgentCore Runtime, which reads with its read-only role (the same runtime as Web Chat — see §8.1).
+
+The bot's Lambda role can do **more** than "send messages". It can:
+
+- send and receive IM messages (the platform credentials live in Secrets Manager);
+- start DevOps Agent deep investigations, read their progress, and chat with DevOps Agent directly;
+- invoke the NotiOps AgentCore Runtime (the `/agent notiops` path);
+- call Bedrock models (smart case analysis, and working out the service when a case is filed);
+- **open / reply to / resolve AWS Support cases** (only after you confirm on the card / form, or reply "confirm" on DingTalk);
+- AssumeRole into NotiOps' trigger role and collection role in onboarded member accounts (needed to dispatch investigations and open cases across accounts);
+- read and write NotiOps' own DynamoDB tables, plus the reports and Skills in its data bucket.
 
 ### Q3: How long is my chat data retained?
 
 | Type | TTL |
 |---|---|
 | Chat events / investigation context | 7 days |
-| Investigation report HTML (S3) | 7 days (presigned URL also 7 days) |
+| Investigation report HTML (S3) | **Not deleted automatically**: there is no lifecycle rule on the `investigations/` prefix, so the objects stay in the data bucket until the bucket itself is deleted; what expires is the links on the card (valid for a few hours, at most about 12) |
 | Language preference | 90 days |
 | DM lock | 30 days |
 | Channel thread lock | 7 days |
 | Investigation lock | 24 hours |
 | Push event dedup | 5 minutes |
 
-DDB TTL handles cleanup automatically — no manual intervention needed.
+Everything except the investigation reports is cleaned up automatically by DDB TTL — no manual intervention needed.
 
 ### Q4: The bot suddenly stopped responding, what do I do?
 
 Follow the §20 process and ask an admin to investigate. Common causes:
-- ECS task is restarting (transient, wait 30 seconds)
-- IM credentials expired (admin re-enters them in Secrets Manager)
-- Bedrock throttling (occasional during peak hours)
+- IM credentials expired or changed (the admin re-enters them under Web Chat More → Admin → IM Integration, or edits that secret in Secrets Manager directly)
+- Bedrock throttling (occasional during peak hours; it only affects the places that use a model — `/agent notiops` answers and smart case analysis)
 
 ### Q5: Can I add the bot to non-production channels?
 
-Yes. **We strongly recommend trying it in a test channel for 1–2 weeks first**. The bot accepts every chat by default; admins can use `AllowedChatIds` to restrict it to an allowlist.
+Yes. **We strongly recommend trying it in a test channel for 1–2 weeks first**. By default the bot answers in every chat it is invited to; admins can narrow that down with a chat allowlist: on one-click deployments it is the stack parameter `ImAllowedChatIds` (labelled **IM chat/channel allow list** on the parameters page — see [DEPLOYMENT_ONECLICK.en.md](DEPLOYMENT_ONECLICK.en.md)); on `setup.sh` deployments, add `imAllowedChatIds` to the `context` block of `infra/cdk.json` and re-run `./setup.sh` (see [DEPLOYMENT.en.md §8.1](DEPLOYMENT.en.md)).
 
 ### Q6: Are the bot's replies model-generated? Will it hallucinate?
 
 - **Investigation reports**: generated by DevOps Agent actually reading your resources, with a trace.html for verification — no fabrication
-- **Concept Q&A**: the conversation's Bedrock model (Claude Sonnet 5 by default) + AWS official docs retrieval (Knowledge MCP); answers come with 📚 source URLs you can click to verify
-- **Intent classification / progress narration**: LLM-generated and may have minor inaccuracies, but doesn't affect the truthfulness of the investigation result itself
+- **Concept Q&A**: by default your own DevOps Agent answers directly (0 NotiOps tokens, no sources block); only after you switch the chat object to NotiOps Agent (`@bot agent notiops`, see §15.5) is it the conversation's Bedrock model (Kimi K3 by default) + AWS official docs retrieval (Knowledge MCP), with the URLs under "Sources" that you can click to verify (see §13.2)
+- **Intent detection**: a deterministic rule match with no model call (0 tokens); the rules are in §13.4
+- **Investigation progress**: the progress card adds DevOps Agent's own investigation-journal entries one by one; NotiOps calls no model and writes no narration of its own (§11.3)
 
-If a concept answer disagrees with what you know, **click the 📚 source URL and read the AWS official docs yourself** — that's ground truth.
+If a concept answer disagrees with what you know, **click the URL under "Sources" and read the AWS official docs yourself** (a DevOps Agent direct answer has no sources block, so look it up in the AWS docs directly) — that's ground truth.
 
 ### Q7: Will creating an AWS Support case via the bot incur extra Support fees?
 
@@ -1640,16 +1677,18 @@ But **the precondition is**: the role you give DevOps Agent has not accidentally
 
 ### 20.1 Feedback channels
 
-Just @ the bot in the channel: `@bot I wish you could...`. The bot won't "understand" the feedback itself (it'll classify it as chitchat), but **the message lands in ECS logs and admins review them periodically to improve prompts**.
+To request a feature or report a problem: open an issue on the public repository's Issues page (the GitHub icon to the right of your name at the bottom left of Web Chat opens the repository home — see §1.2), or tell the administrator who runs this NotiOps deployment.
+
+⚠️ **Don't give feedback by @-ing the bot with "I wish you could…"** — nothing records it: the message is treated as an ordinary question and handed to this chat's chat object to answer (your own DevOps Agent by default), and the bot's logs only keep metadata such as error types, never message text, so the administrator can't find it in the logs either.
 
 ### 20.2 Where to get help
 
 | Problem | Who to contact |
 |---|---|
 | Bot didn't reply | Internal channel admin / IT ops |
-| Bot replied but the content is clearly wrong | Screenshot it in the bot channel, admin checks ECS logs |
-| Investigation report won't open | Check whether the S3 presigned URL has expired (7 days) |
-| I don't have permission to investigate this resource | This is a DevOps Agent role permission issue, not the bot's problem |
+| Bot replied but the content is clearly wrong | Send a screenshot to the admin; the admin checks the worker log `/aws/lambda/notiops-im-worker-<platform>` (on one-click deployments, `/aws/lambda/<StackName>-im-worker-<platform>`) — it holds metadata such as error types but no message text, so include your original message in the screenshot |
+| Investigation report won't open | Most likely the link has expired: the card's links are S3 presigned URLs that stay valid only for a few hours (at most about 12). The report is still in the bucket, but the link is not renewed — to look at this investigation again, use the progress card's "🔬 Open this investigation" button (on DingTalk, the link in the acknowledgement) to open it in the DevOps Agent console; that needs a console login (see §11.4) |
+| I don't have permission to investigate this resource | This is a permission issue of the role of whoever answers you (by default the role your DevOps Agent uses; after `/agent notiops`, the NotiOps AgentCore Runtime's read-only role), not the bot's problem |
 | AWS Support case creation failed | Read the error the bot returned — likely Support plan limit or severity not allowed |
 
 ### 20.3 Want to learn more?

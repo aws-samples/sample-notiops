@@ -78,9 +78,12 @@ def get_client():
     # 异常文案保持纯英文：它只进 CloudWatch，永远不会渲染给 IM 用户，
     # 所以不走 i18n（i18n 表只装用户可见文案）。**不打印 token 本身，连长度也不打**
     # （docs/LOGGING_STANDARD.md）。
+    # 指路写的是**现在的**入口（Web Chat「更多 → 管理」→「集成 IM」→ Slack）。原先的
+    # "Notification settings" 是 2026-09-04 已退役的旧管理台页面，照着找会扑空。
     if not token:
-        raise RuntimeError("slack bot token secret is empty (fill it in the "
-                           "Web Chat admin console -> Notification settings)")
+        raise RuntimeError("slack bot token secret is empty (fill it in Web Chat: "
+                           "More -> Admin -> IM Integration -> Slack -> "
+                           "Bot User OAuth Token)")
     if not token.startswith(("xoxb-", "xoxp-")):
         raise RuntimeError(
             "slack bot token secret does not look like a Slack token "

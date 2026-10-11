@@ -145,3 +145,35 @@ export function restorableMode(topic: string | undefined, mode: DevopsMode): Dev
   //    而是入口下线。把入口加回来时，这一行要改回 `topicHasDevopsAgent(topic) ? mode : "off"`。
   return "off";
 }
+
+/**
+ * 拉到历史以后，按历史消息里**持久化**的 `via` 把「对话对象」的锁恢复成哪个模式
+ * （ChatApp 水合处调用）。回 `null` = 不动这个会话现有的字段。
+ *
+ * 为什么要有这一条：`devopsChat` / `starops` 后端不存（见文件头）。localStorage 那条路径
+ * 恢复不了通用会话里选的 DevOps Agent（`restorableMode` 对 general 的 `"chat"` 一律 off），
+ * 换了浏览器两种对象都恢复不了；而历史消息的 `via` 是 store.mjs 逐条存下的事实，换浏览器也
+ * 成立 —— 不靠它恢复的话，一段由客户自己的 DevOps Agent 答过的会话，刷新后接着问会**静默
+ * 换成 NotiOps 来答**（客户只会觉得答案风格突然变了）。
+ *
+ * 口径（每一条都是「不报错、只是错」的那种）：
+ *  · 只恢复通用会话：其余主题仍是"每轮开关"语义。
+ *  · 两条锁互斥，STAROps 优先（与 `modeOf` / BFF 的一选一同序）。**绝不能**合并成"有 via
+ *    就锁 devopsChat"：那样一段阿里云会话刷新后被锁成 AWS DevOps Agent，接着问就把问题原文
+ *    送去了另一朵云 —— 界面上只是署名行变了一行字。
+ *  · 🔴 STAROps 那条过 `topicHasStarops`（`MULTICLOUD_UI` 关着时恒 false）—— 与上面的
+ *    `restorableMode`、`ChatObjectPicker` 的回退同一条规则：多云关着时，已经落过盘的 STAROps
+ *    会话**退回 NotiOps**。回 `"off"` 而不是 `null`：明说"对象是 NotiOps"，不指望会话上恰好
+ *    没有别的字段。互斥按**历史事实**判、不按闸门结果 —— 退回的是 NotiOps，不是 DevOps Agent。
+ *    2026-10-11 之前 ChatApp 里这段不看开关，而选择器只挂在空会话的落地页上，有历史的
+ *    STAROps 会话恰好绕过了它的回退：标题栏仍是「阿里云 STAROps」，接着问照样走 BFF 那条链路。
+ */
+export function relockFromHistory(
+  topic: string | undefined,
+  history: ReadonlyArray<{ via?: string }>,
+): DevopsMode | null {
+  if ((topic ?? "general") !== "general") return null;
+  if (history.some((m) => m.via === "starops")) return topicHasStarops(topic) ? "starops" : "off";
+  if (history.some((m) => m.via === "devops-agent")) return "chat";
+  return null;
+}

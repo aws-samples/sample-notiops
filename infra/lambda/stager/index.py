@@ -323,15 +323,29 @@ def _artifacts_upsert(props) -> dict:
     # 选项自动落到"要装 IM"这一侧，不需要再回来改这里。
     # 反过来也成立：`InstallOption` 属性变了（web → web+feishu）就是一次 Update，
     # 这个函数会重跑并把缺的产物补下来。
-    skip_im = (props.get("InstallOption") or "web").strip() == "web"
+    # 加装项按**产物名前缀**跳过。清单与前缀的唯一真源是 scripts/artifacts.py
+    # （`OPTIONAL_PREFIXES`）；这里不 import 它 —— 本文件是内联进模板的 Lambda 代码，
+    # 没有仓库上下文，所以前缀在这里是重复的字面量。两边都改的判据在
+    # scripts/test_oneclick_parity.py 里。
+    skip_prefixes = []
+    if (props.get("InstallOption") or "web").strip() == "web":
+        skip_prefixes.append("im-")
+    # 成本 MCP：客户没填 CUR 表就不该为这 ~25MB 的依赖层等下载，
+    # 也不该在 staging 桶里看到自己没装的东西。
+    if not (props.get("CostMcpEnabled") or "").strip():
+        skip_prefixes.append("cost-mcp-")
+    # CUR 自建：客户没选 ProvisionCur=yes 就不搬这个 zip（它只有 stage1 custom resource
+    # 和 stage2 finalizer 两段代码，很小，但没选就不该出现在客户的 staging 桶里）。
+    if not (props.get("CurProvisionerEnabled") or "").strip():
+        skip_prefixes.append("cur-provisioner")
     staged, skipped = {}, []
     for a in artifacts:
-        if skip_im and a["name"].startswith("im-"):
+        if any(a["name"].startswith(p) for p in skip_prefixes):
             skipped.append(a["name"])
             continue
         staged[a["name"]] = _fetch_to_s3(f"{base}/{a['name']}", bucket, a["key"], a["sha256"])
     if skipped:
-        print(f"skipped {len(skipped)} IM artifact(s) (InstallOption=web): {skipped}")
+        print(f"skipped {len(skipped)} optional artifact(s) (prefixes {skip_prefixes}): {skipped}")
     return {"StagedCount": str(len(staged)), "TotalBytes": str(sum(staged.values()))}
 
 
@@ -685,6 +699,19 @@ def _create_admin(props) -> str:
     return "ok"
 
 
+class _TeardownIncomplete(Exception):
+    """删栈收尾有一步或多步没做成。消息里**逐条**列出每个失败的对象与错误码。
+
+    只放「哪个对象 + 哪个 API + 错误码」，不放 AWS 的原始报错正文：后者带调用方角色 ARN、
+    账号号，而且多条拼起来会把 CFN 的 Reason（这里截在 1000 字符）挤爆，只剩第一条。
+    正文在日志里（`attempt()` 那行 ERROR），Reason 末尾自带日志流名。
+    """
+
+    def __init__(self, failures: list[str]):
+        super().__init__(f"teardown incomplete ({len(failures)} step(s) failed): " + "; ".join(failures))
+        self.failures = list(failures)
+
+
 def _teardown_site(props) -> dict:
     """删栈清理。分两级：
 
@@ -695,16 +722,53 @@ def _teardown_site(props) -> dict:
         「这里不动它们」+ Retain 共同兑现的。
 
     两级的失败处理**故意不一样**：
-      · 数据类（桶/表）出错一律上抛 → 栈进 DELETE_FAILED。客户明确要求"全删"，
+      · 数据类（桶/表/secret）出错 → 栈进 DELETE_FAILED。客户明确要求"全删"，
         悄悄留下数据比卡住更糟。
       · 日志组出错只记 WARN → 它们是空容器、不产生费用，为了一个日志组把删栈卡死
         不划算。留下的孤儿会写进删栈报告（Outputs 里的清理说明）。
+
+        ⚠️ **CUR 相关的东西一概不碰** —— 报告定义、交付桶、`notiops-cur-athena-<账号>` 那个
+    官方 Athena 集成栈、以及 lambda6 下发的 Athena 保存查询。这是**刻意**的,不是漏了:
+      · 那是客户的**账单历史**,AWS **不补发**过去的月份;
+      · 更实际的是:留着能让**重装立刻可用** —— 新建 CUR 到首次交付有 ~24h 硬延迟,而这些
+        东西还在时 `lambda6_cur_finalizer` 会走「复用既有 CUR」快路(按 S3 路径去 Glue
+        **动态发现**已有表),几分钟就翻 READY。删了 = 重装的客户重新等一天。
+    与 `teardown.sh`(方式 B)同一个口径,并写进 `DataRetentionOnDelete` 输出告知客户。
+    **别在这里加 CUR 删除** —— 判据钉着(tests/test_cur_provisioner_parity.py)。
+
+    数据类的失败**先记下、全部试完再一起报**，而不是撞上第一个就抛（2026-10-10 一次真实删栈，
+    v1.0.30 方式 A）：stager 缺 CostMcpResults 桶的权限，在第三个桶上就抛了 —— 第四个桶
+    （数据桶）、两张表、几个 secret **一个都没试**。后果有两层：① 客户要手工收拾的东西比
+    实际坏掉的多得多；② 要是还有第二处漏授权，这一次**看不见它**，修完一处再删还会再炸。
+    结果照旧是 FAILED（`_TeardownIncomplete`），只是一次就把**所有**失败列出来。
     """
     mode = props.get("TeardownMode", "KeepData")
     report = {"Mode": mode}
+    failures: list[str] = []
 
-    report["SiteObjectsDeleted"] = str(_empty_bucket(props["SiteBucket"]))
-    report["StagingObjectsDeleted"] = str(_empty_bucket(props["StagingBucket"]))
+    def attempt(label: str, fn):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            op = exc.operation_name if isinstance(exc, ClientError) else ""
+            failures.append(f"{label}: {op + ' ' if op else ''}{_err_code(exc)}")
+            # 全文只进日志（带缺的是哪个 action，排障要它）；CFN 的 Reason 只放码，见 _TeardownIncomplete
+            print(f"ERROR teardown step failed — {label}: {exc!r}")
+            return None
+
+    def emptied(bucket: str) -> str:
+        n = attempt(f"s3://{bucket}", lambda: _empty_bucket(bucket))
+        return "failed" if n is None else str(n)
+
+    report["SiteObjectsDeleted"] = emptied(props["SiteBucket"])
+    report["StagingObjectsDeleted"] = emptied(props["StagingBucket"])
+    # Athena 查询结果桶 —— **无条件清空**（与 StagingBucket 同类：它是缓存，不是要留给
+    # 客户的数据；桶上还挂着 7 天生命周期）。不清的后果不是"留了点垃圾"，而是
+    # **删栈失败** —— 那个桶是 DESTROY 且一键路径不能用 autoDeleteObjects
+    # （会引入 cr.Provider = 隐式资产，本模板禁止）。
+    cost_results = props.get("CostResultsBucket") or ""
+    if cost_results:
+        report["CostResultsObjectsDeleted"] = emptied(cost_results)
 
     logs = boto3.client("logs")
     for name in json.loads(props.get("LogGroupNames") or "[]"):
@@ -716,20 +780,26 @@ def _teardown_site(props) -> dict:
 
     if mode != "DeleteEverything":
         print("TeardownMode=KeepData — the config/session tables and the data bucket are kept")
+        if failures:
+            raise _TeardownIncomplete(failures)
         return report
 
     data_bucket = props.get("DataBucket") or ""
     if data_bucket:
-        _empty_bucket(data_bucket)
-        _delete_bucket(data_bucket)
+        def _drop_data_bucket():
+            _empty_bucket(data_bucket)
+            _delete_bucket(data_bucket)
+        attempt(f"s3://{data_bucket}", _drop_data_bucket)
     ddb = boto3.client("dynamodb")
     for table in json.loads(props.get("TableNames") or "[]"):
-        try:
-            ddb.delete_table(TableName=table)
-            print(f"deleted table {table}")
-        except Exception as exc:  # noqa: BLE001
-            if not _ignore_missing(exc):
-                raise
+        def _drop_table(table=table):
+            try:
+                ddb.delete_table(TableName=table)
+                print(f"deleted table {table}")
+            except Exception as exc:  # noqa: BLE001
+                if not _ignore_missing(exc):
+                    raise
+        attempt(f"table {table}", _drop_table)
     # 这几个 secret 都不是栈内资源，CFN 完全不知道它们存在，而 DeleteEverything 承诺
     # "不留东西"，所以必须在这里收尾：
     #   · notiops/bedrock-api-key —— 管理员在 Admin「模型」页选「API Key」凭证方式时
@@ -745,14 +815,18 @@ def _teardown_site(props) -> dict:
     # 而这是"客户明确要求全删"的路径。`setup.sh` 那条路径由 teardown.sh 做同一件事。
     sm = boto3.client("secretsmanager")
     for name in json.loads(props.get("SecretNames") or "[]"):
-        try:
-            sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
-            print(f"deleted secret {name}")
-        except Exception as exc:  # noqa: BLE001
-            # 绝大多数情况下它根本不存在（客户从没用过 API Key 模式）—— 那是正常的，
-            # 不该把删栈卡在 ResourceNotFoundException 上。
-            if not _ignore_missing(exc):
-                raise
+        def _drop_secret(name=name):
+            try:
+                sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+                print(f"deleted secret {name}")
+            except Exception as exc:  # noqa: BLE001
+                # 绝大多数情况下它根本不存在（客户从没用过 API Key 模式）—— 那是正常的，
+                # 不该把删栈卡在 ResourceNotFoundException 上。
+                if not _ignore_missing(exc):
+                    raise
+        attempt(f"secret {name}", _drop_secret)
+    if failures:
+        raise _TeardownIncomplete(failures)
     report["DeletedEverything"] = "true"
     return report
 
@@ -950,8 +1024,14 @@ def _org_setup(props: dict) -> dict:
         "NotiOps member account onboarding (cross-account read-only role)",
         auto_deployment=True, call_as=call_as,
     )
+    # 🔴 CreateCollectionRole 必须显式传 no（与 setup.sh 的 DA_SS_PARAMS 同口径）。模板 Default 是
+    # "yes"，而采集角色 `notiops-idle-detection-role-<系统账号>` 已由上面那个 onboarding StackSet
+    # 在成员账号里建好（第二步要求第一步先 ACTIVE）。两份都建 → EntityAlreadyExists → 第二步
+    # 「一键关联」的成员栈整栈回滚、账号记 failed、巡检零信号。BFF 建实例时不带参数覆盖，
+    # 所以 StackSet 这一层的值就是最终值。2026-10-10 用户报告、对照 setup.sh 核实。
     report["DevOpsAgentStackSet"] = _stackset_upsert(
-        cfn, props["DevOpsStackSetName"], props["DevOpsTemplateBody"], common,
+        cfn, props["DevOpsStackSetName"], props["DevOpsTemplateBody"],
+        {**common, "CreateCollectionRole": "no"},
         "NotiOps member DevOps Agent onboarding (agent space + trigger role)",
         # 不自动下发：成员账号的 Agent Space 有独立成本与配置，按账号在 Admin
         # 「账户」页第二步一键关联时才建实例。

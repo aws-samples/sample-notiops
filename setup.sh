@@ -556,8 +556,18 @@ if [ "$MULTI_ACCOUNT_MODE" = true ]; then
       # 🔴 这条限制必须**在部署前**说，而不是等客户在管理页点了一键接入才发现：
       #    CloudFormation 不会把 stack 部署到管理账号（即使它在被 target 的 OU 里），
       #    而那个调用会**返回成功**、操作也会变 SUCCEEDED —— 是「假成功」不是报错。
+      # 🔴 出路是**只走**「手动接入账号」。这里原来写的是「先手工部 member-account-onboarding.yaml
+      #    再手动接入」—— 照做必回滚：手动接入的链接写死 `param_CreateCollectionRole=yes`
+      #    （member_accounts.mjs::generateLaunchStackUrl），member-devops-agent.yaml 于是也建
+      #    `notiops-idle-detection-role-<系统账号>`，与 onboarding 那份**同名** ⇒ 后部的那个
+      #    EntityAlreadyExists、整栈回滚。两份的事件转发规则名字不同、不撞，但都建会把每个调查
+      #    事件投两次（不报错）。所以已经部过 onboarding 那份的账号，quick-create 页上要把
+      #    CreateCollectionRole 改成 no、DevOpsEventBusArn 清空 —— member-devops-agent.yaml 这两个
+      #    参数的说明写的就是这件事。主体口径与 docs/DEPLOYMENT.md §0.1.2「硬性前置」那段 🔴 一致；
+      #    DevOpsEventBusArn 那半句来自上述模板的参数说明（文档那段只写了 CreateCollectionRole）。
       echo "    $(t "⚠ 管理账号 ${ORG_MGMT_ACCOUNT} 自己无法通过 StackSet 上车（CloudFormation 不会把栈部署到管理账号）。" "⚠ The management account ${ORG_MGMT_ACCOUNT} itself cannot be onboarded via StackSets (CloudFormation never deploys a stack to the management account).")"
-      echo "      $(t "要让 NotiOps 查它：在管理账号里手工部一次 infra/member-account-onboarding.yaml，再用管理页「手动接入账号」登记。" "To query it, deploy infra/member-account-onboarding.yaml manually in that account, then register it via \"Manual onboarding\" in the Admin page.")"
+      echo "      $(t "要让 NotiOps 查它：只用 Web Chat「更多 → 管理」→「账户」→「手动接入账号」—— 生成链接、用管理账号登录部署那个栈、回填 Stack Outputs，采集角色由那个栈一并建好。" "To query it, use \"Manual onboarding\" alone (Web Chat \"More → Admin\" → \"Accounts\"): generate the link, deploy that stack while signed in to the management account, and paste the Stack Outputs back; that stack creates the collection role too.")"
+      echo "      $(t "别再手工部 infra/member-account-onboarding.yaml：两个栈建同名采集角色，后部的那个 EntityAlreadyExists、整栈回滚。已经部过的话，在 quick-create 页把 CreateCollectionRole 改成 no；那个栈建了事件转发的话，DevOpsEventBusArn 也清空（否则每个调查事件投两次）。" "Do not also deploy infra/member-account-onboarding.yaml by hand: both stacks create a collection role with the same name, so the second one fails with EntityAlreadyExists and rolls back. If it is already deployed there, set CreateCollectionRole to no on the quick-create page; if that stack forwards events, also clear DevOpsEventBusArn (otherwise every investigation event is delivered twice).")"
     else
       # 🔴 这里**不问**「你是委派管理员吗?」—— 上面 `detect_stackset_call_as` 已经用
       #    `list-delegated-administrators` 查过了。让客户声明身份 = 把一个可以 100% 确定
@@ -597,6 +607,10 @@ if [ "$MULTI_ACCOUNT_MODE" = true ]; then
   else
     echo "  $(t "ℹ 退回逐账号允许清单模式。成员账号需手动部署:" "ℹ Falling back to per-account allowlist mode. Member accounts must be deployed manually:")"
     echo "    $(t "infra/member-account-onboarding.yaml(只读角色 + DevOps/PHD 事件转发)" "infra/member-account-onboarding.yaml (read-only role + DevOps/PHD event forwarding)")"
+    # ⚠️ 这一句必须跟着：部署完成后的「新增业务账户流程」会把这类部署（非 org 模式）的账号指去
+    #    「手动接入账号」，而它的链接写死 CreateCollectionRole=yes —— 与上面这份模板建同名采集角色，
+    #    两个都部 ⇒ EntityAlreadyExists、整栈回滚；两份都建转发规则 ⇒ 每个调查事件投两次。
+    echo "    $(t "部过它的账号以后再走「手动接入账号」时:quick-create 页把 CreateCollectionRole 改成 no(否则同名采集角色撞名、整栈回滚);它建了事件转发的话 DevOpsEventBusArn 也清空(否则每个调查事件投两次)" "If such an account later also goes through \"Manual onboarding\": set CreateCollectionRole to no on the quick-create page (otherwise the same-named collection role clashes and the stack rolls back); if that stack forwards events, also clear DevOpsEventBusArn (otherwise every investigation event is delivered twice)")"
   fi
 fi
 
@@ -1145,6 +1159,14 @@ echo "  $(t "✓ web chat BFF 依赖安装完成" "✓ Web Chat BFF dependencies
 # 为什么要两个变量：Function URL 里不含函数 ARN，而 lambda:InvokeFunctionUrl 必须按资源
 # 授权（docs/DEPLOYMENT.md §14）。只填一半会得到"看起来装好了、每次调用 403"的部署，
 # 而 403 的根因只在 CloudTrail 里 —— 所以在这里就拦掉，别让它跑到最后。
+# 账号号在这里就要解析出来：下面「自建成本 MCP」那段用它拼 `cur-athena-status#<账号>` 与
+# 函数 ARN，而 CDK_ACCOUNT 原本要到 CDK bootstrap 那一节才赋值（2026-10-10 用户报告：那之前
+# 拿到的是空串 → 查不到 CUR 记录 → `COST_MCP_SELF_HOST=true ./setup.sh` 必然 exit 1，函数 ARN
+# 也缺账号段）。后面那一节照旧会再取一次，值相同。
+# 一律以 STS 为准（后面 CDK 那一节也是无条件重取）：shell 里若残留一个别的账号号，这里沿用它会让 CUR
+# 记录与函数 ARN 指向另一个账号，而 CDK 部署进的是当前凭证的账号。
+CDK_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
+
 COST_AGENT_MCP_URL="${COST_AGENT_MCP_URL:-}"
 COST_AGENT_MCP_URL="${COST_AGENT_MCP_URL%/}"
 COST_AGENT_FN_ARN="${COST_AGENT_FN_ARN:-}"
@@ -1170,12 +1192,39 @@ case "$_cost_rc" in
   *) _cost_live_state="unknown" ;;
 esac
 
+# 🔴 现网那个 URL 可能就是**我们自己**部的成本 MCP server（SelfHosted 态）。不认出来的话
+#    （2026-10-10 发版前审查实测）：带 COST_MCP_SELF_HOST=true 重跑 → 撞上下面的「互斥」检查
+#    exit 1；不带 → 当成 External 部署，CDK 把自建的 notiops-cost-mcp 删掉，BFF / agent 指向
+#    一个已删掉的 URL。判据：WebChatStack 只在自建态才有 `CostMcpUrl` 输出，且它等于现网 BFF
+#    里那个。读不到就**不猜**（猜错的两种后果都是静默坏掉），停下来让人说清楚。
+_cost_selfhosted_live=false
+if [ -z "$COST_AGENT_MCP_URL" ] && [ "$_cost_live_state" = "value" ]; then
+  read_live_stack_output "WebChatStack" "CostMcpUrl" && _own_rc=0 || _own_rc=$?
+  if [ "$_own_rc" = "0" ] && [ -n "$LIVE_READ_VALUE" ] && [ "${LIVE_READ_VALUE%/}" = "$_cost_live_url" ]; then
+    _cost_selfhosted_live=true
+  elif [ "$_own_rc" = "2" ]; then
+    echo "" >&2
+    echo "  $(t "❌ 现网配了成本 MCP server，但读不到 WebChatStack 的输出，分不清它是自建的还是你自带的 —— 拒绝继续。" "❌ The live deployment has a cost MCP server, but the WebChatStack outputs could not be read, so it is unclear whether NotiOps hosts it or you do -- refusing to continue.")" >&2
+    echo "     $(t "原因: " "Reason: ")$LIVE_READ_ERR" >&2
+    echo "     $(t "NotiOps 自建的: " "Hosted by NotiOps: ")COST_MCP_SELF_HOST=true ./setup.sh" >&2
+    echo "     $(t "你自带的: " "Your own server:   ")COST_AGENT_MCP_URL=$_cost_live_url COST_AGENT_FN_ARN=<function ARN> ./setup.sh" >&2
+    exit 1
+  fi
+fi
+
 if [ -n "$COST_AGENT_MCP_URL" ]; then
   # 显式 > 探测。但跟现网不一样就得说一声 —— 否则"我以为只是重跑一次"会悄悄换掉数据源。
   if [ "$_cost_live_state" = "value" ] && [ "$_cost_live_url" != "$COST_AGENT_MCP_URL" ]; then
     echo "  $(t "ℹ 环境变量给的 CUR 数据源与现网不同,按环境变量走(显式 > 探测):" "ℹ The CUR data source given in the environment differs from the live one; the environment wins (explicit > detected):")"
     echo "    $(t "现网: " "live:     ")${_cost_live_url}"
     echo "    $(t "本次: " "this run: ")${COST_AGENT_MCP_URL}"
+  fi
+elif [ "$_cost_selfhosted_live" = "true" ]; then
+  if [ "${COST_MCP_SELF_HOST:-}" = "false" ]; then
+    echo "  $(t "⚠ COST_MCP_SELF_HOST=false：现网自建的成本 MCP server 会在这次部署里被删掉 —— 4 张 CUR 报表从侧栏摘掉，成本问答改用 Cost Explorer。" "⚠ COST_MCP_SELF_HOST=false: the live self-hosted cost MCP server will be removed by this deployment -- the 4 CUR sheets disappear from the sidebar and cost questions use Cost Explorer.")"
+  else
+    COST_MCP_SELF_HOST=true
+    echo "  $(t "✓ 沿用现网的自建成本 MCP server（来源: WebChatStack 的 CostMcpUrl 输出与现网 BFF 一致）" "✓ Keeping the live self-hosted cost MCP server (source: the WebChatStack CostMcpUrl output matches the live BFF)")"
   fi
 elif [ "$_cost_live_state" = "value" ]; then
   COST_AGENT_MCP_URL="$_cost_live_url"
@@ -1236,6 +1285,177 @@ if [ -n "$COST_AGENT_MCP_URL" ]; then
   fi
   COST_AGENT_FLAG="-c costAgentMcpUrl=$COST_AGENT_MCP_URL -c costAgentFunctionArn=$COST_AGENT_FN_ARN"
   echo "  $(t "✓ 将接入客户自有 CUR 数据源（cost-agent MCP）" "✓ Will wire in your own CUR data source (cost-agent MCP)")"
+fi
+
+# ── 自建成本 MCP server（SelfHosted 态）────────────────────────────────────────
+# 三态：Off（默认）/ External（上面那段，客户自带 server）/ SelfHosted（NotiOps 自己部）。
+# 开关：COST_MCP_SELF_HOST=true ./setup.sh
+#
+# ⚠️ 与 External 互斥 —— 同时给两个是配置错误，web-chat-core.ts 会在 synth 期拦住。
+#    这里提前拦一次，省掉一次 3 分钟的 synth。
+#
+# CUR 表**不让客户重填**：NotiOps 在这条路径上本来就 provision 了 CUR + Glue + Athena
+# （见本文件「CUR + Athena FinOps 数据源」那一节），并把结果记在 notiops-config 的
+# `cur-athena-status#<账号>` 里。这里直接读它 —— 确认或覆盖，不是空白填写。
+if [ "${COST_MCP_SELF_HOST:-false}" = "true" ]; then
+  if [ -n "$COST_AGENT_MCP_URL" ]; then
+    echo ""
+    echo "  $(t "❌ COST_MCP_SELF_HOST=true 与 COST_AGENT_MCP_URL 互斥。" "❌ COST_MCP_SELF_HOST=true and COST_AGENT_MCP_URL are mutually exclusive.")" >&2
+    echo "     $(t "要么 NotiOps 自己部一个成本 MCP server，要么指向你已有的那个 —— 二选一。" "Either NotiOps runs the cost MCP server, or you point at your own -- pick one.")" >&2
+    exit 1
+  fi
+  # ⚠️ 跨账号（CUR_ROLE_ARN）在自建态下**暂不支持**（2026-10-10 发版前审查实测）：server 用 assume
+  #    来的凭证调 Athena，查询跑在 CUR 那个账号里，却带着只存在于 NotiOps 账号的 workgroup 名 ⇒
+  #    45 个工具每次都 `WorkGroup does not exist`。修好要在 CUR 账号里另有一个带扫描上限的
+  #    workgroup，这一版不做 —— 先在这里拦住，别部署出一个每次都失败的数据源。一键部署在模板里同样拦。
+  if [ -n "${CUR_ROLE_ARN:-}" ]; then
+    echo "" >&2
+    echo "  $(t "❌ COST_MCP_SELF_HOST=true 暂不支持 CUR_ROLE_ARN（CUR 在另一个账号）。" "❌ COST_MCP_SELF_HOST=true does not support CUR_ROLE_ARN (a CUR in another account) yet.")" >&2
+    echo "     $(t "两个办法：① 把 NotiOps 部署在 CUR 所在的账号；② 用你自己的成本 MCP server：" "Two options: (1) deploy NotiOps in the account that holds the CUR; (2) use your own cost MCP server: ")COST_AGENT_MCP_URL=<Function URL> COST_AGENT_FN_ARN=<function ARN> ./setup.sh" >&2
+    exit 1
+  fi
+  if [ -z "$CDK_ACCOUNT" ]; then
+    echo "  $(t "❌ 取不到当前账号号（aws sts get-caller-identity 失败）—— 自建成本 MCP 要用它定位 CUR 记录与函数 ARN。" "❌ Could not resolve the account id (aws sts get-caller-identity failed) -- the self-hosted cost MCP needs it for the CUR record and the function ARN.")" >&2
+    exit 1
+  fi
+  echo ""
+  echo "$(t "── 自建成本 MCP server（客户 CUR 查询）──" "── Self-hosted cost MCP server (customer CUR queries) ──")"
+
+  # 重跑时沿用现网的可选旋钮（显式 > 现网 > 默认）。不回读的话，客户当初设过的 CUR_VERSION /
+  # CUR_TAG_KEYS / 扫描上限，重跑一次就**静默**回到默认值。
+  if [ "$_cost_selfhosted_live" = "true" ]; then
+    for _knob in CUR_VERSION CUR_TAG_KEYS; do
+      [ -n "${!_knob:-}" ] && continue
+      read_live_lambda_env "notiops-cost-mcp" "$_knob" && _knob_rc=0 || _knob_rc=$?
+      if [ "$_knob_rc" = "0" ] && [ -n "$LIVE_READ_VALUE" ]; then
+        printf -v "$_knob" '%s' "$LIVE_READ_VALUE"
+        echo "  $(t "✓ 沿用现网 " "✓ Keeping the live ")$_knob=$LIVE_READ_VALUE"
+      elif [ "$_knob_rc" = "2" ]; then
+        warn_live_read_failed "$_knob" "$_knob" "会回到默认值" "falls back to its default" "$_knob=<value> COST_MCP_SELF_HOST=true ./setup.sh"
+      fi
+    done
+    if [ -z "${COST_MCP_BYTES_CUTOFF:-}" ]; then
+      _wg_cut="$(aws athena get-work-group --region "$DEPLOY_REGION" --work-group notiops-cost-mcp \
+        --query 'WorkGroup.Configuration.BytesScannedCutoffPerQuery' --output text 2>/dev/null || true)"
+      if [ -n "$_wg_cut" ] && [ "$_wg_cut" != "None" ]; then
+        COST_MCP_BYTES_CUTOFF="$_wg_cut"
+        echo "  $(t "✓ 沿用现网扫描上限（字节/查询）: " "✓ Keeping the live scan cap (bytes per query): ")$COST_MCP_BYTES_CUTOFF"
+      fi
+    fi
+  fi
+
+  # ① 读 CUR/Athena 状态（阶段二完成后才有 athena_database / athena_table）
+  _cur_status_json="$(aws dynamodb get-item --region "$DEPLOY_REGION" \
+    --table-name notiops-config \
+    --key "{\"PK\":{\"S\":\"cur-athena-status#$CDK_ACCOUNT\"},\"SK\":{\"S\":\"STATUS\"}}" \
+    --output json 2>/dev/null || echo '{}')"
+  # 记录不存在时 CLI **什么都不打**（0 字节，退出码 0）—— 不兜成 {} 的话，下一行的 json.load 在
+  # `set -e` 下直接把整个脚本静默杀掉（新装必然走到这里）。
+  [ -n "$_cur_status_json" ] || _cur_status_json='{}'
+  _cur_state="$(echo "$_cur_status_json" | python3 -c 'import json,sys; d=json.load(sys.stdin).get("Item",{}); print(d.get("status",{}).get("S",""))' 2>/dev/null)"
+  _cur_db="$(echo "$_cur_status_json" | python3 -c 'import json,sys; d=json.load(sys.stdin).get("Item",{}); print(d.get("athena_database",{}).get("S",""))' 2>/dev/null)"
+  _cur_tbl="$(echo "$_cur_status_json" | python3 -c 'import json,sys; d=json.load(sys.stdin).get("Item",{}); print(d.get("athena_table",{}).get("S",""))' 2>/dev/null)"
+  _cur_bkt="$(echo "$_cur_status_json" | python3 -c 'import json,sys; d=json.load(sys.stdin).get("Item",{}); print(d.get("bucket",{}).get("S",""))' 2>/dev/null)"
+  _cur_ym="$(echo "$_cur_status_json" | python3 -c 'import json,sys; d=json.load(sys.stdin).get("Item",{}); print(str(d.get("year_month_partitioned",{}).get("BOOL",False)).lower())' 2>/dev/null)"
+
+  # 显式环境变量优先（显式 > 探测，与本文件其他地方同一口径）
+  CUR_TABLE="${CUR_TABLE:-}"
+  if [ -z "$CUR_TABLE" ] && [ -n "$_cur_db" ] && [ -n "$_cur_tbl" ]; then
+    CUR_TABLE="${_cur_db}.${_cur_tbl}"
+    echo "  $(t "✓ 沿用 NotiOps 已建的 CUR 表（来源: notiops-config 的 cur-athena-status 记录）: " "✓ Reusing the CUR table NotiOps already created (source: the cur-athena-status record in notiops-config): ")${CUR_TABLE}"
+  fi
+  CUR_BUCKET_NAME="${CUR_BUCKET_NAME:-$_cur_bkt}"
+
+  # 新装时这里**一定**还没有 cur-athena-status 记录：CUR 要到本脚本后面「CUR + Athena」那一步才建
+  # （2026-10-10 发版前审查：原来这里直接报错退出，`COST_MCP_SELF_HOST=true` 在新装上一次都跑不通）。
+  # 没记录、也没显式给表/桶时：账号里已有 NotiOps 上次留下的 notiops-cur-report（删除时刻意保留）
+  # 就用它的桶；否则用后面那一步新建时的桶名 —— 两处是同一个公式。
+  _selfhost_assumed_bucket=""
+  if [ -z "$CUR_TABLE" ] && [ -z "$CUR_BUCKET_NAME" ]; then
+    _kept_bkt="$(aws cur describe-report-definitions --region us-east-1 \
+      --query "ReportDefinitions[?ReportName=='notiops-cur-report'] | [0].S3Bucket" --output text 2>/dev/null || true)"
+    if [ -n "$_kept_bkt" ] && [ "$_kept_bkt" != "None" ]; then
+      CUR_BUCKET_NAME="$_kept_bkt"
+      echo "  $(t "✓ 找到 NotiOps 上次留下的 CUR 报告 notiops-cur-report（删除时刻意保留），用它的桶: " "✓ Found the notiops-cur-report CUR that NotiOps kept on delete; using its bucket: ")$CUR_BUCKET_NAME"
+    else
+      CUR_BUCKET_NAME="notiops-cur-${CDK_ACCOUNT}-${DEPLOY_REGION}"
+      _selfhost_assumed_bucket="$CUR_BUCKET_NAME"
+      echo "  $(t "ℹ 还没有 CUR —— 后面「CUR + Athena」那一步会直接新建它，自建 server 读的就是它: " "i No CUR yet -- the 'CUR + Athena' step below creates it; the self-hosted server reads that one: ")$CUR_BUCKET_NAME"
+      echo "    $(t "那一步会直接新建它、不再询问；要改用你已有的 CUR，带上 CUR_TABLE=<库>.<表> CUR_BUCKET_NAME=<桶> 重跑。" "That step creates it without asking; to use an existing CUR instead, re-run with CUR_TABLE=<db>.<table> CUR_BUCKET_NAME=<bucket>.")"
+    fi
+  fi
+
+  # ⚠️ 分区形态错了不会报错，只会**静默给错答案**（见 cost_mcp/athena.py::rate_window_filter）。
+  # lambda6 的发现逻辑对「每月一张表」的官方布局会返回 year_month_partitioned=false，
+  # 那种表上 flat 只能查到一个月 —— 所以这里**不猜**：非 true 时要求显式指定。
+  if [ -z "${CUR_PARTITION_STYLE:-}" ]; then
+    if [ "$_cur_ym" = "true" ]; then
+      CUR_PARTITION_STYLE="year-month"
+    else
+      CUR_PARTITION_STYLE="flat"
+      # 表名还没有（新装 / 还在等首次交付）时不提示：那种情况 server 在运行时从 cur-athena-status
+      # 记录里一起解析表名与分区形态（cost_mcp/athena.py 的 year_month_partitioned），这里传的
+      # flat 不会被用到；提示了反而让人以为要手动改。
+      if [ -n "$CUR_TABLE" ]; then
+        echo "  $(t "⚠ CUR 记录里 year_month_partitioned 不为 true，按 flat 处理。" "⚠ year_month_partitioned is not true in the CUR record; assuming flat.")"
+        echo "    $(t "如果你的 CUR 是「每月一张表」的官方布局，flat 只能查到一个月 —— 用 CUR_PARTITION_STYLE=... 显式指定。" "If your CUR uses the official one-table-per-month layout, flat only sees a single month -- set CUR_PARTITION_STYLE=... explicitly.")"
+      fi
+    fi
+  fi
+
+  # 表名还没有 —— 这有两种完全不同的情况，不能一律当失败：
+  #   ① NotiOps 已经替客户建了 CUR（记录存在、有桶名，只是还在等 AWS 首次交付）
+  #      → **照常部署**。表名由 server 在运行时从 notiops-config 里读
+  #      （cost_mcp/athena.py::_table_from_config_table，只认 READY），finalizer 翻 READY
+  #      的那一刻自动接上，客户**不需要回来重跑一次**。
+  #      以前这里是硬 exit + 「等 CUR 就绪后重跑本脚本」—— 而"过一天记得回来再跑一次"
+  #      实际上等于不会跑，于是成本主题一直停在 Cost Explorer。
+  #   ② 连记录都没有（客户自己没 CUR 也没让我们建）→ 这才是真的配不出来，照旧报错。
+  if [ -z "$CUR_TABLE" ] && [ -n "$CUR_BUCKET_NAME" ]; then
+    echo "  $(t "ℹ CUR 表还没建好（cur-athena-status: " "i The CUR table is not ready yet (cur-athena-status: ")${_cur_state:-none}$(t "）—— 照常部署。" ") -- deploying anyway.")"
+    echo "    $(t "AWS 首次交付最长 24 小时；就绪后 server 会自动读到表名并切过去，你不用再跑一次本脚本。在那之前成本问题走 Cost Explorer。" "AWS takes up to 24h for the first delivery. Once it is ready the server picks the table up on its own and switches over -- you do not need to re-run this script. Until then cost questions use Cost Explorer.")"
+  elif [ -z "$CUR_TABLE" ]; then
+    echo "  $(t "❌ 取不到 CUR 表名，也取不到 CUR 数据桶名（cur-athena-status 状态: " "❌ Could not determine the CUR table or its data bucket (cur-athena-status status: ")${_cur_state:-none}）" >&2
+    echo "     $(t "新建的 CUR 首次交付最长要 24 小时，阶段二（Glue/Athena 表）完成后本记录才会写入 athena_table。" "A new CUR takes up to 24h for first delivery; athena_table is only written after stage 2 (Glue/Athena table) completes.")" >&2
+    echo "     $(t "两个办法：① 让本脚本替你建 CUR（后面「CUR + Athena」那一步选新建）；② 已有表就显式指定 CUR_TABLE=<库>.<表> CUR_BUCKET_NAME=<桶>。" "Two options: (1) let this script create the CUR for you (choose 'create' in the 'CUR + Athena' step later on); (2) if you already have a table, pass CUR_TABLE=<db>.<table> CUR_BUCKET_NAME=<bucket>.")" >&2
+    exit 1
+  fi
+  if [ -z "$CUR_BUCKET_NAME" ] && [ -z "${CUR_ROLE_ARN:-}" ]; then
+    echo "  $(t "❌ 取不到 CUR 数据桶名。" "❌ Could not determine the CUR data bucket.")" >&2
+    echo "     $(t "读 CUR 必须知道桶名才能按资源授权（跨账号 CUR 暂不支持）：用 CUR_BUCKET_NAME=<桶> 指定。" "CUR access needs the bucket name to grant per-resource read (a CUR in another account is not supported yet): pass CUR_BUCKET_NAME=<bucket>.")" >&2
+    exit 1
+  fi
+
+  # ② 依赖层（与 IM 层同一套做法：pip --platform manylinux2014_x86_64，不用容器）
+  echo "  $(t "→ 构建成本 MCP 依赖层…" "→ Building the cost MCP dependency layer...")"
+  # ⚠️ 必须用绝对路径：走到这里时当前目录是 bff/web-chat（上面 npm ci 那一节 cd 进去的），
+  # 相对路径 `scripts/build_cost_layer.sh` 根本找不到（2026-10-10 发版前审查实测）。
+  if ! bash "$PROJECT_ROOT/scripts/build_cost_layer.sh"; then
+    echo "  $(t "❌ 依赖层构建失败 —— 不继续（空层会部署成功然后在 Lambda 上 import 崩）。" "❌ Layer build failed -- stopping (an empty layer deploys fine and then fails to import on Lambda).")" >&2
+    exit 1
+  fi
+
+  # ⚠️ `curTable` 可以是空串（CUR 还在等首次交付，见上面那段）。**不要**因为它空就不传
+  # 这个 flag —— `web-chat-stack.ts` 里 `|| undefined` 会把空串转成 undefined，而
+  # `curProvisionedByNotiOps: true` 让构件允许这种状态（表名运行时从 DDB 解析）。
+  COST_AGENT_FLAG="-c costMcpSelfHosted=true -c curTable=$CUR_TABLE -c curPartitionStyle=$CUR_PARTITION_STYLE"
+  [ -n "$CUR_BUCKET_NAME" ] && COST_AGENT_FLAG="$COST_AGENT_FLAG -c curBucketName=$CUR_BUCKET_NAME"
+  [ -n "${CUR_ROLE_ARN:-}" ] && COST_AGENT_FLAG="$COST_AGENT_FLAG -c curRoleArn=$CUR_ROLE_ARN"
+  [ -n "${CUR_VERSION:-}" ] && COST_AGENT_FLAG="$COST_AGENT_FLAG -c curVersion=$CUR_VERSION"
+  [ -n "${CUR_TAG_KEYS:-}" ] && COST_AGENT_FLAG="$COST_AGENT_FLAG -c curTagKeys=$CUR_TAG_KEYS"
+  [ -n "${COST_MCP_BYTES_CUTOFF:-}" ] && COST_AGENT_FLAG="$COST_AGENT_FLAG -c costMcpBytesScannedCutoff=$COST_MCP_BYTES_CUTOFF"
+  echo "  $(t "✓ 将自建成本 MCP server（表 " "✓ Will self-host the cost MCP server (table ")${CUR_TABLE:-$(t "待就绪后自动解析" "resolved automatically once ready")}$(t "，分区 " ", partition ")${CUR_PARTITION_STYLE}）"
+  echo "    $(t "扫描量上限默认 100 GiB/查询（workgroup 级强制）—— CUR 很大时用 COST_MCP_BYTES_CUTOFF 调。" "Scan cap defaults to 100 GiB per query (enforced at the workgroup) -- tune with COST_MCP_BYTES_CUTOFF for large CURs.")"
+
+  # ③ agent 侧的 IAM 授权：函数 ARN **部署前就能算**，因为自建态把函数名钉死成
+  #    `notiops-cost-mcp`（web-chat-core.ts 里 `props.staticTemplate` 为假时的分支）。
+  #    这一点很关键 —— agent 在本脚本更早处就部完了（$AGENT_RUNTIME_ARN 要先有，
+  #    WebChatStack 才能注入），那时 Function URL 还不存在。把 ARN 先给 deploy_agent.sh
+  #    做 `lambda:InvokeFunctionUrl` 授权（见 agentcore/cdk/lib/cdk-stack.ts 的
+  #    `InvokeCostAgentMcp`），URL 留到 `cdk deploy --all` 之后回填。
+  #    ⚠️ 顺序反了的症状是「授权到一个不存在的函数名」= 每次调用 403，而根因只在
+  #    CloudTrail 里 —— 所以这两半必须成对，别只做一半。
+  export COST_AGENT_FN_ARN="arn:aws:lambda:${DEPLOY_REGION}:${CDK_ACCOUNT}:function:notiops-cost-mcp"
 fi
 
 # ── Web Chat Agent（AgentCore Runtime）部署 ──
@@ -1984,12 +2204,25 @@ if [ -n "$AGENT_RUNTIME_ARN" ]; then
   # STACK_NAME 变量在下面 [4/4] 段才赋值,这里用字面栈名(cdk-outputs.json 的顶层 key)。
   DA_SPACE_ID=$(jq -r '.NotiOpsBackendStack.AgentSpaceId // empty' cdk-outputs.json 2>/dev/null || echo "")
   RPT_CDN=$(jq -r '.NotiOpsBackendStack.ReportsCdnDomain // empty' cdk-outputs.json 2>/dev/null || echo "")
-  if [ -n "$DA_SPACE_ID" ] || [ -n "$RPT_CDN" ]; then
-    echo "  $(t "回填部署后才可得的 runtime env(Agent Space / 报告 CDN)…" "Backfilling post-deploy runtime env (Agent Space / reports CDN)…")"
+  # 自建成本 MCP 的 Function URL 同理：它是 WebChatStack 的产物，而 agent 在本脚本更早处
+  # 就部完了（agent 必须先有，WebChatStack 才能注入它的 ARN）。所以 URL 只能事后回填。
+  # ⚠️ 函数 **ARN** 不用回填 —— 自建态函数名钉死为 `notiops-cost-mcp`，ARN 部署前就能算，
+  # 上面已经通过 COST_AGENT_FN_ARN 交给 deploy_agent.sh 做 IAM 授权了。
+  # 没有 URL 的那一段时间里 agent 侧是**干净地缺席**（core/cost_agent_mcp.py 见 URL 为空
+  # 就不挂任何工具），不是半配置状态。
+  COST_MCP_URL_OUT=$(jq -r '.WebChatStack.CostMcpUrl // empty' cdk-outputs.json 2>/dev/null || echo "")
+  if [ -n "$DA_SPACE_ID" ] || [ -n "$RPT_CDN" ] || [ -n "$COST_MCP_URL_OUT" ]; then
+    echo "  $(t "回填部署后才可得的 runtime env(Agent Space / 报告 CDN / 成本 MCP URL)…" "Backfilling post-deploy runtime env (Agent Space / reports CDN / cost MCP URL)…")"
+    _bf_args=("DEVOPS_AGENT_SPACE_ID=$DA_SPACE_ID" "REPORTS_CDN_DOMAIN=$RPT_CDN")
+    # MERGE-PATCH 语义：只传我们确实拿到了的 key。URL 为空时**不传**这一项 ——
+    # 传空串会把上一次装好的值显式清掉（见 backfill_runtime_env.sh 文件头「空值合法」）。
+    [ -n "$COST_MCP_URL_OUT" ] && _bf_args+=("COST_AGENT_MCP_URL=${COST_MCP_URL_OUT%/}")
     REGION="$DEPLOY_REGION" RT_ARN="$AGENT_RUNTIME_ARN" SET_IDLE="" UI_LANG="$UI_LANG" \
-      bash "$PROJECT_ROOT/scripts/backfill_runtime_env.sh" \
-        "DEVOPS_AGENT_SPACE_ID=$DA_SPACE_ID" "REPORTS_CDN_DOMAIN=$RPT_CDN" \
+      bash "$PROJECT_ROOT/scripts/backfill_runtime_env.sh" "${_bf_args[@]}" \
       || echo "  $(t "⚠ 部署后 env 回填未完成(不阻断);运行时兜底仍生效,可稍后重跑 setup.sh。" "⚠ Post-deploy env backfill did not complete (non-blocking); runtime fallbacks still apply, you can re-run setup.sh later.")"
+    if [ -n "$COST_MCP_URL_OUT" ]; then
+      echo "  $(t "✓ agent 已拿到自建成本 MCP 的地址 —— 聊天里的成本问题可以走客户自己的 CUR 了" "✓ The agent now has the self-hosted cost MCP endpoint -- cost questions in chat can use the customer's own CUR")"
+    fi
   fi
 fi
 
@@ -2108,8 +2341,24 @@ else
     --output json 2>/dev/null || echo "[]")
   EXISTING_CUR_COUNT=$(echo "$EXISTING_CUR_JSON" | jq 'length' 2>/dev/null || echo "0")
 
+  # 🔴 先认 NotiOps 自己留下的那份（2026-10-10 发版前审查补）：删除 NotiOps 时 CUR 报告与桶**刻意保留**，
+  #    状态记录却随 notiops-config 一起删了 ⇒ 重装正好走到这里。原来下面默认「0 新建」会再 put 一个
+  #    **已存在**的 notiops-cur-report → 重名失败 → CUR 静默不接（而文档承诺的是「重装直接复用」）。
+  #    账号里已有这份报告就直接复用它，不问。CLI 自己会翻页，不会漏掉第二页上的报告。
   CUR_CHOICE="0"
-  if [ "$EXISTING_CUR_COUNT" -gt 0 ] 2>/dev/null; then
+  _own_cur_json="$(aws cur describe-report-definitions --region us-east-1 \
+    --query "ReportDefinitions[?ReportName=='notiops-cur-report']" --output json 2>/dev/null || echo "[]")"
+  if [ "$(echo "$_own_cur_json" | jq 'length' 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null; then
+    echo "  $(t "✓ 找到 NotiOps 上次留下的 CUR 报告 notiops-cur-report（删除时刻意保留）—— 直接复用，不再新建。" "✓ Found the notiops-cur-report CUR that NotiOps kept on delete -- reusing it instead of creating a new one.")"
+    EXISTING_CUR_JSON="$_own_cur_json"
+    EXISTING_CUR_COUNT=1
+    CUR_CHOICE="1"
+  elif [ -n "${_selfhost_assumed_bucket:-}" ]; then
+    # 自建成本 MCP 刚才已按「NotiOps 新建的 CUR」授权（桶 $_selfhost_assumed_bucket）。这一步再让人选
+    # 复用另一份 CUR，server 就读不到它（授权的是另一个桶）—— 所以不问，直接新建。
+    echo "  $(t "ℹ 自建成本 MCP 已按 NotiOps 新建的 CUR 授权 —— 这一步直接新建。要改用你已有的 CUR，带上 CUR_TABLE=<库>.<表> CUR_BUCKET_NAME=<桶> 重跑。" "i The self-hosted cost MCP is set up for the CUR NotiOps creates -- creating it now. To use an existing CUR instead, re-run with CUR_TABLE=<db>.<table> CUR_BUCKET_NAME=<bucket>.")"
+    CUR_CHOICE="0"
+  elif [ "$EXISTING_CUR_COUNT" -gt 0 ] 2>/dev/null; then
     echo "  $(t "发现 " "Found ")$EXISTING_CUR_COUNT$(t " 个符合条件的既有 CUR 报告（Hourly + Resource IDs）：" " eligible existing CUR report(s) (Hourly + Resource IDs):")"
     echo "$EXISTING_CUR_JSON" | jq -r '.[] | "    - \(.ReportName)  (bucket: \(.S3Bucket))"'
     echo ""
@@ -2159,21 +2408,14 @@ else
           --create-bucket-configuration LocationConstraint="$DEPLOY_REGION" >/dev/null
       fi
       # CUR 交付要求桶策略允许 billingreports.amazonaws.com 写入（官方固定策略）。
-      cat > /tmp/notiops-cur-bucket-policy.json <<EOF
-{
-  "Version": "2008-10-17",
-  "Statement": [
-    {"Sid": "AllowCURServiceGetAcl", "Effect": "Allow",
-     "Principal": {"Service": "billingreports.amazonaws.com"},
-     "Action": ["s3:GetBucketAcl", "s3:GetBucketPolicy"], "Resource": "arn:aws:s3:::$CUR_BUCKET",
-     "Condition": {"StringEquals": {"aws:SourceAccount": "$CDK_ACCOUNT"}, "StringLike": {"aws:SourceArn": "arn:aws:cur:us-east-1:$CDK_ACCOUNT:definition/*"}}},
-    {"Sid": "AllowCURServicePutObject", "Effect": "Allow",
-     "Principal": {"Service": "billingreports.amazonaws.com"},
-     "Action": "s3:PutObject", "Resource": "arn:aws:s3:::$CUR_BUCKET/*",
-     "Condition": {"StringEquals": {"aws:SourceAccount": "$CDK_ACCOUNT"}, "StringLike": {"aws:SourceArn": "arn:aws:cur:us-east-1:$CDK_ACCOUNT:definition/*"}}}
-  ]
-}
-EOF
+      # ⚠️ 策略形状**不在这里拼** —— 唯一真源是 `cur_provisioner/spec.py`，方式 A 的
+      # custom resource 用的是同一份。以前这里是内联 JSON，于是"方式 A 和方式 B 建出来的
+      # CUR 不一样"变成一个只能靠人两边都记得改的隐患。
+      # ⚠️ 必须带 PYTHONPATH：走到这里时当前目录是 infra/（CDK 部署那一节 cd 进去的），venv 也已退出 ——
+      # 不带就是 ModuleNotFoundError，在 `set -e` 下新装直接死在这一步（2026-10-10 发版前审查实测；
+      # 这两行是 09-20 改成调 cur_provisioner.spec 时引入的，v1.0.29 没有这个问题）。
+      PYTHONPATH="$PROJECT_ROOT" python3 -m cur_provisioner.spec bucket-policy "$CUR_BUCKET" "$CDK_ACCOUNT" \
+        > /tmp/notiops-cur-bucket-policy.json
       aws s3api put-bucket-policy --bucket "$CUR_BUCKET" --policy file:///tmp/notiops-cur-bucket-policy.json >/dev/null
       rm -f /tmp/notiops-cur-bucket-policy.json
       # 该桶由 boto3 直建（不经 CDK），手动补上与 CDK 资源一致的项目标签。
@@ -2183,19 +2425,12 @@ EOF
 
     echo "  $(t "→ 创建 CUR ReportDefinition: " "→ Creating CUR ReportDefinition: ")$CUR_REPORT_NAME$(t "（Hourly + Resource IDs + Athena/Parquet）" " (Hourly + Resource IDs + Athena/Parquet)")"
     # cur:PutReportDefinition 仅支持 us-east-1 endpoint（CUR 是全局服务，API 端点固定）。
-    if aws cur put-report-definition --region us-east-1 --report-definition "{
-      \"ReportName\": \"$CUR_REPORT_NAME\",
-      \"TimeUnit\": \"HOURLY\",
-      \"Format\": \"Parquet\",
-      \"Compression\": \"Parquet\",
-      \"AdditionalSchemaElements\": [\"RESOURCES\"],
-      \"S3Bucket\": \"$CUR_BUCKET\",
-      \"S3Prefix\": \"$CUR_PREFIX\",
-      \"S3Region\": \"$DEPLOY_REGION\",
-      \"AdditionalArtifacts\": [\"ATHENA\"],
-      \"RefreshClosedReports\": true,
-      \"ReportVersioning\": \"OVERWRITE_REPORT\"
-    }" >/dev/null 2>/tmp/notiops-cur-create-err.log; then
+    # ⚠️ 报告定义**不在这里拼** —— 唯一真源是 `cur_provisioner/spec.py`（方式 A 的
+    # custom resource 用同一份）。每个字段为什么是这个值，那个文件里逐条写了。
+    if aws cur put-report-definition --region us-east-1 --report-definition \
+         "$(PYTHONPATH="$PROJECT_ROOT" python3 -m cur_provisioner.spec report-definition \
+              "$CUR_BUCKET" "$DEPLOY_REGION" "$CUR_REPORT_NAME" "$CUR_PREFIX")" \
+         >/dev/null 2>/tmp/notiops-cur-create-err.log; then
       echo "  $(t "✓ CUR 报告已创建，AWS 需要最长 24 小时首次交付" "✓ CUR report created; AWS takes up to 24h for first delivery")"
     else
       echo "  $(t "⚠ CUR 报告创建失败（可能已存在同名报告，或权限不足），详情：" "⚠ CUR report creation failed (a report with the same name may exist, or insufficient permissions); details:")"
@@ -2206,8 +2441,11 @@ EOF
 
     if [ -n "$CUR_REPORT_NAME" ] && [ -n "$CDK_ACCOUNT" ]; then
       NOW_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      # ⚠️ 必须带 `prefix`(2026-10-10 补)。常驻自愈规则只传 account_id,桶名/报告名/前缀
+      # 都从这条记录里读;原来这里不写 prefix ⇒ 自愈时拿空串去找 crawler-cfn.yml ⇒ 永远找不到。
+      # 方式 A 的 cur_provisioner 一直是写了的,两边现在一致。
       aws dynamodb put-item --table-name notiops-config --region "$DEPLOY_REGION" \
-        --item "{\"PK\":{\"S\":\"cur-athena-status#$CDK_ACCOUNT\"},\"SK\":{\"S\":\"STATUS\"},\"status\":{\"S\":\"PENDING\"},\"bucket\":{\"S\":\"$CUR_BUCKET\"},\"report_name\":{\"S\":\"$CUR_REPORT_NAME\"},\"region\":{\"S\":\"$DEPLOY_REGION\"},\"created_at\":{\"S\":\"$NOW_ISO\"}}" \
+        --item "{\"PK\":{\"S\":\"cur-athena-status#$CDK_ACCOUNT\"},\"SK\":{\"S\":\"STATUS\"},\"status\":{\"S\":\"PENDING\"},\"bucket\":{\"S\":\"$CUR_BUCKET\"},\"report_name\":{\"S\":\"$CUR_REPORT_NAME\"},\"prefix\":{\"S\":\"$CUR_PREFIX\"},\"region\":{\"S\":\"$DEPLOY_REGION\"},\"created_at\":{\"S\":\"$NOW_ISO\"}}" \
         >/dev/null 2>&1 || true
 
       # 调度 T+25h 一次性 EventBridge Scheduler → lambda6_cur_finalizer
@@ -2435,25 +2673,28 @@ echo ""
 if [ "$AGENT_STATUS" = "deployed" ]; then
   echo "  $(t "✅ 登录后即可直接用 —— 问答 / 故障调查 / 成本分析 / Support 案例," "✅ Ready to use right after login — Q&A / investigation / cost analysis / Support cases,")"
   echo "     $(t "默认操作【部署账号】本身,无需任何额外配置。左侧菜单能看到" "operating on the [deploy account] itself by default, no extra config. The left menu shows")"
-  echo "     $(t "通知 / 调查 / FinOps / 案例 / Skills,以及「更多」里的 安全 / 巡检&报告 / 定制。" "Notifications / Investigation / Cost / Cases / Skills, plus Security / Inspections & Reports / Customize under \"More\".")"
+  echo "     $(t "通知 / 调查 / 成本 / 案例,以及「更多」里的 巡检 / 技能 / 管理(各自按权限显示)。" "Notifications / Investigation / Cost / Cases, plus Inspection / Skills / Admin under \"More\" (each shown per permission).")"
 else
   # agent 没上线时这句"登录后即可直接用"是**假的** —— 别说。
   echo "  $(t "⚠ 上面的 Agent 问题修好之前,聊天只会回显,不要按下面的流程验收。" "⚠ Until the agent issue above is fixed, chat only echoes — do not sign off on the steps below yet.")"
 fi
 echo ""
-# ⚠️ 站内「资源巡检」看板与上面那个「巡检 & 报告」是**两个不同的东西**：
-#    后者外链到老控制台（CloudFront），前者是站内看板。这里必须单独说一句 ——
-#    不说的话客户跑完 setup.sh 压根不知道有这个页面（侧栏入口是 fail-CLOSED 的，
-#    只有拿到 nav:inspection 能力才显示），于是整个 feature 交付了等于没交付。
-echo "  $(t "  📋 资源巡检看板(站内,与上面的「巡检 & 报告」外链不是同一个页面):" "  📋 Resource Inspection dashboard (in-app; NOT the \"Inspections & Reports\" external link above):")"
-echo "     $(t "左侧「资源巡检」→ 总览 / 高负载 / 闲置与成本 / 结构性风险 / 巡检范围 / 阈值与定时。" "Left menu \"Resource Inspection\" → Overview / High Load / Idle & Cost / Structural Risk / Scope / Schedule.")"
+# ⚠️ 这里必须单独说一句巡检看板在哪 —— 不说的话客户跑完 setup.sh 压根不知道有这个页面（入口
+#    是 fail-CLOSED 的，只有拿到 nav:inspection 能力才显示；2026-10-10 起还收在默认收起的「更多」里），
+#    于是整个 feature 交付了等于没交付。老的「巡检 & 报告」外链控制台已于 2026-09-04 退役，别再提它。
+# ⚠️ 目录名照 frontend/chat-app/src/components/InspectionDashboardBrowser.tsx 的 ENTRIES 抄，
+#    并扣掉 api/inspection.ts::HIDDEN_KINDS 隐藏的那类（「配置检查」2026-08-31 起隐藏）。
+#    「待处置」「巡检总览」只是老深链 id 的别名（LEGACY_TAB → 高负载），目录里没有这两页 ——
+#    这里曾经列过它们，客户照着找不到，会以为部署没装全。
+echo "  $(t "  📋 资源巡检看板(站内):" "  📋 Resource Inspection dashboard (in-app):")"
+echo "     $(t "左侧「更多 → 巡检」→ 巡检发现(高负载 / 闲置与成本)· 配置(巡检范围 / 阈值与定时)。" "Left menu \"More → Inspection\" → Findings (High Load / Idle & Cost) · Settings (Scope / Thresholds & Schedule).")"
 echo "     $(t "两类巡检默认都在每天 UTC 02:00(= 北京时间 10:00)跑,首轮结果在那之后可见;时刻可在「阈值与定时」页改。" "Both run types default to 02:00 UTC daily; first results appear after that. Change it on the \"Thresholds & Schedule\" page.")"
 echo "     $(t "改排除清单 / 改执行时刻需要 action:inspection:scope / :schedule 权限(默认只有 admin 有)。" "Editing exclusions / schedule needs action:inspection:scope / :schedule (admin only by default).")"
 echo "     $(t "出问题要立刻停:见 inspection/adapters/switches.py 顶部的 kill switch 命令(改 DDB 一行,不用重新部署)。" "To stop it immediately: see the kill switch commands atop inspection/adapters/switches.py (one DDB write, no redeploy).")"
 echo ""
 echo "  $(t "2️⃣  (可选)填 Bedrock API Key —— 跨账号调模型才需要:" "2️⃣  (Optional) Set a Bedrock API Key — only needed for cross-account model calls:")"
-echo "      $(t "Web Chat 左侧「更多 → 巡检 & 报告」打开控制台 →「设置 → AI 配置」填入并保存。" "Open the console via Web Chat \"More → Inspections & Reports\" → \"Settings → AI Config\", enter and save.")"
-echo "      $(t "留空则 Agent 用本地 AWS 凭证调当前账号 Bedrock 模型,不影响使用。" "If left empty, the Agent uses local AWS credentials to call the current account\x27s Bedrock models — works fine.")"
+echo "      $(t "Web Chat 左侧「更多 → 管理」→「模型」→「凭证方式」选 Bedrock API Key,填入并保存。" "In Web Chat open \"More → Admin\" → \"Models\", set \"Credentials\" to Bedrock API key, paste it and save.")"
+echo "      $(t "留空则 Agent 用本地 AWS 凭证调当前账号 Bedrock 模型,不影响使用。" "If left empty, the Agent uses local AWS credentials to call the current account's Bedrock models — works fine.")"
 echo ""
 if [ -n "$ENABLED_PLATFORMS" ]; then
   echo "  ┌──────────────────────────────────────────────────────────────────┐"
@@ -2462,7 +2703,7 @@ if [ -n "$ENABLED_PLATFORMS" ]; then
   echo "  $(t "  本次已部署 IM: " "  IM deployed this run: ")$ENABLED_PLATFORMS"
   echo "  $(t "  刚创建的凭证 Secret 是空的,必须填入你的机器人凭证,bot 才能连接。" "  The credential Secrets just created are EMPTY — you must fill in your bot credentials before the bot can connect.")"
   echo ""
-  echo "  $(t "  【填法一】Web Chat 左侧「更多 → 巡检 & 报告」打开控制台 →「设置 → 通知设置」填入。" "  [Option A] Web Chat left menu \"More → Inspections & Reports\" → console → \"Settings → Notifications\".")"
+  echo "  $(t "  【填法一】Web Chat 左侧「更多 → 管理」→「集成 IM」填入并保存。" "  [Option A] Web Chat left menu \"More → Admin\" → \"IM Integration\", fill in and save.")"
   # M2 之后没有可重启的 ECS 服务了:Webhook Lambda 每次冷启动都重新读 Secret,
   # 热容器最多带一个短 TTL 的缓存 —— 所以「填完等下一次调用」就是全部操作,
   # 不存在也不需要「重启服务」这一步。旧文案让客户去找一个不存在的 ECS 服务。
@@ -2519,12 +2760,11 @@ else
   echo "      $(t "以后想加飞书 / Slack / 钉钉:重跑 ./setup.sh 选对应平台即可,无需重建其余资源。" "To add Feishu / Slack / DingTalk later: re-run ./setup.sh and pick the platform — no need to rebuild anything else.")"
 fi
 echo ""
-echo "  $(t "4️⃣  (可选)开启闲置资源检测 + 成本自动巡检 —— 不配也不影响 Web Chat:" "4️⃣  (Optional) Enable idle-resource detection + auto cost inspection — does not affect Web Chat:")"
-echo "      $(t "Web Chat 左侧「更多 → 巡检 & 报告」打开控制台 →「目标账户管理」→ 添加要巡检的账户:" "Open the console (Web Chat \"More → Inspections & Reports\") → \"Target Accounts\" → add accounts to inspect:")"
-echo "        $(t "- 账户 ID: 当前 AWS 账户 ID(或其他要扫描的账户)" "- Account ID: the current AWS account (or any other account to scan)")"
-echo "        - Role ARN: $IDLE_ROLE_ARN"
-echo "        $(t "- Region:   要扫描的区域" "- Region:   the region to scan")"
-echo "      $(t "配好后系统每天 00:00 UTC 自动扫描。" "Once configured, the system scans automatically daily at 00:00 UTC.")"
+# 老的「目标账户管理」外链控制台已于 2026-09-04 退役（那时这一步要手填账户 ID / Role ARN / Region）。
+# 现在多账号走「管理 → 账户」接入，资源级的排除在巡检看板的「巡检范围」里做。
+echo "  $(t "4️⃣  (可选)把成员账号也纳入巡检 / 多账号排查 —— 不配也不影响 Web Chat:" "4️⃣  (Optional) Bring member accounts into inspection / cross-account troubleshooting — does not affect Web Chat:")"
+echo "      $(t "Web Chat 左侧「更多 → 管理」→「账户」→「成员账号接入」(组织内可一键接入)。" "In Web Chat open \"More → Admin\" → \"Accounts\" → \"Member account onboarding\" (one-click inside an Organization).")"
+echo "      $(t "不想扫的资源在「更多 → 巡检」→「巡检范围」里加排除;巡检默认每天 UTC 02:00 跑。" "Exclude resources you don't want scanned under \"More → Inspection\" → \"Scope\"; inspection runs daily at 02:00 UTC by default.")"
 echo ""
 echo "  $(t "ℹ️  FinOps 的 DevOps Agent 调用成本卡需 CUR/Athena 数据源,首次部署后约 24h" "ℹ️  The FinOps DevOps Agent cost card needs the CUR/Athena data source; ~24h after first deploy")"
 echo "      $(t "才有数据(占位卡片会先显示),其余 FinOps/Budget 数据即时可用。" "before data appears (a placeholder card shows first). All other FinOps/Budget data is available immediately.")"
@@ -2564,16 +2804,45 @@ echo "  Custom Event Bus ARN:            $DEVOPS_EVENT_BUS_ARN"
 echo "  $(t "总线跨账号判据:                  " "Bus cross-account judgement:           ")$DEVOPS_BUS_JUDGEMENT"
 echo "  $(t "Onboarding 模板 S3 Bucket:       " "Onboarding template S3 Bucket:         ")$ONBOARDING_BUCKET"
 echo ""
+# 老的 Dashboard「DevOps Agent 账户配置」页已随老控制台于 2026-09-04 退役。现在这条路是 Web Chat
+# 「管理 → 账户」卡片底部的「手动接入账号」（AdminPanel.tsx::CrossPayerSection）：回填的是
+# member-devops-agent.yaml 的三个 Output（模板里没有叫 OnboardingPayload 的输出），按钮顺序是
+# 「测试连接」在前、「保存并激活」在后（测试用的是输入框里的值，先测后存是成立的）。
+#
+# 🔴 分流**先说 org 规则，手动接入是「其余情况」**（与 docs/DEPLOYMENT.md §0.1.1 同一结构），
+#    不能写成并列的「组织外 / 没有管理账号权限 / 非 --multi-account 时走手动接入」：委派管理员
+#    部署的运维**字面上就没有**管理账号权限，按并列那句他会把组织内账号也拿去手动接入。
+#    这段横幅不在 ORG_MODE 块里，--multi-account 也照打；而手动接入的链接写死
+#    `param_CreateCollectionRole=yes`（member_accounts.mjs::generateLaunchStackUrl），会在
+#    目标账号建 `notiops-idle-detection-role-<系统账号>` —— org 模式下同名角色已经由
+#    member-account-onboarding.yaml（StackSet：OU auto-deployment / 一键接入）建过。
+#    两边都建 ⇒ 后建的那个 EntityAlreadyExists、整栈回滚（member-devops-agent.yaml 里
+#    CreateCollectionRole 的说明写着同一个警告）。
+#    ⚠️ admin.xpayer.desc（i18n.ts）是手动接入那张卡片自己的说明，只列「组织外」和「同组织
+#    但没有管理账号权限」两种，不是这里的分流依据 —— 这里照 DEPLOYMENT §0.1.1。
+# 🔴 org 规则有一个例外：**组织管理账号本身**。委派管理员部署时它是列表里普通的一行，但
+#    「一键接入」不渲染（AdminPanel.tsx 的 `!a.isOrgManagementAccount`；BFF 的
+#    assertStackSetTargetable 也拒），只能走手动接入。不写这个例外，横幅就和上面 ORG 检测段
+#    那条 ⚠（同一次运行里先打）给出相反的指令，而且横幅这条对它根本做不到。
+#    从管理账号自己部署时没有这一行（它就是部署账号，列表里排除了），例外不适用也不冲突。
+# ⚠️「一键关联」不是要点的一步：一键接入成功后 BFF 自动接着做第二步关联
+#    （member_accounts.mjs::onboardStatus → associateDevopsAgent；列表加载的服务端对账也走这条），
+#    按钮只在第二步徽标既不是「调查能力已启用」也不是「关联中」时出现，是重试入口。
+#    写成「再点一键关联」会让人去找一个通常不在的按钮。
+# ⚠️「详见」指 DEPLOYMENT §0.1.1，别指 USER_GUIDE §6.4：后者只有两句话、没有步骤，
+#    还把读者转回部署文档。
 echo "  $(t "新增业务账户流程: " "To onboard a new business account:")"
 echo "    $(t "1. (不需要重新部署本栈 —— 判据与账号无关)" "1. (No redeploy of this stack needed - the judgement is account-agnostic)")"
-echo "    $(t "2. 在 Dashboard「DevOps Agent 账户配置」页生成 Launch Stack URL 发给客户" "2. In the Dashboard \"DevOps Agent Account Config\" page, generate a Launch Stack URL and send it to the customer")"
-echo "    $(t "3. 客户部署 CFN → 回填 OnboardingPayload → 测试连接 → 启用" "3. Customer deploys the CFN → fills back the OnboardingPayload → tests connection → enables")"
-echo "  $(t "详见 docs/USER_GUIDE.md 的 DevOps Agent 接入章节" "See the DevOps Agent onboarding section in docs/USER_GUIDE.md")"
+echo "    $(t "2. 按 --multi-account 部署时,组织内账号在 Web Chat 左侧「更多 → 管理」→「账户」→「成员账号接入」点「一键接入」,成功后「第二步: DevOps Agent」关联会自动接着做(那一行出现「一键关联」时点它重试)。别对这些账号走手动接入 —— 它建的采集角色和 StackSets 下发的同名,撞名会整栈回滚" "2. In a --multi-account deployment, organization accounts use \"Onboard\" in Web Chat under \"More → Admin\" → \"Accounts\" → \"Member account onboarding\"; the \"Step 2: DevOps Agent\" association then runs by itself (if an \"Associate\" button shows up on that row, click it to retry). Do not use Manual onboarding for these accounts: its collection role has the same name as the one StackSets creates, and the clash rolls the whole stack back")"
+echo "       $(t "例外是组织管理账号本身:委派管理员部署时它那一行没有「一键接入」,只能走第 3 步的手动接入(只走这一条,别再手工部 infra/member-account-onboarding.yaml)" "The exception is the organization's management account itself: in a delegated-admin deployment its row has no \"Onboard\", so it goes through Manual onboarding in step 3 (that alone; do not also deploy infra/member-account-onboarding.yaml by hand)")"
+echo "    $(t "3. 其余情况(账号不在本组织、没有管理账号权限,或未按 --multi-account 部署):Web Chat 左侧「更多 → 管理」→「账户」→「手动接入账号」,输入账号 ID →「生成链接」,把 Launch Stack 链接发给客户" "3. In every other case (the account is outside this organization, you lack management-account access, or the deployment is not --multi-account): in Web Chat open \"More → Admin\" → \"Accounts\" → \"Manual onboarding\", enter the account ID → \"Generate link\", then send the Launch Stack link to the customer")"
+echo "    $(t "4. 客户用该账号部署 CFN → 把 Stack Outputs 里的 AgentSpaceId / TriggerRoleArn / InspectionAgentSpaceId 回填到同一处 →「测试连接」→「保存并激活」" "4. The customer deploys the CFN in that account → you paste AgentSpaceId / TriggerRoleArn / InspectionAgentSpaceId from its Stack Outputs back into the same form → \"Test connection\" → \"Save & activate\"")"
+echo "  $(t "详见 docs/DEPLOYMENT.md §0.1.1" "See docs/DEPLOYMENT.en.md §0.1.1")"
 
 # ─── Organizations 模式: StackSets 批量下发成员账号资源 ───
 # 一个 StackSet 同时完成: 只读采集角色 + DevOps Agent 事件转发 + (可选)PHD 事件转发。
-# auto-deployment 开启后, 新账号加入目标 OU 会自动完成接入(仍需在控制台
-# 「账户接入」页登记 regions 才会被采集)。
+# auto-deployment 开启后, 新账号加入目标 OU 会自动完成接入(仍需在 Web Chat
+# 「管理 → 账户」页登记 regions 才会被采集;老控制台的「账户接入」页已于 2026-09-04 退役)。
 if [ "$ORG_MODE" = true ]; then
   echo ""
   echo "$(t "─── Organizations 模式: 成员账号资源下发(StackSets) ───" "─── Organizations Mode: Member-Account Rollout (StackSets) ───")"
@@ -2734,8 +3003,10 @@ if [ "$ORG_MODE" = true ]; then
   fi
 
   # 2b. DevOps Agent 关联 StackSet(Phase 2)：成员账号独立 Agent Space + Trigger Role。
-  #     不开 auto-deployment、不批量下发 —— space 有独立成本/配置，按账号在控制台
-  #     「账户接入」页第二步一键关联时才创建实例。
+  #     不开 auto-deployment、不批量下发 —— space 有独立成本/配置，按账号做第二步关联时才
+  #     创建实例：Web Chat「管理 → 账户」页一键接入成功后 BFF 自动接着做
+  #     （member_accounts.mjs::onboardStatus → associateDevopsAgent），那一行的「一键关联」
+  #     只是没成功时的重试入口。
   DA_TEMPLATE="$PROJECT_ROOT/infra/member-devops-agent.yaml"
   DA_STACKSET_NAME="notiops-member-devops-agent"
 
@@ -2786,15 +3057,15 @@ if [ "$ORG_MODE" = true ]; then
       --permission-model SERVICE_MANAGED \
       --auto-deployment Enabled=false \
       --region "$DEPLOY_REGION" >/dev/null
-    echo "  $(t "✓ DevOps Agent StackSet 已创建(按账号在控制台第二步一键关联)" "✓ DevOps Agent StackSet created (associate per-account in step 2 of the console)")"
+    echo "  $(t "✓ DevOps Agent StackSet 已创建(之后在 Web Chat「更多 → 管理」→「账户」对账号点「一键接入」,成功后「第二步: DevOps Agent」关联自动接着做;那一行出现「一键关联」时点它重试)" "✓ DevOps Agent StackSet created (later, once \"Onboard\" succeeds for an account under Web Chat \"More → Admin\" → \"Accounts\", the \"Step 2: DevOps Agent\" association follows by itself; if an \"Associate\" button shows up on that row, click it to retry)")"
   fi
 
-  # 3. 选择部署目标 OU(留空 = 跳过批量下发, 之后在控制台「账户接入」页逐账号接入)
+  # 3. 选择部署目标 OU(留空 = 跳过批量下发, 之后在 Web Chat「管理 → 账户」页逐账号接入)
   ORG_TARGET_OUS="${ORG_TARGET_OUS:-}"
   if [ -z "$ORG_TARGET_OUS" ]; then
     echo ""
     echo "  $(t "输入要批量接入的 OU ID(如 ou-abcd-12345678; 根 r-abcd = 全组织; 逗号分隔)。" "Enter OU IDs to onboard in bulk (e.g. ou-abcd-12345678; root r-abcd = entire org; comma-separated).")"
-    echo "  $(t "留空跳过 —— 之后可在控制台「账户接入」页逐账号一键接入。" "Leave empty to skip — you can onboard accounts one-by-one later on the console \"Account Onboarding\" page.")"
+    echo "  $(t "留空跳过 —— 之后可在 Web Chat「更多 → 管理」→「账户」→「成员账号接入」逐账号一键接入。" "Leave empty to skip — you can onboard accounts one-by-one later in Web Chat under \"More → Admin\" → \"Accounts\" → \"Member account onboarding\".")"
     read -p "  Target OU IDs: " ORG_TARGET_OUS
   fi
   if [ -n "$ORG_TARGET_OUS" ]; then
@@ -2809,14 +3080,14 @@ if [ "$ORG_MODE" = true ]; then
       --region "$DEPLOY_REGION" >/dev/null \
       && echo "  $(t "✓ 已提交(异步执行, 可在 CloudFormation StackSets 控制台查看进度)" "✓ Submitted (runs asynchronously; track progress in the CloudFormation StackSets console)")" \
       || echo "  $(t "⚠ 提交失败(常见原因: 目标 OU 已有实例或有进行中的 operation)" "⚠ Submission failed (common causes: target OU already has instances, or an operation is in progress)")"
-    echo "  $(t "⚠ 注意: StackSet 只创建账号内资源;各账号仍需在控制台「账户接入」页" "⚠ Note: StackSet only creates in-account resources; each account still needs to be registered on the console \"Account Onboarding\" page")"
+    echo "  $(t "⚠ 注意: StackSet 只创建账号内资源;各账号仍需在 Web Chat「更多 → 管理」→「账户」→「成员账号接入」" "⚠ Note: StackSet only creates in-account resources; each account still needs to be registered in Web Chat under \"More → Admin\" → \"Accounts\" → \"Member account onboarding\"")"
     echo "     $(t "登记(选择采集 region)后才会进入巡检/成本采集范围。" "(choosing the collection region) before it enters the inspection/cost-collection scope.")"
   else
-    echo "  $(t "跳过批量下发。控制台「账户接入」页可逐账号一键接入。" "Skipping bulk rollout. Onboard accounts one-by-one on the console \"Account Onboarding\" page.")"
+    echo "  $(t "跳过批量下发。之后可在 Web Chat「更多 → 管理」→「账户」→「成员账号接入」逐账号一键接入。" "Skipping bulk rollout. Onboard accounts one-by-one later in Web Chat under \"More → Admin\" → \"Accounts\" → \"Member account onboarding\".")"
   fi
 
   # 4. (可选) Security Hub 组织聚合 —— 把部署账号设为 Security Hub 委派管理员并创建
-  #    Finding Aggregator(ALL_REGIONS)。之后 Security tab 在部署账号一次 GetFindings
+  #    Finding Aggregator(ALL_REGIONS)。之后安全态势看板在部署账号一次 GetFindings
   #    即可看到全组织发现(优于逐账号 AssumeRole 扇出);逐账号 ?account= 视角仍可用于下钻。
   SH_ORG_AGG="${SH_ORG_AGG:-}"
   if [ -z "$SH_ORG_AGG" ]; then
@@ -2840,7 +3111,7 @@ if [ "$ORG_MODE" = true ]; then
         echo "  $(t "ℹ Finding Aggregator 已存在或创建失败, 跳过" "ℹ Finding Aggregator already exists or creation failed, skipping")"
       fi
       ;;
-    *) echo "  $(t "跳过 Security Hub 组织聚合(Security tab 走逐账号 ?account= 视角)" "Skipping Security Hub org aggregation (the Security tab uses per-account ?account= views)")" ;;
+    *) echo "  $(t "跳过 Security Hub 组织聚合(安全态势看板走逐账号 ?account= 视角)" "Skipping Security Hub org aggregation (the Security posture dashboard uses per-account ?account= views)")" ;;
   esac
 fi
 

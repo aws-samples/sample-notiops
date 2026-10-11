@@ -9,7 +9,7 @@
 > **Time**: **~10 minutes** (the stack itself measured ~4.5 minutes).
 >
 > **See also**:
-> - [DEPLOYMENT.en.md](DEPLOYMENT.en.md) — the full deployment guide (`setup.sh`: IM bots, scheduled inspection and its dashboard's write path, CUR/Athena)
+> - [DEPLOYMENT.en.md](DEPLOYMENT.en.md) — the full deployment guide (`setup.sh`: IM bots, scheduled inspection and its dashboard, CUR/Athena)
 > - [USER_GUIDE.en.md](USER_GUIDE.en.md) — how to use it once deployed
 
 ---
@@ -22,28 +22,33 @@ The repository ships **two** ways to deploy, with different scope. This document
 |---|---|---|
 | What you need | git, Node, Python, uv, AWS CDK, plus deployment credentials (**no Docker/finch** — since 2026-09-03 / M2 the IM side ships as a Lambda Layer and builds no images) | **just a browser logged into the AWS console** |
 | How you start | clone the repo → `./setup.sh` | download one template from the Release → upload it in the CloudFormation console |
-| What gets deployed | Web Chat + IM bots (Feishu/Slack/DingTalk, several at once if you want) + daily inspection (including the inspection dashboard's write path) + CUR/Athena FinOps source | **Web Chat** (chat UI + BFF + agent + a DevOps Agent space; multi-account optional) **plus one optional IM bot** (Feishu/Lark, Slack or DingTalk — see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)) |
+| What gets deployed | Web Chat + IM bots (Feishu/Slack/DingTalk, several at once if you want) + daily inspection (including its dashboard in the web UI) + CUR/Athena FinOps source | **Web Chat** (chat UI + BFF + agent + a DevOps Agent space; multi-account optional) **plus one optional IM bot** (Feishu/Lark, Slack or DingTalk — see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)) **plus an optional CUR/Athena FinOps source** (built for you, or an existing one connected — see [§2.12](#212-optional-connect-your-own-cur-data-source)) |
 | Good for | long-term use, IM notifications, scheduled inspection | trying it out / demos / just the read-only ops assistant in a browser (with the option of @-mentioning it in a group chat) |
 
-**You can do both, in order**: deploy one-click to try it (tick the IM bot right there on the parameters page if you want one — see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)), then run `setup.sh` later when you want scheduled inspection, proactive push, and the inspection dashboard to actually have data. (Both paths create the same admin username, `admin`, so they don't collide.)
+**You can do both, in order**: deploy one-click to try it (tick the IM bot right there on the parameters page if you want one — see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)), then run `setup.sh` later when you want scheduled inspection (with its dashboard) and proactive push. ⚠️ In the same account and Region, though, the two paths use the same table and bucket names and cannot exist side by side: first delete this stack with `DeleteEverything` (its data does not carry over; see [§6](#6-deleting-the-stack)), or install `setup.sh` in another Region.
 
 ### 0.1 What one-click does **not** include
 
 Better said up front than discovered later. These require `setup.sh`:
 
-- **Proactive push into IM**: daily inspection reports and alerts posted into a Feishu/Slack/DingTalk group. The IM bot itself **can** be installed (see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk) — you @-mention it, it answers), but that is **request/response only**; proactive push needs the report pipeline that only `setup.sh` deploys. (The same 10 signal sources **do** land in the in-browser Notifications inbox — see [§2.9](#29-notifications-inbox); only the IM leg is missing.)
-- **More than one IM platform at a time**: one one-click stack installs exactly **one** platform (Feishu/Lark, Slack or DingTalk — pick one, see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)); running several side by side needs `setup.sh` (`-c enabledPlatforms=feishu,slack,dingtalk`).
+- **Proactive push into IM**: the daily ops notification and AWS Health events posted into a Feishu group — both come from the report pipeline that only `setup.sh` deploys, and they go to Feishu only (real-time alert pushes do not reach IM on either path in this release, see [DEPLOYMENT.en.md §7](DEPLOYMENT.en.md#7-enable--tune-push-mode)). The IM bot itself **can** be installed (see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk) — you @-mention it, it answers), but that is **request/response only**. (The 10 signal sources **do** land in the in-browser Notifications inbox — see [§2.9](#29-notifications-inbox); only the IM leg is missing.)
+- **More than one IM platform at a time**: one one-click stack installs exactly **one** platform (Feishu/Lark, Slack or DingTalk — pick one, see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)); running several side by side needs `setup.sh` (pick several at its IM-platform prompt, e.g. `1,2,3`, which becomes `-c enabledPlatforms=feishu,slack,dingtalk`).
 - **Scheduled daily inspection** (idle-resource detection, cost-anomaly scanning) and its four Lambdas (`notiops-inspection-scheduler` / `-executor` / `-reconciler` / `-push`) plus the cost-anomaly scanner `notiops-cost-analyzer`.
-- **The inspection write path** — and therefore the data behind the *inspection dashboard /
-  thresholds / scan scope / target-account* pages. Those pages are part of chat-app and ship on
-  **both** paths, but one-click never creates the `notiops-inspection` table, so opening them
-  fails to load (the BFF returns `ddb_error`). Making them show anything needs `setup.sh`.
+- **The inspection dashboard** (sidebar **More → Inspection**: Findings → High Load / Idle & Cost;
+  Settings → Scope / Thresholds & Schedule). The page code is part of chat-app and shared by both
+  paths, but one-click creates neither the `notiops-inspection` table nor the four inspection Lambdas
+  above, so on one-click the entry **does not appear at all** (rather than failing once you open it):
+  `nav:inspection` declares `requiresEnv: INSPECTION_TABLE`, one-click leaves that variable empty, and
+  the Inspection tab and all its sub-pages drop out of `/capabilities`; calling the `/inspection/*`
+  API directly returns a plain `inspection_not_deployed`. So on one-click, **More** holds only the **Skills** /
+  **Admin** items you are allowed to see, and an account allowed neither (by default, every preset
+  role except admin and `role:developer`) sees no **More** at all — that is expected, not a broken
+  deployment. The inspection dashboard needs `setup.sh`.
   (**The Skills management UI is not in this list** — one-click still creates the Skills bucket,
   so that page works.)
-- **CUR + Athena cost detail**: FinOps questions still work at Cost Explorer granularity, but there is no bill-line-level drill-down.
-- **Cross-account scheduled inspection and event forwarding**: one-click *can* do **cross-account read-only inspection / investigation / case creation** (`DeployMode=MultiAccount`, see [§2.6](#26-optional-multi-account-across-an-organization)), but the member-account **CloudWatch OAM Sink** and **cross-account event forwarding** (Health / DevOps Agent investigation events flowing back) are not part of this path — those need `setup.sh`.
+- **Cross-account scheduled inspection and event forwarding**: one-click *can* do **cross-account read-only troubleshooting / investigation / case creation** (`DeployMode=MultiAccount`, see [§2.6](#26-optional-multi-account-across-an-organization)), but the member-account **CloudWatch OAM Sink** and **cross-account event forwarding** (Health / DevOps Agent investigation events flowing back) are not part of this path — those need `setup.sh`.
 
-(**DevOps Agent deep investigation**, **web search** and the **Notifications inbox** are *not* in this list — the stack creates all three for you, see [§2.7](#27-deep-investigation-aws-devops-agent), [§2.8](#28-web-search-agentcore-web-search) and [§2.9](#29-notifications-inbox). The **IM bot** is not in this list either — it's an option on the parameters page, see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk).)
+(**DevOps Agent deep investigation**, **web search** and the **Notifications inbox** are *not* in this list — the stack creates all three for you, see [§2.7](#27-deep-investigation-aws-devops-agent), [§2.8](#28-web-search-agentcore-web-search) and [§2.9](#29-notifications-inbox). The **IM bot** is not in this list either — it's an option on the parameters page, see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk). Nor is **CUR + Athena cost detail** (since v1.0.30): set `ProvisionCur` to `yes` on the parameters page and the stack creates the CUR and the official Athena integration for you (AWS takes up to 24 hours to deliver the first report; until then cost questions use Cost Explorer, and they switch over on their own once it is ready); if you already have a CUR, connect its Glue table instead (`CurTable`; the table must be in this stack's account and Region). Both are covered in [§2.12](#212-optional-connect-your-own-cur-data-source).)
 
 ---
 
@@ -70,34 +75,35 @@ The console stores the template you upload in a bucket named `cf-templates-<rand
 > **Missing `s3:PutObject` looks like this** (a real customer report):
 > `User: arn:aws:iam::111122223333:user/alice is not authorized to perform: s3:PutObject on resource: "arn:aws:s3:::cf-templates-xxxxxxxx-us-east-1/2026-01-01T000000.000Zabc-notiops-webchat.template.json"`
 >
-> **You can avoid these five entirely**: upload the template to a bucket you already have, then on Create stack choose **Amazon S3 URL** instead of **Upload a template file** and paste the object URL. That path needs no new S3 permissions. The template is a little over 370 KB, well under the 1 MB ceiling for the S3-URL route.
+> **You can avoid these five entirely**: upload the template to a bucket you already have, then on Create stack choose **Amazon S3 URL** instead of **Upload a template file** and paste the object URL. That path needs no new S3 permissions. The template is about 430 KB (it grows with the resource count each release), well under the 1 MB ceiling for the S3-URL route.
 
 #### (2) Creating the stack — the resources are created **as you**
 
-This template ships **no** CloudFormation service role (stack service role). CloudFormation does not switch identity: every one of the stack's 133 resources is created using **your current IAM identity**, so your permissions are the ceiling on what this stack can build. The service scope:
+This template ships **no** CloudFormation service role (stack service role). CloudFormation does not switch identity: the template declares 154 resources (counting the ones that only get created for certain parameter values; the default parameters create 74 — see [§3](#3-what-the-stack-creates)), and every one that does get created is created using **your current IAM identity**, so your permissions are the ceiling on what this stack can build. The service scope (the counts are what the template declares):
 
 | Service prefix | What the stack creates | Count |
 |---|---|---|
 | `cloudformation` | The stack itself (create / describe / rollback / delete) | 1 stack |
-| `iam` | Roles + inline policies + one managed policy; **also `iam:PassRole`** — handing an execution role to Lambda / EventBridge / AgentCore is also done as you | 12 Role + 12 Policy + 1 ManagedPolicy |
-| `lambda` | Functions, a layer, invoke permissions, a Function URL | 12 Function + 1 Layer + 10 Permission + 1 Url |
-| `logs` | Log groups; **plus `logs:PutResourcePolicy` (resource `*`)** because RUM writes to CloudWatch Logs | 12 LogGroup |
-| `events` | Scheduled rules (inspection, sentinel, reports) | 16 Rule |
-| `dynamodb` | Config, sessions, Skills, notifications | 4 Table |
-| `s3` | Site bucket, artifact bucket, Skills bucket + bucket policies (same service as (1), different objects) | 3 Bucket + 3 BucketPolicy |
+| `iam` | Roles + inline policies + one managed policy; **also `iam:PassRole`** — handing an execution role to Lambda / EventBridge / AgentCore is also done as you | 15 Role + 16 Policy + 1 ManagedPolicy |
+| `lambda` | Functions, layers, invoke permissions, Function URLs | 15 Function + 2 Layer + 11 Permission + 2 Url |
+| `logs` | Log groups; **plus `logs:PutResourcePolicy` (resource `*`)** because RUM writes to CloudWatch Logs | 15 LogGroup |
+| `events` | Event rules: the 10 Notifications-inbox sources + the daily CUR dashboard warm-up; with IM also the investigation callback, progress polling and ingress keep-alive (one keep-alive rule per platform, only the chosen one is created); with `ProvisionCur=yes` also the CUR stage-2 schedule | 17 Rule |
+| `dynamodb` | Config table, the web chat table (sessions, messages and the Notifications inbox); with IM also the group-conversation and usage tables | 4 Table |
+| `s3` | Site bucket, artifact (staging) bucket, data bucket (Skills, reports) + bucket policies; with `CurTable` set or `ProvisionCur=yes` also the cost MCP's Athena query-results bucket (same service as (1), different objects) | 4 Bucket + 4 BucketPolicy |
 | `cloudfront` | Site distributions + a function + OAI / OAC | 2 Distribution + 1 Function + 2 access identities |
 | `cognito-idp` | User pool, app client, 8 permission groups | 1 UserPool + 1 Client + 8 Group |
 | `cognito-identity` | Identity pools + role attachments (how the frontend gets temporary credentials to sign SigV4) | 2 IdentityPool + 2 RoleAttachment |
-| `apigateway` | The BFF's HTTP APIs (HTTP API also uses the `apigateway:` prefix) | 3 Api + 3 Integration + 3 Route + 3 Stage |
-| `sqs` | Notification delivery queue + queue policy | 1 Queue + 1 QueuePolicy |
+| `apigateway` | The IM bot's public entry point: one HTTP API per platform, only the chosen one is created (HTTP API also uses the `apigateway:` prefix) | 3 Api + 3 Integration + 3 Route + 3 Stage |
+| `sqs` | Dead-letter queue + queue policy for the deep-investigation callback (which delivers group-chat investigation reports back to the group); created only with IM | 1 Queue + 1 QueuePolicy |
 | `rum` | Frontend real-user monitoring | 1 AppMonitor |
 | `bedrock-agentcore` | Agent runtime + session memory | 1 Runtime + 1 Memory |
 | `aidevops` | The DevOps Agent space and its association (**the IAM prefix is `aidevops:`**, not `devops-agent:`) | 1 AgentSpace + 1 Association |
+| `athena` | The cost MCP's dedicated workgroup (the per-query scan cap lives on it); created only when `CurTable` is set or `ProvisionCur=yes` | 1 WorkGroup |
 
-Services your identity does **not** need: `organizations` / `securityhub` / `cur` / `oam`. Those are only used by the optional multi-account, security-inspection and billing-detail features, and they are called by the stack's own `StagerOrgSetup` Lambda under **its own execution role** — not as you. (This differs from `setup.sh`; see [DEPLOYMENT.en.md §2.4](DEPLOYMENT.en.md#24-iam-deployment-permissions).)
+Services your identity does **not** need: `organizations` / `securityhub` / `cur` / `oam` / `glue`. Those are only used by the multi-account, security-posture-dashboard and billing-detail features, and they are all called by functions inside the stack under **their own execution roles** (`StagerOrgSetup` and the StackSets it rolls out to member accounts for multi-account, the CUR stage-1 / stage-2 functions for creating the CUR, and otherwise the BFF, the agent and the cost MCP) — not as you. (This differs from `setup.sh`; see [DEPLOYMENT.en.md §2.4](DEPLOYMENT.en.md#24-iam-deployment-permissions).)
 
 > ⚠️ **Be clear about one thing: on this path the installer is effectively an account administrator.**
-> `iam:CreateRole` + `iam:PutRolePolicy` + `iam:AttachRolePolicy` in the table above can only be scoped to `*` (role names carry CloudFormation-generated suffixes), and that combination is equivalent to privilege escalation — with it you can mint yourself an admin role. So "least privilege" here can only mean **narrowing the service scope** (the 15 services above instead of `*`); it can **never** mean "let a non-administrator install this".
+> `iam:CreateRole` + `iam:PutRolePolicy` + `iam:AttachRolePolicy` in the table above can only be scoped to `*` (role names carry CloudFormation-generated suffixes), and that combination is equivalent to privilege escalation — with it you can mint yourself an admin role. So "least privilege" here can only mean **narrowing the service scope** (the 16 services above instead of `*`); it can **never** mean "let a non-administrator install this".
 > If your policy forbids holding that permission long-term: install with a temporary identity and then retire it — **using NotiOps day to day requires no AWS permissions at all**; users only sign in to Cognito.
 
 > You must tick **"I acknowledge that AWS CloudFormation might create IAM resources"** —
@@ -107,14 +113,14 @@ Services your identity does **not** need: `organizations` / `securityhub` / `cur
 
 The agent runs on **Amazon Bedrock**. **Before creating the stack**, go to the Bedrock console → Model access and confirm the model you want shows **Access granted** in that region.
 
-- **The default model is xAI Grok 4.6** (`global.xai.grok-4.6`) — grant access to that one or the deployment is unusable.
-- Want a different model (Claude Sonnet 5 / Opus 5 / Haiku 4.5, Amazon Nova Pro, DeepSeek, GLM 5, the GPT-5.6 family)? Grant those too; users can switch per session from the top-right of the chat page.
+- **The default model is Moonshot Kimi K3** (`global.moonshotai.kimi-k3`) — grant access to that one or the deployment is unusable.
+- Want a different model (Grok 4.7, GLM 5.3, Claude Sonnet 5.5 / Opus 5.5, DeepSeek, GPT-5.6 / GPT-6 Sol)? Grant those too; users can switch per conversation from the model picker at the right end of the composer toolbar. Note: Claude Sonnet 5.5 / Opus 5.5 and GPT-6 Sol need an AWS Marketplace agreement accepted **once per account** -- in some accounts Sonnet 5 works while 5.5 is not enabled yet. The simplest fix is to accept the 5.5 agreement once in that account. Otherwise, re-enable `claude-sonnet-5` / `claude-opus-5` on the **More → Admin → Models** page -- **that fixes Web only**. In IM the aliases `claude` / `opus` belong to the 5.5 entries, so with IM installed also disable `claude-sonnet-5-5` / `claude-opus-5-5` and tell people in your groups to switch with `@bot model claude-sonnet-5` / `@bot model claude-opus-5` (conversations already set to `claude` / `opus` then fall back to the default model). If GPT-6 Sol (the IM alias `gpt_sol` belongs to it) is not enabled in that account, either accept its agreement once there, or disable `gpt-6-sol` on the same page (conversations already set to `gpt_sol` then fall back to the default model).
 - **us-east-1** or **us-west-2** recommended (best Bedrock AgentCore and model coverage).
 - Without model access the stack still **succeeds**, the site loads and login works — but every question fails with `AccessDeniedException`. This is the most common "it deployed but doesn't work".
 
 ### 1.3 The account must be able to reach GitHub (or bring your own mirror)
 
-During deployment, a Lambda inside the stack downloads the artifacts (frontend, BFF, notification producer, agent code — four; two more if you opted into an IM bot) from the **GitHub Release** and stages them into your own S3 bucket. Lambda is not in a VPC here and uses AWS-managed egress, so **most accounts satisfy this out of the box**.
+During deployment, a Lambda inside the stack downloads the artifacts (frontend, BFF, notification producer, agent code — these four always; the IM bot's two, the cost MCP's two and the CUR-creation one only if you opted into that feature, see [§2.1](#21-download-the-template)) from the **GitHub Release** and stages them into your own S3 bucket. Lambda is not in a VPC here and uses AWS-managed egress, so **most accounts satisfy this out of the box**.
 
 If your enterprise egress allowlist does **not** include github.com, you don't have to abandon this path — see [§7 No internet egress: use a private S3 mirror](#7-no-internet-egress-use-a-private-s3-mirror).
 
@@ -130,9 +136,9 @@ From the [Releases](https://github.com/aws-samples/sample-notiops/releases) page
 notiops-webchat.template.json
 ```
 
-The same release also has six artifacts (`bff.zip` / `chat-dist.zip` / `web-notif.zip` / `im-code.zip` / `im-layer.zip` / `agent-code.zip`) — **you don't need to download those**; the template makes your account fetch them. Their SHA256 digests are baked into the template and verified on arrival; a mismatch fails the stack.
+The same release also has nine artifacts (`bff.zip` / `chat-dist.zip` / `web-notif.zip` / `agent-code.zip` / `im-code.zip` / `im-layer.zip` / `cost-mcp-code.zip` / `cost-mcp-layer.zip` / `cur-provisioner.zip`) — **you don't need to download those**; the template makes your account fetch them. Their SHA256 digests are baked into the template and verified on arrival; a mismatch fails the stack.
 
-> The two `im-*.zip` files are downloaded only if you pick an install option that includes IM ([§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)). The default (web only) skips them, so you don't pay transfer or storage for those ~28 MB.
+> The last five are **downloaded on demand**: the two `im-*.zip` files only if you pick an install option that includes IM ([§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)); the two `cost-mcp-*.zip` files only if the stack deploys its own cost MCP for you (`CurTable` set, or `ProvisionCur=yes` — pointing `CostAgentMcpUrl` at an MCP you already run, [§2.12](#212-optional-connect-your-own-cur-data-source), does not count); `cur-provisioner.zip` only if `ProvisionCur=yes`. With every default left alone (web only, `CurTable` empty, `ProvisionCur=no`) all five are skipped, so you don't pay transfer or storage for them.
 
 > **Why isn't there a one-click "Launch Stack" link?** CloudFormation's `TemplateURL` only accepts
 > objects in S3, not GitHub URLs. So this costs you two extra clicks (download + upload) and buys
@@ -163,18 +169,19 @@ Everything else has a safe default. For a first deployment, **leave them all alo
 | **What to install** | `web` | A four-way dropdown: `web` (just the in-browser chat UI) / `web+feishu` (plus a Feishu/Lark bot) / `web+slack` (plus a Slack bot) / `web+dingtalk` (plus a DingTalk bot). **All four install web** — IM is an add-on, not a replacement. Picking an IM option leaves a few steps to do on the IM platform side, see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk). **You can change it after deploying** (update the stack with a different value — see §2.11). |
 | **Give the agent account-wide read-only access?** | `Yes` | `Yes` attaches the AWS-managed `ReadOnlyAccess` policy so the agent can answer questions about any resource in the account. `No` restricts it to the explicit read-only grants (cost, logs, metrics, RDS/EC2 describe); some questions then fail with a message naming the missing action. **Neither option grants any write permission.** |
 | **CORS allowed origins** | `*` | The endpoint is already `AWS_IAM` (SigV4) authenticated, so `*` is not a privilege hole. For defense in depth, update the stack after the first deploy and set this to the `ChatUrl` output. |
-| **IM chat/channel allow list (optional)** | empty | Only meaningful once you installed IM ([§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)); with web only you can ignore it entirely. A comma-separated list of Feishu chat ids (`oc_...`), Slack channel ids (`C...`) or DingTalk `conversationId`s (@-mention the bot once, then take it out of the worker log), **no spaces**; empty means no restriction — the bot answers in every group it is invited to. All three platforms share this one parameter. It is one of the defense-in-depth boundaries on the IM entry point (boundary (c) in [§8](#8-security-notes-worth-knowing)): a message from a chat outside the list is dropped **before any model call** — Feishu/Slack are stopped in the ingress function (which holds even if signature verification were bypassed), while DingTalk's `conversationId` only becomes readable **after** signature verification, so its check lands one layer later, in the worker. **The normal rhythm is: deploy with it empty → create the group and take its chat id → then update the stack with that id**, which is why it sits in the `Security` group and not among the required parameters. Equivalent to `-c imAllowedChatIds=…` on the `setup.sh` path. |
+| **IM chat/channel allow list (optional)** | empty | Only meaningful once you installed IM ([§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)); with web only you can ignore it entirely. A comma-separated list of Feishu chat ids (`oc_...`), Slack channel ids (`C...`) or DingTalk `conversationId`s (@-mention the bot once, then take it out of the worker log), **no spaces**; empty means no restriction — the bot answers in every group it is invited to. All three platforms share this one parameter. It is one of the defense-in-depth boundaries on the IM entry point (boundary (c) in [§8](#8-security-notes-worth-knowing)): a message from a chat outside the list is dropped **before any model call** — Feishu/Slack are stopped in the ingress function (which holds even if signature verification were bypassed), while DingTalk's `conversationId` only becomes readable **after** signature verification, so its check lands one layer later, in the worker. **The normal rhythm is: deploy with it empty → create the group and take its chat id → then update the stack with that id**, which is why it sits in the `Security` group and not among the required parameters. Equivalent to `imAllowedChatIds` on the `setup.sh` path (there it goes into the `context` block of `infra/cdk.json`, see [IM_WEBHOOK_SETUP.en.md §4](IM_WEBHOOK_SETUP.en.md#4-chat-allowlist-optional-all-three-platforms)). |
 | **On stack delete** | `KeepData` | Decides what happens to your data when the stack is deleted. See [§6](#6-deleting-the-stack) — **there is a gotcha; read it before you delete**. |
 | **Deployment mode** | `SingleAccount` | Pick `MultiAccount` (and fill in the org id below) to let it also see **other** accounts in your organization. `MultiAccount` requires this account to be the **AWS Organizations management account** or a registered **StackSets delegated administrator** member account (auto-detected, no parameter to set) — run the commands in [§2.6.1](#261-hard-prerequisite-management-account-or-a-stacksets-delegated-administrator) first to confirm. If the account doesn't qualify, the stack fails within the first minute and tells you what to do. |
 | **AWS Organizations id (MultiAccount only)** | empty | Only needed with `MultiAccount` (starts with `o-`). **Half a choice does nothing**: `MultiAccount` with an empty org id stays single-account, and the `DeployModeStatus` output says so. Getting the id **wrong** — a valid org id that isn't this account's — is caught by the in-stack preflight (otherwise it gets baked into the member trust policy and every account onboarding afterwards fails with AccessDenied, with nothing on screen pointing at the id). |
 | **Enable AWS DevOps Agent features (deep investigation, DevOps Chat)?** | `Yes` | One switch, **four** capabilities — see [§2.7](#27-deep-investigation-aws-devops-agent). An idle agent space costs nothing, which is why it defaults to on; pick `No` if you don't want it (all four are then greyed out). |
+| The **Optional: your own CUR data source** group | empty / `no` | Only when you want line-item cost analysis: `ProvisionCur=yes` (shown as **Let NotiOps create the CUR for you?**) has the stack create the CUR for you; if you already have a CUR, fill in `CurTable` + `CurBucketName` (table and bucket must be in this stack's account and Region); if you already run your own cost-agent MCP, fill in `CostAgentMcpUrl` + `CostAgentFunctionArn`. Pick only one of the three — see [§2.12](#212-optional-connect-your-own-cur-data-source). `CurRoleArn` (a CUR in another account) is not supported yet; leave it empty. |
 | **Artifact base URL override** / **Artifact mirror bucket name (s3:// only)** | empty | Only when you can't reach GitHub — see [§7](#7-no-internet-egress-use-a-private-s3-mirror). |
 
 ### 2.4 Acknowledge IAM, create
 
 **Next** → on the final page tick **"I acknowledge that AWS CloudFormation might create IAM resources"** → **Submit**.
 
-**Measured: about 4.5 minutes** (two independent runs: 4m16s / 4m25s, us-east-1, with the default web-only option). You'll see the stack waiting on two `Custom::NotiOpsStager…` resources — that's it staging ~165 MB of artifacts from GitHub into your S3 bucket, unpacking the frontend, writing runtime config, and creating the admin user. An install option that includes IM stages another ~28 MB and creates 3 more Lambdas (tens of seconds).
+**Measured: about 4.5 minutes** (two independent runs: 4m16s / 4m25s, us-east-1, with the default web-only option). You'll see the stack waiting on two `Custom::NotiOpsStager…` resources — that's it staging ~165 MB of artifacts from GitHub into your S3 bucket, unpacking the frontend, writing runtime config, and creating the admin user. An install option that includes IM also stages the two IM artifacts and creates 4 more Lambdas (ingress / worker / progress refresh / investigation callback; tens of seconds).
 
 ### 2.5 Sign in
 
@@ -254,12 +261,20 @@ aws sts get-caller-identity --query Account --output text
     --query 'DelegatedAdministrators[].Id' --output text
   ```
 
-  This account's id **is** in the output ⇒ `MultiAccount` is fine. It is not ⇒ three ways forward: register it per [2.6.2](#262-deploying-from-a-member-account-register-a-stacksets-delegated-administrator), run this template **in the management account** instead, or pick `SingleAccount` for now (web / IM / deep investigation / case creation all work exactly the same; it just only sees this one account).
+  This account's id **is** in the output ⇒ `MultiAccount` is fine. It is not ⇒ three ways forward: register it per [2.6.2](#262-deploying-from-a-member-account-register-a-stacksets-delegated-administrator), run this template **in the management account** instead, or pick `SingleAccount` for now (web / IM / deep investigation / case creation all work exactly the same; you just get no one-click onboarding — accounts added through "Manual onboarding" can still be investigated on the web with "Deep Dive" / "DevOps Chat", see [DEPLOYMENT.en.md §0.1.2](DEPLOYMENT.en.md#012-deploy-mode-single-account-default-vs-multi-account---multi-account); "Generate link" first needs the template upload described in the 🔴 note below).
   ⚠️ That command **must** pass `--service-principal`. Without it you get the delegated administrators of **every** service (GuardDuty / Config / Security Hub …). Those accounts also hold Organizations read-only permissions but **cannot** operate StackSets — judging from that list gives you a "should work" that turns into `AccessDenied` at StackSet creation time.
 - First command says `AWSOrganizationsNotInUseException` ⇒ this account is not in an organization at all; `SingleAccount` is the only option.
 - First command says `AccessDeniedException` ⇒ almost always a service control policy blocking `organizations:DescribeOrganization`. Until that is lifted, the stack's own check cannot read it either, so it will not get through.
 
-> 🔴 **One hard limit that has nothing to do with which identity you use**: CloudFormation **never** deploys a service-managed StackSet into the **organization management account itself** — even if you target the OU it sits in, `CreateStackInstances` returns SUCCEEDED and creates nothing (a silent fake success). So "let NotiOps inspect the management account itself" cannot go through a StackSet: deploy [`infra/member-account-onboarding.yaml`](../infra/member-account-onboarding.yaml) into the management account by hand, then register it from **Admin → Accounts** in the web UI with "onboard an account manually". This is the same under both deploying identities.
+> 🔴 **One hard limit that has nothing to do with which identity you use**: CloudFormation **never** deploys a service-managed StackSet into the **organization management account itself** — even if you target the OU it sits in, `CreateStackInstances` returns SUCCEEDED and creates nothing (a silent fake success). In practice only a **delegated-administrator deployment** runs into it (when you deploy from the management account itself, it is the deploy account and there is nothing to do): the management account is an ordinary row on **More → Admin → Accounts** in the web UI, but has no one-click onboarding button. To let NotiOps query it, use **"Manual onboarding" alone** on the same page: "Generate link" → deploy that stack while signed in to the management account → paste the Stack Outputs back → "Test connection" → "Save & activate"; that stack creates the cross-account collection role as well (read-only, plus Support-case open / reply / resolve by default, controlled by the member template parameter `EnableSupportCaseWrite`).
+>
+> - **Do not** also deploy [`infra/member-account-onboarding.yaml`](../infra/member-account-onboarding.yaml) by hand: it creates a collection role with the same name (`notiops-idle-detection-role-<deploy-account-id>`), so deploying both ends in `EntityAlreadyExists` and a stack rollback. If it is already deployed in the management account, set `CreateCollectionRole` to `no` on the quick-create page, and if that stack forwards events (its `DevOpsEventBusArn` parameter is set), also clear `DevOpsEventBusArn` on the same page — the two stacks name their forwarding rules differently, so nothing fails, but both would forward the same investigation events.
+> - ⚠️ A one-click deployment does **not** put the template that "Generate link" needs into the data bucket; until you upload it, "Generate link" only returns `template not found` (for every account, not just this one). In the deploy account, upload [`infra/member-devops-agent.yaml`](../infra/member-devops-agent.yaml) from the same release as your stack (see the `InstalledRelease` output):
+>
+>   ```bash
+>   aws s3 cp member-devops-agent.yaml \
+>     s3://notiops-data-<account-id>-<region>/onboarding-templates/member-devops-agent.yaml
+>   ```
 
 **The org id is the first column** of the first command (starts with `o-`). Getting it wrong fails in a particularly unhelpful way: it gets baked into the member-account trust policy as `aws:PrincipalOrgID`, so every subsequent member-account onboarding returns `AccessDenied` with nothing on screen pointing at a mistyped id. That's why the stack's preflight **also cross-checks** the id you typed against the organization this account really belongs to, and refuses with the correct value if they differ.
 
@@ -311,7 +326,7 @@ A service-managed StackSet requires **trusted access** between CloudFormation an
 
 If something like an SCP does block the stack from doing it, the failure reason hands you both commands verbatim (with your region filled in) — run them in the management account and update the stack. The most misleading part here: **the Organizations half often already lists that service principal**, so it looks enabled, while the CloudFormation half is still `DISABLED` — and the `ValidationError` AWS returns says nothing about `activate-organizations-access`.
 
-**What you additionally get**: the stack creates two StackSets (`notiops-member-onboarding`, `notiops-member-devops-agent`) and — when deployed in the management account — enables Organizations trusted access for StackSets. ⚠️ Service-managed StackSets **always live in the organization management account**, even when a delegated administrator created them, so when you deploy from a member account these two will not appear in the deploying account's CloudFormation console. You then onboard member accounts one at a time from **Admin → Accounts** in the web UI (each member account gets a cross-account **read-only** role plus a deep-investigation trigger role). After that you can switch accounts in the chat UI for read-only inspection, deep investigation, and case creation.
+**What you additionally get**: the stack creates two StackSets (`notiops-member-onboarding`, `notiops-member-devops-agent`) and — when deployed in the management account — enables Organizations trusted access for StackSets. ⚠️ Service-managed StackSets **always live in the organization management account**, even when a delegated administrator created them, so when you deploy from a member account these two will not appear in the deploying account's CloudFormation console. You then onboard member accounts one at a time from **More → Admin → Accounts** in the web UI (each member account gets a cross-account collection role — read-only, plus Support-case open / reply / resolve by default, controlled by the member template parameter `EnableSupportCaseWrite` — plus a deep-investigation trigger role). After that you can switch accounts in the chat UI for read-only troubleshooting, deep investigation, and case creation.
 
 This path still does **not** include: member-account CloudWatch OAM Sinks, cross-account Health / investigation event forwarding, or cross-account scheduled inspection. Those three need `setup.sh`.
 
@@ -394,7 +409,7 @@ That **What to install** dropdown in the first parameter group:
 | `web+slack` | Web Chat **plus** a Slack bot: the `/notiops` slash command, @-mentions, DMs. |
 | `web+dingtalk` | Web Chat **plus** a DingTalk bot: @-mention it in a group (nothing to register for slash commands — DingTalk has no command registry the way Slack does). |
 
-**All four options install web** — IM is an add-on, not a replacement. One stack installs **one** IM platform; if you want several at once, use `setup.sh` from [DEPLOYMENT.en.md](DEPLOYMENT.en.md) (`-c enabledPlatforms=feishu,slack,dingtalk`).
+**All four options install web** — IM is an add-on, not a replacement. One stack installs **one** IM platform; if you want several at once, use `setup.sh` from [DEPLOYMENT.en.md](DEPLOYMENT.en.md) (pick several at its IM-platform prompt, e.g. `1,2,3`, which becomes `-c enabledPlatforms=feishu,slack,dingtalk`).
 
 **IM and the web UI are the same backend**: the same read-only AWS DevOps Agent, the same Skills, the same config table. So whatever you ask in the browser (cost, investigations, Support cases) gives the same answer in a group chat.
 
@@ -405,9 +420,9 @@ That **What to install** dropdown in the first parameter group:
 - **The bot won't react to your message**: the instant acknowledgement when it picks up a command is a **text receipt**, not a 👀 reaction.
 - **There is only one place to paste the message-receive address** (Feishu has two, Slack three), but DingTalk **validates nothing when you save it**: one wrong character in the address and credentials-not-written-yet look exactly the same — the bot just says nothing. So on DingTalk the way in to troubleshooting is the logs, see [§4.5](#45-im-is-installed-but-the-bot-stays-silent-in-the-group).
 
-**It doesn't burn tokens**: every incoming message first goes through deterministic routing (regex + keywords, in both English and Chinese); anything that matches "look at resources / start an investigation / check progress / switch model / switch language" calls the API directly and costs **zero tokens**. Only the **case flow** (turning your description into case text) actually calls the model.
+**By default it doesn't burn tokens**: every incoming message first goes through deterministic routing (regex + keywords, in both English and Chinese); anything that matches "look at resources / start an investigation / check progress / switch model / switch language" calls the API directly, and chat defaults to `/agent devops`, which the DevOps Agent answers directly. In that mode the NotiOps side spends **zero tokens**; only the **case flow** (turning your description into case text) actually calls the model. **That changes once someone sends `/agent notiops`**: from then on every question is answered by the NotiOps agent (the same AgentCore Runtime the web chat uses, with the narrow `im-chat` tool set), and that **does** consume Bedrock tokens. The switch applies per conversation — anyone in a group can flip it and the whole group follows; see the `/agent` row in [IM_WEBHOOK_SETUP.en.md §2.4](IM_WEBHOOK_SETUP.en.md#24-slash-commands).
 
-**A deep investigation started from a group chat delivers its report back to that group**: when the investigation finishes (usually a few minutes), a callback function in the stack writes the HTML report under the `investigations/` prefix of the data bucket and posts a card to the group carrying a **time-limited public download link** — whoever reads the report does not need access to this AWS account. The link is served by this stack's own CloudFront distribution, the one whose function only allows report paths.
+**A deep investigation started from a group chat delivers its report back to that group**: when the investigation finishes (usually a few minutes), a callback function in the stack writes the HTML report under the `investigations/` prefix of the data bucket and posts a card to the group carrying a **time-limited public download link** — whoever reads the report does not need access to this AWS account. The link is an **S3 presigned URL** that the callback function signs with its own **temporary credentials** (not CloudFront: the stack's report CloudFront distribution only serves `reports/`, and investigation reports live under `investigations/`). Such a link cannot outlive the credentials that signed it: it stops working when they expire, at most about 12 hours later, not 7 days. Download the report if you need to keep it.
 
 > ⚠️ This path is **asynchronous** (EventBridge → Lambda), so when it breaks it does so **without any error**: the progress card still reaches 100% (a different function draws that by polling task state) and then the report simply never arrives. On DingTalk there is no such card (progress is appended messages), so the symptom reads "the last progress message arrived, the report card never did" — the checks are the same. If that happens, check in this order: does `aws lambda get-function --function-name <stack-name>-devops-callback` exist → does its log group (a CFN-generated random name; resolve it by the logical-ID prefix `DevOpsCallbackLogs`, same command shape as the table in [§4](#4-troubleshooting)) contain `account_not_configured` → does `aws s3 ls s3://<data-bucket>/investigations/` hold an object for this investigation. If all three are fine and it still doesn't arrive, look at that function's dead-letter queue.
 
@@ -415,9 +430,9 @@ That **What to install** dropdown in the first parameter group:
 
 1. **Put credentials in Secrets Manager** — the bot needs keys to verify signatures and to reply.
    - **Feishu/Lark**: `notiops/im-bot-feishu`, four keys: `app_id` / `app_secret` / `encrypt_key` / `verification_token`.
-     **Easiest path is the web UI**: sign in and go to **Admin → IM Integration** — all four credentials sit on one form and Save writes them into this secret, so you need no CLI and no extra credentials. That page also carries the four-step summary of the Feishu-side work and a "View the detailed setup steps" side panel.
-   - **Slack**: two secrets, `notiops/slack-bot-token` (starts with `xoxb-`) and `notiops/slack-signing-secret`, each holding a **plain string** (not JSON — the data plane uses the whole SecretString as the value). **The web UI works here too**: **Admin → IM Integration → the Slack tab**, two fields and Save; the backend creates the secret for you if it doesn't exist, and that page has the same "View the detailed setup steps" drawer. ⚠️ **Both** Slack values are credentials (there is no plainly-visible field to cross-check against, like Feishu's `app_id` or DingTalk's `app_key`), so the only way to confirm *which* app you configured is that page's Test credentials button — it reports your workspace and bot name back, and **names every missing bot token scope**.
-   - **DingTalk**: `notiops/im-bot-dingtalk`, two keys: `app_key` / `app_secret` (the AppKey / AppSecret from "Credentials and basic info" on the DingTalk open platform). **The web UI works here too**: **Admin → IM Integration → the DingTalk tab**, two fields and Save; the backend creates the secret for you if it doesn't exist, and that page has the same "View the detailed setup steps" drawer in its top-right corner. ⚠️ DingTalk has **only this one** secret: the AppSecret both fetches access tokens and verifies the `sign` on inbound requests, so there is no equivalent of Feishu's `encrypt_key` / `verification_token` — the two missing fields on the form are **deliberate**.
+     **Easiest path is the web UI**: sign in and go to **More → Admin → IM Integration** in the left nav — all four credentials sit on one form and Save writes them into this secret, so you need no CLI and no extra credentials. That page also carries the four-step summary of the Feishu-side work and a "View the detailed setup steps" side panel.
+   - **Slack**: two secrets, `notiops/slack-bot-token` (starts with `xoxb-`) and `notiops/slack-signing-secret`, each holding a **plain string** (not JSON — the data plane uses the whole SecretString as the value). **The web UI works here too**: **More → Admin → IM Integration → the Slack tab**, two fields and Save; the backend creates the secret for you if it doesn't exist, and that page has the same "View the detailed setup steps" drawer. ⚠️ **Both** Slack values are credentials (there is no plainly-visible field to cross-check against, like Feishu's `app_id` or DingTalk's `app_key`), so the only way to confirm *which* app you configured is that page's Test credentials button — it reports your workspace and bot name back, and **names every missing bot token scope**.
+   - **DingTalk**: `notiops/im-bot-dingtalk`, two keys: `app_key` / `app_secret` (the AppKey / AppSecret from "Credentials and basic info" on the DingTalk open platform). **The web UI works here too**: **More → Admin → IM Integration → the DingTalk tab**, two fields and Save; the backend creates the secret for you if it doesn't exist, and that page has the same "View the detailed setup steps" drawer in its top-right corner. ⚠️ DingTalk has **only this one** secret: the AppSecret both fetches access tokens and verifies the `sign` on inbound requests, so there is no equivalent of Feishu's `encrypt_key` / `verification_token` — the two missing fields on the form are **deliberate**.
 2. **Paste the request URL back into the IM platform** — that's the `FeishuWebhookUrl` / `SlackWebhookUrl` / `DingtalkWebhookUrl` output.
 
 > ⚠️ **Don't reverse the order**: credentials first, request URL second. Feishu and Slack fire a verification request the **moment** you save the request URL; with no credentials yet the ingress function fails outright, and what you see on the IM platform is "verification failed" — which looks like a wrong URL.
@@ -436,46 +451,57 @@ That **What to install** dropdown in the first parameter group:
 
 ### 2.12 (Optional) Connect your own CUR data source
 
-The **Optional: your own CUR data source** group on the parameters page — two parameters, **both empty by default = not enabled**:
+**Off by default**: cost questions still get answered (from Cost Explorer), just without line-item drill-down. If you want it there are three ways in, and **you pick only one** (filling in more than one is rejected by the parameter-validation rules `CostMcpExclusiveWithExternal` / `ProvisionCurExcludesCurTable` **before the stack is created**, so you never end up with half a thing). The parameters below all sit in the **Optional: your own CUR data source** group on the parameters page (`ProvisionCur` shows up there as **Let NotiOps create the CUR for you?**):
 
-| Parameter | What to put in it |
-|---|---|
-| `CostAgentMcpUrl` | The **Function URL** of your own cost-agent MCP Lambda (`https://<id>.lambda-url.<region>.on.aws`) |
-| `CostAgentFunctionArn` | **The same Lambda's function ARN** |
+| Way in | What to fill in | What you get |
+|---|---|---|
+| **Let the stack create the CUR** (pick this if you have none) | `ProvisionCur=yes`, `CurTable` left empty | An hourly, resource-level CUR in Parquet plus the official Athena integration, and a cost MCP (45 read-only CUR tools) on top. ⏱ AWS takes **up to 24 hours** to deliver the first report; until then cost questions use Cost Explorer, and they switch over on their own once it is ready (checked every 4 hours) — **no second deployment needed** |
+| **Connect an existing CUR table** | `CurTable` (`database.table`) + `CurBucketName` (the bucket holding the CUR data) | The same cost MCP, usable right away. The table, its database and the bucket must all be in this stack's **account and Region** (see the three points below the table). ⚠️ The partition style `CurPartitionStyle` defaults to `flat` — **check it against your table** (a table built by the official Glue crawler is `year-month`) |
+| **Point at a cost-agent MCP you already run** | `CostAgentMcpUrl` + `CostAgentFunctionArn` | The stack creates nothing for it — see "External" below |
 
-This connects **someone else's CUR table** — a customer's, or several payers' (the TAM scenario) — at line-item granularity. It is not this account's own cost data: that's already on the FinOps page and needs neither parameter. Enabling it adds 4 CUR sheets to the FinOps page (cost trend / credit / extended support / Savings Plans) plus the ability to ask about that spend directly in chat.
+NotiOps builds the first two itself, entirely in your account: a Lambda (`cost_mcp/` in this repository) + a dedicated Athena workgroup (`<stack-name>-cost-mcp`) + a separate query-results bucket. The workgroup enforces a per-query scan cap, `CostMcpScanCapGiB` (default 100 GiB) — Athena bills per byte scanned and has no per-call cap, so this is the real spend guard. 🔒 **Deleting the stack does not delete your billing data**: the CUR report and its S3 bucket created by `ProvisionCur=yes` stay in place under either `TeardownMode` (see the end of [§6.5](#65-delete-stopped-in-delete_failed-stagersite)). A later reinstall in the same account and Region (again with `ProvisionCur=yes`) reuses that CUR, with no new 24-hour wait for a first delivery; on one-click, though, it is only picked up by the next 4-hourly check, so allow **up to about 4 hours** — until then cost questions use Cost Explorer.
 
-⚠️ **Both or neither.** A Function URL does **not** contain the function ARN, and the invoke permission (`lambda:InvokeFunctionUrl`) can only be granted per resource — so filling in just the URL deploys a data source that *looks* installed and 403s on every call. The template therefore carries a parameter-validation rule (`CostAgentArnRequiredWithUrl`): half-filled is rejected **before the stack is created**, so you never end up with half a thing.
+When you **connect an existing CUR table**, check these three things first:
+
+- **Same account, same Region, and give the bucket name**: the `CurTable` Glue table, its database and the `CurBucketName` bucket must all be in **this stack's account and Region** — that is where the cost MCP runs Athena (with the table in another Region the stack still deploys fine, but every query fails afterwards). `CurBucketName` is not optional (rule `CostMcpNeedsCurAccess` rejects `CurTable` without it): the cost MCP is granted read on exactly that bucket, rather than read on every bucket in the account.
+- **A CUR in another account (`CurRoleArn`) is not supported yet**: the parameter is still there but must stay empty — a value is rejected before the stack is created by the rule `CostMcpCrossAccountNotSupported`. In that setup the queries would run in the CUR's account, against a workgroup that only exists in this one, so every query would fail. If your CUR lives in another account or Region: deploy NotiOps in that account / Region, or use the third way in (`CostAgentMcpUrl`) to point at a server you run yourself.
+- **`CurTagKeys` (which user tags to split cost by) takes the column suffix**: the part after `resource_tags_user_` in your CUR table's column names (letters, digits and underscores only; comma separated, no spaces) — **not** the tag key as you typed it in AWS. For example, the tag `cost-center` usually shows up as the column `resource_tags_user_cost_center`, so you enter `cost_center`. Look at the table's columns in Glue / Athena before filling it in.
+
+All three add the same things: 4 CUR sheets on the FinOps page (cost trend / credit / extended support / Savings Plans) plus the ability to ask about that spend directly in chat.
+
+**External** usually means **someone else's CUR table** — a customer's, or several payers' (the TAM scenario) — at line-item granularity. ⚠️ **Both of its parameters or neither.** A Function URL does **not** contain the function ARN, and the invoke permissions (the two actions `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction`) can only be granted per function — so filling in just the URL deploys a data source that *looks* installed and 403s on every call. The template therefore carries a parameter-validation rule (`CostAgentArnRequiredWithUrl`): half-filled is rejected **before the stack is created**.
 
 - **Leave them empty**: the capability doesn't exist, by design — the 4 sheets' navigation entries simply don't appear (no menu item that does nothing when clicked), and chat mounts no corresponding tools. Nothing else is affected.
-- **Add it later**: update the stack with the two parameters filled in; no rebuild needed.
-- **One step remains on your side**: that Lambda's **resource policy** must allow this stack's two roles (the BFF and the agent runtime) to invoke its Function URL — that's your own deployment, which the template can't touch.
+- **Add it later**: update the stack with the corresponding parameters filled in; no rebuild needed.
+- **An External server in another account leaves one step on your side**: that Lambda's **resource policy** must grant this stack's two roles (the BFF and the agent runtime) **both** actions — `lambda:InvokeFunctionUrl` (condition `lambda:FunctionUrlAuthType=AWS_IAM`) and `lambda:InvokeFunction` (condition `lambda:InvokedViaFunctionUrl=true`). Since 2025-10 AWS requires both for a Function URL; this stack already creates the two matching grants on its own side, but that Lambda is your own deployment, which the template can't touch. The typical symptom of granting only the first: the request never shows up in that function's logs while its `Url4xxCount` keeps rising.
 - **If the MCP goes down it doesn't take the tool with it**: only those 4 dashboard sheets say "temporarily unavailable"; chat falls back to Cost Explorer and then to the AWS read-only API, and **tells you it switched sources** (different measure — don't reconcile against it blindly).
 
-**How to deploy that Lambda, caveats about the 45 tools' measures, and the full degradation chain are in [DEPLOYMENT.en.md §14](DEPLOYMENT.en.md#14-customer-cur-dashboard--cost-agent-mcp-optional)** (that section covers both deployment paths).
+**The full parameter table (including `CurVersion`), caveats about the 45 tools' measures, and the full degradation chain are in [DEPLOYMENT.en.md §14](DEPLOYMENT.en.md#14-customer-cur-dashboard--cost-agent-mcp-optional)** (that section covers both deployment paths).
 
 ---
 
 ## 3. What the stack creates
 
-**69 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 5 fewer with deep investigation off; 8 more if you pick multi-account; **20 more if you pick an install option with IM**):
+**74 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 6 fewer with deep investigation off; 8 more if you pick multi-account; **26 more if you pick an install option with IM**; 10 more — the cost MCP set — with `CurTable` set or `ProvisionCur=yes`, and another 11 on top of that if you chose `ProvisionCur=yes`):
 
 | Category | Resources |
 |---|---|
 | Frontend | S3 website bucket + CloudFront distribution + CloudWatch RUM; report downloads go through a second CloudFront distribution (with a CloudFront Function that only lets report paths through) |
-| API | 1 Lambda (BFF) + Function URL (`AWS_IAM` auth, streaming) |
+| API | 1 Lambda (BFF) + Function URL (`AWS_IAM` auth, streaming) + 1 EventBridge rule (warms the CUR dashboard cache once a day; with no CUR connected the BFF returns immediately) + its invoke permission |
 | Agent | 1 Bedrock AgentCore Runtime + 1 AgentCore Memory (session memory, see [§2.10](#210-session-memory-agentcore-memory)) |
 | Sign-in | Cognito User Pool + Client + Identity Pool + 8 groups (roles) |
 | Data | DynamoDB `notiops-config`, `notiops-web-chat`; 1 data bucket (reports etc.) |
 | Deployment helper | 1 staging bucket (for the staged artifacts) + 1 inline Lambda + 3 custom resources (stage the artifacts / write the frontend config / **on delete, drain the staging bucket until it really is empty**) |
-| Permissions | 6 IAM roles + 5 inline policies (the AgentCore Memory execution role has **no policy at all** — it is just a shell for the service to trust) |
+| Permissions | 6 IAM roles + 5 inline policies (the AgentCore Memory execution role has **no policy at all** — it is just a shell for the service to trust) + 1 managed policy (the BFF role's grants exceed the inline-policy size limit, and the overflow lands here) |
 | Notifications inbox (see [§2.9](#29-notifications-inbox)) | **10 EventBridge rules** (5 ENABLED / 5 DISABLED) + 1 Lambda + its log group + 1 role (plus its policy) + 1 Lambda invoke permission = 15 |
-| Deep investigation (on by default) | 1 DevOps Agent agent space (**with its operator app enabled automatically**) + 1 read-only association + 1 role assumed by DevOps Agent (plus its policy) + 1 operator app role = 5 |
+| Deep investigation (on by default) | 1 DevOps Agent agent space (**with its operator app enabled automatically**) + 1 read-only association + 1 role assumed by DevOps Agent (plus its policy) + 1 operator app role + 1 custom resource (registers the deployment account for deep investigation) = 6 |
 | Web search (us-east-1 only) | 1 custom resource (creates the AgentCore gateway) + 1 gateway service role + 1 inline policy |
 | Multi-account (optional) | 2 custom resources (① the eligibility preflight ② creates the two member StackSets) + the preflight's own Lambda / role / policy / log group + 2 inline policies = 8 |
-| IM bot (optional, see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)) | 3 Lambdas (ingress / worker / progress refresh) + 3 log groups + 1 **API Gateway HTTP API** (a public entry point, see below; 4 resources counting its route / integration / stage) + 3 invoke permissions (HTTP API -> ingress, keep-alive rule -> ingress, progress rule -> progress) + 1 dependency layer + 2 DynamoDB tables (group conversations, usage) + 2 EventBridge rules (refreshes investigation progress every minute, pings the ingress every 4 minutes) + 1 role (plus its policy) = 20. All three platforms have the **same shape**; only the ingress/worker pair is swapped for that platform's pair (with `web+dingtalk` the progress-refresh function is still created, but DingTalk progress is appended messages with no card to refresh, so its every-minute scan finds nothing to do) |
+| IM bot (optional, see [§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk)) | 4 Lambdas (ingress / worker / progress refresh / investigation callback — the last one delivers deep-investigation reports started from a group chat back to that group) + 4 log groups + 1 **API Gateway HTTP API** (a public entry point, see below; 4 resources counting its route / integration / stage) + 4 invoke permissions (HTTP API -> ingress, keep-alive rule -> ingress, progress rule -> progress, callback rule -> investigation callback) + 1 dependency layer + 2 DynamoDB tables (group conversations, usage) + 3 EventBridge rules (refreshes investigation progress every minute, pings the ingress every 4 minutes, fires the callback when an investigation ends) + 1 SQS dead-letter queue (plus its queue policy: if the callback can't be delivered, or the callback function itself fails, the event lands here instead of being lost) + 1 role (plus its policy) = 26. All three platforms have the **same shape**; only the ingress/worker pair is swapped for that platform's pair (with `web+dingtalk` the progress-refresh function is still created, but DingTalk progress is appended messages with no card to refresh, so its every-minute scan finds nothing to do) |
+| Cost MCP (optional: `CurTable` set or `ProvisionCur=yes`, see [§2.12](#212-optional-connect-your-own-cur-data-source)) | 1 Lambda + Function URL + 1 dependency layer + log group + 1 role (plus its policy) + 1 Athena workgroup + 1 query-results bucket (plus its bucket policy) + 1 inline policy that lets the agent call it = 10 |
+| CUR creation (optional: `ProvisionCur=yes`, on top of the cost MCP) | Stage 1: 1 Lambda + log group + 1 role (plus its policy) + 1 custom resource (creates the delivery bucket, its bucket policy and the report definition); stage 2: 1 Lambda + log group + 1 role (plus its policy) + 1 EventBridge rule every 4 hours + its invoke permission = 11. The CUR report, the delivery bucket and the `notiops-cur-athena-<account>` stack that stage 2 deploys are **not** resources of this stack — they stay when you delete it, see the end of [§6.5](#65-delete-stopped-in-delete_failed-stagersite) |
 
-**Cost, idle**: CloudFront, S3 and DynamoDB are pay-per-use, Lambda costs nothing when not invoked, and an idle AgentCore Runtime costs nothing — idle, this is cents of storage. The real cost is **Bedrock tokens when you ask questions**. Each installed release keeps ~**165 MB** in the staging bucket (~28 MB more with IM installed; ≈ $0.004/month in S3 Standard); upgrades don't purge old versions, see [§5](#5-upgrading). The IM set is likewise **free when idle** (three Lambdas that cost nothing uninvoked, two on-demand tables, and that per-minute progress rule only does real work while an investigation is running).
+**Cost, idle**: CloudFront, S3 and DynamoDB are pay-per-use, Lambda costs nothing when not invoked, and an idle AgentCore Runtime costs nothing — idle, this is cents of storage. The real cost is **Bedrock tokens when you ask questions**. Each installed release keeps ~**165 MB** in the staging bucket (plus the IM and cost MCP code and dependency layers if you installed those; ≈ $0.004/month in S3 Standard), and an upgrade keeps the previous release's copy too (the bucket is emptied when you delete the stack), see [§5](#5-upgrading). The IM set is likewise **free when idle** (four Lambdas that cost nothing uninvoked, two on-demand tables, and that per-minute progress rule only does real work while an investigation is running). The cost MCP likewise costs nothing uninvoked; what it really adds once built is the **Athena scan volume** of each query (capped, see [§2.12](#212-optional-connect-your-own-cur-data-source)) and, with `ProvisionCur=yes`, the S3 storage of the delivered CUR.
 
 **Read-only by design**: every grant the agent gets is read-only, and there is no tool in the product that modifies your resources. The furthest it can go is **opening an AWS Support case**, and only after you confirm in the conversation.
 
@@ -485,11 +511,12 @@ This connects **someone else's CUR table** — a customer's, or several payers' 
 
 ### 4.1 The stack rolled back — find which resource failed
 
-On the Events tab, find the **first** `CREATE_FAILED` (not the last). The two common ones:
+On the Events tab, find the **first** `CREATE_FAILED` / `UPDATE_FAILED` (not the last). The two common ones:
 
 | Symptom | Cause and fix |
 |---|---|
 | `StagerArtifacts` failed, logs show a timeout / connection error | The account has no internet egress and can't reach GitHub. Go to [§7](#7-no-internet-egress-use-a-private-s3-mirror). |
+| `StagerArtifacts` failed with `failed to stage <your mirror>/<file name> after 3 attempts`, followed by `AccessDenied` or HTTP 404 | You are using the [§7](#7-no-internet-egress-use-a-private-s3-mirror) mirror and **that file is missing from it**. On an `s3://` mirror a missing file shows up as `AccessDenied`, not "not found": the deployment Lambda has `s3:GetObject` on that bucket but no `s3:ListBucket`, so S3 answers a key that doesn't exist with a 403 — don't let it send you off checking permissions. Add the file to the mirror first. If the stack failed to **create**, then clean up the retained resources per §4.2 below and create it again. If an **update** failed (for example when you turn on IM or the cost options later), the stack rolls back to where it was on its own (`UPDATE_ROLLBACK_COMPLETE`) and the tables and the bucket are still in use — do **not** follow §4.2; just run the update again once the file is there. |
 | `AgentRuntime` failed | The region may not support Bedrock AgentCore. Use us-east-1 / us-west-2. |
 | `StagerPreflight` failed, mentioning `needs this account to be either the AWS Organizations management account or a registered ... delegated administrator` | You picked `MultiAccount`, but this account is neither the management account nor a registered StackSets delegated administrator (yet). The failure reason already lists all three ways forward, the register command verbatim, and the management account id. To deploy from this member account, register it per [§2.6.2](#262-deploying-from-a-member-account-register-a-stacksets-delegated-administrator) and update the stack. |
 | `StagerPreflight` failed, mentioning an `OrganizationId` mismatch | You mistyped the org id. The failure reason carries the **correct** one; fix it and create the stack again. |
@@ -562,7 +589,7 @@ The step-by-step checks and what each error means are in [IM_WEBHOOK_SETUP.en.md
 You can, with two catches:
 
 ```bash
-# The template is over 370 KB (it grows with the resource count each release), well past the
+# The template is about 430 KB (it grows with the resource count each release), well past the
 # 51,200-byte --template-body limit, so it must go via S3 + --template-url
 aws s3 cp notiops-webchat.template.json s3://<your-bucket>/notiops-webchat.template.json
 aws cloudformation create-stack --stack-name notiops \
@@ -586,18 +613,40 @@ When a new release lands: **download the new template and update the existing st
 
 1. Download `notiops-webchat.template.json` from the new release.
 2. CloudFormation → select your stack → **Update** → **Replace existing template** → **Upload a template file**.
-3. Keep parameters on **Use existing value** (except what you actually want to change) → tick IAM → Submit.
+3. Keep parameters on **Use existing value** (except what you actually want to change) → tick IAM → Submit. (If your stack is on v1.0.20–v1.0.29 and has an IM bot, read the 🔴 note below before you submit.)
 
-**Measured: ~1 minute.** During the upgrade: new artifacts are staged (their S3 keys carry the release tag, so the old objects remain) → the frontend is republished and last version's stale files are pruned → CloudFront is invalidated (`/*`) → the AgentCore Runtime gets a new version **in place** (same ARN, no frontend config change).
+**Measured: ~1 minute.** During the upgrade: the new release's artifacts are staged from GitHub or your mirror (their S3 keys carry the release tag) → the frontend is republished and last version's stale files are pruned → CloudFront is invalidated (`/*`) → the AgentCore Runtime gets a new version **in place** (same ARN, no frontend config change).
 
 An upgrade does **not**: re-send the invitation email, change the admin's email or password, touch existing settings in `config.json`, or clear your chat history.
 
-**Rollback**: update again with the **older template** (artifacts are stored per tag, so the old objects are still there).
+**Multi-account mode**: since v1.0.30 the member DevOps Agent StackSet (`notiops-member-devops-agent`) is rolled out with `CreateCollectionRole=no` (same as `setup.sh`), so it no longer creates a second copy of the inspection collection role that the onboarding StackSet already put into the member account under the same name. Any account where **Step 2: DevOps Agent** → **Associate** on **More → Admin → Accounts** failed earlier, with the member stack rolling back on `EntityAlreadyExists`, can simply be associated again once this update is done — every release's update re-applies both StackSets, so there is nothing else to do.
 
-> **The staging bucket accumulates**: ~165 MB per installed release (~28 MB more with IM
-> installed). To clean up, manually delete objects under `agent/<old-tag>/`,
-> `frontend/<old-tag>/` and `im/<old-tag>/` in the staging bucket — **not the current
-> release's**, or the next stack update won't find its code.
+> 🔴 **Stacks upgrading from v1.0.20–v1.0.29 that have an IM bot (What to install is not `web`) and use the default GitHub artifact source (Artifact base URL override left empty)** (the `InstalledRelease` output and those two parameters tell you):
+> `im-code.zip` has been withdrawn from the GitHub Releases of those versions. If this upgrade fails **for any reason**, CloudFormation's automatic rollback re-runs the deployment Lambda from the **old** template, which re-downloads the old `im-code.zip` → HTTP 404 → the stack stops in `UPDATE_ROLLBACK_FAILED` (on `StagerArtifacts`). Nothing in v1.0.30 can prevent this: the rollback runs the old template's inline code with the old SHA256 list.
+>
+> - **Before upgrading**: under **Stack failure options** in the update wizard, pick **Preserve successfully provisioned resources** (on the CLI, `aws cloudformation update-stack … --disable-rollback`). If the upgrade then fails, the stack stops in `UPDATE_FAILED` without rolling back; fix the cause and run the update to v1.0.30 again — and **don't** press Roll back in between.
+> - **Already stuck in `UPDATE_ROLLBACK_FAILED`**:
+>
+>   ```bash
+>   aws cloudformation continue-update-rollback --stack-name <stack> --region <region> \
+>     --resources-to-skip StagerArtifacts
+>   ```
+>
+>   If it stops again on other resources with `NoSuchKey`, run it once more with the logical IDs CloudFormation reports as `UPDATE_FAILED` as `--resources-to-skip`. Once the rollback completes, fix whatever made the upgrade fail, then run the update to v1.0.30 again.
+>
+> These recovery steps are worked out from the mechanism; they have not yet been tried on a real stack running one of those old versions with IM.
+
+**Rollback**: update again with the **older template**. ⚠️ That does not switch back to old files already in the bucket: an update to a different template version makes the stack **download that version's artifacts again** from GitHub (or your mirror) — the stack doesn't reuse what's already in the bucket — so it only works while that older release still has all its artifacts. That is why a stack with IM **cannot** roll back to v1.0.20–v1.0.29: `im-code.zip` has been withdrawn from those releases, so the update fails on `StagerArtifacts` with HTTP 404 (and CloudFormation then returns the stack to the current version).
+
+> **Staged artifacts are kept** (from v1.0.30; stacks on v1.0.29 and earlier have a lifecycle rule, `expire-staged-artifacts-7d`, that deletes them after 7 days, and upgrading to v1.0.30 removes it). The reason: every update of the AgentCore Runtime — even one that only changes a parameter — re-reads the agent package from this bucket. Once the artifacts have expired, an update that only changes a parameter such as `EnableDeepInvestigation`, `DeployMode` or `CostAgentMcpUrl` fails on `AgentRuntime` (`S3 object not found in bucket`), the rollback needs the same package and fails too, and the stack stops in `UPDATE_ROLLBACK_FAILED` (measured 2026-10-11). Each release is about 165 MB, so the storage cost is negligible; the bucket is emptied when you delete the stack.
+>
+> 🔴 **Stacks still on v1.0.29 or earlier whose last install or upgrade was more than 7 days ago**: don't make a parameter-only update — **upgrade to v1.0.30 first** (a version change downloads the artifacts again). If a stack is already stuck in `UPDATE_ROLLBACK_FAILED`, let the rollback finish first (if the failure events name a resource other than `AgentRuntime`, skip that one instead):
+>
+> ```bash
+> aws cloudformation continue-update-rollback --stack-name <stack-name> --resources-to-skip AgentRuntime
+> ```
+>
+> Once it reaches `UPDATE_ROLLBACK_COMPLETE` (about half a minute in our test), upgrade to v1.0.30, then change the parameter.
 
 ---
 
@@ -612,8 +661,9 @@ The `TeardownMode` parameter decides the fate of three things:
 | `notiops-config` table (settings) | **kept** | deleted |
 | `notiops-web-chat` table (chat history, notifications) | **kept** | deleted |
 | Data bucket `notiops-data-…` (exported reports etc.) | **kept** | deleted |
-| Everything else (frontend, CloudFront, Lambda, agent, **Cognito user pool**, and with IM installed those 20 resources including both IM tables) | deleted | deleted |
+| Everything else (frontend, CloudFront, Lambda, agent, **Cognito user pool**, and with IM installed those 26 resources including both IM tables) | deleted | deleted |
 | IM credentials (the `notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` / the two Slack Secrets Manager secrets — outside the stack) | **kept** | deleted (unrecoverable) |
+| The CUR report, delivery bucket and `notiops-cur-athena-<account>` stack created by `ProvisionCur=yes` (outside the stack) | **kept** | **kept** (on purpose: that is your billing history, and AWS does not re-deliver it; a reinstall in the same account and Region reuses it, picked up within about 4 hours — see [§2.12](#212-optional-connect-your-own-cur-data-source)) |
 
 > ⚠️ **The Cognito user pool is deleted in both modes** — users and passwords are gone.
 > `KeepData` preserves **data**, not accounts.
@@ -649,7 +699,7 @@ Getting the order wrong fails silently: the stack goes away, the tables and buck
 
 CloudFormation → select the stack → **Delete**. **Measured**: `KeepData` ~**3m10s**; `DeleteEverything` ~**6m47s** (the extra time is emptying and deleting the two buckets and two tables). Don't expect `DeleteEverything` to finish in three minutes.
 
-During deletion the stack's deployment Lambda first **empties** the website and staging buckets (a non-empty bucket can't be deleted and would stall the whole delete), then honours `TeardownMode` for the two tables and the data bucket. Measured: **zero `DELETE_FAILED`** in both modes.
+During deletion the stack's deployment Lambda first **empties** the website bucket, the staging bucket and (when the cost MCP is installed) the Athena query-results bucket (a non-empty bucket can't be deleted and would stall the whole delete), then honours `TeardownMode` for the two tables and the data bucket. Measured in 2026-08: **zero `DELETE_FAILED`** in both modes. Note: this did **not** hold on a v1.0.30 pre-release -- with the cost MCP installed, the deployment Lambda lacked permissions on the query-results bucket and the delete stopped in `DELETE_FAILED` (measured 2026-10-10, fixed; re-measured the same day after the fix: `DeleteEverything` finished in 4m12s with zero `DELETE_FAILED`, with an object left in the query-results bucket on purpose). If yours is stuck, see [§6.5](#65-delete-stopped-in-delete_failed-stagersite).
 
 ### 6.4 What's left behind (orphans), and whether to care
 
@@ -658,10 +708,35 @@ During deletion the stack's deployment Lambda first **empties** the website and 
 | Log group `/aws/vendedlogs/RUMService_notiops-web-chat<hash>` | Created by CloudWatch RUM itself; not owned by the stack. The `notiops-web-chat` part of that name is the **RUM app monitor's fixed name — it does not follow the stack name**, so it reads the same even when your stack is called something else | **Fine to ignore**: measured at 0 bytes, expires after 30 days. To clean up, delete it in CloudWatch by its **full name** (don't bulk-delete by prefix) |
 | The two tables + data bucket under `KeepData` | That is what `KeepData` **means** | Delete manually when you're done with them (empty the bucket first). **You must delete them before you can redeploy into this account** — see the second warning in §6.1 |
 | CloudFront access logs, if you enabled them yourself | Not managed by this stack | As you like |
-| **If you ever installed IM**: the `notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` / `notiops/slack-bot-token` / `notiops/slack-signing-secret` Secrets Manager secrets | They are not stack resources (all three platforms' secrets are created on demand by the admin console's "IM Integration" page), so `KeepData` leaves them alone | `DeleteEverything` **deletes them too** (unrecoverable). Under `KeepData`, delete them yourself if you want them gone; leave them and a reinstall reuses the same-named secrets |
+| **If you ever installed IM**: the `notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` / `notiops/slack-bot-token` / `notiops/slack-signing-secret` Secrets Manager secrets | They are not stack resources (all three platforms' secrets are created on demand by the web UI's "More → Admin → IM Integration" page), so `KeepData` leaves them alone | `DeleteEverything` **deletes them too** (unrecoverable). Under `KeepData`, delete them yourself if you want them gone; leave them and a reinstall reuses the same-named secrets |
 | **In multi-account mode**: the `notiops-member-onboarding` / `notiops-member-devops-agent` StackSets, and Organizations trusted access for StackSets | **Deliberate.** (1) A StackSet can only be deleted once every stack instance is gone, and removing those wipes the cross-account roles in your member accounts — a cross-account destructive action shouldn't be triggered implicitly by deleting one stack. (2) Trusted access is an **organization-wide** switch; turning it off with our stack would break other people's StackSet deployments. | If you really want them gone: CloudFormation → StackSets → **Delete stacks from StackSet** (removes the instances), then delete the StackSet itself. Leave trusted access alone unless you're sure nobody else relies on it. |
 
-**No other orphans**: the agent's log group, the BFF's log group, the notification handler's log group, the deployment Lambda's log group, IAM roles, the Cognito user pool, the RUM app monitor, the AgentCore Runtime, the website bucket and the staging bucket were all verified to go away with the stack. The agent space and association created for deep investigation also go away with it (they are ordinary stack resources). Same for the session-memory AgentCore Memory ([§2.10](#210-session-memory-agentcore-memory)) — an ordinary stack resource with **no** retention policy, deleted with the stack, taking the stored session messages with it (this one is what the template declares; unlike the list above, it has not yet been verified by an actual stack deletion). The web-search AgentCore gateway splits two ways: one **this stack created** is deleted with the stack; one it **reused** (a pre-existing `notiops-websearch-gw` in the account, e.g. from `setup.sh`) is left alone — deleting one stack shouldn't take down something another deployment path still uses.
+**No other orphans**: the agent's log group, the BFF's log group, the notification handler's log group, the deployment Lambda's log group, IAM roles, the Cognito user pool, the RUM app monitor, the AgentCore Runtime, the website bucket and the staging bucket were all verified to go away with the stack. Note: this did **not** hold on a v1.0.30 pre-release -- the three functions added in that release (cost MCP, CUR stage 1 / stage 2) had no stack-owned log group, so the `/aws/lambda/<stack>-CostMcpFunction…` / `…CurProvisionerFn…` / `…CurFinalizerFn…` groups Lambda creates on first invocation were not owned by the stack, survived the delete and **never expire** (after a clean delete on 2026-10-10 `…CurProvisionerFn…` was left behind; fixed -- every function now writes to a stack-owned log group, and a test checks each one). The execution roles of those three functions also **no longer carry** `logs:CreateLogGroup`: Lambda delivers logs asynchronously, so after the stack deleted a log group, late log lines used to re-create it through that permission (seen in the RC round trip the same day: the group reappeared one second after it was deleted) — now they can't. Some of the older functions still have that permission, which leaves a narrow gap: if one of them happens to be invoked in the last few seconds of the delete, its log group can be re-created this way and stay behind in the account (a known issue). If you find one, delete it in CloudWatch by its full name. With `ProvisionCur=yes` the account also keeps the log groups of the two Lambdas in the `notiops-cur-athena-<account>` stack (AWS's own template: `…AWSCURInitializer…` / `…AWSS3CURNotification…`) -- they are kept **on purpose** together with that stack (see the end of §6.5), not orphans of this one. The agent space and association created for deep investigation also go away with it (they are ordinary stack resources). Same for the session-memory AgentCore Memory ([§2.10](#210-session-memory-agentcore-memory)) — an ordinary stack resource with **no** retention policy, deleted with the stack, taking the stored session messages with it (this one is what the template declares; unlike the list above, it has not yet been verified by an actual stack deletion). The web-search AgentCore gateway splits two ways: one **this stack created** is deleted with the stack; one it **reused** (a pre-existing `notiops-websearch-gw` in the account, e.g. from `setup.sh`) is left alone — deleting one stack shouldn't take down something another deployment path still uses.
+
+### 6.5 Delete stopped in `DELETE_FAILED` (StagerSite)
+
+`StagerSite` is the "empty first, then honour `TeardownMode`" step above. When it fails, **its failure reason lists every step that did not complete** (which bucket / table / secret, which API, which error code) -- read that line first. A stack in `DELETE_FAILED` **cannot be updated**, so the way out is to finish the remaining work by hand and let CloudFormation skip this step:
+
+```bash
+# 1. Empty the buckets named in the failure reason (only those)
+aws s3 rm s3://<bucket named in the failure reason> --recursive
+
+# 2. Retry the delete, skipping StagerSite (a custom resource with no physical resource behind it)
+aws cloudformation delete-stack --stack-name <stack> --retain-resources StagerSite
+```
+
+Skipping StagerSite **also skips its clean-up**. If you chose `DeleteEverything`, nothing will delete the following for you any more -- remove them yourself after the stack is gone: the two tables (`notiops-config` / `notiops-web-chat`), the data bucket `notiops-data-<account>-<region>` (empty it first; **it holds your Skills and exported reports -- export them first if you want to keep them**), any of the `notiops/*` secrets from the §6.4 table that exist, and this stack's agent log group under `/aws/bedrock-agentcore/runtimes/`. With `KeepData` the two tables and the data bucket are kept on purpose anyway. Everything CUR-related (the report, its delivery bucket, the `notiops-cur-athena-<account>` stack) is **kept** in every mode, by design.
+
+```bash
+# 3. Only if you chose DeleteEverything: finish the clean-up that was skipped. Otherwise a re-install in the
+#    same account and Region fails its pre-check on the same-named tables / bucket (~9 s, see §6.1)
+aws dynamodb delete-table --table-name notiops-config
+aws dynamodb delete-table --table-name notiops-web-chat
+aws s3 rb s3://notiops-data-<account>-<region> --force   # --force empties it first; export Skills / reports before if you want them
+aws logs delete-log-group --log-group-name /aws/bedrock-agentcore/runtimes/<runtime id>-DEFAULT
+# any of the notiops/* secrets from the §6.4 table that exist:
+aws secretsmanager delete-secret --secret-id notiops/<name> --force-delete-without-recovery
+```
 
 ---
 
@@ -672,15 +747,18 @@ If your account has no internet egress (or policy forbids pulling executable cod
 **One-time setup** (done once by someone with credentials; every account/team can then reuse the mirror):
 
 ```bash
-# Download the artifacts from the release into a bucket in the SAME region you deploy to
-aws s3 cp bff.zip        s3://my-mirror/notiops/v1.2.3/
-aws s3 cp chat-dist.zip  s3://my-mirror/notiops/v1.2.3/
-aws s3 cp web-notif.zip  s3://my-mirror/notiops/v1.2.3/
-aws s3 cp agent-code.zip s3://my-mirror/notiops/v1.2.3/
-# These two only if you're installing an IM bot (§2.11); a web-only stack never fetches them
-aws s3 cp im-code.zip    s3://my-mirror/notiops/v1.2.3/
-aws s3 cp im-layer.zip   s3://my-mirror/notiops/v1.2.3/
+# 1. Download the nine zips and SHA256SUMS from the release into one directory. SHA256SUMS is the
+#    list to go by: one zip per line, the same list as scripts/artifacts.py in the repository
+#    (the nine that `python3 scripts/artifacts.py all` prints)
+# 2. From that directory, copy all of them into a bucket in the SAME region you deploy to
+for f in $(awk '{print $2}' SHA256SUMS); do
+  aws s3 cp "$f" s3://my-mirror/notiops/v1.2.3/
+done
 ```
+
+**Mirroring all nine** is simplest — the stack only fetches the ones it uses, and you won't have to come back when you turn on IM or the cost options later. Mirroring only what you need also works: `bff.zip` / `chat-dist.zip` / `web-notif.zip` / `agent-code.zip` are always needed; the two `im-*.zip` files only for an IM bot (§2.11); the two `cost-mcp-*.zip` files only if the stack deploys its own cost MCP (§2.12: `CurTable` set or `ProvisionCur=yes`; pointing `CostAgentMcpUrl` at your own server does not count); `cur-provisioner.zip` only with `ProvisionCur=yes`. Leave out one that is needed and the stack fails on `StagerArtifacts` (symptom and fix in §4.1).
+
+**When you upgrade**, upload the new release into a **new** directory (one per version, like `v1.2.3/` above) and change **Artifact base URL override** to it in the update; clear the old directory only after the update has succeeded. If the update fails, the automatic rollback fetches the old release's files from the old directory again and checks them against the old SHA256 values — if they are gone or overwritten, the stack stops in `UPDATE_ROLLBACK_FAILED`.
 
 **Then set two parameters when creating the stack**:
 
@@ -712,5 +790,5 @@ Integrity still holds: every artifact's SHA256 in the template was computed over
 
 - [USER_GUIDE.en.md](USER_GUIDE.en.md) — using the UI and its topics (cost, investigation, Support cases, Skills…)
 - [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) — what to click on the Feishu/Slack/DingTalk side once you installed an IM bot ([§2.11](#211-add-an-im-bot-feishulark-slack-or-dingtalk))
-- [DEPLOYMENT.en.md](DEPLOYMENT.en.md) — the full deployment, when you want scheduled inspection, proactive push into IM, and the inspection dashboard to have data
+- [DEPLOYMENT.en.md](DEPLOYMENT.en.md) — the full deployment, when you want scheduled inspection (with its dashboard) and proactive push into IM
 - [TECHNICAL_DESIGN.en.md](TECHNICAL_DESIGN.en.md) — architecture and design trade-offs

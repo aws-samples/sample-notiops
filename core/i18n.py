@@ -328,16 +328,30 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "❌ Dispatch failed{status}\n```{body}```",
     },
     # Shown when DEFAULT_INVESTIGATION_ACCOUNT_ID is unset, so the bot
-    # has no business account to route the cross-account investigation
-    # to. Directs the user to configure a default in the Dashboard.
+    # has no account to route the investigation to. Both deploy paths
+    # inject it (`createImCore` in infra/lib/constructs/im-core.ts, set to
+    # the deployment account), so reaching this means the IM function's
+    # environment was changed by hand -- the fix is restoring the variable
+    # (set it back to the deployment account ID). A redeploy is not the fix:
+    # with an unchanged template CloudFormation reports "no changes" and the
+    # hand-edited environment stays as it is. There is no
+    # UI for it: the old text pointed at the Dashboard, retired 2026-09-04,
+    # and its "or name a target account" escape does not apply here (these
+    # paths only read the env var, before looking at the request).
     "confirm.no_default_account": {
         "zh": "⚠️ *尚未配置默认调查账号*\n"
-              "请先在 Dashboard 设置默认调查账号(或在指令中指明目标账号),"
-              "之后再 @ 我发起调查。",
+              "这套部署的 IM 函数缺少环境变量 `DEFAULT_INVESTIGATION_ACCOUNT_ID`"
+              "(正常部署会自动设成部署账号),发不起调查。"
+              "请管理员把这个环境变量设回部署账号 ID(手工改过的话,原样重新部署"
+              "不会把它改回来),之后再 @ 我发起调查。",
         "en": "⚠️ *No default investigation account configured*\n"
-              "Please set a default investigation account in the Dashboard "
-              "(or name a target account in your request), then @ me again "
-              "to start an investigation.",
+              "This deployment's IM function is missing the "
+              "`DEFAULT_INVESTIGATION_ACCOUNT_ID` environment variable (a normal "
+              "deployment sets it to the deployment account automatically), so "
+              "no investigation can be started. Ask your administrator to set it "
+              "back to the deployment account ID (redeploying the same version "
+              "does not undo a manual edit), then @ me again to start an "
+              "investigation.",
     },
     # Shown when an investigate-class request is dispatched but live
     # investigation is deferred (2026-06-02 decision — cross-account
@@ -520,8 +534,8 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "*Linked Case* · `{case_display_id}`",
     },
     "report.link_validity": {
-        "zh": "🔗 链接 7 天内有效 · 无需登录控制台即可访问",
-        "en": "🔗 Links valid for 7 days · no console login required",
+        "zh": "🔗 链接数小时内有效（最长约 12 小时）· 无需登录控制台即可访问",
+        "en": "🔗 Links stay valid for a few hours (at most about 12) · no console login required",
     },
     "report.next_steps_header": {
         "zh": "*🤖 建议的下一步*",
@@ -626,11 +640,15 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
     # 的能力介绍，用户真问了个问题、等了 5 分钟、拿到一段自我介绍，只会以为 bot 坏了。
     # 这里如实说「等了多久、为什么、下一步做什么」。
     # ⚠️ 文案里的「5 分钟」对应 core/bedrock_chat.py 的 read_timeout=300；改一处要改两处。
+    # ⚠️ 这里**不点名具体模型**（2026-10-10 起）：原文是「换个出字更快的模型:`@bot model claude`」，
+    # 那是 `claude` 还等于 Sonnet 5 时写的。`claude` 现在挂在 Claude Sonnet 5.5 上，它要部署账号
+    # 接受过 AWS Marketplace 协议，没接受的账号里它恰恰调不通（config/llm-model-catalog.json 里
+    # 它的 _availability_note）。与 runtime 的超时文案（agent-build 的 main.py）同一口径：让用户自己挑。
     "chitchat.model_timeout": {
         "zh": ("⏳ 模型 5 分钟内没有返回内容,这一轮我先停下了。\n"
                "\n通常是问题比较重、模型在做很长的推理。可以试:\n"
                "• 把问题拆小一点(只问一个服务、缩小时间范围)再发一次\n"
-               "• 或换个出字更快的模型:`@bot model claude`\n"
+               "• 或换一个模型再试:`@bot model list` 看有哪些可选,`@bot model <alias>` 切换\n"
                "• 要做长时间排查的话,直接说「排查 …」走深度调查那条路"),
         "en": ("⏳ The model returned nothing within 5 minutes, so I stopped "
                "waiting on this one.\n"
@@ -638,26 +656,40 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
                "doing a long reasoning pass. You can:\n"
                "• Narrow it down (one service, a shorter time range) and send "
                "again\n"
-               "• Or switch to a faster model: `@bot model claude`\n"
+               "• Or switch to a different model and retry: `@bot model list` "
+               "shows the options, `@bot model <alias>` switches\n"
                "• For a genuinely long investigation, say \"investigate …\" to "
                "take the deep-investigation path"),
     },
+    # 下面两条 GPT 兜底文案（2026-10-10 起）给的退路**不一样**，别再写成同一句：
+    #   · gpt.output_blocked：坏的是这一轮的模型输出，凭证没事 → 先给 `@bot model default`。默认模型
+    #     必须在启用集里（BFF 的 validateConfig 与种子脚本的 _sanity_check 都拦「默认未启用」），
+    #     是这时最稳的退路。
+    #   · gpt.auth_failed：先给「找管理员」，换模型的两条写明前提。api_key 模式下这条路径上的每一次
+    #     模型调用用的都是同一把 Key（Converse / InvokeModel 由 core/bedrock_credentials 注入
+    #     AWS_BEARER_TOKEN_BEDROCK，Mantle 由 core/openai_responses_client._sign_and_send 带 Bearer），
+    #     所以 Key 过期 / 被吊销（401）时换成默认模型或 Claude 照样被拒；只有 403（Key 有效、只是不许调
+    #     这个模型，见 llm_config.invalidate_api_key 的说明）换模型才有用。
+    # 两条都照留 `claude`（tests/test_phd_summarizer.py 要求 gpt.auth_failed 里有 `model claude`），但写明
+    # 前提 —— 它现在是 Claude Sonnet 5.5，没接受 Marketplace 协议的部署账号里照着切过去，下一句还是
+    # 调不通（见种子文件里它的 _availability_note）。
     "gpt.output_blocked": {
         "zh": ("⚠️ 当前模型(GPT-5.6 Terra)的本轮输出被审计拦截"
                "(疑似协议碎片或低质 token 混入),已跳过避免给你看到 garbage。\n"
                "\n建议切到稳定模型重试这一句:\n"
-               "• `@bot model claude` → Claude Sonnet 5(内部测试中较稳定)\n"
-               "• `@bot model nova` → Amazon Nova Pro(合规白名单友好)\n"
+               "• `@bot model default` → 回到默认模型\n"
+               "• `@bot model claude` → Claude Sonnet 5.5(内部测试中较稳定;"
+               "需要部署账号已接受它的 AWS Marketplace 协议)\n"
                "\n(所有模型均经 Amazon Bedrock 访问;GPT-5.6 Terra 当前为 experimental,见 USER_GUIDE §15.3。)"),
         "en": ("⚠️ The current model (GPT-5.6 Terra) had its reply blocked by "
                "the output sanitizer this turn (suspected protocol "
                "fragment or low-quality token leak). Skipped so you "
                "don't see garbage.\n"
                "\nTry switching to a stable model and retrying:\n"
-               "• `@bot model claude` → Claude Sonnet 5 (more stable in "
-               "our testing)\n"
-               "• `@bot model nova` → Amazon Nova Pro (compliance-list "
-               "friendly)\n"
+               "• `@bot model default` → back to the default model\n"
+               "• `@bot model claude` → Claude Sonnet 5.5 (more stable in "
+               "our testing; needs the deployment account to have accepted "
+               "its AWS Marketplace agreement)\n"
                "\n(All models are accessed through Amazon Bedrock. "
                "GPT-5.6 Terra is currently experimental, see USER_GUIDE §15.3.)"),
     },
@@ -668,18 +700,27 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
                "这**不是**临时故障,重试不会好 —— 通常是 Bedrock API Key 过期 / 被吊销,"
                "或者这个 Key 被限制了不能调该模型。\n"
                "\n你现在可以:\n"
-               "• `@bot model claude` → 换 Claude Sonnet 5 继续(走另一套调用路径,大概率可用)\n"
-               "• 让管理员到控制台「模型」页检查凭证方式与 Bedrock API Key\n"),
+               "• 让管理员到 Web 端「更多 → 管理 → 模型」检查凭证方式与 Bedrock API Key"
+               "(Key 过期 / 被吊销时只有这一条管用:换哪个模型都一样被拒)\n"
+               "• `@bot model default` → 回到默认模型继续"
+               "(仅当这个 Key 只是不许调 GPT-5.6 Terra 时有用)\n"
+               "• `@bot model claude` → 换 Claude Sonnet 5.5 继续(同上;"
+               "还需要部署账号已接受它的 AWS Marketplace 协议)\n"),
         "en": ("⚠️ Amazon Bedrock rejected this system's credential when calling "
                "the current model (GPT-5.6 Terra).\n"
                "This is **not** a transient error and retrying will not help — "
                "usually the Bedrock API key has expired or been revoked, or that "
                "key is not permitted to invoke this model.\n"
                "\nWhat you can do now:\n"
-               "• `@bot model claude` → switch to Claude Sonnet 5 (a different "
-               "call path, very likely still working)\n"
                "• Ask an administrator to check the credential mode and the "
-               "Bedrock API key on the console's Models page\n"),
+               "Bedrock API key under More → Admin → Models in the web app "
+               "(the only fix when the key has expired or been revoked: every "
+               "model rejects it then)\n"
+               "• `@bot model default` → continue on the default model (only "
+               "helps when the key is merely not allowed to call GPT-5.6 Terra)\n"
+               "• `@bot model claude` → switch to Claude Sonnet 5.5 (same caveat; "
+               "it also needs the deployment account to have accepted its AWS "
+               "Marketplace agreement)\n"),
     },
 
     # -- Slash commands ----------------------------------------------------
@@ -840,7 +881,8 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "⚠️ 切换失败(DDB 写入错误),请稍后再试 —— 当前仍然是原来那个。",
         "en": "⚠️ Switch failed (DDB write error); please try again — still on the previous one.",
     },
-    # ⚠️ 下面这一对（以及 `agent.usage` / `help.row.agent` 那两对）是**孪生文案**：
+    # ⚠️ 下面这一对（以及 `agent.usage` / `help.row.agent` / `agent.starops_not_configured`
+    # 那三对）是**孪生文案**：
     #   · 基线 key = 当前发给客户的那份，**不含 starops**；
     #   · `<key>.multicloud` = 含 starops 的原文，逐字保留。
     # 选哪一份由 `core/multicloud.py` 的 `VISIBLE` 决定（2026-09-15 产品决策：多云先不
@@ -883,16 +925,27 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "⚠️ This deployment has no NotiOps Agent wired in (missing `AGENT_RUNTIME_ARN`), "
               "so the switch was not applied. Still on the DevOps Agent direct path.",
     },
-    # ⚠️ 与 `agent.not_configured` 同一条口径:**拒绝且不写偏好**。这里要说清楚"去哪儿配"
-    # 与"缺的是两样东西",否则客户只填了 AccessKey 就回来重试,又被拒一次。
+    # ⚠️ 与 `agent.not_configured` 同一条口径:**拒绝且不写偏好**。
+    # 孪生文案(见上面 `agent.unknown` 那段注释),2026-10-10 补进 `_TWINNED`:
+    #   · 基线 = 多云关着时发的那份。**不许指路** —— 管理后台的「多云」页在
+    #     `MULTICLOUD_UI = false` 时根本不在左导航里,照着去找是死路(没配阿里云的部署
+    #     手打 `/agent starops` 拿到的就是这一句)。所以只说"暂未开放 + 仍是原来那个";
+    #   · `.multicloud` = 原文,只有路径按**当前**侧栏改过(2026-10-10 起「管理」收进「更多」,
+    #     与 `starops_chat.not_configured_text()` 可见那一支、web 侧同一个落点)。多云翻开时要
+    #     说清楚"去哪儿配"与"缺的是两样东西",否则客户只填了 AccessKey 就回来重试,又被拒一次。
     # 缺**哪一项**的精确话术在 `core/starops_chat.not_configured_text()`(对话时给),
-    # 这里是切换时的拒绝 —— 只给去处,不重复那张表。
+    # 这里是切换时的拒绝 —— `.multicloud` 那份也只给去处,不重复那张表。
     "agent.starops_not_configured": {
-        "zh": "⚠️ 还没配好阿里云 STAROps,切不过去。请到管理后台 →「多云」→ 阿里云,"
+        "zh": "⚠️ 多云暂未开放,切不过去。当前仍然是原来那个 agent。",
+        "en": "⚠️ Multi-cloud is not available yet, so the switch was not applied. "
+              "Still on the previous agent.",
+    },
+    "agent.starops_not_configured.multicloud": {
+        "zh": "⚠️ 还没配好阿里云 STAROps,切不过去。请到 更多 → 管理 →「多云」→ 阿里云,"
               "填好 **AccessKey**(ID + Secret)和 **数字员工 ID**,再切一次。"
               "当前仍然是原来那个 agent。",
         "en": "⚠️ Alibaba Cloud STAROps is not configured yet, so the switch was not applied. "
-              "Go to Admin -> Multi-cloud -> Alibaba Cloud, fill in the **AccessKey** "
+              "Go to More -> Admin -> Multi-cloud -> Alibaba Cloud, fill in the **AccessKey** "
               "(ID + Secret) and the **digital employee ID**, then switch again. "
               "Still on the previous agent.",
     },
@@ -1041,11 +1094,11 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "not selectable right now (single-account mode)",
     },
     "account.list_empty": {
-        "zh": "ℹ️ 目前只有部署账号。要问别的账号,得先在 Web 端的「账号」页面把它上车并启用 —— "
+        "zh": "ℹ️ 目前只有部署账号。要问别的账号,得先在 Web 端「更多 → 管理 → 账户」把它上车并启用 —— "
               "IM 侧只读这份清单,不能在这里上车。",
         "en": "ℹ️ Only the deployment account is available. To ask about others, onboard and enable "
-              "them on the Accounts page in the web app — the bot only reads that list; it can't "
-              "onboard an account here.",
+              "them under More → Admin → Accounts in the web app — the bot only reads that list; "
+              "it can't onboard an account here.",
     },
     "account.locked_note": {
         # **查看**路径用这条（ℹ️，陈述事实）；**切换**路径用 `account.locked_refused`
@@ -1061,11 +1114,11 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "⚠️ Not switched: this deployment is single-account.",
     },
     "account.not_enabled": {
-        "zh": "⚠️ 没切:账号 `{account}` 不在已启用的清单里。请先在 Web 端的「账号」页面"
+        "zh": "⚠️ 没切:账号 `{account}` 不在已启用的清单里。请先在 Web 端「更多 → 管理 → 账户」"
               "把它上车并启用 —— 上车只能在 Web 做,IM 侧只能从已启用的里面选。",
         "en": "⚠️ Not switched: account `{account}` is not in the enabled list. Onboard and enable "
-              "it on the Accounts page in the web app first — onboarding only happens there; here "
-              "you can only pick from what is already enabled.",
+              "it under More → Admin → Accounts in the web app first — onboarding only happens "
+              "there; here you can only pick from what is already enabled.",
     },
     "account.set_chat": {
         "zh": "✅ 已切到账号 `{account}`。本群所有人之后问的都是这个账号。",
@@ -1232,8 +1285,9 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
     # 缓存读写),照样进日志与指标;只是**不渲染到卡片上**。要重新露出来就是在
     # `usage_footer` 里把它拼回去,不需要动链路。
     #
-    # 模型 id 来自 `usage["modelId"]`（`core.llm_config.resolve(alias).model_id`,
-    # 与 agent 侧 `resolve_model_id()` 同一个模块、同一行 DDB 配置）—— 不是硬编码的
+    # 模型 id 来自 `usage["modelId"]`（`core.agent_chat._resolve_model_id`:IM 侧
+    # `core.llm_config.resolve(alias)` 算一遍,再按 runtime 那一端的目录核对一遍 —— 两份
+    # `llm_config` 函数体相同、读同一行 DDB 配置,但各按自己的端过滤目录）—— 不是硬编码的
     # 默认模型名:Admin 换过默认模型、或用户 `/model` 点的那个已被停用而实际回落到别的
     # 模型时,落款必须说**实际生效**的那个,否则就是在跟客户报一个假的模型。
     #
@@ -1243,7 +1297,8 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "Agent: NotiOps | Model: {model}",
         "en": "Agent: NotiOps | Model: {model}",
     },
-    # 拿不到模型 id（配置读失败等）→ 只报 agent，**不许**退成上面那句"无模型消耗"：
+    # 拿不到或报不准模型 id（配置读失败;IM 上点的模型只在 im 上架、runtime 换成默认模型来答;
+    # 这一轮是不调模型的内置回答 `via="builtin"`）→ 只报 agent，**不许**退成上面那句"无模型消耗"：
     # 那是把"不知道"说成"没花钱"。宁可少说一半，也不能说反。
     "router.agent_model_unknown": {
         "zh": "Agent: NotiOps",
@@ -1612,11 +1667,11 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
     # 返回 None）。这句必须说清"没开"，不能含糊：唯一比"开错账号"更糟的是让客户以为
     # 开成功了。
     "case.create.account_refused": {
-        "zh": "⚠️ 没创建:账号 `{account}` 不在可开案例的清单里。请先在 Web 端的「账号」"
-              "页面把它上车并启用,或改选别的账号重新提交。",
+        "zh": "⚠️ 没创建:账号 `{account}` 不在可开案例的清单里。请先在 Web 端「更多 → 管理 → 账户」"
+              "把它上车并启用,或改选别的账号重新提交。",
         "en": "⚠️ Not created: account `{account}` is not in the list of accounts cases "
-              "can be opened in. Onboard and enable it on the Accounts page in the web "
-              "app, or pick a different account and submit again.",
+              "can be opened in. Onboard and enable it under More → Admin → Accounts in "
+              "the web app, or pick a different account and submit again.",
     },
     # 跨账号卡片的账号横幅：list / view / reply / resolve / analyze / 结果卡通用。
     #
@@ -1702,12 +1757,12 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
     # 客户去猜是自己没上车、还是没给权限、还是我们坏了。
     "case.create.fail_cross_account": {
         "zh": "拿不到目标账号的访问凭证,没有开单。可能是:该账号没在 Web 端上车 / 已被停用,"
-              "或跨账号角色还没在该账号里部署。请在 Web 端「账号」页确认后重试;"
+              "或跨账号角色还没在该账号里部署。请在 Web 端「更多 → 管理 → 账户」确认后重试;"
               "也可以先 `account default` 回到部署账号下开单。",
         "en": "Could not obtain credentials for the target account, so nothing was created. "
               "Either the account was never onboarded (or has been disabled) in the web app, "
-              "or its cross-account role is not deployed yet. Check the Accounts page in the "
-              "web app and retry; or run `account default` to open the case under the "
+              "or its cross-account role is not deployed yet. Check More → Admin → Accounts "
+              "in the web app and retry; or run `account default` to open the case under the "
               "deployment account instead.",
     },
     "case.create.fail_support_read_denied": {
@@ -3849,13 +3904,24 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
     # 深度调查的诚实声明。飞书/Slack 的调查卡会**原地刷新**成进度条；钉钉的消息发出
     # 去就改不了了（§4.4），所以必须说清"这里不会自己更新"，否则用户会盯着一条静态
     # 消息等半小时。报告投递是另一条路（`shared/report_delivery`），那条**能**回来。
+    #
+    # 「想看中间进展」**只许指链接，不许教用户发一句话**（2026-10-11）。原先写的是「再问一次
+    # 「调查进展」」/ "ask again for progress"，照着做的结果（`core.nl_router.classify` 离线可复现）：
+    # 「调查进展」不命中任何路由、落进普通对话，答的是一段与这条调查无关的话；「调查 进展」/
+    # "investigation progress" 命中 `/调查` 命令，**再开一条计费的新调查**。这条消息里、这句话
+    # 正下方本来就有一个 Operator App 链接（`dt_messages.dispatch_text` → `live_card.console_link`；
+    # 能发出这句说明 `start_investigation` 成功了，成功就一定有 agent space，链接就一定非空），
+    # 所以指它。只说「Operator App」、不说「本次调查」：拿不到 task_id 时那个链接回落成 Operator
+    # 主页（标签同步换成「🌐 Operator 主页」），两种情况下这句话都得是真的。
+    # 判据：tests/test_im_dingtalk_investigate_ack.py。
     "im.dt.investigate.no_live_progress": {
         "zh": "\n\nℹ️ 钉钉的消息发出后无法原地刷新，所以**这条不会自动更新**。"
-              "报告跑完会自动投回这个会话；想看中间进展就再问一次"
-              "「调查进展」。",
+              "报告跑完会自动投回这个会话；想看中间进展，点下面的链接到 DevOps Agent "
+              "的 Operator App 里看。",
         "en": "\n\nℹ️ DingTalk messages can't be edited after sending, so **this "
               "one won't update itself**. The finished report will be delivered "
-              "back to this conversation; ask again for progress any time.",
+              "back to this conversation; to follow progress in the meantime, use "
+              "the link below — it opens the DevOps Agent Operator App.",
     },
     "im.dt.investigate.snapshot_only": {
         "zh": "\n\nℹ️ 以上是此刻的快照，不会自动刷新 —— 再问一次就是最新的。",

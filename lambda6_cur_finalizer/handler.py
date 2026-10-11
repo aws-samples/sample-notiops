@@ -56,10 +56,80 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+#: 只描述「这一次尝试」的字段。换状态时如果调用方没再给，就必须**清掉** —— 否则 READY 记录
+#: 会带着上一次 DELAYED 的 `note`（「crawler-cfn.yml 尚未交付」）或 FAILED 的 `error`，
+#: 读到的人会以为还没好。其余字段（bucket / report_name / **prefix** / created_at …）一律保留。
+_TRANSIENT_FIELDS = ("note", "error")
+
+
 def _update_status(account_id: str, **fields) -> None:
+    """**合并**写状态记录，不覆盖。
+
+    🔴 原来这里是 `put_item` —— **整条覆盖**。阶段一（cur_provisioner）写 PENDING 时带了
+    `prefix`，而这里写 DELAYED / FAILED 时没传它 ⇒ 第一次 DELAYED 就把 `prefix` 从记录里
+    **抹掉了**。之后每 4 小时一次的自愈规则只传 `account_id`、前缀靠从记录里读 ⇒ 读到空串 ⇒
+    去 `<报告名>/` 下找 `crawler-cfn.yml`,而它实际在 `<前缀>/<报告名>/` 下 ⇒ **永远找不到**,
+    每 4 小时报一次 DELAYED。2026-10-10 在验证账号上实测：AWS 10-09 就把模板投递到了，
+    状态到 10-10 仍是 DELAYED。讽刺的是，这恰好是自愈规则本来要修的那种「静默卡住」。
+
+    改成 `update_item`:只 SET 本次给出的字段，只 REMOVE 过期的瞬时字段。
+    """
     table = _ddb.Table(CONFIG_TABLE)
-    item = {"PK": f"cur-athena-status#{account_id}", "SK": "STATUS", "updated_at": _now_iso(), **fields}
-    table.put_item(Item=item)
+    fields = {"updated_at": _now_iso(), **fields}
+    names, values, sets = {}, {}, []
+    # `status` / `region` 都是 DynamoDB 保留字 —— 一律走占位符,不区分。
+    for i, (k, v) in enumerate(fields.items()):
+        names[f"#k{i}"] = k
+        values[f":v{i}"] = v
+        sets.append(f"#k{i} = :v{i}")
+    removes = []
+    for j, k in enumerate(f for f in _TRANSIENT_FIELDS if f not in fields):
+        names[f"#r{j}"] = k
+        removes.append(f"#r{j}")
+    expr = "SET " + ", ".join(sets)
+    if removes:
+        expr += " REMOVE " + ", ".join(removes)
+    table.update_item(
+        Key={"PK": f"cur-athena-status#{account_id}", "SK": "STATUS"},
+        UpdateExpression=expr,
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=values,
+    )
+
+
+def _resolve_prefix(report_name: str, event_prefix, record_prefix) -> str | None:
+    """CUR 交付前缀:event → 状态记录 → **向 CUR 服务查**(权威来源)。
+
+    为什么需要第三档:在 `_update_status` 修好之前写下的记录,`prefix` 已经被覆盖写抹掉了;
+    方式 B 的 `setup.sh` 写 PENDING 时也**从来没带过** `prefix`。这些记录光靠合并写救不回来,
+    而它们恰恰是自愈规则要救的那一批(T+25h 那次没成功的部署)。
+    所以记录里也没有时,去问 `cur:DescribeReportDefinitions` —— 那是报告定义本身,不是猜。
+
+    ⚠️ 用 `None` 表示「没有」,`""` 是**合法值**(CUR 允许报告直接放在桶根下)。
+    返回 None = 三处都拿不到,调用方应如实报错而不是拿空串去找。
+    """
+    if event_prefix is not None:
+        return event_prefix
+    if record_prefix is not None:
+        return record_prefix
+    try:
+        cur = boto3.client("cur", region_name="us-east-1")  # CUR 的 API 端点只有 us-east-1
+        # 必须翻页：这个 API 一页最多 5 个报告定义，账号里多于 5 个时我们那个可能在后面几页 ——
+        # 只看第一页就会误报「找不到前缀」。
+        kwargs: dict = {}
+        while True:
+            page = cur.describe_report_definitions(**kwargs)
+            for rd in page.get("ReportDefinitions", []):
+                if rd.get("ReportName") == report_name:
+                    return rd.get("S3Prefix", "")
+            if not page.get("NextToken"):
+                break
+            kwargs = {"NextToken": page["NextToken"]}
+    except Exception as exc:  # noqa: BLE001
+        # 只记异常类型名 —— 详情里会带账号号。
+        logger.warning("lambda6_cur_finalizer: describe_report_definitions failed: %s",
+                       type(exc).__name__)
+    return None
 
 
 def _get_status(account_id: str) -> dict | None:
@@ -251,13 +321,82 @@ def handler(event, context):
     account_id = event.get("account_id", "")
     bucket = event.get("bucket", "")
     report_name = event.get("report_name", "")
-    prefix = event.get("prefix", "")
+    # ⚠️ 不给默认值:`None` = 调用方没给,`""` = 调用方明确说「报告在桶根下」。见 _resolve_prefix。
+    event_prefix = event.get("prefix")
+    # 显式调用(setup.sh 同步调用 / T+25h 一次性 schedule)会带全桶名与报告名;
+    # 常驻自愈规则**只**带 account_id。两者的语义不同,见下面守卫 ①。
+    explicit = bool(bucket and report_name)
 
-    if not (account_id and bucket and report_name):
-        # 只记缺失的字段名，不 dump 整个 event（可能含桶名/前缀等路径信息）。
-        _missing = [k for k, v in (("account_id", account_id), ("bucket", bucket), ("report_name", report_name)) if not v]
-        logger.error("lambda6_cur_finalizer: missing required event fields: %s", ",".join(_missing))
-        return {"status": "FAILED", "error": "missing account_id/bucket/report_name in event"}
+    if not account_id:
+        logger.error("lambda6_cur_finalizer: missing required event field: account_id")
+        return {"status": "FAILED", "error": "missing account_id in event"}
+
+    # ── 三道守卫：让这个 handler 可以被**周期性**触发 ────────────────────────────
+    #
+    # 背景：阶段二原来只在 T+25h 被一次性 EventBridge Scheduler 触发一次。那样**不自愈** ——
+    # 那一次如果撞上 AWS 交付晚了、或者 crawler 还没爬完，状态就停在 `DELAYED`，而**再也
+    # 没有下一次**。客户看到的是"装了 CUR 但成本还是走 Cost Explorer"，没有任何报错，
+    # 只能靠有人想起来重跑 setup.sh —— 而「靠有人记得」不是控制手段。
+    # 现在改成 4 小时一次的常驻规则（见 notiops-webchat-standalone-stack.ts 与
+    # notiops-backend-stack.ts），代价是本函数必须能被反复空跑。
+    #
+    # `_get_status` 走的是 DynamoDB **resource** API，取回来就是反序列化好的普通 dict
+    # （不是 `{"S": ...}` 那种低层形状）。读失败时**不要**当成"没有记录" ——
+    # 那会让第一道守卫误判成"客户没选这个功能"而永久静默。读不到就照原路往下走。
+    try:
+        status_item = _get_status(account_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("lambda6_cur_finalizer: status read failed (%s); continuing",
+                       type(exc).__name__)
+        status_item = {"status": "UNKNOWN"}
+    status_item = status_item or {}
+    current = status_item.get("status", "")
+
+    # ① 没有状态记录 **且** 是常驻规则那种只带 account_id 的空跑 = 客户没让 NotiOps 建 CUR。
+    #    什么都不做 —— 否则常驻规则会拿着一个不存在的桶去 list,再写一条 `FAILED` 记录,
+    #    等于给没选这个功能的客户凭空造一个故障态。
+    #
+    #    🔴 「且」字是 2026-10-10 补的。原来只判断「没有记录」,于是方式 B 的「复用客户已有
+    #    CUR」那条路被拦死了:setup.sh 在那条路上**直接**同步调用本函数、调用前**不写**任何
+    #    状态记录,于是这里返回 NOT_PROVISIONED、永远写不出 READY。显式调用带全了桶名与
+    #    报告名,是权威的,必须照做。
+    if not status_item and not explicit:
+        logger.info("lambda6_cur_finalizer: no cur-athena-status record; CUR was not provisioned "
+                    "by NotiOps -- nothing to finalize")
+        return {"status": "NOT_PROVISIONED"}
+
+    # ② 已经 READY = 阶段二早就完成了。**立刻返回**，不要重新发现、更不要重新下发保存查询。
+    #    常驻规则每 4h 敲一次门，READY 之后这就是一次 DDB GetItem 然后结束（成本可忽略）。
+    #    少了这道守卫，它会每 4 小时重跑一遍 crawler 发现 + Athena 写保存查询 —— 那是真实
+    #    的写操作，永远重复执行没有意义，还会把 CloudTrail 刷满。
+    #    🔴 这道守卫必须在 ③ 解析前缀**之前**（2026-10-10 发版前审查补）：v1.0.29 及更早写下的
+    #    READY 记录都没有 `prefix`，原来先解析前缀 —— CUR API 失败一次（或报告定义多于一页、
+    #    我们那个不在第一页），就会把一个好好的 READY 改写成 FAILED，而 BFF 的 CUR 看板只认 READY。
+    if current == "READY":
+        logger.info("lambda6_cur_finalizer: already READY, nothing to do")
+        return {"status": "READY", "unchanged": True}
+
+    # ③ 桶名/报告名以**状态记录为准**，event 里的只是可选提示。
+    #    这很关键：常驻规则是在部署期静态声明的，它**猜不到**桶名 —— 方式 B 可能复用客户
+    #    自己那份 CUR（桶名任意）。而阶段一写的那条记录里就有权威值。
+    #    反过来 setup.sh 同步调用时会把这些字段显式传进来（复用既有 CUR 的场景，那时还
+    #    没有记录），所以 event 优先、记录兜底。
+    bucket = bucket or status_item.get("bucket", "")
+    report_name = report_name or status_item.get("report_name", "")
+    region = event.get("region") or status_item.get("region") or region
+    if not (bucket and report_name):
+        _missing = [k for k, v in (("bucket", bucket), ("report_name", report_name)) if not v]
+        logger.error("lambda6_cur_finalizer: missing %s in both the event and the status record",
+                     ",".join(_missing))
+        return {"status": "FAILED", "error": "missing bucket/report_name"}
+    prefix = _resolve_prefix(report_name, event_prefix, status_item.get("prefix"))
+    if prefix is None:
+        # 三处都拿不到:**不许**拿空串去找(那正是原来那个永远 DELAYED 的缺陷的样子)。
+        logger.error("lambda6_cur_finalizer: CUR prefix unknown (not in event, record, or CUR API)")
+        _update_status(account_id, status="FAILED", bucket=bucket, report_name=report_name,
+                       region=region, error="CUR prefix unknown")
+        return {"status": "FAILED", "error": "CUR prefix unknown"}
+
 
     # 幂等 / 复用快速路：既有 CUR 若已建过 Athena 表（含用户自己做过 Athena 集成的场景），
     # 直接动态发现并落库，跳过 CFN 部署。不依赖任何命名约定。
@@ -269,7 +408,7 @@ def handler(event, context):
     if found:
         logger.info("lambda6_cur_finalizer: discovered existing table %s.%s (partitioned=%s)",
                     found["database"], found["table"], found["partitioned"])
-        _update_status(account_id, status="READY", bucket=bucket, report_name=report_name,
+        _update_status(account_id, prefix=prefix, status="READY", bucket=bucket, report_name=report_name,
                        region=region, athena_database=found["database"],
                        athena_table=found["table"], year_month_partitioned=found["partitioned"])
         _provision_finops_saved_queries(region, found["database"], found["table"])
@@ -282,7 +421,7 @@ def handler(event, context):
         template_key = _find_crawler_template_key(bucket, report_name, prefix)
     except Exception as e:  # noqa: BLE001
         logger.exception("lambda6_cur_finalizer: S3 list failed")
-        _update_status(account_id, status="FAILED", error=f"S3 list failed: {e}",
+        _update_status(account_id, prefix=prefix, status="FAILED", error=f"S3 list failed: {e}",
                         bucket=bucket, report_name=report_name, region=region)
         return {"status": "FAILED", "error": str(e)}
 
@@ -292,9 +431,9 @@ def handler(event, context):
         # 新建 schedule，交给用户重跑 setup.sh 的检测逻辑处理（§setup.sh CUR 检测）。
         logger.warning("lambda6_cur_finalizer: crawler-cfn.yml not found yet under %s/%s/",
                         bucket, report_name)
-        _update_status(account_id, status="DELAYED", bucket=bucket, report_name=report_name,
+        _update_status(account_id, prefix=prefix, status="DELAYED", bucket=bucket, report_name=report_name,
                         region=region,
-                        note="crawler-cfn.yml 尚未交付，重跑 setup.sh 可重新检测/调度")
+                        note="crawler-cfn.yml not delivered yet; NotiOps re-checks every 4 hours automatically")
         return {"status": "DELAYED"}
 
     stack_name = f"notiops-cur-athena-{account_id}"
@@ -308,7 +447,7 @@ def handler(event, context):
         logger.info("lambda6_cur_finalizer: stack %s already exists, treating as in-progress/complete", stack_name)
     except Exception as e:  # noqa: BLE001
         logger.exception("lambda6_cur_finalizer: create_stack failed")
-        _update_status(account_id, status="FAILED", error=f"create_stack failed: {e}",
+        _update_status(account_id, prefix=prefix, status="FAILED", error=f"create_stack failed: {e}",
                         bucket=bucket, report_name=report_name, region=region)
         return {"status": "FAILED", "error": str(e)}
 
@@ -316,7 +455,7 @@ def handler(event, context):
     if not ok:
         logger.error("lambda6_cur_finalizer: stack %s did not reach CREATE_COMPLETE: %s",
                      stack_name, final_status)
-        _update_status(account_id, status="FAILED", error=f"stack status={final_status}",
+        _update_status(account_id, prefix=prefix, status="FAILED", error=f"stack status={final_status}",
                         bucket=bucket, report_name=report_name, region=region,
                         athena_stack_name=stack_name)
         return {"status": "FAILED", "error": final_status}
@@ -337,14 +476,14 @@ def handler(event, context):
 
     if not found:
         logger.warning("lambda6_cur_finalizer: stack %s ready but no CUR table discovered yet", stack_name)
-        _update_status(account_id, status="DELAYED", bucket=bucket, report_name=report_name,
+        _update_status(account_id, prefix=prefix, status="DELAYED", bucket=bucket, report_name=report_name,
                         region=region, athena_stack_name=stack_name,
-                        note="Athena stack 已部署，crawler 尚未产出表，稍后重跑 setup.sh 收尾")
+                        note="Athena stack deployed, crawler has not produced the table yet; NotiOps re-checks every 4 hours automatically")
         return {"status": "DELAYED"}
 
     logger.info("lambda6_cur_finalizer: stack %s COMPLETE, discovered %s.%s (partitioned=%s)",
                 stack_name, found["database"], found["table"], found["partitioned"])
-    _update_status(account_id, status="READY", bucket=bucket, report_name=report_name,
+    _update_status(account_id, prefix=prefix, status="READY", bucket=bucket, report_name=report_name,
                    region=region, athena_stack_name=stack_name, athena_database=found["database"],
                    athena_table=found["table"], year_month_partitioned=found["partitioned"])
     _provision_finops_saved_queries(region, found["database"], found["table"])

@@ -6,10 +6,13 @@
 #   bff.zip                       Web Chat BFF 的 Lambda 代码（含 node_modules）
 #   chat-dist.zip                 前端构建产物（index.html / assets/… 在 zip 根）
 #   web-notif.zip                 「通知」生产端 Lambda（AWS 事件 → Web 收件箱）
-#   im-code.zip                   IM（飞书/Slack）三个 Lambda 的业务代码
+#   im-code.zip                   IM（飞书/Slack/钉钉）Lambda 的业务代码（只取 IM 运行时那几个包，见 build_im_zips.py）
 #   im-layer.zip                  IM 依赖层（lark-oapi + slack-sdk + boto3，manylinux2014）
+#   cost-mcp-code.zip             自建成本 MCP server 的 Lambda 代码（只含 cost_mcp/）
+#   cost-mcp-layer.zip            自建成本 MCP server 的依赖层（带预编译 .pyc）
+#   cur-provisioner.zip           CUR 自建（ProvisionCur=yes）：阶段一 custom resource + 阶段二 finalizer
 #   agent-code.zip                AgentCore Runtime 的 CodeZip（含 linux/aarch64 依赖，~144MB）
-#   SHA256SUMS                    上面六个 zip 的校验和
+#   SHA256SUMS                    上面那些 zip 的校验和（清单见 scripts/artifacts.py）
 #   notiops-webchat.template.json 客户点 "Launch Stack" 打开的那份模板
 #
 # 模板与产物是**一对一绑死**的：tag 进 S3 key、sha256 进模板里的产物清单。
@@ -21,7 +24,7 @@
 # 客户选「只装 web」时 StagerFn 按 `im-` 前缀跳过下载（infra/lambda/stager/index.py），
 # 所以不装 IM 的客户不为这两个 zip 付流量。
 #
-# 六个产物为什么各自这样打：
+# 各产物为什么这样打（清单与顺序见 scripts/artifacts.py）：
 #
 #   · agent-code.zip 用 `agentcore package` 而不是自己 pip vendoring。
 #     AgentCore 托管运行时**不做 pip install**（Step 1 PoC 实测），zip 里必须已经躺着
@@ -120,9 +123,11 @@ echo "  output dir  : $OUT_DIR"
 mkdir -p "$OUT_DIR"
 # 上一轮的产物必须清掉：残留的旧 zip 会被下面的 SHA256SUMS 一起算进去，
 # 于是"清单里混着上一轮的产物"这种状态要到客户开栈时才暴露。
-rm -f "$OUT_DIR/bff.zip" "$OUT_DIR/chat-dist.zip" "$OUT_DIR/web-notif.zip" \
-      "$OUT_DIR/im-code.zip" "$OUT_DIR/im-layer.zip" \
-      "$OUT_DIR/agent-code.zip" "$OUT_DIR/SHA256SUMS" "$TEMPLATE_OUT"
+# 产物名从 scripts/artifacts.py 派生（唯一真源）—— 这里曾经是一份手抄的清单，
+# 漏一个的症状是「上一轮的旧 zip 被这一轮的 SHA256SUMS 一起算进去」。
+ARTIFACT_NAMES="$(python3 "$(dirname "$0")/artifacts.py" all)"
+for _a in $ARTIFACT_NAMES; do rm -f "$OUT_DIR/$_a"; done
+rm -f "$OUT_DIR/SHA256SUMS" "$TEMPLATE_OUT"
 
 # ── 1. 前端 → chat-dist.zip ───────────────────────────────────────────────────
 step "frontend build -> chat-dist.zip"
@@ -177,6 +182,103 @@ python3 scripts/build_web_notif_zip.py --out "$OUT_DIR/web-notif.zip"
 step "im code + deps layer -> im-code.zip / im-layer.zip"
 python3 scripts/build_im_zips.py --out-dir "$OUT_DIR"
 
+# ── 2d. 自建成本 MCP server → cost-mcp-code.zip + cost-mcp-layer.zip ─────────
+# 与 IM 同构地分成 code + layer：依赖层解压 ~64MB，与 1902 行业务代码放一起会让每次
+# 改 Python 都重传整包；而且 Lambda「代码 + 层」解压合计上限 250MB，层是共享依赖的机制。
+# ⚠️ 层必须用 scripts/build_cost_layer.sh 打 —— 它带 manylinux2014 + cp314 的平台参数，
+# 并逐个校验原生扩展的 ABI。直接 pip install 会装成本机（macOS）二进制，
+# 部署成功、Lambda 上 import 崩。
+step "cost mcp code + deps layer -> cost-mcp-code.zip / cost-mcp-layer.zip"
+bash scripts/build_cost_layer.sh
+# mtime 钉死成 1980-01-01，让同一份源码每次打出**逐字节相同**的 zip（sha256 可复现）。
+python3 - "$OUT_DIR" <<'PYZIP'
+import os, sys, zipfile
+out_dir = sys.argv[1]
+FIXED = (1980, 1, 1, 0, 0, 0)
+
+def write_zip(zip_path, root, arc_prefix="", keep_pyc=True, skip_dirs=()):
+    names = []
+    for base, dirs, files in os.walk(root):
+        # skip_dirs:相对 root 的目录，整棵不打（层的 `python/bin`，理由见下面调用处）
+        dirs[:] = [d for d in dirs if os.path.relpath(os.path.join(base, d), root) not in skip_dirs]
+        # ⚠️ 代码 zip（keep_pyc=False）必须剪掉 __pycache__ —— 本机跑过 py_compile / 测试之后 cost_mcp/
+        # 下会有它，实测第一版打出来是 13 个文件而不是 7 个。层（keep_pyc=True）则**刻意保留**：
+        # 预编译是冷启动能低于 10s 的唯一决定性因素（见 build_cost_layer.sh），而 .pyc 恰好**全在**
+        # __pycache__ 里。原来这里不分青红皂白地剪 → 发出去的 cost-mcp-layer.zip 一个 .pyc 都没有
+        # （2026-10-10 发版前审查实测：914 个 .py / 0 个 .pyc），与方式 B 的 fromAsset 不对等。
+        dirs[:] = sorted(d for d in dirs if keep_pyc or d != "__pycache__")
+        for f in sorted(files):
+            if f.endswith(".DS_Store"):
+                continue
+            if keep_pyc is False and f.endswith(".pyc"):
+                continue
+            full = os.path.join(base, f)
+            arc = os.path.join(arc_prefix, os.path.relpath(full, root))
+            names.append((full, arc))
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for full, arc in sorted(names, key=lambda x: x[1]):
+            zi = zipfile.ZipInfo(arc, date_time=FIXED)
+            zi.external_attr = 0o644 << 16
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            with open(full, "rb") as fh:
+                z.writestr(zi, fh.read())
+    return len(names)
+
+
+def write_zip_into(zip_path, root, arc_prefix="", keep_pyc=True):
+    """把第二个目录**追加**进一个已存在的 zip（同一份 mtime / 权限口径）。
+
+    给 cur-provisioner.zip 用：它要同时装 `cur_provisioner/` 和 `lambda6_cur_finalizer/`
+    两个包（两个 handler 共用一个产物）。
+    ⚠️ 用 `"a"` 而不是重新打开写 —— `"w"` 会把前一半截掉，而且不会报错。
+    """
+    names = []
+    for base, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if keep_pyc or d != "__pycache__")   # 同 write_zip
+        for f in sorted(files):
+            if f.endswith(".DS_Store"):
+                continue
+            if keep_pyc is False and f.endswith(".pyc"):
+                continue
+            full = os.path.join(base, f)
+            names.append((full, os.path.join(arc_prefix, os.path.relpath(full, root))))
+    with zipfile.ZipFile(zip_path, "a", zipfile.ZIP_DEFLATED) as z:
+        for full, arc in sorted(names, key=lambda x: x[1]):
+            zi = zipfile.ZipInfo(arc, date_time=FIXED)
+            zi.external_attr = 0o644 << 16
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            with open(full, "rb") as fh:
+                z.writestr(zi, fh.read())
+    return len(names)
+
+n1 = write_zip(os.path.join(out_dir, "cost-mcp-code.zip"), "cost_mcp", "cost_mcp", keep_pyc=False)
+# ⚠️ `python/bin` 不打：pip 装出来的 console-script 包装器第一行是**构建机 venv 的绝对路径**（从主检出
+# 打包时就是本机用户名 + 目录结构），而这个 zip 公开发布；在 Lambda 里它们也毫无用处。IM 层同理
+# （scripts/build_im_zips.py::collect_layer）。末尾的 check_artifacts_no_local_paths.py 是兜底判据。
+n2 = write_zip(os.path.join(out_dir, "cost-mcp-layer.zip"), "lambda_layer_cost", skip_dirs=("python/bin",))
+# 层必须带预编译字节码（与 build_im_layer.sh 对 IM 层的断言同一口径）：.pyc 少于 .py = 方式 A 的
+# 成本 MCP 每次冷启动都要在只读的 /opt 上把整层重新编译一遍。
+with zipfile.ZipFile(os.path.join(out_dir, "cost-mcp-layer.zip")) as _z:
+    _n = _z.namelist()
+    _py = sum(1 for x in _n if x.endswith(".py")); _pyc = sum(1 for x in _n if x.endswith(".pyc"))
+if _pyc < _py:
+    sys.exit(f"cost-mcp-layer.zip: {_py} .py but only {_pyc} .pyc -- the layer must ship precompiled "
+             "bytecode (re-run scripts/build_cost_layer.sh; never prune __pycache__ from a layer)")
+print(f"  cost-mcp-code.zip: {n1} files | cost-mcp-layer.zip: {n2} files")
+
+# ── CUR 自建（方式 A 的 ProvisionCur=yes）→ cur-provisioner.zip ────────────────
+# 两个 handler 打在**同一个 zip** 里：
+#   · `cur_provisioner.custom_resource.handler` = 阶段一（建桶 + 桶策略 + ReportDefinition）
+#   · `lambda6_cur_finalizer.handler.handler`   = 阶段二（AWS 首次交付后部署官方 Athena 集成）
+# 合起来不到 40 KB，拆成两个产物只会让发布清单和 stager 多两条要维护的东西。
+# ⚠️ 没有依赖层：这两段只用 boto3（Lambda 运行时自带）+ 标准库。
+n3 = write_zip(os.path.join(out_dir, "cur-provisioner.zip"), "cur_provisioner",
+               "cur_provisioner", keep_pyc=False)
+n3 += write_zip_into(os.path.join(out_dir, "cur-provisioner.zip"), "lambda6_cur_finalizer",
+                     "lambda6_cur_finalizer", keep_pyc=False)
+print(f"  cur-provisioner.zip: {n3} files")
+PYZIP
+
 # ── 3. Agent → agent-code.zip ────────────────────────────────────────────────
 step "agentcore package -> agent-code.zip"
 AGENT_ZIP="$AGENT_DIR/agentcore/NotiOpsWebChat.zip"
@@ -191,7 +293,7 @@ fi
 cp "$AGENT_ZIP" "$OUT_DIR/agent-code.zip"
 
 # ── 4. 逐个产物验形状 ─────────────────────────────────────────────────────────
-# 六个 zip 都是"内容错了也照样能上传、要等客户开栈甚至打开页面才暴露"的类型。
+# 这些 zip 都是"内容错了也照样能上传、要等客户开栈甚至打开页面才暴露"的类型。
 # 这里在发布前把各自的入口文件钉住。
 step "verify artifact shapes"
 python3 - "$OUT_DIR" <<'PY'
@@ -294,6 +396,69 @@ if so_names:
           f"{so_names[0]} is not an x86_64 ELF (magic={head[:4]!r}, e_machine={head[18:20]!r}) — "
           "rebuild with scripts/build_im_layer.sh (--platform manylinux2014_x86_64)")
 
+# cost-mcp-code.zip / cost-mcp-layer.zip —— 自建成本 MCP server。
+cost_code = names("cost-mcp-code.zip")
+check("cost-mcp-code.zip has the Lambda handler module",
+      "cost_mcp/lambda_handler.py" in cost_code)
+check("cost-mcp-code.zip has the Athena executor", "cost_mcp/athena.py" in cost_code)
+check("cost-mcp-code.zip has the SQL template library", "cost_mcp/sql.py" in cost_code)
+# 只许有 cost_mcp/ —— 资产范围跑偏过一次：`exclude: ["*"]` 里的 `*` 不匹配点文件,
+# 于是 .gitlab-ci.yml / .gitleaks.toml 漏进了会下发到**客户账号**的包里。
+check("cost-mcp-code.zip contains nothing outside cost_mcp/",
+      all(n.startswith("cost_mcp/") for n in cost_code),
+      "unexpected: " + ", ".join(sorted(n for n in cost_code if not n.startswith("cost_mcp/"))[:6]))
+check("cost-mcp-code.zip carries no .pyc", not any(n.endswith(".pyc") for n in cost_code))
+
+# cur-provisioner.zip —— CUR 自建（方式 A 的 ProvisionCur=yes）。两个 handler 一个包。
+cur_prov = names("cur-provisioner.zip")
+check("cur-provisioner.zip has the stage-1 custom resource handler",
+      "cur_provisioner/custom_resource.py" in cur_prov)
+check("cur-provisioner.zip has the CUR spec (shared with setup.sh)",
+      "cur_provisioner/spec.py" in cur_prov)
+check("cur-provisioner.zip has the stage-1 provisioner",
+      "cur_provisioner/provision.py" in cur_prov)
+# ⚠️ 阶段二必须在**同一个** zip 里 —— 一键栈的 CurFinalizerFn 用的就是这个 key,
+# 只是 handler 指向 lambda6。漏了它的症状是部署成功、然后 CUR 永远停在 PENDING。
+check("cur-provisioner.zip has the stage-2 finalizer",
+      "lambda6_cur_finalizer/handler.py" in cur_prov)
+check("cur-provisioner.zip has the FinOps saved queries",
+      "lambda6_cur_finalizer/athena_saved_queries.py" in cur_prov)
+check("cur-provisioner.zip contains nothing else",
+      all(n.startswith(("cur_provisioner/", "lambda6_cur_finalizer/")) for n in cur_prov),
+      "unexpected: " + ", ".join(sorted(
+          n for n in cur_prov if not n.startswith(("cur_provisioner/", "lambda6_cur_finalizer/")))[:6]))
+check("cur-provisioner.zip carries no .pyc", not any(n.endswith(".pyc") for n in cur_prov))
+
+cost_layer = names("cost-mcp-layer.zip")
+check("cost-mcp-layer.zip puts deps under python/", any(n.startswith("python/") for n in cost_layer))
+for pkg in ("mcp", "mangum", "boto3", "botocore", "starlette", "pydantic"):
+    check(f"cost-mcp-layer.zip bundles {pkg}", any(n.startswith(f"python/{pkg}/") for n in cost_layer))
+# ⚠️ 这里**逐个** .so 校验 ABI，比上面 im-layer 那段严：那段只读了 `so_names[0]` 的 ELF 头,
+# 而"是 Linux ELF"与"ABI 版本对得上"是两件事 —— 上游交来的 cost MCP 依赖树里那些 .so
+# 全是 Linux x86_64 的，只是 cp311，在 python3.14 的 Lambda 上照样 ImportError。
+cost_sos = sorted(n for n in cost_layer if n.endswith(".so"))
+check("cost-mcp-layer.zip has native extensions at all", bool(cost_sos))
+if cost_sos:
+    import re as _re
+    with zipfile.ZipFile(out / "cost-mcp-layer.zip") as zf:
+        for so in cost_sos:
+            head = zf.read(so)[:20]
+            check(f"{so.split('/')[-1]} is a Linux x86_64 ELF",
+                  head[:4] == b"\x7fELF" and head[18:20] == b"\x3e\x00",
+                  f"magic={head[:4]!r} e_machine={head[18:20]!r} — rebuild with scripts/build_cost_layer.sh")
+    bad_abi = []
+    for so in cost_sos:
+        base = so.split("/")[-1]
+        if ".abi3." in base:
+            continue          # 稳定 ABI，跨 minor 通用（cryptography 走这条）
+        m = _re.search(r"cpython-(\d+)", base)
+        if m and m.group(1) != "314":
+            bad_abi.append(base)
+    check("cost-mcp-layer.zip native extensions target cpython-314 (or abi3)",
+          not bad_abi,
+          "wrong ABI: " + ", ".join(bad_abi[:6]) + " — scripts/build_cost_layer.sh pins "
+          "--python-version 3.14; a cp311 wheel deploys fine and then ImportErrors on Lambda")
+
 # agent-code.zip —— 托管运行时不 pip install，所以依赖必须是已经躺在包里的
 # linux/aarch64 + cp313 wheel。三条各自对应一种真实的失败：
 #   main.py 不在根          → 运行时找不到 EntryPoint
@@ -315,14 +480,23 @@ if failed:
 print("  all artifact shape checks passed")
 PY
 
+# ── 4b. 公开产物里不许有构建机的本地路径 ─────────────────────────────────────────
+# §2.3 的 comm 核对只管「来自仓库的文件在不在快照里」，看不见第三方包里被构建过程写进去的东西 ——
+# 2026-10-11 发 v1.0.30 前查出：两个依赖层的 console-script 包装器带着构建机 venv 的绝对路径，从主检出
+# 打出来的就是本机用户名。这一步扫**全部**产物的全部文件，命中 $HOME 或仓库根的绝对路径就整条失败。
+step "no builder-local paths in any artifact"
+python3 scripts/check_artifacts_no_local_paths.py "$OUT_DIR"
+
 # ── 5. SHA256SUMS ────────────────────────────────────────────────────────────
 step "SHA256SUMS"
-(cd "$OUT_DIR" && shasum -a 256 bff.zip chat-dist.zip web-notif.zip \
-    im-code.zip im-layer.zip agent-code.zip > SHA256SUMS)
+# 行序与 release notes 校验和段一致（都取 artifacts.py 的 NOTES_ORDER）——
+# 以前两边行序不同，客户对照着看时容易以为漏了一个。shasum -c 对行序不敏感。
+# shellcheck disable=SC2086
+(cd "$OUT_DIR" && shasum -a 256 $(python3 "$PROJECT_ROOT/scripts/artifacts.py" sums) > SHA256SUMS)
 cat "$OUT_DIR/SHA256SUMS"
 
-# ── 5.5 把六个校验和写进 release notes ───────────────────────────────────────
-# 客户唯一能自己核对产物的东西就是 Release 正文里那六行 sha256（模板里烧的是同
+# ── 5.5 把校验和写进 release notes ─────────────────────────────────────────────
+# 客户唯一能自己核对产物的东西就是 Release 正文里那几行 sha256（每个 zip 一行，清单见 scripts/artifacts.py）（模板里烧的是同
 # 一份，栈下载后逐个比对）。到 2026-09-04 发 v1.0.20 为止，这一步是纯手抄：上面
 # 那个 `cat SHA256SUMS` 打出来，人再贴进 notes。抄错一位不会有任何东西报警，
 # 后果出现在**客户账号里**（checksum 不匹配 → 栈 ROLLBACK）。
@@ -334,7 +508,7 @@ step "release notes checksums"
 if [ -f "$NOTES" ]; then
   python3 scripts/write_release_notes_sums.py --sha256 "$OUT_DIR/SHA256SUMS" --notes "$NOTES"
 else
-  echo "  ⚠ 还没有 $NOTES —— 六个校验和**没有**写进任何地方。"
+  echo "  ⚠ 还没有 $NOTES —— 校验和**没有**写进任何地方。"
   echo "    正文写好后（范式见发布手册的「校验和段」一节）补跑一次:"
   echo "      python3 scripts/write_release_notes_sums.py \\"
   echo "        --sha256 $OUT_DIR/SHA256SUMS --notes $NOTES"
@@ -350,15 +524,17 @@ python3 scripts/postprocess_template.py "${POST_ARGS[@]}"
 
 # ── 7. 收尾 ──────────────────────────────────────────────────────────────────
 step "done"
-(cd "$OUT_DIR" && ls -lh bff.zip chat-dist.zip web-notif.zip im-code.zip im-layer.zip \
-    agent-code.zip SHA256SUMS notiops-webchat.template.json)
+# 产物清单从 scripts/artifacts.py 派生（唯一真源）；另外两个不是 zip：校验和与模板。
+# shellcheck disable=SC2086
+(cd "$OUT_DIR" && ls -lh $ARTIFACT_NAMES SHA256SUMS notiops-webchat.template.json)
+FILE_COUNT=$(( $(echo "$ARTIFACT_NAMES" | wc -w | tr -d ' ') + 2 ))
 cat <<EOF
 
-Publish these eight files together (they are cryptographically bound to each other):
+Publish these $FILE_COUNT files together (they are cryptographically bound to each other):
   $OUT_DIR
 
 Next:
-  1. Upload the six zips + SHA256SUMS as assets of release $RELEASE_TAG
+  1. Upload all $(echo "$ARTIFACT_NAMES" | wc -w | tr -d " ") zips + SHA256SUMS as assets of release $RELEASE_TAG
      (or to the S3 prefix you passed as --base-url).
   2. Upload notiops-webchat.template.json to S3 and deploy via --template-url
      (it is larger than CloudFormation's 51,200-byte --template-body limit).

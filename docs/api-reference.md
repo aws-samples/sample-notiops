@@ -119,6 +119,8 @@ CloudFront Function 把其它前缀一律 403）。
 
 ### 1.5 资源巡检
 
+> 只在方式 B（`setup.sh`）上有后端：方式 A（一键部署）上本节全部端点都返回 `inspection_not_deployed`，见 §5.1。
+
 读侧：
 
 | 方法 | 路径后缀 | 说明 |
@@ -322,7 +324,8 @@ ingress Lambda（定义在 `infra/lib/constructs/im-core.ts`）：
 
 `source` / `detail-type` 写错一个字，规则就**永不触发且不报任何错**（这也是那张表必须是
 单一真源、不许各栈各抄一份的原因）。两条部署路径共用同一张表，唯一差别是「怎么关掉某个源」：
-方式 B 用合成期 `-c webNotif<Id>=off`，方式 A 在 EventBridge 控制台上 Disable 那条规则
+方式 B 用合成期 context `"webNotif<Id>": "off"`（写进 `infra/cdk.json` 再重跑 `./setup.sh`，见
+[DEPLOYMENT.md](DEPLOYMENT.md) §8.1），方式 A 在 EventBridge 控制台上 Disable 那条规则
 （发布出去的静态模板没有 context）—— 默认开哪 5 个、规则叫什么名字，两边逐字相同。
 
 ---
@@ -369,27 +372,40 @@ ingress 与 webhook 定义都在 `im-core.ts` 里逐字同源，差的只是一�
 判据与理由写在 `infra/lib/constructs/devops-callback.ts` 的文件头
 （它是那 7 条 detail-type 的单一真源）。
 
-### 5.1 一处**响应内容**上的差异：每日成本异常卡
+### 5.1 **响应内容**上的差异：每日成本异常卡与资源巡检
 
-路由集合两边相同，但有一个能力节点在方式 A 上**不下发**。这是能力树的 `requiresEnv`
-机制今天造成的**唯一**一处路径差异（`config/capabilities.json` 里带 `requiresEnv` 的节点共 5 个，
-另外 4 个见本节末尾）。说清楚是哪一个、为什么：
+路由集合两边相同，但有两个能力节点在方式 A 上**不下发**，都是能力树的 `requiresEnv` 机制造成的
+（`config/capabilities.json` 里带 `requiresEnv` 的节点共 6 个：这 2 个是路径差异，另外 4 个见本节末尾）。
+说清楚是哪两个、为什么：
 
 | | 方式 A（一键 CFN） | 方式 B（setup.sh） |
 |---|---|---|
 | 能力节点 `nav:finops:daily-anomaly` | 不出现在 `GET /me/capabilities` 树里 | 正常出现 |
 | `GET /finops/dashboard` 的 `dailyAnomaly` 顶层字段 | 不在响应里 | 在响应里 |
 | 写侧 | 不装 `notiops-cost-analyzer` 及其定时规则 | 装 |
+| 能力节点 `nav:inspection`（「巡检」tab，连同它下面全部子页） | 不出现在 `GET /me/capabilities` 树里 | 正常出现 |
+| §1.5 的全部 `/inspection/*` 端点（读写都算） | HTTP 200 + `{"ok": false, "code": "inspection_not_deployed", "message": "…"}` | 正常响应 |
+| 写侧 | 不建 `notiops-inspection` 表，也不装巡检那 4 个 Lambda（`notiops-inspection-scheduler` / `-executor` / `-reconciler` / `-push`） | 建 / 装 |
 
-机制：`config/capabilities.json` 给该节点声明了 `"requiresEnv": "COST_ANALYZER_FUNCTION"`，
-而 `web-chat-core.ts` 在静态模板（方式 A）路径上把 BFF 的这个环境变量置空 ——
-变量为空 → 节点从能力树里消失 → 前端不渲染入口，`filterDashboard` 也把响应里那段摘掉。
+机制：`config/capabilities.json` 给 `nav:finops:daily-anomaly` 声明了 `"requiresEnv": "COST_ANALYZER_FUNCTION"`、
+给 `nav:inspection` 声明了 `"requiresEnv": "INSPECTION_TABLE"`，而 `web-chat-core.ts` 在静态模板（方式 A）
+路径上把 BFF 的这两个环境变量都置空 —— 变量为空 → 节点从能力树里消失 → 前端不渲染入口。
+两个节点各有一处要说清：
 
-这是**刻意的，而不是遗漏**：方式 A 的最小底座里没有任何东西在跑那个每日扫描，
-把卡片留着只会让它恒显示「近 3 天没有扫描记录」—— 那才是静默降级。判据与理由写在
-`config/capabilities.json` 该节点的 `_note` 里。
+- `nav:finops:daily-anomaly` 是 subtab，所在的 `GET /finops/dashboard` 两边都有，
+  所以还要 `filterDashboard` 把响应里 `dailyAnomaly` 那段摘掉。
+- `nav:inspection` 是 tab：tab 被摘掉，它下面的子页也一起不下发（`visibleTree` 不会因为子页
+  可见再把 tab 补回来），方式 A 侧栏「更多」里因此根本没有「巡检」。`/inspection/*` 端点由
+  `bff/web-chat/index.mjs` 里一道门（`inspectionConfigured()`）统一挡住，给绕过前端的调用兜底
+  （直接打 API、或浏览器里缓存着旧前端包）：通过鉴权的请求拿到上表那个**诚实的错误码**，
+  而不是 404 —— 端点存在，只是这套部署没装这个后端。没有巡检权限的调用方照旧是 403。
 
-注意与它并排的另一张卡 `nav:finops:anomalies`（AWS Cost Anomaly Detection）**两条路径都有** ——
+这是**刻意的，而不是遗漏**：方式 A 的最小底座里没有任何东西在跑那个每日扫描，也没有巡检表和
+巡检 Lambda。把卡片和 tab 留着只会让前者恒显示「近 3 天没有扫描记录」、后者一点进去就是
+「加载失败 (ddb_error)」—— 那才是静默降级。判据与理由写在 `config/capabilities.json`
+这两个节点的 `_note` / `_note_env` 里。
+
+注意与每日成本异常卡并排的另一张卡 `nav:finops:anomalies`（AWS Cost Anomaly Detection）**两条路径都有** ——
 它是两套不同的引擎，只是需要客户自己先建异常监控器。同理，4 张 CUR sheet
 （`nav:finops` 下 `requiresEnv: COST_AGENT_MCP_URL` 的那几个）在两条路径上都可用，
 它们缺的时候是**客户没配自己的 CUR 数据源**，不是路径差异。

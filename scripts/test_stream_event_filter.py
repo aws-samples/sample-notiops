@@ -16,7 +16,7 @@
 本测试钉住 ① 与 ③ 的判据（③ 的 JS 侧另有 bff/web-chat/tests/agentcore.test.mjs）：
   * bytes 事件必须被丢弃（含未来任何新的带二进制的 chunk —— 兜底靠递归扫描，
     不靠"认识 redactedContent 这个名字"）。
-  * 明文思考链仍要发（{reasoning}），否则前端折叠灰字功能被一起改坏。
+  * 明文思考链仍要发（{reasoning}），否则右侧「思考过程」面板的思考段（thinking.ts::appendReasoning）会被一起改坏（Kimi K3 / GLM 5.3 的思考就靠它）。
   * 正文增量必须原样通过。
   * **两处 stream 循环（主循环 + 寒暄快路径）必须共用同一个出口** —— 原 bug 的成因
     就是快路径自己写了一遍过滤、漏了 reasoning 分支。这条断言防它再次分叉。

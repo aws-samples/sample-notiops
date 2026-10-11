@@ -11,7 +11,8 @@
   · 联网默认 **关**（`/web on` 开）；
   · 卡片页脚换成「Agent: NotiOps | Model: <实际生效的模型 id>」，不能再写「0 token」
     （用量 2026-09-06 起**只统计不显示**，但 `usage` 里照样是实测值 —— 见
-    `_resolve_model_id` 与 `core/i18n.py::router.agent_model`）。
+    `_resolve_model_id` 与 `core/i18n.py::router.agent_model`）。报不准是哪个模型答的
+    （runtime 换了模型、或这一轮是不调模型的内置回答）时只写「Agent: NotiOps」。
 
 ── 为什么是逐语义端口而不是复用 bff ────────────────────────────────────────────
 调用契约（payload 形状、SSE 解析、`runtimeSessionId` 规整、`extract()` 的每一处防御、
@@ -58,20 +59,78 @@ def _safe_err(e: Exception) -> str:
     return f"{type(e).__name__}/{code}" if code else type(e).__name__
 
 
+#: 回答 IM `/agent notiops` 的 runtime 按哪个端过滤模型目录。⚠️ 必须与 agent 树
+#: `agent-build/NotiOpsWebChat/app/NotiOpsWebChat/core/llm_config.py` 的 `_SURFACE` 逐字相等 ——
+#: 那一轮是**它**在挑模型，不是本进程里 `_SURFACE = "im"` 的那份。
+_RUNTIME_SURFACE = "webchat"
+
+
+def _runtime_entry(alias: str, cfg: dict) -> dict | None:
+    """runtime 拿到这个 alias 会用目录里的**哪一条** —— 只拿来核对落款，不拿来报。
+
+    逐条照抄 agent 树 `core/llm_config.py` 的 `_find` → `resolve` → `_default_entry`，只是端换成
+    `_RUNTIME_SURFACE`：按规范 alias / short / legacy 找本端第一条，找到的那条已停用就回落默认
+    （不接着往下找）；默认先取 `default_model`（必须启用），再取本端第一个启用项。改那三个函数
+    时要同步这里。
+    """
+    models = [m for m in (cfg.get("models") or [])
+              if isinstance(m, dict) and _RUNTIME_SURFACE in (m.get("surfaces") or [])]
+    a = (alias or "").strip().lower()
+    if a:
+        for m in models:
+            if (a == m.get("alias") or a == (m.get("short") or "")
+                    or a in (m.get("aliases_legacy") or [])):
+                if m.get("enabled"):
+                    return m
+                break
+    want = str(cfg.get("default_model") or "")
+    for m in models:
+        if m.get("alias") == want and m.get("enabled"):
+            return m
+    for m in models:
+        if m.get("enabled"):
+            return m
+    return models[0] if models else None
+
+
 def _resolve_model_id(alias: str) -> str:
-    """alias（`/model` 那条命令的产物，空 = 走默认）→ **实际生效**的模型 id。
+    """alias（`/model` 那条命令的产物，空 = 走默认）→ 落款要报的模型 id。**报不准就回空串。**
 
-    与 agent 侧 `model/load.py::resolve_model_id()` 是同一个函数体（都只是
-    `llm_config.resolve(alias).model_id`）—— 同一个模块、同一行 DDB 配置，所以这里
-    算出来的就是 runtime 真的加载的那个，含「点的模型被 Admin 停用 → 回落默认」。
+    先用 IM 侧 `core/llm_config.py` 算一遍（与 agent 侧 `model/load.py::resolve_model_id()` 同一个
+    函数体、读同一行 DDB 配置，含「点的模型被 Admin 停用 → 回落默认」），再按 runtime 那一端
+    （`_RUNTIME_SURFACE`）核对：两边挑中同一条目录项、同一个 model id 才报。
 
-    **永不抛**：拿不到就回空串，落款退成只报 agent 名（`router.agent_model_unknown`）。
-    局部 import 是刻意的 —— `core.llm_config` 顶层 `import boto3` 并在首次读配置时
-    建 DDB 资源；不该为了一行落款把它拖进每个 import `core.agent_chat` 的进程。
+    为什么要核对（2026-10-11）：两份 `llm_config` **不是同一个模块**，各按自己的端过滤目录
+    （IM 这份 `_SURFACE = "im"`，runtime 那份 `"webchat"`）。IM 上点了一个**只在 im 上架**的模型
+    （目前是 `gpt_luna`）时，runtime 查不到它、换成它那一端的默认模型来答，IM 这边却照样算出
+    `openai.gpt-5.6-luna` —— 落款报的是一个根本没开口的模型。默认模型只在一端上架、或点的模型
+    已停用而两端回落到的默认不同时，也是同一个问题。核对不上就回空串，落款退成只报 agent 名
+    （`router.agent_model_unknown`）：宁可少说一半，不能说错。`resolve()` 的结果拿不到 alias
+    时不核对（真实的 `ResolvedModel` 一定带 alias）。
+
+    仍然核对不到的：runtime 自己临时换模型（GPT 那条 Mantle 客户端建不起来时回落到非 Mantle
+    模型，见 agent 树 `model/load.py::load_model`），以及两边的配置缓存（各自 60s TTL）不在同一代。
+    根治要让 runtime 在流里报它实际加载的模型。
+
+    **永不抛**：拿不到就回空串。局部 import 是刻意的 —— `core.llm_config` 顶层 `import boto3`
+    并在首次读配置时建 DDB 资源；不该为了一行落款把它拖进每个 import `core.agent_chat` 的进程。
     """
     try:
         from core import llm_config
-        return str(llm_config.resolve(alias or "").model_id or "")
+        got = llm_config.resolve(alias or "")
+        model_id = str(got.model_id or "")
+        picked = str(getattr(got, "alias", "") or "")
+        if model_id and picked:
+            ran = _runtime_entry(alias, llm_config.get_config())
+            ran_id = ""
+            if ran is not None:
+                ran_id = str((ran.get("model_id_override") or {}).get(_RUNTIME_SURFACE)
+                             or ran.get("model_id") or "")
+            if ran is None or ran.get("alias") != picked or ran_id != model_id:
+                logger.info("agent_chat: footer names no model (im=%s runtime=%s)",
+                            picked, (ran or {}).get("alias") or "-")
+                return ""
+        return model_id
     except Exception as e:                            # noqa: BLE001
         logger.warning("agent_chat: model id resolve failed: %s", _safe_err(e))
         return ""
@@ -355,9 +414,11 @@ def _step_text_of(obj) -> tuple[str, str]:
 # 主流程
 # ---------------------------------------------------------------------------
 def consume_stream(body, sink: Sink, *, max_wait_sec: int) -> dict:
-    """吃完一条 SSE 流。返回 `{"status","usage","error"}`。
+    """吃完一条 SSE 流。返回 `{"status","usage","error","via"}`。
 
     `status` ∈ {"completed","timed_out","failed"}。
+    `via` = 流里最后一个非空的答案来源标记（agent 的 `{"via": "builtin"}`：这一轮是内置的
+    确定性回答、没调模型），没有就是空串 —— 与 `agentcore.mjs` 的 `onVia` 同一个口径。
 
     ⚠️ **错误帧后置处理**（与 agentcore.mjs 同一条铁律）：在解析回调里就 raise 会把
     SDK 的迭代器撕开，**丢掉缓冲区里已经到达的后续帧** —— 现网表现是"报错了，但其实
@@ -367,6 +428,7 @@ def consume_stream(body, sink: Sink, *, max_wait_sec: int) -> dict:
     buf = ""
     usage: dict = {}
     runtime_error: dict | None = None
+    via = ""
     timed_out = False
 
     chunks = body.iter_chunks() if hasattr(body, "iter_chunks") else body
@@ -404,12 +466,14 @@ def consume_stream(body, sink: Sink, *, max_wait_sec: int) -> dict:
                         sink.step(t, d)
                 if got["usage"]:
                     usage = got["usage"]
+                if got["via"]:
+                    via = got["via"]
 
     if timed_out:
-        return {"status": "timed_out", "usage": usage, "error": runtime_error}
+        return {"status": "timed_out", "usage": usage, "error": runtime_error, "via": via}
     if runtime_error and not sink.reply.strip():
-        return {"status": "failed", "usage": usage, "error": runtime_error}
-    return {"status": "completed", "usage": usage, "error": runtime_error}
+        return {"status": "failed", "usage": usage, "error": runtime_error, "via": via}
+    return {"status": "completed", "usage": usage, "error": runtime_error, "via": via}
 
 
 def run_agent_chat(text: str, *, locale: str = "en", session_id: str = "",
@@ -512,12 +576,15 @@ def run_agent_chat(text: str, *, locale: str = "en", session_id: str = "",
     # 照样在这个 dict 里 —— 见 `core/i18n.py::router.agent_model` 那段注释）。
     #
     # ⚠️ 为什么在这里解析、而不是在卡片层：`model` 是**这一轮真的发出去**的 alias
-    # （`llm_pref_resolver` 的产物），而 `llm_config.resolve()` 与 agent 侧
-    # `resolve_model_id()` 是同一个模块、读同一行 DDB 配置 —— 所以这里算出来的就是
-    # runtime 实际加载的那个 id，包括「用户点的模型已被 Admin 停用 → 回落默认」这种
-    # 情况。放到卡片层再猜一遍就会漂移，而漂移的症状是**落款报了个假模型**。
-    # 失败只丢这一个字段（落款退成只报 agent 名）—— 报不出模型不该毁掉整张卡。
-    usage["modelId"] = _resolve_model_id(model)
+    # （`llm_pref_resolver` 的产物）。`_resolve_model_id` 拿它在 IM 这边算一遍、再按 runtime
+    # 那一端核对一遍，所以「用户点的模型已被 Admin 停用 → 回落默认」与「只在 im 上架的模型，
+    # runtime 换成它自己的默认来答」这两种情况都不会报错模型。放到卡片层再猜一遍就会漂移，
+    # 而漂移的症状是**落款报了个假模型**。
+    # `via == "builtin"`（agent 的能力快路径：「你是谁」这类问题由内置文案回答，0 token）时
+    # 这一轮**没调模型**，报哪个模型都是把答案来源说错 —— web 端同一条回答署名 "NotiOps"
+    # （frontend 的 `Message.tsx::modelSignature`），这里同样留空。
+    # 报不出、报不准都只丢这一个字段（落款退成只报 agent 名）—— 不该毁掉整张卡。
+    usage["modelId"] = "" if out.get("via") == "builtin" else _resolve_model_id(model)
 
     reply = sink.reply.strip()
     status = out.get("status")

@@ -19,6 +19,7 @@ import type {
   ConfigData, FindingRow, FindingsData, MetricDirection, OverviewData,
   RuleField, ScopeData,
 } from "./api/inspection";
+import { LocaleContext, STRINGS } from "./i18n";
 
 // ⚠️ mock 必须在被测组件 import **之前**生效。vitest 的 `vi.mock` 会被提升，
 //    所以写在这里即可 —— 但工厂函数里不能引用外部变量（提升后还没初始化）。
@@ -3583,11 +3584,40 @@ describe("运维信号可见性", () => {
     expect(screen.getByText(/有 2 条判读不可信/)).toBeTruthy();
     // 光报数与不报的信息量是一样的 —— 要说去哪修
     expect(screen.getByText(/关联进巡检 space/)).toBeTruthy();
+    // 🔴 2026-10-11：「去哪修」必须是一条**照着能点到**的路径。「管理」2026-10-10 起收进侧栏
+    //    「更多」（默认收起），原来那句「去管理页」在一级导航里找不到。路径与落点按钮都从
+    //    STRINGS 取 —— 导航标签改名时这里跟着红，而不是告警里留一条旧路径。
+    const body = screen.getByText(/点开对应 finding 的详情/).textContent || "";
+    const path = [STRINGS["nav.more"].zh, STRINGS["nav.admin"].zh, STRINGS["admin.tab.accounts"].zh].join(" → ");
+    expect(body, "没从「更多」写起").toContain(path);
+    expect(body).toContain(STRINGS["admin.inspxacct.title"].zh);
+    expect(body).toContain(STRINGS["admin.inspxacct.assocBtn"].zh);
     // 分档明细：已验证干净与未验证（存量）分开报，不许合并
     expect(screen.getByText(/已验证干净 13/)).toBeTruthy();
     expect(screen.getByText(/未验证（存量）3/)).toBeTruthy();
     expect(screen.queryByText(/条判读已验证按方法论产出/),
       "报警和全绿行同时出现 —— 自相矛盾").toBeNull();
+  });
+
+  it("★★ D22 en 与 zh 同样三档、同一条路径", async () => {
+    /* 🔴 en 原来只有两档（漏了「读不到 journal」），而且只说 "fixed in the admin page"。
+       `detectLocale()` 默认回 en —— 客户默认看到的正是这一份，而上面那些用例只渲染 zh
+       （不裹 Provider 时 LocaleContext 的默认值是 zh）。 */
+    vi.mocked(api.getInspectionOverview).mockResolvedValue(ovr({
+      gate_quality: { untrusted: 1, degraded: 0, clean: 0, unknown: 0 },
+    }));
+    render(
+      <LocaleContext.Provider value={{ locale: "en", setLocale: () => {} }}>
+        <InspectionDashboard dashboardId="overview" />
+      </LocaleContext.Provider>,
+    );
+    const body = (await screen.findByText(/Open the finding details/)).textContent || "";
+    const path = [STRINGS["nav.more"].en, STRINGS["nav.admin"].en, STRINGS["admin.tab.accounts"].en].join(" → ");
+    expect(body, "没从 More 写起").toContain(path);
+    expect(body).toContain(STRINGS["admin.inspxacct.title"].en);
+    expect(body).toContain(STRINGS["admin.inspxacct.assocBtn"].en);
+    expect(body, "en 漏了「读不到 journal」那一档").toMatch(/unreadable journal/);
+    expect(body).not.toMatch(/admin page/);
   });
 
   it("★★★ D22 只有降级（可信）→ warning，不说「不可信」", async () => {

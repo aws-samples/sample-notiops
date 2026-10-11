@@ -48,7 +48,12 @@ const ZH: GuideBlock[] = [
       "地址是随部署生成的,换个部署就变 —— 别把别人截图里的那串填进去。",
     ],
   },
-  { k: "warn", tx: "没装钉钉的栈没有这个地址(上面会显示取不到,Outputs 里也不会出现 DingtalkWebhookUrl)。一键部署要在参数页的 What to install 里把钉钉选上,然后更新栈;脚本部署重跑 ./setup.sh 选 3) 钉钉。" },
+  // 2026-10-11 改（飞书 / Slack 两份抽屉同一句）：一键部署的 InstallOption 是**单选**
+  // （infra/lib/notiops-webchat-standalone-stack.ts 的 allowedValues 只有 web / web+feishu /
+  // web+slack / web+dingtalk，三个 Install* 条件都是等值判断）。原文「把钉钉选上」读起来像加选 ——
+  // 三个 IM 分页又总是都显示，装着飞书的管理员照这句换了值，更新栈就把正在用的飞书机器人去掉了。
+  // 脚本部署是多选（IM_PLATFORM_CHOICE 逗号分隔），只填新平台的话现网那个会被当成「这次不带」。
+  { k: "warn", tx: "没装钉钉的栈没有这个地址(上面会显示取不到,Outputs 里也不会出现 DingtalkWebhookUrl)。一键部署:参数页的 What to install 选 web+dingtalk,然后更新栈 —— 这一项是单选,一键部署一次只装一个 IM 机器人,从别的机器人换过来会把那个机器人去掉;脚本部署:重跑 ./setup.sh,在「IM 平台选择」那一步把 3) 钉钉选上(已经在用的平台一起选,例如 1,3)。" },
 
   { k: "h", tx: "4. 开 HTTP 模式并填地址" },
   { k: "p", tx: "回到应用的「机器人」页:" },
@@ -89,12 +94,28 @@ const ZH: GuideBlock[] = [
       "卡片上的按钮只能是**链接**:钉钉的 ActionCard 按钮全部是 URL 跳转,没有「点一下回传给服务器」这种交互。所以需要确认的操作(开案例、启动调查)在钉钉里用回复关键词完成。",
       "已发出去的消息改不了:钉钉没有更新消息的接口,所以没有飞书那种「卡片自己变」的进度条,长任务改成追加一两条进度消息。",
       "机器人不能给消息贴表情:所以收到指令时没有 👍 那种「已收到」的即时反馈,取而代之的是一条文字回执。",
-      "群里主动推送要另配一个自定义机器人地址(见第 7 步):机器人自己那条回复通道是钉钉在回调里给的一次性会话地址,只在收到消息后约 90 分钟内有效,做不了「定时主动发」。",
+      // 2026-10-11 改：原文「群里主动推送要另配一个自定义机器人地址(见第 7 步)…做不了「定时主动发」」
+      // 与第 7 步打架、理由也过时了 —— 调查报告早就走服务端 API（dingtalk_sender._deliver_to_chat →
+      // dingtalk_api.send_group / send_oto）投回会话；而这一版没有任何主动推送投钉钉：lambda4_notifier
+      // 与 phd_event_forwarder 只发飞书，push_handler 的 `_push_configured()` 只认没有任何栈设置的
+      // PUSH_TARGET_* / DINGTALK_PUSH_WEBHOOK_URL 环境变量。那一条是本版本的范围、不是平台差异，
+      // 所以在这个「平台差异」列表里要明说，免得读成「钉钉做不到」。
+      "机器人自己的回复通道是一次性的:它是钉钉在回调里给的会话地址,只在收到消息后约 90 分钟内有效。所以调查报告不走它,而是走服务端 API 投回发起调查的那个会话,不用另配。每日通知、Health 和实时事件推送这一版都不投钉钉 —— 这一条是本版本的范围,不是钉钉平台做不到;第 7 步那个自定义机器人地址的用途见第 7 步。",
     ],
   },
 
-  { k: "h", tx: "7. 主动推送（可选）" },
-  { k: "p", tx: "巡检广播、告警、定时报告这类**没人先说话**的推送,钉钉要走「自定义机器人」:群设置 → 智能群助手 → 添加机器人 → 自定义 → 复制它的 Webhook 地址,填进本页的「自定义机器人推送地址」。" },
+  // 2026-10-11 与 i18n.ts 的 `admin.notif.dt.pushUrlHint` 同一次改（理由与代码出处见那条的注释）：
+  // 原文说「巡检广播、告警、定时报告」都走这个地址 —— 告警与定时报告在这一版根本不投钉钉，
+  // 巡检推送也还配不起来；这个地址眼下实际起作用的只有报告回贴的兜底。
+  { k: "h", tx: "7. 自定义机器人推送地址（可选）" },
+  { k: "p", tx: "这个地址是群里另加的「自定义机器人」的 Webhook:群设置 → 智能群助手 → 添加机器人 → 自定义 → 复制它的 Webhook 地址,填进本页的「自定义机器人推送地址」。这一版只有两处会用到它:调查报告回贴的兜底(正常走服务端 API 投回发起调查的会话,投不出去才改发到这个群);以及巡检推送 —— 但巡检只有完整部署(setup.sh)才有,而本版本还没有把群登记成巡检推送目标的途径。每日通知、Health 和实时事件推送都不投钉钉。" },
+  // 「别选加签」与 docs/DEPLOYMENT.md §3.3 第 8 步同一条：dingtalk_sender 的加签密钥只认
+  // DINGTALK_PUSH_WEBHOOK_SECRET(_ARN) 环境变量，哪条部署路径都不设，本页也没有这一格 ⇒ 发出去
+  // 的消息不带签名。「测试凭证」同样不签名，所以选了加签会在那里当场看到拒收。
+  // 另两种安全设置也要说（2026-10-11，与 docs/IM_WEBHOOK_SETUP.md §3.7 那段 ⚠️ 同口径）：只写「别选
+  // 加签」，客户自然会选「自定义关键词」，而「测试凭证」那条测试消息里有 NotiOps —— 测试通过、
+  // 真实报告却投不进去，这正是最难查的那种失败。
+  { k: "warn", tx: "添加自定义机器人时,安全设置别选「加签」:这一版没有地方保存加签密钥,我们发出去的消息不带签名,会被钉钉拒收(填好地址后点「测试凭证」会显示推送地址拒收了那条消息)。另两种也保证不了投递:「自定义关键词」要求每条消息都含那个词,而我们发出的报告不保证含有 ——「测试凭证」那条测试消息里有 NotiOps,所以它通过不代表真实报告也能投进去;「IP 地址(段)」要固定的出口 IP,而我们没有。这个地址眼下实际用到的只有调查报告回贴的兜底(见上),所以这一项可以留空。" },
   { k: "warn", tx: "那串地址**本身就是凭证** —— 谁拿到都能往这个群发消息。所以本页只回显后 4 位、只接受 https://oapi.dingtalk.com/robot/send 这一个形态,日志里也不会出现它。别贴到工单或截图里。" },
   { k: "p", tx: "群里 @机器人 的问答**不需要**这一项 —— 那条路用钉钉回调里带的一次性会话地址,不需要任何额外配置。留空即可。" },
   { k: "p", tx: "填好后点「测试凭证」:它先用 AppKey / AppSecret 换一次 access token(凭证是否正确的权威判据),填了推送地址的话再往那个群真发一条。钉钉**没有**「往任意群发测试消息」的接口,所以没填推送地址时测试只验凭证、什么都不发 —— 那时要端到端验证,请回第 5 步在群里 @ 一句。" },
@@ -129,7 +150,7 @@ const EN: GuideBlock[] = [
       "The URL is generated per deployment and differs between deployments — never paste the one from somebody else's screenshot.",
     ],
   },
-  { k: "warn", tx: "A stack deployed without DingTalk has no such URL (the box above will say it could not be found, and there is no DingtalkWebhookUrl output either). For one-click deployment, include DingTalk under \"What to install\" and update the stack; for script deployment, re-run ./setup.sh and pick 3) DingTalk." },
+  { k: "warn", tx: "A stack deployed without DingTalk has no such URL (the box above will say it could not be found, and there is no DingtalkWebhookUrl output either). For one-click deployment, pick web+dingtalk under \"What to install\" on the parameters page and update the stack — it is a single choice, so a one-click stack runs one IM bot at a time and switching from another bot removes that bot; for script deployment, re-run ./setup.sh and pick 3) DingTalk at the IM Platform Selection step (also pick the platforms you already use, e.g. 1,3)." },
 
   { k: "h", tx: "4. Switch to HTTP mode and paste the URL" },
   { k: "p", tx: "Back on the app's Robot page:" },
@@ -170,12 +191,13 @@ const EN: GuideBlock[] = [
       "Card buttons can only be LINKS: every DingTalk ActionCard button is a URL jump — there is no \"click posts back to the server\" interaction. Actions that need confirmation (opening a case, starting an investigation) are therefore confirmed by replying with a keyword.",
       "Sent messages cannot be edited: DingTalk has no message-update API, so instead of Feishu's self-updating card there are one or two appended progress messages for long tasks.",
       "Robots cannot add reactions: there is no 👍-style instant acknowledgement when a command is received; a short text receipt takes its place.",
-      "Proactive pushes into a group need a separate custom-robot URL (step 7): the robot's own reply channel is a one-time session webhook that DingTalk hands us in the callback, valid for roughly 90 minutes after a message — it cannot carry scheduled pushes.",
+      "The robot's own reply channel is one-time: it is a session webhook that DingTalk hands us in the callback, valid for roughly 90 minutes after a message. Investigation reports therefore do not use it; they go back to the conversation that started them through the server API, with nothing extra to configure. The daily notification, Health and real-time event pushes are not sent to DingTalk in this release — that is this release's scope, not a DingTalk platform limit; for what the custom-robot URL in step 7 is used for, see step 7.",
     ],
   },
 
-  { k: "h", tx: "7. Proactive push (optional)" },
-  { k: "p", tx: "For pushes nobody asked for first — inspection broadcasts, alerts, scheduled reports — DingTalk requires a \"custom robot\": Group settings → Group assistant → Add robot → Custom → copy its webhook URL and paste it into the Custom-robot push URL field on this page." },
+  { k: "h", tx: "7. Custom-robot push URL (optional)" },
+  { k: "p", tx: "This is the webhook of a separate DingTalk \"custom robot\" added to the group: Group settings → Group assistant → Add robot → Custom → copy its webhook URL and paste it into the Custom-robot push URL field on this page. In this release only two things use it: the fallback for investigation reports (they normally go back to the conversation that started them through the server API, and land in this group only when that fails), and inspection push — but inspection exists only on the full (setup.sh) deployment, and this release has no way yet to register a group as an inspection push target. The daily notification, Health and real-time event pushes are not sent to DingTalk." },
+  { k: "warn", tx: "When adding the custom robot, do not pick 加签 (HMAC sign) as its security setting: this release has nowhere to store the signing secret, so the messages we send carry no signature and DingTalk rejects them (after filling in the URL, Test credentials reports that the push webhook rejected the message). The other two cannot guarantee delivery either: a custom keyword must appear in every message, and the reports we send are not guaranteed to contain it — the Test credentials message contains NotiOps, so a passing test does not prove that real reports get through; an IP address (range) needs a fixed egress IP, which we do not have. In practice this URL is only used today as the fallback for investigation reports (see above), so you can leave it empty." },
   { k: "warn", tx: "That URL IS a credential — anyone holding it can post into that group. So this page only echoes its last 4 chars, accepts only the https://oapi.dingtalk.com/robot/send shape, and never logs it. Do not paste it into tickets or screenshots." },
   { k: "p", tx: "In-chat Q&A does NOT need this field — that path uses the one-time session webhook from DingTalk's own callback and needs no extra configuration. Leaving it empty is fine." },
   { k: "p", tx: "Once filled, click Test credentials: it first fetches one access token with the AppKey/AppSecret (the authoritative credential check), then, if a push URL is set, posts a real message to that group. DingTalk has NO API to post a test message into an arbitrary group, so with no push URL configured the test only validates credentials and sends nothing — to verify end to end in that case, go back to step 5 and @mention the robot." },

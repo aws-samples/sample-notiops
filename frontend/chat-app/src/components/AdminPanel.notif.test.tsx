@@ -17,6 +17,9 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, cleanup, waitFor, fireEvent } from "@testing-library/react";
 
 import { STRINGS } from "../i18n";
+import { FEISHU_GUIDE } from "../content/feishuGuide";
+import { DINGTALK_GUIDE } from "../content/dingtalkGuide";
+import { SLACK_GUIDE } from "../content/slackGuide";
 
 /** 后端回来的形态：敏感字段已脱敏（空 = 未配置 → 空串，见 bff/web-chat/feishu_config.mjs）。
  *  `webhook_url` 是**只读**回带字段，不脱敏（它是公开入口地址，不是凭证）。 */
@@ -653,4 +656,32 @@ describe("Admin「集成 IM」Slack 分页", () => {
     expect(body).not.toContain("DingtalkWebhookUrl");
     expect(document.querySelectorAll(".imd-body .imd-h").length).toBe(7);
   });
+});
+
+/**
+ * 三份 IM 抽屉里「没装这个平台怎么办」那一句（2026-10-11）。
+ *
+ * 🔴 一键部署的 What to install（InstallOption）是**单选**：allowedValues 只有 web / web+feishu /
+ *    web+slack / web+dingtalk，三个 Install* 条件都是等值判断（infra/lib/notiops-webchat-standalone-stack.ts）。
+ *    原文写成「勾上 Slack」「把钉钉选上」/ "include Slack"，读起来是加选 —— 而三个 IM 分页总是都显示，
+ *    装着飞书的管理员照 Slack / 钉钉分页那句换了值，更新栈就把正在用的飞书机器人去掉了。
+ *    Slack 那份还写着参数页上根本没有的「安装哪些能力」。
+ * 纯内容断言（不渲染）：两种语言都要扫 —— 渲染断言只看得到默认的 zh。
+ */
+
+describe("三份 IM 抽屉：一键部署的 What to install 是单选", () => {
+  const guides = { feishu: FEISHU_GUIDE, dingtalk: DINGTALK_GUIDE, slack: SLACK_GUIDE } as const;
+  for (const [platform, guide] of Object.entries(guides)) {
+    for (const loc of ["zh", "en"] as const) {
+      it(`${platform} / ${loc}：给出确切取值并说明换选会去掉当前那个机器人`, () => {
+        // JSON.stringify 是为了连 items[] / rows[] 里的字一起扫到（同 AdminPanel.aliyun.test.tsx）。
+        const txt = JSON.stringify(guide[loc]);
+        expect(txt, "没用参数页上的真实标签").toContain("What to install");
+        expect(txt, "没给确切取值").toContain(`web+${platform}`);
+        expect(txt, "没说这一项是单选").toContain(loc === "zh" ? "单选" : "single choice");
+        expect(txt, "参数页上没有这个字样").not.toContain("安装哪些能力");
+        expect(txt, "读成加选").not.toMatch(/勾上 Slack|What to install 里把钉钉选上|include (Slack|DingTalk) under/);
+      });
+    }
+  }
 });

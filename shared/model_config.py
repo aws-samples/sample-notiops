@@ -1,8 +1,14 @@
 """Bot 模型 ID 动态配置 — SSM Parameter + TTL 缓存。
 
-Dashboard「AI 助手模型」页面写入 SSM `/notiops/agent/model_id`,
-本模块提供 `get_bot_model_id()` 供 ECS bot 的所有 Bedrock 调用点使用。
-TTL 300 秒(5 分钟),Dashboard 改模型后最多 5 分钟自动生效,无需重启容器。
+本模块提供 `get_bot_model_id()`,给 IM bot 的内部小任务(意图分类 / 下一步建议 / 进度卡 /
+案例分类与分析 / skill 派发,经 `core/bot_llm.py`)挑 Bedrock 模型 —— **不是**对话模型。
+
+SSM `/notiops/agent/model_id` 由 CDK 写入(`infra/lib/notiops-backend-stack.ts` 的
+`AgentModelIdParam`;方式A 的一键栈不建这个参数,读到 ParameterNotFound 就落到下面
+Fallback 链的后两级)。旧 Dashboard「AI 助手模型」页随旧管理台 2026-09-04 退役之后,
+**没有任何网页再写它**:Web Chat「更多 → 管理 → 模型」写的是 DynamoDB `llmcfg`
+(对话模型目录),不是这个参数。手工改 SSM 的话 TTL 300 秒(5 分钟)内自动生效、
+无需重启;但模板里这个值变了的那次升级,会按模板值把它写回去。
 
 Fallback 链:SSM → 环境变量 BEDROCK_MODEL_ID → hardcoded default。
 SSM 读取失败(网络/权限)时 fail-open 用 fallback,不阻塞请求。
@@ -17,7 +23,7 @@ import boto3
 logger = logging.getLogger("shared.model_config")
 
 _SSM_PARAMETER = "/notiops/agent/model_id"
-# `global.*` —— 与 CDK 写入 SSM 的值（global.xai.grok-4.6）一致。
+# `global.*` —— 与 CDK 写入 SSM 的值（global.moonshotai.kimi-k3）一致。
 # 此前这里是 us.*，只有在 SSM 与 env 都缺失时才暴露，属于隐蔽的地理路由分叉。
 #
 # 历史约束已解除（留着，因为它解释了为什么这个默认值长期落后于模型目录）：本函数的
@@ -26,12 +32,13 @@ _SSM_PARAMETER = "/notiops/agent/model_id"
 # skill_authoring，随 skill 能力从 IM 侧退役而删除），它们原先各自手搓
 # Anthropic 原生 body，所以这里**必须**是 Claude，换非 Claude 模型 = ValidationException。
 # 2026-09-01 那几处已统一到 core/bot_llm.py → shared/llm_provider.py::invoke_llm
-# （Bedrock Converse），于是这个默认值跟随目录 default_model 改成 Grok 4.6。
+# （Bedrock Converse），于是这个默认值跟随目录 default_model 改成 Grok 4.6；
+# 2026-10-10 目录默认换成 Kimi K3，这里随之改成下面这行的 `global.moonshotai.kimi-k3`。
 #
 # ⚠️ 仍不能填只在 bedrock-mantle 上架的模型（GPT-5.6 系列）：`core/bot_llm.py` 恒走
 # Converse，不按 model_id 猜协议。见 core/llm_pref_resolver.py 与
 # infra/lib/notiops-backend-stack.ts 的 AgentModelIdParam 注释（spec R8）。
-_ENV_DEFAULT = os.environ.get("BEDROCK_MODEL_ID", "global.xai.grok-4.6")
+_ENV_DEFAULT = os.environ.get("BEDROCK_MODEL_ID", "global.moonshotai.kimi-k3")
 _CACHE_TTL = 300  # 5 分钟
 
 _cached_model_id: str | None = None
@@ -41,7 +48,7 @@ _cached_ts: float = 0.0
 def get_bot_model_id() -> str:
     """返回当前应使用的 Bedrock 模型 ID。
 
-    优先级:SSM Parameter(Dashboard 设置)→ 环境变量 → hardcoded default。
+    优先级:SSM Parameter(CDK 写入)→ 环境变量 → hardcoded default。
     带 5 分钟 TTL 缓存,热路径零延迟。
     """
     global _cached_model_id, _cached_ts

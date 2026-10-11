@@ -69,7 +69,10 @@ const ZH: GuideBlock[] = [
       "地址是随部署生成的，换个部署就变 —— 别把别人截图里的那串填进去。",
     ],
   },
-  { k: "warn", tx: "只装了 web 的栈没有这个地址（上面会显示取不到，Outputs 里也不会出现 FeishuWebhookUrl）。一键部署要在参数页的 What to install 选 web+feishu，然后更新栈。" },
+  // 2026-10-11 改（与钉钉 / Slack 两份抽屉同一句，理由见 dingtalkGuide.ts 那条注释）：一键部署的
+  // What to install 是单选，换选会去掉当前那个机器人；原文只说「选 web+feishu」，装着 Slack /
+  // 钉钉的栈照做就把它们去掉了。原文也没给脚本部署的做法，顺手补上。
+  { k: "warn", tx: "没装飞书的栈没有这个地址（上面会显示取不到，Outputs 里也不会出现 FeishuWebhookUrl）。一键部署：参数页的 What to install 选 web+feishu，然后更新栈 —— 这一项是单选，一键部署一次只装一个 IM 机器人，从别的机器人换过来会把那个机器人去掉；脚本部署：重跑 ./setup.sh，在「IM 平台选择」那一步把 1) 飞书选上（已经在用的平台一起选，例如 1,3）。" },
 
   { k: "h", tx: "4. 事件配置" },
   { k: "p", tx: "事件与回调 → 事件配置:" },
@@ -115,7 +118,10 @@ const ZH: GuideBlock[] = [
   },
 
   { k: "h", tx: "7. 推送群组（出方向）" },
-  { k: "p", tx: "本页的「推送群组 Chat ID」只管**出方向**:每日报告、告警推送、调查回调发到这些群。把机器人拉进群后取群的 oc_ 开头 chat id 填进来，点「测试」会真发一条消息过去。" },
+  // 2026-10-11 与 i18n.ts 的 `admin.notif.chatIdsHint` 同一次改（理由与代码出处见那条的注释）：
+  // 原文「每日报告、告警推送、调查回调」三样里两样不对。块是纯文本渲染，原文 `**出方向**` 的星号
+  // 会原样显示，顺手去掉。
+  { k: "p", tx: "本页的「推送群组 Chat ID」只管出方向:每日运维通知(每天 02:00 UTC)和 AWS Health 事件通知发到这些群 —— 这两样只有完整部署(setup.sh)才有,一键部署里这份列表收不到任何推送。调查结果回贴发起调查的那个会话,不发到这里;巡检推送也不读这份列表。把机器人拉进群后取群的 oc_ 开头 chat id 填进来，点「测试」会真发一条消息过去。" },
   { k: "p", tx: "群里 @机器人 的收方向不用在这里登记 —— 那由第 4 步的事件订阅决定。" },
 ];
 
@@ -160,7 +166,7 @@ const EN: GuideBlock[] = [
       "The URL is generated per deployment and differs between deployments — never paste the one from somebody else's screenshot.",
     ],
   },
-  { k: "warn", tx: "A web-only stack has no such URL (the box above will say it could not be found, and there is no FeishuWebhookUrl output either). For one-click deployment, pick web+feishu under \"What to install\" on the parameters page and update the stack." },
+  { k: "warn", tx: "A stack deployed without Feishu has no such URL (the box above will say it could not be found, and there is no FeishuWebhookUrl output either). For one-click deployment, pick web+feishu under \"What to install\" on the parameters page and update the stack — it is a single choice, so a one-click stack runs one IM bot at a time and switching from another bot removes that bot; for script deployment, re-run ./setup.sh and pick 1) Feishu at the IM Platform Selection step (also pick the platforms you already use, e.g. 1,3)." },
 
   { k: "h", tx: "4. Event configuration" },
   { k: "p", tx: "Events & Callbacks → Event configuration:" },
@@ -206,7 +212,7 @@ const EN: GuideBlock[] = [
   },
 
   { k: "h", tx: "7. Target group chats (outbound)" },
-  { k: "p", tx: "The \"Target group chat IDs\" field on this page is outbound only: daily reports, alert pushes and investigation callbacks are delivered to these chats. Add the bot to a chat, copy the chat's oc_-prefixed id here, and click Test to send a real message." },
+  { k: "p", tx: "The \"Target group chat IDs\" field on this page is outbound only: the daily notification (02:00 UTC) and AWS Health event notifications are delivered to these chats. Both exist only on the full (setup.sh) deployment — on a one-click deployment this list receives nothing. Investigation results are posted back to the conversation that started them, not here, and inspection push does not read this list. Add the bot to a chat, copy the chat's oc_-prefixed id here, and click Test to send a real message." },
   { k: "p", tx: "Inbound (@mentioning the bot in a chat) needs no entry here — that is driven by the event subscription from step 4." },
 ];
 

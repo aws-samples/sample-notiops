@@ -1,6 +1,6 @@
 /**
  * 「谁来答这一轮」记忆里 STAROps 那一支在**多云翻开时**的主题口径（convMode.ts 的
- * `restorableMode`）。
+ * `restorableMode`，以及拉历史后按 `via` 回锁的 `relockFromHistory`）。
  *
  * 为什么必须单独一个文件：`convMode.test.ts` 跑的是真开关（2026-09-15 起 `MULTICLOUD_UI`
  * 关着），它钉的是「一律 off」这件事本身；而 vitest 的 `vi.mock` 是**整文件生效**的 ——
@@ -22,7 +22,7 @@ import { describe, it, expect, vi } from "vitest";
 
 vi.mock("./featureFlags", () => ({ MULTICLOUD_UI: true }));
 
-import { restorableMode } from "./convMode";
+import { restorableMode, relockFromHistory } from "./convMode";
 
 describe("恢复前的主题闸门：多云翻开时的 STAROps", () => {
   it("只在 general 恢复（topic 缺失按 general）", () => {
@@ -44,5 +44,29 @@ describe("恢复前的主题闸门：多云翻开时的 STAROps", () => {
     expect(restorableMode("investigate", "direct")).toBe("direct");
     expect(restorableMode("general", "direct")).toBe("off");
     expect(restorableMode("investigate", "agent")).toBe("off");
+  });
+});
+
+describe("拉历史后的回锁：多云翻开时的 STAROps（relockFromHistory）", () => {
+  const h = (...vias: (string | undefined)[]) => vias.map((via) => ({ via }));
+
+  it("通用会话里有 STAROps 回复 → 锁回 STAROps", () => {
+    expect(relockFromHistory("general", h(undefined, "starops"))).toBe("starops");
+    expect(relockFromHistory(undefined, h("starops"))).toBe("starops");
+  });
+
+  it("两种 via 都有 → STAROps 优先（与 modeOf / BFF 的一选一同序）", () => {
+    expect(relockFromHistory("general", h("devops-agent", "starops"))).toBe("starops");
+  });
+
+  it("别的主题一律不动", () => {
+    for (const topic of ["investigate", "cost", "finops", "cases", "whats-new"]) {
+      expect(relockFromHistory(topic, h("starops")), topic).toBeNull();
+    }
+  });
+
+  it("翻开多云不影响 DevOps 那条", () => {
+    expect(relockFromHistory("general", h("devops-agent"))).toBe("chat");
+    expect(relockFromHistory("general", h(undefined))).toBeNull();
   });
 });

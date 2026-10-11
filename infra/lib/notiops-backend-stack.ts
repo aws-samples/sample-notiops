@@ -1,18 +1,24 @@
 /**
- * AWS 资源闲置检测与优化系统 — CDK Stack（全自动版）。
+ * NotiOps 后端栈 —— 方式 B（`./setup.sh`）部署的主栈。方式 A（一键部署）不建它，
+ * 用的是 notiops-webchat-standalone-stack.ts。
  *
- * 一键部署所有资源：
- * - DynamoDB Tables (conversations / metrics / config)
- * - SNS Topic
- * - Cognito User Pool + 默认管理员用户
- * - Lambda1 (Collector)、Lambda2 (Analyzer)、API Lambda
- * - API Gateway REST API + Cognito Authorizer
- * - EventBridge 定时规则
- * - S3 + CloudFront 前端托管（自动注入后端配置）
+ * 主要资源：
+ * - DynamoDB Tables (conversations / metrics / inspection / config)
+ * - SNS Topic（告警 / 巡检运维告警 / PHD 事件聚合）
+ * - Cognito User Pool + 角色分级用的 group（Web Chat 登录；第一个管理员由 setup.sh 建）
+ * - Lambda：Notifier / CostAnalyzer / CurFinalizer、资源巡检（scheduler / executor /
+ *   reconciler / push）、DevOps Agent 回调、实时推送、Web 通知、PHD 转发
+ *   （PHD 的 topic 与转发 Lambda 可用 -c skipPhd=true 跳过）
+ * - DevOps Agent Space（排障、巡检各一个）+ Custom Event Bus + EventBridge 定时 / 事件规则
+ * - 共享数据桶 + 报告 CDN（CloudFront，只暴露 reports/*）
  * - 管理账户 IdleDetectionRole（跨账户采集用）
+ *
+ * 老控制台那一套（API Gateway REST API + API Lambda + S3/CloudFront 前端托管）与
+ * Lambda1/2/3 已于 2026-09-04 退役；下文注释里残留的这些名字，指的都是已退役的部件。
  */
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
+import { curFinalizerPolicyStatements } from "./constructs/cur-finalizer-policy";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as apigateway from "aws-cdk-lib/aws-apigateway";
 import * as cognito from "aws-cdk-lib/aws-cognito";
@@ -64,7 +70,7 @@ import {
 
 export class NotiOpsBackendStack extends cdk.Stack {
   public readonly dataBucketName: string;
-  // 暴露给 WebChatStack：web chat 与控制台共享同一个 Cognito 池
+  // 暴露给 WebChatStack：web chat 登录用的就是本栈这个 Cognito 池（老控制台已于 2026-09-04 退役，池现在只服务 web chat）
   public readonly userPoolId: string;
   public readonly userPoolClientId: string;
   // 报告分发 CDN 域名（CloudFront+OAC，只暴露 dataBucket 的 reports/*）——
@@ -88,9 +94,14 @@ export class NotiOpsBackendStack extends cdk.Stack {
     // ─── 多账号(Organizations)模式 ───
     // -c organizationId=o-xxxx 时启用：
     //   1. 不注入 LOCKED_ACCOUNT_ID（解锁 shared/account_scope.py 闸门，恢复多账号采集/调查）
-    //   2. Custom Bus / PHD SNS Topic 的 Resource Policy 用 aws:PrincipalOrgID 整组放行，
-    //      替代逐账号白名单（实际采集范围仍由 config 表 enabled 账号控制）
-    //   3. API Lambda 获得 StackSets/Organizations 权限，支撑控制台一键接入
+    //   2. PHD SNS Topic 的 Resource Policy 用 aws:PrincipalOrgID 整组放行，
+    //      替代逐账号允许清单（实际采集范围仍由 config 表 enabled 账号控制）。
+    //      Custom Event Bus 的策略不看 org、两种模式同一份 —— 为什么不加 aws:PrincipalOrgID
+    //      见下面 DevOpsAgentEventBusPolicy 处
+    //   3. 建 CloudWatch OAM Sink（或用 -c oamSinkArn 复用已有的），成员账号经 oam:Link 共享观测数据
+    // 成员账号一键接入（Web Chat「更多 → 管理 → 账户」）要的 StackSets/Organizations 权限不在本栈：
+    // 由 Web Chat BFF 持有，见 constructs/web-chat-core.ts 的 OrgOnboardStackSets /
+    // OrgOnboardListAccounts（同一个 -c organizationId 开关）。
     // 未设置时保持 v1 单账号锁定行为，完全向后兼容。
     const organizationId = (this.node.tryGetContext("organizationId") as string | undefined)?.trim() || "";
     const orgMode = organizationId.length > 0;
@@ -259,10 +270,11 @@ export class NotiOpsBackendStack extends cdk.Stack {
     });
 
     // ─── 角色分级（认证统一、授权分级）───
-    // 同一个池既服务 web chat 又服务控制台；用 group 区分能干什么：
-    //   admin  → 可进控制台改阈值/目标账户/通知配置
-    //   member → 只用 web chat
-    // chat BFF 与控制台 API 各自校验同一 JWT 的 cognito:groups。
+    // 这个池只服务 Web Chat（老控制台已于 2026-09-04 退役）；用 group 区分能干什么：
+    //   admin  → 全部权限（role:admin = `*`；「更多 → 管理」默认只有它看得到）
+    //   member → 默认映射到只读的 role:viewer
+    // 校验在 Web Chat BFF：读 JWT 的 cognito:groups，按 bff/web-chat/authz.mjs 的
+    // DEFAULT_GROUP_ROLE_MAP（管理员可在「组映射」页覆盖）换算成权限。
     new cognito.CfnUserPoolGroup(this, "AdminGroup", {
       userPoolId: userPool.userPoolId,
       groupName: "admin",
@@ -451,7 +463,9 @@ export class NotiOpsBackendStack extends cdk.Stack {
     // → 既不报「失败」也不报「成功」，看板上那天直接空白。
     inspectionTable.grantReadWriteData(lambdaRole);
 
-    // Bedrock 权限（Lambda3 Converse + API Lambda ListInferenceProfiles/ListFoundationModels）
+    // Bedrock 权限（共享 lambdaRole）。下面 List* 那条原是给老控制台 API Lambda 的（它与
+    // Lambda3 一起于 2026-09-04 退役）；Admin「模型」页的候选列表走 BFF 自己的授权
+    // （constructs/web-chat-core.ts 的 BedrockListFoundationModels），不靠这条。
     // bedrock:InvokeModel 同时覆盖 Converse API，无需单独声明 bedrock:Converse
     lambdaRole.addToPolicy(new iam.PolicyStatement({
       actions: ["bedrock:InvokeModel"],
@@ -630,12 +644,21 @@ export class NotiOpsBackendStack extends cdk.Stack {
     // ENAMETOOLONG. Excluding "infra/**" is not enough because the copy
     // races with the output being written. Keeping output outside the source
     // is the robust fix; the excludes below keep the package lean (~few MB).
+    // 🔴 **所有以点开头的路径都排掉**（`.*` 四条，2026-10-10）。fromAsset 走的是文件系统、不看
+    //    .gitignore，仓库根里的点目录是各种本地工具的地盘，而且会不断冒出新的：
+    //      · `.claude/worktrees/<名字>/` —— Claude Code 的 worktree 隔离放的**整份仓库检出**，一次
+    //        synth 里 11 个 Lambda 的代码包都带上了它（858 个文件；审 assembly 拦下，没上线）；
+    //      · 本机工具的配置与日志（`.claude/`、`.playwright-mcp/`）、CI 与扫描配置（`.gitlab-ci.yml` /
+    //        `.gitleaks.toml`）—— 都不该进代码包（一键部署的 im-code.zip 与这里共用排除口径）。
+    //    ⚠️ CDK 的 GLOB 里 `*` **不匹配**点开头的名字（成本 MCP 资产那条注释实测过），所以必须
+    //    显式写 `.*`；`**/.*` 两条管嵌套的（如 `scripts/.seams_baseline.json`）。`.claude/**` 留着
+    //    是为了让人一眼看出它为什么在。与 `dist/**` 一样四处都要有，tests/test_repo_root_asset_excludes.py 钉着。
     const lambdaCode = lambda.Code.fromAsset("../", {
       exclude: [
         "frontend/**", "infra/**", ".venv*/**", "**/node_modules/**",
         "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
-        ".git/**", "tests/**", "docs/**", ".kiro/**",
-        "lambda_layer/**", "lambda_layer_im/**", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
+        ".git/**", "tests/**", "docs/**", ".kiro/**", ".claude/**", ".*", ".*/**", "**/.*", "**/.*/**",
+        "lambda_layer/**", "lambda_layer_im/**", "lambda_layer_cost/**", "lambda_layer_cost", "cost_mcp/**", "cost_mcp", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
         // ⚠️ dist/** 是一键部署（方式A）的产物目录（dist/oneclick + dist/verify，
         // 各 ~290MB 的 zip）。不排掉它，「代码资产 + 依赖层」解压后会超 Lambda 的
         // 250MB 上限，部署到一半才报 `Unzipped size must be smaller than 262144000
@@ -674,9 +697,12 @@ export class NotiOpsBackendStack extends cdk.Stack {
     });
 
 
-    // ─── 多账号一键接入（控制台「账户接入」Tab，orgMode 专属）───
-    // API Lambda 通过 StackSets 向成员账号下发 member-account-onboarding.yaml，
-    // 并用 Organizations ListAccounts 填充账号下拉列表。
+    // ─── 多账号一键接入（Web Chat「更多 → 管理 → 账户」，orgMode 专属）───
+    // BFF（bff/web-chat/member_accounts.mjs）往 StackSet 加实例、向成员账号下发
+    // member-account-onboarding.yaml，并用 Organizations ListAccounts 填充账号列表。
+    // （老控制台的「账户接入」Tab 与它背后的 API Lambda 已于 2026-09-04 退役。）
+    // BFF 那两条 IAM 授权在 constructs/web-chat-core.ts（OrgOnboardStackSets / OrgOnboardListAccounts）；
+    // 本栈在这一段只管成员账号 oam:Link 要连的 OAM Sink（新建，或用 -c oamSinkArn 复用已有的）。
     if (orgMode) {
       // CloudWatch OAM Sink（跨账号 observability 管理侧入口）：成员账号经 member
       // 模板的 oam:Link 把 metrics/logs/traces 共享进来（调查/告警关联分析用）。
@@ -713,7 +739,10 @@ export class NotiOpsBackendStack extends cdk.Stack {
 
     }
 
-    // Lambda4 - Notifier（定时推送巡检报告和闲置资源通知到飞书）
+    // Lambda4 - Notifier（每日运维通知到飞书：资源巡检 / 成本异常 / 近期调查汇总，见
+    // lambda4_notifier/handler.py 文件头）。原先的「闲置资源」段已于 2026-09-04 随 Lambda1/2/3 退役。
+    // description 2026-10-11 改过（旧文案还写着闲置资源通知）；纯 ASCII，与本栈这一版改过的其它
+    // description 同一口径。这一处改动本身只引出一次 UpdateFunctionConfiguration，不碰下面的触发规则。
     const lambda4 = new lambda.Function(this, "Lambda4Notifier", {
       ...commonLambdaProps,
       functionName: "notiops-notifier",
@@ -722,7 +751,9 @@ export class NotiOpsBackendStack extends cdk.Stack {
       logGroup: logGroupNotifier,
       timeout: cdk.Duration.minutes(10),
       memorySize: 256,
-      description: "定时推送巡检报告和闲置资源通知到飞书",
+      description:
+        "Daily ops notification to Feishu: resource inspection status, cost anomalies and " +
+        "recent investigations (recipients: notify_chat_ids in the Feishu bot secret).",
     } as lambda.FunctionProps);
 
     // Lambda5 - CostAnalyzer（每日成本异常分析）
@@ -749,78 +780,13 @@ export class NotiOpsBackendStack extends cdk.Stack {
         iam.ManagedPolicy.fromAwsManagedPolicyName("service-role/AWSLambdaBasicExecutionRole"),
       ],
     });
-    curFinalizerRole.addToPolicy(new iam.PolicyStatement({
-      // 只读 CUR 交付桶。复用既有 CUR 时，桶名由客户自定义、部署期不可知，故放开到 *
-      // （仅 List/Get 只读，用于读取 crawler-cfn.yml 模板 + 发现数据路径）。
-      actions: ["s3:ListBucket", "s3:GetObject"],
-      resources: ["*"],
-    }));
-    curFinalizerRole.addToPolicy(new iam.PolicyStatement({
-      // 部署 AWS 官方生成的 Athena 集成 CFN 模板（内含 IAM Role/Glue/Lambda），
-      // 名称范围限定为本 Lambda 自己创建的 stack（notiops-cur-athena-<account_id>）。
-      actions: ["cloudformation:CreateStack", "cloudformation:DescribeStacks", "cloudformation:DescribeStackResources", "cloudformation:DeleteStack"],
-      resources: ["arn:aws:cloudformation:*:*:stack/notiops-cur-athena-*/*"],
-    }));
-    // 该 CFN 模板会创建 3 个 IAM Role + Glue DB/Crawler + 2 个 Lambda + S3 通知；
-    // create_stack 调用者本身需要具备这些创建权限（CFN 以调用者角色执行，不是 CFN
-    // 服务角色）。按资源类型分组、能按 ARN 收窄的都收窄（IAM/Lambda 用命名前缀），
-    // 只有官方模板内部动态命名、部署前不可预知的 Glue 资源保留 * 并显式说明。
-    //
-    // (1) IAM：官方 Athena 集成模板创建的 Role 名带 CUR/Athena 前缀，收窄到本项目相关的
-    //     role 命名前缀，避免对任意 IAM Role 的写权限。
-    curFinalizerRole.addToPolicy(new iam.PolicyStatement({
-      actions: [
-        "iam:CreateRole", "iam:PutRolePolicy", "iam:GetRole", "iam:PassRole",
-        "iam:AttachRolePolicy", "iam:TagRole",
-        "iam:DeleteRole", "iam:DeleteRolePolicy", "iam:DetachRolePolicy",
-      ],
-      resources: [
-        `arn:aws:iam::${this.account}:role/notiops-cur-*`,
-        `arn:aws:iam::${this.account}:role/AWSCUR*`,
-        `arn:aws:iam::${this.account}:role/*Athena*`,
-      ],
-    }));
-    // (2) Lambda：官方模板建的函数名带 CUR/Athena 前缀，按函数名 ARN 前缀收窄（本账号本区）。
-    curFinalizerRole.addToPolicy(new iam.PolicyStatement({
-      actions: [
-        "lambda:CreateFunction", "lambda:GetFunction", "lambda:AddPermission",
-        "lambda:InvokeFunction", "lambda:TagResource",
-        "lambda:DeleteFunction", "lambda:RemovePermission",
-        "lambda:PutFunctionConcurrency", "lambda:DeleteFunctionConcurrency",
-      ],
-      resources: [
-        `arn:aws:lambda:*:${this.account}:function:notiops-cur-*`,
-        `arn:aws:lambda:*:${this.account}:function:*Athena*`,
-        `arn:aws:lambda:*:${this.account}:function:*aws-cur*`,
-      ],
-    }));
-    // (3) Glue + S3 通知：⚠️ 官方 crawler-cfn.yml 内部动态生成 Glue Database/Crawler/Table 名
-    //     （部署前不可预知），无法按 ARN 收窄；且 s3:PutBucketNotification 作用于客户自有的
-    //     CUR 交付桶（桶名部署期未知）。故这两类保留 resources:["*"]，收紧到 action 层面。
-    //     安全警告：这是 AWS 官方 Athena-集成模板本身要求的最小权限面
-    //     （见 docs.aws.amazon.com/cur/latest/userguide/use-athena-cf.md）；该角色仅由一次性
-    //     lambda6_cur_finalizer 使用、只在 CUR 首次交付后触发一次，非常驻。
-    curFinalizerRole.addToPolicy(new iam.PolicyStatement({
-      actions: [
-        "glue:CreateDatabase", "glue:CreateCrawler", "glue:GetDatabase", "glue:GetCrawler",
-        "glue:TagResource",
-        "glue:GetDatabases", "glue:GetTables", "glue:GetTable", "glue:StartCrawler", "glue:StopCrawler",
-        "glue:CreateTable", "glue:UpdateTable", "glue:DeleteTable",
-        "glue:DeleteDatabase", "glue:DeleteCrawler",
-        "s3:PutBucketNotification", "s3:GetBucketNotification",
-      ],
-      resources: ["*"],
-    }));
-    // CUR 翻成 READY 的同一时刻，finalizer 幂等下发 6 条 FinOps 保存查询（Cost Deep Dive 后端，
-    // 见 lambda6_cur_finalizer/athena_saved_queries.py）+ 给 primary workgroup 设结果输出位置。
-    // Athena 保存查询 / workgroup 属账号级资源（无法按细粒度 ARN 收窄），收紧到 action 层面。
-    curFinalizerRole.addToPolicy(new iam.PolicyStatement({
-      actions: [
-        "athena:ListNamedQueries", "athena:BatchGetNamedQuery", "athena:CreateNamedQuery",
-        "athena:GetWorkGroup", "athena:UpdateWorkGroup",
-      ],
-      resources: ["*"],
-    }));
+    // 权限定义在 constructs/cur-finalizer-policy.ts —— **两条部署路径共用那一份**。
+    // 这里不传 deliveryBucketName：setup.sh 支持复用客户自己已有的 CUR，桶名部署期不可知，
+    // 所以 S3 只读与桶通知只能给 *。这一形态与原先写在这里的那几条语句逐字节相同
+    // （判据：tests/test_cur_provisioner_parity.py），只多了一条 cur:DescribeReportDefinitions。
+    for (const st of curFinalizerPolicyStatements({ partition: "aws", account: this.account })) {
+      curFinalizerRole.addToPolicy(st);
+    }
 
     const lambda6CurFinalizer = new lambda.Function(this, "Lambda6CurFinalizer", {
       runtime: lambda.Runtime.PYTHON_3_14,
@@ -849,6 +815,31 @@ export class NotiOpsBackendStack extends cdk.Stack {
       resources: [lambda6CurFinalizer.functionArn],
     }));
 
+    // ⚠️ 阶段二的**自愈**触发器 —— 这条规则取代了原来"setup.sh 建一个 T+25h 一次性
+    // schedule"的做法（那个 schedule 仍然保留作为快速路：它能在 T+25h 立刻收尾，而这条
+    // 规则最多晚 4 小时）。
+    //
+    // 为什么必须有它：一次性 schedule **不自愈**。那一次如果撞上 AWS 交付晚了、或者
+    // crawler 还没爬完，状态就停在 `DELAYED`，而**再也没有下一次** —— 客户看到的是
+    // "装了 CUR 但成本还是走 Cost Explorer"，没有任何报错，只能靠有人想起来重跑 setup.sh。
+    // 「靠有人记得」不是控制手段（与依赖金丝雀那件事同一条教训）。
+    //
+    // 空跑成本：handler 开头两道守卫 —— 没有 cur-athena-status 记录直接返回、已 READY
+    // 直接返回，都是一次 DynamoDB GetItem（见 lambda6_cur_finalizer/handler.py）。
+    // 方式 A 的同一条规则在 notiops-webchat-standalone-stack.ts 里（判据钉住两边都有）。
+    new events.Rule(this, "CurFinalizerSelfHealRule", {
+      ruleName: "notiops-cur-finalizer-selfheal",
+      description: "每 4 小时检查 AWS 是否已首次交付 CUR；已就绪则空跑返回（自愈，"
+                   + "取代只跑一次的 T+25h schedule）",
+      schedule: events.Schedule.rate(cdk.Duration.hours(4)),
+      targets: [new targets.LambdaFunction(lambda6CurFinalizer, {
+        // ⚠️ 只传 `account_id`。桶名/报告名**故意不传** —— 这条规则是部署期静态声明的，
+        // 它猜不到桶名（方式 B 可能复用客户自己那份 CUR，桶名任意）。handler 以
+        // `cur-athena-status` 记录里的权威值为准（见该文件的守卫 ③）。
+        event: events.RuleTargetInput.fromObject({ account_id: this.account }),
+      })],
+    });
+
     new cdk.CfnOutput(this, "CurFinalizerFunctionArn", {
       value: lambda6CurFinalizer.functionArn,
       description: "setup.sh 创建 EventBridge Scheduler 一次性 schedule 时作为 Target",
@@ -859,7 +850,8 @@ export class NotiOpsBackendStack extends cdk.Stack {
     });
 
     // ─── EventBridge 定时规则 ───
-    // Lambda5 每天定时成本异常分析（在 Lambda3 之后、Lambda4 之前，01:15 UTC）
+    // Lambda5 每天定时成本异常分析（01:15 UTC，排在 Lambda4 的 02:00 之前；原先还排在
+    // Lambda3 之后，Lambda3 已于 2026-09-04 退役）
     new events.Rule(this, "DailyCostAnalysisRule", {
       ruleName: "notiops-daily-cost-analysis",
       description: "每天 01:15 UTC 触发 Lambda5-CostAnalyzer 执行成本异常分析",
@@ -867,7 +859,12 @@ export class NotiOpsBackendStack extends cdk.Stack {
       targets: [new targets.LambdaFunction(lambda5)],
     });
 
-    // Lambda4 每天定时推送通知（在 Lambda3 巡检完成后执行，02:00 UTC）
+    // Lambda4 每天 02:00 UTC 推送每日运维通知。这个时刻原是排在 Lambda3 健康巡检之后（Lambda3 已于
+    // 2026-09-04 退役，02:00 只是沿用下来的）。新巡检两类的默认时刻也是 02:00 UTC
+    // （inspection/domain/schedule.py 的 `at_utc`），所以默认配置下当天那一轮往往还没跑完。
+    // ⚠️ 下面这条规则的 description 还写着已退役的「闲置资源通知」，**故意没跟着改**：改 Rule 的任何属性
+    //    CFN 都会整条 PutRule、带上模板里的 State（ENABLED）—— 运维在控制台手工 disable 过它的部署会被
+    //    悄悄重新打开、第二天照常往群里发。要改就和「这条规则本来就要动」的那次改动一起改。
     new events.Rule(this, "DailyNotificationRule", {
       ruleName: "notiops-daily-notification",
       description: "每天 02:00 UTC 触发 Lambda4-Notifier 推送巡检报告和闲置资源通知",
@@ -945,7 +942,10 @@ export class NotiOpsBackendStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // ─── 阿里云账号凭据（多云上车；Admin「多云」页填）───
+    // ─── 阿里云账号凭据（多云上车；由 BFF 的 `/admin/aliyun-config` 写入）───
+    // 写它的 Admin「多云」页 2026-09-15 起随 `MULTICLOUD_UI = false`（frontend/chat-app/src/featureFlags.ts）
+    // 不在导航里了；BFF 路由与读它的 STAROps 链路都原样保留，那之前存下的 AK/SK 照旧有效。
+    //
     // 预建（而不是让 BFF 首次保存时 CreateSecret）的理由是**卸载能收干净**：
     // `tests/test_teardown_secrets.py` 双向比对 teardown.sh 的 SECRETS 与本文件里声明为
     // DESTROY 的 secret —— 不在这里建，teardown.sh 就不许列它，方式B 卸载会永久留下一个
@@ -956,9 +956,17 @@ export class NotiOpsBackendStack extends cdk.Stack {
     // BFF 侧「空 ⇒ 未配置」这条判定就建立在这上面，回 `****` 会让客户以为已经配好。
     // 不绑变量：本栈没有任何 Lambda 直接读它（读它的是 web-chat 栈里的 BFF，按字面名
     // 授权、不走跨栈 Export）。绑一个用不到的变量会让下一个人以为这里还该接点什么。
+    //
+    // description 2026-10-10 改过：旧文案是中文，还把人指到上面那个已经不在导航里的「多云」页。
+    // 纯 ASCII：CFN 收模板时会把资源 Description 里的非 ASCII 换成 `?`（见 postprocess_template.py）。
+    // ⚠️ 只许动 description：只改 Description 是一次不出新版本的 UpdateSecret，已存的 AK/SK 不受影响；
+    // `generateSecretString` 一个字节都别碰 —— 它一变 CFN 就生成新的 secret 版本，拿模板里的空串
+    // 盖掉客户已存的凭据。
     new secretsmanager.Secret(this, "AliyunCredentialsSecret", {
       secretName: "notiops/aliyun-credentials",
-      description: "阿里云账号凭据（access_key_id / access_key_secret / region_id；Admin「多云」页填）",
+      description:
+        "Alibaba Cloud credentials (access_key_id / access_key_secret / region_id). Written by the " +
+        "web chat backend; multi-cloud is not available in the web UI yet.",
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       generateSecretString: {
         secretStringTemplate: JSON.stringify({
@@ -971,10 +979,15 @@ export class NotiOpsBackendStack extends cdk.Stack {
       },
     });
 
+    // description 只说「预留」：填它的老 Dashboard「AI 认证 → LiteLLM」已于 2026-09-04 退役，
+    // 而 Web Chat「模型」页只认 bedrock（llm_config.mjs 拒收 litellm，providerHint 也这么写）。
+    // 只改 Description 不会重新生成 secret 的值（GenerateSecretString 没动）。
+    // 纯 ASCII：CFN 收模板时会把资源 Description 里的非 ASCII 换成 `?`（见 postprocess_template.py）。
     const liteLlmConfigSecret = new secretsmanager.Secret(this, "LiteLlmConfigSecret", {
       secretName: "notiops/litellm-config",
       description:
-        "LiteLLM Proxy config (base_url / api_key / default_model). Filled in via Dashboard → AI 认证 → LiteLLM.",
+        "LiteLLM Proxy config (base_url / api_key / default_model). Reserved for a later phase -- " +
+        "not configurable in the web UI yet (Amazon Bedrock only for now).",
       generateSecretString: {
         secretStringTemplate: JSON.stringify({
           base_url: "",
@@ -987,6 +1000,18 @@ export class NotiOpsBackendStack extends cdk.Stack {
     });
 
     // SSM Parameters
+    //
+    // ⚠️ 下面 description 里的「Writable via Dashboard」已过时（老 Dashboard 2026-09-04 退役，
+    //    现在没有任何代码写这个参数），但这一条**故意没跟着改**：SSM 没有「只改描述」的 API，
+    //    描述只能经 PutParameter 改（必带 Value、Overwrite），于是 CFN 会把模板值一起写回 ——
+    //    而模板值 "bedrock" 从未变过，老 Dashboard 时代切到 "litellm" 的部署会在那次升级里被
+    //    **静默**切回 bedrock（shared/llm_provider.py 仍按它路由后端的 LLM 调用）。
+    //    2026-10-10 发版前复核：要改描述只有两条出路，选哪条要产品拍板，拍板前别顺手改这一行 ——
+    //    (a) 接受这次重置：升级说明里写明切过 litellm 的部署升级后要重跑
+    //        `aws ssm put-parameter --name /notiops/llm/provider --value litellm --type String --overwrite`；
+    //    (b) 让 CFN 写回的就是现网值：setup.sh 先回读这个参数、经 `-c llmProvider=` 传进来当
+    //        stringValue（参数不存在 = 全新部署 → "bedrock"；读失败不许当成不存在），与
+    //        opsAlertEmail / inspectionReportLocale 那几项「沿用现网值」同一套做法。
     const llmProviderParam = new ssm.StringParameter(this, "LlmProviderParam", {
       parameterName: "/notiops/llm/provider",
       stringValue: "bedrock",
@@ -996,9 +1021,16 @@ export class NotiOpsBackendStack extends cdk.Stack {
     });
     llmProviderParam.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
-    // 这一条不是"对话默认模型"，而是 IM 侧一批**内部工具调用**的模型：意图分类 /
-    // 下一步建议 / 进度卡叙述 / 案例分类 / 技能派发 / 技能编写
-    // （shared/model_config.py::get_bot_model_id 的 8 个调用点）。
+    // 这一条不是"对话默认模型"，而是 IM 侧一批**内部工具调用**的模型：
+    // core/bot_llm.py::invoke_bot_text 的 7 个调用点（取值走 shared/model_config.py::get_bot_model_id）——
+    // 意图分类 / 下一步建议 / 进度卡（叙述 + 思考片段翻译）/ 案例分析 / 案例分类 / 技能派发；
+    // 原第 8 处「技能编写」2026-09-06 随 skill 能力从 IM 侧退役而删除。
+    //
+    // ⚠️ 现网 IM（Webhook → Lambda）平时只走得到**案例分析与案例分类**两处（见
+    // platforms/common/im_types.py 的 Caps 说明）：意图分类、进度卡、技能派发挂在已退役的
+    // Fargate 长连接路径上（platforms/*/app/main.py、core/progress_poller.py；只有聊天记录里
+    // 飞书老卡片上的按钮还可能触发一次意图分类），下一步建议 2026-09-05 起没有生产调用方
+    // （core/next_steps.py 文件头）。所以下面 description 只点这两处。
     //
     // 历史（留着，因为它解释了为什么这里长期落后于目录默认）：那 8 处原先都是手搓
     // Anthropic 原生 body（"anthropic_version": "bedrock-2023-05-31"）的 `invoke_model`，
@@ -1015,10 +1047,17 @@ export class NotiOpsBackendStack extends cdk.Stack {
     // `core/bot_llm.py` 恒走 Converse，不按 model_id 猜协议（猜错报
     // "model identifier is invalid"，读起来像模型不存在，归因极贵）。
     // 见 core/llm_pref_resolver.py 顶部对同一约束的说明（spec R8）。
+    //
+    // description 2026-10-10 改过：旧文案「used by the Strands Agent (writable via dashboard)」
+    // 两半都不对 —— 它不是对话模型（上面第一段），写它的老 Dashboard 也已退役。与上面
+    // `LlmProviderParam` 不同，这里改描述**不额外**引入覆盖：同一版的 stringValue 已从
+    // Grok 4.6 换成 Kimi K3，升级时 CFN 本来就要按模板值重写这个参数一次。
     const agentModelIdParam = new ssm.StringParameter(this, "AgentModelIdParam", {
       parameterName: "/notiops/agent/model_id",
-      stringValue: "global.xai.grok-4.6",
-      description: "Current Bedrock model ID used by the Strands Agent (writable via dashboard)",
+      stringValue: "global.moonshotai.kimi-k3",
+      description:
+        "Bedrock model ID for the IM bot's internal helper calls (today mainly Support case analysis " +
+        "and case classification). Not the chat model; set by this stack, not editable in the web UI.",
       tier: ssm.ParameterTier.STANDARD,
     });
     agentModelIdParam.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
@@ -1103,7 +1142,7 @@ export class NotiOpsBackendStack extends cdk.Stack {
 
     // ─── DevOps Agent Space(部署账号自动创建 + onboard)───
     // 部署账号的 Agent Space 由 CDK 自动创建,无需手动 onboard。
-    // 其他业务账号仍需 Dashboard 手动上车(跨账号 onboarding 流程)。
+    // 其他业务账号在 Web Chat「更多 → 管理 → 账户」接入(跨账号 onboarding 流程)。
     const devopsAgentModule = require("aws-cdk-lib/aws-devopsagent");
     // ─── Operator App（Web App）的角色 ───
     //
@@ -1580,7 +1619,9 @@ def handler(event, context):
       eventBusName: "notiops-devops-events",
     });
 
-    // API Lambda 需要 PutEvents 到 Custom Event Bus（测试连接 Step 3 + 未来可能的手动触发）
+    // 共享 lambdaRole 往 Custom Event Bus 的 PutEvents：原是给老控制台 API Lambda 的「测试连接」
+    // Step 3 用的（它已于 2026-09-04 退役），现在仓库里没有跑在 lambdaRole 下的代码往这条总线投事件。
+    // 成员账号的跨账号投递靠的是下面那条资源策略 + 成员侧转发角色，与这条授权无关。
     lambdaRole.addToPolicy(new iam.PolicyStatement({
       sid: "PutEventsToDevOpsCustomBus",
       actions: ["events:PutEvents"],
@@ -1592,15 +1633,15 @@ def handler(event, context):
     // 判据从「你是哪个账号」换成「你是不是我们模板建出来的转发角色 + 事件是不是
     // DA 服务署名的」。
     //
-    // 🔴 **为什么要换掉原来那个白名单。** 原来是
+    // 🔴 **为什么要换掉原来那个允许清单。** 原来是
     //    `StringEquals aws:PrincipalAccount ∈ <CDK context 的常量列表>`，
     //    而那个列表由 setup.sh 用 `-c` 传进来、**烧进 CFN 模板**。于是接入一个
     //    子账号的代价是「改 setup.sh 的变量 → 重跑 ./setup.sh → CDK 更新整个
     //    NotiOpsBackendStack（Lambda/DDB/API GW/CloudFront）」。在几十个账号的
     //    量级上不可接受。现在加账号**零部署**：客户的栈建出那个角色就能投递。
     //
-    // 🔴 **原来还有个 `length > 0` 门控** —— 白名单为空就整条策略不创建。
-    //    实测 2026-08-29：生产总线的 `Policy` 就是 `None`（从来没配过白名单），
+    // 🔴 **原来还有个 `length > 0` 门控** —— 允许清单为空就整条策略不创建。
+    //    实测 2026-08-29：生产总线的 `Policy` 就是 `None`（从来没配过允许清单），
     //    也就是说跨账号事件回传**一直是死的**，而 UI 上照样能 onboard。
     //    现在策略恒创建。
     //
@@ -1691,13 +1732,17 @@ def handler(event, context):
 
     new cdk.CfnOutput(this, "DevOpsAgentBusPolicyJudgement", {
       // 值保持纯 ASCII：它会被 setup.sh 用 jq 取出后直接 echo，含中文/em-dash
-      // 会在部分终端显示为乱码。中文说明放 description。
+      // 会在部分终端显示为乱码。
+      // description 也是纯 ASCII（2026-10-11 改）：CFN 存回的模板里 Outputs Description 的非 ASCII
+      // 一律成了 `?`（实测记录见 scripts/postprocess_template.py），原来那句中文在 Outputs 页上读不出来；
+      // 改写时那份旧的按账号放行名单统一叫 allowlist（包容性用语，中文注释里写「允许清单」）。
       value:
         "ArnLike aws:PrincipalArn arn:<partition>:iam::*:role/"
         + "notiops-devops-forwarder-role-* AND events:source=aws.aidevops",
       description:
-        "Custom Event Bus 的跨账号 PutEvents 判据。加账号无需重新部署 —— "
-        + "客户栈建出该名字的转发角色即可投递（原来的账号白名单已废弃）",
+        "Which cross-account PutEvents the DevOps Agent custom event bus accepts. Adding an "
+        + "account needs no redeploy: once a member account stack creates a forwarder role with "
+        + "this name, its events are accepted (the old per-account allowlist is retired).",
     });
 
     // ═══════════════════════════════════════════════════════════════════
@@ -2252,8 +2297,8 @@ def handler(event, context):
         "frontend/**", "infra/**", "tests/**", ".venv*/**",
         "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
         "**/node_modules/**", ".git/**", ".hypothesis/**",
-        "*.md", ".pytest_cache/**", ".kiro/**",
-        "lambda_layer/**", "lambda_layer_im/**", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
+        "*.md", ".pytest_cache/**", ".kiro/**", ".claude/**", ".*", ".*/**", "**/.*", "**/.*/**",
+        "lambda_layer/**", "lambda_layer_im/**", "lambda_layer_cost/**", "lambda_layer_cost", "cost_mcp/**", "cost_mcp", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
         "dist/**",   // 见上面 lambdaCode 处的长注释：漏了会撞 Lambda 250MB 解压上限
         "platforms/**", "agent/**",
         "api/**", "lambda1_collector/**", "lambda2_analyzer/**",
@@ -2477,11 +2522,6 @@ def handler(event, context):
     this.reportsCdnDomain = reportsCdn.distributionDomainName;
     new cdk.CfnOutput(this, "ReportsCdnDomain", { value: reportsCdn.distributionDomainName });
 
-    // Dashboard API Lambda 读写 onboarding 模板 + skill(管理端)
-    // DATA_BUCKET：调查详情按需从 S3 读 investigations/<task_id>/report.md
-    // （report pipeline refactor）。代码侧解析顺序 S3_BUCKET → DATA_BUCKET →
-    // SKILLS_BUCKET，三者均指向同一数据桶。
-
     // 注:seedDataFn 不再写 S3 skill(预置 skill 改由 BFF 运行时 seedPresetSkills 统一 seed),
     // 故此处不再给它注入 SKILLS_BUCKET / 授予 dataBucket 读写 / 加 dataBucket 依赖(最小权限)。
     // 它只写 DynamoDB 配置(阈值/prompt/模型),权限在 seedDataFn 定义处已用 configTable.grantWriteData 授予。
@@ -2502,14 +2542,20 @@ def handler(event, context):
 
 
     // ─── Push Handler：多源实时事件推送(CloudWatch/Backup/GuardDuty/CostAnomaly/TA)───
-    // 原 notiops-devops 的实时推送功能。默认 DISABLED,需在 Dashboard 或 CDK context 启用。
-    // 每个事件源独立 Rule,可单独 enable/disable。
+    // 原 notiops-devops 的实时推送功能。每个事件源独立一条 `notiops-push-<源>` Rule,建出来都是 DISABLED。
+    // ⚠️ 2026-10-11 复核:光 enable 规则**推不出任何东西**。规则只负责把事件交给 notiops-push-handler,
+    //    发不发由 shared/report_delivery/push_handler.py 的 `_push_configured()` 决定 —— 要有
+    //    `PUSH_TARGET_CHAT_ID`(钉钉也可改用 `PUSH_TARGET_PLATFORM=dingtalk` + `DINGTALK_PUSH_WEBHOOK_URL[_ARN]`),
+    //    而本栈(下面的 environment)与 setup.sh 都不设这几个变量 ⇒ 每个事件只在日志里记一行
+    //    「Push disabled」就返回,IM 侧什么都收不到。要不要给它接推送目标是待定的产品决定;
+    //    定下来之前,别把「enable 规则」写成「开启推送」。
+    // 没有 CDK context 开关(那是下面 web 通知规则的 `-c webNotif<Id>`),老 Dashboard 的开关也已退役。
     const pushLambdaCode = lambda.Code.fromAsset("../", {
       exclude: [
         "frontend/**", "infra/**", ".venv*/**", "**/node_modules/**",
         "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
-        ".git/**", "tests/**", "docs/**", ".kiro/**",
-        "lambda_layer/**", "lambda_layer_im/**", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
+        ".git/**", "tests/**", "docs/**", ".kiro/**", ".claude/**", ".*", ".*/**", "**/.*", "**/.*/**",
+        "lambda_layer/**", "lambda_layer_im/**", "lambda_layer_cost/**", "lambda_layer_cost", "cost_mcp/**", "cost_mcp", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
         "dist/**",   // 见上面 lambdaCode 处的长注释：漏了会撞 Lambda 250MB 解压上限
         "platforms/**", "*.md", "mcp_server/**",
         ".hypothesis/**", ".pytest_cache/**",
@@ -2575,7 +2621,7 @@ def handler(event, context):
     //
     // 判据用 `anything-but` + `prefix`（EventBridge 支持，见
     // https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-create-pattern-operators.html ）
-    // 而不是把客户的告警名逐个列白名单 —— 后者要求我们预先知道客户建了什么告警。
+    // 而不是把客户的告警名逐个列进允许清单 —— 后者要求我们预先知道客户建了什么告警。
     const excludeOwnOpsAlarms = {
       alarmName: [{ "anything-but": { prefix: OPS_ALARM_NAME_PREFIX } }],
     };
@@ -2590,7 +2636,7 @@ def handler(event, context):
           ...(isAlarmSource ? { detail: excludeOwnOpsAlarms } : {}),
         },
         targets: [new targets.LambdaFunction(pushLambda)],
-        enabled: false, // 默认 DISABLED,需在控制台或 CDK context 启用
+        enabled: false, // 默认 DISABLED;enable 了也只是把事件交给 push handler,没有推送目标就不发(见本段开头)
       });
     }
 
@@ -2674,8 +2720,9 @@ def handler(event, context):
           `notiops-web-notif-${src.id.toLowerCase()} will never fire. ` +
           `To receive these notifications, deploy NotiOps in us-east-1, or ` +
           `forward the events from us-east-1 to this region via a cross-region ` +
-          `EventBridge rule. Silence this by deploying with ` +
-          `-c webNotif${src.id}=off.`
+          `EventBridge rule. Silence this by adding "webNotif${src.id}": "off" ` +
+          `to the context in infra/cdk.json and re-running ./setup.sh ` +
+          `(a one-off -c flag is dropped by the next ./setup.sh run).`
         );
       }
     }
@@ -2748,8 +2795,8 @@ def handler(event, context):
           "frontend/**", "infra/**", "tests/**", ".venv*/**",
           "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
           "**/node_modules/**", ".git/**", ".hypothesis/**",
-          "*.md", ".pytest_cache/**", ".kiro/**",
-          "lambda_layer/**", "lambda_layer_im/**", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
+          "*.md", ".pytest_cache/**", ".kiro/**", ".claude/**", ".*", ".*/**", "**/.*", "**/.*/**",
+          "lambda_layer/**", "lambda_layer_im/**", "lambda_layer_cost/**", "lambda_layer_cost", "cost_mcp/**", "cost_mcp", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
         "dist/**",   // 见上面 lambdaCode 处的长注释：漏了会撞 Lambda 250MB 解压上限
           "platforms/**", "agent/**",
           "api/**", "lambda1_collector/**", "lambda2_analyzer/**",
@@ -2776,7 +2823,7 @@ def handler(event, context):
           // MODEL_ID 现在只是**兜底**：真值走 DDB appconfig#phd（Admin「后端任务模型」写入，
           // 由 BFF 从模型目录解析 alias 后投影过去）。保留 env 是为了 DDB 不可用 / 未 seed
           // 时仍能推送，见 shared/phd_config.py 的三级降级。
-          MODEL_ID: "global.xai.grok-4.6",
+          MODEL_ID: "global.moonshotai.kimi-k3",
           CONFIG_TABLE: configTable.tableName,
         },
         description: "PHD 事件转发 — SNS 触发,LLM 翻译摘要(Bedrock/LiteLLM 可切换),推送飞书",
@@ -2807,7 +2854,8 @@ def handler(event, context):
 
       // 只读 notiops-config：取 appconfig#phd / SK=bedrock_model_id（Admin 配的翻译模型）。
       // PHD Lambda 用的是自己的 role（不是共享 lambdaRole），所以这条必须单独授予。
-      // 只需读 —— 这张表的写入方是 BFF 与 API Lambda。
+      // 只需读 —— appconfig#phd 这一格只由 BFF 写（Admin「模型」页的「后端任务模型」，
+      // bff/web-chat/llm_config.mjs）；原先也写这张表的老控制台 API Lambda 已于 2026-09-04 退役。
       configTable.grantReadData(phdLambda);
 
       // SNS → Lambda 订阅
@@ -2832,9 +2880,16 @@ def handler(event, context):
       value: lambdaRole.roleArn,
       description: "Lambda 执行 Role ARN — 用于目标账户 IdleDetectionRole 的信任策略",
     });
+    // 下面这条与 LiteLlmConfigSecretArn 的 description 2026-10-10 改写过（原文指向已退役的
+    // Dashboard「目标账户管理」/「AI 认证」）。改写时用纯 ASCII：CFN 收模板时会把 Outputs
+    // Description 里的非 ASCII 换成 `?`（实测记录见 scripts/postprocess_template.py）。
+    // 部署账号不用登记：AutoOnboardResource 每次部署自动写 da# 记录，巡检对部署账号直接用
+    // 自身角色（lambda_inspection_executor `_session_for`），账号选择器里它是内置项。
     new cdk.CfnOutput(this, "IdleDetectionRoleArn", {
       value: idleDetectionRole.roleArn,
-      description: "管理账户 IdleDetectionRole ARN — 在 Dashboard 目标账户管理中添加",
+      description:
+        "Read-only collection role in this (deploy) account -- nothing to register, the deploy " +
+        "account is built in. Onboard member accounts in Web Chat under More > Admin > Accounts.",
     });
     new cdk.CfnOutput(this, "DevOpsAgentEventBusArn", {
       value: devopsEventBus.eventBusArn,
@@ -2867,7 +2922,9 @@ def handler(event, context):
     });
     new cdk.CfnOutput(this, "LiteLlmConfigSecretArn", {
       value: liteLlmConfigSecret.secretArn,
-      description: "LiteLLM Config Secret ARN — Dashboard 填充 base_url / api_key / default_model",
+      description:
+        "LiteLLM Config Secret ARN -- reserved for a later phase; not configurable in the web UI yet " +
+        "(Amazon Bedrock only for now)",
     });
   }
 }

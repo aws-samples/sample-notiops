@@ -8,7 +8,10 @@
 ── 这个模块只管一件事：**说什么**，不管**能做什么** ──────────────────────────
 `VISIBLE = False` 之后：
   · `/help` 菜单里不再有 starops 那一格；
-  · `/agent` 的用法行、以及打错参数时的「可用: …」不再列 starops。
+  · `/agent` 的用法行、以及打错参数时的「可用: …」不再列 starops；
+  · 没配阿里云时 `/agent starops` 的拒绝语、以及 `starops_chat.not_configured_text()`
+    都**不再指向**管理后台的「多云」页（2026-10-10 补）—— 那一页在 Web 端同样藏着，
+    照着去找是死路。
 但 `/agent starops` **依然能打通** —— `_AGENT_ALIASES` / `AGENT_ARG_WORDS` /
 `starops_chat.configured()` 那道闸门全部原样保留。
 
@@ -17,7 +20,8 @@
     后台填过 AccessKey 的部署（含我们自己的现网）还在用它，藏掉入口的同时把执行路径
     也掐掉，等于一次静默的功能回退 —— 那比多一条没写进菜单的命令糟得多。
   · 反过来，**没**配阿里云的部署打 `/agent starops` 拿到的是
-    `agent.starops_not_configured`（拒绝且不写偏好），不会切到一条死路上。
+    `agent.starops_not_configured`（拒绝且不写偏好），不会切到一条死路上 —— 而且这句
+    拒绝本身也走孪生 key：多云关着时只说"暂未开放"，不把人指到一个点不开的页面。
 所以「菜单里没有、硬打还能用」这个组合在这里是正确答案，而不是不一致。
 
 ── 为什么用「孪生 key」而不是在渲染处拼字符串 ──────────────────────────────
@@ -35,9 +39,16 @@
 `help.row.web.multicloud` 会变成客户菜单里的一行乱码。`_TWINNED` 与 i18n 的一致性由
 `tests/test_multicloud_gate.py` 钉住。
 
-⚠️ Web 端有**另一份**同名开关（`frontend/chat-app/src/featureFlags.ts` 的
-`MULTICLOUD_UI`），因为那是另一个运行时。两边必须一起翻，否则会出现「网页里没有、
-IM 里还在推荐」这种自相矛盾的产品。
+⚠️ Web 端还有**另外两份**同一含义的开关，因为那是另外的运行时：前端入口
+`frontend/chat-app/src/featureFlags.ts` 的 `MULTICLOUD_UI`，以及 BFF「去配一下」那句往哪儿
+指路的 `bff/web-chat/starops_chat.mjs` 的 `MULTICLOUD_VISIBLE`。三处必须一起翻，否则会出现
+「网页里没有、IM 里还在推荐」这种自相矛盾的产品。三者是否一致由
+`bff/web-chat/tests/starops_chat.test.mjs` 核对 —— 它按行读下面 `VISIBLE = …` 那一行，
+别改那一行的写法。⚠️ 那条核对只在 BFF 的 `npm test` 里跑（CI 里是 `bff-tests` 这个 job），
+而它只在 MR 改到 `bff/web-chat/**` 或 `config/llm-model-catalog.json` 时才触发（2026-10-11
+核对）；pytest 里没有同样的检查（`tests/test_multicloud_gate.py` 不读另外两份）。所以**只**改了
+本文件、或只改了前端那份的 MR，CI 上拦不住 —— 翻这个开关时在本地跑一次
+`cd bff/web-chat && npm test`。
 """
 
 from __future__ import annotations
@@ -50,6 +61,10 @@ _TWINNED = frozenset({
     "help.row.agent",
     "agent.usage",
     "agent.unknown",
+    # 2026-10-10：基线那份原先写着「请到管理后台 →「多云」→ 阿里云」，而那一页在
+    # `MULTICLOUD_UI = false` 时不在左导航里 —— 没配阿里云的部署手打 `/agent starops`，
+    # 被指到一个谁都打不开的页面。
+    "agent.starops_not_configured",
 })
 
 
@@ -79,3 +94,8 @@ def agent_usage_key() -> str:
 def agent_unknown_key() -> str:
     """`/agent <打错的参数>` 时那句「可用: …」的 i18n key。"""
     return key("agent.unknown")
+
+
+def agent_starops_not_configured_key() -> str:
+    """没配阿里云时 `/agent starops` 那句拒绝语的 i18n key。"""
+    return key("agent.starops_not_configured")

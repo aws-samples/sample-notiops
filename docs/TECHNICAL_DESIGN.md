@@ -2,7 +2,7 @@
 
 > 🌐 **Language**: [中文](TECHNICAL_DESIGN.md) · [English](TECHNICAL_DESIGN.en.md)
 >
-> **一句话定位**:一个 **只读的 Web Chat 运维控制台** 为主入口 —— 在浏览器里直接和 AWS 运维 agent(Strands / Bedrock **AgentCore Runtime**)对话,做调查 / FinOps / 案例 / Skills,全程只读、绝不改环境;作为必要补充,同时把 **AWS DevOps Agent**(AWS 推出的 agentic 调查服务,`aidevops` API)接入企业 IM(飞书 / Slack),让用户在告警群里 `@bot 一句话` 也能调起调查、看实时进度、收到本地化报告 —— **不再需要登陆 AWS 控制台**。
+> **一句话定位**:一个 **只读的 Web Chat 运维控制台** 为主入口 —— 在浏览器里直接和 AWS 运维 agent(Strands / Bedrock **AgentCore Runtime**)对话,做调查 / FinOps / 案例 / Skills,全程只读、绝不改环境;作为必要补充,同时把 **AWS DevOps Agent**(AWS 推出的 agentic 调查服务,`aidevops` API)接入企业 IM(飞书 / Slack / 钉钉),让用户在告警群里 `@bot 一句话` 也能调起调查、看实时进度、收到本地化报告 —— **不再需要登陆 AWS 控制台**。
 
 **版本**:v1.3 · 2026-06-10
 
@@ -52,7 +52,7 @@
 - **read-only 权限模型**:Agent 用客户授权给 Agent 服务的角色读 AWS 资源做调查,不改环境(本项目 bot 不涉及这层权限,见 §5.1)
 - **agentic loop**:自带规划 → 调用工具 → 反思的循环,产出结构化调查报告 + journal trace
 - **完整生命周期 EventBridge 事件**:`Investigation Started` / `In Progress` / `Completed` 等
-- **本项目 bot 与 Agent 的边界**:bot 只调用 `aidevops:ListJournalRecords`(读进度),不直接代客户跑调查 — 真正的资源访问发生在 Agent 服务侧,跟 bot 的 IAM 完全分离
+- **本项目 bot 与 Agent 的边界**:IM worker 用自己的执行角色调 DevOps Agent 的控制面 API —— `CreateBacklogTask` / `GetBacklogTask` 发起与跟踪调查、`ListJournalRecords` 读进度、`CreateChat` / `SendMessage` 直连问答(完整权限清单见 §5.1);真正读客户资源的是 Agent 服务侧,用的是客户授权给 Agent 的角色,跟 bot 的 IAM 完全分离
 
 ### 1.2 它解决的痛点 vs 现状
 
@@ -74,7 +74,7 @@ NotiOps 的目标:**让 SRE 随时随地掌控云环境**。主入口是一个 *
 
 > DevOps Agent 是好工具,但 **触达客户** 是当前最大的卡点。
 >
-> 本项目用工程级实现解决了这个"最后一公里":主入口 Web Chat 控制台让任何团队成员打开浏览器即可只读调查,无需 AWS 控制台权限;而 IM 侧作为补充,一次部署后 bot 就在团队已有的飞书 / Slack 群等着被 @,既能 ad-hoc 调查,也能主动观察 CloudWatch / Health / Backup 等 6 类事件源,收到告警自动启动调查并把结果回贴到群里。
+> 本项目用工程级实现解决了这个"最后一公里":主入口 Web Chat 控制台让任何团队成员打开浏览器即可只读调查,无需 AWS 控制台权限;而 IM 侧作为补充,一次部署后 bot 就在团队已有的飞书 / Slack / 钉钉群等着被 @,随时 ad-hoc 调查。告警类事件(AWS Health / CloudWatch Alarm / GuardDuty 等,默认开 5 个源)进 Web「通知」收件箱,在通知卡上一键「深入调查」;IM 侧「事件一来就自动调查并回贴到群里」的 Push 模式规则已建好但默认关闭,当前版本推送链路还没接通(见 §4.6)。
 
 ### 1.5 设计原则
 
@@ -82,7 +82,7 @@ NotiOps 的目标:**让 SRE 随时随地掌控云环境**。主入口是一个 *
 2. **平台无关**:`core/` 共享代码 + `platforms/<name>/` 适配层,新增 IM 平台不需要碰 `core/`
 3. **零变更承诺**:bot 全链路只读,绝不替客户改云环境(详见 §5)
 4. **失败永远可降级**:Bedrock 错误 / 模式禁用 / 解析失败,统统降级到 read-only investigate 路径,绝不静默丢失
-5. **最小权限**:bot 任务角色严格白名单,不能调 EC2 / RDS / IAM 写操作
+5. **最小权限**:IM Lambda 执行角色按允许清单逐条授权(见 §5.1),对客户基础设施(EC2 / RDS / IAM 等)没有写权限
 
 ---
 
@@ -137,10 +137,10 @@ NotiOps 的目标:**让 SRE 随时随地掌控云环境**。主入口是一个 *
 │  ┌──────────────────────────────────────────────────┐              │
 │  │          AWS Lambda(无服务器)                    │              │
 │  │  • report-handler  (Investigation Completed)     │              │
-│  │  • push-handler    (CloudWatch / Health / ...)   │              │
+│  │  • push-handler    (CloudWatch / Backup / ...)   │              │
 │  └──────┬───────────────────────────────────┬───────┘              │
 └─────────┼───────────────────────────────────┼──────────────────────┘
-          │ aidevops:ListJournalRecords      │ EventBridge × 6 rules
+          │ aidevops:ListJournalRecords      │ EventBridge × 5 rules
           ▼                                   ▼
    ┌──────────────────────┐          ┌─────────────────────┐
    │  AWS DevOps Agent    │          │   AWS 服务事件源    │
@@ -154,7 +154,7 @@ NotiOps 的目标:**让 SRE 随时随地掌控云环境**。主入口是一个 *
 
 | 层 | 物理位置 | 职责 | 代码 |
 |---|---|---|---|
-| **L1 平台适配层** | Lambda(每个平台一对:ingress + worker,`ImStack`) | ingress:验签 + 幂等去重 + 异步投递;worker:消息 / 卡片回调路由与处理 | `platforms/{feishu,slack,dingtalk}/lambda_ingress.py` + `lambda_worker.py`(回滚用的长连接入口在 `platforms/*/app/`) |
+| **L1 平台适配层** | Lambda(每个平台一对:ingress + worker,`ImStack`) | ingress:验签 + 秒回 ACK + 异步投递;worker:幂等去重 + 消息 / 卡片回调路由与处理 | `platforms/{feishu,slack,dingtalk}/lambda_ingress.py` + `lambda_worker.py`(回滚用的长连接入口在 `platforms/*/app/`) |
 | **L2 公共业务逻辑** | 跟 L1 同进程或 Lambda 内 | 确定性意图路由(`core/nl_router`,0 token)、对话、进度轮询、case、push、签名派发 | `core/` |
 | **L3 后台任务** | AWS Lambda(无状态) | 接 EventBridge 事件,渲染报告,投递到 IM | `shared/report_delivery/report_handler.py`、`shared/report_delivery/push_handler.py`、`shared/report_delivery/feishu_sender.py`、`shared/report_delivery/slack_sender.py` |
 
@@ -168,12 +168,18 @@ L2 被两类调用方共用 —— IM worker Lambda / 后台 Lambda(CDK 打包�
                     │                                 │
   飞书 ──webhook──→ │  ┌──────────────┐              │
                     │  │ API GW HTTP  │  飞书        │
-                    │  │ API + ingress│  (128MB /    │
-                    │  │ λ + worker λ │   900MB×900s)│
+                    │  │ API + ingress│  (规格见图下)│
+                    │  │ λ + worker λ │              │
                     │  └──────┬───────┘              │
                     │         │                      │
                     │  ┌──────▼───────┐              │
  Slack ──webhook──→ │  │ API GW HTTP  │  Slack       │
+                    │  │ API + ingress│  (同上)      │
+                    │  │ λ + worker λ │              │
+                    │  └──────┬───────┘              │
+                    │         │                      │
+                    │  ┌──────▼───────┐              │
+  钉钉 ──webhook──→ │  │ API GW HTTP  │  钉钉        │
                     │  │ API + ingress│  (同上)      │
                     │  │ λ + worker λ │              │
                     │  └──────┬───────┘              │
@@ -183,14 +189,16 @@ L2 被两类调用方共用 —— IM worker Lambda / 后台 Lambda(CDK 打包�
                     │   │  • DynamoDB (跨平台状态) │ │
                     │   │  • S3 (报告 + Trace)     │ │
                     │   │  • Secrets Manager       │ │
-                    │   │  • Bedrock (Haiku)       │ │
+                    │   │  • Bedrock (Converse)    │ │
                     │   │  • Lambda × 2            │ │
-                    │   │  • EventBridge × 6 rules │ │
+                    │   │  • EventBridge × 5 rules │ │
                     │   └──────────────────────────┘ │
                     └─────────────────────────────────┘
 ```
 
-**关键设计:** 每个 IM 平台独立 HTTP API + 独立 ingress/worker Lambda + 独立执行角色(同一个 `ImStack`),但**所有平台共享同一份 `core/` 代码 + 共享 DDB / Lambda / S3 + 同一个进度轮询 Lambda**。客户可以只部署飞书,或只部署 Slack,或两个都部署。
+**关键设计:** 每个 IM 平台独立 HTTP API + 独立 ingress/worker Lambda(同一个 `ImStack`;所有 IM Lambda 共用一个执行角色),而且**所有平台共享同一份 `core/` 代码 + 共享 DDB / Lambda / S3 + 同一个进度轮询 Lambda**(进度轮询只服务飞书 / Slack:钉钉改不了已发出的消息,进度由 worker 追加发送)。客户可以只部署其中一个平台,也可以多选。
+
+**函数规格**(三个平台相同,定义在 `infra/lib/constructs/im-core.ts`):ingress 2048 MB / 20 s、`reservedConcurrentExecutions=10`;worker 1024 MB / 900 s。ingress 的内存和超时是**冷启动**决定的(验签 + 异步投递本身只要几十毫秒),往下调会撞 Lambda INIT 阶段的 10 秒上限,实测记录见那里飞书 ingress 的注释。
 
 > ⚠️ 2026-09-03(M2)之前这里是每平台一个 ECS Fargate Service(512 CPU / 1024 MB,长连接 / Socket Mode),由 `BotStack` 部署 —— 已退役,`infra/lib/bot-stack.ts` 只作源码级回滚路径保留。
 
@@ -198,23 +206,23 @@ L2 被两类调用方共用 —— IM worker Lambda / 后台 Lambda(CDK 打包�
 
 ### 2.4 Web Chat 架构(agentic AI 助手)
 
-> **定位**:Web Chat 是 NotiOps 的**主入口** —— 浏览器里直接和 AWS 运维 agent 对话的 agentic 助手,IM 侧(飞书 / Slack / 钉钉)是面向告警群响应的必要补充。它有自己的 agent 运行时、BFF、前端与鉴权链路,和 IM 侧共享部分后端约束与存储(如 Skills 的 S3 前缀、只读防线理念),但**不复用 IM 侧的 `core/` / IM worker Lambda / EventBridge 派发链路**。
+> **定位**:Web Chat 是 NotiOps 的**主入口** —— 浏览器里直接和 AWS 运维 agent 对话的 agentic 助手,IM 侧(飞书 / Slack / 钉钉)是面向告警群响应的必要补充。它有自己的 agent 运行时、BFF、前端与鉴权链路,和 IM 侧共享部分后端约束与存储(如共用数据桶的 `reports/` 前缀、模型目录、只读防线理念;Skills 只在 Web 端,IM 侧的 skill 入口 2026-09-06 已退役),但**不复用 IM 侧的 `core/` / IM worker Lambda / EventBridge 派发链路**。
 
 #### 2.4.1 四层组件
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
 │  浏览器 · React / Vite 前端                                    │
-│  • 左侧导航(7 项):通知/调查/成本/案例/巡检/技能/管理           │
+│  • 左侧导航:通知/调查/成本/案例 + 更多(巡检/技能/管理)         │
 │    (安全已并入调查;调查/成本/案例的看板走输入框上方的胶囊)   │
-│  • 主聊天 + 右侧「Sources / 调查过程」停靠面板                  │
+│  • 主聊天 + 右侧「Sources / 思考过程」停靠面板                  │
 │  • 多模型切换 · 多账号选择器 · 联网搜索开关 · /命令菜单        │
 └───────────────┬───────────────────────────────────────────────┘
                 │ Cognito 登录 → Identity Pool 拿临时凭据
                 │ 对 Function URL 做 SigV4 签名请求
                 ▼
 ┌───────────────────────────────────────────────────────────────┐
-│  BFF · Node20 Lambda(Function URL,响应流式 SSE)             │
+│  BFF · Node.js 24 Lambda(Function URL,响应流式 SSE)         │
 │  • 鉴权:Function URL AUTH_TYPE = AWS_IAM(SigV4 验签)         │
 │  • 转发对话到 AgentCore Runtime,把结果转成 SSE 事件流         │
 │  • 确定性端点:/actions/execute(建案执行)、                  │
@@ -239,7 +247,7 @@ L2 被两类调用方共用 —— IM worker Lambda / 后台 Lambda(CDK 打包�
 | 层 | 物理位置 | 职责 |
 |---|---|---|
 | **前端** | React / Vite(静态托管) | 主题导航、聊天 UI、右侧面板、模型 / 账号 / 联网开关;`config.json` 注入 `chatApiBase` + cognito + `identityPoolId` |
-| **BFF** | Node20 Lambda + Function URL(`notiops-web-chat-bff`) | Function URL 响应流式返回 SSE;转发对话到 AgentCore Runtime;暴露确定性端点(建案执行 `/actions/execute`、服务目录 `/support/services`、通知收件箱读取) |
+| **BFF** | Node.js 24 Lambda + Function URL(`notiops-web-chat-bff`) | Function URL 响应流式返回 SSE;转发对话到 AgentCore Runtime;暴露确定性端点(建案执行 `/actions/execute`、服务目录 `/support/services`、通知收件箱读取) |
 | **Agent** | Bedrock AgentCore Runtime(Strands agent) | 单 agent + 工具 + 主题聚焦层;`investigate_live` 流式调查;`create_case_from_template` 确定性建案;严格只读 |
 | **通知 Handler** | Lambda(`notiops-web-notif-handler`) | 接 EventBridge 事件源,复用 `core/push_event` normalizer + 5min 去重,写 DDB `notif#` 段(持久化收件箱) |
 | **存储 / 基建** | CDK `WebChatStack` | DynamoDB 单表 `notiops-web-chat`;BFF Lambda + Function URL(`AWS_IAM`) |
@@ -273,13 +281,15 @@ BFF 把 AgentCore Runtime 的产出转成一条 SSE 事件流,前端按类型分
 | `sources` | 工具调用 / 出处透传 | 右侧 Sources 面板 |
 | `actions` | 结构化动作(如建案预览卡) | 主聊天内联卡片 |
 | `followups` | 追问 / 后续建议 | 主聊天底部建议 |
-| `investigation_step` | 调查过程(Observation / Finding) | 右侧「调查过程」停靠面板(不自动弹) |
+| `investigation_step` | DevOps Agent 调查步骤(Observation / Finding) | 右侧「思考过程」面板(唯一的过程面板,与 Sources 共用停靠位,打开它会收起 Sources;本轮第一步到达时自动弹开,用户手动关过一次就不再自动弹;每条回复正文上方至多一个「查看思考过程 · N 步」入口 —— 有过程步骤才出现,且步骤不落库、刷新页面后不再显示) |
+| `thinking_step` | 思考 / 处理过程的一步(工具调用及入参摘要、工具返回摘要) | 同上,进「思考过程」面板 |
+| `reasoning` | 模型思考增量 | 同上,**只**进「思考过程」面板(气泡里不再另起折叠灰字) |
 | `usage` | token 用量 | 会话统计 / 调试 |
 | `done` | 本轮结束 | 结束流、解锁输入(支持停止生成) |
 
 #### 2.4.5 左侧主题导航(有序)
 
-通知(Notifications) / 调查(Investigate) / 成本(FinOps) / 案例(Cases) / 巡检(Inspection) / 技能(Skills) / 管理(Admin)。**七项全是一级入口,没有「更多」分组** —— `Sidebar.tsx` 里 `SHOW_MORE_GROUP = false`,「管理」已于 2026-09-11 从「更多」子菜单提为一级。⚠️ 注意「侧栏有几项」≠「有几个对话主题」:侧栏 7 项里,「巡检」是**看板直达入口**、「管理」是控制台,`TOPICS` 只有 **4 条**(investigate / finops / cases / whats-new)。⚠️ **侧栏里没有「安全」** —— 2026-09-11 同日去掉(见下),安全看板只从「调查」输入框上方的「安全态势」胶囊进;`Sidebar.tsx` 连 `showSecurity` / `securityActive` / `onSecurity` 三条 prop 都已删掉,补回入口会让一个已退役的对话主题在导航里复活。
+一级是 通知(Notifications) / 调查(Investigate) / 成本(FinOps) / 案例(Cases) 四项,外加一个可展开的「更多」,里面是 巡检(Inspection) / 技能(Skills) / 管理(Admin)(2026-10-10 用户要求收进去;2026-09-11 曾把「管理」提到一级,这次反过来)。「更多」在当前页属于它时自动展开、展开态记在 localStorage(`notiops.moreOpen`),三项都没权限时整个不渲染;「定制」仍由 `SHOW_CUSTOMIZE_ITEM = false` 关着。⚠️ 注意「侧栏有几项」≠「有几个对话主题」:这 7 项里,「巡检」是**看板直达入口**、「管理」是控制台,`TOPICS` 只有 **4 条**(investigate / finops / cases / whats-new)。⚠️ **侧栏里没有「安全」** —— 2026-09-11 同日去掉(见下),安全看板只从「调查」输入框上方的「安全态势」胶囊进;`Sidebar.tsx` 连 `showSecurity` / `securityActive` / `onSecurity` 三条 prop 都已删掉,补回入口会让一个已退役的对话主题在导航里复活。
 
 > **2026-09-11:「安全」不再是对话主题,只保留看板。** 它的聊天能力本来就是 investigate 的真子集(agent 侧 `_TOPIC_FOCUS` 没有 `security` 这一项,工具只挂 core 8 个,而 investigate 是 22 个),同一句安全问题在「安全」里问答得更差。改法:
 > - **主题注册表删掉 `security`**,安全类 6 句起手问句整组并入 investigate 的池子(6 → 12);
@@ -289,9 +299,9 @@ BFF 把 AgentCore Runtime 的产出转成一条 SSE 事件流,前端按类型分
 > - **四颗胶囊的名字刻意不共用同一个词尾**,图标也**不上色**。第一版四个都叫「XX 态势」,客户原话「我发现取的 dashboard 名字都是 XX 态势」—— 整齐,但三个是硬套:`posture` 在安全语境是行业术语(CSPM = Cloud Security **Posture** Management),只有「安全态势」撑得住,`Case posture` 这种在英文里基本不成立。所以第二轮按各自看板的语义内核分别取:`运行概览`(树里 7 项有 6 项是告警/健康/EOL 风险)、`支出与优化`(11 项一半「花了多少」一半「怎么省」)、`案例进展`(4 项全是「现在到哪一步、该谁动」),中英各自读得通就行,不追求词形对齐。已知撞词、刻意接受:「运行概览」与该树第一项「告警总览」语义相近(客户在两个候选里明确选了它)。颜色那条删的是 `.dashpill svg:first-of-type { color: var(--orange) }` —— `icons.tsx` 里没有任何硬编码色值(全是 `currentColor`),看板浏览器左栏图标本来就是 `--muted` / 选中态 `--text`,所以**唯一**能给胶囊图标上色的地方就是这条规则,删掉即全链路无色;主次改由 `.dashpill svg:last-of-type { opacity:.5 }` 拉开。两条都有源码级断言钉在 `topicmerge.test.tsx`;
 > - 库里 `topic:"security"` 的老会话**改不掉**(`ensureConversation` 带 `attribute_not_exists(SK)`,没有任何接口能改 topic),所以归一放在**读**的时候:前端 `normalizeTopic`(水合会话头时)+ BFF `topic.mjs`(`POST /stream` 与 `POST /warmup` **两个入口都要**,因为 agent 侧 LRU 缓存键含 topic,只归一一个会让预热白做)。BFF 侧对未知 topic **原样透传、不做 allowlist**,免得把老客户端打死。
 
-新对话默认模型 **Claude Sonnet 5**;另可切 Claude Opus 5、Claude Haiku 4.5、Amazon Nova Pro、DeepSeek V3.2、GPT-5.6(Terra / Sol / Luna)。默认模型与启用集都由管理员在 Admin「模型」页定(真源:`config/llm-model-catalog.json` → DDB `llmcfg`)。每会话记忆模型偏好,每条回复署名所用模型。多账号选择器默认部署账号(团队共享);联网搜索开关默认关。
+新对话默认模型 **Kimi K3**(`global.moonshotai.kimi-k3`;IM 侧 `/agent notiops` 对话默认的也是它 —— 两端共用一份目录、一个默认;IM 的案例分析 / 分类等内部小任务另读 SSM `/notiops/agent/model_id`,见 §4.7.5);开箱另可切 Grok 4.7、GLM 5.3、Claude Sonnet 5.5、Claude Opus 5.5、DeepSeek V3.2、GPT-5.6 Terra、GPT-6 Sol。默认模型与启用集都由管理员在 Admin「模型」页定(真源:`config/llm-model-catalog.json` → DDB `llmcfg`;每个模型的 `surfaces` 决定它出现在 Web、IM 还是两边 —— 例如 DeepSeek V3.2 只在 Web)。每会话记忆模型偏好,每条回复署名所用模型。多账号选择器默认部署账号(团队共享);联网搜索开关默认关。
 
-> ⚠️ **FinOps Agent 深度分析当前置灰禁用(即将上线,暂未完善)**:DevOps Agent 开关现在在「调查」与「FinOps」两个主题都显示,FinOps 里可开它做成本 / 用量深度分析;但 **FinOps Agent 开关目前置灰禁用**,前端提示"即将上线"。进入 FinOps 主题时该开关默认关(仅「调查」主题默认开)。
+> ⚠️ **成本(FinOps)主题里没有「FinOps Agent」开关**:原来那项永久置灰、提示「即将上线」的占位 2026-09-13 起已从界面删掉(功能真上线时再加回来)。工具条上的「深度调查」(DevOps Agent)出现在「调查」与「成本」两个主题(`types.ts::topicHasDevopsAgent` 按例外排除通用 / 案例 / What's New),**所有主题默认关**;「DevOps 对话」只在「调查」主题。
 
 ---
 
@@ -307,7 +317,6 @@ sequenceDiagram
     participant W as worker λ
     participant Agent as AWS DevOps Agent
     participant P as notiops-im-progress λ
-    participant H as Bedrock Haiku
     participant L as Lambda<br/>(report-handler)
     participant S3 as S3
     participant DDB as DynamoDB
@@ -339,7 +348,7 @@ sequenceDiagram
     Agent->>L: EventBridge "Investigation Completed"
     L->>Agent: ListJournalRecords (拉完整 journal)
     L->>L: 渲染 trace.html + 提取 summary_md
-    L->>S3: upload 7 天预签 URL
+    L->>S3: upload + 生成预签 URL(实际有效期见 §5.4)
     L->>DDB: 查 incident#xxx → 路由信息
     L->>U: 通过 sender 发回原群:**一张** ✅ NotiOps 报告卡<br/>(调查目标 + 报告正文 + 查看完整报告 / Trace / 升级 Support)
 ```
@@ -444,7 +453,9 @@ DynamoDB 单表 notiops-web-chat · notif# 段
 
 ### 3.5 Web Chat · 调查 investigate_live 流式分流
 
-「调查」主题的 DevOps Agent 深度调查用 `investigate_live` **同步发起 + 实时流式**,并把**过程与结论分流**:
+> 🔁 **2026-09-13 起,界面上的「深度调查」走的是 §3.6 的直连路径**(`deep_investigate_direct` → `bff/web-chat/devops_investigate.mjs`,NotiOps 侧 0 token)。本节这条经 agent 工具 `investigate_live` 转交的路径撤掉了界面入口 —— 前端字段与 BFF / agent 侧通路都还在,历史会话里的这个模式恢复时一律置为关(`convMode.ts::restorableMode`)。下图的过程 / 结论分流对两条路径一样(同形的 SSE 事件、同一个「思考过程」面板);差别只在报告链接:直连那条只走报告 CDN,CDN 域名为空时不出报告链接,没有下图的 presigned 兜底。
+
+「调查」主题里经 agent 转交的 DevOps Agent 深度调查用 `investigate_live` **同步发起 + 实时流式**,并把**过程与结论分流**:
 
 ```
 用户在「调查」主题发起深度调查
@@ -454,8 +465,10 @@ DevOps Agent 深度调查(实时流式)
         │
         ├── 分析过程(Observation / Finding)
         │     → SSE investigation_step 事件
-        │     → 右侧「调查过程」停靠面板(复用 Sources 栏,不自动弹,实时增长)
-        │     → 主聊天给「查看调查过程」入口按钮
+        │     → 右侧「思考过程」面板(与普通对话共用、与 Sources 共用停靠位;第一步到达时自动弹开,
+        │       用户手动关过一次后不再自动弹;实时增长)
+        │     → 回复正文上方一个「查看思考过程 · N 步」入口(面板被手动关掉后从这里重开;
+        │       步骤不落库,刷新页面后入口不再显示)
         │
         └── root cause 结论
               → 主聊天(仅留结论 + HTML 在线报告)
@@ -471,16 +484,16 @@ DevOps Agent 深度调查(实时流式)
 
 ### 3.6 Web Chat · 两条「BFF 直连 DevOps Agent」路径(0 token)
 
-除了 §3.5 那条经我们 agent 转交的深度调查,Web Chat 还有两条**完全绕过 agent runtime 与 Bedrock** 的路径:BFF 用 SigV4 直接调客户自己账号里的 **AWS DevOps Agent 控制面 API**,NotiOps 只当传输层。三条路径**互斥**(前端单选)。
+除了 §3.5 那条经我们 agent 转交的深度调查,Web Chat 还有两条**完全绕过 agent runtime 与 Bedrock** 的路径:BFF 用 SigV4 直接调客户自己账号里的 **AWS DevOps Agent 控制面 API**,NotiOps 只当传输层。三条路径**互斥**(前端单选);2026-09-13 起界面只露后两条 —— 按钮上的「深度调查」就是下表第二行(直连),第一行经 agent 转交的那条没有界面入口了(见 §3.5 开头)。
 
 | 路径 | 前端标志 | BFF 落点 | 这一轮谁在答 |
 |---|---|---|---|
-| 深度调查 | `devops_agent` | agent runtime → `investigate_live` → `CreateBacklogTask` | DevOps Agent(NotiOps 的模型先把问题整理成调查请求,烧 token) |
-| 深度调查(直连) | `deep_investigate_direct` | `devops_investigate.mjs` → `CreateBacklogTask` + journal 增量轮询 / `GetBacklogTask` 判终态 | DevOps Agent(不经模型) |
+| 深度调查(经 agent 转交;2026-09-13 起无界面入口) | `devops_agent` | agent runtime → `investigate_live` → `CreateBacklogTask` | DevOps Agent(NotiOps 的模型先把问题整理成调查请求,烧 token) |
+| 深度调查(直连;界面上就叫「深度调查」) | `deep_investigate_direct` | `devops_investigate.mjs` → `CreateBacklogTask` + journal 增量轮询 / `GetBacklogTask` 判终态 | DevOps Agent(不经模型) |
 | DevOps 对话 | `devops_chat_direct` | `devops_chat.mjs` → `CreateChat` + `SendMessage` | DevOps Agent **直答** |
 
 - **为什么走控制面 API,而不是远端 MCP(`/mcp`)/ A2A(`/a2a/*`)**:后两条是给"外部模型"用的**工具面** —— 一接上,回答就重新由 Bedrock 模型生成,token 只会**更多**。控制面 `CreateChat` / `SendMessage` 是 DevOps Agent **自己**在答,因此不需要模型、也不需要新密钥(沿用 BFF Role / 跨账号 AssumeRole 的 SigV4)。
-- **SSE 事件与 §3.5 同形**(`token` / `progress` / `investigation_step` / `usage`),前端渲染与右侧「调查过程」面板**零改动复用**;两条直连路径也**复用同一条 `/stream` 路由**(不新增路由 → 不动 authz / capabilities)。`usage` 恒为 `{totalTokens: 0, direct: true}`,前端据此不渲染 token 徽章;DevOps Agent 侧的真实用量只落 CloudWatch(客户在自己的 DevOps Agent 账单里看)。
+- **SSE 事件与 §3.5 同形**(`token` / `progress` / `investigation_step` / `usage`),前端渲染与右侧「思考过程」面板**零改动复用**;两条直连路径也**复用同一条 `/stream` 路由**(不新增路由 → 不动 authz / capabilities)。`usage` 恒为 `{totalTokens: 0, direct: true}`,前端据此不渲染 token 徽章;DevOps Agent 侧的真实用量只落 CloudWatch(客户在自己的 DevOps Agent 账单里看)。
 - **流式体验对齐"客户直接开 DevOps Agent 网页聊"**(硬要求):正文 `textDelta` **逐 delta 转发**不缓冲;工具调用 / 思考 / 子代理等非正文块进右侧面板,正文未开始时补一条瞬态 `progress` 避免首答空白;**未知类型的块按正文处理**(失败安全 —— 宁可多显示,也不能把答案藏进面板)。
 - **单轮上限 840s**(BFF Lambda 平台硬顶 900s 内的保守取值,`NOTIOPS_DEVOPS_CHAT_MAX_WAIT_SEC` 可调)。超时**不算失败**:已流出的正文照样落库,并提示去 DevOps Agent 后台继续看。
 - **Skill 的转移方式两条路径不同**:两条直连路径由 `bff/web-chat/devops_skill.mjs` 把选中 Skill 的**正文内联**进本轮请求,所以**不需要先发布**(代价:`references/` 参考文件取不到);而转交路径(深度调查)用的是 Agent Space 里的那一份,**必须先发布**才会被激活。界面对这两句如实分开写。
@@ -490,6 +503,8 @@ DevOps Agent 深度调查(实时流式)
 ## 4. 模块深入
 
 ### 4.1 意图分类器 `bedrock_intent`
+
+> ⚠️ **口径范围**:本节描述的是 `core/bedrock_intent.py` 的 LLM 意图分类。现网 IM(M2 之后的 Webhook + Lambda)不调用它 —— 意图路由由 `core/nl_router.py` 的正则确定性完成(0 token,见 §3.1);它只在回滚路径(已随 `BotStack` 退役的长连接 app)上跑。
 
 #### 4.1.1 职责
 
@@ -533,7 +548,7 @@ def analyze_intent(user_text: str, *, locale: str = "zh") -> dict:
 | `chitchat` | ⚠️ 仅 `enabled` 档 | 寒暄 | "你好" / "你能干什么" |
 | `general_qa` | ⚠️ 仅 `qa_only` / `enabled` 档 | AWS 概念问答 | "ALB 和 NLB 有什么区别" |
 
-`chitchat` / `general_qa` 受 `AGENTIC_CHAT_MODE` 三档总开关控制,**默认 `enabled`**(全部 10 类命令开放)。想退到只 investigate / case_* / query 时把 parameter 改成 `disabled` 即可。详见 §4.2 三档开关说明。
+`chitchat` / `general_qa` 受 `AGENTIC_CHAT_MODE` 三档总开关控制;回滚路径的 `infra/lib/bot-stack.ts` 把它写死为 `enabled`(全部 10 类命令开放),未设置时代码默认 `disabled`。它不是部署参数,也没有 CDK context 可改(见 §4.1.7)。详见 §4.2 三档开关说明。
 
 #### 4.1.4 三段式分类决策
 
@@ -548,7 +563,7 @@ def analyze_intent(user_text: str, *, locale: str = "zh") -> dict:
 若消息匹配 /list-cases / /view-case 等 slash 模式
    → 直接归对应 case_* command
    │
-   ▼  Step 3: Bedrock Haiku 分类
+   ▼  Step 3: Bedrock 分类(core/bot_llm,模型取 SSM /notiops/agent/model_id)
 否则调 Bedrock 解析,返回结构化 JSON
    │
    ▼  Step 4: mode gating
@@ -568,9 +583,9 @@ def analyze_intent(user_text: str, *, locale: str = "zh") -> dict:
 
 我们曾经把多轮上下文(prior history)作为 prompt 的一部分喂给 Bedrock。结果发现:**当 chat 历史里堆了几条 investigate(用户在用 bot 调查),Bedrock 把后续的 "你好" 也判成 investigate**。原因是 history block 里 5 条都是 EC2/ALB/S3 实操,把"你好"两个字的弱信号淹没了。
 
-解决方案:在 Bedrock 之前做一个**廉价的 short-circuit**:消息 ≤12 字 + 命中预定义寒暄白名单 + 不含资源 ID,直接归 chitchat。
+解决方案:在 Bedrock 之前做一个**廉价的 short-circuit**:消息 ≤12 字 + 命中预定义寒暄允许清单 + 不含资源 ID,直接归 chitchat。
 
-`_is_obvious_chitchat()` 覆盖的高频白名单:
+`_is_obvious_chitchat()` 覆盖的高频允许清单:
 
 ```
 你好 / 您好 / 嗨 / 哈喽 / 早上好 / 晚上好
@@ -583,9 +598,9 @@ good morning / good afternoon
 
 #### 4.1.7 模式总开关 `AGENTIC_CHAT_MODE`
 
-CFN parameter,通过 task definition env 透传,**改不需要 rebuild**:
+环境变量,每次调用都重读。⚠️ 它**不是**部署参数,也没有 CDK context 可改:回滚路径的 `infra/lib/bot-stack.ts` 与 IM Lambda 的 `infra/lib/constructs/im-core.ts` 都把它写死为 `enabled`(现网 webhook IM 走 `core/nl_router.py`,根本不经过这一层);未设置时代码默认 `disabled`:
 
-| 值 | VALID_COMMANDS 子集 | 默认 |
+| 值 | VALID_COMMANDS 子集 | 两个栈写死的值 |
 |---|---|---|
 | `disabled` | `{investigate, case_*, query}` (8 类) | |
 | `qa_only` | 加 `general_qa`(9 类),chitchat 不允许 | |
@@ -617,14 +632,14 @@ _is_change_request(text) — 命中关键词集
     │  豁免:句首是 "如何 / 怎么 / 怎样 / how to / what is" 等问句
     │
     ▼  L2: Bedrock system prompt
-显式约束 Haiku:
+显式约束会话模型:
   - 不假扮其他角色
   - 不输出可执行变更命令
   - 任何示例命令必须 read-only 并加 "review 前缀"
   - 不编造资源 ID
     │
     ▼  L3: 出站正则审计
-_audit_response_for_change(reply) 扫 Haiku 输出
+_audit_response_for_change(reply) 扫会话模型输出
     │  命中 aws cli mutation / terraform apply / kubectl change
     │  → 整条响应替换为 REFUSAL_TEXT
     │
@@ -692,7 +707,7 @@ _OUTBOUND_CHANGE_RE = (
 )
 ```
 
-如果 Haiku 在解释概念时给出 `aws ec2 describe-instances`(read-only),**不**触发审计;但如果给出 `aws ec2 stop-instances`(mutation),**整条响应替换**为 REFUSAL。
+如果会话模型在解释概念时给出 `aws ec2 describe-instances`(read-only),**不**触发审计;但如果给出 `aws ec2 stop-instances`(mutation),**整条响应替换**为 REFUSAL。
 
 #### 4.2.6 测试覆盖
 
@@ -724,12 +739,12 @@ def respond(user_text, *, command, chitchat_count, locale="en") -> str:
 每条 LLM 产出的回复尾部会追加单行模型署名,让用户清楚看到回复来自哪个模型(而不是被当成"标准答案"信赖):
 
 ```
-By Claude Sonnet 5 (via Amazon Bedrock)
+By Kimi K3 (via Amazon Bedrock)
 ```
 
 - 实现:`core/bedrock_chat.py::respond()` 直接用本轮解析出的目录条目 label(`model_entry.label`)拼 `By <label> (via Amazon Bedrock)`
 - **只有一张模型名表 —— 模型目录本身**(DynamoDB,Admin「模型」页可改)。早期还有一张硬编码的 `_MODEL_FRIENDLY_NAMES` / `_friendly_model_name()` / `_model_footer()`,2026-08 已删:它没有调用方了,而且子串匹配不严谨(needle `claude-sonnet-5` 也会命中未来的 `claude-sonnet-5x`)。目录里查不到的 alias 由 `core/model_catalog.py` 兜底
-- 署名跟随本群 / 本 DM 当前选的模型(默认 Claude Sonnet 5),不是写死某一个模型
+- 署名跟随本群 / 本 DM 当前选的模型(默认 Kimi K3),不是写死某一个模型
 - 纯文本格式(不用 markdown italic),原因:飞书 `reply_text` 路径不渲染 markdown,`_..._` 字面会显示出来
 
 代码:[core/bedrock_chat.py](../core/bedrock_chat.py)
@@ -737,6 +752,8 @@ By Claude Sonnet 5 (via Amazon Bedrock)
 ---
 
 ### 4.3 Webhook 派发 `webhook_dispatch`
+
+> ⚠️ **口径范围**:现网发起调查**不走**这里 —— IM worker 与 Web 都直接调 DevOps Agent 控制面 API `CreateBacklogTask`(SigV4,见 §3.1 / §3.6)。`webhook_dispatch` 现在只剩回滚路径的长连接 app 与 `push_handler` 还在调用(而 push 链路当前没接通,见 §4.6);本节保留作 M2 之前的设计记录。
 
 #### 4.3.1 职责
 
@@ -746,10 +763,10 @@ DevOps Agent 提供两种接入方式:
 
 | 接入方式 | 适用场景 | 本项目用哪个 |
 |---|---|---|
-| **`aidevops` SDK API**(`CreateTask` 等) | 程序化 / IDE 插件 | ❌ |
-| **Generic incident webhook** | 客户的 SIEM / 告警系统 / 任何能 POST JSON 的来源 | ✅ |
+| **`aidevops` 控制面 API**(`CreateBacklogTask` 等) | 程序化 / IDE 插件 | ✅ 现网(M2 起) |
+| **Generic incident webhook** | 客户的 SIEM / 告警系统 / 任何能 POST JSON 的来源 | 只剩回滚路径与 `push_handler` |
 
-我们选 generic webhook 路线,理由:
+M2 之前我们选的是 generic webhook 路线,当时的理由:
 
 - **接入成本低**:任何能 HTTP POST 的客户端都能接入,不依赖 boto3 / SDK / IAM 编程角色
 - **协议稳定**:JSON schema 是公开的 incident 协议,跨 SDK 版本不漂移
@@ -941,7 +958,7 @@ agent 已经拿到 EC2 元信息和最近 1 小时的 CPU 指标,
 
 #### 4.4.5 翻译实现细节
 
-`translate_thinking_zh()` 调 Bedrock Haiku,system prompt 强调:
+`translate_thinking_zh()` 调 Bedrock(`core/bot_llm` → SSM `/notiops/agent/model_id`,默认 Kimi K3),system prompt 强调:
 
 - 保留专有名词原文(EC2 / S3 / IAM / Region / instance-id 等)
 - 保留代码段、路径、ARN 原文
@@ -1011,20 +1028,21 @@ agent 已经拿到 EC2 元信息和最近 1 小时的 CPU 指标,
 
 #### 4.6.1 设计目标
 
-bot **零客户配置即装即用** —— 部署后自动订阅 6 个 EventBridge 事件源,客户什么都不用配。
+设计目标是**零客户配置**:常见 AWS 告警事件一来,就往目标群推一张 heads-up 卡,并自动派发一次 DevOps Agent 调查,报告回到同一个群。
 
-#### 4.6.2 6 个事件源
+**现状(先读这段)**:全量部署(方式 B)给下表 5 个事件源各建一条规则,**全部建成 DISABLED**;而且当前版本这条推送链路**还没接通**(见 §4.6.4 末尾),只 enable 规则既不会发卡,也不会派调查。要在事件上一键调查,目前用 Web「通知」收件箱(§3.3)。一键部署(方式 A)不建这组规则。
 
-| 源 | 默认 | EventBridge pattern | 备注 |
-|---|---|---|---|
-| CloudWatch Alarm 状态变化 → ALARM | ✅ ON | `aws.cloudwatch` + state.value=ALARM | 客户已有 alarm 直接生效 |
-| AWS Health(issue / scheduledChange / accountNotification) | ✅ ON | `aws.health` | Personal Health Dashboard 自动产生事件 |
-| AWS Backup Job FAILED / EXPIRED / ABORTED | ✅ ON | `aws.backup` | Backup 服务自带事件 |
-| GuardDuty finding(severity ≥ `GUARDDUTY_MIN_SEVERITY`) | ⛔ OFF | `aws.guardduty` | 需客户先启用 GuardDuty |
-| Cost Anomaly Detection | ⛔ OFF | `aws.ce` | 需客户先在 Billing 建 monitor |
-| Trusted Advisor ERROR-status changes | ⛔ OFF | `aws.trustedadvisor` | 仅 Business+ Support 计划生效;只推 ERROR 状态变更,不推 refresh notification;`TA_INCLUDE_CATEGORIES` 默认白名单 `security,fault_tolerance,service_limits` |
+#### 4.6.2 5 条推送规则
 
-每个源对应一条 EventBridge rule(`notiops-push-<源>`,默认 DISABLED);开关就是 enable/disable 那条规则本身,没有对应的 CFN parameter。
+| 源 | 规则 | 默认 | EventBridge pattern | 备注 |
+|---|---|---|---|---|
+| CloudWatch Alarm 状态变化 | `notiops-push-cloudwatchalarm` | ⛔ OFF | `aws.cloudwatch` / `CloudWatch Alarm State Change`(排除 NotiOps 自己的 `notiops-inspection-*` 运维告警) | 客户已有的 alarm 都算;normalizer 只放行进入 ALARM 的变化 |
+| AWS Backup 任务 | `notiops-push-backupjob` | ⛔ OFF | `aws.backup` / `Backup Job State Change` | normalizer 只放行 FAILED / EXPIRED / ABORTED |
+| GuardDuty finding | `notiops-push-guardduty` | ⛔ OFF | `aws.guardduty` / `GuardDuty Finding` | 只放行 severity ≥ `GUARDDUTY_MIN_SEVERITY`(默认 7.0);需客户先启用 GuardDuty |
+| Cost Anomaly Detection | `notiops-push-costanomaly` | ⛔ OFF | `aws.ce` / `Anomaly Detected` | 需客户先在 Billing 建 monitor;全局服务,只在 us-east-1 发事件 |
+| Trusted Advisor | `notiops-push-trustedadvisor` | ⛔ OFF | `aws.trustedadvisor` / `Trusted Advisor Check Item Refresh Notification` | 仅 Business+ Support 计划生效;normalizer 只放行 ERROR 状态,类别默认允许清单 `TA_INCLUDE_CATEGORIES=security,fault_tolerance,service_limits`;同样只在 us-east-1 发事件 |
+
+开关就是在 EventBridge 上 enable / disable 那条规则本身(`aws events enable-rule --name notiops-push-<源>`),不用重新部署,也没有对应的 CFN 参数或 CDK context。**AWS Health 不在这一组**:它走单独的 `notiops-phd-forwarder`(摘要后只推飞书 Secret 里 `notify_chat_ids` 的群,不自动调查);Web「通知」收件箱是另一组规则 `notiops-web-notif-<源>`(§3.3),与这里互不影响。
 
 #### 4.6.3 事件归一化
 
@@ -1033,14 +1051,20 @@ bot **零客户配置即装即用** —— 部署后自动订阅 6 个 EventBrid
 ```python
 @dataclass
 class PushEvent:
-    title: str               # 卡片标题(已带 emoji)
-    description: str         # 主体文字
-    console_url: str         # "在控制台查看" 按钮 URL
-    dedupe_key: str          # 同资源 + 同事件类型的去重键
-    investigate_query: str   # 自动派发给 DevOps Agent 的查询文本
+    source: str               # 人读的来源名:"CloudWatch Alarm" / "GuardDuty" ...
+    title: str                # 一行摘要(≤120 字符)
+    severity: str             # "info" | "warn" | "critical",决定卡片颜色
+    resource: str             # 主资源 ARN / id;账号级事件为空
+    region: str = ""
+    account: str = ""
+    description: str = ""     # 多行上下文(发给 agent,也显示在卡片上)
+    dedupe_key: str = ""      # 同值 → 窗口内去重
+    dispatch_query: str = ""  # 派发给 DevOps Agent 做后续调查的文本
+    console_url: str = ""     # 可选:控制台深链
+    raw_event_excerpt: dict = field(default_factory=dict)
 ```
 
-每个事件源有一个独立的 normalizer 函数(`_normalize_cloudwatch_alarm` / `_normalize_health` / ...),输入 EventBridge 事件 JSON,输出 `PushEvent` 或 None(过滤)。
+每个事件源有一个独立的 normalizer 函数(`from_cloudwatch_alarm` / `from_aws_backup` / `from_guardduty` / ...,共 10 个源,Web「通知」收件箱与这里共用同一套),输入 EventBridge 事件 JSON,输出 `PushEvent` 或 None(过滤);`normalize()` 按事件的 `source` 分发。
 
 #### 4.6.4 噪音治理
 
@@ -1048,7 +1072,7 @@ class PushEvent:
 事件来 → 去重检查
    │
    ▼ DDB conditional put:
-key = "push_dedup#<dedupe_key>"
+key = "push_dedupe#<dedupe_key>"
 TTL = 现在 + 5 分钟
 ConditionExpression: attribute_not_exists(lookup_key)
    │  失败(同一资源 5 分钟内已触发) → 直接丢弃
@@ -1056,12 +1080,12 @@ ConditionExpression: attribute_not_exists(lookup_key)
 立即推送 heads-up 卡到目标群
    │
    ▼ 自动派发 investigate
-core.webhook_dispatch.dispatch(query=investigate_query, ...)
+core.webhook_dispatch.dispatch(user_text=<由 dispatch_query 等拼成>, ...)
    │
    ▼ 几分钟后调查报告回到同一个群
 ```
 
-`PushTargetPlatform` / `PushTargetChatId` 是可选 CFN 参数,但**强烈建议部署时显式提供**(避免漏配导致静默不发卡片)。`PushTargetChatId` 留空时 Lambda short-circuit,完全不发卡片(适合先静默观察日志再决定开关)。
+⚠️ **当前版本这条链路还没接通**:`push_handler` 发卡的目标群只认它自己的环境变量 `PUSH_TARGET_PLATFORM` / `PUSH_TARGET_CHAT_ID`(不读飞书 Secret 的 `notify_chat_ids`),派发调查走的是老的 `webhook_dispatch` 通道(`WEBHOOK_URL` / `WEBHOOK_SECRET_ARN`,§4.3),而部署时这几个值都不注入,也没有对应的 CFN 参数 / CDK context。所以 enable 规则之后,每个事件只会在 `/aws/lambda/notiops-push-handler` 里留下一行 `Push disabled (no chat_id or webhook URL); ignoring event (platform=feishu)` 就返回 —— 不发卡,也不派调查。
 
 代码:[shared/report_delivery/push_handler.py](../shared/report_delivery/push_handler.py)、[core/push_event.py](../core/push_event.py)
 
@@ -1108,7 +1132,7 @@ core.webhook_dispatch.dispatch(query=investigate_query, ...)
 2. **prompt 组装**([core/case_analyze.py](../core/case_analyze.py) `_format_for_prompt`):
    - 一段结构化 markdown,case 头部 + 全部 communications 编号 + speaker 标记
    - 每条 message 单条上限 4000 字符,超长截断
-3. **LLM 调用**(`bedrock-runtime:InvokeModel`,模型走 `get_bot_model_id()` —— 即 SSM `/notiops/agent/model_id`,当前 `global.anthropic.claude-sonnet-5`。⚠️ 这条**不跟随** `@bot model` 的会话偏好:本调用点手搓 Anthropic 原生 body,换非 Claude 模型会 ValidationException,见 `shared/model_config.py`):
+3. **LLM 调用**(`core/bot_llm.py::invoke_bot_text` → `shared/llm_provider.invoke_llm`,即 Bedrock Converse;模型走 `get_bot_model_id()` —— 即 SSM `/notiops/agent/model_id`(方式 B 由 CDK 写入 `global.moonshotai.kimi-k3`;方式 A 的一键栈不建这个参数,读不到时落到 `shared/model_config.py` 的兜底,同为 `global.moonshotai.kimi-k3`),与目录默认相同,但它是独立的一格:Admin「模型」页改默认不会带着它变。⚠️ 这条**不跟随** `@bot model` 的会话偏好。2026-09-01 之前本调用点手搓 Anthropic 原生 body,这一格只能填 Claude;改走 Converse 之后目录里 Converse 可调的模型都能填,唯独只在 `bedrock-mantle` 上架的 GPT-5.6 系列不行(`bot_llm` 恒走 Converse、不按 model_id 猜协议),见 `shared/model_config.py`):
    - System prompt 硬规则:
      - 不发明资源 ID / ARN / account ID
      - 不输出 mutation 命令(零变更承诺,read-only 命令 OK)
@@ -1132,9 +1156,9 @@ core.webhook_dispatch.dispatch(query=investigate_query, ...)
 
 #### 4.8.1 单表设计
 
-只用一张共享表 `notiops-devops-conversations`(deletion policy: Retain),所有状态通过 `lookup_key` 前缀分类。优点:
+只用一张共享表(方式 B 是 `notiops-conversations`,deletion policy: Retain;一键部署方式 A 装了 IM 时另建一张同形、由 CloudFormation 命名、随栈删除的表),所有状态通过 `lookup_key` 前缀分类。优点:
 
-- TTL 7 天自动清理,无需 cron 维护
+- 每行带 `ttl`,DDB TTL 自动清理(各前缀的时长见下表),无需 cron 维护
 - 全部用 `get_item` / `put_item` / `update_item` + ConditionExpression,不依赖二级索引
 - 跨平台共享:飞书 / Slack / 钉钉用同一张表,`platform` 字段区分
 
@@ -1142,14 +1166,14 @@ core.webhook_dispatch.dispatch(query=investigate_query, ...)
 
 | 前缀 | 用途 | TTL |
 |---|---|---|
-| `event#<event_id>` | 平台内事件去重 + 生命周期(received → awaiting_confirmation → dispatched / cancelled) | 7 天 |
-| `incident#<incident_id>` | 跨链路路由(IM ↔ DevOps Agent ↔ Lambda)。incident_id 格式:`<platform>-<event_id>` | 7 天 |
-| `task#<task_id>` | DevOps Agent task fallback 路由(当 incident_id 抽取失败) | 7 天 |
+| `event#<event_id>` | 平台内事件去重 + 生命周期(received → awaiting_confirmation → dispatched / cancelled) | 24 小时 |
+| `incident#<incident_id>` | 跨链路路由(IM ↔ DevOps Agent ↔ Lambda)。incident_id 格式:`<platform>-<event_id>` | 24 小时 |
+| `task#<task_id>` | DevOps Agent task fallback 路由(当 incident_id 抽取失败) | 24 小时 |
 | `support#<incident_id>` | case 创建上下文(把 case_display_id 与 incident_id 关联) | 7 天 |
 | `imtask#<incident_id>` | **现网(M2 起)**:一次已派发深度调查的全部上下文 + 进度游标(`message_id` / `execution_id` / `task_id` / `seen_ids` / `console_url`),`notiops-im-progress` 每分钟扫它 | 30 分钟(终态立刻删行) |
 | `imchat#<platform>:<chat_id>` | 一个会话的 DevOps Agent `execution_id`(IM 多轮上下文靠它,不靠模型记忆) | 12 小时 |
 | `progress#<incident_id>` | ⚠️ **已退役(M2)**:ECS daemon 的进度卡轮询状态(tick_count / last_polled_at / last_summary_md) | 报告完成后自动删 |
-| `push_dedup#<resource>:<event_type>` | push 事件 5 分钟去重 | 5 分钟 |
+| `push_dedupe#<dedupe_key>` | push 事件 5 分钟去重(`dedupe_key` 由 normalizer 把事件类型 + 账号 / 区域 / 资源等字段哈希而成) | 5 分钟 |
 | `locale#user#<user_id>` | 用户显式语言偏好(由 §4.9 `set_user_pref` 写入) | 90 天 |
 | `locale#dm#<platform>:<user_id>` | DM 自动锁定(首条消息 auto-detect 后写入,后续 follow-up 沿用) | 30 天 |
 | `locale#thread#<platform>:<root_id>` | 群里 thread 锁定(同一线程不让两字回复 "why?" 误转英文) | 7 天 |
@@ -1208,7 +1232,7 @@ i18n.parse_language_switch_intent(text: str) -> str   # NL "切换到英文" / "
 3. thread lock          locale#thread#<plat>:<root> (7d)
 4. DM lock              locale#dm#<plat>:<uid>     (30d)
 5. 自动检测当前消息       i18n.detect_locale(text)
-6. 群组默认             env DEFAULT_LOCALE          (CFN parameter)
+6. 群组默认             env DEFAULT_LOCALE          (现网两条部署路径都不注入 → 直接落到下一层)
 7. fallback             "en"
 ```
 
@@ -1273,7 +1297,7 @@ Lambda 这一侧(report-handler / push-handler)拿到的事件里没有 user_id,
 用户问 "ALB 和 NLB 什么区别"
    │
    ▼  bedrock_chat.respond(...) 走 Bedrock Tool Use
-Bedrock 会话模型(默认 Claude Sonnet 5)
+Bedrock 会话模型(默认 Kimi K3)
    │  自主决定要不要调 tool
    ├── aws_docs_search(query)    ← MCP tool 1
    ├── aws_docs_read(url)         ← MCP tool 2
@@ -1320,17 +1344,17 @@ Body 文本 + 📚 来源块(列出每个引用的 URL)
 
 - **5 秒 hard timeout**:MCP 调慢直接放行,bedrock 不卡死
 - **最多 5 hits / hit 600 字符**:防止 prompt context 爆掉
-- **URL 白名单 host**:回复里出现的 AWS 控制台 URL 必须是 `console.aws.amazon.com` 等已知 host —— 防 LLM 把 wrong-region 链接 / 钓鱼链接编进回复
+- **URL host 允许清单**:回复里出现的 AWS 控制台 URL 必须是 `console.aws.amazon.com` 等已知 host —— 防 LLM 把 wrong-region 链接 / 钓鱼链接编进回复
 - **read-only**:MCP 只允许 search / read tool,Bedrock 没法用来调"开 EC2"之类 mutating tool —— 系统 prompt + tool allowlist 双重把守
 
 #### 4.10.4 开关 `AwsMcpMode`
 
-CFN parameter,通过 task definition env 透传:
+环境变量 `AWS_MCP_MODE`,只有 `core/bedrock_chat.py` 读(也就是只作用于回滚路径的长连接 app)。⚠️ 它**不是**部署参数,也没有 CDK context 可改:`infra/lib/bot-stack.ts` 与 `infra/lib/constructs/im-core.ts` 都把它写死为 `docs_only`;未设置时代码默认 `disabled`:
 
 | 值 | 含义 |
 |---|---|
 | `disabled` | 永远不调 MCP,只用 Bedrock 训练数据回答(2026-01 cutoff) |
-| `docs_only`(默认 ✅) | 启用 AWS docs / 博客 / re:Post 检索 |
+| `docs_only`(两个栈写死的值 ✅) | 启用 AWS docs / 博客 / re:Post 检索 |
 
 > 早期还存在 `account_resources` 档(Tier-2,跨 boto3 ReadOnly 调资源),已**撤销 2026-05-30** —— 账户级查询的语义模糊性(哪些 region / 哪些 service)在单次问答里很难处理好,这类需求改走 `investigate` 路径让 DevOps Agent 完整调查。
 
@@ -1338,7 +1362,7 @@ CFN parameter,通过 task definition env 透传:
 
 `scripts/test_aws_docs_mcp.py` 跑 62 个 case:
 
-- search 命中正确 host(白名单守门)
+- search 命中正确 host(允许清单守门)
 - read 解析后字段长度限制
 - timeout 模拟 → bedrock 仍出回复(不被 MCP 卡死)
 - 多 tool 串联(search → read → quote)的多轮 toolUse
@@ -1351,40 +1375,76 @@ CFN parameter,通过 task definition env 透传:
 
 ### 5.1 IAM 最小权限
 
-**IM worker Lambda 执行角色**(M2 之前是 bot ECS task role,权限集相同)只能调:
+**IM Lambda 执行角色**(ingress / worker / progress 三类函数共用一个,定义在两条部署路径共用的 `infra/lib/constructs/im-core.ts`;M2 之前对应的是 bot ECS task role —— 现在这个在 `aidevops` 上更宽,因为发起调查 / 直连对话用的是它自己的凭证)只能调:
 
 ```
-✅ bedrock-runtime:InvokeModel              (Haiku 调用)
-✅ dynamodb:GetItem/PutItem/UpdateItem/Scan (本项目共享表)
-✅ secretsmanager:GetSecretValue            (webhook + IM token)
-✅ aidevops:ListJournalRecords              (读 DevOps Agent 进度)
-✅ support:DescribeCases / CreateCase /
-   AddCommunicationToCase / ResolveCase     (case 管理)
+✅ dynamodb:GetItem / BatchGetItem / Query / Scan / PutItem / UpdateItem /
+   DeleteItem / BatchWriteItem / ConditionCheckItem / DescribeTable
+                                            (只限本项目的 metrics / config / conversations 三张表)
+✅ bedrock:InvokeModel / InvokeModelWithResponseStream、bedrock-mantle:CreateInference
+                                            (case 分类 / 分析等内部小任务;模型取 SSM /notiops/agent/model_id)
+✅ bedrock-agentcore:InvokeAgentRuntime     (/agent notiops 那条路;只限本账号的 runtime)
+✅ aidevops:CreateBacklogTask / GetBacklogTask / ListJournalRecords / ListRecommendations /
+   CreateChat / SendMessage / ListPendingMessages(只限本账号的 agent space)+ ListAgentSpaces
+✅ sts:AssumeRole                           (只限 notiops-agent-trigger-* 与成员账号采集角色 notiops-idle-detection-role*)
+✅ support:CreateCase / DescribeCases / DescribeCommunications / AddCommunicationToCase /
+   ResolveCase / DescribeServices / DescribeSeverityLevels / DescribeTrustedAdvisorChecks
+                                            (case 管理;Support API 不支持资源级授权,只能写 *)
+✅ s3:GetObject / PutObject                 (只限本项目数据桶的 skills/ / mcp-snapshots/ / reports/ 前缀)
+   + s3:ListBucket(只限 skills/ 前缀)
+✅ ssm:GetParameter                          (只限 /notiops/*)
+✅ secretsmanager:GetSecretValue            (只限 IM 凭据 Secret、notiops/bedrock-api-key、notiops/aliyun-credentials)
+✅ lambda:InvokeFunction                     (只限已装各 IM 平台的 worker 函数,用途是 ingress → worker
+                                             异步投递;角色是共用的,所以任一用这个角色的函数都能调它们)
+✅ AWS 托管策略 AWSLambdaBasicExecutionRole  (写自己的 CloudWatch 日志)
+   一键部署(方式 A)里 DevOps 回调函数也用这个角色,所以那边另加:
+   s3:GetObject / PutObject(只限 investigations/ 前缀)+ sqs:SendMessage(只限回调的 DLQ)
 
-❌ 绝对没有 EC2 / RDS / IAM / S3 / Lambda / KMS 写权限
+❌ 对客户基础设施(EC2 / RDS / IAM / Lambda / KMS / 客户自己的 S3 桶等)没有任何写权限
 ```
 
-**Lambda role**:与上对称,加 `s3:PutObject`(上传报告 HTML)+ `events:PutRule`(EventBridge 自管)。
+**后台 Lambda 角色**(`NotiOpsBackendStack` 的共享执行角色 `notiops-lambda-execution-role`,DevOps 回调 / push-handler / 巡检 / 成本分析 / 每日通知等共用):读客户账号的只读 API(CloudWatch 指标、RDS / ElastiCache 描述、Trusted Advisor 检查结果、Cost Explorer)+ `sts:AssumeRole`(只限 `notiops-idle-detection-role*` 与 `notiops-agent-trigger-*`)+ `bedrock:InvokeModel` + DevOps Agent(读 journal;巡检判读另有 `CreateBacklogTask` 等)+ 本项目自己资源的读写(DDB 表、SNS 主题、SQS 队列、本项目的 Secret 与 SSM 参数、往自己的事件总线 `events:PutEvents`;数据桶按函数单独授权)+ `lambda:InvokeFunction`。注意最后这条的资源写的是本账号本区域的 `function:*` —— 比它实际要调的那几个函数宽,技术上也覆盖账号里不属于 NotiOps 的函数。除此之外它没有改客户基础设施的权限;也没有 `events:PutRule` 这类改 EventBridge 规则的权限(本节早期版本这么写过,代码里从来没有)。
 
-设计原则:即使 bot 完全沦陷(IM token 泄漏 + prompt 注入 + 代码漏洞),最大破坏面也只是 IM 端 —— **不能直接改云环境**。
+设计原则:即使 bot 完全沦陷(IM token 泄漏 + prompt 注入 + 代码漏洞),最大破坏面也只是 IM 端 —— **不能直接改云环境**;它能写的只有本项目自己的资源和 Support 工单(见 §5.3)。
 
 ### 5.2 Webhook HMAC 签名
 
-- secret 在 Secrets Manager,7 天轮换
+> ⚠️ 只适用于 §4.3 那条 legacy 通道(回滚路径的长连接 app 与 `push_handler`)。现网发起调查走 DevOps Agent 控制面 API(IAM + SigV4),不经过这里;两条部署路径都**不**建这个 webhook Secret,也没有为它配置自动轮换。
+
+- secret 放在 Secrets Manager(由 `WEBHOOK_SECRET_ARN` 指过去)
 - HMAC-SHA256 over `{timestamp}:{body}`,base64 编码
 - Headers:`x-amzn-event-timestamp` + `x-amzn-event-signature`(AWS standard)
 - DevOps Agent 端验签拒绝伪造
 
 ### 5.3 零变更防御:硬边界 + 按入口的纵深防御
 
-硬边界是 **只读 IAM 角色**(§5.1):无论哪条入口,访问客户账号用的都是只读角色,写操作
-拿不到权限。这一层之上是纵深防御,而**两条入口的纵深层不一样** —— 别当同一套看:
+硬边界是 **只读 IAM 角色**(§5.1):无论哪条入口,访问客户账号用的都是对客户基础设施只读的角色,
+改资源的写操作拿不到权限。对话 / 调查链路上,唯一会动到客户自己东西的写授权是 AWS Support 工单的
+建 / 回 / 关:IM 执行角色、BFF 角色,以及成员账号的采集角色(模板参数 `EnableSupportCaseWrite`
+默认 `true`,可设为 `false` 关掉)上带 `support:CreateCase` / `AddCommunicationToCase` / `ResolveCase`,
+且只在用户确认预览后才执行(见下表最后一行)。
+
+⚠️ 这**不等于**这几个角色别的什么都写不了。下面这些写权限作用于 NotiOps 自己的资源,审计时要一起看:
+
+- **两个执行角色**(IM 执行角色、BFF 角色)都能读写本项目自己的 DDB 表与数据桶前缀,并用自己的凭证
+  在本账号的 Agent Space 里发起 DevOps Agent 调查与对话(`CreateBacklogTask` / `CreateChat` /
+  `SendMessage`,见 §5.1)。
+- **BFF 角色**另有一组只在控制台里有人显式操作时才用到的写权限(都受能力权限控制;Skill 发布在
+  「更多 → 技能」,其余在「更多 → 管理」):多账号模式下两个成员 StackSet(`notiops-member-onboarding` /
+  `notiops-member-devops-agent`)的实例增删 —— 会在成员账号里建 / 删 NotiOps 自己的资源(IAM 角色、
+  Agent Space 与关联、事件转发规则等,见 `infra/member-account-onboarding.yaml` /
+  `infra/member-devops-agent.yaml`);本账号 Agent Space 的关联(`AssociateService`,配一条
+  `iam:PassRole`:资源是本账号的 `role/*`,条件限定只能传给 `aidevops.amazonaws.com`)与 Skill 资产
+  (`CreateAsset` / `UpdateAsset` / `DeleteAsset`);本部署 Cognito 用户池里的用户与组;IM / 阿里云凭据
+  Secret 的读写(首次保存可新建)。授权全文在 `infra/lib/constructs/web-chat-core.ts`。
+
+这一层之上是纵深防御,而**两条入口的纵深层不一样** —— 别当同一套看:
 
 | 层 | 网页控制台 | IM(M2 之后 = Webhook + Lambda) |
 |---|---|---|
-| 工具 / 模型层只读 | `READ_OPERATIONS_ONLY=true`(官方 aws-api-mcp)+ 精选只读 MCP 允许清单(FinOps / Investigation / RDS·CloudWatch 巡检 / Cases) | 直连 DevOps Agent 的**只读 agent**,NotiOps 自己不过模型(0 token) |
-| 命令级 denylist | ✅ `is_denied_command()` —— 拦 `secretsmanager get-secret-value` / `ssm get-parameter --with-decryption` / `kms decrypt` 这类「本身只读、但不该读」的动作 | — |
-| system prompt 只读约束 | ✅ | 由 DevOps Agent 侧负责 |
+| 工具 / 模型层只读 | `READ_OPERATIONS_ONLY=true`(官方 aws-api-mcp)+ 精选只读 MCP 允许清单(FinOps / Investigation / RDS·CloudWatch 巡检 / Cases) | 默认直连 DevOps Agent 的**只读 agent**(NotiOps 侧 0 token);`/agent notiops` 之后走 NotiOps agent —— 与网页同一个 runtime,只挂窄工具集(文档检索 + 只读的 `call_aws`,跨账号时换成只读的 `aws_readonly`),`READ_OPERATIONS_ONLY` 同左 |
+| 命令级 denylist | ✅ `is_denied_command()` —— 拦 `secretsmanager get-secret-value` / `ssm get-parameter --with-decryption` / `kms decrypt` 这类「本身只读、但不该读」的动作 | 默认那条路 —;`/agent notiops` 之后同左(`call_aws` 那一层) |
+| system prompt 只读约束 | ✅ | 默认由 DevOps Agent 侧负责;`/agent notiops` 之后同左 |
 | 入站正则 | — | ✅ `platforms/common/router.py::_STRONG_CHANGE_RE`,只认强变更措辞(绝不扩到「改一下 / 调整」) |
 | 出站审计 | — | — |
 | 写类动作 | 工单的建 / 回 / 关只产出**预览**,用户确认后才执行 | 同左(走 `case_flow` 卡片确认) |
@@ -1394,25 +1454,26 @@ CFN parameter,通过 task definition env 透传:
 退役的 ECS 长连接 app,M2 之后只在回滚路径上跑。历史上「38 个综合 case 单测全过」说的
 就是那三层,单测仍在,覆盖的是回滚路径。
 
-⚠️ **已知缺口(未做):** `core/case_analyze.py` 是 IM Webhook 路径上**唯一还调 LLM** 的
-能力(`platforms/feishu/caps.py` → `case_flow.start_analyze` → `case_analyze.analyze`)。
-它走 `core/bot_llm.py`,而 `bot_llm` 里**没有**出站审计 —— `case_analyze.py` 自己的
-docstring 曾声称「L3 outbound audit still runs (see `_audit_response`)」,那是陈旧说法
-(全仓库没有 `_audit_response`;唯一的审计函数 `bedrock_chat._audit_response_for_change`
+⚠️ **已知缺口(未做):** IM Webhook 路径上 NotiOps 自己调模型的,除了 `/agent notiops` 之后的
+对话(走 AgentCore runtime,护栏见上表),还有两处,都走 `core/bot_llm.py`:案例智能分析
+`core/case_analyze.py`(`platforms/feishu/caps.py` → `case_flow.start_analyze` → `case_analyze.analyze`)
+与建单表单提交那一刻的服务分类 `core/case_classifier.py`。`bot_llm` 里**没有**出站审计 ——
+`case_analyze.py` 自己的 docstring 曾声称「L3 outbound audit still runs (see `_audit_response`)」,
+那是陈旧说法(全仓库没有 `_audit_response`;唯一的审计函数 `bedrock_chat._audit_response_for_change`
 只在 `bedrock_chat.respond()` 里调用),该 docstring 已于 2026-09-03 就地更正。
-要补这条审计,得把它接到 `bot_llm` 上。风险有限:这条路径的输出是案例摘要,不含可执行
+要补这条审计,得把它接到 `bot_llm` 上。风险有限:这两处的输出是案例摘要 / 服务分类,不含可执行
 命令,且硬边界(只读角色)照旧;但「文档说有、代码里没有」本身必须消掉,故在此记明。
 
 ### 5.4 数据保留与隐私
 
 | 数据 | 存储 | 保留 | 访问控制 |
 |---|---|---|---|
-| 调查报告 HTML | S3 | 7 天预签 URL | URL 持有者可访问,7 天后失效 |
-| Trace HTML | S3 | 7 天 | 同上 |
-| DDB event_id / incident_id 元数据 | DynamoDB | 7 天 TTL 自动清理 | bot task role 只读 |
+| IM 调查报告 / Trace HTML | S3 数据桶 `investigations/<task_id>/` | 对象本身**没有**生命周期规则,随数据桶一起删(方式 B 删栈即删;方式 A 默认保留数据桶,`TeardownMode=DeleteEverything` 才清) | 预签 URL 持有者可访问。名义有效期 7 天(`PRESIGN_EXPIRY` 默认 604800 秒),但签名用的是回调 Lambda 执行角色的临时凭证,凭证一过期链接就失效(IAM 角色的临时凭证最长 12 小时),远早于 7 天;这个前缀不走报告 CDN |
+| Web 端报告 / IM 长回答 HTML | S3 数据桶 `reports/` | 7 天生命周期自动删除 | 经报告 CDN(CloudFront)分发,链接即凭证 |
+| DDB event_id / incident_id / task_id 路由行 | DynamoDB | 24 小时 TTL(`support#` 案例上下文 7 天) | IM 执行角色与后台 Lambda 角色读写 |
 | Push event 去重 key | DynamoDB | 5 分钟 TTL | 同上 |
 | Bedrock 调用内容 | 不持久化 | — | 走 Bedrock 标准合规 |
-| IM token / webhook secret | Secrets Manager | 持久 | bot task role + Lambda role 读取 |
+| IM 凭据 Secret | Secrets Manager | 持久 | IM 执行角色与要发卡的后台 Lambda 读取;BFF 角色读写(「更多 → 管理 → 集成 IM」保存时写入,首次保存可新建);方式 B 的后台 Lambda 角色对飞书 Secret 另有写权限 |
 
 ### 5.5 跨平台数据隔离
 
@@ -1426,8 +1487,8 @@ DDB 行带 `platform` 字段,所有查询必须按 `platform` 过滤(防止飞�
 简要要点:
 
 - **唯一部署入口**:`./setup.sh`(交互式 CDK 部署)。原 `deploy.sh` / SAM 流程已下线
-- **两个 CDK 栈 + 选了 IM 再多一个**:`WebChatStack`(主入口:AgentCore Runtime agent + BFF Lambda + Function URL SSE + `notiops-web-chat` 表 + notif handler + Cognito Identity Pool,详见 §6.1)+ `NotiOpsBackendStack`(共享后端 Lambda + DDB + S3 + EventBridge)+ `ImStack`(选了 IM 平台才建:每平台一个 API Gateway HTTP API + ingress/worker Lambda)。~~`BotStack`~~(VPC + ECS + ECR)**2026-09-03 / M2 已退役,不再部署**
-- **凭据流**:`setup.sh` 直接调 `secretsmanager:CreateSecret`,IM 凭据写到 Secrets Manager,本地不落盘;CDK 栈通过 ARN 引用
+- **两个 CDK 栈 + 选了 IM 再多一个**:`WebChatStack`(主入口:BFF Lambda + Function URL SSE + `notiops-web-chat` 表 + 前端(S3 + CloudFront)+ Cognito Identity Pool;agent 不在 CDK 里,由 `scripts/deploy_agent.sh` 另外部署到 AgentCore Runtime,详见 §6.1)+ `NotiOpsBackendStack`(共享后端 Lambda —— 含 Web「通知」收件箱的 `notiops-web-notif-handler` —— + DDB + S3 + EventBridge)+ `ImStack`(选了 IM 平台才建:每平台一个 API Gateway HTTP API + ingress/worker Lambda)。~~`BotStack`~~(VPC + ECS + ECR)**2026-09-03 / M2 已退役,不再部署**
+- **凭据流**:`setup.sh` 不问、也不写 IM 凭据。各平台的 IM 凭据 Secret 由 `NotiOpsBackendStack` 建成空壳,部署完在 Web Chat「更多 → 管理 → 集成 IM」里填(保存即写进 Secrets Manager),也可以直接在 Secrets Manager 里改;本地不落盘,栈与函数按名字 / ARN 引用
 - **多平台**:Feishu / Slack / DingTalk 在 setup.sh 交互式选择,可多选
 
 调参 / 回滚 / 排错见 DEPLOYMENT.md 对应章节。
@@ -1447,11 +1508,11 @@ Web Chat 有自己的部署链路(见 §2.4):
 |---|---|
 | `WEB_CHAT_TABLE` | Web Chat 单表 `notiops-web-chat` |
 | `AGENT_RUNTIME_ARN` | AgentCore Runtime ARN |
-| `SKILLS_BUCKET` | Skills S3 存储桶(`skills/` 前缀,与 IM 端共享) |
+| `SKILLS_BUCKET` | Skills S3 存储桶(`skills/` 前缀;只在 Web 端用,IM 侧的 skill 入口 2026-09-06 已退役) |
 | `DEVOPS_AGENT_SPACE_ID` | DevOps Agent space |
 | `REPORTS_CDN_DOMAIN` | 调查报告 CloudFront 域名 |
 | `CONFIG_TABLE` | `notiops-config`(复用) |
-| `NOTIOPS_CROSS_ACCOUNT_ROLE` | 跨账号只读角色 |
+| `NOTIOPS_CROSS_ACCOUNT_ROLE` | 成员账号采集角色的名字(`notiops-idle-detection-role`,多账号模式带 `-<部署账号>` 后缀):对基础设施只读,`EnableSupportCaseWrite=true`(默认)时另带三条 Support 工单写权限 |
 | `LOCKED_ACCOUNT_ID` | v1 跨账号默认锁定的部署账号 |
 
 > ⚠️ v1 **跨账号默认锁定部署账号**(`LOCKED_ACCOUNT_ID`);多账号选择器面向团队共享,但默认仍指向部署账号。
@@ -1472,7 +1533,7 @@ Web Chat 有自己的部署链路(见 §2.4):
 
 | 组件 | CloudWatch Log Group(命名规则) | 备注 |
 |---|---|---|
-| Feishu ingress | `/aws/lambda/notiops-im-ingress-feishu` | 验签 + 幂等去重 + 异步投递(**收不到消息先看这里**) |
+| Feishu ingress | `/aws/lambda/notiops-im-ingress-feishu` | 验签 + 异步投递(幂等去重在 worker;**收不到消息先看这里**) |
 | Feishu worker | `/aws/lambda/notiops-im-worker-feishu` | 真正处理消息 / 卡片回调 |
 | Slack ingress | `/aws/lambda/notiops-im-ingress-slack` | 同上(Events / Interactivity / Slash 三类都走这里) |
 | Slack worker | `/aws/lambda/notiops-im-worker-slack` | 真正处理消息 / 交互 |
@@ -1481,44 +1542,51 @@ Web Chat 有自己的部署链路(见 §2.4):
 | IM 进度轮询 | `/aws/lambda/notiops-im-progress` | 调查进度卡刷新 |
 | Feishu / Slack bot(回滚路径)| `/ecs/<bot-stack>-{feishu,slack}-bot-*` | 长连接 / Socket Mode 容器,只在回滚时有流量 |
 | DevOps Callback | `/aws/lambda/notiops-devops-callback` | 调查结果回调 |
-| Lambda4 Notifier | `/aws/lambda/notiops-notifier` | 定时推送(含 6 事件源) |
-| Health Checker | `/aws/lambda/notiops-health-checker` | AWS Health 巡检 |
+| Lambda4 Notifier | `/aws/lambda/notiops-notifier` | 每日通知(资源巡检 / 成本异常 / 过去 24h 调查汇总,只推飞书) |
+| 资源巡检 | `/aws/lambda/notiops-inspection-{scheduler,executor,reconciler,push}` | 调度 / 执行 / 对账 / 推送(原来的 `notiops-health-checker` 已于 2026-09-04 退役) |
+| Push handler | `/aws/lambda/notiops-push-handler` | 主动观察推送(5 条规则默认关,当前链路未接通,见 §4.6) |
 | Cost Analyzer | `/aws/lambda/notiops-cost-analyzer` | 成本异常检测 |
 
 > 真实 log group 名以 `aws logs describe-log-groups` 查到的为准(CDK 给 ECS log group 加哈希后缀,Lambda 用固定名)。
 
 ### 7.2 关键结构化日志
 
+现网 webhook IM(M2 起)的关键日志行,都在 `notiops-im-worker-<platform>` 里:
+
+```
+worker: chat oc_xxx not in allowlist                          # 不在群允许清单(Slack 写 channel、钉钉写 conversation)
+worker: duplicate event <event_id> — skipped                  # 平台重试被幂等去重挡掉
+router: refused change-like request platform=feishu kind=chat # 强变更措辞 / prompt 注入被二道门拦下
+```
+
+Push(`/aws/lambda/notiops-push-handler`):当前版本不注入目标群,规则 enable 之后每个事件只会留下这一行(见 §4.6.4):
+
+```
+Push disabled (no chat_id or webhook URL); ignoring event (platform=feishu)
+```
+
+接通之后才会出现 `Received push event source=... detail-type=...`、`Duplicate push event within window; key=...` 这类行。
+
+下面三段是**回滚路径**(已随 `BotStack` 退役的长连接 app 与 ECS daemon)的日志,现网看不到:
+
 意图分类(每次 @bot 一行):
 
 ```
-intent_classify: command=investigate history_len=0
-   bedrock_ref=False final_ref=False text_len=11
-   rewrite_len=0 drop_reason=-
+intent_classify: command=investigate text_len=11 is_change=False
 ```
 
 变更请求拦截:
 
 ```
-change-request rejected at front-line (text_len=21)
 bedrock_chat: rejected change-request via inbound regex (command=chitchat, mode=enabled)
-bedrock_chat: outbound audit rejected response — replacing with canned refusal
+bedrock_chat: outbound audit rejected response (command=..., ...)
 ```
 
 进度轮询:
 
 ```
-progress tick: incident=feishu-xxx tick=3 elapsed=60s
-   all_records=12 tool_use=4 type_counts={'message': 8, 'utilization': 4}
+progress tick: incident=feishu-xxx tick=3 elapsed=60s all_records=12 tool_use=4 type_counts={'message': 8, 'utilization': 4}
 progress tick: extracted 5 recent_tools, 4 tool_calls, thinking=yes
-```
-
-Push 派发:
-
-```
-push_handler: source=cloudwatch alarm_name=high-cpu state=ALARM
-push_handler: dedupe miss for cloudwatch:high-cpu — already pushed in last 5 min
-push_handler: dispatched feishu-push-<dedupe_key>
 ```
 
 ### 7.3 关键指标(待加 CloudWatch metric filter)
@@ -1537,22 +1605,19 @@ push_handler: dispatched feishu-push-<dedupe_key>
 
 新增 IM 平台(Teams / 微信企业号 / 任何支持 bot 的平台)只需做三件事,**`core/` 完全不动**。
 
-> **本节只讲如何新增 IM 补充平台;主入口 Web Chat 是另一条独立的接入面**(见 §2.4):它不是 IM 平台适配层,而是浏览器端的 agentic 助手,自带 AgentCore Runtime + BFF Function URL SSE + React 前端 + Cognito/SigV4 鉴权。它与 IM 侧共享部分后端约束与存储(如 Skills 的 S3 `skills/` 前缀、只读防线理念),但不复用本节的 `core/` + IM 适配层(ingress/worker Lambda)与 sender 契约。
+> **本节只讲如何新增 IM 补充平台;主入口 Web Chat 是另一条独立的接入面**(见 §2.4):它不是 IM 平台适配层,而是浏览器端的 agentic 助手,自带 AgentCore Runtime + BFF Function URL SSE + React 前端 + Cognito/SigV4 鉴权。它与 IM 侧共享部分后端约束与存储(如共用数据桶的 `reports/` 前缀、模型目录、只读防线理念),但不复用本节的 `core/` + IM 适配层(ingress/worker Lambda)与 sender 契约。
 
 ### 8.1 三步指南
 
 #### Step 1: 添加 platform 适配层
 
-`platforms/<name>/app/main.py`,实现:
+`platforms/<name>/` 下三个文件:
 
-```python
-# IM 协议适配:接收消息事件 → 调 core.bedrock_intent.analyze_intent
-# 卡片回调路由:dispatch / cancel_dispatch / case_* / next_step_dispatch
-def on_message(event): ...
-def on_card_action(event): ...
-```
+- `lambda_ingress.py` —— webhook 入口:验签 / 解密 / URL challenge,秒回 ACK,再 `InvocationType='Event'` 异步投给 worker
+- `lambda_worker.py` —— 群允许清单 → 幂等去重(`ddb_state.put_new_event`)→ 把消息规范化成 `ImMessage`,交给 `platforms/common/router.py::dispatch()`
+- `caps.py` —— 实现 `platforms/common/im_types.py` 里的 `Caps`(十个能力 + 传输,每个方法自己完成回复)
 
-参考 [platforms/feishu/app/main.py](../platforms/feishu/app/main.py)(580 行)和 [platforms/slack/app/main.py](../platforms/slack/app/main.py)(587 行)结构对称。
+参考 `platforms/feishu/`、`platforms/slack/`、`platforms/dingtalk/` 三套,结构对称。`platforms/<name>/app/main.py` 那种长连接进程(收消息后调 `core.bedrock_intent.analyze_intent`)是 M2 之前的写法,新平台不要再照它写。
 
 #### Step 2: 添加 sender 模块
 
@@ -1577,11 +1642,11 @@ def send_push_headsup(chat_id: str, event: dict) -> None: ...
 不再有 CFN 模板,所有平台栈统一在 CDK 里。⚠️ **2026-09-03(M2)之后新平台走 webhook + Lambda,不要再照 Fargate 那套写**。在 [`infra/lib/constructs/im-core.ts`](../infra/lib/constructs/im-core.ts) 里仿照 Feishu / Slack 的模式加一套:
 
 - 一个 `createIngressHttpApi(...)`(`$default` catch-all,未鉴权 —— 鉴权靠平台签名)
-- `ingress` Lambda(128MB / 短超时,`reservedConcurrentExecutions=10`):验签 + 幂等 + `InvocationType='Event'` 投 worker + 表情 ack
-- `worker` Lambda(900s):规范化成 `ImMessage` → `platforms.common.router.dispatch` → 新平台的 `Caps` 实现
+- `ingress` Lambda(2048MB / 20s,`reservedConcurrentExecutions=10`):验签 + `InvocationType='Event'` 投 worker + 表情 ack(幂等去重在 worker)。⚠️ 这两个数是**冷启动**决定的,别往下调 —— 512 / 1024MB 实测都撞 Lambda INIT 阶段的 10 秒上限,记录在 `im-core.ts` 飞书 ingress 那段注释里
+- `worker` Lambda(1024MB / 900s):规范化成 `ImMessage` → `platforms.common.router.dispatch` → 新平台的 `Caps` 实现
 - 两个函数共用 `scripts/build_im_layer.sh` 产出的依赖 Layer(**不需要容器构建**)
-- 执行角色加 DDB / Bedrock / sts:AssumeRole / aidevops 权限(参考已有 feishu/slack 的声明)
-- 新增一个 `notiops/im-bot-<name>` Secret(由 `NotiOpsBackendStack` 建空壳,部署后再填)
+- 执行角色:新函数用同一个共享的 `imRole`(见 §5.1);它的 `secretsmanager:GetSecretValue` 是按 Secret 名字收窄的,新平台的 Secret 名要补进去,ingress → worker 的 invoke 权限用 `grantInvokeWorkerByName` 按函数名授
+- 新增一个 `notiops/im-bot-<name>` Secret(由 `NotiOpsBackendStack` 建空壳,部署后再填),并把这个名字补进 `infra/lib/constructs/web-chat-core.ts` 的 `imBotSecretNames` —— BFF 在「集成 IM」页按这份清单读写凭据,漏了是整页 500(见那里的注释)
 - ⚠️ 别给 Lambda 设 `AWS_REGION` 环境变量(保留名,CFN 直接拒;Fargate 时代没这个限制)
 
 CDK 自动 synth 出 CloudFormation,你不需要写任何 template.yaml。
@@ -1617,7 +1682,7 @@ class ProgressCardIR:
 
 ### 8.3 工作量估算
 
-飞书 / Slack 两个适配层结构对称,代码量都在 ~600 行(平台特定)+ ~400-1100 行(sender)。新增平台预计 **1-2 天**(熟悉对方 IM API 后)。
+飞书 / Slack / 钉钉三个适配层结构对称(各自是 ingress + worker + caps 三个文件,约 1,200-1,700 行,注释占了不少)+ sender 约 500-1,500 行。新增平台预计 **1-2 天**(熟悉对方 IM API 后)。
 
 ---
 
@@ -1630,20 +1695,20 @@ class ProgressCardIR:
 | 1 | 多轮上下文 | ❌ 已撤销 (2026-05-27) | history 强先验把 chitchat 误判,与 #8 打架 |
 | 2 | 派发前 enrichment | ⏳ 未开始 | 提升单次调查质量,需 ReadOnly IAM 设计 |
 | 3 | next-step 按钮 | 🔴 已退役 (2026-09-05) | 曾由 Bedrock 生成 dispatch / open_url;为了让深度调查链路 0 token 去掉,格式契约见 §4.5 |
-| 4 | 主动观察一期 | ✅ 已实现 (2026-05-25) | 6 事件源 + 5 分钟去重 |
+| 4 | 主动观察一期 | ✅ 已实现 (2026-05-25) | 6 事件源 + 5 分钟去重。现状:5 条 `notiops-push-*` 规则默认关(AWS Health 改走单独的转发器),当前版本推送链路还没接通,见 §4.6 |
 | 4' | 主动观察二期 | ⏳ 未开始 | rollup 风暴 / 路由表 / 跨账号 |
-| 5 | 定时巡检 cron | ⏳ 未开始 | 每天扫 IAM / SG / 费用异常 |
-| 6 | 多 LLM 切换(Claude / Nova / GPT)| ✅ 已实现 (2026-06-05) | `core/model_catalog.py` 别名表 + `core/llm_pref_resolver.py` per-chat 偏好 + per-model `max_output_tokens`;`@bot model nova` 任意切换 |
+| 5 | 定时巡检 cron | ✅ 部分已实现 | 方式 B 已有资源巡检(RDS / Aurora / ElastiCache 的高负载 / 闲置与成本,调度器每 15 分钟按「阈值与定时」派发)与每日成本异常分析;IAM / SG 等覆盖仍未开始 |
+| 6 | 多 LLM 切换 | ✅ 已实现 (2026-06-05) | 可选集 = 模型目录(DDB `llmcfg`,Admin「模型」页管理;`core/model_catalog.py` 是它在 IM 侧的适配层)里对 IM 启用的模型 + `core/llm_pref_resolver.py` per-chat 偏好 + per-model `max_output_tokens`;`@bot model <别名>` 任意切换(如 `@bot model claude`),`@bot model list` 列出可选,默认 Kimi K3 |
 | 7 | 跨调查记忆 / FAQ 库 | ⏳ 长期 | OpenSearch / S3 Vectors |
 | 8 | 通用对话能力 | ✅ 已实现 (2026-05-27) | 三层防御(⚠️ 仅回滚路径,见 §5.3)+ 三档开关 + 17 / 23 / 38 case 单测 |
 | 9 | Skill 编排 | 🔴 IM 侧已退役 (2026-09-06) | 三个平台一起去掉(`core/nl_router.py` 里 `_SKILLS_RE` / `Caps.skills` / `KINDS` 的 `"skills"` 全删),不是某个平台缺实现;skill 选择 + 自助上传(authoring)能力完整保留在 Web Chat 端 |
 | 10 | 双语支持 (zh / en) | ✅ 已实现 (2026-05-31) | 自动检测 + 4 层锁定 + `language` 命令 + 自然语切换;详见 §4.9 |
 | 11 | AWS MCP(docs / pricing / cost) | ⚠️ IM 侧只剩 docs (2026-09-03 / M2) | Tier-1 hosted Knowledge MCP 仍在;Pricing/Cost/WA **sidecar 随 `BotStack` 退役**,IM Lambda 显式关掉(Web Chat 侧走进程内 stdio MCP,不受影响) |
-| 12 | 钉钉(DingTalk)平台支持 | ✅ 已上线 (2026-09-08) | 两条部署路径都可选(`setup.sh` 选项 3 / 一键部署 `InstallOption=web+dingtalk`),与飞书 / Slack 同一个 Lambda webhook 形态。对话 / 调查 / case 全生命周期(bot 回一张纯文本模版,用户整段复制改完发回,再回「确认」)/ push 投递 / 报告 markdown 回贴。永久性平台差异(不是分期):消息发出后不可编辑 → 进度改追加式(仍然送达);卡片按钮只能跳 URL → 没有 Next-step 一键派发;主动推送只能配一个目标 |
+| 12 | 钉钉(DingTalk)平台支持 | ✅ 已上线 (2026-09-08) | 两条部署路径都可选(`setup.sh` 选项 3 / 一键部署 `InstallOption=web+dingtalk`),与飞书 / Slack 同一个 Lambda webhook 形态。对话 / 调查 / case 全生命周期(bot 回一张纯文本模版,用户整段复制改完发回,再回「确认」)/ push 投递(推送链路当前未接通,见 §4.6)/ 报告 markdown 回贴。永久性平台差异(不是分期):消息发出后不可编辑 → 进度改追加式(仍然送达);卡片按钮只能跳 URL → 没有 Next-step 一键派发;主动推送只能配一个目标 |
 
 ### 9.1 短期(本季度)
 
-- **#5 定时巡检** —— 让 bot 主动干活,补 push 模式被动等告警
+- **#5 巡检覆盖扩展** —— 在已上线的资源巡检之外继续覆盖 IAM / SG 等,补 push 模式被动等告警
 - **#2 enrichment** —— 减少 agent 澄清来回,提升单次调查质量
 - **#4 二期** —— rollup 风暴模式 + 路由表(不同 service 推不同群)+ 跨账号订阅
 
@@ -1657,7 +1722,6 @@ class ProgressCardIR:
 
 - 客户在 IM 里说一句话 → DevOps Agent 调查 + 历史经验复用 + 主动建议 → 形成完整 SRE 助手闭环
 - 跨账号 / 跨组织订阅,中央 bot 服务多个工作负载
-- 接入到 AWS CX Builder Hub 应用市场,降低客户接入门槛
 
 ---
 
@@ -1674,11 +1738,11 @@ notiops/
 │   ├── bedrock_chat.py                # 通用对话 + 三层防御 + 模型 footer(仅回滚路径)
 │   ├── progress_card.py               # ⚠️ 已退役(M2):进度卡 IR + Bedrock 摘要 + 翻译
 │   ├── progress_poller.py             # ⚠️ 已退役(M2):ECS daemon 轮询调度
-│   ├── next_steps.py                  # 报告后建议生成(URL 白名单)
+│   ├── next_steps.py                  # 报告后建议生成(URL 允许清单;2026-09-05 起没有生产调用方)
 │   ├── case_management.py             # AWS Support case 增删改查
 │   ├── case_classifier.py             # 服务 code 分类(~324 候选)
 │   ├── support_logic.py               # severity / language 双语标签 + idempotency
-│   ├── push_event.py                  # 6 个事件源 normalizer
+│   ├── push_event.py                  # 10 个事件源 normalizer(IM 推送与 Web「通知」收件箱共用)
 │   ├── webhook_dispatch.py            # HMAC 签名 + 重试派发
 │   ├── i18n.py                        # 中央翻译表 + locale 检测 + NL 切换正则
 │   ├── locale_resolver.py             # 7 层优先级解析 + 4 类锁定 row
@@ -1713,7 +1777,7 @@ notiops/
 ├── lambda_inspection_push/            # 巡检结果推送(Rule 每 15 分钟,时段窗口在代码里判)
 ├── inspection/                        # 巡检域逻辑(pipeline / domain / adapters / skills)
 ├── agent/                             # 手写参考骨架(Strands),**不参与部署**;已与下面那份分叉
-│                                      #   (405 行 vs 2819 行),读现网行为请读 agent-build/
+│                                      #   (main.py 438 行 vs 3,318 行,2026-10 实测),读现网行为请读 agent-build/
 ├── agent-build/                       # ★ 现网 Web Chat agent 的源码 + AgentCore CLI 脚手架 ——
 │   └── NotiOpsWebChat/                #   agentcore.json 的 codeLocation 指向 app/NotiOpsWebChat/,
 │                                      #   scripts/deploy_agent.sh 只 cd 到这里跑 `agentcore deploy`
@@ -1733,7 +1797,8 @@ notiops/
 │   │   ├── lambda_worker.py           # ★ 真正处理消息 / 卡片回调
 │   │   ├── webhook_adapter.py         # 事件体 → 平台无关的处理入参
 │   │   ├── im_cards.py                # 卡片构造
-│   │   ├── app/                       # ⚠️ 已退役(M2):长连接 bot 进程,留作源码回滚
+│   │   ├── app/                       # ⚠️ 长连接 bot 进程(M2 已退役,留作源码回滚);其中 feishu_utils /
+│   │   │                              #   case_flow / support_flow 与 main.py 的卡片回调仍被 webhook worker 复用
 │   │   │   ├── main.py                # lark-oapi 长连接 + 卡片路由
 │   │   │   ├── feishu_utils.py        # tenant_access_token 缓存
 │   │   │   ├── progress_sender.py     # progress IR → 飞书 v2 卡
@@ -1745,7 +1810,7 @@ notiops/
 │   │   ├── lambda_ingress.py          # ★ Events / Interactivity / Slash 同一入口
 │   │   ├── lambda_worker.py           # ★
 │   │   ├── im_blocks.py
-│   │   ├── app/                       # 回滚路径:Socket Mode bot 进程
+│   │   ├── app/                       # 回滚路径:Socket Mode bot 进程;其中 blocks / case_flow 仍被 webhook 的 caps 复用
 │   │   │   ├── main.py                # slack_bolt Socket Mode + 路由
 │   │   │   ├── blocks.py              # Block Kit 工厂方法
 │   │   │   ├── progress_sender.py
@@ -1767,7 +1832,7 @@ notiops/
 │   └── aws-wa-mcp/                    # 默认禁用,代码保留
 ├── scripts/
 │   ├── lint_i18n.py                   # i18n treadmill,CI 把守
-│   ├── i18n_baseline.txt              # 30 条合法中文字面量豁免清单
+│   ├── i18n_baseline.txt              # 登记在案的 CJK 字面量豁免清单(只许减不许增;2026-10 为 147 条)
 │   ├── install_hooks.sh               # pre-commit 安装
 │   └── test_aws_docs_mcp.py           # 62 case MCP 单测
 ├── docs/                              # 设计文档(本目录)
@@ -1789,7 +1854,7 @@ notiops/
 
 ### 10.2 DDB 表结构
 
-`infra/lib/notiops-backend-stack.ts` 创建的共享表(继承 SAM 时代命名 `notiops-devops-conversations`,DeletionPolicy: Retain)。所有状态通过 `lookup_key` 前缀分类。
+`infra/lib/notiops-backend-stack.ts` 创建的共享表 `notiops-conversations`(DeletionPolicy: Retain;一键部署方式 A 的同形表见 §4.8.1)。所有状态通过 `lookup_key` 前缀分类。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -1833,13 +1898,13 @@ CDK context 完整列表(`ImStack` + `NotiOpsBackendStack`)请见 [DEPLOYMENT.md
 | Howto + change-request | **23** | 12 howto + 11 真变更 | inline 单测脚本 |
 | Inbound + outbound 综合 | **38** | inbound/outbound × {必中, 必通过} | inline 单测脚本 |
 | Markdown 表格 normalize | **4** | 对齐分隔符 / 缺分隔行 / 已规范 / 行内 pipe | inline 单测脚本 |
-| Chitchat 短路白名单 | **30+** | 高频寒暄 + 应通过的 investigate / qa | inline 单测脚本 |
+| Chitchat 短路允许清单 | **30+** | 高频寒暄 + 应通过的 investigate / qa | inline 单测脚本 |
 
 测试目前以 inline Python script 形式跑(不依赖 pytest),后续可以迁移到正规 test framework。
 
 ### 10.5 常用运维命令
 
-> 占位符 `<platform>`(`feishu` / `slack`)/ `<conv-table>` 替换成真名(见
+> 占位符 `<platform>`(`feishu` / `slack` / `dingtalk`)/ `<conv-table>` 替换成真名(见
 > [DEPLOYMENT.md §6](DEPLOYMENT.md#6-冒烟测试))。M2(2026-09-03)之后**没有 ECS 集群 /
 > service 了**,IM 侧全是 Lambda,日志组名字是固定的 `/aws/lambda/notiops-im-*`。
 
@@ -1852,22 +1917,25 @@ aws logs tail /aws/lambda/notiops-devops-callback --since 5m --follow
 aws logs tail /aws/lambda/notiops-notifier --since 5m --follow
 
 # === 定向查询(关键日志关键字)===
-aws logs tail /aws/lambda/notiops-im-worker-<platform> --since 1h --filter-pattern "nl_router"       # 确定性路由结果
-aws logs tail /aws/lambda/notiops-im-worker-<platform> --since 1h --filter-pattern "change-request"  # 变更拦截
+aws logs tail /aws/lambda/notiops-im-worker-<platform> --since 1h --filter-pattern '"refused change-like request"'  # 变更 / prompt 注入被二道门拦下
+aws logs tail /aws/lambda/notiops-im-worker-<platform> --since 1h --filter-pattern '"not in allowlist"'             # 不在群允许清单里的会话被丢弃
 aws logs tail /aws/lambda/notiops-im-progress --since 1h --filter-pattern "progress"                 # 进度轮询
 
-# === 配置变更(改 infra/cdk.json 后)===
-cd infra && npx cdk deploy ImStack               # IM 配置项(ImStack 只读 3 个 context key,见 DEPLOYMENT.md §11.1)
-cd infra && npx cdk deploy NotiOpsBackendStack   # push / 后端配置项
+# === 配置变更 ===
+# 改配置的正路是重跑 ./setup.sh:它每次部署都带着全套 -c(ImStack 读 enabledPlatforms / imAllowedChatIds /
+# organizationId / agentRuntimeArn 四个 key)。setup.sh 不传的 key(如 imAllowedChatIds、webNotif<Id>)
+# 写进 infra/cdk.json 的 context 块再重跑。别只带一两个 -c 手工 cdk deploy 单栈 ——
+# 没带上的 context 会把对应功能静默关掉。IM push 事件源不是 context,而是 EventBridge 规则:
+aws events enable-rule  --name notiops-push-<源>   # <源> = cloudwatchalarm / backupjob / guardduty / costanomaly / trustedadvisor
+aws events disable-rule --name notiops-push-<源>   # 当前版本推送链路还没接通,见 §4.6
 
 # === 让 IM Lambda 换一批执行环境(重读 Secret)===
 # Lambda 冷启动时才读 Secret;改任意一个环境变量即可强制换环境。
 # ⚠️ update-function-configuration --environment 会**整体替换** env map,
-#    先 get-function-configuration 拿全量再改,别只传一个键。做法见 DEPLOYMENT.md §8.2
+#    先 get-function-configuration 拿全量再改,别只传一个键。做法见 DEPLOYMENT.md §8.3
 
 # === 部署整个项目 ===
-./setup.sh                  # 全量(bootstrap → build → CDK deploy --all)
-cd infra && npx cdk deploy --all   # 只 redeploy(不重 build)
+./setup.sh                  # 全量(bootstrap → build → CDK deploy --all);重跑只补差异
 
 # === DDB 状态查询 ===
 aws dynamodb get-item --table-name <conv-table> \

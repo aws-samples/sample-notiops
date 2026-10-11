@@ -75,9 +75,9 @@ class ModelEntry:
 
 
 # Last-resort alias. Deliberately the *short* form: it is also the `short` of
-# the seed's default (`xai-grok-4-6`), and `llm_config` accepts short aliases,
+# the seed's default (`moonshot-kimi-k3`), and `llm_config` accepts short aliases,
 # so this resolves even when DynamoDB is unreachable.
-DEFAULT_ALIAS = "grok"
+DEFAULT_ALIAS = "kimi"
 
 # Absolute floor, used only if `llm_config` itself somehow fails (it is written
 # not to raise, but `get()` is on the critical path of every reply and must not
@@ -95,11 +95,13 @@ DEFAULT_ALIAS = "grok"
 # the normal path resolves to `llm_config._OUTPUT_TARGET` = 6000 — the floor must
 # match what the normal path produces, not the model card.
 #
-# 2026-09-01: follows the catalogue default from Claude Sonnet 5 to Grok 4.6.
+# 2026-10-10: follows the catalogue default from Grok 4.6 to Kimi K3 (128000 hard
+# limit, no `output_override` -> the normal path also resolves to 6000).
+# 2026-09-01: followed it from Claude Sonnet 5 to Grok 4.6.
 _FLOOR = ModelEntry(
     alias=DEFAULT_ALIAS,
-    model_id="global.xai.grok-4.6",
-    label="Grok 4.6",
+    model_id="global.moonshotai.kimi-k3",
+    label="Kimi K3",
     kind="bedrock_converse",
     max_output_tokens=6000,
 )

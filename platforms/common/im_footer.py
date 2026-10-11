@@ -63,7 +63,8 @@ def route_line(locale: str, *, agent: str = "devops", usage=None) -> str:
     三条路三套说法，故意不含糊：
       · `devops`  → `router.direct_no_token`（直连，NotiOps 侧 0 token）；
       · `notiops` → `router.agent_model`，报 `usage["modelId"]`（`core.agent_chat`
-        用 `llm_config.resolve()` 算出的**实际生效**模型 id）。拿不到就退
+        用 `llm_config.resolve()` 算出、并按 runtime 那一端核对过的**实际生效**模型 id）。
+        拿不到、报不准、或这一轮是不调模型的内置回答（`via="builtin"`）时它是空串，就退
         `router.agent_model_unknown`（只报 agent 名）—— **绝不能**退成"无模型消耗"
         那句：那是把"不知道"说成"没花钱"。
       · `starops` → `router.direct_starops`（直连阿里云 STAROps，NotiOps 侧 0 token，

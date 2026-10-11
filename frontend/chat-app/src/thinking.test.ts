@@ -6,7 +6,7 @@
  * 累积逻辑本身，因为 bug 都藏在合并/去重/过滤这些边界上，而它们与 UI 无关、最该单测。
  */
 import { describe, it, expect } from "vitest";
-import { appendStep, appendReasoning, isWaitHint, hasThinking, MAX_THINKING_STEPS, type TimelineStep } from "./thinking";
+import { appendStep, appendReasoning, isWaitHint, hasThinking, MAX_THINKING_STEPS, THOUGHT_TRUNCATED_MARK, type TimelineStep } from "./thinking";
 
 const T = 1_700_000_000_000;
 
@@ -110,6 +110,32 @@ describe("appendReasoning", () => {
   it("空增量不产生新数组（避免无谓重渲染）", () => {
     const a: TimelineStep[] = [];
     expect(appendReasoning(a, "", T)).toBe(a);
+  });
+
+  // 2026-10-10 起思考**只**在侧边栏里看（气泡里那份不封顶的折叠灰字已删），所以截断必须看得出来。
+  it("超过单段上限 → 截断并在末尾留标记，之后的增量不再改它（同一个数组）", () => {
+    let s: TimelineStep[] = [];
+    for (let i = 0; i < 90; i++) s = appendReasoning(s, "想".repeat(100), T + i);   // 9000 字
+    expect(s).toHaveLength(1);
+    expect(s[0].text.length).toBe(8000);
+    expect(s[0].text.endsWith(THOUGHT_TRUNCATED_MARK)).toBe(true);
+    const frozen = s;
+    expect(appendReasoning(frozen, "还有", T + 999)).toBe(frozen);
+  });
+
+  it("恰好拼到上限时还不加标记；下一个增量来了才补上（不悄悄丢）", () => {
+    let s: TimelineStep[] = appendReasoning([], "a".repeat(8000), T);
+    expect(s[0].text.length).toBe(8000);
+    expect(s[0].text.endsWith(THOUGHT_TRUNCATED_MARK)).toBe(false);
+    s = appendReasoning(s, "b", T + 1);
+    expect(s[0].text.length).toBe(8000);
+    expect(s[0].text.endsWith(THOUGHT_TRUNCATED_MARK)).toBe(true);
+  });
+
+  it("单个超长增量另起一段时同样截断留标记", () => {
+    const s = appendReasoning([], "x".repeat(9000), T);
+    expect(s[0].text.length).toBe(8000);
+    expect(s[0].text.endsWith(THOUGHT_TRUNCATED_MARK)).toBe(true);
   });
 });
 

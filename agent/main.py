@@ -70,7 +70,7 @@ _TOPIC_FOCUS = {
 app = BedrockAgentCoreApp()
 
 # 模型可由 BFF 通过 payload.model 覆盖；默认跟随 config/llm-model-catalog.json 的
-# default_model（2026-09-01 起为 Grok 4.6）。
+# default_model（2026-10-10 起为 Kimi K3；2026-09-01 – 10-09 是 Grok 4.6）。
 #
 # ⚠️ 这份 alias→model_id 映射是**离线镜像**，不是运行时权威。部署的 agent
 # （agent-build/NotiOpsWebChat/app/NotiOpsWebChat/model/load.py）从 DDB 的模型目录
@@ -78,11 +78,18 @@ app = BedrockAgentCoreApp()
 # （见该文件顶部注释）。所以这里只需与 config/llm-model-catalog.json 的 seed 值同值，
 # 加新模型时**先改目录**，这张表只是让本目录能独立跑起来。
 _DEFAULT_MODEL = os.environ.get(
-    "NOTIOPS_DEFAULT_MODEL", "global.xai.grok-4.6"
+    "NOTIOPS_DEFAULT_MODEL", "global.moonshotai.kimi-k3"
 )
 
 _MODEL_MAP = {
-    "xai-grok-4-6": "global.xai.grok-4.6",  # 目录 default_model
+    "moonshot-kimi-k3": "global.moonshotai.kimi-k3",  # 目录 default_model（2026-10-10 起）
+    "xai-grok-4-7": "global.xai.grok-4.7",
+    "zai-glm-5-3": "global.zai.glm-5.3",  # 与 GLM 5 不同，5.3 有 global. profile
+    "claude-sonnet-5-5": "global.anthropic.claude-sonnet-5-5",
+    "claude-opus-5-5": "global.anthropic.claude-opus-5-5",
+    "gpt-6-sol": "global.openai.gpt-6-sol",  # ⚠️ 走 Converse，不走 Mantle（Mantle 上没有它）
+    # —— 以下是目录里已 disabled 的条目，留着让老会话的偏好还能解析 ——
+    "xai-grok-4-6": "global.xai.grok-4.6",
     "claude-sonnet-5": "global.anthropic.claude-sonnet-5",
     "claude-opus-5": "global.anthropic.claude-opus-5",
     "claude-haiku-4-5": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -385,7 +392,7 @@ async def invoke(payload):
     # 流式：把 Strands 的事件逐个 yield，Runtime 转 SSE。
     # 额外抽出两类"处理中"信号（长耗时时聊天窗口不再干等）：
     #   · 工具开始调用 → {progress}：一句"正在做什么"（双语随本轮语言）。
-    #   · reasoning 增量 → {reasoning}：模型思考过程（前端可折叠灰字，收到正文即隐藏）。
+    #   · reasoning 增量 → {reasoning}：模型思考过程（前端只并进右侧「思考过程」面板的思考段）。
     async for event in agent.stream_async(prompt):
         for _out in _stream_events(event, _en):
             yield _out

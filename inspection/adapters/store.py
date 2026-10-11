@@ -1709,7 +1709,7 @@ def _finding_to_item(
                 #    传 `{"severity":"INFO","state":"resolved","SK":"hijacked"}`
                 #    三项全部生效。
                 logger.warning(
-                    "evidence 试图覆盖保留字段 %s（已忽略）—— 抽取白名单可能写宽了", k)
+                    "evidence 试图覆盖保留字段 %s（已忽略）—— 抽取允许清单可能写宽了", k)
                 continue
             if v is not None:
                 item[k] = _jsonable(v)

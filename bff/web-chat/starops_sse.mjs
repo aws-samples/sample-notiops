@@ -3,7 +3,7 @@
  *
  * 定位：与 `devops_chat.mjs` 完全同一个角色 —— 把外部 agent 服务的流式响应转成
  * NotiOps 既有的四种 SSE 事件（`token` / `progress` / `investigation_step` / `usage`），
- * 因此前端渲染与右侧「调查过程」面板**零改动复用**。NotiOps 侧 0 token
+ * 因此前端渲染与右侧「思考过程」面板**零改动复用**。NotiOps 侧 0 token
  * （回答由阿里云自己的模型生成，我们只当传输层）。
  *
  * ⚠️ **为什么这个文件不 import 任何东西**：`devops_chat.mjs` 的 `makeSink` / `alreadySaid`

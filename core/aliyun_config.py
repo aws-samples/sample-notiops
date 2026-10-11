@@ -1,7 +1,8 @@
 """阿里云凭据读取（IM 侧）—— `bff/web-chat/aliyun_config.mjs` **读那一半**的语义移植。
 
-只搬 `loadAliyunCredentials()`。**写那一半刻意不移植**：配置只在 Admin「多云」页写
-（那是 BFF 的 `apiPutAliyunConfig`），IM 侧一行都不写。在这里再实现一遍校验/合并，等于
+只搬 `loadAliyunCredentials()`。**写那一半刻意不移植**：配置只由 BFF 的 `apiPutAliyunConfig`
+写（Admin「多云」页背后的接口；那一页 2026-09-15 起随 `MULTICLOUD_UI = false` 藏着、
+左导航里点不到，见 `core/multicloud.py`），IM 侧一行都不写。在这里再实现一遍校验/合并，等于
 让同一个 secret 有两个写入者、两套校验 —— 而这一页最贵的 bug 恰好是「界面骗人」
 （客户以为存好了、实际发不出请求）。少一个写入者就少一种骗法。
 
@@ -21,7 +22,7 @@
 文件、连长度都不记**；`starops_workspace` 的值里嵌着阿里云账号 UID（见多云证据文档 §9），
 **绝不进日志**。失败只记异常**类型名**（`_safe_err`）。
 
-ARCC 未查询（MCP server 本次会话连不上）—— 本模块按标准做法处理凭据：只读、不回显、
+本模块按标准做法处理凭据：只读、不回显、
 不记日志、按资源收窄的单个 secret。
 """
 from __future__ import annotations

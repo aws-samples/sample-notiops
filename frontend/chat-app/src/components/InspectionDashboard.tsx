@@ -2356,14 +2356,22 @@ function OpsPanel({ overview, lastRuns, zh, t }: {
               gq.untrusted > 0 ? `${gq.untrusted} unverified judgement(s) - not produced by our methodology` : "",
               gq.degraded > 0 ? `${gq.degraded} with caveats` : "",
             ].filter(Boolean).join(", ")}>
+          {/* 「账号没关联」那一档与 i18n.ts 的 `insp.gate.no_data_access` 同一句（单条徽标的
+              title 用那条 key，这里是聚合告警的内联孪生）—— 路径从「更多」写起：2026-10-10 起
+              「管理」收进侧栏「更多」（默认收起），一级导航里看不到它。en 原来缺了「读不到 journal」
+              那一档，2026-10-11 补齐。 */}
           <div style={{ fontSize: 12 }}>
             {zh
               ? "点开对应 finding 的详情看具体是哪一档：skill 没加载/加载错 → 查"
-                + "派发措辞路由；账号没关联 → 去管理页把账号关联进巡检 space；"
+                + "派发措辞路由；账号没关联 → 去「更多 → 管理 → 账户」把该账号关联进巡检 space"
+                + "（该账号的「巡检的跨账号前置」→「一键关联」）；"
                 + "读不到 journal → 可能还在跑，也可能是我们权限不足。"
               : "Open the finding details for the specific cause: skill not "
                 + "loaded / wrong skill points at dispatch wording; missing "
-                + "account association is fixed in the admin page."}
+                + "account association → link the account into the inspection agent space "
+                + "under More → Admin → Accounts (that account's \"Cross-account "
+                + "prerequisites for inspection\" → \"Link now\"); unreadable journal → "
+                + "the run may still be in flight, or our permissions may be insufficient."}
             <span style={{ marginLeft: 10, color: C.muted }}>
               {zh
                 ? `已验证干净 ${gq.clean}${gq.unknown > 0 ? ` · 未验证（存量）${gq.unknown}` : ""}`

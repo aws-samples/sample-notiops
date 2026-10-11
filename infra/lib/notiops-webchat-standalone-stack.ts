@@ -26,6 +26,7 @@ import { Construct } from "constructs";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as events from "aws-cdk-lib/aws-events";
+import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as logs from "aws-cdk-lib/aws-logs";
@@ -36,7 +37,8 @@ import * as path from "path";
 // IM（飞书 / Slack）三件套 —— 与 `im-stack.ts`（方式 B）**共用同一个 construct**。
 import { createImCore } from "./constructs/im-core";
 import { createMinimalBase } from "./constructs/minimal-base-core";
-import { createWebChatCore } from "./constructs/web-chat-core";
+import { createWebChatCore, PROVISIONED_CUR_DB } from "./constructs/web-chat-core";
+import { curFinalizerPolicyStatements } from "./constructs/cur-finalizer-policy";
 // 「通知」生产端 —— 与 `notiops-backend-stack.ts`（方式 B）**共用同一份**事件源定义。
 import {
   WEB_NOTIF_ARTIFACT,
@@ -130,7 +132,7 @@ const llmCatalogJson = (() => {
 /**
  * Bedrock Mantle（GPT 系模型的调用面）可用区域。
  *
- * ⚠️ 这份名单必须 **⊇ Admin 可保存的 Mantle 区域白名单**
+ * ⚠️ 这份名单必须 **⊇ Admin 可保存的 Mantle 区域允许清单**
  * （`bff/web-chat/llm_config.mjs::MANTLE_REGIONS` 是权威源）。少一个区，管理员就能存下一条
  * 该区的 GPT 条目（校验过、保存时的连通性探测也过 —— 探测用的是 BFF 的角色），
  * 但用户真发消息时是 runtime 的角色在调 → 403。`scripts/test_mantle_regions_consistent.py`
@@ -189,7 +191,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         "update.",
     });
 
-    // CORS 白名单。默认 "*" 的理由与 CDK 路径一致（端点已由 AWS_IAM/SigV4 鉴权，
+    // CORS 允许清单。默认 "*" 的理由与 CDK 路径一致（端点已由 AWS_IAM/SigV4 鉴权，
     // 且前端 CloudFront 域名是部署期才生成的、模板里无从预置）。一键部署这条路上
     // 尤其无解：模板必须先算出 Function URL 的 CORS 配置，而 CloudFront 分配在它之后
     // 才创建（资源顺序不能动，见 web-chat-core.ts 的逻辑 ID 说明）。
@@ -242,11 +244,13 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       default: "",
       description:
         "Optional. Where to download the release artifacts from, if this account cannot reach " +
-        "GitHub. There are six release files: bff.zip, chat-dist.zip, web-notif.zip, " +
-        "agent-code.zip, im-code.zip and im-layer.zip. The first four are always needed; " +
-        "im-code.zip and im-layer.zip are downloaded only when InstallOption is not 'web', so a " +
-        "web-only install can mirror just the first four (mirror all six if you may add a bot " +
-        "later). Keep the mirror FLAT: the deployment helper fetches <base>/<filename>, so the " +
+        "GitHub. There are nine release files: bff.zip, chat-dist.zip, web-notif.zip and " +
+        "agent-code.zip are always needed. The other five are only downloaded when you ask for " +
+        "them: im-code.zip and im-layer.zip when InstallOption is not 'web'; " +
+        "cost-mcp-code.zip and cost-mcp-layer.zip when CurTable is set or ProvisionCur is yes; " +
+        "and cur-provisioner.zip when ProvisionCur is yes. So a web-only install can mirror " +
+        "just the first four -- mirror all nine if you may turn those options on later. " +
+        "Keep the mirror FLAT: the deployment helper fetches <base>/<filename>, so the " +
         "files must sit directly under the base -- do not recreate the release tag folders. Set " +
         "this to either s3://my-bucket/my/prefix (objects at my/prefix/bff.zip and so on, read " +
         "with the deployment helper's own credentials -- no public access needed, also set the " +
@@ -368,6 +372,127 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         "lambda:InvokeFunctionUrl has to be granted per function -- so it cannot be derived.",
     });
 
+    // ── 自建成本 MCP server（方式 A 的 SelfHosted 态）──────────────────────────
+    //
+    // 与上面那两个 External 参数的关系是**互斥**（下面有 CfnRule 钉住）：
+    //   · 都不填          → Off，零新增资源（默认）
+    //   · 填 CostAgentMcpUrl → External，指向客户已有的 server
+    //   · 填 CurTable      → SelfHosted，本栈自己建一个成本 MCP server
+    //
+    // 为什么用「填不填 CurTable」而不是再加一个下拉开关：`CurTable` 是 SelfHosted 态
+    // **无论如何都必须有**的东西（server 缺它启动就 raise），多一个开关只会多一种
+    // 「选了装但没填表」的半配置状态。
+    //
+    // 两种进入 SelfHosted 的方式（与方式 B 一致）：
+    //   · `CurTable` 填一张**客户已有**的 Glue 表；
+    //   · `ProvisionCur=yes` 让 NotiOps **自己建** CUR（下面那个参数），此时 CurTable 留空 ——
+    //     那张表要等 AWS 首次交付（~24h）之后才存在，部署这一刻填什么都是猜的。
+    const curTable = new cdk.CfnParameter(this, "CurTable", {
+      type: "String",
+      default: "",
+      allowedPattern: "^([a-zA-Z0-9_]+\\.[a-zA-Z0-9_]+)?$",
+      constraintDescription: "Must be <glue-database>.<table> (letters, digits, underscore) or empty.",
+      description:
+        "Optional. Your existing Cost and Usage Report Glue table as <database>.<table>. Fill this " +
+        "in and NotiOps deploys its own cost MCP server for you -- 45 read-only CUR analysis tools " +
+        "(Savings Plan waste and expiry, ODCR utilisation, per-service drill-down, invoice " +
+        "reconciliation) that answer in chat and power four FinOps dashboards. Leave empty and " +
+        "cost questions are answered from Cost Explorer instead. Mutually exclusive with " +
+        "CostAgentMcpUrl. Requires CurBucketName. The table, its Glue database and the CUR " +
+        "bucket must be in this account and in the Region you deploy to: the server runs " +
+        "Athena here. A CUR in another account is not supported yet (see CurRoleArn).",
+    });
+    // ⚠️ 描述里**不能出现非 ASCII**（em dash 写成 `--`）—— postprocess_template.py 会拦。
+    const provisionCur = new cdk.CfnParameter(this, "ProvisionCur", {
+      type: "String",
+      default: "no",
+      allowedValues: ["no", "yes"],
+      description:
+        "Let NotiOps create the Cost and Usage Report for you (leave CurTable empty if you " +
+        "pick yes). It creates an hourly, resource-level CUR in Parquet plus the official " +
+        "Athena integration, which is what the 45 cost tools query. AWS takes up to 24h to " +
+        "deliver the first report, so cost answers fall back to Cost Explorer until then and " +
+        "switch over on their own -- you do not need to deploy again. Nothing is deleted when " +
+        "you delete this stack: the report and its S3 bucket are your billing history, so they " +
+        "are left in place. Pick no if you already have a CUR (use CurTable) or if your " +
+        "organization creates CURs centrally.",
+    });
+    const curBucketName = new cdk.CfnParameter(this, "CurBucketName", {
+      type: "String",
+      default: "",
+      allowedPattern: "^([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])?$",
+      constraintDescription: "Must be an S3 bucket name or empty.",
+      description:
+        "Required with CurTable: the S3 bucket holding the CUR data, in this account. Athena " +
+        "reads it, so the server role is granted read on exactly this bucket -- we will not " +
+        "grant read on every bucket.",
+    });
+    const curRoleArn = new cdk.CfnParameter(this, "CurRoleArn", {
+      type: "String",
+      default: "",
+      allowedPattern: "^(arn:aws[a-z-]*:iam::\\d{12}:role/[\\w+=,.@/-]{1,512})?$",
+      constraintDescription: "Must be an IAM role ARN or empty.",
+      description:
+        "Not supported yet -- leave empty (the stack refuses a value). A CUR in another account " +
+        "needs an Athena workgroup with a scan cap in that account, which this release does not " +
+        "set up, so every query would fail. For a CUR in another account, deploy NotiOps in " +
+        "that account, or connect your own cost MCP server with CostAgentMcpUrl + " +
+        "CostAgentFunctionArn.",
+    });
+    const curPartitionStyle = new cdk.CfnParameter(this, "CurPartitionStyle", {
+      type: "String",
+      default: "flat",
+      allowedValues: ["flat", "year-month", "billing-period"],
+      description:
+        "How your CUR table is partitioned. 'year-month' if it has year= and month= partitions " +
+        "(what the official Glue crawler produces), 'billing-period' for CUR 2.0, 'flat' for a " +
+        "single unpartitioned table. Getting this wrong does not error -- it silently limits " +
+        "queries to part of your data, so check it against your table.",
+    });
+    const curVersion = new cdk.CfnParameter(this, "CurVersion", {
+      type: "String",
+      default: "1",
+      allowedValues: ["1", "2"],
+      description:
+        "CUR schema version. '1' is the legacy column layout and is the tested path. '2' " +
+        "(aggregated CUR 2.0, where many attributes move into map columns) is supported but " +
+        "experimental -- verify a few numbers against your invoice before relying on it.",
+    });
+    const curTagKeys = new cdk.CfnParameter(this, "CurTagKeys", {
+      type: "String",
+      default: "",
+      allowedPattern: "^([A-Za-z0-9_]+(,[A-Za-z0-9_]+)*)?$",
+      constraintDescription: "Comma-separated tag keys (letters, digits, underscore) or empty.",
+      description:
+        "Optional. User tags to split cost by, comma separated, written as the part after " +
+        "resource_tags_user_ in your CUR table's column names -- not the tag key as you typed " +
+        "it in AWS. Check your table: a tag key like cost-center usually appears as the column " +
+        "resource_tags_user_cost_center, so enter cost_center (for example team,cost_center). " +
+        "Leave empty and no tag dimension is offered at all -- we would rather not offer a " +
+        "dimension that comes back entirely as (untagged).",
+    });
+    // ⚠️ 为什么是 allowedValues + Mapping，而不是一个自由数字参数：
+    // CloudFormation **没有算术** —— 客户填 GiB、Athena 收字节，这个换算在模板里
+    // 无法计算（`Token.asNumber(x) * 1024` 在 TS 里类型合法，但合成出来是垃圾值，
+    // 而且 synth 不报错）。所以用一张查表把两个单位接起来。
+    const costMcpScanCapGiB = new cdk.CfnParameter(this, "CostMcpScanCapGiB", {
+      type: "String",
+      default: "100",
+      allowedValues: ["10", "25", "50", "100", "250", "500", "1000", "2000"],
+      description:
+        "Maximum data one CUR query may scan, in GiB (default 100). This is a real spend limit, " +
+        "not a hint: Athena charges per byte scanned and has no per-call cap, so it is enforced " +
+        "on a dedicated workgroup. Raise it if your CUR is large and queries get cancelled; " +
+        "lower it to cap what a single question can cost you.",
+    });
+    const costMcpScanCapBytes = new cdk.CfnMapping(this, "CostMcpScanCap", {
+      mapping: Object.fromEntries(
+        ["10", "25", "50", "100", "250", "500", "1000", "2000"].map(
+          (gib) => [gib, { Bytes: String(Number(gib) * 1024 * 1024 * 1024) }],
+        ),
+      ),
+    });
+
     // 群 / 频道允许清单 —— IM 只读四道防线的第三道。
     //
     // 🔴 为什么必须有这个参数（原来这里是写死的 `allowedChatIds: ""`）：
@@ -420,7 +545,15 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           },
           {
             Label: { default: "Optional: your own CUR data source" },
-            Parameters: [costAgentMcpUrl.logicalId, costAgentFunctionArn.logicalId],
+            Parameters: [
+              costAgentMcpUrl.logicalId, costAgentFunctionArn.logicalId,
+              // 自建成本 MCP（填 CurTable 即启用）。与上面两个 External 参数放同一组：
+              // 客户在这一屏做的是同一个决定 —— 「成本数据从哪来」。
+              provisionCur.logicalId,
+              curTable.logicalId, curBucketName.logicalId, curRoleArn.logicalId,
+              curPartitionStyle.logicalId, curVersion.logicalId, curTagKeys.logicalId,
+              costMcpScanCapGiB.logicalId,
+            ],
           },
           {
             Label: { default: "Lifecycle & advanced" },
@@ -444,6 +577,14 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           [artifactBaseUrl.logicalId]: { default: "Artifact base URL override" },
           [artifactMirrorBucket.logicalId]: { default: "Artifact mirror bucket name (s3:// only)" },
           [costAgentMcpUrl.logicalId]: { default: "cost-agent MCP Function URL (optional)" },
+          [provisionCur.logicalId]: { default: "Let NotiOps create the CUR for you?" },
+          [curTable.logicalId]: { default: "Your CUR Glue table (optional, enables cost analysis)" },
+          [curBucketName.logicalId]: { default: "CUR S3 bucket (same account)" },
+          [curRoleArn.logicalId]: { default: "CUR read-only role ARN (cross-account, not supported yet)" },
+          [curPartitionStyle.logicalId]: { default: "CUR partition style" },
+          [curVersion.logicalId]: { default: "CUR schema version" },
+          [curTagKeys.logicalId]: { default: "CUR tag keys to split by (optional)" },
+          [costMcpScanCapGiB.logicalId]: { default: "Max data scanned per cost query (GiB)" },
           [costAgentFunctionArn.logicalId]: { default: "cost-agent Lambda function ARN" },
         },
       },
@@ -528,6 +669,79 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // 只填 URL 不填 ARN 会得到一个"看起来装好了、每次调用都 403"的部署（Function URL 的
     // IAM 鉴权失败信息在 CloudTrail 里，客户看到的只是表格空着）。所以在**开栈之前**拦掉，
     // 而不是让它跑起来再排查。CfnRule 在参数校验阶段执行，失败时栈根本不会创建。
+    // ── 自建成本 MCP server 的部署期判据 ──────────────────────────────────────
+    // 「NotiOps 自己建 CUR」= ProvisionCur=yes。
+    const provisionCurCond = new cdk.CfnCondition(this, "ProvisionCurReport", {
+      expression: cdk.Fn.conditionEquals(provisionCur.valueAsString, "yes"),
+    });
+    // 「填了 CurTable」**或**「让 NotiOps 自己建 CUR」= 装成本 MCP。
+    // 资源照常建，由这个条件决定它们到底存不存在。
+    const installCostMcp = new cdk.CfnCondition(this, "InstallCostMcp", {
+      expression: cdk.Fn.conditionOr(
+        cdk.Fn.conditionNot(cdk.Fn.conditionEquals(curTable.valueAsString, "")),
+        cdk.Fn.conditionEquals(provisionCur.valueAsString, "yes"),
+      ),
+    });
+
+    // 互斥：自建与外接只能选一个。两个都填时「哪个生效」就变成读代码才知道的事，
+    // 而客户以为自己配了两条冗余路径 —— 这种含糊比报错糟得多。
+    new cdk.CfnRule(this, "CostMcpExclusiveWithExternal", {
+      ruleCondition: cdk.Fn.conditionOr(
+        cdk.Fn.conditionNot(cdk.Fn.conditionEquals(curTable.valueAsString, "")),
+        cdk.Fn.conditionEquals(provisionCur.valueAsString, "yes"),
+      ),
+      assertions: [{
+        assert: cdk.Fn.conditionEquals(costAgentMcpUrl.valueAsString, ""),
+        assertDescription:
+          "CurTable/ProvisionCur and CostAgentMcpUrl are mutually exclusive: either NotiOps "
+          + "deploys the cost MCP server for you, or you point at one you already run "
+          + "(CostAgentMcpUrl).",
+      }],
+    });
+
+    // `ProvisionCur=yes` 与 `CurTable` 也互斥 —— 前者说"表还不存在、等我建"，后者说
+    // "表已经有了、就是这张"。两个一起给的话，客户以为填的那张表会被用上，实际上
+    // 自建流程会另建一份 CUR，于是账单上多一份 CUR 费用、而答案来自哪张表要读代码才知道。
+    new cdk.CfnRule(this, "ProvisionCurExcludesCurTable", {
+      ruleCondition: cdk.Fn.conditionEquals(provisionCur.valueAsString, "yes"),
+      assertions: [{
+        assert: cdk.Fn.conditionEquals(curTable.valueAsString, ""),
+        assertDescription:
+          "ProvisionCur=yes means NotiOps creates the CUR and discovers its Athena table for "
+          + "you, so leave CurTable empty. If you already have a CUR, set ProvisionCur=no and "
+          + "pass its table in CurTable instead.",
+      }],
+    });
+
+    // 要桶名（跨账号 CurRoleArn 暂不支持，见下面 CostMcpCrossAccountNotSupported）。
+    // 放过去的代价是给执行角色 `s3:GetObject *`（读账号里任意桶）才能跑起来，
+    // 那是「为了让它能用而放宽权限」，正是不该做的妥协。
+    // ⚠️ `ProvisionCur=yes` 时**不**要求这两个：桶是我们自己建的，桶名在合成期就能算出来
+    // （`notiops-cur-<账号>-<区>`），没有任何需要客户填的东西。
+    new cdk.CfnRule(this, "CostMcpNeedsCurAccess", {
+      ruleCondition: cdk.Fn.conditionNot(cdk.Fn.conditionEquals(curTable.valueAsString, "")),
+      assertions: [{
+        assert: cdk.Fn.conditionNot(cdk.Fn.conditionEquals(curBucketName.valueAsString, "")),
+        assertDescription:
+          "CurTable needs CurBucketName: the S3 bucket in this account that holds the CUR data "
+          + "(Athena reads it). Without it the server would need read access to every bucket.",
+      }],
+    });
+
+    // 🔴 跨账号 CUR 暂不支持（2026-10-10 发版前审查实测）：server 用 assume 来的凭证调 Athena，查询跑在
+    // CUR 那个账号里，却带着只存在于本账号的 workgroup 名 ⇒ 45 个工具每次都 `WorkGroup does not exist`。
+    // 修好要在 CUR 账号里另有一个带扫描上限的 workgroup —— 这一版不做，先在模板里拒掉，别部署出一个
+    // 每次都失败的数据源。参数本身留着（不改参数个数、以后真支持时不用迁移）。方式 B 由 setup.sh 同样拒。
+    new cdk.CfnRule(this, "CostMcpCrossAccountNotSupported", {
+      assertions: [{
+        assert: cdk.Fn.conditionEquals(curRoleArn.valueAsString, ""),
+        assertDescription:
+          "CurRoleArn (a CUR in another account) is not supported yet -- leave it empty. Deploy "
+          + "NotiOps in the account that holds the CUR, or connect your own cost MCP server with "
+          + "CostAgentMcpUrl + CostAgentFunctionArn.",
+      }],
+    });
+
     new cdk.CfnRule(this, "CostAgentArnRequiredWithUrl", {
       ruleCondition: cdk.Fn.conditionNot(cdk.Fn.conditionEquals(costAgentMcpUrl.valueAsString, "")),
       assertions: [{
@@ -572,6 +786,15 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // 「代码 + 层」解压后合计上限 250MB，层是唯一能让三个函数共享这份依赖的机制。
     const imCodeKey = `im/${releaseTag}/im-code.zip`;
     const imLayerKey = `im/${releaseTag}/im-layer.zip`;
+    // 自建成本 MCP server（客户 CUR 查询）。与 IM 同构地分成 code + layer 两个 zip：
+    // 依赖层解压 ~64MB，与 1902 行业务代码放一起会让每次改 Python 都重传整包。
+    // ⚠️ 名字**必须以 `cost-mcp-` 开头** —— stager 按产物名前缀决定跳不跳
+    // （没填 CUR 表的客户不该为这 ~25MB 等下载），清单见 scripts/artifacts.py。
+    const costMcpCodeKey = `cost-mcp/${releaseTag}/cost-mcp-code.zip`;
+    const costMcpLayerKey = `cost-mcp/${releaseTag}/cost-mcp-layer.zip`;
+    // 阶段一（custom resource）与阶段二（finalizer）在**同一个 zip** 里，只是 handler 不同 ——
+    // 两段代码合起来不到 40 KB，分成两个产物只会让发布清单和 stager 多两条要维护的东西。
+    const curProvisionerKey = `cur/${releaseTag}/cur-provisioner.zip`;
 
     // ══ Staging 桶：Release 产物在客户账号里的落脚点 ═══════════════════════════
     // Lambda 的 `Code.S3Bucket` 与 AgentCore 的 `Code.S3.Bucket` 都只接受**同区域**的
@@ -583,12 +806,20 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       enforceSSL: true,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       // 桶名交给 CFN 生成：固定名会让「删栈后立刻重建」撞上 S3 桶名回收延迟。
-      lifecycleRules: [
-        // 产物搬完就只有 Lambda/AgentCore 首次拉取会读它。7 天后清掉旧版本产物省钱，
-        // 同时**不影响**已经部署好的 Lambda —— Lambda 在创建/更新时就把代码复制走了，
-        // 运行期不再回读这个桶（AgentCore 同理）。
-        { id: "expire-staged-artifacts-7d", expiration: cdk.Duration.days(7) },
-      ],
+      //
+      // 🔴 **没有生命周期规则，产物一直留着**（2026-10-11 起；之前是 `expire-staged-artifacts-7d`）。
+      // 原来的理由是「搬完就只有首次拉取会读它，Lambda 与 AgentCore 都在创建 / 更新时把代码复制走」——
+      // 对 Lambda 成立（只改参数时 Code 没变，CFN 不调 UpdateFunctionCode），对 AgentCore **不成立**：
+      // `AWS::BedrockAgentCore::Runtime` 的**任何**更新（哪怕只是环境变量）都会让服务按 `Code.S3`
+      // 重读一次包。而只改 `EnableDeepInvestigation` / `DeployMode` / `CostAgentMcpUrl` 这类参数的
+      // update 不会让 `StagerArtifacts` 重搬（它的属性没变）⇒ 距上次搬运超过 7 天时这次 update 必然
+      // 失败，回滚又要重读同一个包、同样失败 ⇒ 栈卡在 `UPDATE_ROLLBACK_FAILED`。v1.0.30-rc2 在验证账号
+      // 实测（清空 staging 桶模拟过期 → 只改 EnableDeepInvestigation）：`S3 object not found in bucket`，
+      // 与上面的推断一字不差；恢复办法是 `continue-update-rollback --resources-to-skip AgentRuntime`。
+      // 代价：每个 release 约 165 MB（装了 IM / 成本 MCP 再多它们的包），升级时旧版本的那份也留着 ——
+      // S3 标准存储每 GB 每月约 2 美分，可以忽略；删栈时 StagingCleanup 清空整个桶。
+      // ⚠️ 别改成「搬完新版本就删旧版本前缀」：升级失败回滚时 CFN 先回滚 Runtime（它后更新）、
+      //    再回滚 StagerArtifacts，Runtime 那一步要的正是旧版本的包。
     });
 
     // ══ 最小底座 ══════════════════════════════════════════════════════════════
@@ -704,6 +935,12 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         // 值本身也是「切换安装选项就重搬」的触发器：web → web+feishu 的栈更新会改这个
         // 属性 → CFN 发 Update → stager 这次把 IM 产物补下来。
         InstallOption: installOption.valueAsString,
+        // 客户填了 CurTable 才让 stager 下载 `cost-mcp-` 那两个产物（层 ~25MB）。
+        // 值本身也是「事后补填 CurTable 就重搬」的触发器：参数一变 → 这个属性变 →
+        // CFN 发 Update → stager 这次把成本产物补下来（与 InstallOption 同一机制）。
+        CostMcpEnabled: cdk.Fn.conditionIf(installCostMcp.logicalId, "true", "").toString(),
+        // 同理：选了 ProvisionCur 才搬 cur-provisioner.zip。
+        CurProvisionerEnabled: cdk.Fn.conditionIf(provisionCurCond.logicalId, "true", "").toString(),
       },
     });
     stagerArtifacts.addDependency(stagerFn);
@@ -1197,16 +1434,29 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     }));
     // 客户自建 cost-agent MCP（CUR 行级明细，docs/DEPLOYMENT.md §14）。与方式 B 的
     // `agent-build/.../cdk/lib/cdk-stack.ts` 同 Sid 同动作（parity 断言按 Sid 比对）。
-    // ⚠️ 不能带 `lambda:FunctionUrlAuthType` Condition —— 实测那样恒 403（§14.5）。
+    // ⚠️ 旧注释曾写「不能带 `lambda:FunctionUrlAuthType` Condition,实测那样恒 403」——
+    //    那是**对同一个 403 的误判**。真正缺的是 `lambda:InvokeFunction`
+    //    (AWS 2025-10 起 Function URL 要求两个动作)。2026-09-20 实测纠正。
     // 没填参数时资源指向一个不存在的函数：语句照在但授不到东西，客户日后只改参数即可开通。
+    // 🔴 两个动作都要给（`InvokeFunctionUrl` + `InvokeFunction`）—— AWS 2025-10 起
+    // 新建的 Function URL 要求两者齐备,只给前一个会「签名有效、身份正确、模拟器说 allowed」
+    // 却在授权阶段 403 且请求不到达函数。详见 web-chat-core.ts 里 InvokeCostAgentMcp 那段。
+    const costAgentArnEffective = cdk.Fn.conditionIf(
+      hasCostAgentMcp.logicalId,
+      costAgentFunctionArn.valueAsString,
+      `arn:${this.partition}:lambda:${this.region}:${this.account}:function:notiops-cost-agent-not-configured`,
+    ).toString();
     runtimeRole.addToPolicy(new iam.PolicyStatement({
       sid: "InvokeCostAgentMcp",
       actions: ["lambda:InvokeFunctionUrl"],
-      resources: [cdk.Fn.conditionIf(
-        hasCostAgentMcp.logicalId,
-        costAgentFunctionArn.valueAsString,
-        `arn:${this.partition}:lambda:${this.region}:${this.account}:function:notiops-cost-agent-not-configured`,
-      ).toString()],
+      resources: [costAgentArnEffective],
+      conditions: { StringEquals: { "lambda:FunctionUrlAuthType": "AWS_IAM" } },
+    }));
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      sid: "InvokeCostAgentMcpFn",
+      actions: ["lambda:InvokeFunction"],
+      resources: [costAgentArnEffective],
+      conditions: { Bool: { "lambda:InvokedViaFunctionUrl": "true" } },
     }));
     // 模型目录 / RBAC 等配置（agent 侧也要读，例如按角色裁剪工具）。
     runtimeRole.addToPolicy(new iam.PolicyStatement({
@@ -1404,6 +1654,22 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     stagerPreflight.cfnOptions.condition = isMultiAccount;
     stagerPreflight.addDependency(preflightFn);
 
+    // ── 自建成本 MCP server 的依赖层 ──────────────────────────────────────────
+    // 方式 B 从 `lambda_layer_cost/` 打资产；这里从 staging 桶取 Release 里的
+    // cost-mcp-layer.zip。⚠️ 构件 id 必须是 `CostMcpLayer` —— 方式 B 在
+    // web-chat-stack.ts 里用的是同一个 id，而 scripts/postprocess_template.py 按
+    // `aws:cdk:path` 的 `/CostMcpLayer/Resource` 后缀去模板里取 S3 key。
+    // description 里写死直接依赖的版本：运维在控制台唯一能看见"层里装了什么"的地方，
+    // 与 cost_mcp/requirements.txt 的三个直接依赖保持一致。
+    const costMcpLayer = new lambda.LayerVersion(this, "CostMcpLayer", {
+      code: lambda.Code.fromBucket(stagingBucket, costMcpLayerKey),
+      compatibleRuntimes: [lambda.Runtime.PYTHON_3_14],
+      description: "Cost MCP deps: mcp 2.0.0 + mangum 0.21.0 + boto3 1.43.77 (pinned)",
+    });
+    const costMcpLayerCfn = costMcpLayer.node.defaultChild as cdk.CfnResource;
+    costMcpLayerCfn.cfnOptions.condition = installCostMcp;
+    costMcpLayerCfn.addDependency(stagerArtifacts);
+
     // ══ Web Chat 主体 ═════════════════════════════════════════════════════════
     const webchat = createWebChatCore(this, {
       staticTemplate: true,
@@ -1443,10 +1709,318 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         costAgentFunctionArn.valueAsString,
         `arn:${cdk.Aws.PARTITION}:lambda:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:function:notiops-cost-agent-not-configured`,
       ).toString(),
+      // ── 自建成本 MCP server（SelfHosted 态）──
+      // 代码从 staging 桶取（一键模板禁 Code.fromAsset —— 会拉出隐式 CDK 资产）。
+      // ⚠️ 这些值**无条件**传：资源照常建，由 `costMcpEnabledCondition` 决定它们在
+      // 客户账号里到底存不存在。没选装时 CFN 连这些资源都不创建，参数留空也无妨。
+      costMcpCode: lambda.Code.fromBucket(stagingBucket, costMcpCodeKey),
+      costMcpLayer,
+      costMcpEnabledCondition: installCostMcp,
+      curTable: curTable.valueAsString,
+      // Glue 库名（只用于收窄 IAM）。⚠️ 必须在**模板里**切，不能在 TS 里切 ——
+      // `curTable` 是部署期值。自建 CUR 时那张表还不存在，库名用官方 crawler 的命名。
+      curDatabase: cdk.Fn.conditionIf(
+        provisionCurCond.logicalId,
+        PROVISIONED_CUR_DB,
+        cdk.Fn.select(0, cdk.Fn.split(".", curTable.valueAsString)),
+      ).toString(),
+      curPartitionStyle: curPartitionStyle.valueAsString,
+      curVersion: curVersion.valueAsString,
+      // ⚠️ 桶名是一个 `Fn::If`：自建时是**我们算得出来的**那个桶
+      // （`notiops-cur-<账号>-<区>`，与 cur_provisioner/spec.py 的拼法一致），
+      // 否则用客户填的。没有这一步，`ProvisionCur=yes` 的客户会因为
+      // `curBucketName` 为空而拿到一条读不到任何桶的策略 —— 症状是 Athena
+      // 查询全部 AccessDenied，而参数页上客户什么都没漏填。
+      curBucketName: cdk.Fn.conditionIf(
+        provisionCurCond.logicalId,
+        `notiops-cur-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
+        curBucketName.valueAsString,
+      ).toString(),
+      curRoleArn: curRoleArn.valueAsString,
+      curTagKeys: curTagKeys.valueAsString,
+      // 自建 CUR 时表名部署期还不存在 —— 运行时从 notiops-config 读。
+      //
+      // ⚠️ 这两个是**合成期**的值，不能写成 `Fn::If`：它们决定的是"模板里长什么样"
+      // （要不要那条 DDB 只读策略），而不是"部署时取哪个值"。所以方式 A **一律**把
+      // 回落通路接上，由取值决定走哪条：
+      //   · `CurTable` 填了 → `CUR_TABLE` 环境变量非空 → server 直接用它；
+      //   · `ProvisionCur=yes` → `CurTable` 是空串 → 环境变量是**空字符串**
+      //     （不是"不存在"；CFN 无法条件化一个环境变量的存在与否），而
+      //     `cost_mcp/athena.py` 把空串和缺失同等对待 → 走 DDB 解析。
+      // 两条路互不影响，且多出来的代价只是一条钉在单个 PK 上的 `dynamodb:GetItem`。
+      curProvisionedByNotiOps: true,
+      configTableName: base.configTable.tableName,
+      // GiB → 字节。参数用 GiB 是因为客户脑子里的单位是 GiB，而 Athena 的
+      // BytesScannedCutoffPerQuery 收的是字节 —— 让客户自己数十位数是在制造事故。
+      costMcpBytesScannedCutoff: cdk.Token.asNumber(
+        costMcpScanCapBytes.findInMap(costMcpScanCapGiB.valueAsString, "Bytes"),
+      ),
       // 不带的只有 `idleConsoleUrl`：它指向完整部署才有的管理仪表盘，而侧边栏那个入口
       // 本来就被 `SHOW_INSPECTIONS = false` 隐藏（Sidebar.tsx），AdminPanel 里也只是一个
       // 可选的 ↗ 外链 —— 空串是正确取值，不是缺口。
     });
+
+    // ── 自建成本 MCP：把整组资源挂到「客户填了 CurTable」这个条件上 ──────────────
+    // 共享构件无条件地把资源建了出来（方式 B 靠合成期分支决定建不建），方式 A 这边
+    // 必须逐个打部署期条件 —— 没选装时这些资源在客户账号里**根本不创建**。
+    //
+    // ⚠️ 角色必须连它的**内联策略**一起打（`applyCondition` 就是为这个存在的）：
+    // `AWS::IAM::Policy` 是另一个资源，只给 Role 打条件会在客户不选装时留下一条引用
+    // 不存在角色的策略，**整栈部署失败**。这个坑在深度调查那两个角色上已经踩过一次。
+    if (webchat.costMcp) {
+      const c = webchat.costMcp;
+      applyCondition(c.role, installCostMcp);
+      // ⚠️ L1 与 L2 要分开处理：`CfnWorkGroup` **本身就是** L1，没有 `defaultChild`
+      // （照 L2 的写法会 `Cannot read properties of undefined (reading 'cfnOptions')`
+      // —— tsc 看不出来，只有真 synth 才报）。
+      c.workgroup.cfnOptions.condition = installCostMcp;
+      for (const r of [c.fn, c.url, c.resultsBucket, ...(c.logGroup ? [c.logGroup] : [])]) {
+        (r.node.defaultChild as cdk.CfnResource).cfnOptions.condition = installCostMcp;
+      }
+      // 🔴 `enforceSSL: true` 会让 CDK 顺手生成一条 `AWS::S3::BucketPolicy`，而它是桶的
+      // **兄弟子节点**、不是 defaultChild —— 漏掉它的后果不是"少一条策略"，而是**客户不选装
+      // 时整栈部署失败**（一条无条件的策略引用一个不存在的桶）。synth 会警告
+      // 「Reference to ... which is conditional」，但 tsc 不报、警告也很容易被刷过去。
+      const resultsPolicy = c.resultsBucket.node.tryFindChild("Policy")?.node.defaultChild;
+      if (resultsPolicy) (resultsPolicy as cdk.CfnResource).cfnOptions.condition = installCostMcp;
+      // 代码与层都来自 staging 桶 ⇒ 必须等 stager 搬完。层那边已经显式加过依赖，
+      // 函数这边也要 —— 否则 CFN 会并行创建，函数先起来就是一个
+      // `Error occurred while GetObject. S3 Error Code: NoSuchKey`。
+      (c.fn.node.defaultChild as cdk.CfnResource).addDependency(stagerArtifacts);
+
+      // 🔴 agent 侧的两处接线必须在**这里**补,不能在上面写死
+      //    （2026-09-20 一次真部署发现的缺陷）
+      //
+      // 症状:`ProvisionCur=yes` / 填了 `CurTable` 的客户,栈开得好好的、4 张报表也在,
+      // 但**聊天里问成本一个 CUR 工具都不会被调用** —— 45 个工具形同不存在,而且没有
+      // 任何报错:agent 侧看到的就是"没配这个数据源",于是安静地退回 Cost Explorer。
+      //
+      // 根因是**顺序**:`runtimeRole` 的 `InvokeCostAgentMcp` 授权与 `AgentRuntime` 的
+      // `COST_AGENT_MCP_URL` 环境变量都声明在 `createWebChatCore()` **之前**,那时自建
+      // server 还不存在,所以它们只能门控在 `HasCostAgentMcp`（=**只有外接模式**）上。
+      // 给方式 A 加自建能力时我改了构件（BFF 侧拿到了正确的有效值），却漏了 agent 这两处。
+      // 实测证据:runtime 的环境变量里**没有** `COST_AGENT_MCP_URL`,而角色里那条
+      // `InvokeCostAgentMcp` 指向的是 `…:function:notiops-cost-agent-not-configured`
+      // 这个占位符 —— 两者都指向"未配置"。
+      //
+      // ⚠️ 为什么不把上面那两段整体挪到构件之后:`createWebChatCore()` 需要 runtime 的
+      // ARN（BFF 要调 agent），挪动会变成循环依赖。所以这里用**追加**的方式修:
+      //   · 环境变量 → `addPropertyOverride`（`EnvironmentVariables` 是顶层属性）
+      //   · IAM      → 再加一条**带条件**的语句,而不是去改上面那条
+      //     （上面那条在外接模式下仍然正确,两条并存时按"取并集"生效）
+      const effectiveCostMcpUrl = cdk.Fn.conditionIf(
+        installCostMcp.logicalId,
+        c.url.url,
+        cdk.Fn.conditionIf(hasCostAgentMcp.logicalId, costAgentMcpUrl.valueAsString, cdk.Aws.NO_VALUE),
+      ).toString();
+      runtime.addPropertyOverride("EnvironmentVariables.COST_AGENT_MCP_URL", effectiveCostMcpUrl);
+
+      // 自建 server 的 Function URL 授权。单独一条、挂 `InstallCostMcp` 条件 ——
+      // 没选装时这条语句整体不存在,外接模式照旧走上面那条。
+      const selfHostedInvoke = new iam.Policy(this, "AgentInvokeSelfHostedCostMcp", {
+        statements: [
+          // 🔴 两个动作 —— 见 web-chat-core.ts 里 InvokeCostAgentMcp 那段的说明。
+          // 2026-09-20 验证账号实测:只给 InvokeFunctionUrl 时 agent 恒 403、
+          // 补上 InvokeFunction 后立刻返回 45 个工具。
+          new iam.PolicyStatement({
+            sid: "InvokeSelfHostedCostMcp",
+            actions: ["lambda:InvokeFunctionUrl"],
+            resources: [c.fn.functionArn],
+            conditions: { StringEquals: { "lambda:FunctionUrlAuthType": "AWS_IAM" } },
+          }),
+          new iam.PolicyStatement({
+            sid: "InvokeSelfHostedCostMcpFn",
+            actions: ["lambda:InvokeFunction"],
+            resources: [c.fn.functionArn],
+            conditions: { Bool: { "lambda:InvokedViaFunctionUrl": "true" } },
+          }),
+        ],
+        roles: [runtimeRole],
+      });
+      (selfHostedInvoke.node.defaultChild as cdk.CfnResource).cfnOptions.condition = installCostMcp;
+    }
+
+    // ══ NotiOps 自己建 CUR（ProvisionCur=yes）══════════════════════════════════
+    //
+    // 这一段是方式 A 与方式 B 的**功能对齐**：方式 B 的 `setup.sh` 一直会替客户建 CUR，
+    // 方式 A 以前只能接一张客户已有的表。两段逻辑共用 `cur_provisioner/spec.py` 里的
+    // 报告规格（唯一真源），所以不会出现"A 建出来的 CUR 和 B 建出来的字段不一样"。
+    //
+    // AWS 官方的 CUR → Athena 集成天生分两阶段，中间有 ~24h 硬延迟：
+    //   阶段一（CurProvisionerFn，custom resource）：建交付桶 + 桶策略 + ReportDefinition，
+    //           写 notiops-config 的 `cur-athena-status#<账号>` = PENDING。
+    //   阶段二（CurFinalizerFn，定时触发）：AWS 首次交付后会在同一 S3 路径下放一个
+    //           `crawler-cfn.yml`，finalizer 发现它就把它部署成**另一个** CFN 栈
+    //           （Glue 库/表/crawler），爬完翻 READY 并写下真实库表名。
+    //
+    // ⚠️ 阶段二为什么是**周期性**而不是"T+25h 跑一次"
+    // 方式 B 原来用 EventBridge Scheduler 调一个 T+25h 的一次性任务。它的问题不是不准，
+    // 是**不自愈**：那一次如果撞上 AWS 交付晚了、或者 crawler 还没爬完，状态就停在
+    // `DELAYED`，而**再也没有下一次**。客户看到的是"装了 CUR 但成本还是走 Cost Explorer"，
+    // 没有任何报错。所以这里改成 4 小时一次的常驻规则 + finalizer 自己按 READY 短路：
+    // 已经 READY 就是一次 DDB GetItem 然后返回（成本可忽略），没 READY 就再试一次。
+    // 代价是这条规则永远在（每 4h 一次空跑），换来的是"迟到也能自己补上"。
+    {
+      // 不挂 AWSLambdaBasicExecutionRole：它带 `logs:CreateLogGroup`（资源 `*`）。删栈时 CFN 调完
+      // 本函数的 Delete、几秒后就删它的日志组，而 Lambda 的日志是**异步投递**的 —— 晚到的那几行
+      // 会借这个角色把日志组**重新建出来**（不归栈管、永不过期）。2026-10-10 v1.0.30 RC 真机往返
+      // 实测：CFN 删掉日志组 1 秒后它又出现了。写日志只给自己那个组（下面的 *OwnLogStreams），
+      // 与 StagerFn / WebNotifFn 同一口径。
+      const curProvRole = new iam.Role(this, "CurProvisionerRole", {
+        assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+        description: "NotiOps: creates the customer's CUR report and its Athena integration",
+      });
+      // 阶段一：建桶 + 挂桶策略 + 建 ReportDefinition。
+      // ⚠️ `cur:PutReportDefinition` **不支持资源级限定**（CUR 的 API 只认 `*`），
+      // 所以这一条只能是 `*`。这不是偷懒 —— IAM 里 cur 这个服务没有资源 ARN 可写。
+      // 能收窄的是 S3：桶名在合成期就算得出来，所以下面那条钉死在**这一个**桶上。
+      curProvRole.addToPolicy(new iam.PolicyStatement({
+        sid: "CreateCurReportDefinition",
+        actions: ["cur:PutReportDefinition", "cur:DescribeReportDefinitions"],
+        resources: ["*"],
+      }));
+      curProvRole.addToPolicy(new iam.PolicyStatement({
+        sid: "CreateCurDeliveryBucket",
+        actions: ["s3:CreateBucket", "s3:PutBucketPolicy", "s3:PutBucketTagging",
+                  "s3:GetBucketPolicy", "s3:GetBucketLocation", "s3:ListBucket"],
+        resources: [`arn:${cdk.Aws.PARTITION}:s3:::notiops-cur-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`],
+      }));
+      // ⚠️ **一个删除动作都不给**（无 `s3:DeleteBucket`、无 `cur:DeleteReportDefinition`）。
+      // 这不只是最小权限：客户的 CUR 和已交付的 Parquet 就是他们的**账单历史**，AWS
+      // 删了不会补发。栈删除时我们刻意什么都不删（cur_provisioner/provision.py::on_delete），
+      // 而"没有权限删"是比"代码里记得不要删"更硬的保证。
+      base.configTable.grantReadWriteData(curProvRole);
+
+      const curProvLogs = new logs.LogGroup(this, "CurProvisionerLogs", {
+        retention: logs.RetentionDays.TWO_WEEKS,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      });
+      (curProvLogs.node.defaultChild as cdk.CfnResource).cfnOptions.condition = provisionCurCond;
+      curProvRole.addToPolicy(new iam.PolicyStatement({
+        sid: "CurProvisionerOwnLogStreams",
+        actions: ["logs:CreateLogStream", "logs:PutLogEvents"],
+        resources: [curProvLogs.logGroupArn, `${curProvLogs.logGroupArn}:*`],
+      }));
+      const curProvFn = new lambda.Function(this, "CurProvisionerFn", {
+        runtime: lambda.Runtime.PYTHON_3_14,
+        handler: "cur_provisioner.custom_resource.handler",
+        code: lambda.Code.fromBucket(stagingBucket, curProvisionerKey),
+        role: curProvRole,
+        timeout: cdk.Duration.seconds(120),
+        memorySize: 256,
+        description: "NotiOps: CUR stage 1 -- delivery bucket, bucket policy, report definition",
+        // 显式日志组（栈内资源，删栈一并删）。不给的话 Lambda 首次调用时自建 /aws/lambda/<名字>，
+        // 不归栈管、永不过期 —— 2026-10-10 一次干净的删栈后它就留在了账号里。条件见下方。
+        logGroup: curProvLogs,
+      });
+      const curProvFnCfn = curProvFn.node.defaultChild as cdk.CfnResource;
+      curProvFnCfn.cfnOptions.condition = provisionCurCond;
+      curProvFnCfn.addDependency(stagerArtifacts);
+
+      const curProvision = new cdk.CfnResource(this, "CurProvision", {
+        type: "Custom::NotiOpsCurProvision",
+        properties: {
+          ServiceToken: curProvFn.functionArn,
+          ConfigTable: base.configTable.tableName,
+          DeployRegion: this.region,
+          // 每个 Release 重跑一次（同 StagerPreflight 的理由）：规格改了不体现为任何
+          // 属性变化 → CFN 不发 Update → 存量部署拿不到新规格。
+          ReleaseTag: releaseTag,
+        },
+      });
+      curProvision.cfnOptions.condition = provisionCurCond;
+      curProvision.addDependency(curProvFnCfn);
+      // 🔴 角色的**内联策略**也要等：没有这条依赖，CFN 会在策略生效前就调 custom resource，
+      // 于是阶段一以 AccessDenied 失败、整栈回滚 —— 而重试一次就好了。这类"第一次必挂、
+      // 重试就过"的部署最难排查。
+      applyCondition(curProvRole, provisionCurCond);
+      const curProvPolicy = curProvRole.node.tryFindChild("DefaultPolicy")?.node.defaultChild;
+      if (curProvPolicy) curProvision.addDependency(curProvPolicy as cdk.CfnResource);
+
+      // ── 阶段二：finalizer（与方式 B 的 lambda6 是**同一份代码**）─────────────
+      // 不挂 AWSLambdaBasicExecutionRole，理由同 CurProvisionerRole（它带 logs:CreateLogGroup）。
+      const curFinRole = new iam.Role(this, "CurFinalizerRole", {
+        assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+        description: "NotiOps: CUR stage 2 -- deploys the official Athena integration once AWS delivers",
+      });
+      // 🔴 权限定义在 constructs/cur-finalizer-policy.ts —— 与方式 B **共用那一份**。
+      //
+      // 这里原来是我手写的一份，和方式 B 那份（现网跑通过）漂移了六处：CreateStack 的资源
+      // 写成 `stack/athenacurcfn-*`（而 finalizer 建的栈叫 `notiops-cur-athena-<账号>`，
+      // 建栈必然 AccessDenied）、缺 DescribeStackResources / DeleteStack、缺 glue:GetDatabases /
+      // GetTables（发现表那步**静默**失败）、动作名写成 GetNamedQuery（代码调的是
+      // BatchGetNamedQuery）、缺 lambda:PutFunctionConcurrency（官方模板里两个 Lambda 都设了
+      // ReservedConcurrentExecutions=1，建栈会回滚）。2026-10-10 验证账号真部署后发现。
+      //
+      // 传 deliveryBucketName：一键栈只在 ProvisionCur=yes 时部署 finalizer，桶是我们自己建的、
+      // 名字确定 ⇒ S3 读与桶通知收窄到这一个桶（方式 B 可能复用客户自己的桶，所以那边是 *）。
+      for (const st of curFinalizerPolicyStatements({
+        partition: cdk.Aws.PARTITION,
+        account: cdk.Aws.ACCOUNT_ID,
+        deliveryBucketName: `notiops-cur-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
+      })) {
+        curFinRole.addToPolicy(st);
+      }
+      base.configTable.grantReadWriteData(curFinRole);
+
+      const curFinLogs = new logs.LogGroup(this, "CurFinalizerLogs", {
+        retention: logs.RetentionDays.TWO_WEEKS,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      });
+      (curFinLogs.node.defaultChild as cdk.CfnResource).cfnOptions.condition = provisionCurCond;
+      curFinRole.addToPolicy(new iam.PolicyStatement({
+        sid: "CurFinalizerOwnLogStreams",
+        actions: ["logs:CreateLogStream", "logs:PutLogEvents"],
+        resources: [curFinLogs.logGroupArn, `${curFinLogs.logGroupArn}:*`],
+      }));
+      const curFinFn = new lambda.Function(this, "CurFinalizerFn", {
+        runtime: lambda.Runtime.PYTHON_3_14,
+        handler: "lambda6_cur_finalizer.handler.handler",
+        code: lambda.Code.fromBucket(stagingBucket, curProvisionerKey),
+        role: curFinRole,
+        timeout: cdk.Duration.minutes(14),
+        memorySize: 512,
+        environment: { CONFIG_TABLE: base.configTable.tableName },
+        description: "NotiOps: CUR stage 2 -- detects first delivery and deploys Athena integration",
+        logGroup: curFinLogs,   // 同 CurProvisionerFn：栈内日志组，删栈一并删
+      });
+      const curFinFnCfn = curFinFn.node.defaultChild as cdk.CfnResource;
+      curFinFnCfn.cfnOptions.condition = provisionCurCond;
+      curFinFnCfn.addDependency(stagerArtifacts);
+      applyCondition(curFinRole, provisionCurCond);
+
+      // 4 小时一次。见本段开头关于"为什么不是一次性 T+25h"的说明。
+      const curFinRule = new events.Rule(this, "CurFinalizerSchedule", {
+        schedule: events.Schedule.rate(cdk.Duration.hours(4)),
+        description: "NotiOps: keep checking whether AWS has delivered the first CUR yet "
+                     + "(self-healing; the finalizer short-circuits once the table is READY)",
+        targets: [new targets.LambdaFunction(curFinFn, {
+          // 只传 `account_id` —— 桶名/报告名以 `cur-athena-status` 记录为准
+          // （与方式 B 的同名规则逐字同源，见 notiops-backend-stack.ts）。
+          event: events.RuleTargetInput.fromObject({ account_id: cdk.Aws.ACCOUNT_ID }),
+        })],
+      });
+      const curFinRuleCfn = curFinRule.node.defaultChild as cdk.CfnResource;
+      curFinRuleCfn.cfnOptions.condition = provisionCurCond;
+      // 🔴 `targets.LambdaFunction` 顺手生成一条 `AWS::Lambda::Permission`，它是**规则的
+      // 兄弟子节点**，不是 defaultChild。漏掉它的后果不是"少一条授权"，而是客户不选
+      // ProvisionCur 时**整栈部署失败**（无条件的 Permission 引用不存在的函数）。
+      // 与上面成本 MCP 结果桶那条 BucketPolicy 是同一个坑。
+      for (const child of curFinRule.node.children) {
+        const cfn = (child as cdk.CfnResource);
+        if (cfn instanceof lambda.CfnPermission) cfn.cfnOptions.condition = provisionCurCond;
+      }
+      for (const child of curFinFn.node.children) {
+        if (child instanceof lambda.CfnPermission) child.cfnOptions.condition = provisionCurCond;
+      }
+
+      new cdk.CfnOutput(this, "CurProvisionedBucket", {
+        description: "S3 bucket NotiOps created for your Cost and Usage Report (left in place "
+                     + "when you delete this stack -- it holds your billing history)",
+        value: `notiops-cur-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
+        condition: provisionCurCond,
+      });
+    }
     // BFF 的代码 zip 也在 staging 桶里（`S3Bucket` 由 postprocess 改写成 !Ref StagingBucket），
     // 所以它也必须等搬完。放在 CDK 里声明而不是让 postprocess 补 DependsOn：
     // 依赖关系属于栈的语义，越少交给正则改写越好。
@@ -1531,6 +2105,36 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       actions: ["s3:ListBucket", "s3:ListBucketVersions", "s3:DeleteBucket"],
       resources: [base.dataBucket.bucketArn],
     }));
+    // Athena 查询结果桶（只在装了成本 MCP 时存在）。`_teardown_site` 删栈时**无条件**清它 ——
+    // KeepData / DeleteEverything 两种模式都清（它是缓存、不是客户数据），所以「交给 stager
+    // 清空」（StagerSite 的 `CostResultsBucket`）和这两条授权必须一起加。2026-10-10 一次真实
+    // 删栈就是缺了它：stager 在 ListObjectVersions 上 AccessDenied → StagerSite DELETE_FAILED
+    // → 94 个资源里 52 个留在账号里继续计费。tests/test_oneclick_teardown_grants.py 逐个核
+    // 「StagerSite 交给 stager 清的每个桶，stager 角色都有清它要的动作」。
+    //
+    // 两条写法上的约束，踩哪条都是整栈坏：
+    //   · 必须进 stager 自己的 DefaultPolicy，**不能**另起一个带 Condition 的 iam.Policy。
+    //     StagerFn DependsOn DefaultPolicy，所以删栈时这份权限一定比 StagerSite 的 Delete
+    //     活得久；独立策略没人依赖它，CFN 可能先把它删掉。反过来让 StagerFn 去 DependsOn
+    //     一个带 Condition 的资源也不行 ——「被依赖的资源因条件没建时，依赖它的资源也不建」
+    //     （CFN `Condition` 属性文档原话），不装成本 MCP 的客户会连 stager 都没有。
+    //   · 条件用 Fn::If + NoValue 表达，并且每条语句都带一个**恒在**的 ARN（staging 桶，它
+    //     本来就有这些动作）：不装时 Fn::If 落成 NoValue，Resource 若成了空数组整条策略无效。
+    if (webchat.costMcp) {
+      const results = webchat.costMcp.resultsBucket;
+      const ifInstalled = (arn: string) =>
+        cdk.Fn.conditionIf(installCostMcp.logicalId, arn, cdk.Aws.NO_VALUE).toString();
+      stagerRole.addToPolicy(new iam.PolicyStatement({
+        sid: "TeardownListCostResults",
+        actions: ["s3:ListBucket", "s3:ListBucketVersions"],
+        resources: [stagingBucket.bucketArn, ifInstalled(results.bucketArn)],
+      }));
+      stagerRole.addToPolicy(new iam.PolicyStatement({
+        sid: "TeardownEmptyCostResults",
+        actions: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+        resources: [stagingBucket.arnForObjects("*"), ifInstalled(results.arnForObjects("*"))],
+      }));
+    }
     // 这几个 secret 都不在栈里（Bedrock API Key 由 BFF 按需建，见 web-chat-core.ts 的
     // `BedrockApiKeySecretAccess`；IM 凭证与阿里云凭据由管理控制台建或客户手建），CFN
     // 不会删它们 —— DeleteEverything 时由 StagerFn 收尾。**逐个点名**：不给「删本账号
@@ -1590,6 +2194,15 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         // 在部署期就写死在这里，删栈时才有得读。
         TeardownMode: teardownMode.valueAsString,
         DataBucket: base.dataBucket.bucketName,
+        // Athena 查询结果桶。⚠️ 必须交给 stager 清空 —— 它是 DESTROY，而一键路径不能用
+        // autoDeleteObjects（会引入 cr.Provider = 隐式资产，本文件头禁止）。里面有对象时
+        // CFN 删不掉桶，**整个删栈会失败**，客户只能手工去清。
+        // 没选装时这个值是空串（下面 handler 见空就跳过）。
+        CostResultsBucket: cdk.Fn.conditionIf(
+          installCostMcp.logicalId,
+          webchat.costMcp ? webchat.costMcp.resultsBucket.bucketName : "",
+          "",
+        ).toString(),
         TableNames: cdk.Stack.of(this).toJsonString([base.configTable.tableName, webchat.table.tableName]),
         // 按需创建的 secret（都是**栈外**资源，所以 CFN 不会替我们删）。
         //   · notiops/bedrock-api-key —— BFF 在客户切到 API Key 模式时建；名字与
@@ -1604,7 +2217,9 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         //     这是**两个纯字符串** secret，不是一个 JSON secret（数据面
         //     platforms/slack/caps.py 直接把整个 SecretString 当值用，没有 json.loads）。
         //   · notiops/aliyun-credentials —— 管理控制台「多云」页保存客户阿里云 AK/SK 时建
-        //     （bff/web-chat/aliyun_config.mjs）。**方式B 是栈内资源**（见
+        //     （bff/web-chat/aliyun_config.mjs）。那一页 2026-09-15 起随 `MULTICLOUD_UI = false`
+        //     （frontend/chat-app/src/featureFlags.ts）不在导航里了，但 BFF 的 `/admin/aliyun-config`
+        //     路由还在、那之前存下的 secret 也还在 —— 所以照样要列在这里收。**方式B 是栈内资源**（见
         //     notiops-backend-stack.ts 的 `AliyunCredentialsSecret`），方式A 没有对应的
         //     CFN 资源，所以只能走这条 StagerFn 收尾路径 —— 这也是它必须在这份清单里的原因。
         //     里面装的是客户阿里云账号的长期凭据，漏删的代价比 IM 凭证高一个量级。
@@ -1909,8 +2524,8 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       handler: DEVOPS_CALLBACK_HANDLER,
       // 与 IM 三个函数**同一个** zip + 同一个层：`devops_agent_callback/` 只有 116KB，
       // 而它 import 的 `shared/**` / `core/**` 本来就在 im-code.zip 里，依赖也只用到
-      // stdlib + boto3（全是惰性 import）。单独发第 8 个产物会牵动整条发布流程
-      // （发布手册里四处写死「八个产物」，还要把模板的 sha256 重烧一遍）。
+      // stdlib + boto3（全是惰性 import）。单独再发一个产物要动 scripts/artifacts.py 的清单与
+      // stager 的可选前缀、多一个要镜像的文件，还要把模板的 sha256 重烧一遍 —— 不值得。
       code: { s3Bucket: stagingBucket.bucketName, s3Key: imCodeKey },
       layers: [imLayer.layerVersionArn],
       timeout: DEVOPS_CALLBACK_TIMEOUT_SECONDS,
@@ -2201,17 +2816,19 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // 为什么单独一行「凭证放哪」：webhook 地址填好了但 secret 是空的时候，ingress 在
     // 冷启动就失败（fail-fast，见 lambda_ingress.py 文件头），而客户在 IM 里看到的
     // 只是"机器人不回话" —— 完全看不出缺的是凭证。
+    // 点击路径与 setup.sh 收尾横幅同一口径：侧栏的「管理」收在「更多」里（2026-10-10 起，
+    // Sidebar.tsx），「更多」默认收起 —— 路径里漏了 More，客户在一级导航里找不到 Admin。
     const imFeishuNextSteps =
-      "Open the admin console (ChatUrl > Admin > IM integration) and enter the Feishu app id, " +
+      "Open the admin console (ChatUrl > More > Admin > IM Integration) and enter the Feishu app id, " +
       "app secret, Encrypt Key and Verification Token. Then paste FeishuWebhookUrl into the " +
       "Feishu console under Events and Card callbacks. The bot stays silent until both are done.";
     const imSlackNextSteps =
-      "Open the admin console (ChatUrl > Admin > IM integration > Slack) and enter the bot user " +
+      "Open the admin console (ChatUrl > More > Admin > IM Integration > Slack) and enter the bot user " +
       "OAuth token (xoxb-) and the app signing secret. Then paste SlackWebhookUrl into your Slack " +
       "app -- the same URL goes into Event Subscriptions, Interactivity and Slash Commands. The " +
       "bot stays silent until both are done.";
     const imDingtalkNextSteps =
-      "Open the admin console (ChatUrl > Admin > IM integration > DingTalk) and enter the robot " +
+      "Open the admin console (ChatUrl > More > Admin > IM Integration > DingTalk) and enter the robot " +
       "AppKey and AppSecret. Then paste DingtalkWebhookUrl into the DingTalk Open Platform under " +
       "Robot > Message receiving mode > HTTP mode. The bot stays silent until both are done.";
     // 嵌套 `Fn::conditionIf`，不是 `Fn::Or` —— 三个平台是互斥的枚举值，要选的是
@@ -2228,13 +2845,43 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     imNextSteps.condition = installIm;
 
     new cdk.CfnOutput(this, "InstalledRelease", { description: "NotiOps release deployed by this stack", value: releaseTag });
+    // ⚠️ 这句话是客户在删栈**之前**唯一会读到的口径说明,所以「什么被留下」必须写全 ——
+    // 漏掉的部分会变成"以为删干净了、其实还在计费"。2026-09-20 补上 CUR 那三样:
+    // 它们**两种模式下都保留**(与 TeardownMode 无关),既因为那是客户的账单历史
+    // (AWS 不补发过去的月份),也因为留着能让重装走「复用既有 CUR」快路 ——
+    // 几分钟就绪,而不是再等一次 ~24h 首次交付。与 teardown.sh 的口径逐字一致。
+    // 2026-10-11 再补两样(发版前审查):阶段二建的「NotiOps - 」Athena 保存查询(teardown.sh 那句
+    // 本来就点了名),以及多账号模式留下的两个成员 StackSet 与 Organizations 受信访问
+    // (DEPLOYMENT_ONECLICK §6.4 写的「刻意留下」)。
     new cdk.CfnOutput(this, "DataRetentionOnDelete", {
       description: "What deleting this stack does to your data",
       value: cdk.Fn.join("", [
         "TeardownMode=", teardownMode.valueAsString,
         ". KeepData keeps the notiops-config table, the chat history table and ",
         base.dataBucket.bucketName,
-        "; the Cognito user pool is always deleted. To switch modes, update the stack first, then delete it.",
+        "; the Cognito user pool is always deleted. Either way, everything CUR-related is KEPT: ",
+        cdk.Fn.conditionIf(
+          provisionCurCond.logicalId,
+          cdk.Fn.join("", [
+            "the CUR report notiops-cur-report, its bucket notiops-cur-",
+            cdk.Aws.ACCOUNT_ID, "-", cdk.Aws.REGION,
+            ", the Athena integration stack notiops-cur-athena-", cdk.Aws.ACCOUNT_ID,
+            " and the \"NotiOps - \" Athena saved queries",
+            " stay in place -- that is your billing history (AWS does not backfill past months), ",
+            "and keeping it lets a reinstall reuse the existing data -- the next 4-hourly check picks it ",
+            "up, so within about 4 hours -- instead of waiting another 24h for a new report's first ",
+            "delivery. Delete them yourself if you want them gone.",
+          ]).toString(),
+          "nothing, because this deployment did not create a CUR.",
+        ).toString(),
+        cdk.Fn.conditionIf(
+          isMultiAccount.logicalId,
+          " Multi-account mode also leaves the member StackSets notiops-member-onboarding and " +
+            "notiops-member-devops-agent and Organizations trusted access in place, on purpose " +
+            "(see the one-click deployment guide, section 6.4).",
+          "",
+        ).toString(),
+        " To switch modes, update the stack first, then delete it.",
       ]),
     });
 
@@ -2303,9 +2950,10 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         isMultiAccount.logicalId,
         cdk.Fn.join("", [
           "MultiAccount. Member StackSets notiops-member-onboarding and ",
-          "notiops-member-devops-agent were created in this account; onboard member accounts from ",
-          "the Admin panel. Deleting this stack does NOT delete those StackSets or the roles they ",
-          "created in member accounts - delete them by hand if you want them gone.",
+          "notiops-member-devops-agent were created in this account; onboard member accounts in ",
+          "the web chat under More > Admin > Accounts. Deleting this stack does NOT delete those ",
+          "StackSets or the roles they created in member accounts - delete them by hand if you want ",
+          "them gone.",
         ]),
         cdk.Fn.conditionIf(
           multiAccountRequested.logicalId,

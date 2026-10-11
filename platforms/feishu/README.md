@@ -62,8 +62,11 @@ ACK → 异步投给 worker Lambda 干活。平台无关的业务逻辑在
 ```
 
 **路由是确定性的、0 token**：`core/nl_router.py` 用正则把消息分到
-`help` / `language` / `model` / `investigate` / `case` / `chat` 六条路，只有「案例」那条
-会调一次 LLM 抽标题/正文。详见 [`../common/router.py`](../common/router.py) 文件头。
+`help` / `language` / `model` / `agent` / `web` / `account` / `investigate` / `investigate_status` /
+`case` 九条路，认不出的落到兜底的 `chat`（一共十条能力）。路由这一层从不调模型；会花 NotiOps 侧
+token 的只有下游几处：案例的智能分析（`core/case_analyze.py`）、建案例时的服务分类
+（`core/case_classifier.py`），以及用户 `/agent notiops` 之后的 `chat`（走 NotiOps Agent）。
+详见 [`../common/router.py`](../common/router.py) 文件头。
 
 ## 飞书开放平台一次性配置
 
@@ -126,11 +129,14 @@ ingress 冷启动时硬校验，任一为空直接崩（故意的）。
 
 `setup.sh` **不采集任何 IM 凭据**。CDK（`NotiOpsBackendStack`，不是 `ImStack`）只创建一个
 **空的** Secret `notiops/im-bot-feishu`；
-部署完成后再填 App ID / App Secret / Encrypt Key / Verification Token（以及可选的推送目标群
+部署完成后再填 App ID / App Secret / Encrypt Key / Verification Token（以及可选的每日推送群
 `notify_chat_ids`），两种方式：
 
-1. **(推荐)** 登录 Web Chat(admin)→「通知设置」填入飞书凭据。
-2. 直接更新 Secret：
+1. **(推荐,不需要任何 AWS 权限)** 登录 Web Chat(admin)→ 左侧「更多 → 管理」→「集成 IM」→
+   **飞书 / Lark** 分页,填上面这四项(要每日推送的话再加「推送群组 Chat ID」;每日推送与 PHD 事件转发
+   只有 `setup.sh` 部署才有,一键部署填了它也收不到),保存。敏感字段保存后
+   只回显后 4 位,原样留着再保存 = 不修改;每个群 ID 旁的「测试」会往那个群真发一条消息。
+2. 直接更新 Secret（一键部署的模板**不建**这个 Secret，那条路径下先用第 1 种保存一次）：
    ```bash
    # Secret 结构见 docs/DEPLOYMENT.md §4。
    aws secretsmanager put-secret-value --secret-id notiops/im-bot-feishu \
@@ -139,7 +145,7 @@ ingress 冷启动时硬校验，任一为空直接崩（故意的）。
    ```
    Lambda 是**冷启动时**读 Secret 的：改完等旧执行环境自然回收即可，急的话改一下 ingress
    的环境变量（任意无害的值）强制换一批执行环境 —— 做法和注意点见
-   `docs/DEPLOYMENT.md` §8.2。
+   `docs/DEPLOYMENT.md` §8.3。
 
 CDK 栈始终通过 ARN 引用该 Secret，**本地不落任何凭据文件**。DevOps Agent 的 webhook /
 HMAC secret、共享 DDB 表、S3 报告 bucket 都由 `NotiOpsBackendStack` 拥有并自动创建，
@@ -179,8 +185,11 @@ aws logs tail /aws/lambda/notiops-im-worker-feishu --region <REGION> --follow
 # 卡片停在「正在思考」不动 —— 看进度轮询
 aws logs tail /aws/lambda/notiops-im-progress --region <REGION> --follow
 
-# 改了飞书适配器代码后重新部署(在仓库根执行):
-cd ../../infra && npx cdk deploy ImStack
+# 改了飞书适配器代码后重新部署(在仓库根执行)—— 重跑 setup.sh,它会带上部署时的全部 -c 参数:
+./setup.sh
+# ⚠️ 别单独跑 `npx cdk deploy ImStack`:不带 setup.sh 平时传的那些 -c,它会按默认值重新合成
+#    (agentRuntimeArn 变空 → `/agent notiops` 用不了;多账号部署的跨账号闸门被重新锁上;
+#    enabledPlatforms 回到只有 feishu,装了别的平台的话会被拆掉)。见 docs/DEPLOYMENT.md §8.1。
 ```
 
 常见症状 → 原因对照表在
@@ -199,7 +208,7 @@ cd ../../infra && npx cdk deploy ImStack
 | [lambda_ingress.py](lambda_ingress.py) | webhook 入口：解密验签 + URL challenge + 异步投 worker + 👀 表情 |
 | [lambda_worker.py](lambda_worker.py) | 干活儿的：幂等去重 + locale + 规范化 → `common.router` |
 | [webhook_adapter.py](webhook_adapter.py) | 响应形状收口（不外泄异常文本） |
-| [caps.py](caps.py) | `FeishuCaps` —— 七个能力在飞书上的实现 |
+| [caps.py](caps.py) | `FeishuCaps` —— 十条能力在飞书上的实现 |
 | [im_cards.py](im_cards.py) | 飞书卡片（进度卡、答案卡、案例表单） |
 | [app/feishu_utils.py](app/feishu_utils.py) | tenant_access_token 缓存、消息/卡片/表情发送 |
 | [app/case_flow.py](app/case_flow.py) | 案例 CRUD 的卡片回调处理 |
@@ -215,12 +224,14 @@ cd ../../infra && npx cdk deploy ImStack
 > 也不命中深挖措辞，落到兜底的 `chat`（DevOps Agent 直连问答，同样 0 token），
 > 不再有**用户主动拉取**巡检报告的卡片路径 —— 新巡检的报告在 Web Chat 的巡检看板里看。
 >
-> ⚠️ 这只关掉了 pull，**push 仍在线**：每日推送照旧把 DDB 里的巡检结果渲染成飞书交互
+> ⚠️ 这只关掉了 pull，**push 仍在线**（`setup.sh` 部署）：每日推送照旧把 DDB 里的巡检结果渲染成飞书交互
 > 卡片（`lambda4_notifier/handler.py:99` 读 `notiops-inspection` 表 → `:471`
 > `_format_inspection_section` → `:391` `shared/feishu_sender.FeishuSender`，
 > `msg_type: interactive`），另一条同构路径是 `inspection/adapters/broadcast.py` →
-> `shared/report_delivery/feishu_sender.send_markdown` → `_send_summary_cards`。
-> 所以飞书里仍然看得到巡检报告卡片,只是不能再用一句话把它问出来。
+> `shared/report_delivery/feishu_sender.send_markdown` → `_send_summary_cards`（巡检推送：
+> 它不读 `notify_chat_ids`，要先把群登记成推送目标，而本版本**还没有**这一步的途径 —— 没有
+> 网页入口、`setup.sh` 不问、发布包里也没有对应的工具，所以这一条眼下投不出去）。
+> 所以飞书里仍然看得到巡检报告卡片（靠每日推送）,只是不能再用一句话把它问出来。
 
 平台无关 (`../common/` 与 `../../core/` 共享):
 
@@ -230,9 +241,9 @@ cd ../../infra && npx cdk deploy ImStack
 | [../common/quick_ack.py](../common/quick_ack.py) | 提问后的 👀 表情（三平台共用，永不抛） |
 | [../common/live_card.py](../common/live_card.py) | 自刷新进度卡 |
 | [../common/lambda_progress.py](../common/lambda_progress.py) | 进度轮询 Lambda（扫 `imtask#` 行） |
-| [../../core/nl_router.py](../../core/nl_router.py) | 双语正则意图路由（六条路） |
-| [../../core/bedrock_intent.py](../../core/bedrock_intent.py) | Bedrock 意图总结（只剩案例路径用） |
+| [../../core/nl_router.py](../../core/nl_router.py) | 双语正则意图路由（九条路 + 兜底 `chat`） |
+| [../../core/bedrock_intent.py](../../core/bedrock_intent.py) | 旧的 Bedrock 意图分类；webhook 现网路径已不调它（只剩已退役的长连接 `app/` 引用） |
 | [../../core/case_classifier.py](../../core/case_classifier.py) | AWS Support service/category 分类器 |
-| [../../core/webhook_dispatch.py](../../core/webhook_dispatch.py) | HMAC 派发 webhook 到 DevOps Agent |
+| [../../core/webhook_dispatch.py](../../core/webhook_dispatch.py) | HMAC 签名的 DevOps Agent generic webhook 派发；现网深度调查不走它（走 `core/devops_agent.py` 的 CreateBacklogTask） |
 | [../../core/ddb_state.py](../../core/ddb_state.py) | DynamoDB 共享状态表(跨平台，带 `platform` 字段) |
 | [../../core/support_logic.py](../../core/support_logic.py) | Support Case 创建业务逻辑(分类 + CreateCase + 幂等锁) |

@@ -201,7 +201,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-
 (function(){{
 const md=`{md_escaped}`;
 function esc(s){{return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}}
-// URL scheme 白名单：只允许 http/https/mailto/相对(#、/)链接，拦截 javascript:/data:/vbscript:
+// URL scheme 允许清单：只允许 http/https/mailto/相对(#、/)链接，拦截 javascript:/data:/vbscript:
 // 等可执行 scheme（防 XSS：markdown 链接里的 URL 是不可信内容）。不安全则退回 '#'。
 function safeUrl(u){{
   var t=(u||'').trim();
@@ -260,7 +260,7 @@ while(i<lines.length){{
   cls();h+='<p>'+inl(T)+'</p>';i++}}
 cls();
 // h 完全由本渲染器构造：所有文本都过 esc()（转义 &<>"'，含引号防属性注入），链接 href 过
-// safeUrl() 白名单。无原始不可信 HTML 注入路径。故此处 innerHTML 赋值安全。
+// safeUrl() 允许清单。无原始不可信 HTML 注入路径。故此处 innerHTML 赋值安全。
 // TOC 同理：el.textContent 会解码实体，故拼进 toc.innerHTML 前必须再过一次 esc()（见下）。
 document.getElementById('rc').innerHTML=h;
 // TOC

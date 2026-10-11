@@ -62,10 +62,11 @@ export default function UserMenu({ username, onSignOut }: { username: string; on
           <div className="um-head">NotiOps</div>
           {/* 2026-09-11：删掉了菜单第一项「设置」。它从来没有实现，点了只弹一句
               「即将上线」——菜单里唯一一个纯占位项，让人以为这里能配什么东西。
-              真正的配置入口在侧栏「管理」（角色/权限/模型/IM 凭据）与「巡检 →
-              设置」，跟这里不是一回事。连带删掉只有它在用的 `soon()` 与两个
-              i18n 键 `login.settings` / `menu.soon`（留着会被 lint_i18n 的
-              孤儿键检查抓到）。要加真的全局设置，别复活这个占位 —— 直接接线。 */}
+              真正的配置入口在侧栏「更多」里（2026-10-10 起收进去的）：「管理」
+              （角色/权限/模型/IM 凭据）与「巡检 → 配置」，跟这里不是一回事。
+              连带删掉只有它在用的 `soon()` 与两个 i18n 键 `login.settings` /
+              `menu.soon`（留着会被 lint_i18n 的孤儿键检查抓到）。要加真的全局设置，
+              别复活这个占位 —— 直接接线。 */}
 
           <div className="um-sub">
             <button className="um-item" onClick={() => { setApprOpen((o) => !o); setLangOpen(false); }}>

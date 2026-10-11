@@ -72,7 +72,7 @@ export class ImStack extends cdk.Stack {
       ?? (this.node.tryGetContext("enabledPlatforms") as string || "feishu")
           .split(",").map((s: string) => s.trim().toLowerCase());
 
-    // 群白名单（可选）。留空 = 不限制（与长连接时代行为一致）。
+    // 群允许清单（可选）。留空 = 不限制（与长连接时代行为一致）。
     const allowedChatIds = (this.node.tryGetContext("imAllowedChatIds") as string || "").trim();
 
     // NotiOps agent runtime ARN —— `/agent notiops` 那条路（走模型）要用。

@@ -26,7 +26,7 @@ import { unreadCount } from "../api/notifications";
 import { streamChat, warmupChat, listConversations, getMessages, deleteConversationApi, renameConversationApi, setPinnedApi, executeActionApi, getAccountsFull, type SourceItem, type AccountInfo } from "../api/chat";
 import { useLocale, useT } from "../i18n";
 import { topicDef, deepDiveTogglesFor, normalizeTopic, type ChatMessage, type Conversation, type TopicKey } from "../types";
-import { loadConvMode, saveConvMode, forgetConvMode, modeOf, fieldsOf, restorableMode } from "../convMode";
+import { loadConvMode, saveConvMode, forgetConvMode, modeOf, fieldsOf, restorableMode, relockFromHistory } from "../convMode";
 import { defaultModelId, modelDisplayName, refreshModelCatalog, isSelectableModel, useModelCatalog } from "../models";
 import { IconInvestigate, IconFinOps, IconCases, IconSecurity, IconWhatsNew, IconReports, IconDatabase, IconGauge, IconPercent, IconCluster, IconCloud, IconInspection, IconChip, IconHeartPulse, IconFileText } from "../components/icons";
 
@@ -194,7 +194,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   // 而且如果离开的那条会话是空的又没落库，它会把会话**删掉** —— 从对话里点开看板再返回，
   // 会发现刚开的新对话没了。
   const [dashReturn, setDashReturn] = useState<ViewKey | null>(null);
-  // 「Skills」一级入口点击信号：每次点都自增。已在 skills 视图内（可能停在某个 skill 详情/编辑器）
+  // 侧栏「更多 → 技能」入口的点击信号：每次点都自增。已在 skills 视图内（可能停在某个 skill 详情/编辑器）
   // 时，CustomizePanel 据此重置回列表首页——无修改直接回、有未保存修改先确认。见 skillsHome 透传。
   const [skillsHome, setSkillsHome] = useState(0);
   // 当前用户可见能力 key 集合（GET /me/capabilities）；据此门禁 tab 入口。
@@ -429,9 +429,10 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   // 「思考过程」面板实时数据：按 msgId 从当前会话取该消息（每次渲染都取最新）——流式新步骤写进
   // 消息后这里自动反映到面板，无需重新打开。**两个 agent 共用这一个面板**（2026-09-04）。
   const thinkMsg = thinkMsgId ? active.messages.find((m) => m.id === thinkMsgId) : undefined;
-  // 兼容**改版前**存下来的老消息：那时 DevOps 的过程只写进 investigationSteps、没进 thinkingSteps，
-  // 刷新后若只看 thinkingSteps 会是空面板。故 thinkingSteps 为空时回落到 investigationSteps
-  // （只有 text，没有 kind → 统一按 status 那一档渲染）。新消息两者都有，走前者。
+  // thinkingSteps 为空时回落到 investigationSteps（只有 text，没有 kind → 统一按 status 那一档渲染）。
+  // DevOps 那条路径两者边流边写（带 text 的调查步骤也并进思考时间线，见下面 onInvestigationStep），
+  // 所以这条回落只在「thinkingSteps 为空、investigationSteps 非空」时生效。⚠️ 它不是历史兼容：
+  // 步骤从来不落库（store.mjs 的 appendMessage 不存，上面的历史映射也不带），刷新后两者都为空。
   const thinkSteps: TimelineStep[] = thinkMsg?.thinkingSteps?.length
     ? thinkMsg.thinkingSteps
     : (thinkMsg?.investigationSteps ?? []).map((s) => ({ text: s.text, kind: "status" as const }));
@@ -699,30 +700,21 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
           via: m.via,               // 答案来源(devops-agent → 署名行显示 "AWS DevOps Agent")
           staropsEmployee: m.starops_employee, // 阿里云那条：页脚显示当时那个数字员工 ID
         }));
-        // 「对话对象」的锁要**跨刷新**成立：devopsChat 只活在前端内存里，刷新后回落 false ——
-        // 那样一个由客户自己的 DevOps Agent 答过的会话，接着问会**静默换成 NotiOps 来答**
-        // （客户看不出来，只会觉得答案风格突然变了）。历史消息里的 via="devops-agent" 是
-        // 持久化的事实（store.mjs 存了这个字段），用它把锁恢复回来。
-        // 只恢复通用会话：故障调查主题仍是"每轮开关"语义，这里一行不动。
-        // ⚠️ 历史被截断时这个锁也会跟着丢：`via="devops-agent"` 只存在于被丢掉的
-        // 那些早期轮次里 → relock=false → 接着问会静默换回 NotiOps 来答。所以下面那条
-        // 截断提示不只是"少显示了几条"，它同时是这个锁失效的唯一线索。
-        //
-        // STAROps 同理，但**必须是独立的一条锁**，绝不能与上面那条合并成"有 via 就锁 devopsChat"：
-        // 那样刷新后一段阿里云会话会被锁成 AWS DevOps Agent，接着问就把问题原文送去了
-        // 另一朵云 —— 界面上只是署名行变了一行字，客户几乎不可能发现。
-        // 两条锁互斥，STAROps 优先（与 modeOf / BFF 的一选一同序）。
-        const relock = mapped.some((m) => m.via === "devops-agent");
-        const relockSo = mapped.some((m) => m.via === "starops");
+        // 「对话对象」的锁要**跨刷新**成立：devopsChat / starops 只活在前端内存里，刷新后回落
+        // false —— 那样一个由客户自己的 DevOps Agent 答过的会话，接着问会**静默换成 NotiOps
+        // 来答**（客户看不出来，只会觉得答案风格突然变了）。历史消息里的 via 是持久化的事实
+        // （store.mjs 存了这个字段），用它把锁恢复回来。口径全在 `convMode.relockFromHistory`
+        // （有单测）：只恢复通用会话；两条锁互斥、STAROps 优先；STAROps 那条过多云开关 ——
+        // `MULTICLOUD_UI` 关着时有 STAROps 历史的会话退回 NotiOps（2026-10-11 之前这里不看开关）。
+        // ⚠️ 历史被截断时这个锁也会跟着丢：带 via 的轮次只在被丢掉的那些早期轮次里时，回锁
+        // 不生效 → 接着问会静默换回 NotiOps 来答。所以下面那条截断提示不只是"少显示了几条"，
+        // 它同时是这个锁失效的唯一线索。
         setConversations((prev) => prev.map((c) => {
           if (c.id !== activeId) return c;
-          const general = (c.topic ?? "general") === "general";
-          const lockSo = relockSo && general;
-          const lock = !lockSo && relock && general;
+          const relockMode = relockFromHistory(c.topic, mapped);
           return {
             ...c, messages: mapped, historyTruncated: truncated, historyLimit: limit,
-            ...(lockSo ? { starops: true, devopsChat: false, devopsAgent: false, devopsAgentDirect: false }
-              : lock ? { devopsChat: true, starops: false, devopsAgent: false, devopsAgentDirect: false } : {}),
+            ...(relockMode ? fieldsOf(relockMode) : {}),
           };
         }));
       })
@@ -887,7 +879,6 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     const tk = setInterval(() => { sec += 1; patchMsgIn(convId, botId, { thinkElapsed: sec }); }, 1000);
     let firstToken = true;
     let acc = "";
-    let reasoningAcc = ""; // 思考过程累积（可折叠灰字）
     const invSteps: import("../api/chat").InvestigationStep[] = []; // 调查过程累积（走右侧面板）
     // 「思考过程」时间线累积（走右侧面板；合并连续思考、去重重复行、滤掉 BFF 等待期提示）。
     let thinkTimeline: TimelineStep[] = [];
@@ -923,22 +914,20 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
             // 这类 BFF 等待期提示——那不是模型/工具做的事）。
             if (p?.text) pushThinking(appendStep(thinkTimeline, { text: p.text, kind: p.kind }, Date.now()));
           },
-          // 思考过程增量：累积成可折叠灰字（默认折叠）+ 并进右侧面板的思考段。语言由 agent 端锁定跟随本轮。
+          // 思考过程增量：**只**并进右侧「思考过程」面板的思考段（气泡里不再另起一份折叠灰字 ——
+          // 那会和面板入口同名同内容，见 Message.tsx 入口规矩 3）。语言由 agent 端锁定跟随本轮。
           onReasoning: (r) => {
-            if (r?.text) {
-              reasoningAcc += r.text;
-              patchMsgIn(convId, botId, { reasoning: reasoningAcc });
-              pushThinking(appendReasoning(thinkTimeline, r.text, Date.now()));
-            }
+            if (r?.text) pushThinking(appendReasoning(thinkTimeline, r.text, Date.now()));
           },
           // 思考/处理过程的一步（工具调用及入参摘要、工具返回摘要）→ 右侧「思考过程」面板。
           onThinkingStep: (step) => { if (step?.text) pushThinking(appendStep(thinkTimeline, step, Date.now())); },
           onSources: (sources) => patchMsgIn(convId, botId, { sources }),
           onActions: (actions) => patchMsgIn(convId, botId, { actions }),
           onFollowups: (followups) => patchMsgIn(convId, botId, { followups }),
-          // DevOps Agent 的调查步骤。除了原样存进 investigationSteps（面板的 console 深链、历史兼容
-          // 都靠它），**还要进同一条思考时间线** —— 两个 agent 的过程展示要一致：同一个面板、同样的
-          // 图标/「进行中」脉冲/自动滚底/自动弹出。只写 investigationSteps 的话 DevOps 那条不会自动弹。
+          // DevOps Agent 的调查步骤。除了原样存进 investigationSteps（面板顶部的 console 深链也从这里
+          // 取；步骤本身不落库，刷新就没了），**还要进同一条思考时间线** —— 两个 agent 的过程展示
+          // 要一致：同一个面板、同样的图标/「进行中」脉冲/自动滚底/自动弹出。只写 investigationSteps
+          // 的话 DevOps 那条不会自动弹。
           onInvestigationStep: (step) => {
             invSteps.push(step);
             const patch: Partial<ChatMessage> = { investigationSteps: [...invSteps] };
@@ -1486,8 +1475,9 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
           /* 安全看板两栏浏览器（左目录 + 右内容）。
              2026-09-11「安全」不再是聊天主题（聊天并入「调查」），所以这里和 view==="inspection"
              一样：**没有主题落地页**，点进来直接是目录，initial 缺省落「TA 安全检查」。
-             返回按钮只在 dashReturn 有值时给 —— 那代表用户是从「调查」输入框上方的
-             「安全态势」胶囊进来的，回得去；从侧栏直接点进来没有上一步，给了就是死按钮。 */
+             返回按钮只在 dashReturn 有值时给。这个看板唯一的入口是「调查」输入框上方的
+             「安全态势」胶囊（侧栏的「安全」那一项同一天就去掉了），从胶囊进来总会记下
+             dashReturn、回得去；判断留着是兜底 —— 没有"上一步"时给返回按钮就是死按钮。 */
           <>
             <div className="topbar">
               {collapsed && (

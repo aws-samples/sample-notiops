@@ -16,7 +16,7 @@
  *
  * 流式体验对齐"客户直接开 DevOps Agent 网页聊"（这是本功能的硬要求）：
  *   · 正文 textDelta **逐 delta 转发**，不缓冲、不等整块 —— 打字机效果与官方页面一致；
- *   · 工具调用 / 思考 / 子代理等非正文块 → `investigation_step`（右侧「调查过程」面板）
+ *   · 工具调用 / 思考 / 子代理等非正文块 → `investigation_step`（右侧「思考过程」面板）
  *     + 正文还没开始时同步一条瞬态 `progress`，避免首答 5-30s 的空白等待；
  *   · jsonDelta（工具入参）只累积、**绝不**进气泡；
  *   · 未知类型的块按"正文"处理（失败安全：宁可多显示，也不能把答案藏进面板）。
@@ -192,7 +192,7 @@ export function makeSink({ emit }) {
     reply: "",
     /** 正文：既流给前端，也累积进 reply 供落库。 */
     say(t) { s.reply += t; emit("token", { delta: t }); },
-    /** 过程行 → 右侧「调查过程」面板。 */
+    /** 过程行 → 右侧「思考过程」面板。 */
     step(t, extra) { emit("investigation_step", { step: { text: t, ...(extra || {}) } }); },
     /** 瞬态进度行：**只在正文还没开始时**发（前端收到正文即清空），避免盖住答案。 */
     progress(t) { if (!s.reply) emit("progress", { text: t }); },
@@ -342,6 +342,34 @@ export async function consumeEvents(events, sink, { en = false, maxWaitSec = MAX
 }
 
 /**
+ * `CreateChat` 失败时气泡里的那句话。**退路按入口分**（2026-10-11 改）：
+ *
+ * 工具条上的「DevOps 对话」平铺开关只有故障调查主题有（前端 types.ts 的 `DEVOPS_CHAT_TOPICS`）——
+ * 那里关掉开关就回到普通对话。通用会话里 DevOps Agent 是新对话主页选的「对话对象」
+ * （ChatObjectPicker），发出第一句后就固定了，会话里**没有**开关可关；原来这里一律写
+ * 「关闭「DevOps 对话」改用普通对话」，在通用会话里是一条客户做不到的指引。那里的退路只能是
+ * 开一个「新对话」—— 与 index.mjs 里本路径抛异常时的兜底文案、STAROps 那几句是同一条退路。
+ *
+ * 抽成纯函数是为了**能被测到**（同 starops_chat.mjs::createThreadFailText）：`runDevopsChat`
+ * 要真连 DevOps Agent 才走得到这个分支。
+ *
+ * @param {boolean} en
+ * @param {string}  code         已经过 safeErr 的错误名/码（不含服务端原文）
+ * @param {{ toggleHere?: boolean }} [opts]  本主题工具条上有没有那个平铺开关。缺省 `false` ——
+ *   漏传时说「开一个新对话」仍然做得到，反过来就是把人指向一个不存在的开关。
+ */
+export function createChatFailText(en, code, { toggleHere = false } = {}) {
+  if (en) {
+    return `\n⚠️ Failed to create the DevOps Agent chat (${code}). Retry later, or ${toggleHere
+      ? "turn off “DevOps Chat” to use the standard chat"
+      : "start a “New chat” to switch back to the standard chat"}.\n`;
+  }
+  return `\n⚠️ 创建 DevOps Agent 对话失败（${code}）。请稍后重试，或${toggleHere
+    ? "关闭「DevOps 对话」改用普通对话"
+    : "开一个「新对话」换回普通对话"}。\n`;
+}
+
+/**
  * 「DevOps 对话」主流程。**NotiOps 侧 0 token**（不经 Bedrock / agent runtime）。
  *
  * @param {object} p
@@ -351,10 +379,12 @@ export async function consumeEvents(events, sink, { en = false, maxWaitSec = MAX
  * @param {string} p.conversationId  会话 id（用来复用同一个 DevOps Agent executionId → 多轮上下文）
  * @param {string} [p.skillId]       本轮用 `/` 显式选中的 NotiOps Skill（空=没选）
  * @param {string} [p.skillVersion]  指定版本（缺省=latest）
+ * @param {boolean} [p.toggleHere]   本主题工具条上有没有「DevOps 对话」平铺开关（index.mjs 按主题算好
+ *                                   传进来；只决定失败文案里的退路，见 createChatFailText）
  * @param {function} p.emit          (event, data) => void，写一条 SSE
  * @returns {Promise<string>}        落库用的 assistant 正文
  */
-export async function runDevopsChat({ text, locale, accountId, conversationId, skillId, skillVersion, emit }) {
+export async function runDevopsChat({ text, locale, accountId, conversationId, skillId, skillVersion, toggleHere = false, emit }) {
   const en = locale === "en";
   const dv = (zh, enStr) => (en ? enStr : zh);
   const sink = makeSink({ emit });
@@ -439,9 +469,8 @@ export async function runDevopsChat({ text, locale, accountId, conversationId, s
       executionId = await newChat();
     } catch (e) {
       console.warn("[devops-chat] create_chat_failed", safeErr(e));
-      say(dv(
-        `\n⚠️ 创建 DevOps Agent 对话失败（${safeErr(e)}）。请稍后重试，或关闭「DevOps 对话」改用普通对话。\n`,
-        `\n⚠️ Failed to create the DevOps Agent chat (${safeErr(e)}). Retry later, or turn off “DevOps Chat” to use the standard chat.\n`));
+      // 退路按入口分（只有故障调查主题有那个平铺开关），见 createChatFailText。
+      say(createChatFailText(en, safeErr(e), { toggleHere }));
       finishUsage();
       return sink.reply;
     }

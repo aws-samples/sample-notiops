@@ -479,7 +479,9 @@ def handler(event: dict, context) -> dict:
 
     web_base = os.environ.get("WEB_BASE_URL", "").strip().rstrip("/")
     if web_base:
-        content += f"\n---\n💡 判读详情与处置入口：{web_base}（左侧「巡检」看板）"
+        # 位置提示要跟侧栏一致：2026-10-10 起「巡检」收进了「更多」（默认收起），只写「左侧「巡检」」
+        # 的话，收到消息的人在一级导航里找不到它。
+        content += f"\n---\n💡 判读详情与处置入口：{web_base}（左侧「更多 → 巡检」看板）"
     else:
         content += "\n---\n💡 判读详情与处置入口见 Web Chat 巡检看板。"
 

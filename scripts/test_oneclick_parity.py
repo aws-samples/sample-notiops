@@ -911,7 +911,7 @@ def test_im_webhook_parity() -> None:
                f"必须读 {IM_EXCLUDE_FILE}，不能自己写一份文件清单")
     patterns = [l.strip() for l in _read(IM_EXCLUDE_FILE).splitlines()
                 if l.strip() and not l.strip().startswith("#")]
-    for sentinel in ("dist/**", ".cdk-out", "**/node_modules/**"):
+    for sentinel in ("dist/**", ".cdk-out", "**/node_modules/**", ".claude/**", ".*/**", "**/.*"):
         _check(f"排除清单里有哨兵 {sentinel}", sentinel in patterns)
     _check("排除清单**没有** platforms/**", "platforms/**" not in patterns,
            "IM 的三个 handler 全在 platforms/ 下，排掉它 = handler not found")
@@ -925,9 +925,51 @@ def test_im_webhook_parity() -> None:
         _check(f"{artifact} 在模板清单里（postprocess）", f'"{artifact}"' in postprocess)
         _check(f"{artifact} 进 SHA256SUMS（package_artifacts）", artifact in package)
         _check(f"{artifact} 带 stager 的跳过前缀 im-", artifact.startswith("im-"))
+    # stager 的跳过判据在 2026-09-20 从「只认 im-」泛化成「按前缀分组」（成本 MCP 也用它）。
+    # 这里钉的是**机制仍在**，不是某一行的写法：`skip_prefixes` 这个名字 + "im-" 这个前缀
+    # + InstallOption 这个开关三者都要在。
     _check("stager 按 im- 前缀跳过（只装 web 时）",
-           'startswith("im-")' in stager and "InstallOption" in stager,
+           "skip_prefixes" in stager and '"im-"' in stager and "InstallOption" in stager,
            "少了这段，只装 web 的客户也要白下载 28MiB 的 IM 产物")
+
+    # ── 13) 自建成本 MCP server：两条路径都要能自建（铁律）────────────────────────
+    # 只有方式 B 能自建的话，一键部署的客户看到的是「FinOps 有四张 CUR 报表、点进去全空」。
+    standalone_src = _read(ONECLICK)
+    webcore_src = _read("infra/lib/constructs/web-chat-core.ts")
+    webstack_src = _read("infra/lib/web-chat-stack.ts")
+    _check("资源定义在两条路径共用的构件里（不是各写一份）",
+           "CostMcpFunction" in webcore_src and "CostMcpFunction" not in standalone_src,
+           "CostMcpFunction 必须只在 web-chat-core.ts 里出现一次 —— 抄进一键栈就是"
+           "「改了 A 忘了 B」的开端（见 im-core.ts 文件头）")
+    _check("方式 A 从 staging 桶取代码与层（一键模板禁 Code.fromAsset）",
+           "costMcpCodeKey" in standalone_src and "costMcpLayerKey" in standalone_src
+           and "fromBucket(stagingBucket, costMcpCodeKey)" in standalone_src)
+    _check("方式 B 从本地资产取代码",
+           "costMcpCode" in webstack_src and "costMcpSelfHosted" in webstack_src)
+    _check("方式 A 用部署期条件（CfnCondition），方式 B 用合成期分支",
+           "InstallCostMcp" in standalone_src and "costMcpEnabledCondition" in standalone_src)
+    for artifact in ("cost-mcp-code.zip", "cost-mcp-layer.zip"):
+        _check(f"{artifact} 在模板清单里（postprocess）", f'"{artifact}"' in postprocess)
+        _check(f"{artifact} 由 package_artifacts 打出来", artifact in package)
+        _check(f"{artifact} 带 stager 的跳过前缀 cost-mcp-", artifact.startswith("cost-mcp-"))
+    _check("stager 按 cost-mcp- 前缀跳过（没填 CUR 表时）",
+           '"cost-mcp-"' in stager and "CostMcpEnabled" in stager,
+           "少了这段，没配 CUR 的客户也要白下载 30MiB 的依赖层")
+    _check("扫描量上限走 workgroup 的 BytesScannedCutoffPerQuery（Athena 没有逐调用上限）",
+           "bytesScannedCutoffPerQuery" in webcore_src
+           and "enforceWorkGroupConfiguration: true" in webcore_src,
+           "少了 Enforce 那条，调用方可以自带 ResultConfiguration 把花费上限绕过去")
+    # ⚠️ 判据是「有没有被当**环境变量键**注入」，不是「文件里有没有这个字符串」——
+    # `curRoleArn` 那个 prop 的注释**故意**提到 `CUR_ACCESS_KEY_ID` 来解释上游那条路
+    # 为什么被删。裸包含判据会把「解释得清楚」当成「还在」（这个坑在
+    # tests/test_cost_mcp_sql_safety.py 与 tests/test_webchat_memory_session.py 里各踩过一次，
+    # 那两处都改用 AST 只看字符串常量；TS 这边没有现成的 AST，所以判 `KEY:` 这个形状）。
+    _check("跨账号读 CUR 只走 AssumeRole（不许把静态 AK/SK 注入成环境变量）",
+           "curRoleArn" in webcore_src
+           and not re.search(r"CUR_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)\s*:", webcore_src),
+           "web-chat-core.ts 把静态凭据当 env 注入了 —— 那条路在并入 cost_mcp 时就该删掉")
+    _check("Athena 结果桶交给 stager 在删栈时清空（否则删栈失败）",
+           "CostResultsBucket" in standalone_src and "CostResultsBucket" in stager)
 
     # 8) 群/频道允许清单（IM 四道防线的第三道）必须**两条路径都能开**。
     #
@@ -1306,7 +1348,7 @@ def test_agentcore_memory_parity() -> None:
     # 2026-09-01 的产品决策本身：**跨会话记忆是关着的**。
     # 上面两条只保证"写入端与读取端一致"，一致地打开也能过 —— 所以决策要单独钉一条。
     # 如果哪天决定恢复跨会话记忆，这条断言就该在同一个 MR 里被显式改掉（连带
-    # RELEASE_TEST_CHECKLIST 的 §4.13 / §4.14 / §11.10 从「已废弃」改回去），
+    # 发布回归清单里对应的几条从「已废弃」改回去），
     # 而不是让它悄悄变成"两边都开着也算过"。
     _check("跨会话记忆两条路径都没有 strategy（产品决策：只保留会话内）",
            not setup["strategies"] and not oneclick["strategies"],
@@ -1421,6 +1463,110 @@ def test_cur_dashboard_parity() -> None:
            and "InvokeCostAgentMcp" in _read(SETUP_CDK),
            "runtime 角色少了 lambda:InvokeFunctionUrl —— 仪表盘能看（BFF 有权限），"
            "但聊天里问客户费用恒失败降级到 CE，症状是「数字口径莫名变了」")
+
+
+# ───────────── 第十三个维度：**替客户建 CUR**（阶段一 + 阶段二 + 自愈）─────────────
+#
+# 为什么它与第十个维度（CUR 仪表盘 / cost-agent MCP）分开算一维：那一维管的是
+# 「有了一张 CUR 表之后，怎么把它接起来」；这一维管的是**那张表从哪来**。
+# 两件事的失败方式完全不同 ——
+#   · 第十维漂移 → 表有、接不上 → 403 / 空表格（看得见）
+#   · 本维漂移   → 表根本没被建出来，或者建出来了但字段不一样 → 客户以为"CUR 装了"，
+#                  而成本主题静默停在 Cost Explorer（**看不见**，要等客户问到某个维度）
+#
+# 这一维曾经就是**方式 A 完全没有**的那块：`setup.sh` 一直会替客户建 CUR，而一键模板
+# 只能接一张客户已有的表（那时文件头还写着"本栈刻意不含 CUR provisioning"）。
+#
+# 三件必须对等的事：
+#   ① 规格唯一真源。两条路径都必须从 `cur_provisioner/spec.py` 取报告定义与桶策略。
+#      各拼一份的症状不是报错，是「同一个成本工具在 A 上答得对、在 B 上答得不对」。
+#   ② 阶段二有**自愈**触发。原来只有 T+25h 一次性 schedule，迟到一次就永久停在 DELAYED。
+#   ③ 表名运行时可解析。CUR 建好到能查有 ~24h 硬延迟，部署期拿不到表名 —— 两条路径都要
+#      能在就绪后自动接上，而不是要求客户"过一天回来再部署一次"。
+def test_cur_provisioning_parity() -> None:
+    """NotiOps 替客户建 CUR：两条路径都要能建、建得一样、且都能自愈。"""
+    print("\ntest_cur_provisioning_parity")
+    oneclick = _read(ONECLICK)
+    setup_sh = _read(SETUP_SH)
+    backend = _read("infra/lib/notiops-backend-stack.ts")
+    core = _read("infra/lib/constructs/web-chat-core.ts")
+    athena = _read("cost_mcp/athena.py")
+    finalizer = _read("lambda6_cur_finalizer/handler.py")
+
+    # ── ① 规格唯一真源 ──
+    _check("方式 B 从共享规格取报告定义与桶策略",
+           "cur_provisioner.spec report-definition" in setup_sh
+           and "cur_provisioner.spec bucket-policy" in setup_sh,
+           "setup.sh 又在内联拼 CUR 定义 —— 与方式 A 的 custom resource 会静默漂移，"
+           "而症状是「同一个工具在一条路径上答错」，不是报错")
+    _check("方式 A 的 custom resource 用的是同一份规格",
+           "cur_provisioner.custom_resource.handler" in oneclick,
+           "一键模板没有阶段一的 handler = 方式 A 又回到「只能接客户已有的表」")
+
+    # ── ② 两条路径都能建 ──
+    _check("方式 A 提供了让 NotiOps 建 CUR 的参数",
+           "ProvisionCur" in oneclick and "CurProvisionerFn" in oneclick,
+           "一键部署的客户只有参数页这一个入口；没有它 = 这条路径上客户必须自己先建 CUR")
+    _check("方式 A 把阶段二的 finalizer 也部署了",
+           "lambda6_cur_finalizer.handler.handler" in oneclick,
+           "只有阶段一 = CUR 建好了但永远停在 PENDING（Glue 表没人建），"
+           "而部署本身报成功")
+    _check("方式 A 的 ProvisionCur 与 CurTable 互斥",
+           "ProvisionCurExcludesCurTable" in oneclick,
+           "两个一起给会建出第二份 CUR（多一份账单费用），而客户以为用的是自己填的那张表")
+
+    # ── ③ 自愈触发：两条路径都要有 ──
+    for label, src, rule in (("方式 B", backend, "CurFinalizerSelfHealRule"),
+                             ("方式 A", oneclick, "CurFinalizerSchedule")):
+        ok = rule in src and "Duration.hours(4)" in src[src.index(rule):src.index(rule) + 1400] \
+            if rule in src else False
+        _check(f"{label} 的阶段二是**周期性**触发（自愈）", ok,
+               "一次性 schedule 不自愈：AWS 交付晚了或 crawler 没爬完，状态就停在 DELAYED "
+               "且再也没有下一次 —— 客户看到「装了 CUR 但成本还是走 CE」，没有任何报错")
+    _check("finalizer 已 READY 时空跑返回",
+           '"unchanged": True' in finalizer,
+           "没有短路 = 常驻规则每 4 小时重跑一遍 crawler 发现 + Athena 写保存查询")
+    _check("finalizer 没有状态记录时什么都不做",
+           '"NOT_PROVISIONED"' in finalizer,
+           "没有这道守卫 = 给**没选**这个功能的客户每 4 小时凭空写一条 FAILED 记录")
+
+    # ── ④ 表名运行时解析：两条路径都要接上 ──
+    _check("server 能在 CUR_TABLE 为空时从 notiops-config 解析表名",
+           "_cur_from_config_table" in athena,
+           "没有它 = 客户必须在 CUR 就绪后**再部署一次**才能用上；"
+           "而「过一天记得回来再点一次」实际上等于不会点")
+    _check("解析只认 READY",
+           '!= "READY"' in athena[athena.index("def _cur_from_config_table"):
+                                  athena.index("class AthenaEnv")],
+           "PENDING/DELAYED 时连上去查会得到**看起来正常的空结果** —— "
+           "客户会理解成「NotiOps 说我这个月没花钱」，比明确报错糟得多")
+    for label, src in (("方式 A", oneclick), ("方式 B", _read("infra/lib/web-chat-stack.ts"))):
+        _check(f"{label} 接上了表名回落通路",
+               "curProvisionedByNotiOps: true" in src and "configTableName" in src,
+               "这条路径上的客户仍然要过一天回来再部署一次")
+    _check("回落通路的 DDB 读权限钉在单个 PK 上",
+           "ReadCurAthenaStatusOnly" in core and "dynamodb:LeadingKeys" in core,
+           "notiops-config 里还有平台凭证/IM 配置 —— 成本 MCP 没有任何理由能读到它们")
+
+    # ── ⑤ 删除语义：绝不删客户的账单数据 ──
+    #
+    # ⚠️ 这条**必须**限定在 `CurProvisionerRole` 那一段里，而且要剥掉注释：
+    #   · 全文 grep `s3:DeleteBucket` 会命中一个**无关的既有角色**（卸载时清空自己那几个
+    #     桶的那个），那是正当的；
+    #   · 也会命中源码里解释"为什么一个删除动作都不给"的注释本身。
+    # 两种误报都会让人为了让判据变绿去改一段本来正确的代码。
+    _role_start = oneclick.index("CurProvisionerRole")
+    _role_end = oneclick.index("CurProvisionerFn")
+    _role_block = "\n".join(
+        line for line in oneclick[_role_start:_role_end].splitlines()
+        if not line.lstrip().startswith("//")
+    )
+    _deletes = [a for a in ("s3:DeleteBucket", "s3:DeleteObject", "cur:DeleteReportDefinition")
+                if a in _role_block]
+    _check("阶段一的角色没有任何删除权限", not _deletes,
+           f"CurProvisionerRole 拿到了 {_deletes} —— CUR 报告删了客户的历史账单明细断档，"
+           "而 AWS **不会补发**过去的月份；"
+           "「没有权限删」比「代码里记得不要删」更硬")
 
 
 # ────────── 第十一个维度：DevOps Agent 调查结果回调（异步链路的最后一跳）──────────
@@ -1910,6 +2056,7 @@ def main() -> int:
         test_cur_dashboard_parity()
         test_devops_callback_parity()
         test_aliyun_credentials_parity()
+        test_cur_provisioning_parity()
     except AssertionError as e:
         # 提取器找不到目标 = 有人改了源码的形态。必须失败而不是静默通过 ——
         # 静默通过的断言比没有断言更糟：它让人以为这件事有人守着。

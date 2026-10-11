@@ -124,5 +124,66 @@ ok("onboardAccount 把 StackSetNotFoundException 翻译成带出路的 config_er
 ok("associateDevopsAgent 同样翻译",
   (member.match(/StackSetNotFoundException/g) || []).length >= 2);
 
+/* ④b 行为级（2026-10-11）：真调 onboardAccount / associateDevopsAgent，让 CreateStackInstances 抛
+ * StackSetNotFoundException，看管理页上**原样显示**的那句话（index.mjs 把 config_error 的 message
+ * 直接回成 {error}）。
+ * 🔴 两句原来都断言原因是「部署时没带 --multi-account」—— 在这里不可能成立：非多账号部署的
+ *    MEMBER_ONBOARDING_STACKSET_NAME 是空串，stackSetName() 先抛 org_mode_disabled。出路也只给了
+ *    setup.sh，一键部署（方式 A）的客户照做等于换一条安装路径。第二步那句的「手动接入账号」还漏了
+ *    CreateCollectionRole=no —— 第一步已经建过同名采集角色，照做 EntityAlreadyExists、整栈回滚。 */
+{
+  // 模块级常量在 import 时求值 → 必须在 import 之前设。每个测试文件是单独的 node 进程，不串味。
+  process.env.MEMBER_ONBOARDING_STACKSET_NAME = "notiops-member-onboarding";
+  process.env.STACKSET_CALL_AS = "DELEGATED_ADMIN";
+  delete process.env.MEMBER_DA_STACKSET_NAME;
+  delete process.env.ORG_MANAGEMENT_ACCOUNT_ID;
+  const cfnLib = await import("@aws-sdk/client-cloudformation");
+  const orgLib = await import("@aws-sdk/client-organizations");
+  const ddbLib = await import("@aws-sdk/lib-dynamodb");
+  const origCfn = cfnLib.CloudFormationClient.prototype.send;
+  const origOrg = orgLib.OrganizationsClient.prototype.send;
+  const origDdb = ddbLib.DynamoDBDocumentClient.prototype.send;
+  let cfgRow; // getConfigAccount 读到的 account# 行
+  cfnLib.CloudFormationClient.prototype.send = async () => {
+    throw Object.assign(new Error("StackSet not found"), { name: "StackSetNotFoundException" });
+  };
+  orgLib.OrganizationsClient.prototype.send = async (cmd) =>
+    (cmd?.constructor?.name === "ListRootsCommand" ? { Roots: [{ Id: "r-abcd" }] } : { Account: { Name: "acct" } });
+  ddbLib.DynamoDBDocumentClient.prototype.send = async () => ({ Item: cfgRow });
+  const errOf = async (fn) => { try { await fn(); return null; } catch (e) { return e; } };
+  let e1 = null, e2 = null;
+  try {
+    const m = await import("../member_accounts.mjs");
+    cfgRow = undefined;                          // 第一步：账号还没登记
+    e1 = await errOf(() => m.onboardAccount("123456789012", ["us-east-1"]));
+    cfgRow = { org_onboard_status: "ACTIVE" };   // 第二步：第一步已完成（否则 complete_step1_first）
+    e2 = await errOf(() => m.associateDevopsAgent("123456789012"));
+  } finally {
+    cfnLib.CloudFormationClient.prototype.send = origCfn;
+    orgLib.OrganizationsClient.prototype.send = origOrg;
+    ddbLib.DynamoDBDocumentClient.prototype.send = origDdb;
+  }
+  for (const [name, e, ss] of [
+    ["一键接入", e1, "notiops-member-onboarding"],
+    ["一键关联", e2, "notiops-member-devops-agent"],
+  ]) {
+    const msg = String(e?.message || "");
+    ok(`${name}: StackSetNotFound → config_error（路由层转 400、管理页原样显示）`, e?.code === "config_error");
+    ok(`${name}: 不再断言「部署时没带 --multi-account」，而是说明这本来就是多账号部署`,
+      !msg.includes("没带 --multi-account") && msg.includes("多账号模式"));
+    ok(`${name}: 说清用哪个 CallAs 找不到哪个 StackSet`,
+      msg.includes("CallAs=DELEGATED_ADMIN") && msg.includes(ss));
+    ok(`${name}: 两条部署路径各给补建办法（setup.sh 重跑 / 一键部署升级到新版本）`,
+      msg.includes("setup.sh 部署的，重跑 ./setup.sh --multi-account") && msg.includes("一键部署")
+      && msg.includes("升级到新版本"));
+    ok(`${name}: 不再说「同时把后端切成多账号模式」（它已经是）`, !msg.includes("切成多账号模式"));
+    ok(`${name}: 给出不依赖 StackSet 的「手动接入账号」`, msg.includes("「手动接入账号」"));
+  }
+  ok("一键关联: 手动接入那条退路带上 CreateCollectionRole=no（第一步已建同名采集角色，否则整栈回滚）",
+    String(e2?.message || "").includes("CreateCollectionRole 改成 no"));
+  ok("一键接入: 第一步的手动接入退路不叫人改 CreateCollectionRole（那个账号里还没有采集角色）",
+    !String(e1?.message || "").includes("CreateCollectionRole"));
+}
+
 console.log(`\nPASSED: ${pass} ok, ${fail} failed`);
 process.exit(fail ? 1 : 0);

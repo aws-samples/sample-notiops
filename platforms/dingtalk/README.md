@@ -73,20 +73,25 @@ AWS Support 案例操作，结果回到**原会话**。
 └──────────────────────────────────────────────┘
 ```
 
-**路由是确定性的、0 token**：`core/nl_router.py` 用正则把消息分到十条能力，只有「案例」
-那条会调一次 LLM 抽标题/正文。详见 [`../common/router.py`](../common/router.py) 文件头。
+**路由是确定性的、0 token**：`core/nl_router.py` 用正则把消息分到十条能力（九条确定性路由 + 兜底的
+`chat`）。路由这一层从不调模型；会花 NotiOps 侧 token 的只有下游几处：案例的智能分析
+（`core/case_analyze.py`）、建案例时的服务分类（`core/case_classifier.py`），以及用户
+`/agent notiops` 之后的 `chat`（走 NotiOps Agent）。详见 [`../common/router.py`](../common/router.py) 文件头。
 
 ## 出站：两条路，按"在不在会话里"分
 
 | # | 机制 | 支持 @ | 需要 token | 用在哪 |
 |---|---|---|---|---|
 | 1 | `sessionWebhook`（入站报文里带的地址） | ✅ | ❌ | **所有会话内回复** |
-| 2 | `POST /v1.0/robot/groupMessages/send` | ❌ | ✅ | 群的**会话外**投递（报告回写、推送） |
+| 2 | `POST /v1.0/robot/groupMessages/send` | ❌ | ✅ | 群的**会话外**投递（报告回写） |
 | 3 | `POST /v1.0/robot/oToMessages/batchSend` | ❌ | ✅ | 单聊的会话外投递（≤20 userIds/次） |
 
 `sessionWebhook` 的有效期 **≈90 分钟**（官方示例报文里 `sessionWebhookExpiredTime -
 createAt ≈ 5,402,586 ms`）。90 分钟 > Lambda 的 15 分钟上限 ⇒ **会话内的所有回复都不需要
 access_token**。过期了才走机制 2/3 兜底（`sender.reply()` 自己判）。
+
+主动推送不在这张表里：它走群里另加的**自定义机器人**地址（secret 里可选的 `webhook_url`），
+见下文「钉钉凭据怎么填」。
 
 > 🔒 **`sessionWebhook` 就是凭证**（URL 本身即鉴权）—— 绝不进日志、绝不落库、绝不写进任何
 > 文件。它只在 ingress → worker 的 `Payload` 里流转。
@@ -131,8 +136,8 @@ access_token**。过期了才走机制 2/3 兜底（`sender.reply()` 自己判�
 ingress 冷启动时硬校验，为空直接崩（故意的：空 secret = 请求完全可伪造）。
 
 ### 4. 申请权限（只有报告回写需要）
-**权限管理** → 勾上「企业内机器人发送消息权限」。只影响**会话外**投递（报告跑完回贴、
-每日推送）；会话内回复走 `sessionWebhook`，不需要任何权限。
+**权限管理** → 勾上「企业内机器人发送消息权限」。只影响**会话外**投递（报告跑完回贴）；
+会话内回复走 `sessionWebhook`，不需要任何权限。
 
 ### 5. 发布版本
 **版本管理与发布** → 创建新版本 → 发布。
@@ -151,17 +156,35 @@ ingress 冷启动时硬校验，为空直接崩（故意的：空 secret = 请�
 
 ### 钉钉凭据怎么填（关键）
 
-`setup.sh` / 一键模板 **都不采集任何 IM 凭据**。CDK 只创建一个**空的** Secret
-`notiops/im-bot-dingtalk`；部署完成后再填：
+`setup.sh` / 一键模板 **都不采集任何 IM 凭据**，部署完成后再填，两种方式：
 
-```bash
-aws secretsmanager put-secret-value --secret-id notiops/im-bot-dingtalk \
-  --secret-string '{"app_key":"ding...","app_secret":"..."}' \
-  --region <REGION>
-```
+1. **（推荐，不需要任何 AWS 权限）** 登录 Web Chat（admin）→ 左侧「更多 → 管理」→「集成 IM」→
+   **钉钉 DingTalk** 分页，填 AppKey / AppSecret，保存；Secret 还不存在时后端会替你建。
+   保存后点「测试凭证」会用这两个值换一次 access token（凭证对不对的权威判据）。
+   同一页的「自定义机器人推送地址」可选，它管什么见下面的 `webhook_url`。
+2. 直接更新 Secret —— `setup.sh` 部署时 CDK 会建一个**空的** `notiops/im-bot-dingtalk`；
+   一键模板**不建**，那条路径下先用第 1 种保存一次：
+   ```bash
+   aws secretsmanager put-secret-value --secret-id notiops/im-bot-dingtalk \
+     --secret-string '{"app_key":"ding...","app_secret":"..."}' \
+     --region <REGION>
+   ```
 
-可选字段：`card_template_id`（Tier 2 预留）、`webhook_url`（旧自定义机器人的推送地址，
-cron/广播路径仍在用）。
+可选字段：`card_template_id`（Tier 2 预留）、`webhook_url`（群里另加的**自定义机器人**的地址，
+网页上叫「自定义机器人推送地址」）。`webhook_url` 只有两处会用：
+
+- **巡检推送** —— 主动推送里**唯一**会投钉钉的一种，`webhook_url` 就是它的发送地址。但光有
+  地址不够：巡检只有 `setup.sh` 部署才有，而且还要先把群登记成**推送目标**（`inspchat#target`
+  行，见 [`inspection/domain/targets.py`](../../inspection/domain/targets.py)）—— 本版本**还没有**
+  这一步的途径：没有网页入口、`setup.sh` 不问、发布包里也没有对应的工具。所以这一版的钉钉巡检
+  推送实际配不起来，巡检结果在 Web Chat「更多 → 巡检」里看。另外，钉钉最多只能有**一个**启用的
+  推送目标：发送一律走这一个地址，而它绑死自定义机器人所在的那个群，登记两个会把两组账号的结果
+  发进同一个群，所以会被整体拒掉（`AMBIGUOUS_ROUTING`）。
+- **报告回写的兜底** —— 报告平时走上面的机制 2/3 投回提问的会话，那条投不出去时才落到这个
+  地址（也就是自定义机器人所在的那个群，不一定是提问的群）。
+
+每日通知、Health（PHD）和 CloudWatch Alarm / Backup / GuardDuty / Cost Anomaly / Trusted Advisor
+这类实时事件推送都**不投钉钉**：填了 `webhook_url` 也收不到。
 
 ⚠️ **ingress 是 fail-fast 的**：`app_secret` 读不到就 `raise`，Lambda 起不来。所以
 **先填 secret，再去开放平台填回调地址**。钉钉在开放平台保存回调地址时**什么都不校验**
@@ -169,7 +192,7 @@ cron/广播路径仍在用）。
 不吭声**（一个正确配置和一个填错的配置，从开放平台看长得一模一样）；这种情况只能靠上面
 「排查」里的两条 CloudWatch 日志命令去判。
 Lambda 是冷启动时读 secret 的 —— 填完等旧执行环境自然回收，急的话改一下 ingress 的环境
-变量强制换一批（做法见 `docs/DEPLOYMENT.md` §8.2）。
+变量强制换一批（做法见 `docs/DEPLOYMENT.md` §8.3）。
 
 ## 测试
 
@@ -196,8 +219,11 @@ aws logs tail /aws/lambda/notiops-im-ingress-dingtalk --region <REGION> --follow
 # worker（收到了但没回答 / 回答不对看这个）
 aws logs tail /aws/lambda/notiops-im-worker-dingtalk --region <REGION> --follow
 
-# 改了钉钉适配器代码后重新部署（在仓库根执行）:
-cd ../../infra && npx cdk deploy ImStack
+# 改了钉钉适配器代码后重新部署（在仓库根执行）—— 重跑 setup.sh，它会带上部署时的全部 -c 参数:
+./setup.sh
+# ⚠️ 别单独跑 `npx cdk deploy ImStack`：不带 setup.sh 平时传的那些 -c，它会按默认值重新合成
+#    （enabledPlatforms 回到 feishu → 钉钉的路由和函数被换掉；agentRuntimeArn 变空；多账号部署的
+#    跨账号闸门被重新锁上）。见 docs/DEPLOYMENT.md §8.1。
 ```
 
 | 症状 | 原因 |

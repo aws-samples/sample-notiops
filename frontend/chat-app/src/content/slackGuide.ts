@@ -66,7 +66,10 @@ const ZH: GuideBlock[] = [
       "地址按部署生成、每次部署都不一样 —— 别用别人截图里的那个。",
     ],
   },
-  { k: "warn", tx: "没装 Slack 的部署没有这个地址（上面的框会说查不到，Outputs 里也没有 `SlackWebhookUrl`）。一键部署请在「安装哪些能力」里勾上 Slack 后更新堆栈；脚本部署重跑 ./setup.sh 选 2) Slack。" },
+  // 2026-10-11 改（与飞书 / 钉钉两份抽屉同一句，理由见 dingtalkGuide.ts 那条注释）：原文的
+  // 「安装哪些能力」不是参数页上的字样（参数标签是 What to install），「勾上 Slack」又读成加选 ——
+  // 它是单选，装着飞书的栈照做就把飞书机器人去掉了。
+  { k: "warn", tx: "没装 Slack 的部署没有这个地址（上面的框会说查不到，Outputs 里也没有 `SlackWebhookUrl`）。一键部署：参数页的 What to install 选 web+slack，然后更新堆栈 —— 这一项是单选，一键部署一次只装一个 IM 机器人，从别的机器人换过来会把那个机器人去掉；脚本部署：重跑 ./setup.sh，在「IM 平台选择」那一步把 2) Slack 选上（已经在用的平台一起选，例如 1,2）。" },
 
   { k: "h", tx: "5. 三处 Request URL —— 全填同一个" },
   { k: "p", tx: "回到 Slack App 配置页，下面三处填的是**同一个地址、一字不差**:" },
@@ -165,7 +168,7 @@ const EN: GuideBlock[] = [
       "The URL is generated per deployment and differs between deployments — never paste the one from somebody else's screenshot.",
     ],
   },
-  { k: "warn", tx: "A stack deployed without Slack has no such URL (the box above will say it could not be found, and there is no `SlackWebhookUrl` output either). For one-click deployment, include Slack under \"What to install\" and update the stack; for script deployment, re-run ./setup.sh and pick 2) Slack." },
+  { k: "warn", tx: "A stack deployed without Slack has no such URL (the box above will say it could not be found, and there is no `SlackWebhookUrl` output either). For one-click deployment, pick web+slack under \"What to install\" on the parameters page and update the stack — it is a single choice, so a one-click stack runs one IM bot at a time and switching from another bot removes that bot; for script deployment, re-run ./setup.sh and pick 2) Slack at the IM Platform Selection step (also pick the platforms you already use, e.g. 1,2)." },
 
   { k: "h", tx: "5. Three Request URLs — all the same one" },
   { k: "p", tx: "Back in the Slack app config, these three take the **same URL, character for character**:" },

@@ -1,5 +1,6 @@
 /**
- * 成员账号一键接入（Web Chat Admin「账户」页；与 idle 控制台 api/routes/org_onboard.py 同构）。
+ * 成员账号一键接入（Web Chat「更多 → 管理 → 账户」页）。流程与老 idle 控制台的
+ * api/routes/org_onboard.py 同构，并已取代它 —— 老控制台连同那份代码于 2026-09-04 退役。
  *
  * 前提: org 模式部署（setup.sh --multi-account / 方式 A DeployMode=MultiAccount），CDK 注入
  *   MEMBER_ONBOARDING_STACKSET_NAME + ORGANIZATION_ID + STACKSET_CALL_AS 并授权
@@ -82,7 +83,15 @@ const ORG_MANAGEMENT_ACCOUNT_ID = (process.env.ORG_MANAGEMENT_ACCOUNT_ID || "").
  *    列表外。但**委派管理员**部署时管理账号是一个普通行，一键接入按钮照常显示，而
  *    `CreateStackInstances` 会**返回成功、操作也会变 SUCCEEDED、目标账号里什么都没有**：
  *    账号被翻成 ACTIVE、enabled=true，然后每一次跨账号提问都 AssumeRole 失败。
- *    所以必须在调用**之前**拦住，并给出唯一可行的替代做法。
+ *    所以必须在调用**之前**拦住，并给出唯一可行的替代做法。（前端现在按 `isOrgManagementAccount`
+ *    不渲染那一行的一键接入按钮；这道拦截仍要留着，挡老 bundle 与手搓请求。）
+ *
+ * 🔴 替代做法**只有**「手动接入账号」一条（与 docs/DEPLOYMENT.md §0.1.2、setup.sh 委派管理员那段
+ *    提示同一口径；前端 i18n 的 `admin.accounts.mgmtAcctHint` 是同一件事的界面说法，两边要一致）。
+ *    这里原来叫人「先手工部 infra/member-account-onboarding.yaml 再手动接入」—— 照做必回滚：
+ *    手动接入的链接预填 `CreateCollectionRole=yes`（generateLaunchStackUrl），两份模板建的是**同名**
+ *    采集角色 `notiops-idle-detection-role-<系统账号>` ⇒ 后部的那个 EntityAlreadyExists、整栈回滚；
+ *    两份的事件转发规则名字不同、不撞，但都建会把每个调查事件投两次（不报错）。
  */
 function assertStackSetTargetable(id) {
   if (STACKSET_CALL_AS !== "DELEGATED_ADMIN") return;
@@ -90,8 +99,11 @@ function assertStackSetTargetable(id) {
   const e = new Error(
     `一键接入不支持组织管理账号（${id}）：CloudFormation StackSets 不会把 stack 部署到`
     + "管理账号，调用会「成功」但那个账号里什么都不会建。"
-    + "请在管理账号里手工部署一次 infra/member-account-onboarding.yaml（参数与本部署一致），"
-    + "然后用下方「手动接入账号」登记它。");
+    + "要让 NotiOps 查它，只用下方「手动接入账号」：「生成链接」→ 用管理账号登录部署那个栈 →"
+    + " 回填 Stack Outputs →「测试连接」→「保存并激活」，采集角色由那个栈一并建好。"
+    + "别再手工部署 infra/member-account-onboarding.yaml：两个栈建同名采集角色，后部的那个"
+    + " EntityAlreadyExists、整栈回滚。已经部过的话，在 quick-create 页把 CreateCollectionRole"
+    + " 改成 no；那个栈建了事件转发的话，DevOpsEventBusArn 也清空（否则每个调查事件投两次）。");
   e.code = "bad_request";
   throw e;
 }
@@ -339,8 +351,13 @@ export async function listMemberAccounts() {
     row.outOfOrg = true;
     items.push(row);
   }
-  // 第二步状态：da#<id> 记录（idle 控制台「DevOps Agent 账户」向导写入；
-  // pending → template_generated → payload_saved → tested → enabled）
+  // 第二步状态：da#<id> 记录的 onboarding_status。成员账号这一行由本文件写：
+  // 一键关联 associateDevopsAgent 写 provisioning → devopsAgentAssocStatus 读到栈输出后写 active
+  // （失败写 failed）；手动接入 manualPayloadSave 回填后直接写 active。
+  // （老 idle 控制台「DevOps Agent 账户」向导写过的 pending / deployed / tested / disabled 已于
+  //  2026-09-04 随老控制台退役，现在没有代码再往 da# 写这些值；终态 active 是有意沿用的同一字面量
+  //  （见 devopsAgentAssocStatus）。"enabled" 是本文件早期误写进库的历史值，前端只作兼容显示；
+  //  下面的对账分支仍会在响应里回 "enabled"。）
   await Promise.all(items.filter((i) => i.onboarded).map(async (i) => {
     try {
       const r = await ddb.send(new GetCommand({
@@ -414,8 +431,11 @@ export async function listMemberAccounts() {
   // 部署账号仍然**不进 items**（它不是"成员接入"，没有 StackSet 可下线），
   // 但它的巡检 region 范围从这版起可配 —— 单独回传，UI 在列表顶部钉一行。
   // regions 为空数组 = 没配过 = 读侧(scan_region_scope)默认扫全部。
-  // ⚠️ 不复用 GSI 查询结果：部署账号的 account# 行由 CDK Custom Resource 写，
-  //    不保证带 GSI1PK —— 直接按主键读。
+  // ⚠️ 部署账号的 account# 行不是部署时写的：CDK 的 AutoOnboardResource（一键部署是 stager）
+  //    只写它的 da# 行（GSI1PK=da#accounts）；account# 行通常只在管理员第一次给部署账号配巡检 region
+  //    时由下面的 setAccountRegions 建出；有人对部署账号走过「手动接入账号」时 manualPayloadSave
+  //    也会写这一行（存量部署里也可能是 2026-09-04 退役的老 Dashboard「目标账户管理」手工登记
+  //    留下的），多数部署里压根没有 —— 这里直接按主键读，读不到 = 没配过。
   let deployAccount = null;
   if (selfId) {
     let regions = [];
@@ -487,14 +507,25 @@ export async function onboardAccount(accountId, regions) {
       const e = new Error("operation_in_progress"); e.code = "bad_request"; throw e;
     }
     // 🔴 StackSetNotFound 必须翻译成「怎么办」（2026-09-06 客户实测踩中）：
-    //    部署时没带 --multi-account 时 StackSet 压根不存在，而按钮照常显示 ——
     //    裸抛的结果是客户看到 `StackSet notiops-member-onboarding not found`
-    //    的原始报错，完全不知道下一步。原因和出路都是确定的，就该写出来。
+    //    的原始报错，完全不知道下一步。
+    // ⚠️ 2026-10-11 更正：这里原来断言原因是「部署时没带 --multi-account」，出路只有「重跑
+    //    ./setup.sh --multi-account（同时把后端切成多账号模式）」。那个原因在这里**不可能成立**：
+    //    非多账号部署的 MEMBER_ONBOARDING_STACKSET_NAME 是空串（web-chat-core.ts 的 orgSwitch），
+    //    上面的 stackSetName() 先抛 org_mode_disabled，前端也不渲染一键接入按钮。能走到这里的
+    //    只有多账号部署：StackSet 被删了、setup.sh 在建 StackSet 那一步之前就停了，或者 CallAs
+    //    与 StackSet 所在的命名空间对不上（见 STACKSET_CALL_AS —— 这个错「长得像没带
+    //    --multi-account，会把人引去重装」）。补建的办法也按部署路径分：方式 B 重跑 setup.sh；
+    //    方式 A（一键部署）的 StackSet 由 stager 的 OrgSetup 阶段建，它带 ReleaseTag、每个版本的
+    //    升级都重跑一次（_stackset_upsert 找不到就新建）—— 叫一键部署的客户去跑 setup.sh，
+    //    等于叫他换一条安装路径。所以文案只说确定的事：是多账号部署、用哪个 CallAs 找不到哪个
+    //    StackSet，再给两条路径各自的补建办法和不依赖 StackSet 的「手动接入账号」。
     if (err.name === "StackSetNotFoundException") {
       const e = new Error(
-        "一键接入不可用：member-onboarding StackSet 不存在（部署时没带 --multi-account）。"
-        + "两条路：重跑 ./setup.sh --multi-account 补建（推荐，同时把后端切成多账号模式）；"
-        + "或用下方「手动接入账号」（不需要 StackSet）。");
+        `一键接入不可用：这个部署是多账号模式，但以 CallAs=${STACKSET_CALL_AS} 找不到 StackSet ${ss}。`
+        + "补建：setup.sh 部署的，重跑 ./setup.sh --multi-account；一键部署（CloudFormation 模板）的，"
+        + "把栈升级到新版本 —— 每次升级都会重跑建 StackSet 那一步，缺的会补建。"
+        + "等不及的话，先用下方「手动接入账号」（不需要 StackSet）。");
       e.code = "config_error"; throw e;
     }
     throw err;
@@ -609,8 +640,9 @@ export async function setAccountRegions(accountId, regions) {
   }
   const cfg = await getConfigAccount(id);
   if (!cfg) {
-    // 部署账号例外（2026-09-07 起它的巡检范围可配）：它的 account# 行由
-    // CDK Custom Resource 写，老部署里可能压根没有 —— 允许由这次写入建行。
+    // 部署账号例外（2026-09-07 起它的巡检范围可配）：部署时（CDK 的 AutoOnboardResource /
+    // 一键部署的 stager）只写它的 da# 行、从不写 account# 行，所以第一次配范围时这行多半还不存在
+    // —— 允许由这次写入建行（putConfigAccount 会带上 GSI1PK="accounts"）。
     // 成员账号维持原判：没登记就没有"改范围"这回事。
     const { selfAccountId } = await import("./xacct.mjs");
     const self = await selfAccountId().catch(() => "");
@@ -684,10 +716,11 @@ const ALIAS_MAX = 64;
  *    所以不能像 regions 那样「空就拒」。这里两个字段都写空串而不是
  *    `REMOVE`，让读侧的 `||` 兜底链正常工作。
  *
- * ⚠️ **不会重命名已经建好的 agent space。** space 名字在创建时由
- *    `api/routes/devops_agent.py::_sanitize_agent_space_name(account_alias, id)`
- *    定死，之后没有 rename API。UI 的提示里写了这件事 —— 不写的话客户改完
- *    alias 会去 DevOps Agent 控制台找那个新名字，找不到。
+ * ⚠️ **不会重命名已经建好的 agent space。** space 名字在创建时由成员栈模板定死
+ *    （`infra/member-devops-agent.yaml`：`notiops-devops-<账号>-m<系统账号>`，与 alias
+ *    无关；一键关联的 StackSet 与手动接入用的是同一份模板），之后没有 rename API。
+ *    UI 的提示里写了这件事 —— 不写的话客户改完 alias 会去 DevOps Agent 控制台找那个
+ *    新名字，找不到。
  */
 export async function setAccountAlias(accountId, alias) {
   const id = String(accountId || "").trim();
@@ -959,19 +992,31 @@ export async function associateDevopsAgent(accountId) {
     if (err.name === "OperationInProgressException") {
       const e = new Error("operation_in_progress"); e.code = "bad_request"; throw e;
     }
-    // 同 onboardAccount：StackSet 不存在的原因与出路都是确定的，写给用户。
+    // 同 onboardAccount（那里有 2026-10-11 的更正）：上面 stackSetName() 已经确认是多账号部署，
+    // 所以原因不是「部署时没带 --multi-account」；只说确定的事 + 两条部署路径各自的补建办法。
+    // 🔴「手动接入账号」这条退路**必须带上 CreateCollectionRole=no**：能走到这里的账号第一步都已
+    //    ACTIVE（上面 complete_step1_first 拦过），采集角色 `notiops-idle-detection-role-<系统账号>`
+    //    已经在它里面了（一键接入的是 onboarding StackSet 建的）；而手动接入的链接预填
+    //    CreateCollectionRole=yes（generateLaunchStackUrl），member-devops-agent.yaml 会再建一个
+    //    同名角色 ⇒ EntityAlreadyExists、整栈回滚。原来那句只说「或用「手动接入账号」流程」，
+    //    照做必回滚。（事件转发不用管：走过一键接入的账号，链接里 DevOpsEventBusArn 本来就留空。）
     if (err.name === "StackSetNotFoundException") {
       const e = new Error(
-        "一键关联不可用：member-devops-agent StackSet 不存在（部署时没带 --multi-account）。"
-        + "重跑 ./setup.sh --multi-account 补建；或用「手动接入账号」流程（不需要 StackSet）。");
+        `一键关联不可用：这个部署是多账号模式，但以 CallAs=${STACKSET_CALL_AS} 找不到 StackSet ${DA_STACKSET}。`
+        + "补建：setup.sh 部署的，重跑 ./setup.sh --multi-account；一键部署（CloudFormation 模板）的，"
+        + "把栈升级到新版本 —— 每次升级都会重跑建 StackSet 那一步，缺的会补建。"
+        + "等不及的话，可以先用下方「手动接入账号」（不需要 StackSet），但这个账号第一步已经建好了"
+        + "同名的采集角色：在 quick-create 页把 CreateCollectionRole 改成 no，否则 EntityAlreadyExists、"
+        + "整栈回滚。");
       e.code = "config_error"; throw e;
     }
     throw err;
   }
-  // da# 记录：provisioning（与 idle 控制台向导同一张表同一状态机）。
-  // schema 与老向导(api/routes/devops_agent.py _create_account)对齐：补 GSI1PK/GSI1SK
-  // (老列表页靠 GSI1 查询,缺了会在老页面隐形)、account_alias(推送展示用)、region
-  // (shared/devops_agent.py:229 硬下标 mapping["region"],缺了 KeyError)。
+  // da# 记录：provisioning（与老 idle 控制台向导同一张表、终态字面量与老向导对齐）。
+  // schema 沿用老向导(api/routes/devops_agent.py _create_account,2026-09-04 随老控制台删除)：
+  // 补 GSI1PK/GSI1SK(巡检的 enabled_accounts 与 devops_agent_skills.mjs 的 Agent Space 下拉都靠
+  // GSI1 列 da# 行,缺了这个账号就列不出来)、account_alias(推送展示用)、region
+  // (shared/devops_agent.py 按它选 devops-agent 客户端的区,缺了回落到 AWS_REGION)。
   const now = new Date().toISOString();
   await ddb.send(new UpdateCommand({
     TableName: CONFIG_TABLE, Key: { PK: `da#${id}`, SK: "meta" },
@@ -1230,7 +1275,8 @@ export async function generateLaunchStackUrl(accountId) {
     + `&param_SystemAccountId=${sysAcct}`
     + `&param_OrganizationId=`  // 留空 → TriggerRole 不带 org 条件,允许跨 payer
     // 巡检①采集角色：手动接入的账号一定要建（StackSets 没覆盖到它）。
-    // 同 Org 已被一键接入下发过同名角色的账号要在控制台上改成 no，否则撞名。
+    // 同 Org 已被一键接入下发过同名角色的账号要在控制台上改成 no，否则撞名；手工部过
+    // member-account-onboarding.yaml 的账号同理（见 assertStackSetTargetable 上面那段）。
     + `&param_CreateCollectionRole=yes`
     // 巡检②：控制台「添加辅助云来源」向导第 1~6 步（手建角色 + 抄信任策略）
     // 由模板代劳，客户只剩最后一步「连接到代理」。

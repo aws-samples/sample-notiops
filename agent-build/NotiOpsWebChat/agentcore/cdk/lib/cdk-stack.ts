@@ -405,22 +405,39 @@ export class AgentCoreStack extends Stack {
       }));
 
       // 客户自建 cost-agent MCP（CUR 行级明细，见 docs/DEPLOYMENT.md §14）。
-      // Function URL 的 AuthType=AWS_IAM，调用方必须有 `lambda:InvokeFunctionUrl`，
       // 而 **Function URL 里不含函数 ARN** —— 所以 ARN 只能单独给（COST_AGENT_FN_ARN）。
-      // ⚠️ 这条语句**不能**带 `lambda:FunctionUrlAuthType` Condition：实测那样会一直 403
-      //   （identity policy 上那个条件键匹配不上，见 §14.5）。
+      //
+      // 🔴 **两个动作都要给**：`lambda:InvokeFunctionUrl` **和** `lambda:InvokeFunction`。
+      // AWS 在 **2025 年 10 月**改了 Function URL 鉴权，新建的 URL 要求两者齐备
+      // （https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html 开头那条 Note）。
+      // 只给前一个的表现极具误导性:签名有效、身份正确识别、IAM 策略模拟器说 `allowed`，
+      // 但请求在**授权阶段**被拒 → 403，且**根本不到达函数**（函数日志空白，
+      // 只有 `Url4xxCount` 在涨）。2026-09-20 在验证账号实测确认：补上第二个动作后
+      // 立刻返回 45 个工具。
+      //
+      // ⚠️ 上面那条"**不能**带 `lambda:FunctionUrlAuthType` Condition，实测一直 403"的
+      // 旧结论是**对同一个 403 的误判** —— 真正缺的是 `lambda:InvokeFunction`。
+      // 两条语句的 Condition 必须不同（`InvokeFunction` 的授权上下文里没有
+      // `FunctionUrlAuthType` 键，只有 `InvokedViaFunctionUrl`），不能复制粘贴。
+      //
       // 没配时资源写成一个本账号不存在的函数名：语句照在（授不到任何东西），这样
       //   ① 客户日后只补一个环境变量重跑就通，不必改 IAM；
       //   ② scripts/test_oneclick_parity.py 能按 Sid 比对两条路径的动作集合。
       // 别改成 `resources: ['*']` —— 那是"可调用本账号任意 Function URL"的通行证。
       const costAgentFnArn = (process.env.COST_AGENT_FN_ARN || '').trim();
+      const costAgentArn = costAgentFnArn
+        || `arn:aws:lambda:${this.region}:${this.account}:function:notiops-cost-agent-not-configured`;
       env.runtime.role.addToPrincipalPolicy(new iam.PolicyStatement({
         sid: 'InvokeCostAgentMcp',
         actions: ['lambda:InvokeFunctionUrl'],
-        resources: [
-          costAgentFnArn
-          || `arn:aws:lambda:${this.region}:${this.account}:function:notiops-cost-agent-not-configured`,
-        ],
+        resources: [costAgentArn],
+        conditions: { StringEquals: { 'lambda:FunctionUrlAuthType': 'AWS_IAM' } },
+      }));
+      env.runtime.role.addToPrincipalPolicy(new iam.PolicyStatement({
+        sid: 'InvokeCostAgentMcpFn',
+        actions: ['lambda:InvokeFunction'],
+        resources: [costAgentArn],
+        conditions: { Bool: { 'lambda:InvokedViaFunctionUrl': 'true' } },
       }));
 
       const useReadOnly = this.node.tryGetContext('notiopsReadOnlyAccess');

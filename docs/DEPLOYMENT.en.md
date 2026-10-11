@@ -31,10 +31,10 @@
 - §8 [Day-2 Operations](#8-day-2-operations)
 - §9 [Rollback Strategy](#9-rollback-strategy)
 - §10 [Top 5 Deployment Errors](#10-top-5-deployment-errors)
-- §11 [Full Parameter Reference](#11-full-parameter-reference)
+- §11 [Full CDK Context Reference](#11-full-cdk-context-reference)
 - **§12 [Web Chat Deployment](#12-web-chat-deployment)** — the browser-based agentic AI assistant, independent of the IM bot
 - **§13 [CUR + Athena FinOps Data Source](#13-cur--athena-finops-data-source)** — cost-detail data source for the FinOps dashboard (optional; two paths: reuse an existing CUR = ready in minutes / new CUR = ~24h first delivery)
-- §14 [Customer CUR Dashboard + cost-agent MCP](#14-customer-cur-dashboard--cost-agent-mcp-optional) (optional) — line-item CUR for **someone else's** accounts, via your own MCP Lambda
+- §14 [Customer CUR Dashboard + cost-agent MCP](#14-customer-cur-dashboard--cost-agent-mcp-optional) (optional) — line-item detail from one CUR table for chat and 4 dashboard sheets; NotiOps deploys the cost MCP server for you, or points at one you already run
 
 ---
 
@@ -45,11 +45,14 @@
 > 💡 **Just want to try Web Chat?** Then you can skip this whole document.
 > [DEPLOYMENT_ONECLICK.en.md](DEPLOYMENT_ONECLICK.en.md) is a path that needs **nothing installed
 > locally and no access keys**: download one CloudFormation template from the Release, upload it in
-> the console, stack done in ~4.5 minutes. The trade-off is that it deploys **Web Chat only** — no IM
-> bots, no daily inspection, and no inspection backend (the inspection dashboard entry is still
-> there in Web Chat, but nothing writes to it on that path, so opening it fails to load).
-> Want those, come back here and run `setup.sh`
-> (both paths create the same admin username, `admin`, so doing one then the other is fine).
+> the console, stack done in ~4.5 minutes. The trade-off is that it deploys **Web Chat only** (plus at
+> most one optional IM bot, request/response only) — no daily inspection, no inspection backend, and no
+> proactive pushes into IM; on that path "Inspection" **does not appear at all** under Web Chat's
+> "More" (rather than failing to load once you open it). The full list is in §0.1 of that document.
+> Want those, come back here and run `setup.sh`. ⚠️ In the same account and Region the two paths
+> use the same table and bucket names and cannot exist side by side: first delete the one-click
+> stack with `DeleteEverything` (its data does not carry over; see
+> [§6 of that document](DEPLOYMENT_ONECLICK.en.md#6-deleting-the-stack)), or install `setup.sh` in another Region.
 
 ### 0.1 One-command deploy
 
@@ -76,15 +79,15 @@ Re-running `./setup.sh` only patches deltas (existing stacks go through `cdk dif
 
 ### 0.1.1 After deploy: what works out of the box vs what needs one more step
 
-Once `setup.sh` finishes, split features into two buckets — **don't mistake "only inspection needs it" config for "the whole product needs it":**
+Once `setup.sh` finishes, split features into two buckets — **don't mistake the "onboard member accounts" step for something the whole product needs:**
 
 | | Whole product **works out of the box** (no extra config) | **Only** these features need one more step |
 |---|---|---|
-| **Feature** | Web Chat: AWS Q&A · investigation · cost analysis · Support cases · Skills · notifications (Health / alert push) | Idle-resource detection + **automatic cost inspection** (notiops daily scan) |
-| **Default target** | **The deploy account itself**, usable right after login | Must add `Account ID + Role ARN + Region` under the Dashboard "Target Accounts" page |
-| **If not configured** | — | Inspection **idles** (no accounts to scan), but **Web Chat is completely unaffected** |
+| **Feature** | Web Chat: AWS Q&A · investigation · cost analysis · Support cases · Skills · notifications (Health / alert push) · resource inspection (High Load / Idle & Cost) | Bringing **member accounts** (any account other than the deploy account) into inspection |
+| **Default target** | **The deploy account itself**, usable right after login; inspection covers it automatically too (all regions by default, daily at 02:00 UTC) | Onboard each account under Web Chat's left nav "More → Admin" → "Accounts" → "Member account onboarding" |
+| **If not configured** | — | Inspection covers the deploy account only; **Web Chat is completely unaffected** |
 
-> In one line: **just chatting in Web Chat → log in and go, nothing to configure**; to use **idle / automatic cost inspection** (or the future proactive-sentinel cross-account scheduled scans) → you then add accounts under "Target Accounts". Cross-account inspection also needs a read-only `notiops-idle-detection-role` pre-created in the target account — for Organizations, use `./setup.sh --multi-account` to roll it out via StackSets (including DevOps/PHD event forwarding), or onboard in one click from the console "Account Onboarding (Organizations)" page; for non-org setups, manually deploy [`infra/member-account-onboarding.yaml`](../infra/member-account-onboarding.yaml) in the target account.
+> In one line: **just chatting in Web Chat → log in and go, nothing to configure**; resource inspection of the deploy account also runs on schedule as soon as it is installed — see the results under "More → Inspection" (change the run time in the same place, under "Settings → Thresholds & Schedule"). Only to bring **other accounts** into inspection do you onboard them under "More → Admin" → "Accounts", and that works in either deploy mode (an account added there can also be investigated on the web with "Deep Dive" / "DevOps Chat"); what depends on the deploy mode is taking IM, NotiOps-model conversations in Web Chat, Support cases and the daily cost-anomaly scan across to other accounts, or receiving PHD events from member accounts — see §0.1.2. The collection role in a member account (`notiops-idle-detection-role-<deploy account>`; read-only, plus Support-case open / reply / resolve by default — set the template parameter `EnableSupportCaseWrite=false` to keep it strictly read-only) is **not** created by hand — the onboarding template creates it: in a multi-account deployment (`./setup.sh --multi-account`), organization accounts get **one-click onboarding** in "Member account onboarding" (rolled out via StackSets, including DevOps/PHD event forwarding); in every other case (the account is outside this organization, you lack management-account access, or the deployment is not multi-account) use "Manual onboarding" on the same page — enter the account ID → "Generate link" → send the Launch Stack link to that account's admin, who deploys it while signed in to **that account** → paste `AgentSpaceId` / `TriggerRoleArn` / `InspectionAgentSpaceId` from the Stack Outputs back → "Test connection" → "Save & activate"; no Organizations permissions needed at any step. Which regions each account is scanned in is set on that account's row of the "Accounts" page ("Inspection scope"; `*` = all regions); exclude resources you don't want scanned under "More → Inspection" → "Settings → Scope".
 
 ### 0.1.2 Deploy mode: single-account (default) vs multi-account `--multi-account`
 
@@ -94,9 +97,9 @@ Once `setup.sh` finishes, split features into two buckets — **don't mistake "o
 |---|---|---|
 | **How to trigger** | Just `./setup.sh` | `./setup.sh --multi-account`, run either in the **organization management account (payer)** or in a member account registered as a **StackSets delegated administrator** — see the note below |
 | **Who it's for** | Using NotiOps in **this account only** (most trials / single-account customers) | Managing many accounts under Organizations and wanting **cross-member-account** inspection / investigation / event forwarding |
-| **Cross-account gate** | Locked to the deploy account (`LOCKED_ACCOUNT_ID` = this account); the Web console's multi-account selector lists only this account | Gate unlocked (`LOCKED_ACCOUNT_ID` empty, using `aws:PrincipalOrgID` to allow the whole org); console can onboard / switch member accounts |
-| **Member-account resources** | Not rolled out | Rolled out automatically to member accounts via **StackSets** (read-only role + DevOps/PHD event forwarding) |
-| **Features affected** | All Web Chat features work out of the box for **this account** | Additionally unlocks: cross-account **idle/cost inspection**, cross-account **incident investigation**, cross-account **PHD/DevOps event forwarding**, and the console "Account Onboarding (Organizations)" page |
+| **Cross-account gate** | Locked to the deploy account (`LOCKED_ACCOUNT_ID` = this account). The gate covers IM, NotiOps-model conversations in Web Chat, Support cases under "Cases" and the daily cost-anomaly scan — those only touch the deploy account. **Resource inspection** and the web's "Deep Dive" / "DevOps Chat", which call **DevOps Agent directly**, do not go through it, so accounts added with "Manual onboarding" are still inspected in this mode and can still be investigated with those two | Gate unlocked (`LOCKED_ACCOUNT_ID` empty, using `aws:PrincipalOrgID` to allow the whole org): the paths on the left can reach onboarded member accounts too |
+| **Member-account resources** | Not rolled out (to add another account, use "Manual onboarding" and have that account deploy one stack itself — see §0.1.1) | Rolled out automatically to member accounts via **StackSets** (the collection role — read-only, plus Support-case write by default, see §0.1.1 — and DevOps/PHD event forwarding) |
+| **Features affected** | All Web Chat features work out of the box for **this account**; manually onboarded accounts are inspected and can be deep-investigated on the web | Additionally unlocks: **one-click onboarding** of organization accounts under Web Chat "More → Admin" → "Accounts" → "Member account onboarding" (StackSets roll out the collection role + DevOps/PHD event forwarding, and the step-2 DevOps Agent association follows by itself), cross-account **PHD event forwarding**, **cross-account troubleshooting** in IM and NotiOps-model conversations, cross-account **Support cases**, and the daily cost-anomaly scan covering member accounts |
 
 #### Hard prerequisite: management account, or a StackSets delegated administrator
 
@@ -129,8 +132,8 @@ aws organizations list-delegated-administrators \
 
 This account's id **is** in the output ⇒ go ahead. It is not ⇒ three ways forward: have the management
 account register it (below), run it in the management account instead, or stay on default single-account
-mode (web / IM / deep investigation / case creation all work exactly the same, it just only sees this one
-account).
+mode (web / IM / deep investigation / case creation all work exactly the same; you just get no one-click
+onboarding and fewer cross-account features — see the table above).
 ⚠️ That command **must** pass `--service-principal`. Without it you get the delegated administrators of
 **every** service (GuardDuty / Config / Security Hub …); those accounts also hold Organizations read-only
 permissions but **cannot** operate StackSets, so judging from that list gives you a "should work" that
@@ -169,9 +172,18 @@ re-run `./setup.sh --multi-account` in that member account — **no extra flags*
 > 🔴 **One hard limit that has nothing to do with which identity you use**: CloudFormation **never**
 > deploys a service-managed StackSet into the **organization management account itself** — even if you
 > target the OU it sits in, `CreateStackInstances` returns SUCCEEDED and creates nothing (a silent fake
-> success). So "let NotiOps inspect the management account itself" cannot go through a StackSet: deploy
-> `infra/member-account-onboarding.yaml` there by hand, then register it via "Manual onboarding" in the
-> Admin page. This is the same under both deploying identities.
+> success). In practice only a **delegated-administrator deployment** runs into it: there the management
+> account is an ordinary row in the member list, but one-click onboarding is unavailable for it. To let
+> NotiOps query it, use **"Manual onboarding" alone**: "Generate link" → deploy that stack while signed in
+> to the management account → paste the Stack Outputs back → "Test connection" → "Save & activate"; that
+> stack creates the collection role as well. **Do not** also deploy `infra/member-account-onboarding.yaml`
+> by hand: it creates a collection role with the same name, so deploying both ends in `EntityAlreadyExists`
+> and a stack rollback; if it is already deployed in that account, set `CreateCollectionRole` to `no` on
+> the quick-create page, and if that stack forwards events (its `DevOpsEventBusArn` parameter is set), also
+> clear `DevOpsEventBusArn` on the same page — the two stacks name their forwarding rules differently, so
+> nothing fails, but both would forward and every investigation event would be delivered twice. When you
+> deploy from the management account itself there is nothing to do — it is then the deploy account,
+> registered and inspected automatically.
 
 When the prerequisite isn't met, `setup.sh` **stops and exits 1 before `cdk deploy`** (it does not
 silently fall back to single-account), printing those three ways forward and the register command
@@ -180,7 +192,7 @@ verbatim. The one-click equivalent is
 
 **Why isn't multi-account the default?** Multi-account mode requires the current identity to be the **Organizations management account or a StackSets delegated administrator**, touches StackSets, and rolls out resources to member accounts — unnecessary and higher-privilege for the vast majority who just want to try it in a single account. Single-account is the least-privilege, fastest path to a working deployment, so it is **off by default**; add `--multi-account` explicitly when you need it.
 
-**Already deployed single-account and now want multi-account?** Re-run `./setup.sh --multi-account` from the management account (or a registered delegated administrator account) — the incremental CDK update rewrites the gate and rolls out member-account resources. If the Web console shows "This deployment does not have Organizations multi-account mode enabled. Redeploy with `./setup.sh --multi-account` from the organization management account", that is exactly this signal — you are on a single-account deployment and need to re-run with `--multi-account`. **This cannot be toggled from the console.**
+**Already deployed single-account and now want multi-account?** Re-run `./setup.sh --multi-account` from the management account (or a registered delegated administrator account) — the incremental CDK update rewrites the gate and rolls out member-account resources. On a single-account deployment the top of the "More → Admin" → "Accounts" page carries a note that starts "One-click onboarding is unavailable - it needs CloudFormation StackSets…" — that is exactly this signal: one-click onboarding needs a re-run with `--multi-account`, and **this cannot be toggled from the console**. If you would rather not redeploy, "Manual onboarding" on the same page works right away (the accounts it adds are inspected and can be deep-investigated on the web; cross-account troubleshooting in IM and NotiOps-model conversations still needs multi-account mode).
 
 > Not sure which to pick? **Get single-account working first**, confirm Web Chat is usable, then re-run `--multi-account` once you actually have a cross-account need. The two don't conflict — multi-account is a superset.
 
@@ -223,7 +235,7 @@ CDK deploys three stacks in one shot via `cdk deploy --all` (four when you pick 
 (optional) to enable IM: §3 Register an IM app first, then re-run setup.sh and pick the platform
 ```
 
-Credential flow: `setup.sh` **does not collect IM credentials** — it only sets the `enabledPlatforms` flag based on your selection. CDK creates **placeholder** secrets (`notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` / `notiops/slack-bot-token` / `notiops/slack-signing-secret`); after deploy you fill in **all three platforms from the Web Chat admin console → "IM Integration"**, one tab each: four Feishu credentials on one form, one form for DingTalk, and the Slack tab takes two fields — **Bot User OAuth Token** (`xoxb-`) and **Signing Secret**. You can also edit Secrets Manager directly (see §4.2 — webhook mode needs **no** service restart). CDK stacks always reference the secrets by ARN. **Nothing is persisted to disk locally.**
+Credential flow: `setup.sh` **does not collect IM credentials** — it only sets the `enabledPlatforms` flag based on your selection. CDK creates **placeholder** secrets (`notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` / `notiops/slack-bot-token` / `notiops/slack-signing-secret`); after deploy you fill in **all three platforms from Web Chat's left nav "More → Admin → IM Integration"**, one tab each: four Feishu credentials on one form, one form for DingTalk, and the Slack tab takes two fields — **Bot User OAuth Token** (`xoxb-`) and **Signing Secret**. You can also edit Secrets Manager directly (see §4.2 — webhook mode needs **no** service restart). CDK stacks always reference the secrets by ARN. **Nothing is persisted to disk locally.**
 
 > ⚠️ The two Slack secrets hold a **plain string**, not JSON, and the placeholder CDK creates is a **random value**, not an empty one — so "forgot to fill it in" looks exactly like "filled in wrong" (`invalid_auth` / a 401 on URL verification). The "configured" badge on the IM Integration page is derived from the **shape of the value**, so a placeholder always reads as *not configured*; after saving, hit "Test credentials" to see the workspace / bot name and **each missing scope by name**.
 
@@ -285,23 +297,20 @@ Credential flow: `setup.sh` **does not collect IM credentials** — it only sets
 - **AWS account**: admin or equivalent permissions
 - ~~**VPC**~~: **no longer needed** — IM runs on Webhook + Lambda (`ImStack`), so there is no ECS Fargate task and therefore no VPC / public subnet requirement (2026-09-03, IM refactor M2). Only the `infra/lib/bot-stack.ts` long-connection rollback path needs one
 - **AWS DevOps Agent**: enabled (required for deep investigation). **No need to bring your own Agent Space** — CDK auto-creates one named `notiops-devops-<account>` in your account (see §5.3.5); you don't pre-create one or supply a space id
-- **Bedrock**: the model behind the catalogue's **default_model** is enabled in your region (Bedrock console → Model access). Today that is **xAI Grok 4.6** (`global.xai.grok-4.6`); enable the others too (Claude Sonnet 5 / Opus 5 / Haiku 4.5, Nova Pro, DeepSeek, GLM 5, the GPT-5.6 family) if you want users to be able to switch
+- **Bedrock**: the model behind the catalogue's **default_model** is enabled in your region (Bedrock console → Model access). Today that is **Moonshot Kimi K3** (`global.moonshotai.kimi-k3`); enable the others too (Grok 4.7, GLM 5.3, Claude Sonnet 5.5 / Opus 5.5, DeepSeek, GPT-5.6 / GPT-6 Sol) if you want users to be able to switch. Note: Claude Sonnet 5.5 / Opus 5.5 and GPT-6 Sol need an AWS Marketplace agreement accepted **once per account** -- in some accounts Sonnet 5 works while 5.5 is not enabled yet. The simplest fix is to accept the agreement in that account. Otherwise: re-enabling `claude-sonnet-5` / `claude-opus-5` on the Admin "Models" page **fixes Web only** -- the IM aliases `claude` / `opus` belong to the 5.5 entries, so also **disable** `claude-sonnet-5-5` / `claude-opus-5-5` and have IM users switch with `@bot model claude-sonnet-5` / `@bot model claude-opus-5` (once those are disabled, IM preferences already set to `claude` / `opus` fall back to the default model). `gpt_sol` works the same way and belongs to GPT-6 Sol (`gpt-6-sol`): if you do not accept its agreement, disable that entry (preferences already set to `gpt_sol` fall back to the default model)
 
 ### 2.3 Region selection
 
-Different components have different region constraints — plan ahead:
+`setup.sh` deploys **every stack into one region** (the one you pick in the region menu, i.e. `DEPLOY_REGION`); there is no parameter that puts one stack into a different region. So that one region has to satisfy all of these:
 
-| Component | Allowed regions | Notes |
+| Component | Requirement on the deploy region | Notes |
 |---|---|---|
-| **AWS DevOps Agent service** | **`us-east-1` only** | AWS service constraint (single-region preview) |
-| **Shared backend Lambda stack** | **strongly recommended `us-east-1`** | Polls DevOps Agent journal API; cross-region adds latency and IAM complexity |
-| **IM stack (`ImStack`; Feishu / Slack / DingTalk)** | any AWS region | No hard constraint; pick what's nearest your users. The webhook HTTP API lives in this region |
-| **Bedrock** | any region with `claude-sonnet-4-6` enabled | Override via `BedrockRegion` parameter; can differ from the runtime region |
-| **DDB / S3** | follows the Lambda region | Created in the same region as the stack |
+| **AWS DevOps Agent service** | **Must be a region where DevOps Agent is available** | The main stack creates two Agent Spaces (troubleshooting + inspection) right in the deploy region; in a region without DevOps Agent they cannot be created and the deploy fails. The list built into the one-click template is `us-east-1` / `us-west-2` / `ca-central-1` / `sa-east-1` / `ap-south-1` / `ap-southeast-1` / `ap-southeast-2` / `ap-northeast-1` / `eu-central-1` / `eu-west-1` / `eu-west-2`; the Supported Regions page of the AWS DevOps Agent docs is authoritative |
+| **IM stack (`ImStack`; Feishu / Slack / DingTalk)** | Same as the deploy region | The API Gateway HTTP API behind the webhook lives here |
+| **Bedrock** | Same as the deploy region | There is no separate Bedrock region parameter: model calls are made from the deploy region (except GPT-5.6 Terra / Luna, which always go to `us-east-2`). The default model, Kimi K3, is a `global.` cross-Region inference profile; for model access see §2.2 |
+| **DDB / S3** | Same as the deploy region | Created in the same region as the stack |
 
-**Simplest deploy**: the `setup.sh` region menu defaults to `1) ap-northeast-1` (Tokyo); just press Enter to use it. DevOps Agent service capabilities still assume `us-east-1` (see the table above).
-
-**Multi-region**: the IM stack in (say) `ap-southeast-1` for proximity, Lambda + DevOps Agent stay in `us-east-1`. The `DevOpsAgentRegion` CFN parameter (default `us-east-1`) controls which region appears in the IAM Resource ARN for journal-read permissions.
+**Simplest deploy**: the `setup.sh` region menu defaults to `1) ap-northeast-1` (Tokyo); just press Enter to use it — it is on the DevOps Agent list above. Check that list before choosing "Custom input".
 
 ### 2.4 IAM deployment permissions
 
@@ -434,12 +443,12 @@ Only called when the corresponding feature is on — **these are exactly the gro
    filled in after deploy, and it is **the same URL as in step 6**
 8. **Versioning & Release → Create new version** → submit for release (self-built app admin can self-approve)
 9. **Save** the App ID + App Secret + the two keys from step 5 — `setup.sh` does **not**
-   ask for credentials; after deploy, fill them in under **Web Chat admin console →
-   "IM Integration"** — all four credentials (App ID / App Secret / Encrypt Key /
+   ask for credentials; after deploy, fill them in under **Web Chat's left nav "More →
+   Admin → IM Integration"** — all four credentials (App ID / App Secret / Encrypt Key /
    Verification Token) sit on one form and Save writes them into the
    `notiops/im-bot-feishu` secret (you can also edit that secret directly, see §5). See
    §4 / §5 and [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md)
-10. **Add the bot to your channel.** If you want proactive push (Health / alerts, etc.) delivered to a group, grab that group's `chat_id` first:
+10. **Add the bot to your channel.** If you want the daily ops notification and AWS Health events (`setup.sh` deployments only, Feishu only, see §7.1) delivered to a group, grab that group's `chat_id` first:
 
 ```bash
 # First fetch a tenant_access_token
@@ -451,7 +460,7 @@ curl -X POST 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/inter
 curl 'https://open.feishu.cn/open-apis/im/v1/chats' \
   -H 'Authorization: Bearer <tenant_access_token>' | jq '.data.items[]'
 ```
-Later put this `chat_id` into the Feishu secret's `notify_chat_ids` (or configure it under Web Chat admin → "IM Integration") — it is **not** a `setup.sh` prompt (optional; leave empty to disable push delivery).
+Later put this `chat_id` into the Feishu secret's `notify_chat_ids` (or enter it as "Target group chat IDs" on the Feishu tab of Web Chat "More → Admin → IM Integration") — it is **not** a `setup.sh` prompt (optional; leave it empty and neither of those two is sent). Investigation results go back to the conversation that started them and need no entry here; real-time alert pushes do not reach IM in this release (see §7).
 
 ### 3.2 Slack App
 
@@ -477,12 +486,12 @@ Later put this `chat_id` into the Feishu secret's `notify_chat_ids` (or configur
    - Request URL is filled in after deploy
 6. **Install App → Install to Workspace**, grab the Bot Token (`xoxb-...`)
 7. **Save** the Bot Token + Signing Secret — `setup.sh` does **not** ask for credentials;
-   after deploy, enter them under **admin console → "IM Integration" → Slack tab** (the
+   after deploy, enter them under **Web Chat's left nav "More → Admin → IM Integration" → Slack tab** (the
    "View detailed setup steps" drawer on that page walks all 8 steps, each doable entirely
    in a browser); the backend writes them into the `notiops/slack-bot-token` /
    `notiops/slack-signing-secret` secrets. You can also edit Secrets Manager yourself —
    see §4 / §5 and [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §2
-8. In the target channel run `/invite @YourBot`, then open the channel settings panel to copy the **Channel ID** (`C...`). To enable proactive push, put this Channel ID in the notification settings (it is **not** a `setup.sh` prompt)
+8. In the target channel run `/invite @YourBot`. Of the proactive pushes, only **inspection pushes** support Slack today (the daily notification, Health / alarm pushes and the rest do not), but this release has **no way yet** to register a Slack channel as an inspection push target: there is no web setting (the Slack tab of "IM Integration" only takes the Bot Token and Signing Secret), `setup.sh` does not ask, and the release ships no tool for it. So in this release Slack is only for talking to the bot; see inspection results under Web Chat "More → Inspection". The **Channel ID** (`C...`, in the channel settings panel) only matters if you want to restrict the bot to certain channels (the chat allowlist — see [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §4)
 
 ### 3.3 DingTalk Internal App
 
@@ -493,8 +502,8 @@ Later put this `chat_id` into the Feishu secret's `notify_chat_ids` (or configur
 >
 > The full walkthrough (where the URL comes from, how to debug it) is
 > [IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §3 — and **every step there can be
-> done in the browser alone**: admin console → "IM Integration" → DingTalk tab → "View
-> detailed setup steps" in the top right.
+> done in the browser alone**: Web Chat's left nav "More → Admin → IM Integration" → DingTalk
+> tab → "View detailed setup steps" in the top right.
 
 1. Visit [open-dev.dingtalk.com](https://open-dev.dingtalk.com/) → **应用开发 → 企业内部应用 → 创建应用** (App Development → Internal App → Create). Name and description are enough — you do **not** need to declare server egress IPs.
 2. Left nav **机器人 (Robot)** → enable the robot capability, give it a name and icon → save. Unlike Feishu, DingTalk needs **no** per-scope permission ticking — send/receive rides the robot capability's own channel, which is not the same thing as Feishu's `im:` / `cardkit:` scopes.
@@ -504,8 +513,8 @@ Later put this `chat_id` into the Feishu secret's `notify_chat_ids` (or configur
    ⚠️ Left on Stream mode, DingTalk never sends a request to your URL at all and the bot simply never answers — the single most expensive step on this path. For **消息接收地址 (message-receive URL)**, use the `DingtalkWebhookUrl` deploy output (**keep the trailing `/`**), filled in after the deploy completes.
 5. **版本管理与发布 (Version & Release) → publish a version** — without a published version the robot cannot be added to a group.
 6. Group settings → **智能群助手 → 添加机器人** (group assistant → add robot) → pick the app robot you just published.
-7. **Save** AppKey + AppSecret — `setup.sh` does **not** ask for credentials; after deploy, enter them in the **Web Chat admin console → "IM Integration" → DingTalk tab**, which writes them to the `notiops/im-bot-dingtalk` secret (the secret name is identical on both deployment paths; you can also edit that secret directly, see §5). ⚠️ **Order matters: store the credentials first, then fill in the message-receive URL** — the ingress function hard-validates both on cold start and refuses to start if either is missing (better a dead ingress than a public URL anyone can forge requests to).
-8. **(Optional) server-initiated push**: to have investigation reports / proactive observations pushed back into the DingTalk group from Lambda, add a second robot to the group — a **custom robot** (群设置 → 群机器人 → 添加机器人 → 自定义, security setting **加签 / HMAC sign**) — and put its webhook URL in the same secret's `webhook_url` key. ⚠️ It points the **opposite direction** from step 4's message-receive URL and the two are easy to confuse: this one is us **sending to** DingTalk (it is a credential), that one is DingTalk **sending to** us (it is a public ingress address). Skipping this affects only proactive push; chat and investigation dispatch are unaffected.
+7. **Save** AppKey + AppSecret — `setup.sh` does **not** ask for credentials; after deploy, enter them on **Web Chat's left nav "More → Admin → IM Integration" → DingTalk tab**, which writes them to the `notiops/im-bot-dingtalk` secret (the secret name is identical on both deployment paths; you can also edit that secret directly, see §5). ⚠️ **Order matters: store the credentials first, then fill in the message-receive URL** — the ingress function hard-validates both on cold start and refuses to start if either is missing (better a dead ingress than a public URL anyone can forge requests to).
+8. **(Optional) custom-robot push URL**: add a second robot to the group — a **custom robot** (群设置 → 群机器人 → 添加机器人 → 自定义) — and put its webhook URL in the same secret's `webhook_url` key (in the web UI this is "Custom-robot push URL" on the DingTalk tab of "IM Integration"). In this release only two things use it: the fallback when an investigation report cannot be posted back to its conversation, and inspection push (`setup.sh` deployments only, and the group must first be registered as an inspection push target — this release has no way to do that yet); the daily notification, Health and real-time event pushes are not sent to DingTalk (see §7). ⚠️ **In this release none of the custom robot's three security settings (DingTalk requires at least one) can guarantee delivery**: 加签 (HMAC sign) needs a signing secret that neither deployment path has anywhere to store, so the messages we send carry no signature and DingTalk rejects them (Test credentials then reports that the push webhook rejected the message); a custom keyword must appear in every message, and the reports we send are not guaranteed to contain it — the Test credentials message contains `NotiOps`, so a passing test does **not** prove that real reports get through; an IP address (range) needs a fixed egress IP, which these Lambdas do not have. The URL only serves the two uses above (and the second one cannot be set up in this release yet), so **this step can be skipped**. ⚠️ It points the **opposite direction** from step 4's message-receive URL and the two are easy to confuse: this one is us **sending to** DingTalk (it is a credential), that one is DingTalk **sending to** us (it is a public ingress address). Skipping this step leaves chat and investigation dispatch unaffected.
 
 > ⚠️ **DingTalk validates nothing when you save the message-receive URL** — there is no
 > Feishu-style URL challenge, so nothing turns green and nothing errors. That means **one
@@ -531,7 +540,7 @@ CDK deployment doesn't need `bootstrap.env` — `./setup.sh` walks you through t
 |---|---|---|
 | **AWS Profile** | Deploy profile | Pick from your local `~/.aws` profile list, or keep the current one |
 | **AWS** | Account ID | Auto-detected from `aws sts get-caller-identity`; just confirm |
-| | Region | 6 options (`ap-northeast-1` [default] / `us-east-1` / `us-west-2` / `eu-west-1` / `ap-southeast-1` / custom input); DevOps Agent service capabilities assume `us-east-1`, other stacks can be anywhere |
+| | Region | 6 options (`ap-northeast-1` [default] / `us-east-1` / `us-west-2` / `eu-west-1` / `ap-southeast-1` / custom input). Every stack goes into this one region, and it must support AWS DevOps Agent (see §2.3) |
 | **Push (PHD)** | Deploy PHD event forwarding | Defaults to `Y`; the `--phd` flag handles linked-account-side forwarding |
 | **Multi-account** | Business account allowlist | Triggered separately via `--multi-account`; single-account by default |
 | **IM platforms** (optional) | Choice | `1` Feishu / `2` Slack / `3` DingTalk (multi-select, e.g. `1,3`) / `0` skip (default on a **first install only**, web UI only). On a **re-run** the default is to keep the live platforms as-is (`keep`); if the live state cannot be read and there is no TTY, it **exits with an error** rather than continuing on a default. **Only sets the `enabledPlatforms` flag — no credential prompt** |
@@ -541,7 +550,7 @@ CDK deployment doesn't need `bootstrap.env` — `./setup.sh` walks you through t
 ### 4.2 Where IM credentials live / when you fill them
 
 At deploy time CDK creates **empty** IM secrets; you fill the credentials in **after deploy**, two ways (the script's completion banner also points here):
-- **Option A (recommended)**: log in to Web Chat (admin) → left nav "Inspection" opens the Inspections & Reports console → "Settings → Notifications" → fill them in
+- **Option A (recommended)**: log in to Web Chat (admin) → left nav "More → Admin" → "IM Integration" → fill them in
 - **Option B**: update the secret below directly. **Nothing needs restarting** — IM runs on
   Lambda and reads credentials at cold start, so a secret change takes effect on the next
   cold start (to force it now, wait a few minutes or touch a Lambda environment variable to
@@ -557,7 +566,7 @@ CDK stacks always reference the secrets by ARN. **No credential files on the loc
 | `notiops/slack-bot-token` | Slack bot token (`xoxb-`) |
 | `notiops/slack-signing-secret` | Slack signing secret — **the only request-authentication mechanism in webhook mode**; required |
 | `notiops/slack-app-token` | Slack app-level token (`xapp-`, Socket Mode). **Unused** in webhook mode; only needed if you roll back to the `BotStack` long connection |
-| `notiops/im-bot-dingtalk` | DingTalk bot credentials (single secret, JSON: `app_key` / `app_secret` / `webhook_url`). `app_key` / `app_secret` are **required** — miss either and the ingress function crashes on cold start; `webhook_url` (the group's custom-robot URL) is **optional**, needed only for server-initiated pushes (scheduled digests / inspections / Push) |
+| `notiops/im-bot-dingtalk` | DingTalk bot credentials (single secret, JSON: `app_key` / `app_secret` / `webhook_url`). `app_key` / `app_secret` are **required** — miss either and the ingress function crashes on cold start; `webhook_url` (the group's custom-robot URL) is **optional** and used only as the fallback when an investigation report cannot be posted back to its conversation, and for inspection push (which cannot be set up in this release, see §3.3 step 8); the daily digest, Health and real-time event pushes are not sent to DingTalk |
 | `notiops/bedrock-api-key` | Bedrock API Key (cross-account model-invocation auth; populated manually post-deploy, leave empty to use IAM) |
 | `notiops/litellm-config` | LiteLLM credentials (JSON: `base_url` / `api_key` / `default_model`; only if you use LiteLLM) |
 
@@ -565,12 +574,17 @@ CDK stacks always reference the secrets by ARN. **No credential files on the loc
 
 ### 4.3 Optional overrides (change defaults)
 
-Edit `infra/cdk.json` directly, or pass `-c key=value` to `cdk deploy`:
+These are CDK context keys, read at synth time. `setup.sh` passes the ones it manages as `-c` flags on
+every run (`organizationId` / `agentRuntimeArn` / `costAgentMcpUrl` and so on, driven by its own flags and
+environment variables); the ones it does **not** pass (such as `allowedOrigins`) go into the `context` block of
+`infra/cdk.json`, followed by a re-run of `./setup.sh`. Don't pass them with `-c` to a hand-run `cdk deploy`:
+the next `./setup.sh` run will not carry them, and deploying a single stack also drops everything `setup.sh`
+normally passes (see §8.1).
 
 | Context | Default | Notes |
 |---|---|---|
 | `allowedOrigins` | (empty = all origins) | Comma-separated CORS allow-list, e.g. `https://d123.cloudfront.net` |
-| `organizationId` | (empty) | Non-empty = multi-account (Organizations) mode |
+| `organizationId` | (empty) | Non-empty = multi-account (Organizations) mode. Passed by `./setup.sh --multi-account`; don't set it by hand |
 | `inspectionReportLocale` | (empty = follow `DEFAULT_LOCALE`) | Language of the inspection **findings text**; one global value (`setup.sh` derives it from `$INSPECTION_REPORT_LOCALE`) |
 | `monthlyLimitSeconds` | `-1` (= unlimited) | Monthly seconds budget guard for the inspection executor |
 | `opsAlertEmail` | (empty) | Ops alert email (SNS subscription) |
@@ -579,14 +593,14 @@ Edit `infra/cdk.json` directly, or pass `-c key=value` to `cdk deploy`:
 | `skipPhd` | `false` | `true` = do not create the PHD forwarder. Created by default — `setup.sh` no longer asks; opt out with `ENABLE_PHD=false ./setup.sh` (see below) |
 | `phdLinkedAccounts` | (empty) | Member accounts PHD should watch (comma-separated) |
 | `oamSinkArn` | (empty) | Reuse an existing OAM sink instead of creating one |
-| `costAgentMcpUrl` / `costAgentFunctionArn` | (empty) | Your self-hosted cost-agent MCP — the data source behind the four CUR sheets under FinOps; leave it unset and those four entries do not appear at all (see `requiresEnv`) |
-| `agentRuntimeArn` | (empty) | ARN of an already-deployed Web Chat AgentCore Runtime |
+| `costAgentMcpUrl` / `costAgentFunctionArn` | (empty) | "External" mode: a cost-agent MCP **you already run** (the two must come as a pair), used as the data source behind the four CUR sheets under FinOps. To have NotiOps deploy that server for you (recommended), use `COST_MCP_SELF_HOST=true ./setup.sh` instead of these two — see §14.2. With neither, those four entries do not appear at all (see `requiresEnv`) |
+| `agentRuntimeArn` | (empty) | ARN of an already-deployed Web Chat AgentCore Runtime. `setup.sh` passes it once the agent is deployed |
 | `operatorAppAlreadyEnabled` | `false` | ⚠️ **Never pass this by hand** — passing `true` makes the stack assume the Operator App is already enabled and skip enabling it |
 
 For the IM side (`enabledPlatforms` / `imAllowedChatIds`) see the `ImStack` context
-table in §14. `infra/cdk.json`'s `context` block contains **no** entries for any of
-these keys — pass them with `-c` on the command line, or add them to `cdk.json`
-yourself.
+table in §11.1. `infra/cdk.json`'s `context` block contains **no** entries for any of
+these keys by default — to use one, add it there yourself and re-run `./setup.sh`
+(except `enabledPlatforms`, which comes from `setup.sh`'s IM-platform prompt; see §8.1).
 
 **AWS Health event forwarding (PHD) is on by default; `setup.sh` does not ask.**
 
@@ -595,7 +609,7 @@ yourself.
 | What it does | Pushes an **extra** message to your Feishu group for each AWS Health event, summarized by Bedrock |
 | With no Feishu configured | Pushes nothing, and **never calls Bedrock** (the forwarder checks `notify_chat_ids` before summarizing), so the cost is one Lambda invocation |
 | Relation to the Web notification inbox | **None.** Health events land in the Web Chat notification inbox regardless; that path is unaffected by this switch |
-| How to turn it off | `ENABLE_PHD=false ./setup.sh`, or pass `-c skipPhd=true` to a manual `cdk deploy` |
+| How to turn it off | `ENABLE_PHD=false ./setup.sh`, and pass it on every later run too (`setup.sh` creates the forwarder by default, so a run without it puts it back) |
 | IM platforms supported | Feishu only (`phd_event_forwarder/notifier.py` uses `shared.feishu_sender`); DingTalk / Slack are not wired up |
 | Deployment paths | Only **Path B** (`setup.sh` / CDK) has this forwarder; Path A (one-click CloudFormation) does not include PHD |
 
@@ -607,18 +621,21 @@ be answered at that point. It has been removed.
 > (`bedrockModelId` / `agenticChatMode` / `awsMcpMode` / `enableMcpPricing` /
 > `defaultLocale` / `defaultLlmProvider`), and the default `bedrockModelId` value it
 > printed (`us.anthropic.claude-sonnet-4-6`) has not been the default model for a
-> while either (it is `global.xai.grok-4.6` now, and the effective value comes from
+> while either (it is `global.moonshotai.kimi-k3` now, and the effective value comes from
 > the DDB model catalogue rather than a deploy-time parameter). They were pre-M2 keys
 > feeding the `BotStack` Fargate container, and that stack is retired — criterion:
 > `git grep -n <key> -- infra/` returns zero hits for every one of them. See the
-> matching warning in §14.
+> matching warning in §11.1.
 
-> **⚠️ Tighten CORS (recommended for production)**: every endpoint on both the REST API
-> and the Web Chat Function URL is already authenticated (Cognito / AWS_IAM SigV4), so the
+> **⚠️ Tighten CORS (recommended for production)**: every endpoint on the Web Chat Function
+> URL is already authenticated (Cognito / AWS_IAM SigV4), so the
 > browser CORS policy is not the primary trust boundary. The default therefore **falls back
 > to all origins** (`*`) so the sample repo works out of the box without pre-knowing the
 > CloudFront domain that is only generated at deploy time. Production deployments should
-> narrow it explicitly: `cdk deploy ... -c allowedOrigins=https://<your-frontend-domain>`.
+> narrow it explicitly: add `"allowedOrigins": "https://<your-frontend-domain>"` (the
+> `WebChatStack` `ChatUrl` output) to the `context` block of `infra/cdk.json`, then re-run
+> `./setup.sh`. `setup.sh` does not pass this key, so if you only pass it with `-c` to one
+> hand-run `cdk deploy`, the next `./setup.sh` run puts it back to `*` (see §8.1).
 > When it is not set, `cdk synth`/`deploy` prints a warning nudging you to tighten it — this
 > is a defense-in-depth best practice and does not affect functionality.
 
@@ -664,7 +681,8 @@ Common direct-CDK invocations:
 ```bash
 cd infra
 
-# Re-deploy after editing cdk.json context (no image rebuild)
+# After editing the cdk.json context, the right move is to re-run ./setup.sh from the repo root (see §8.1);
+# the lines below are raw CDK commands that bypass setup.sh -- read the warning underneath first
 npx cdk deploy --all
 
 # Deploy a single stack
@@ -674,6 +692,8 @@ npx cdk deploy ImStack       # IM side (Feishu / Slack / DingTalk webhook + Lamb
 # Diff to see what would change
 npx cdk diff --all
 ```
+
+> ⚠️ These commands carry only the `-c` flags you add yourself, none of the ones `setup.sh` normally passes — read the warning at the end of §8.1 before copying them.
 
 ### 5.3 ⚠️ Post-deploy must-read — Agent Space reconfiguration
 
@@ -693,7 +713,7 @@ Walk through the list based on what your existing space has:
 | **Custom Skills / Playbooks** (your scripted diagnostic steps) | ✅ Yes | Same path → Skills → Import / re-create |
 | **Extended IAM data sources** (DB ReadOnly / S3 ReadOnly / private service ReadOnly) | ✅ Yes | Find IAM Role `notiops-agent-primary-<account_id>` → add inline policy granting the required ReadOnly |
 | **Cross-region resource access** | ✅ Yes | Primary role's default policy covers the deploy region only; verify other regions yourself |
-| **Cross-account onboarding** (investigate resources in other business accounts) | ✅ Yes | Business accounts need a `notiops-agent-trigger-<account_id>` role deployed + a row registered in NotiOps's config DDB (use `./setup.sh --multi-account`, or the console "Account Onboarding" page) |
+| **Cross-account onboarding** (investigate resources in other business accounts) | ✅ Yes | The business account needs NotiOps's trigger role (`notiops-agent-trigger-<business account>-m<deploy account>`) + a row registered in NotiOps's config DDB — both are done in Web Chat "More → Admin" → "Accounts": in a multi-account deployment (`./setup.sh --multi-account`), click "Onboard" on an organization account (the step-2 DevOps Agent association then runs by itself; only if the "Step 2: DevOps Agent" badge does not reach "Investigations enabled" and an "Associate" button shows up next to it, click that to retry); in every other case (outside this organization, no management-account access, or not a multi-account deployment) use "Manual onboarding" on the same page (see §0.1.1). ⚠️ In a deployment that is not multi-account, an account added this way can only be investigated through the web's "Deep Dive" / "DevOps Chat", which call DevOps Agent directly; IM and NotiOps-model conversations stay on the deploy account until you redeploy with `--multi-account` (see §0.1.2) |
 | **AWS-native ReadOnly** (EC2 / RDS / Lambda / CloudWatch ...) | ❌ Not affected | `AIDevOpsAgentAccessPolicy` is auto-attached, ready out of the box |
 
 #### 5.3.3 The web app (operator app) is enabled automatically — nothing to click
@@ -761,9 +781,9 @@ cd infra
 #       i.e. exactly the order that fails.
 #    ⚠️ Pass the full set of -c flags (copy them from the setup.sh line) — one missing
 #       flag synthesizes a different template.
-npx cdk deploy WebChatStack --exclusively --require-approval never -c enabledPlatforms=feishu
-# 2. Then the full deploy
-npx cdk deploy --all
+npx cdk deploy WebChatStack --exclusively --require-approval never <every -c from the setup.sh line>
+# 2. Then the full deploy -- again with the full set of -c flags; the simplest way is to re-run ./setup.sh
+npx cdk deploy --all <every -c from the setup.sh line>
 ```
 
 **What about `FALLTHROUGH`?** Reordering cannot save that version (consumer-first fails with `No export named … found`; main-first fails on the export deletion). The correct answer is to **split it into two releases**: ship the retirement first, then the addition. A CI gate in this repo (`cfn-export-gate` plus [infra/exports.golden.json](../infra/exports.golden.json)) blocks such a version before it reaches `main`, so as a deployer you should essentially never see it.
@@ -776,18 +796,18 @@ npx cdk deploy --all
 
 > 💡 **How to find the actual resource names from your deploy**:
 > ```bash
-> # ECS cluster / service
-> aws ecs list-clusters --region $AWS_REGION
-> aws ecs list-services --cluster <cluster-arn> --region $AWS_REGION
+> # Lambda functions (IM is notiops-im-*, the Web Chat BFF is notiops-web-chat-bff; there is no ECS any more, see §6.1)
+> aws lambda list-functions --region $AWS_REGION \
+>   --query 'Functions[?starts_with(FunctionName, `notiops-`)].FunctionName'
 >
-> # CloudWatch log groups (start with /ecs/ or /aws/lambda/)
+> # CloudWatch log groups (these functions log to /aws/lambda/<function name>)
 > aws logs describe-log-groups --region $AWS_REGION \
->   --query 'logGroups[?contains(logGroupName, `bot`) || contains(logGroupName, `notiops`)].logGroupName'
+>   --query 'logGroups[?contains(logGroupName, `notiops`)].logGroupName'
 >
 > # CloudFormation stack outputs (also written to cdk-outputs.json)
 > cat infra/cdk-outputs.json
 > ```
-> Throughout the rest of the document, `<cluster>` / `<service>` / `<log-group>` are placeholders — substitute the actual names you found above.
+> Throughout the rest of the document, `<log-group>` is a placeholder — substitute the actual name you found above.
 
 Run these immediately after deploying:
 
@@ -797,7 +817,7 @@ Run these immediately after deploying:
 
 1. Open the **Web Chat URL** printed in the script's completion banner (or `jq -r '.WebChatStack.ChatUrl' infra/cdk-outputs.json`)
 2. Log in as `admin` / the temp password the script printed (change it on first login)
-3. Confirm the left nav shows: Notifications / Investigate / Cost / Cases / Inspection / Skills / Admin (there is **no** "More" group, and **no** "Security" item — the security dashboards open from the "Security posture" pill above the Investigate composer)
+3. Confirm the left nav shows: Notifications / Investigation / Cost / Cases / **More** (which expands to Inspection / Skills / Admin), and **no** "Security" item — the security dashboards open from the "Security posture" pill above the Investigation composer
 4. Send a question or investigation request (e.g. "investigate EC2 in IAD") — a reply within seconds means success
 
 For the fuller Web Chat smoke test, see §12.6.
@@ -898,25 +918,45 @@ language zh     # switch back to Chinese
 
 ## 7. Enable / Tune Push Mode
 
-> **Push mode** = AWS service events automatically trigger investigations and the bot pushes results to the channel. **By default the push-mode lambda does not send cards after deploy** (`PushTargetChatId` left empty); it must be turned on explicitly.
+> ⚠️ **To be clear up front: in this release, real-time pushes of AWS service events (CloudWatch alarms /
+> Backup / GuardDuty / Cost Anomaly / Trusted Advisor) reach neither Feishu, Slack nor DingTalk, and
+> enabling the rules does not produce any cards.** Whether the push Lambda `notiops-push-handler` delivers
+> depends only on its own environment variables (`PUSH_TARGET_PLATFORM` / `PUSH_TARGET_CHAT_ID`, plus
+> `DINGTALK_PUSH_WEBHOOK_URL` for DingTalk); it does **not** read the Feishu secret's `notify_chat_ids` or the
+> DingTalk secret's `webhook_url`, and neither deployment path sets those variables — so even with the
+> `notiops-push-*` rules enabled, it logs one `Push disabled` line per event and returns.
+> Read these events in Web Chat's left-nav "Notifications" instead (both deployment paths have it, see §12.5).
 
-### 7.1 Enable push (fill in the chat ID)
-`setup.sh` **does not ask** for a push target chat id (it only asks whether to deploy PHD event forwarding). To turn push on, put the target group into the `notify_chat_ids` field of the `notiops/im-bot-feishu` secret, or configure it under Web Chat admin → "IM Integration". Empty = the Lambda short-circuits and posts no card.
+### 7.1 What actually reaches an IM group today (`setup.sh` deployments only)
 
-> ℹ️ **DingTalk does not route by chat id**: its push target is the `webhook_url` field of the
-> `notiops/im-bot-dingtalk` secret (the group's custom-robot URL, see §3.3 step 8), and it supports
-> **exactly one** target (`SINGLE_SINK_PLATFORMS` — a platform limit). With `webhook_url` empty, nothing
-> is pushed to DingTalk (chat and investigation dispatch are unaffected).
+| Push | Where it goes | Where the target comes from |
+|---|---|---|
+| **Daily ops notification** (`notiops-notifier`, 02:00 UTC daily: resource inspection + cost anomalies + investigations from the last 24h) | Feishu only | `notify_chat_ids` in the Feishu secret `notiops/im-bot-feishu`, i.e. "Target group chat IDs" on the Feishu tab of Web Chat "More → Admin → IM Integration"; empty = nothing is sent |
+| **AWS Health events** (the PHD forwarder `notiops-phd-forwarder`, deployed by default, see §4.3) | Feishu only | Same; empty = nothing is pushed and Bedrock is not called |
+| **Inspection push** (`notiops-inspection-push`) | Feishu / DingTalk / Slack | The group must first be registered as an inspection push target — this release has **no way yet** to do that (no web setting, `setup.sh` does not ask, and the release ships no tool for it), so it cannot actually be set up in this release; see inspection results under Web Chat "More → Inspection" |
+
+`setup.sh` **does not ask** for a push target (it only asks whether to deploy PHD event forwarding).
+Investigation results go back to the conversation that started them, not to `notify_chat_ids`. The
+DingTalk secret's `webhook_url` (the group's custom-robot URL, see §3.3 step 8) is used in only two places:
+the fallback when an investigation report cannot be posted back to its conversation, and the inspection
+push in the table above; the daily notification and Health events are not sent to DingTalk.
 
 <!-- Corrected 2026-09-06: this section used to point at a set of push toggle keys in
      infra/cdk.json — the code never reads those keys (repo-wide grep hits docs only),
      so following it silently did nothing. The real mechanism is the EventBridge rule
      toggle below. tests/test_docs_no_phantom_config.py pins this. -->
+<!-- Corrected again 2026-10-11: the rule toggle is real, but the notiops-push-handler behind the
+     rules only honours the PUSH_TARGET_CHAT_ID / PUSH_TARGET_PLATFORM environment variables
+     (_push_configured in shared/report_delivery/push_handler.py), and no stack sets them, so an
+     enabled rule still delivers nothing. This section used to name notify_chat_ids as its target
+     group and the DingTalk webhook_url as its push target; both were wrong. -->
 
-### 7.2 Tune push event sources
+### 7.2 The `notiops-push-*` rules (no IM delivery in this release)
 
-IM push consists of 5 EventBridge rules (`notiops-push-<source>`), **all DISABLED by
-default** — the toggle is enabling/disabling the rule itself; no redeploy needed:
+The backend stack has 5 EventBridge rules (`notiops-push-<source>`), **all DISABLED by default**. The
+toggle is enabling / disabling the rule in EventBridge, but an enabled rule only makes
+`notiops-push-handler` get invoked, log `Push disabled` as described above, and return — it does **not**
+post a card into any IM group:
 
 | Rule name | Event source |
 |---|---|
@@ -926,32 +966,33 @@ default** — the toggle is enabling/disabling the rule itself; no redeploy need
 | `notiops-push-costanomaly` | Cost Anomaly Detection (requires a monitor; global service, emits in us-east-1 only) |
 | `notiops-push-trustedadvisor` | Trusted Advisor check item changes (requires Business+ Support; us-east-1 only) |
 
-```bash
-# Example: enable GuardDuty push
-aws events enable-rule  --name notiops-push-guardduty  --region <deploy-region>
-# Example: disable CloudWatch alarm push
-aws events disable-rule --name notiops-push-cloudwatchalarm --region <deploy-region>
-```
+> What does deliver is the **separate** set of rules behind the web "Notifications" inbox
+> (`notiops-web-notif-*`, 10 rules, 5 on by default), independent of the 5 above: Method B tunes those
+> by putting `"webNotif<Id>": "on"` or `"off"` into the `context` block of `infra/cdk.json` and re-running
+> `./setup.sh` (see §8.1); Method A toggles them in the EventBridge console (see §12.5).
 
-> The web "Notifications" inbox uses a **separate** set of rules (`notiops-web-notif-*`,
-> 5 on by default); the two do not affect each other. Method B can tune those at synth
-> time with `-c webNotif<Id>=on|off`; Method A toggles them in the EventBridge console.
+### 7.3 Fully silent
 
-### 7.3 Fully silent (record events but don't post cards)
+To stop the daily ops notification and Health events reaching a Feishu group, clear `notify_chat_ids` in
+the Feishu secret ("Target group chat IDs" on the Feishu tab of "IM Integration") — both Lambdas keep
+running, they just send nothing. To stop only the Health one, run `ENABLE_PHD=false ./setup.sh` (see §4.3).
+The `notiops-push-*` rules post nothing to groups anyway, so there is nothing to do there.
 
-Clear `notify_chat_ids` in the secret (or the target group under admin → "IM Integration"):
-the Lambda short-circuits and posts no card; the EventBridge rules remain, so event volume
-is still observable in the logs.
 ### 7.4 Test push
 
+You don't have to wait for 02:00 UTC to see the daily ops notification — invoke `notiops-notifier` once by
+hand; with no `report_date` in the event it reports on the current day, exactly as the scheduled run does:
+
 ```bash
-aws events put-events --region $AWS_REGION --entries '[{
-  "Source": "aws.cloudwatch",
-  "DetailType": "CloudWatch Alarm State Change",
-  "Detail": "{\"alarmName\":\"deploy-test\",\"state\":{\"value\":\"ALARM\",\"reason\":\"smoke test\"}}"
-}]'
-# Expected: ⚠️ Proactive Observation card lands in the channel within seconds
+aws lambda invoke --function-name notiops-notifier --region $AWS_REGION \
+  --cli-binary-format raw-in-base64-out --payload '{}' /tmp/notiops-notifier-out.json
+cat /tmp/notiops-notifier-out.json
 ```
+
+- `"status": "completed"` with `"notifications_sent"` ≥ 1 → a "daily ops notification" lands in the Feishu group.
+- `"notifications_sent": 0` → `notify_chat_ids` is empty, or sending failed (check the `/aws/lambda/notiops-notifier` log).
+- `"status": "skipped"` (`"reason": "no_data"`) → there is genuinely nothing to report today (inspection did not
+  run, no open findings, no cost anomalies, no investigations in the last 24h); not a failure.
 
 ---
 
@@ -959,13 +1000,22 @@ aws events put-events --region $AWS_REGION --entries '[{
 
 ### 8.1 Configuration changes
 
-Edit the corresponding context in `infra/cdk.json`, then `npx cdk deploy <stack>`. ~2 min:
+`setup.sh` passes the context keys it manages (`enabledPlatforms` / `agentRuntimeArn` / `organizationId`
+and so on) as `-c` flags on every run; keys it does **not** pass (such as the first two rows below) have to go
+into the `context` block of `infra/cdk.json`, so that every later `./setup.sh` run keeps them:
 
-| Change | Edit which context | Deploy which stack |
-|---|---|---|
-| Edit chat_id allowlist | `imAllowedChatIds` (comma-separated) | `ImStack` |
-| Add / remove IM platforms | `enabledPlatforms` (`none` = deploy no IM side at all) | `ImStack` |
-| Toggle a single push event source | `enable*Push` family | `NotiOpsBackendStack` |
+| Change | How |
+|---|---|
+| Edit chat_id allowlist | Add `"imAllowedChatIds": "oc_xxx,C0123ABC"` (comma-separated) to the `context` block of `infra/cdk.json`, then re-run `./setup.sh` |
+| Toggle a single source of the web "Notifications" inbox | Same, with `"webNotif<Id>": "on"` or `"off"` (see §12.5). The IM `notiops-push-*` rules are not context, and they deliver nothing in this release (see §7) |
+| Add / remove IM platforms | Re-run `./setup.sh` and pick again at the IM-platform prompt (the `-c enabledPlatforms=…` it passes overrides the same key in `cdk.json`; `none` = deploy no IM side at all) |
+
+> ⚠️ **Don't deploy just one stack**: `npx cdk deploy ImStack` without `--exclusively` first redeploys the
+> `NotiOpsBackendStack` it depends on, and both stacks get only the `-c` flags you typed this time — none of
+> the ones `setup.sh` normally passes — so they are synthesized with defaults (`enabledPlatforms` back to
+> `feishu`, an empty `agentRuntimeArn`, and the cross-account gate of a multi-account deployment locked again).
+> It is the same trap as in §5.4. If you really must deploy one stack by hand, add `--exclusively` and copy
+> every `-c` from the `setup.sh` line.
 
 > ⚠️ **No longer context-driven** as of M2 (2026-09-03): chitchat mode, MCP mode, default language,
 > default LLM. Those keys (`agenticChatMode` / `awsMcpMode` / `defaultLocale` / `defaultLlmProvider`)
@@ -998,9 +1048,10 @@ aws lambda update-function-configuration --region $AWS_REGION \
 ```
 
 ⚠️ That command **replaces** the whole environment map — read the existing `Variables` with
-`get-function-configuration` first and pass them all back, don't send a single key. The safer move is
-just `cdk deploy ImStack`. (On pre-M2 installs that still have ECS, the equivalent was
-`aws ecs update-service --force-new-deployment`.)
+`get-function-configuration` first and pass them all back, don't send a single key. Don't reach for
+`cdk deploy ImStack` instead: with an unchanged template it deploys nothing and cycles no instances, and it
+carries only the `-c` flags you type (see the warning at the end of §8.1). (On pre-M2 installs that still
+have ECS, the equivalent was `aws ecs update-service --force-new-deployment`.)
 
 ### 8.4 Inspect logs
 
@@ -1035,21 +1086,27 @@ aws dynamodb delete-item --table-name <conv-table> \
 
 | Level | Action | Impact |
 |---|---|---|
-| **L1 disable a single event source** | `aws events disable-rule --name notiops-push-<source>` (IM push) or `notiops-web-notif-<source>` (web inbox), see §7.2 | Single event source, instant, no deploy |
-| **L2 disable a whole conversation tier** | Edit `agenticChatMode: "disabled"` → `cdk deploy ImStack` | chitchat / general_qa paths |
+| **L1 disable a single event source** | `aws events disable-rule --name notiops-web-notif-<source>` (the web "Notifications" inbox, see §12.5); the IM-side `notiops-push-<source>` rules deliver nothing in this release anyway (see §7) | Single event source, instant, no deploy |
+| ~~**L2 disable a whole conversation tier**~~ | **This switch no longer exists**: `agenticChatMode` has not been read since M2 (2026-09-03) (`AGENTIC_CHAT_MODE=enabled` is hard-coded in `infra/lib/constructs/im-core.ts`), so passing it has no effect — see §11.1. To stop IM, use L4 | — |
 | **L3 take IM from webhook back to long connection** | ⚠️ **No longer "minutes" after M2 (2026-09-03)** — `BotStack` is not instantiated by `infra/bin/app.ts` any more, so you first add `new BotStack(...)` back, install finch/docker, and `cdk deploy BotStack` (which creates VPC/ECS/ECR and builds images), then set the Feishu / Slack console delivery mode back to long connection / Socket Mode. Pre-M2 installs (stack still present) stay minutes-level: switch the delivery mode + `aws ecs update-service --desired-count 1 ...` | Single platform; ~20 min on fresh installs, minutes on pre-M2 installs ([IM_WEBHOOK_SETUP.en.md](IM_WEBHOOK_SETUP.en.md) §1.6) |
 | **L4 turn the bot off entirely** | webhook mode: `aws lambda put-function-concurrency --reserved-concurrent-executions 0` (the ingress starts 429-ing everything at once); long-connection mode: `aws ecs update-service --desired-count 0 ...` | Single platform, instant |
 | **L5 delete the stack** | `cd infra && npx cdk destroy <stack-name>` | Entire stack |
 
-> ⚠️ Stack deletion removes ECR / IAM / SG / ECS. **The DDB tables and S3 report bucket are NOT deleted** (`removalPolicy: RETAIN`) — clean them up manually if needed. By design, every AWS resource created by this project carries the `auto-delete=no` tag to protect it from automated cleanup jobs.
+> ⚠️ Stack deletion removes the Lambda / API Gateway / IAM resources (plus ECR / SG / ECS on pre-M2 installs). **The four DDB tables are NOT deleted** (`notiops-config` / `notiops-conversations` / `notiops-web-chat` / `notiops-inspection`, `removalPolicy: RETAIN`) — clean them up manually if needed; **the data bucket `notiops-data-<account>-<region>` is the opposite: deleting the main stack deletes it together with its objects** (your Skills and long reports live there — export them first if you want to keep them). By design, every AWS resource created by this project carries the `auto-delete=no` tag to protect it from automated cleanup jobs.
 >
 > To remove the **whole environment** (as opposed to rolling back one stack), don't run
 > `cdk destroy` stack by stack — use `./teardown.sh` in the repository root. It deletes
-> the stacks in reverse dependency order and cleans up the non-CDK leftovers (CUR report
-> definition, the one-shot EventBridge schedule, the WebSearch gateway, the 30-day
-> recovery window on the secrets, orphaned log groups). Start with
-> `./teardown.sh --dry-run`; the default keeps the four RETAIN'd tables, and
-> `--delete-everything` wipes them too.
+> the stacks in reverse dependency order and cleans up the non-CDK leftovers (the one-shot
+> EventBridge schedule, the WebSearch gateway, the 30-day recovery window on the secrets).
+> Start with `./teardown.sh --dry-run`; the default keeps the four RETAIN'd tables, and
+> `--delete-everything` deletes them together with the leftover log groups; the data bucket goes
+> with the main stack in both modes, so by default it first backs the bucket up locally
+> (`--no-backup` skips that). Everything
+> CUR-related (the `notiops-cur-report` report definition, its delivery bucket, the Athena
+> integration stack, the saved queries) is **kept in both modes** -- that is your billing
+> history, and AWS does not backfill it; on reinstall `setup.sh` recognises the kept
+> `notiops-cur-report`, reuses it without asking or re-creating it, and picks up the existing
+> Athena table within minutes (see §13.2).
 
 ---
 
@@ -1057,27 +1114,28 @@ aws dynamodb delete-item --table-name <conv-table> \
 
 | Symptom | Likely cause | Diagnose / fix |
 |---|---|---|
-| **Access denied on Secrets Manager** — during CDK deploy (creating the empty secrets) or later when you fill in IM credentials | Deploy user lacks Secrets Manager permission | `aws iam attach-user-policy --policy-arn arn:aws:iam::aws:policy/SecretsManagerReadWrite` |
+| **Access denied on Secrets Manager** — during CDK deploy (creating the empty secrets) or later when you fill in IM credentials with the CLI | The two cases are denied for different identities: during CDK deploy the secrets are created by the bootstrap role `cdk-hnb659fds-cfn-exec-role` (see §2.4 (2)), not by you; only when you fill in credentials with the CLI is it your own identity that lacks permission (the web "IM Integration" page writes through the BFF's own role and is not affected by this row) | CDK deploy case: check whether that role's execution policy was replaced by a narrower one (when `setup.sh` bootstraps the account itself it is AdministratorAccess, see §2.4 (1)), and whether an SCP or a permissions boundary blocks Secrets Manager. CLI case: give the IAM user / role / Identity Center permission set you use a statement limited to `arn:aws:secretsmanager:<region>:<account>:secret:notiops/*` with `secretsmanager:DescribeSecret` / `GetSecretValue` / `PutSecretValue` (`setup.sh` itself also calls `DescribeSecret` / `DeleteSecret`, see §2.4 (3)). Don't attach the whole `SecretsManagerReadWrite` policy for this |
 | **`ImStack` fails at synth complaining the Layer is missing packages** | `scripts/build_im_layer.sh` wasn't run, or it failed | Re-run `bash scripts/build_im_layer.sh` (it cross-downloads with `pip --platform manylinux2014_x86_64 --only-binary=:all:` — **no container needed**) |
 | **Bot doesn't respond to @ — worker logs show `auth failed`** | Wrong IM credentials / wrong Secret payload | `aws secretsmanager get-secret-value --secret-id <name>` and compare to the original credential; fix it and wait for the next cold start (no redeploy needed) |
-| **Bot dispatch succeeds but the report doesn't return to the channel** | report-handler Lambda doesn't have IM credentials | Verify the Secret ARNs in the Lambda env match those in `ImStack`; re-run `cdk deploy NotiOpsBackendStack` |
-| **`Bedrock InvokeModel` AccessDeniedException** | Task role lacks permission / model not enabled in region | Add `bedrock-runtime:InvokeModel` to IAM, or Bedrock console → Model access |
+| **Bot dispatch succeeds but the report doesn't return to the channel** | report-handler Lambda doesn't have IM credentials | Verify the Secret ARNs in the Lambda env match those in `ImStack`; re-run `./setup.sh` (not a lone `cdk deploy NotiOpsBackendStack` — see the warning at the end of §8.1) |
+| **`Bedrock InvokeModel` AccessDeniedException** | The model is not enabled in the deploy region / (Claude Sonnet 5.5 / Opus 5.5, GPT-6 Sol) this account has not accepted its AWS Marketplace agreement / the execution role lacks the permission | Bedrock console → Model access; for the Marketplace agreement and what to do if you won't accept it, see §2.2; the IAM action is `bedrock:InvokeModel` (not `bedrock-runtime:`) |
 
 ---
 
 ## 11. Full CDK Context Reference
 
-All tunable parameters live under the `context` block in `infra/cdk.json`. After editing, run `cd infra && npx cdk deploy <stack>`.
+Below are the context keys each stack **actually reads**. `setup.sh` passes some of them on the command line itself; for the ones it doesn't, put them in the `context` block of `infra/cdk.json` and re-run `./setup.sh` (how, and the single-stack-deploy trap, are in §8.1).
 
 ### 11.1 ImStack (IM platform stack)
 
-`ImStack` reads exactly **three** context keys (`infra/lib/im-stack.ts`):
+`ImStack` reads exactly **four** context keys (`infra/lib/im-stack.ts`):
 
 | context key | Default | Description |
 |---|---|---|
 | `enabledPlatforms` | `feishu` | IM platforms to enable (comma-separated, e.g. `feishu,slack`). `none` = the whole `ImStack` is not instantiated (`infra/bin/app.ts`); platforms not listed get no Lambda / webhook at all |
 | `imAllowedChatIds` | (empty) | chat_id allowlist (comma-separated; empty = no restriction). Injected as `ALLOWED_CHAT_IDS` on the worker |
 | `organizationId` | (empty) | Non-empty = multi-account (Organizations) mode, same semantics as `NotiOpsBackendStack` |
+| `agentRuntimeArn` | (empty) | ARN of the Web Chat AgentCore Runtime (the same `-c` that `WebChatStack` reads). IM's `/agent notiops` goes through it; empty = `/agent notiops` is refused outright (`agent.not_configured`) rather than quietly falling back to DevOps direct. `setup.sh` passes it once the agent is deployed |
 
 > ⚠️ **These keys stopped doing anything after M2 (2026-09-03)** — don't copy them from older docs:
 > `bedrockModelId` / `bedrockRegion` / `agenticChatMode` / `defaultLlmProvider` / `gptRegion` /
@@ -1094,17 +1152,20 @@ All tunable parameters live under the `context` block in `infra/cdk.json`. After
 
 ### 11.2 NotiOpsBackendStack (shared backend + push)
 
-| context key | Default | Description |
-|---|---|---|
-| `agentSpaceId` | (auto) | DevOps Agent space id. **No need to supply one** — CDK auto-creates `notiops-devops-<account>` (see §5.3.5); this context is for advanced override only |
-| `devOpsAgentRegion` | `us-east-1` | Region of the DevOps Agent service (used in IAM Resource ARN); today `us-east-1` only |
-| `reportUrlExpirationSeconds` | `604800` | Pre-signed URL TTL (7 days) |
+The context keys `NotiOpsBackendStack` reads are exactly its rows in the §4.3 table — `organizationId` /
+`inspectionReportLocale` / `monthlyLimitSeconds` / `opsAlertEmail` / `webBaseUrl` / `skipPhd` /
+`phdLinkedAccounts` / `oamSinkArn` / `operatorAppAlreadyEnabled` — plus the `webNotif<Id>` keys from §12.5.
 
-> IM push targets and per-source toggles are **not** CDK context: targets live in the
-> Feishu secret's `notify_chat_ids` (or admin → "IM Integration"), and per-source toggles
-> are the EventBridge rules `notiops-push-<source>` (see §7.2).
+> ⚠️ The three keys this table used to list, `agentSpaceId` / `devOpsAgentRegion` /
+> `reportUrlExpirationSeconds`, are **not read anywhere** in the code, so passing them has no effect: the
+> stack creates both Agent Spaces itself (see §5.3.5), and DevOps Agent is used in the deploy region (see §2.3).
 
-> The report bucket is auto-created (named `notiops-report-${AccountId}-${Region}`, private + KMS-encrypted; no parameter required).
+> IM push targets and per-source toggles are **not** CDK context, and the `notiops-push-*` path delivers
+> nothing to IM in this release; what actually reaches IM, and where its targets come from, is in §7.1.
+
+> The data bucket is auto-created: `notiops-data-<account>-<region>` (private, SSE-S3 encrypted, TLS only;
+> no parameter required), with Skills, reports and so on split by prefix. It is **not** RETAIN'd — deleting the
+> main stack deletes it (see §9).
 
 ---
 
@@ -1116,28 +1177,35 @@ All tunable parameters live under the `context` block in `infra/cdk.json`. After
 
 | Component | Description |
 |---|---|
-| **Agent Runtime** | Bedrock AgentCore Runtime hosting the Strands agent (default model **Claude Sonnet 5**, taken from the catalogue's `default_model`). Deployed as a CodeZip by `scripts/deploy_agent.sh`, which emits a **Runtime ARN** |
-| **BFF Lambda** | Node 20 Lambda (`notiops-web-chat-bff`) with a **Function URL** (`AuthType=AWS_IAM`) that responds to the frontend via **SSE streaming**; it calls the Agent Runtime and also handles deterministic operations directly (case creation `/actions/execute`, the `/support/services` catalog, etc.) |
+| **Agent Runtime** | Bedrock AgentCore Runtime hosting the Strands agent (default model **Kimi K3** (`global.moonshotai.kimi-k3`), taken from the catalogue's `default_model`). Deployed as a CodeZip by `scripts/deploy_agent.sh`, which emits a **Runtime ARN** |
+| **BFF Lambda** | Node.js 24 Lambda (`notiops-web-chat-bff`) with a **Function URL** (`AuthType=AWS_IAM`) that responds to the frontend via **SSE streaming**; it calls the Agent Runtime and also handles deterministic operations directly (case creation `/actions/execute`, the `/support/services` catalog, etc.) |
 | **Frontend** | React / Vite single-page app, statically hosted |
 | **Auth** | Cognito (reuses the notiops user pool) + Identity Pool; the frontend gets temporary credentials and **SigV4-signs** requests to the Function URL |
 | **Data** | CDK `WebChatStack` creates the single DDB table `notiops-web-chat` (sessions/messages + the persistent notification inbox in the `notif#` segment, 90-day TTL, account-shared) |
 
-The data plane is **strictly read-only** end to end: the hard boundary is a read-only IAM role, and on top of it sit tool-level read-only enforcement (`READ_OPERATIONS_ONLY` + a curated read-only MCP allow list), a command-level denylist, and a read-only system prompt (see [TECHNICAL_DESIGN.en.md](TECHNICAL_DESIGN.en.md) §5.3 for the full make-up of this defense in depth). Web Chat does not relax any of it.
+The data plane is **strictly read-only on your infrastructure**: the hard boundary is IAM — the roles that reach your account are read-only on your infrastructure, and writes that change resources get no permission. Outside NotiOps' own resources, the only write permission is creating / replying to / resolving AWS Support cases (run only after you confirm a preview; a member account's role can be made strictly read-only with the template parameter `EnableSupportCaseWrite=false`). On top of it sit tool-level read-only enforcement (`READ_OPERATIONS_ONLY` + a curated read-only MCP allow list), a command-level denylist, and a read-only system prompt (see [TECHNICAL_DESIGN.en.md](TECHNICAL_DESIGN.en.md) §5.3 for the full make-up of this defense in depth). Web Chat does not relax any of it.
 
 ### 12.2 Deployment order
 
-Web Chat is two steps, orchestrated by `setup.sh` (or run manually):
+Web Chat is two steps, and every `./setup.sh` run does both, in order:
 
 ```
 scripts/deploy_agent.sh    # 1) agentcore deploy CodeZip → prints the Agent Runtime ARN
         │
-        ▼  (feed the ARN to CDK)
-cd infra && npx cdk deploy WebChatStack -c agentRuntimeArn=<ARN from step 1>
+        ▼  (setup.sh hands the ARN to CDK as -c agentRuntimeArn=<ARN>)
+setup.sh's cdk deploy --all    # 2) one command with the other -c flags it manages; creates / updates WebChatStack
 ```
 
 1. **`scripts/deploy_agent.sh`** — uses `agentcore deploy` to package the agent as a **CodeZip** and create / update the AgentCore Runtime, printing the **Runtime ARN**.
 2. **CDK `WebChatStack`** — inject that ARN via `-c agentRuntimeArn=<ARN>` to create the BFF Lambda + Function URL + DDB table + notification handler.
 3. **Frontend `config.json`** — after deploy, write the BFF Function URL (and more) into the frontend (see §12.4).
+
+> ⚠️ If you do step 2 by hand, don't pass `-c agentRuntimeArn` alone: without `--exclusively` CDK first
+> redeploys the main stack with defaults, and even with it you lose the rest of the context `setup.sh`
+> normally passes (`organizationId` for multi-account, the cost MCP keys and so on — see the warning at the
+> end of §8.1). Either just re-run `./setup.sh`, or add `--exclusively` and copy every `-c` from the
+> `setup.sh` line — when the agent fails to deploy, `setup.sh` prints that full command at the end (see the
+> first row of §12.7).
 
 ### 12.3 Key environment variables (BFF Lambda / handler)
 
@@ -1149,7 +1217,7 @@ cd infra && npx cdk deploy WebChatStack -c agentRuntimeArn=<ARN from step 1>
 | `DEVOPS_AGENT_SPACE_ID` | DevOps Agent Space id (used for deep investigation) |
 | `REPORTS_CDN_DOMAIN` | CloudFront domain for online reports (HTML reports land in S3, CloudFront 7 days; presigned URL 12h fallback) |
 | `CONFIG_TABLE` | The notiops config table (`notiops-config`), reused for configuration / notification-source toggles |
-| `NOTIOPS_CROSS_ACCOUNT_ROLE` | Cross-account read-only role name (v1 defaults to the deploy account) |
+| `NOTIOPS_CROSS_ACCOUNT_ROLE` | Cross-account collection role name (read-only, plus Support-case open / reply / resolve by default — set `EnableSupportCaseWrite=false` to keep it strictly read-only; see §0.1.1) |
 | `LOCKED_ACCOUNT_ID` | The v1 locked deploy-account id (the multi-account selector defaults to this account) |
 
 ### 12.4 Frontend config.json injection
@@ -1167,7 +1235,7 @@ The frontend build artifact needs a `config.json` (injected at deploy time, not 
 The **persistent inbox** of Web Chat's "Notifications" topic is fed by EventBridge → `notiops-web-notif-handler` (reuses the `core/push_event` normalizer, 5-minute dedup) → writes to the `notif#` segment of the `notiops-web-chat` table. Source toggles:
 
 - **On by default** (5 — highest operational value, manageable noise): AWS Health / CloudWatch Alarm / Cost Anomaly / Trusted Advisor / GuardDuty
-- **Off by default** (5 — turn on with `-c webNotif<Id>=on`): Backup / EC2 Spot / Auto Scaling / RDS / Config
+- **Off by default** (5 — turn one on by adding `"webNotif<Id>": "on"` to the `context` block of `infra/cdk.json` and re-running `./setup.sh`, see §8.1): Backup / EC2 Spot / Auto Scaling / RDS / Config (their `<Id>`s are `BackupJob` / `Ec2Spot` / `AutoScalingFail` / `Rds` / `Config`)
   - Why off: either high volume that floods the inbox (Backup fires per job, Spot, RDS), or it needs a paid service enabled first and is noisy compliance chatter (Config)
 
 > ⚠️ **3 of the 5 on-by-default sources also depend on something on the customer's side** — the rule is enabled, but without the prerequisite no events arrive. The frontend empty state names the reason, so it doesn't get mistaken for NotiOps being broken:
@@ -1182,14 +1250,16 @@ The **persistent inbox** of Web Chat's "Notifications" topic is fed by EventBrid
 > (TA: [docs](https://docs.aws.amazon.com/awssupport/latest/user/cloudwatch-events-ta.html); Cost Anomaly emits in its home region, normally `us-east-1`).
 > Deploy NotiOps in another region and those two rules exist but **never fire** — `cdk synth/deploy` prints an explicit warning.
 > To receive them: deploy NotiOps in `us-east-1`, or add a cross-region forwarding rule in `us-east-1` that ships the events to your deployment region.
-> Don't need them? `-c webNotifCostAnomaly=off -c webNotifTrustedAdvisor=off` and the warning goes away.
+> Don't need them? Add `"webNotifCostAnomaly": "off"` and `"webNotifTrustedAdvisor": "off"` to the `context`
+> block of `infra/cdk.json` and re-run `./setup.sh`; the warning goes away.
 
 > 📌 **Both deployment paths ship this whole set, from one shared definition.** The event-source definitions (10 sources, defaults, rule names, rule descriptions, Lambda env) live in
 > [`infra/lib/constructs/web-notif-sources.ts`](../infra/lib/constructs/web-notif-sources.ts), and `setup.sh`'s
 > `notiops-backend-stack.ts` and the one-click `notiops-webchat-standalone-stack.ts` **import the same file**
 > (check ⑤ in `scripts/test_oneclick_parity.py` pins that nobody copies the list back into a stack).
-> **The one intentional difference is how you turn a source off**: the `-c webNotif<Id>=off` above only applies to `setup.sh`.
-> One-click has no `-c`, so you Disable the `notiops-web-notif-*` rule in the **EventBridge console** instead — the template does not
+> **The one intentional difference is how you turn a source off**: the `webNotif<Id>` key above is CDK context (it goes into the
+> `context` block of `infra/cdk.json`, see §8.1) and only applies to `setup.sh`.
+> One-click has no CDK context, so you Disable the `notiops-web-notif-*` rule in the **EventBridge console** instead — the template does not
 > manage a rule's enabled state, so that manual change is not reverted by a version upgrade.
 > The customer-facing write-up for one-click is [DEPLOYMENT_ONECLICK.en.md §2.9](DEPLOYMENT_ONECLICK.en.md#29-notifications-inbox).
 
@@ -1201,32 +1271,33 @@ The **persistent inbox** of Web Chat's "Notifications" topic is fed by EventBrid
 
 ```
 1. Open the Web Chat frontend URL in a browser → sign in via Cognito
-2. Confirm the left nav shows: Notifications / Investigate / Cost /
-   Cases / Inspection / Skills / Admin
-   (there is **no** "More" group — it was retired; "Admin" is top-level)
-   (there is also **no "Security" item** — Security folded into Investigate,
+2. Confirm the left nav shows: Notifications / Investigation / Cost /
+   Cases / **More**
+   ("More" expands to Inspection / Skills / Admin, and opens by itself when the current page is one of them)
+   (there is also **no "Security" item** — Security folded into Investigation,
     and its dashboards open only from a pill)
-   (Investigate / Cost / Cases each carry a pill row **above** the composer,
+   (Investigation / Cost / Cases each carry a pill row **above** the composer,
     **left-aligned with the chat box** and with **no** leading "Dashboards"
-    label: Investigate = ⟨Operations overview⟩ ⟨Security posture⟩,
+    label: Investigation = ⟨Operations overview⟩ ⟨Security posture⟩,
     Cost = ⟨Spend & savings⟩, Cases = ⟨Case progress⟩. Each opens the same
     dashboard tree as before, with a Back button at the top left)
 3. Send an investigation request (e.g. "investigate EC2 in IAD"):
-   → the main chat surfaces a "View investigation steps" entry; the right-side
-     "Investigation Steps" docked panel grows in real time
+   → a "View thinking · N steps" entry appears above the reply body (one per reply); the
+     right-side "Thinking" docked panel opens by itself when the first step arrives and grows
+     in real time (once you have closed the panel by hand it stops auto-opening — use the entry)
    → on completion the main chat shows the root-cause conclusion + an HTML online report link
 4. Create a case: go to the "Cases" topic, use the editable card to pick service /
    category / case type → preview → confirm
    (execution goes through the deterministic /actions/execute, not the LLM)
 ```
 
-> **FinOps Agent deep analysis: coming soon, currently greyed out and disabled.** Both the "Investigate" and "FinOps" topics show the DevOps Agent toggle (off by default in FinOps, on by default in Investigate); the FinOps Agent deep-analysis toggle is **greyed out / unavailable** today with a "coming soon" hint — do not expect it to work during smoke tests.
+> **The DevOps Agent toggles under the composer**: the Investigation topic has two, "DevOps Chat" and "Deep Dive"; the Cost topic has only "Deep Dive" (General / Cases / What's New have none). **All are off by default** and only take effect once you switch them on. There is **no** "FinOps Agent" toggle (the greyed-out "coming soon" placeholder was removed on 2026-09-13), so don't look for it during the smoke test. A toggle greyed out with an "N/A" badge means the deployment account has no Agent Space, or the selected account isn't onboarded to DevOps Agent (the tooltip says which). Details in [USER_GUIDE.en.md §4.3](USER_GUIDE.en.md#43-who-answers-and-how-deep).
 
 ### 12.7 Common pitfalls
 
 | Symptom | Cause / fix |
 |---|---|
-| **Every question comes back as `Got it — you said: … (Echo — AGENT_RUNTIME_ARN not set …)`** | **The agent was never deployed** and the BFF is on its echo fallback. Chain: `deploy_agent.sh` failed → no Runtime ARN → `WebChatStack` got an empty `AGENT_RUNTIME_ARN` → [bff/web-chat/index.mjs](../bff/web-chat/index.mjs) echoes. **One command fixes it: `bash scripts/fix_web_chat_echo.sh --region <region>`** (read-only diagnosis → prints the verdict → after you confirm: installs uv / pins the CLI / restores the CDK harness / redeploys the agent / injects the ARN into the BFF, carrying over the live `organizationId` and CORS allowlist). By hand: **first suspect is a missing `uv`** (see §2.1) → install uv → `DEPLOY_REGION=<region> bash scripts/deploy_agent.sh` → `cd infra && npx cdk deploy WebChatStack --exclusively -c agentRuntimeArn=<ARN>`. Verify: `aws lambda get-function-configuration --function-name <web-chat-bff> --query 'Environment.Variables.AGENT_RUNTIME_ARN'` must be non-empty |
+| **Every question comes back as `Got it — you said: … (Echo — AGENT_RUNTIME_ARN not set …)`** | **The agent was never deployed** and the BFF is on its echo fallback. Chain: `deploy_agent.sh` failed → no Runtime ARN → `WebChatStack` got an empty `AGENT_RUNTIME_ARN` → [bff/web-chat/index.mjs](../bff/web-chat/index.mjs) echoes. **One command fixes it: `bash scripts/fix_web_chat_echo.sh --region <region>`** (read-only diagnosis → prints the verdict → after you confirm: installs uv / pins the CLI / restores the CDK harness / redeploys the agent / injects the ARN into the BFF, carrying over the live `organizationId` and CORS allowlist). ⚠️ On a deployment whose cost MCP server NotiOps hosts (§14.2) it **refuses to run** -- it would redeploy that server as "your own server" and so delete it; it also refuses when it cannot tell whether NotiOps hosts it. On such a deployment use `COST_MCP_SELF_HOST=true ./setup.sh` instead. By hand: **first suspect is a missing `uv`** (see §2.1) → install uv → re-run `./setup.sh` (it redeploys the agent and injects the ARN together with all the other `-c` flags; on a deployment whose cost MCP server NotiOps hosts, use `COST_MCP_SELF_HOST=true ./setup.sh`). If you would rather not re-run the whole thing: `DEPLOY_REGION=<region> bash scripts/deploy_agent.sh`, then paste the ARN it prints into the full `cdk deploy WebChatStack --exclusively …` command printed at the end of your last `setup.sh` run (it carries that deployment's whole `-c` set, including the multi-account and cost MCP ones). Don't build your own command with only `-c agentRuntimeArn`: every context key it leaves out is synthesized with its default — a multi-account deployment turns into `org_mode_disabled`, the 4 CUR sheets disappear from FinOps, and a self-hosted cost MCP server gets deleted. Verify: `aws lambda get-function-configuration --function-name <web-chat-bff> --query 'Environment.Variables.AGENT_RUNTIME_ARN'` must be non-empty |
 | **Same symptom, but `uv` IS installed** | Second suspect: the **agentcore CLI version drifted**. `@aws/agentcore` ships roughly weekly, and `agentcore deploy`'s "Sync CDK dependencies" step **rewrites the in-repo, git-tracked** `agent-build/NotiOpsWebChat/agentcore/cdk/package.json` (bumping `@aws/agentcore-cdk`), which then no longer matches the in-repo `lib/cdk-stack.ts` → `tsc` fails → deploy dies in seconds, and **re-running does not self-heal**. The real error only exists in the CLI's own log: `tail -80 "$(ls -t agent-build/NotiOpsWebChat/agentcore/.cli/logs/deploy/*.log \| head -1)"`. Fix: `npm install -g @aws/agentcore@0.24.2` + `git checkout -- agent-build/NotiOpsWebChat/agentcore/cdk/package.json agent-build/NotiOpsWebChat/agentcore/cdk/package-lock.json` + `rm -rf agent-build/NotiOpsWebChat/agentcore/cdk/node_modules`, then re-run `deploy_agent.sh` — that whole sequence is exactly what `bash scripts/fix_web_chat_echo.sh` does. (Since v1.0.15 `deploy_agent.sh` hard-stops on both states before deploying) |
 | **`deploy_agent.sh` times out uploading the CodeZip** | Do **NOT** bundle `.venv` into the agent CodeZip (installed deps balloon to hundreds of MB and the S3 upload times out). Ship source + dependency manifest only and let the AgentCore side install deps |
 | **The two stacks conflict / produce garbled artifacts when synth'd in parallel** | Do **NOT** synth the IM bot stack and `WebChatStack` **in parallel into the same `cdk.out/` directory**; run them separately or use different `--output` directories |
@@ -1253,6 +1324,7 @@ setup.sh phase 1 (a few seconds)
   ├─ Detect whether the account already has a qualifying CUR
   │     (Hourly + Include Resource IDs + Athena integration)
   │     └─ Yes → ask reuse vs. new; No → go straight to "new"
+  │        (two cases skip the question, see §13.2)
   │
   ├─ New: cur:PutReportDefinition
   │     · TimeUnit=HOURLY (the hourly granularity you asked for)
@@ -1289,10 +1361,13 @@ lambda6_cur_finalizer (new: auto-fires at T+25h; reuse: invoked synchronously by
 After the main deploy (`npx cdk deploy --all`) completes, `setup.sh` will:
 
 1. Check the DDB `notiops-config` table for an existing CUR/Athena status record for this account — skip if found (avoids duplicate creation)
-2. If none: use `cur:describe-report-definitions` to detect whether the account already has a qualifying CUR (Hourly + Resource IDs)
-   - Found → prompt the user: **0) Create a dedicated new one** (default, AWS-recommended) / **1) Reuse the existing one**
-   - Not found → go straight to creating a new one
-3. Reuse path (pick 1): **synchronously invoke `lambda6_cur_finalizer`** (data already available → dynamically discover / build the Athena table → write `READY`, no 24h wait)
+2. If none: two cases are settled **without asking** first; only if neither applies does it detect and ask:
+   - The account still has NotiOps's own `notiops-cur-report` (deleting NotiOps deliberately keeps it -- e.g. a reinstall after `./teardown.sh --delete-everything`) → **reuse it**, via step 3 below; usually `READY` within minutes
+   - This run is `COST_MCP_SELF_HOST=true` without `CUR_TABLE` / `CUR_BUCKET_NAME` (§14.2) → the self-hosted cost MCP is already set up for the CUR NotiOps creates, so **create it**
+   - Neither → use `cur:describe-report-definitions` to detect whether the account already has a qualifying CUR (Hourly + Resource IDs)
+     - Found → prompt the user: **0) Create a dedicated new one** (default, AWS-recommended) / **1) Reuse the existing one**
+     - Not found → go straight to creating a new one
+3. Reuse path (pick 1, or the `notiops-cur-report` case above): **synchronously invoke `lambda6_cur_finalizer`** (data already available → dynamically discover / build the Athena table → write `READY`, no 24h wait)
 4. New path: create the S3 bucket (with the bucket policy CUR's service needs to write) → `cur put-report-definition` → write DDB `PENDING` → `scheduler create-schedule` (one-time, `action-after-completion=DELETE`)
 
 ### 13.3 New AWS resources involved
@@ -1301,7 +1376,7 @@ After the main deploy (`npx cdk deploy --all`) completes, `setup.sh` will:
 |---|---|
 | S3 bucket `notiops-cur-<account_id>-<region>` | Dedicated CUR report delivery bucket (Parquet format) |
 | CUR ReportDefinition `notiops-cur-report` | Hourly + Resource IDs + Athena integration |
-| Lambda `notiops-cur-finalizer` (`lambda6_cur_finalizer`) | One-time: detects template delivery, deploys the Athena-integration CFN stack |
+| Lambda `lambda6_cur_finalizer` (function name generated by CDK; its log group is fixed at `/aws/lambda/notiops-cur-finalizer`) | Detects the first delivery and deploys the Athena-integration CFN stack; triggered by the one-time schedule below, with a standing EventBridge rule `notiops-cur-finalizer-selfheal` as a 4-hourly backstop (it returns at once when there is no record or the record is already `READY`) |
 | IAM Role `notiops-cur-finalizer-role` | Lambda6 execution role: S3 read-only (any CUR bucket) + CFN Create/Delete/DescribeStackResources (scoped to `notiops-cur-athena-*`) + Glue create/delete/discover db & tables · Start/StopCrawler + Lambda create/delete · PutFunctionConcurrency + IAM create/delete Role (needed to deploy AWS's official Athena template) |
 | IAM Role `notiops-cur-finalizer-scheduler-role` | Role EventBridge Scheduler assumes to invoke Lambda6 |
 | EventBridge Scheduler (one-time, created dynamically by setup.sh) | Fires Lambda6 at T+25h, then auto-deletes (`action-after-completion=DELETE`) |
@@ -1328,7 +1403,7 @@ aws s3 ls s3://<CUR_BUCKET>/<report-prefix>/<report-name>/ --recursive | grep cr
 
 ### 13.5 Permission reminder
 
-The IAM identity running `setup.sh` additionally needs: `cur:PutReportDefinition` / `cur:DescribeReportDefinitions`, `s3:CreateBucket`, `scheduler:CreateSchedule`, `iam:PassRole` (to pass `notiops-cur-finalizer-scheduler-role`); plus the permissions to set up the Athena FinOps saved queries: `athena:GetWorkGroup` / `athena:UpdateWorkGroup` (to set the result output location on the primary workgroup) + `athena:ListNamedQueries` / `athena:BatchGetNamedQuery` / `athena:CreateNamedQuery`. The CDK-deployed `notiops-cur-finalizer-role` (see §13.3) and the Web Chat BFF role (which holds the `athena:*Query*` + `athena:ListNamedQueries`/`BatchGetNamedQuery`/`GetNamedQuery` needed to query CUR (Cost Deep Dive fetches saved queries), `glue:Get*`, CUR-bucket read-only, and on the results bucket `s3:GetBucketLocation` + `s3:GetObject`/`s3:PutObject` (`GetObject` for re-signing Deep Dive CSV downloads); Cost Deep Dive's AI insight needs `bedrock:InvokeModel` (Claude Sonnet inference profile), and same-day result caching needs `dynamodb:PutItem` on the `notiops-config` table — without `GetBucketLocation`, Athena errors with "Unable to verify/create the output bucket") need no additional manual grants.
+The IAM identity running `setup.sh` additionally needs: `cur:PutReportDefinition` / `cur:DescribeReportDefinitions`, `s3:CreateBucket`, `scheduler:CreateSchedule`, `iam:PassRole` (to pass `notiops-cur-finalizer-scheduler-role`); plus the permissions to set up the Athena FinOps saved queries: `athena:GetWorkGroup` / `athena:UpdateWorkGroup` (to set the result output location on the primary workgroup) + `athena:ListNamedQueries` / `athena:BatchGetNamedQuery` / `athena:CreateNamedQuery`. The CDK-deployed `notiops-cur-finalizer-role` (see §13.3) and the Web Chat BFF role (which holds the `athena:*Query*` + `athena:ListNamedQueries`/`BatchGetNamedQuery`/`GetNamedQuery` needed to query CUR (Cost Deep Dive fetches saved queries), `glue:Get*`, CUR-bucket read-only, and on the results bucket `s3:GetBucketLocation` + `s3:GetObject`/`s3:PutObject` (`GetObject` for re-signing Deep Dive CSV downloads); Cost Deep Dive's AI insight needs `bedrock:InvokeModel` (DeepSeek V3.2 first, falling back to the default model Kimi K3 when that Region lacks it or it returns nothing), and same-day result caching needs `dynamodb:PutItem` on the `notiops-config` table — without `GetBucketLocation`, Athena errors with "Unable to verify/create the output bucket") need no additional manual grants.
 
 Once the CUR is ready (within minutes when reusing an existing CUR), `setup.sh` automatically: ① sets the result output location on the primary workgroup (`s3://notiops-data-<account>-<region>/athena-results/`, not overwritten if already set) ② idempotently creates **6** Athena saved queries using the [dynamically-discovered db/table names] — `NotiOps - DevOps Agent Usage & Credit` (same measure as the dashboard's credit card), `NotiOps - EDP Commitment Attainment` (edit the annual commitment + contract start/end in `params` and run it directly), plus 4 **Cost Deep Dive** detail queries: `CloudWatch cost by usage type` / `Data Transfer by service` / `EC2 cost by instance type` / `S3 cost by storage class` (run on demand from the dashboard's "Cost Deep Dive" card). The dashboard's Commitments & Programs card "View SQL in Athena" link points here; each Cost Deep Dive scenario's SQL is also read from these saved queries (single source of truth, editable directly in the Athena console) — after the BFF runs it, it hands the real result rows to Bedrock for charts + insights and caches the day's result in the `notiops-config` table (clicking again the same day only re-signs the CSV download, without re-running SQL / re-calling AI).
 
@@ -1336,7 +1411,9 @@ Once the CUR is ready (within minutes when reusing an existing CUR), `setup.sh` 
 
 ## 14. Customer CUR Dashboard + cost-agent MCP (optional)
 
-> How this differs from §13: §13 queries **this deployment account's own** CUR (which NotiOps creates for you). This section connects **someone else's CUR table** — a customer's, or several payers' (the TAM scenario) — at line-item granularity, through a separate cost-agent MCP Lambda. Leave it unconfigured and the FinOps page simply doesn't show the 4 CUR sheets and chat doesn't mount the customer-CUR tools; nothing else changes (fail-closed).
+> How this differs from §13: §13 queries **this deployment account's own** CUR (which NotiOps creates for you). This section connects **one CUR table** at line-item granularity. The server NotiOps deploys for you only queries a table **in the deployment account and Region** (a CUR in another account is not supported in this release); for a CUR in another account (cross-account, or several payers), use "External" and point NotiOps at a server you run yourself (see §14.2). Leave it unconfigured and the FinOps page simply doesn't show the 4 CUR sheets and chat doesn't mount the CUR tools; nothing else changes (fail-closed).
+>
+> **This cost MCP server is NotiOps's own code, and it is in this repo** (`cost_mcp/`: six Python files, 45 read-only tools). You do **not** need to find code elsewhere or write a Lambda yourself -- give it one CUR table and NotiOps deploys the server for you (see §14.2). If you **already** run a cost-agent MCP of your own, NotiOps can point at it instead of creating one (the "External" row in §14.2).
 
 ### 14.1 What it adds
 
@@ -1344,22 +1421,189 @@ Once the CUR is ready (within minutes when reusing an existing CUR), `setup.sh` 
 |---|---|---|
 | 4 CUR dashboard sheets | FinOps page: Cost trend (cross-filtering) / Credit / Extended Support / Savings Plans | BFF caches per day; instant after the daily warmup |
 | Ask about customer spend in chat | Just ask in the conversation ("customer's total spend in July") | The agent reaches the MCP's 45 CUR tools through 2 meta-tools (`list_cost_tools` / `call_cost_tool`) |
-| Inline charts | Any answer with >=3 data points gets a chart | The tool return carries `display_hint`; the frontend renders a ```chart fence |
+| Inline charts | Any answer with >=3 data points gets a chart | The tool return carries `chartable`; the frontend renders a ```chart fence |
 
-### 14.2 Deploy the cost-agent MCP Lambda (customer-specific, prerequisite)
+**The 45 tools, by theme** (ask "list the available cost tools" at runtime for the authoritative catalogue):
 
-This Lambda's code lives in a **separate repository** (Python, streamable-http MCP over a Lambda Function URL, `AuthType=AWS_IAM`) — not in this repo; ask the maintainer for the address. One Lambda per customer; all the per-customer difference lives in environment variables:
+| Group | Typical questions it answers |
+|---|---|
+| Basic spend / trend / attribution (7) | "What did we spend this month", "year to date", "top 10 services", "split by account / region / OS / usage type", "**why did X go up**" (month-over-month, then drill into usage type / instance type / account) |
+| EC2 and compute (8) | "How much is On Demand vs SP vs Spot vs RI vs Capacity Block", "average daily instances / vCPUs", "how much Graviton", "c5 vs c6i vs c7g" |
+| Commitments: SP / RI / ODCR (10) | "SP coverage / utilisation / **how much is wasted**", "which contracts are wasting money", "**which SPs expire in the next 90 days**", "ODCR utilisation with the worst offenders" |
+| Per-service drill-down (9) | "S3 split by API operation", "how many PiB stored and in which storage classes", "how many EBS volumes, how much gp2 is left", "**how many GB transferred**, how much cross-AZ", "Direct Connect port inventory" |
+| Billing / reconciliation (5) | "Credit / Refund / Tax detail", "**how much EDP discount did we get**", "reconciliation table by payer x charge type x currency (sums to roughly the invoice)", "which accounts are new this month" |
+| AI spend (2) | "Spend per model", "**how many million tokens**" |
+| Tag allocation (1) | Split cost / instances / vCPU by your own user tags |
+| Dashboard-only (3) | Feed the four sheets above; **not for chat** |
 
-| Environment variable | Meaning | Example |
+> **Why use this instead of Cost Explorer alone**: these 45 queries encode measures CE cannot
+> give you -- amortisation via a **row-level** `CASE` (`net_unblended` gets cancelled out by
+> SavingsPlanNegation), a `final_service` that **splits EBS / NAT Gateway / VPC Peering out of
+> EC2**, instance counts as `SUM(usage_amount)/24` over three usage types and four charge types
+> (`COUNT DISTINCT` is off by an order of magnitude), and `COALESCE` on every ARN emptiness test
+> (a CTAS table gives NULL, a native one gives an empty string). Every aggregate comes **straight
+> from SQL**, and the return carries a `caliber_note` the model must repeat verbatim rather than
+> re-adding numbers itself.
+
+### 14.2 Let NotiOps deploy one for you (recommended), or point at one you already run
+
+**Three states; pick one or neither:**
+
+| State | How | Result |
 |---|---|---|
-| `CUR_TABLE` | The customer's CUR table (db.table) | `customer_cur_data.customer_all` |
-| `PARTITION_STYLE` | Partition layout: `year-month` / `billing-period` / `flat` | `year-month` |
-| `ATHENA_WORKGROUP` / `ATHENA_OUTPUT` | Query workgroup / result location (empty = follow the workgroup) | `primary` |
-| `CUR_ACCESS_KEY_ID/SECRET/TOKEN` | Temporary credentials for cross-account queries; leave empty to use the execution role in-account | — |
+| **Off** (default) | Fill nothing in | No extra resources. Cost questions go to Cost Explorer -- nothing is broken, you just do not get line-item detail |
+| **Self-hosted** (recommended) | Give it **one CUR table**, or let NotiOps **create the CUR too** | NotiOps creates the Lambda (`cost_mcp/`, code in this repo) plus a dedicated Athena workgroup and its own results bucket, **all inside your account** |
+| **External** (escape hatch) | Give a Function URL + function ARN | Points at a cost-agent MCP you already run; NotiOps creates nothing |
 
-> ⚠️ Measure caveat: the 45 tools' SQL was tuned against a reference customer (multi-payer, EDP, heavy SP/ODCR use). The basic tools (totals / trend / dimension breakdowns / SP / RI / Extended Support) work as-is on a new table; a few derived measures (LOB tag mapping, the historical window in SP `per_vcpu_rate`) are worth reviewing against your customer's CUR structure before you hand them over.
+> The two are **mutually exclusive**. Filling in both is rejected during parameter validation
+> (path A's `CostMcpExclusiveWithExternal`) or by `setup.sh`'s preflight -- because "which one
+> wins when both are set" would become something you have to read code to answer.
 
-### 14.3 Wiring it into NotiOps (both deployment paths are IaC; you supply two values)
+#### What self-hosting needs
+
+| Value | Path A (one-click parameter) | Path B (`setup.sh` env var) | Required? |
+|---|---|---|---|
+| **Let NotiOps create the CUR** | `ProvisionCur=yes` | nothing extra: `COST_MCP_SELF_HOST=true` without a table creates one (see below) | Either/or: pick this if you have no CUR |
+| CUR Glue table `db.table` | `CurTable` | `CUR_TABLE` (**usually filled in for you**, see below) | Either/or: fill this if you already have a CUR |
+| S3 bucket holding the CUR | `CurBucketName` | `CUR_BUCKET_NAME` | Required with a table (on path B it comes along when the table is read from the record) |
+| Cross-account read-only role | `CurRoleArn` | `CUR_ROLE_ARN` | **Not supported yet -- leave empty** (a value is refused, see below) |
+| Partition layout | `CurPartitionStyle` | `CUR_PARTITION_STYLE` | Defaults to `flat` -- **check this against your table** |
+| CUR schema version | `CurVersion` | `CUR_VERSION` | Defaults to `1` (`2` is experimental) |
+| User tags to split by | `CurTagKeys` | `CUR_TAG_KEYS` | Optional, comma separated, no spaces; these are **column-name suffixes**, see below |
+| Scan cap per query | `CostMcpScanCapGiB` | `COST_MCP_BYTES_CUTOFF` | Defaults to 100 GiB (`COST_MCP_BYTES_CUTOFF` is in bytes) |
+
+> ⚠️ **The table, its Glue database and the CUR bucket must be in the account and Region you deploy
+> NotiOps to.** The server runs Athena there, and Athena only sees the Glue Data Catalog of its own
+> Region: a table in another Region deploys fine, then every query fails (the 4 sheets say
+> "temporarily unavailable" and chat falls back to Cost Explorer). If your CUR's Athena integration
+> is in another Region, deploy NotiOps in that Region, or let NotiOps create a new CUR in the
+> deployment Region (the first row above).
+
+> ⚠️ **A CUR in another account (`CurRoleArn` / `CUR_ROLE_ARN`) is not supported in this release**,
+> and three places refuse it: the one-click template's `CostMcpCrossAccountNotSupported` rule,
+> `setup.sh`'s preflight, and CDK synth. The reason: the queries would run in the CUR account
+> against a workgroup that only exists in the NotiOps account, so every one of them would fail. Two
+> ways forward: (1) deploy NotiOps in the account that holds the CUR; (2) use "External" and point
+> at a server of your own (`CostAgentMcpUrl` + `CostAgentFunctionArn` / `COST_AGENT_MCP_URL` +
+> `COST_AGENT_FN_ARN`, see §14.3). The `CurRoleArn` parameter is still in the template; leave it empty.
+
+> **`CurTagKeys` / `CUR_TAG_KEYS` are not the tag keys as you typed them in AWS, but the part after
+> `resource_tags_user_` in your CUR table's column names.** Check the column list in Glue / Athena
+> first: a tag `cost-center`, for example, usually appears as the column
+> `resource_tags_user_cost_center`, so enter `cost_center` (several: `team,cost_center`). Letters,
+> digits and underscores only, and no spaces around the commas. Path A's parameter page rejects
+> anything else. Path B does not check up front: any other character (e.g. `cost-center`) still
+> deploys, but the server fails as soon as it starts and none of the 45 tools work; a space makes
+> `setup.sh` stop at the CDK synth step with an error that does not mention tag keys (CDK reports
+> `No stacks match the name(s) ...`). Leave it empty and no tag dimension is offered.
+
+#### No CUR yet? Both paths can create one for you
+
+**Both deployment paths can create the CUR for you**, including the official Athena integration.
+You do not have to go and configure one in the AWS console first:
+
+- **Path A**: set `ProvisionCur` to `yes` on the parameter page and leave `CurTable` empty.
+- **Path B**: run `COST_MCP_SELF_HOST=true ./setup.sh` -- **one run is enough**, and no `CUR_TABLE` is
+  needed. The self-hosted server is set up for the CUR NotiOps creates (bucket
+  `notiops-cur-<account>-<region>`), and the "CUR + Athena" step later in the same run (section 13)
+  **creates it without asking**. If the account still has the `notiops-cur-report` from an earlier
+  install (deleting NotiOps deliberately keeps it), that report and its bucket are used instead and
+  nothing new is created.
+
+What gets created is an **Hourly + Include Resource IDs + Athena/Parquet** report -- that exact
+combination is what the 45 tools query. The spec, and the reason behind every single field, is in
+`cur_provisioner/spec.py`.
+
+> ⏱ **AWS takes up to 24 hours to deliver the first report. That delay is on the AWS side and we
+> cannot work around it.** Until then cost questions use Cost Explorer. Once it is ready NotiOps
+> **switches over by itself -- you do not need to deploy again** (it checks every 4 hours and picks
+> the table up the moment it becomes queryable).
+
+> 🔒 **Deleting NotiOps does not delete your billing data.** The CUR report and its S3 bucket are
+> **left exactly as they are** when the stack is deleted -- that is your billing history, and AWS
+> **does not backfill** past months. Delete them by hand if you want them gone. The NotiOps role
+> does not even have permission to delete them.
+> A reinstall reuses them: on path B `setup.sh` recognises the kept `notiops-cur-report` and reuses
+> it without asking or re-creating it, picking up the existing Athena table within minutes; on path A
+> the 4-hourly check picks it up (within about 4 hours).
+
+**If you already have a CUR**: on path A leave `ProvisionCur` at `no` and put the table in `CurTable`
+and its bucket in `CurBucketName`. On path B pass `CUR_TABLE=<db>.<table> CUR_BUCKET_NAME=<bucket>`
+together with the `CUR_PARTITION_STYLE` that matches the table, and pass them **on every later
+`setup.sh` run as well**. Without them `setup.sh` uses the `cur-athena-status#<account>` record in
+`notiops-config`, which describes the CUR that section 13 created or connected for you (the
+partition layout is inferred from it too, and is `flat` when it cannot be inferred) -- only when that
+is the CUR you want can you leave all of them out. **Without** them and without such a record, path B
+creates a new CUR for you as described above instead of using the one you have. On both paths the
+table must meet the same-account, same-Region rule above.
+
+> ⚠️ The two are **mutually exclusive**: `ProvisionCur=yes` together with `CurTable` is rejected
+> during parameter validation (`ProvisionCurExcludesCurTable`). Otherwise you would get a second
+> CUR created for nothing (a second CUR charge on your bill) while believing the table you filled
+> in is the one being used.
+> Path B has **no** such check: with `CUR_TABLE` set, the section 13 step still runs. While there is
+> no such record it sets up NotiOps's own CUR for the FinOps dashboard (it reuses a
+> `notiops-cur-report` kept from an earlier install; otherwise it creates one -- without asking when
+> the account has no qualifying existing CUR, and with "create new" as the default answer when it has
+> one, see section 13.2). From then on that record describes that CUR.
+
+**Re-running path B**: on a deployment that already self-hosts the server, a plain `./setup.sh`
+**keeps self-hosting** -- it recognises the server it deployed (the WebChatStack `CostMcpUrl` output
+matches the live BFF), so you do not need to pass `COST_MCP_SELF_HOST=true` every time. The
+`CUR_VERSION`, `CUR_TAG_KEYS` and per-query scan cap you set before are carried over from the live
+deployment too. To remove the self-hosted server, run `COST_MCP_SELF_HOST=false ./setup.sh` (it
+prints a warning first); after that the 4 CUR sheets disappear from FinOps (dropped by
+`requiresEnv`) and cost questions are answered from Cost Explorer. If it cannot read the stack
+outputs, and so cannot tell whether the live server is the one NotiOps deployed, `setup.sh` stops
+and asks you to say which, rather than guessing.
+
+> ⚠️ Two cases where it does **not** stop:
+> - **The table, bucket and partition layout are not carried over from the live deployment**; they
+>   come from that record, as described under "If you already have a CUR" above. A deployment on your
+>   own table that is re-run without them moves to a different CUR.
+> - If what it cannot read is **the live BFF's configuration** (the warning "⚠️ Could not read the
+>   live configuration ... your own CUR data source (cost-agent MCP)"), `setup.sh` only warns and
+>   carries on, and it cannot tell that the server is self-hosted -- a run that finishes without the
+>   switch removes the self-hosted server. On a self-hosted deployment, use
+>   `COST_MCP_SELF_HOST=true ./setup.sh` instead, and add any `CUR_VERSION` / `CUR_TAG_KEYS` /
+>   `COST_MCP_BYTES_CUTOFF` you set before (they cannot be read back in this case); do not run the
+>   External command that warning suggests.
+
+#### 🔴 Spend guardrail (please read this one)
+
+Athena bills **per byte scanned**, has **no per-call cap**, and **charges for cancelled queries
+too**. So NotiOps gives this server a **dedicated workgroup** with
+`BytesScannedCutoffPerQuery` set from `CostMcpScanCapGiB` (default **100 GiB**) and enforced --
+one question cannot turn into a surprise bill. Raise it if your CUR is large and queries keep
+getting cancelled; lower it to cap what a single question can ever cost you.
+
+#### Permissions (self-hosted; NotiOps sets these up)
+
+The execution role has **no write action at all**: five read-only Athena actions **scoped to that
+one workgroup**, read-only Glue catalog, read-only on the CUR bucket, and write access limited to
+its own results prefix. A CUR in another account is not supported in this release (see above), and
+**NotiOps will not, and does not support, storing long-lived access keys for it.**
+
+#### ⚠️ On a different CUR some answers will be "missing a piece" -- that is normal, not a failure
+
+**A CUR's column set varies per account**: AWS only emits attribute columns for the service
+dimensions you actually use. So:
+
+- **No discount agreement (EDP/PPA)** means no `*_net_*` (post-discount) columns. The server
+  detects this at cold start, falls back to the pre-discount (`unblended`) columns, and **says so
+  in every answer**. With no discount the two are identical anyway; with one, that sentence
+  matters -- do not read pre-discount numbers as post-discount.
+- **No Savings Plans** means no `savings_plan_*` attribute columns, so the SP-detail tools answer
+  "your bill has no Savings Plans" -- **not an error, and not a zero**.
+- Likewise: no GPU usage means no `product_gpu`; no Direct Connect means no `product_port_speed`.
+
+> The rule behind this is **no silent degradation**: if the measure changed, say it; if the data is
+> not there, say it is not there. A plausible-looking wrong number is far worse than "your bill
+> does not contain that."
+
+### 14.3 Wiring up the External mode (pointing at a server you already run)
+
+> For self-hosting, section 14.2 is all you need; this section is about **External** only.
 
 You supply exactly **two values**, and they must come as a pair: a Function URL does not contain the function ARN, and `lambda:InvokeFunctionUrl` can only be granted per resource — so filling in only one half deploys a data source that *looks* installed and 403s on every call, where the 403 is visible only in CloudTrail. Both paths therefore block that half-configuration **before anything is created**.
 
@@ -1370,14 +1614,17 @@ You supply exactly **two values**, and they must come as a pair: a Function URL 
 
 Once supplied, both paths wire up all four pieces automatically (no manual steps remain):
 
-1. **Agent (chat)**: runtime env var `COST_AGENT_MCP_URL` + the execution role's `InvokeCostAgentMcp` (`lambda:InvokeFunctionUrl`).
-2. **BFF (dashboard data)**: the same env var + `InvokeCostAgentMcp` + S3 read/write on the cache prefix (`CurDashCache`).
+1. **Agent (chat)**: runtime env var `COST_AGENT_MCP_URL` + two statements on the execution role, `InvokeCostAgentMcp` (`lambda:InvokeFunctionUrl`) and `InvokeCostAgentMcpFn` (`lambda:InvokeFunction`).
+2. **BFF (dashboard data)**: the same env var + the same two statements + S3 read/write on the cache prefix (`CurDashCache`).
 3. **Cache lifecycle**: 3-day expiry on the data bucket's `cur-dash-cache/` prefix.
 4. **Daily warmup**: EventBridge rule `CurDashWarmup`.
 
 > ⚠️ **Upgrade note**: these used to be manual (the old §14.3/§14.4 in v1.0.x). CDK now **owns** the BFF env var and that rule — the next deploy **overwrites** any `COST_AGENT_MCP_URL` you set by hand with the parameter value. So when you upgrade, pass the URL *and* the function ARN to setup.sh (or fill in the one-click parameters); otherwise your manual configuration is reset to empty and the 4 sheets silently disappear (their capability nodes are dropped by `requiresEnv`). Delete any EventBridge rule you created by hand, or the warmup runs twice a day.
 
-**IAM is two-sided**: the identity side (both roles) is now IaC. The **resource policy still lives on the cost-agent side** — that's your own separate deployment, not in this repo — and must allow those two roles to invoke its Function URL. Field-tested trap: the identity policy must **not** carry a `lambda:FunctionUrlAuthType` Condition; with it, every call 403s.
+**IAM is two-sided**: the identity side (those two roles) is now IaC -- when the server is **in the same account** as NotiOps, that is all it takes. When the server is **in another account**, the **resource policy** on its side (that's your own deployment, not in this repo) must also allow those two roles to invoke it, again with **both actions**.
+
+> 🔴 **When you point at your own server, both actions are required**: `lambda:InvokeFunctionUrl` **and** `lambda:InvokeFunction`. AWS changed Function URL authorization in **October 2025**: newly created URLs require both (the Note at the top of the [official docs](https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html)). Granting only the first is very easy to misdiagnose: the signature is valid, the identity is recognised, and the IAM policy simulator even says `allowed` -- yet the request is rejected **at the authorization step** with a 403 and **never reaches your function** (the function's logs stay empty; only CloudWatch's `Url4xxCount` goes up).
+> ⚠️ The two statements need **different** Conditions: `InvokeFunctionUrl` uses `lambda:FunctionUrlAuthType = AWS_IAM`; the authorization context of `InvokeFunction` has **no** such key, so it uses `lambda:InvokedViaFunctionUrl = true` (copying the first statement's condition gets you another 403, because the condition does not match).
 
 ### 14.4 What happens when the data source is down (the degradation chain never blocks the whole tool)
 
@@ -1392,13 +1639,13 @@ This is an **external** dependency, so it is fail-soft at four layers, and every
 
 A single tool's **logical error** (bad arguments) does not trip the breaker: the data source is alive, so the model is left to fix its arguments and retry. Covered by `tests/test_cost_agent_mcp_failsoft.py` and `bff/web-chat/tests/cur_dashboard_failsoft.test.mjs`.
 
-What the warmup does: on `{"source":"notiops.curdash.warmup"}` the BFF queries all 4 panels concurrently for the default window (T-33 to T-3 — the last 3 days of CUR aren't complete, so the window is closed early) and writes the day's cache, so the first person to open it during the day gets it instantly. The cron is `cron(0 22 * * ? *)` (22:00 UTC = 06:00 Beijing) — **the cache key's date basis is UTC+8**, so if you change the timezone you must change both. To verify, send the same payload manually with `aws lambda invoke --invocation-type Event`; the log should show `curdash warmup: cube:fulfilled credit:fulfilled es:fulfilled sp:fulfilled`.
+What the warmup does: on `{"source":"notiops.curdash.warmup"}` the BFF queries all 4 panels concurrently for the default window (T-33 to T-3 — the last 3 days of CUR aren't complete, so the window is closed early) and writes the day's cache, so the first person to open it during the day gets it instantly. The cron is `cron(0 22 * * ? *)` (22:00 UTC = 06:00 Beijing) — **the cache key's date basis is UTC+8**, so if you change the timezone you must change both. To verify, send the same payload manually with `aws lambda invoke --invocation-type Event`; the log should show `curdash warmup: cube:fulfilled credit:fulfilled es:fulfilled sp:fulfilled` **with no** `cur-dash <panel>: source unavailable (...)` warning before it -- that line alone is not enough: a panel that failed to fetch has already been turned into "temporarily unavailable" and is counted as `fulfilled` there too.
 
 ### 14.5 Troubleshooting
 
 | Symptom | Cause |
 |---|---|
 | The 4 sheets say "data source not configured" | The BFF is missing `COST_AGENT_MCP_URL`, or IAM isn't through |
-| MCP calls keep returning 403 | The identity policy carries a `FunctionUrlAuthType` Condition (remove it); or the resource policy doesn't list the calling role |
+| MCP calls keep returning 403 | **Most common: only `lambda:InvokeFunctionUrl` was granted, `lambda:InvokeFunction` is missing** (both are required since AWS's 2025-10 change); or the server is in another account and its resource policy doesn't list the calling role. Tell-tale: the request is **not** in the function's logs while `Url4xxCount` rises -- it was rejected at the authorization step, not by your code |
 | First open of the day still takes 1-5 minutes | The warmup didn't run, or the timezone is misaligned — the cache key's date basis is UTC+8 and the EventBridge cron must match it; check the BFF log's warmup line |
-| Warmup reports all-rejected | Usually an Athena failure on the MCP side (expired cross-account credentials, etc.); the BFF log carries a per-panel reason |
+| The 4 sheets say "temporarily unavailable", yet the warmup line reads `fulfilled` for all 4 | Usually the MCP side cannot query: a CUR NotiOps just created is still waiting for its first delivery (up to 24 hours), the table is outside the deployment Region, a bad `CUR_TAG_KEYS` value stops the server from starting, or an External server's own credentials have expired, etc. A panel that failed to fetch has already been turned into "temporarily unavailable", so the warmup line still counts it as `fulfilled`; the cause is in the BFF log's per-panel `cur-dash <panel>: source unavailable (...)` lines |

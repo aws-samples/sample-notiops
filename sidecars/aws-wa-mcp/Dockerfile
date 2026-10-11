@@ -3,7 +3,7 @@
 # `--sse` / STDIO, not streamable-http. We pip-install the package and
 # drive the `mcp` instance directly with streamable-http.
 # Base image from ECR Public (AWS-hosted mirror of the official Docker library
-# python image) rather than Docker Hub, per BuilderHub container security guidance.
+# python image) rather than Docker Hub (pinned, scanned public images; no anonymous pull limits).
 FROM public.ecr.aws/docker/library/python:3.14-slim
 
 ENV PIP_NO_CACHE_DIR=1 \

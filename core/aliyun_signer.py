@@ -38,7 +38,7 @@
    `canonical_request` / `string_to_sign` 会被返回（单测要逐字节比），但它们只是**给测试用**的
    —— 生产代码路径上不许打印（里面有 AccessKey **ID** 和请求体 hash）。
 
-ARCC 未查询（MCP server 本次会话连不上）—— 按标准做法处理凭据：只读内存、不落盘、不日志。
+按标准做法处理凭据：只读内存、不落盘、不日志。
 """
 from __future__ import annotations
 

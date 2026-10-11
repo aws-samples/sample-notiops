@@ -362,7 +362,7 @@ ok("ARN 用 BFF 所在 region 拼（= 系统账号 space 所在 region）",
 
     // ④ 账号 ID 形状
     caught = "";
-    try { await mod.setAccountRegions("69836193585", ["us-east-1"]); }
+    try { await mod.setAccountRegions("12345678901", ["us-east-1"]); }
     catch (e) { caught = String(e.message || e); }
     ok("★ 11 位账号 ID 被拒", /invalid_account_id/.test(caught));
 

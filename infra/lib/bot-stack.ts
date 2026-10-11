@@ -1,3 +1,11 @@
+/**
+ * BotStack —— IM 的 Fargate 长连接实现，**已退役、不再实例化**（2026-09-03，IM 重构 M2）。
+ *
+ * `bin/app.ts` 不再 `new BotStack(...)`：IM 侧现在只有 Webhook → Lambda 一条路（方式 B 是
+ * `im-stack.ts`，方式 A 一键栈也经 `constructs/im-core.ts` 建同一套）。本文件故意留在仓库里，
+ * 只为真要回长连接时能重新实例化（理由见 bin/app.ts 那段）。下文注释描述的是它服役时的样子；
+ * 要改 IM 的部署形态，改 constructs/im-core.ts，别改这里。
+ */
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
@@ -273,7 +281,8 @@ export class BotStack extends cdk.Stack {
       resources: [`arn:aws:ssm:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:parameter/notiops/*`],
     }));
 
-    // Secrets Manager read (Feishu credentials via Dashboard UI)
+    // Secrets Manager read (Feishu credentials, saved from Web Chat More → Admin → IM Integration;
+    // the old Dashboard UI that used to write them was retired 2026-09-04)
     // Bedrock API Key（spec R5.2）：Admin 在 webchat 管理页存进 Secrets Manager，
     // IM 侧 `core/bedrock_credentials` 读它并在 bedrock 客户端构造前注入
     // `AWS_BEARER_TOKEN_BEDROCK`。缺此授权的失败模式是**静默的**：读 secret 被拒 → 回退

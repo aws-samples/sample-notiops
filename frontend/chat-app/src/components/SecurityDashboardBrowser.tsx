@@ -9,10 +9,9 @@ import { IconSecurity, IconInvestigate, IconChangelog, IconInspection } from "./
  * 复用 NotificationsPanel 的 .notif2 / .notif-side / .notif-content 样式(团队一致),
  * 右侧内容委托给 SecurityDashboard 的「单 dashboard 模式」(传 dashboardId)。
  *
- * 入口有两个,都落在这里:
- *   ① 侧栏「安全」——「安全」2026-09-11 起不再是聊天主题(聊天并入「调查」),侧栏那一项
- *      就是**看板直达**,没有落地页。
- *   ② 「调查」输入框上方的「安全态势」胶囊。
+ * 入口只有一个:「调查」输入框上方的「安全态势」胶囊(ChatApp 的 dashPillsFor)。
+ * 「安全」2026-09-11 起不再是聊天主题(聊天并入「调查」),所以这里没有落地页,点进来直接是目录。
+ * 侧栏原来那个「安全」直达项同一天也去掉了(见 Sidebar.tsx),别按旧注释以为还有第二个入口。
  */
 interface Dash {
   id: string;
@@ -97,8 +96,8 @@ export default function SecurityDashboardBrowser({
           <SecurityDashboard dashboardId={sel} data={data} can={can}
             accountId={accountId} accounts={accounts} onInvestigate={onInvestigate} onReload={onReload} />
         ) : (
-          /* 四个面板全被关掉。整个「安全」入口本来就该跟着一起隐藏(ChatApp 的
-             showSecurity 门禁 nav:security),走到这里说明只关了子面板没关模块 ——
+          /* 四个面板全被关掉。整个「安全」入口(「安全态势」胶囊)本来就该跟着一起隐藏(ChatApp
+             dashPillsFor 里 nav:security 那条门禁),走到这里说明只关了子面板没关模块 ——
              给一句话,别留一片空白让人以为加载失败。 */
           <div style={{ color: "var(--muted)", fontSize: 13, padding: "40px 24px", textAlign: "center" }}>
             {zh ? "没有可查看的安全面板（请联系管理员开启）" : "No security panels available (ask your administrator to enable them)"}

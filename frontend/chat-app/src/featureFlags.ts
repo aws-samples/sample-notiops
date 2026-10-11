@@ -19,6 +19,13 @@
  *     导航"好几处，漏一处的症状是"界面上还剩半个入口"，而且没有任何报错。
  *  3. IM 侧有**另一份**同名开关（`core/multicloud.py`），因为那是 Python 的另一个进程。
  *     两边要一起翻，否则会出现「网页里没有、IM 里还在推荐」这种自相矛盾的产品。
+ *     BFF 也有一份（`bff/web-chat/starops_chat.mjs::MULTICLOUD_VISIBLE`：另一个运行时，
+ *     读不到这个编译期常量），所以多云这个开关实际是**三处一起翻**。三者一致由
+ *     `bff/web-chat/tests/starops_chat.test.mjs` 校验（它按正则读下面那行 `MULTICLOUD_UI`），
+ *     但它只在 CI 的 bff-tests 里跑，而那个 job 只在改动碰到 `bff/web-chat/**` 或
+ *     `config/llm-model-catalog.json` 时触发（.gitlab-ci.yml 里它的 `rules: changes:`，MR 与
+ *     main 两条同一个列表）—— 只改了这个文件或 `core/multicloud.py` 的 MR 不会跑到它，CI 照样
+ *     是绿的。所以翻开关必须三处在同一个 MR 里改，并在本地跑一次 `cd bff/web-chat && npm test`。
  */
 
 /**
@@ -31,7 +38,8 @@
  *  · `types.ts::topicHasStarops` —— 主题闸门。回 `false` 会让 `convMode.restorableMode`
  *    把已落盘的 `"starops"` 一并当"这个主题不提供这个模式"丢掉，所以**老会话不会**
  *    恢复出一个界面上看不见的对象（这正是那个函数文件头写的「开着一个界面上根本没有的
- *    开关」）。
+ *    开关」）。拉历史时按 `via` 回锁的 `convMode.relockFromHistory`（`pages/ChatApp.tsx`
+ *    水合处调用）过的也是这道闸：有 STAROps 历史的会话退回 NotiOps，不会锁回 STAROps。
  *  · `components/ChatObjectPicker.tsx` —— 新对话主页那一排「对话对象」里的 STAROps 段，
  *    连同它那次 `/features/starops` 探测请求（关了就别打，省一个签名请求）。
  *  · `components/AdminPanel.tsx` —— 「云环境」组里的「多云」导航项。`AliyunView` /
@@ -42,6 +50,15 @@
  *    STAROps 会话（现网上真的有）还要能正确显示成 STAROps；跟着藏掉的话它们会退成
  *    "没有标签"或者被误显示成 DevOps，那是**改写既有事实**，比多一个标签糟得多。
  *  · BFF 的 `/features/starops` 与 STAROps 那条对话链路 —— 后端一律不动。前端不去调而已。
+ *
+ * 🔴 2026-10-11 修：在那之前，`pages/ChatApp.tsx` 拉历史时按 `via="starops"` 恢复对话对象
+ *    的锁**不看**这个开关，于是关着时打开一段多云藏起来之前的 STAROps 会话，它仍锁在 STAROps
+ *    （标题栏照样显示「阿里云 STAROps」），接着问照样走 BFF 那条链路 —— `ChatObjectPicker` 的
+ *    回退管不到它，因为选择器只挂在空会话的落地页上。规则早就定了（「已经落过盘的 STAROps
+ *    会话退回 NotiOps」，见 `ChatObjectPicker.tsx` 与 `ChatObjectPicker.hidden.test.tsx`），
+ *    缺的只是这一处没接上；现在回锁收进 `convMode.relockFromHistory`，过 `topicHasStarops`。
+ *    BFF 的 `notConfiguredText` 关着那一支仍留着：还开着旧页面（旧前端包）的标签页、手搓的请求
+ *    照样能带着 `starops_chat: true` 进来，BFF 也不校验对象锁。
  */
 export const MULTICLOUD_UI = false;
 

@@ -19,7 +19,6 @@
     "  · 输出上限不入 per-surface 值，而是存模型**能力**(hard_output_limit)，各端自行取",
     "    min(hard_output_limit, 本端目标)；确有例外的端用 output_override 显式覆盖。"
   ],
-
   "_schema": {
     "generation": "number — 配置版本，epoch-ms。任何变更必须更新；消费端用 != 比较触发强刷。种子值 0 表示未经 Admin 修改。",
     "provider": "string — bedrock | litellm(Phase 2)。全局单选。",
@@ -42,19 +41,61 @@
     "_removed:models[].verified": "已删除，勿再添加。它断言 (模型 × 区域 × 凭证 × 时间) 这个组合成立，任何一维变了就失效，而我们只感知得到换 Key 那一维。实际后果两次：种子写死 true 让东京调不通的 amazon.nova-pro-v1:0 一路进生产；被收窄的 Key 排除掉的模型照样能设成默认。替代做法是保存时现场探测默认模型（BFF probeDefaultModel），结论属于决策那一刻、不会过期。写入侧另有字段白名单（llm_config.mjs::MODEL_ENTRY_FIELDS）会丢弃它。",
     "backend_tasks": "object — 方案 A（spec R8.1）：巡检平台下线后仍保留的后端任务模型配置。值为 alias，必须 ∈ 启用集；null/空 = 该任务未绑定，Lambda 回落到自己的 env / 硬编码默认。Mantle(GPT) 模型也可以绑 —— shared/llm_provider.py 已有 Responses 协议分支，早期「后端只走 Converse」的限制已解除。BFF 保存时会把 alias 解析成裸 model_id 投影到既有的 appconfig#phd / appconfig#devops_agent（SK=bedrock_model_id，另投影 kind 与 region），后端读取代码零改动。⚠️ 本 map 只允许出现已知任务名 —— 服务端校验会拒绝任何多余键（包括 _comment），别在这里写注释。"
   },
-
   "generation": 0,
   "provider": "bedrock",
   "credential_mode": "iam",
-  "_default_model_note": "默认模型必须是**带跨区推理 profile 前缀**（global. / us. / eu. / apac. …）的条目，不能是裸 id —— 哪怕那个裸 id 支持按需直调。理由：默认模型的第一职责是「随便哪个区装完都能说第一句话」，而裸 id 是逐区上线的，有洞。2026-08-26 短暂把 zai-glm-5（裸 id，实测 us-east-1 / us-west-2 / ap-northeast-1 有，ap-southeast-1 与 eu-* 没有）设成默认，代价是：装在缺 GLM 5 的区时，客户第一句话就报错，且必须自己摸到 Admin「模型」页换默认才能用 —— 对一个公开 sample，这就是「部署成功但不能用」。同时四份客户文档（docs/DEPLOYMENT.md、docs/DEPLOYMENT.en.md、docs/DEPLOYMENT_ONECLICK.md、docs/DEPLOYMENT_ONECLICK.en.md）都写着「默认模型是 X，这一个必须在 Bedrock 开通」，照着做的一键客户只开 X 就直接 AccessDeniedException。这条规则由 scripts/test_llm_catalog_seed.py 的两条断言机器强制：默认必须 profile-prefixed，且它的 model_id 必须出现在那四份客户文档里。 【默认模型的变更史 —— 同一个坑来回踩过，别再原地转】2026-08-27 从 Grok 4.6 改回 Claude Sonnet 5，当时给的两条理由是 (a) Grok 不支持 Converse 显式 cachePoint，长会话 input 成本更高；(b) 2026-08-25 现网出过连续 InternalServerException 的一轮。2026-09-01 **改回 Grok 4.6**（用户明确决策：Grok 4.6 彻底取代 Sonnet 5 当默认，所有地方都要是 Grok）。两条理由的现状：(b) **已定位并修掉，且根因不在 Grok** —— 是跨模型的历史回放：切模型会新建 Agent 并从 AgentCore Memory 恢复上一个模型留下的历史，而 Claude 的 adaptive thinking 会把 reasoningContent 写进持久化历史，把它回放给 Grok 就是 InternalServerException（修法见 agent-build 侧 core/history_scrub.py）。把这个当成「Grok 不稳」是归因错了。(a) **依然成立，是这次决策接受的代价**：Grok 的 supports_prompt_cache=false（带 cachePoint 的请求返回 AccessDeniedException，us-east-1 实测），长会话的 input 不享受缓存折价 —— 换默认意味着长会话 input 成本上升。这是明知的取舍，不是漏看。 【改这一条时必须同步的地方，漂了都是静默故障】core/llm_config.py 的 _BUILTIN_CATALOG['default_model']（DDB 读不到时的兜底）及其 agent-build 镜像；frontend/chat-app/src/types.ts 的 DEFAULT_MODEL；agent/main.py 的 _DEFAULT_MODEL 及其 agent-build 镜像；上面那四份客户文档里的 model_id。这四处都有 scripts/test_llm_catalog_seed.py 的断言盯着。 【不要顺手改的地方】core/bedrock_chat.py 的 BEDROCK_MODEL_ID —— 它只在 bedrock_anthropic 那条分支里当兜底（model_kind 的默认值就是 bedrock_anthropic），**必须留 Claude**：填一个非 Anthropic 的 id 会让手搓的 Anthropic 原生 body 打到 Grok 上，报 ValidationException。同理 core/model_catalog.py 的 _FLOOR 改成非 Claude 时，kind 必须一起从 bedrock_anthropic 改成 bedrock_converse，两者是一对。",
-  "default_model": "xai-grok-4-6",
-
+  "_default_model_note": "默认模型必须是**带跨区推理 profile 前缀**（global. / us. / eu. / apac. …）的条目，不能是裸 id —— 哪怕那个裸 id 支持按需直调。理由：默认模型的第一职责是「随便哪个区装完都能说第一句话」，而裸 id 是逐区上线的，有洞。2026-08-26 短暂把 zai-glm-5（裸 id，实测 us-east-1 / us-west-2 / ap-northeast-1 有，ap-southeast-1 与 eu-* 没有）设成默认，代价是：装在缺 GLM 5 的区时，客户第一句话就报错，且必须自己摸到 Admin「模型」页换默认才能用 —— 对一个公开 sample，这就是「部署成功但不能用」。同时四份客户文档（docs/DEPLOYMENT.md、docs/DEPLOYMENT.en.md、docs/DEPLOYMENT_ONECLICK.md、docs/DEPLOYMENT_ONECLICK.en.md）都写着「默认模型是 X，这一个必须在 Bedrock 开通」，照着做的一键客户只开 X 就直接 AccessDeniedException。这条规则由 scripts/test_llm_catalog_seed.py 的两条断言机器强制：默认必须 profile-prefixed，且它的 model_id 必须出现在那四份客户文档里。 【默认模型的变更史 —— 同一个坑来回踩过，别再原地转】2026-08-27 从 Grok 4.6 改回 Claude Sonnet 5，当时给的两条理由是 (a) Grok 不支持 Converse 显式 cachePoint，长会话 input 成本更高；(b) 2026-08-25 现网出过连续 InternalServerException 的一轮。2026-09-01 **改回 Grok 4.6**（用户明确决策：Grok 4.6 彻底取代 Sonnet 5 当默认，所有地方都要是 Grok）。两条理由的现状：(b) **已定位并修掉，且根因不在 Grok** —— 是跨模型的历史回放：切模型会新建 Agent 并从 AgentCore Memory 恢复上一个模型留下的历史，而 Claude 的 adaptive thinking 会把 reasoningContent 写进持久化历史，把它回放给 Grok 就是 InternalServerException（修法见 agent-build 侧 core/history_scrub.py）。把这个当成「Grok 不稳」是归因错了。(a) **依然成立，是这次决策接受的代价**：Grok 的 supports_prompt_cache=false（带 cachePoint 的请求返回 AccessDeniedException，us-east-1 实测），长会话的 input 不享受缓存折价 —— 换默认意味着长会话 input 成本上升。这是明知的取舍，不是漏看。 【改这一条时必须同步的地方，漂了都是静默故障】core/llm_config.py 的 _BUILTIN_CATALOG['default_model']（DDB 读不到时的兜底）及其 agent-build 镜像；frontend/chat-app/src/types.ts 的 DEFAULT_MODEL；agent/main.py 的 _DEFAULT_MODEL 及其 agent-build 镜像；上面那四份客户文档里的 model_id。这四处都有 scripts/test_llm_catalog_seed.py 的断言盯着。 【以前不能顺手改、2026-09-01 起可以跟着改的地方】core/bedrock_chat.py 的 BEDROCK_MODEL_ID：以前它只在 bedrock_anthropic 那条分支里当兜底（model_kind 的默认值就是 bedrock_anthropic），填一个非 Anthropic 的 id 会让手搓的 Anthropic 原生 body 打到 Grok 上，报 ValidationException。2026-09-01 起兜底路径改走 _default_model_pair()（从目录取**成对**的 model_id + kind），代码不再直接读这个常量，所以它随默认一起改。**仍然成立的那一半**：core/model_catalog.py 的 _FLOOR 是手写的一对，model_id 换成非 Claude 时 kind 必须同时是 bedrock_converse。 【2026-10-10 更新】默认从 xai-grok-4-6 换成 moonshot-kimi-k3（用户决策）。它满足上面那条硬规则：global. 跨区推理 profile。同步改了的落点（缺一处就会出现「CLI 看起来一致、Web 还停在旧默认」那种事故）：本文件 default_model、core/llm_config.py 与 agent-build/.../core/llm_config.py 的 _BUILTIN_CATALOG、frontend/chat-app/src/types.ts 的 DEFAULT_MODEL、agent/main.py 的兜底、notiops-backend-stack.ts 写进 SSM /notiops/agent/model_id 的值与那个 MODEL_ID 环境变量、core/bedrock_chat.py / core/model_catalog.py 的兜底、shared/model_config.py / phd_config.py / summarizer_config.py 的后端任务兜底、BFF 里 insight_llm.mjs 的仪表盘洞察**兜底**模型（首选是非推理的 deepseek.v3.2，最后一项必须等于这里的默认 —— bff/web-chat/tests/dashboard_insight_requests.test.mjs 会核）以及 index.mjs 的请求兜底 alias。实测代价见 moonshot-kimi-k3 条目的 _default_note。",
+  "default_model": "moonshot-kimi-k3",
   "models": [
     {
-      "alias": "xai-grok-4-6",
+      "alias": "moonshot-kimi-k3",
+      "short": "kimi",
+      "aliases_legacy": [],
+      "_default_note": "2026-10-10 起为默认模型（用户决策）。实测代价，写在这里免得被当成「没想到」：25k 上下文、IM 预算（6000）下首答案中位 12.8s，是 Grok 4.6（6.8s）的约 2 倍（各 5 轮交替，us-east-1）；输出单价 $15/M，是 Grok 4.6（$6/M）的 2.5 倍。优点：小输出预算也能答（256 / 500 都出文本，Grok 4.6/4.7 在 256 时一个字都不出）、隐式缓存读便宜（$0.30/M）。",
+      "model_id": "global.moonshotai.kimi-k3",
+      "label": "Kimi K3",
+      "desc_key": "model.desc.kimi",
+      "kind": "bedrock_converse",
+      "region": null,
+      "_hard_output_limit_note": "128000 是 bedrock-runtime 实测拒绝阈值：maxTokens=131072 → ValidationException『exceeds the model limit of 128000』，65536 正常（us-east-1，2026-09-22）。",
+      "hard_output_limit": 128000,
+      "output_override": null,
+      "_supports_prompt_cache_note": "实测不支持 Converse 显式 cachePoint：ValidationException『This model doesn't support the cachePoint field』（us-east-1，2026-10-10）。但它有**隐式**缓存且真的生效：25k system 重复请求时 cacheReadInputTokens=23509、inputTokens 只剩 7。声明 true 会让 load.py 给每个请求插 cachePoint ⇒ 每次调用都失败。",
+      "supports_prompt_cache": false,
+      "_temperature_note": "拒绝 temperature 与 topP（ValidationException）。代码本来就不发（core/bot_llm.py 有 grep 实证），这里记一笔防止有人加回来。",
+      "surfaces": [
+        "webchat",
+        "im"
+      ],
+      "enabled": true
+    },
+    {
+      "alias": "xai-grok-4-7",
       "short": "grok",
+      "aliases_legacy": [],
+      "model_id": "global.xai.grok-4.7",
+      "label": "Grok 4.7",
+      "desc_key": "model.desc.grok",
+      "kind": "bedrock_converse",
+      "region": null,
+      "_reasoning_note": "⚠️ 比 4.6 推理重得多：maxTokens=2048 时 30s 跑满 2048 token、**一个答案字都没有**（全是 reasoning）；IM 的 6000 与 webchat 的 32768 预算下都正常出答案（首答案 6.6–11.1s）。所以别把它绑给小预算的后端任务。",
+      "hard_output_limit": 524288,
+      "output_override": null,
+      "_supports_prompt_cache_note": "实测不支持 Converse 显式 cachePoint：AccessDeniedException（us-east-1，2026-10-10），与 4.6 同。",
+      "supports_prompt_cache": false,
+      "surfaces": [
+        "webchat",
+        "im"
+      ],
+      "enabled": true
+    },
+    {
+      "alias": "xai-grok-4-6",
+      "short": null,
       "_aliases_legacy_note": "global-xai-grok-4-6 是 Grok 4.6 上线（2026-08-18）后、本条目进种子之前，运维在 Admin「模型」页手工加这个模型时用过的 alias（直接拿 model_id 当 alias）。留在这里让那些部署里的存量会话偏好继续解析到本条目，而不是静默回落默认模型。",
-      "aliases_legacy": ["global-xai-grok-4-6"],
+      "aliases_legacy": [
+        "global-xai-grok-4-6"
+      ],
       "model_id": "global.xai.grok-4.6",
       "label": "Grok 4.6",
       "desc_key": "model.desc.grok",
@@ -65,12 +106,36 @@
       "output_override": null,
       "_supports_prompt_cache_note": "模型卡把 prompt caching 列为 bedrock-runtime 支持项，但**实测不支持 Converse 显式 cachePoint**：带 cachePoint 的请求返回 AccessDeniedException『You invoked an unsupported model or your request did not allow prompt caching』（us-east-1，2026-08-20）。故声明 false —— 声明 true 会让 load.py 给每个请求插 cachePoint，grok 的每一次调用都直接失败。",
       "supports_prompt_cache": false,
-      "surfaces": ["webchat", "im"],
+      "surfaces": [
+        "webchat",
+        "im"
+      ],
+      "enabled": false
+    },
+    {
+      "alias": "zai-glm-5-3",
+      "short": "glm",
+      "aliases_legacy": [],
+      "_model_id_note": "与 GLM 5 不同，5.3 **有**跨区推理 profile（global. / us.），且只走 profile（foundation model 的 inferenceTypes 只有 INFERENCE_PROFILE）。",
+      "model_id": "global.zai.glm-5.3",
+      "label": "GLM 5.3",
+      "desc_key": "model.desc.glm",
+      "kind": "bedrock_converse",
+      "region": null,
+      "_hard_output_limit_note": "128000 是实测拒绝阈值（maxTokens=999999 → 『model limit of 128000』，us-east-1，2026-10-10）。",
+      "hard_output_limit": 128000,
+      "output_override": null,
+      "_supports_prompt_cache_note": "⚠️ **别被第一次实测骗了**：只在 system 上放一个 cachePoint 时它接受；但按 load.py 的真实形状（工具末尾 + 最后一条 user 消息末尾各一个）发，返回 ValidationException『This model doesn't support the cachePoint field』（us-east-1，2026-10-10）。声明 true ⇒ 每一次调用都失败。",
+      "supports_prompt_cache": false,
+      "surfaces": [
+        "webchat",
+        "im"
+      ],
       "enabled": true
     },
     {
       "alias": "zai-glm-5",
-      "short": "glm",
+      "short": null,
       "aliases_legacy": [],
       "_model_id_note": "**裸 model id，没有跨区推理 profile**。2026-08-26 在 us-east-1 实测：bedrock list-foundation-models 里 zai.glm-5 是 ACTIVE，而 list-inference-profiles 里 GLM 一条都没有 —— 所以只能按需直调裸 id。相应地它已登记进 scripts/test_llm_catalog_seed.py 的 _ON_DEMAND_BARE_IDS。",
       "model_id": "zai.glm-5",
@@ -85,40 +150,97 @@
       "_supports_prompt_cache_note": "实测**不支持** Converse 显式 cachePoint：带 cachePoint 的请求返回 AccessDeniedException（us-east-1，2026-08-26）。声明 true 会让 load.py 给每个请求插 cachePoint，于是每一次调用都直接失败 —— 与 grok 那条同一个坑。",
       "supports_prompt_cache": false,
       "_surfaces_note": "webchat + IM 两端都上。2026-09-01 补上 im：此前只写 webchat，理由是「IM 侧内置兜底目录不含它」—— 那个理由已经过期（IM 兜底目录 core/llm_config.py 的 _BUILTIN_CATALOG 里早有这条，core/model_catalog.py 只是它的适配层），于是唯一挡着 GLM 上 IM 的东西就是这个 surfaces 字段本身，成了「代码支持、种子不给」的哑口。改动配套：core/llm_config.py 里同条 surfaces 也要加 im，否则 DDB 读不到时兜底目录仍不给（scripts/test_llm_catalog_seed.py 的正/反向两条断言会一起抓）。注意它仍**不能当 default_model**（裸 id，见 _model_id_note / _region_availability_note）—— 「能在 IM 用」与「能当默认」是两件事。",
-      "surfaces": ["webchat", "im"],
+      "surfaces": [
+        "webchat",
+        "im"
+      ],
+      "enabled": false
+    },
+    {
+      "alias": "claude-sonnet-5-5",
+      "short": "claude",
+      "aliases_legacy": [
+        "claude"
+      ],
+      "model_id": "global.anthropic.claude-sonnet-5-5",
+      "label": "Claude Sonnet 5.5",
+      "desc_key": "model.desc.claude",
+      "kind": "bedrock_anthropic",
+      "region": null,
+      "_availability_note": "与 Sonnet 5 同构（同一请求体、128000 输出上限、Converse cachePoint 与 ttl=1h 都支持，第二次请求读到 7445 缓存 token，实测 2026-10-10）。⚠️ **账号级协议**：没接受过它的 Marketplace 协议的账号里 agreementAvailability=NOT_AVAILABLE，调用报『Model access is denied … AWS Marketplace subscription』，而同账号的 Sonnet 5 正常 —— 客户账号可能出现「5 能用、5.5 还没开通」。所以 Sonnet 5 条目保留为 enabled=false 而不是删掉。⚠️ **但在 Admin「模型」页只把 Sonnet 5 启用回去，只修好了 Web**：IM 的 `claude`（short + aliases_legacy）挂在本条目上，claude-sonnet-5 没有短别名，所以 `@bot model claude` 和存量 `claude` 偏好照旧解析到 5.5、照旧调不通；Admin 页改不了 short / aliases_legacy，BFF 也不许两个条目认领同一个名字。没开通 5.5 的账号二选一：① 在该账号里把 5.5 的协议接受一次；② 启用 claude-sonnet-5 的**同时停用本条目**，再让 IM 用户改用 `@bot model claude-sonnet-5` —— 本条目停用后，存量 `claude` 偏好回落到默认模型，`@bot model claude` 回「未知模型」。",
+      "hard_output_limit": 128000,
+      "output_override": {
+        "im": 6000
+      },
+      "supports_prompt_cache": true,
+      "surfaces": [
+        "webchat",
+        "im"
+      ],
       "enabled": true
     },
     {
       "alias": "claude-sonnet-5",
-      "short": "claude",
-      "aliases_legacy": ["claude"],
+      "short": null,
+      "aliases_legacy": [],
       "model_id": "global.anthropic.claude-sonnet-5",
-
       "label": "Claude Sonnet 5",
       "desc_key": "model.desc.claude",
       "kind": "bedrock_anthropic",
       "region": null,
       "hard_output_limit": 128000,
-      "output_override": { "im": 6000 },
+      "output_override": {
+        "im": 6000
+      },
       "supports_prompt_cache": true,
-      "surfaces": ["webchat", "im"],
+      "surfaces": [
+        "webchat",
+        "im"
+      ],
+      "enabled": false
+    },
+    {
+      "alias": "claude-opus-5-5",
+      "short": "opus",
+      "aliases_legacy": [
+        "opus"
+      ],
+      "model_id": "global.anthropic.claude-opus-5-5",
+      "label": "Claude Opus 5.5",
+      "desc_key": "model.desc.opus",
+      "kind": "bedrock_anthropic",
+      "region": null,
+      "_availability_note": "与 Opus 5 同构（同上，实测 cachePoint + ttl=1h 均读到 7445 缓存 token）。账号级协议风险与处理同 claude-sonnet-5-5 那条说明，换成 `opus` / claude-opus-5：只把 claude-opus-5 启用回去只修好 Web；没开通 5.5 的账号要么接受一次协议，要么启用 claude-opus-5 的同时停用本条目、让 IM 用户改用 `@bot model claude-opus-5`（存量 `opus` 偏好随后回落到默认模型）。",
+      "hard_output_limit": 128000,
+      "output_override": {
+        "im": 6000
+      },
+      "supports_prompt_cache": true,
+      "surfaces": [
+        "webchat",
+        "im"
+      ],
       "enabled": true
     },
     {
       "alias": "claude-opus-5",
-      "short": "opus",
-      "aliases_legacy": ["opus"],
+      "short": null,
+      "aliases_legacy": [],
       "model_id": "global.anthropic.claude-opus-5",
-
       "label": "Claude Opus 5",
       "desc_key": "model.desc.opus",
       "kind": "bedrock_anthropic",
       "region": null,
       "hard_output_limit": 128000,
-      "output_override": { "im": 6000 },
+      "output_override": {
+        "im": 6000
+      },
       "supports_prompt_cache": true,
-      "surfaces": ["webchat", "im"],
-      "enabled": true
+      "surfaces": [
+        "webchat",
+        "im"
+      ],
+      "enabled": false
     },
     {
       "alias": "claude-sonnet-4-6",
@@ -130,9 +252,13 @@
       "kind": "bedrock_anthropic",
       "region": null,
       "hard_output_limit": 65536,
-      "output_override": { "im": 6000 },
+      "output_override": {
+        "im": 6000
+      },
       "supports_prompt_cache": true,
-      "surfaces": ["webchat"],
+      "surfaces": [
+        "webchat"
+      ],
       "enabled": false
     },
     {
@@ -145,27 +271,38 @@
       "kind": "bedrock_anthropic",
       "region": null,
       "hard_output_limit": 65536,
-      "output_override": { "im": 6000 },
+      "output_override": {
+        "im": 6000
+      },
       "supports_prompt_cache": true,
       "_surfaces_note": "webchat only —— IM 侧 core/model_catalog.py 现无 haiku 条目，如需在 IM 开放需先补该条目（surfaces 反映现状，不预告承诺）",
       "_enabled_note": "2026-09-03 用户要求从 Web 对话的默认模型列表里去掉（列表太长、它也不是任何主题的推荐项）。条目**保留不删**：删了之后历史消息的落款会退化成裸 alias。要重新开放就把这里改回 true。",
-      "surfaces": ["webchat"],
+      "surfaces": [
+        "webchat"
+      ],
       "enabled": false
     },
     {
       "alias": "amazon-nova-pro",
       "short": "nova",
-      "aliases_legacy": ["nova"],
+      "aliases_legacy": [
+        "nova"
+      ],
       "model_id": "apac.amazon.nova-pro-v1:0",
       "label": "Amazon Nova Pro",
       "desc_key": "model.desc.nova",
       "kind": "bedrock_converse",
       "region": null,
       "hard_output_limit": 5120,
-      "output_override": { "im": 5000 },
+      "output_override": {
+        "im": 5000
+      },
       "supports_prompt_cache": false,
-      "surfaces": ["webchat", "im"],
-      "enabled": true
+      "surfaces": [
+        "webchat",
+        "im"
+      ],
+      "enabled": false
     },
     {
       "alias": "deepseek-v3-2",
@@ -179,57 +316,102 @@
       "hard_output_limit": 8192,
       "output_override": null,
       "supports_prompt_cache": false,
-      "surfaces": ["webchat"],
+      "surfaces": [
+        "webchat"
+      ],
       "enabled": true
     },
     {
       "alias": "gpt-5-6",
       "short": "gpt",
-      "aliases_legacy": ["gpt"],
+      "aliases_legacy": [
+        "gpt"
+      ],
       "model_id": "openai.gpt-5.6-terra",
       "label": "GPT-5.6 Terra",
       "desc_key": "model.desc.gpt",
       "kind": "bedrock_mantle_responses",
       "region": "us-east-2",
       "hard_output_limit": 32768,
-      "output_override": { "im": 8000 },
+      "output_override": {
+        "im": 8000
+      },
       "supports_prompt_cache": false,
-      "surfaces": ["webchat", "im"],
+      "surfaces": [
+        "webchat",
+        "im"
+      ],
+      "enabled": true
+    },
+    {
+      "alias": "gpt-6-sol",
+      "short": "gpt_sol",
+      "aliases_legacy": [
+        "gpt_sol"
+      ],
+      "_kind_note": "⚠️ **调用通道变了**：GPT-6 Sol **不在** bedrock-mantle 上（us-east-2 的 Responses 接口返回 404『The model openai.gpt-6-sol does not exist』），只能走 Converse + global. profile。所以 kind 是 bedrock_converse、region 为 null（跟随部署区），不再钉死 us-east-2 —— 与 5.6 系不同。",
+      "model_id": "global.openai.gpt-6-sol",
+      "label": "GPT-6 Sol",
+      "desc_key": "model.desc.gpt6Sol",
+      "kind": "bedrock_converse",
+      "region": null,
+      "_availability_note": "⚠️ **账号级协议**：与 claude-sonnet-5-5 同一类 —— 要账号级 AWS Marketplace 订阅，没接受协议的账号调不通、接受过的正常（2026-10-10 实测）。IM 的 `gpt_sol`（short + aliases_legacy）挂在本条目上。没开通的账号：在该账号里接受一次协议，或停用本条目（存量 `gpt_sol` 偏好随后回落到默认模型）。",
+      "_hard_output_limit_note": "131072 是实测拒绝阈值（us-east-1，2026-10-10）。",
+      "hard_output_limit": 131072,
+      "output_override": {
+        "im": 8000
+      },
+      "_supports_prompt_cache_note": "实测不支持 Converse 显式 cachePoint：AccessDeniedException（us-east-1，2026-10-10）。",
+      "supports_prompt_cache": false,
+      "surfaces": [
+        "webchat",
+        "im"
+      ],
       "enabled": true
     },
     {
       "alias": "gpt-5-6-sol",
-      "short": "gpt_sol",
-      "aliases_legacy": ["gpt_sol"],
+      "short": null,
+      "aliases_legacy": [],
       "model_id": "openai.gpt-5.6-sol",
       "label": "GPT-5.6 Sol",
       "desc_key": "model.desc.gptSol",
       "kind": "bedrock_mantle_responses",
       "region": "us-east-2",
       "hard_output_limit": 32768,
-      "output_override": { "im": 8000 },
+      "output_override": {
+        "im": 8000
+      },
       "supports_prompt_cache": false,
-      "surfaces": ["webchat", "im"],
-      "enabled": true
+      "surfaces": [
+        "webchat",
+        "im"
+      ],
+      "enabled": false
     },
     {
       "alias": "gpt-5-6-luna",
       "short": "gpt_luna",
-      "aliases_legacy": ["gpt_luna"],
+      "aliases_legacy": [
+        "gpt_luna"
+      ],
       "model_id": "openai.gpt-5.6-luna",
       "label": "GPT-5.6 Luna",
       "desc_key": "model.desc.gptLuna",
       "kind": "bedrock_mantle_responses",
       "region": "us-east-2",
       "hard_output_limit": 32768,
-      "output_override": { "im": 8000 },
+      "output_override": {
+        "im": 8000
+      },
       "supports_prompt_cache": false,
       "_surfaces_note": "2026-09-03 用户要求从 Web 对话的默认模型列表里去掉（同一代 GPT 三个变体挤在列表里，Web 侧只留 Terra / Sol）。**IM 侧保留**（`@bot model gpt_luna` 仍可用），所以走 surfaces 收窄而不是 enabled=false —— 后者会把 IM 一起关掉。",
-      "surfaces": ["im"],
+      "surfaces": [
+        "im"
+      ],
       "enabled": true
     }
   ],
-
   "backend_tasks": {
     "phd_translate": null,
     "devops_report_summarize": null

@@ -180,13 +180,13 @@ function judgeBtn() {
  *
  * ⚠️ **按内容找，不按 DOM 顺序猜。** 抽屉也是 `role="dialog"`，而两者在
  * `InspectionDashboard` 里的渲染顺序不是这套用例该依赖的东西
- * （`at(-1)` 曾经拿到抽屉，然后在里面找不到「派发判读」）。
+ * （`at(-1)` 曾经拿到抽屉，然后在里面找不到「开始分析」）。
  * 判据用「里面有派发按钮」——那是弹窗的定义性特征。
  */
 function judgeModalEl(): HTMLElement | null {
   return [...document.querySelectorAll('[role="dialog"]')].find((d) =>
     [...d.querySelectorAll("button")].some(
-      (b) => /派发判读|Dispatch review/.test(b.textContent || ""))) as
+      (b) => /开始分析|Start analysis/.test(b.textContent || ""))) as
     HTMLElement | null ?? null;
 }
 
@@ -202,7 +202,7 @@ function refreshBtn(): HTMLButtonElement | undefined {
     HTMLButtonElement | undefined;
 }
 
-/** 弹窗里那个按钮（`派发判读` / `取消`）。 */
+/** 弹窗里那个按钮（`开始分析` / `取消`）。 */
 function inModal(re: RegExp): HTMLButtonElement | undefined {
   const dlg = judgeModalEl();
   return [...(dlg?.querySelectorAll("button") ?? [])]
@@ -238,14 +238,20 @@ describe("闲置轮的卡片不显示「判读缺失」", () => {
     expect(screen.queryByText(/规则结论 ⓘ/)).toBeNull();
   });
 
-  it("★★★ 反例：有确定性结论**文本**时要显示它（那是真信息）", async () => {
+  it("★★★ 反例：「凭什么判它闲」要有落点 —— 在抽屉的「判定方式」里", async () => {
+    // 2026-10 第二版：列表行不再印规则说明（每行一样 = 零信息量；表格下方那两段
+    // 「规则结论」客户截图圈出来要删）。说明挪进抽屉，紧挨评分明细。
     vi.mocked(api.getInspectionFindings).mockResolvedValue(FINDINGS([
       IDLE({ conclusion: "闲置判定：六维加权评分明细见本条详情。" } as Partial<FindingRow>),
     ]));
     render(<InspectionDashboard dashboardId="idle" can={() => true} />);
     await waitFor(() => {
-      expect(screen.queryByText(/六维加权评分明细/),
-        "有 conclusion 文本却不显示 —— 那是唯一说明「凭什么判它闲」的话",
+      expect(screen.queryByText(/notiops-tb-redis/)).not.toBeNull();
+    });
+    openDrawer(/notiops-tb-redis/);
+    await waitFor(() => {
+      expect(screen.queryByText("判定方式"),
+        "抽屉里没有「判定方式」—— 那是唯一说明「凭什么判它闲」的话",
       ).not.toBeNull();
     });
   });
@@ -311,12 +317,14 @@ describe("闲置轮的详情抽屉：AI 判读整节不渲染", () => {
     <InspectionDashboardPanel row={row}
       onClose={() => {}} />);
 
-  it("★★★ 「AI 判读」这个小节标题**不出现**", () => {
+  it("★★★ 「AI 判读」那一**节**不出现（没派过的闲置条目）", () => {
+    // 2026-10 第三版「结论先行」：抽屉不再有「AI 判读：未派」那张摘要卡 ——
+    // 没派过就是没有，下面给的是通用处置步骤 + 一句「拿不准可以派 AI」。
+    // 不许回来的是那**一整节**（标题 + 等待态 / 「还没有判读」）。
     open(IDLE());
-    expect(screen.queryByText("AI 判读"),
-      "闲置轮抽屉里还有「AI 判读」小节 —— 它下面只能是错的话（「还没」/「等 1~3 分钟」）",
-    ).toBeNull();
-    expect(screen.queryByText("AI analysis")).toBeNull();
+    expect(screen.queryByText("AI 判读"), "「AI 判读」那一节回来了").toBeNull();
+    expect(screen.getByText("建议处置")).toBeTruthy();
+    expect(document.querySelector(".insp-md"), "判读正文区回来了").toBeNull();
   });
 
   it("★★★ 那三句错话一个字都不许出现", () => {
@@ -354,10 +362,14 @@ describe("闲置轮的详情抽屉：AI 判读整节不渲染", () => {
         basis: "percent", observed: 0.25,
       }],
     }));
-    // 删 AI 判读那一节时把这一节一起删掉的话，抽屉里就只剩 KV 网格了
-    expect(screen.queryByText(/闲置评分明细/) || screen.queryByText(/Idle score/),
+    // 结论先行：评分明细默认折起，但**入口必须在**、点开有内容 ——
+    // 删掉它抽屉就没有「凭什么说它闲」的完整回答。
+    fireEvent.click(screen.getByRole("button", { name: /评分明细/ }));
+    expect(document.querySelector('[role="progressbar"]'),
       "评分明细没了 —— 那是「凭什么说它闲」的完整回答，删了抽屉就没有结论",
     ).not.toBeNull();
+    // 依据列表（实测值 + 白话）不折叠
+    expect(screen.getByText("判定依据")).toBeTruthy();
   });
 
   it("★★★ 反例：**高负载**的抽屉照旧有「AI 判读」小节", async () => {
@@ -453,7 +465,7 @@ describe("「深入分析」= 派一次真的 DA 判读（不是跳聊天）", (
       return d!;
     });
     fireEvent.click([...dlg.querySelectorAll("button")]
-      .find((b) => /派发判读|Dispatch review/.test(b.textContent || ""))!);
+      .find((b) => /开始分析|Start analysis/.test(b.textContent || ""))!);
   };
 
   it("★★★ 点了调 judgeInspectionFinding，用 finding 自己的账号", async () => {
@@ -586,7 +598,8 @@ describe("「深入分析」= 派一次真的 DA 判读（不是跳聊天）", (
     });
     await clickInvestigate();
     await waitFor(() => {
-      expect(screen.queryByText(/巡检被拉停了/)).not.toBeNull();
+      // 🔴 不显示后端原文：那句里是内部键名，客户看不到也改不了（review B21）。
+      expect(screen.queryByText(/巡检已被管理员暂停/)).not.toBeNull();
     });
     /* 抽屉还开着（派发只从抽屉发起），「深入分析」按钮必须还在。 */
     expect(screen.queryByText(/深入分析|Investigate/),
@@ -821,7 +834,7 @@ describe("判读的三处细节（反向注入补的）", () => {
     await waitFor(() => {
       expect(judgeModalEl(), "确认弹窗没开").not.toBeNull();
     });
-    fireEvent.click(inModal(/派发判读|Dispatch review/)!);
+    fireEvent.click(inModal(/开始分析|Start analysis/)!);
     /* 🔴 判据是 `aria-disabled` —— `Btn` 的 `loading` 走它（本仓库刻意不用
        原生 disabled，见 ui.tsx 那段说明）。
        没有 loading 的表现：判读是同步 invoke（1~3 秒），客户以为没反应连点
@@ -830,7 +843,7 @@ describe("判读的三处细节（反向注入补的）", () => {
           正是为了让人看到这个状态）。 */
     await waitFor(() => {
       const el = [...document.querySelectorAll('[role="dialog"] button')]
-        .find((b) => /派发判读|Dispatch review/.test(b.textContent || ""));
+        .find((b) => /开始分析|Start analysis/.test(b.textContent || ""));
       expect(el?.getAttribute("aria-disabled"),
         "派发中按钮没进 loading —— 客户会连点，第二次开始拿 already_dispatched",
       ).toBe("true");
@@ -946,7 +959,7 @@ describe("确认弹窗（备注与按钮不再隔 350px）", () => {
       "弹窗里没有备注框 —— 那它又回到了「离按钮 350px」那个状态",
     ).not.toBeNull();
     const btns = [...dlg.querySelectorAll("button")].map((b) => b.textContent || "");
-    expect(btns.some((x) => /派发判读|Dispatch review/.test(x)),
+    expect(btns.some((x) => /开始分析|Start analysis/.test(x)),
       `弹窗里没有派发按钮：${btns}`,
     ).toBe(true);
   });
@@ -979,6 +992,48 @@ describe("确认弹窗（备注与按钮不再隔 350px）", () => {
     ).not.toHaveBeenCalled();
   });
 
+  it("★★★ 面向客户的文案：没有内部词、没有 97.3/100、服务名是正式写法", async () => {
+    /* 2026-10 客户原话：「这里面废话真多」。旧版写着「派发判读」「1~3 分钟后
+       回填」「不能重复派」、小写 `elasticache`、`闲置分 99.3/100`。 */
+    await openModal();
+    const txt = judgeModalEl()!.textContent || "";
+    expect(txt, "弹窗里又出现了内部词").not.toMatch(/派发|回填|判读|dispatch/i);
+    expect(txt, "闲置分又写成了 x/100").not.toMatch(/\/100\b/);
+    expect(txt, "服务名没走 serviceLabel").toContain("ElastiCache");
+    expect(txt, "规格没显示").toContain("cache.t4g.micro");
+    expect(txt, "闲置分应当是表格同款的「闲置 99」标签").toMatch(/闲置\s*99/);
+  });
+
+  it("★★ 计数器空着时不显示，开始输入才出现", async () => {
+    // 一个孤零零的 `0/1000` 是噪音；但上限是硬的，输入后必须看得到。
+    const LIMIT = (await import("./api/inspection")).OPERATOR_NOTE_LIMIT;
+    await openModal();
+    expect(judgeModalEl()!.textContent).not.toContain(`/${LIMIT}`);
+    fireEvent.change(judgeModalEl()!.querySelector("textarea")!,
+      { target: { value: "abc" } });
+    await waitFor(() =>
+      expect(judgeModalEl()!.textContent).toContain(`3/${LIMIT}`));
+  });
+
+  it("★★★ 高负载那一条不能问「是不是真闲置」", async () => {
+    /* 同一个弹窗也给高负载用。旧文案写死了「判断它是真闲置还是有理由地闲着」，
+       放在一条 CPU 85% 的发现上是错话。 */
+    vi.mocked(api.getInspectionFindings).mockResolvedValue(FINDINGS([HIGH()]));
+    render(<InspectionDashboard dashboardId="high-load" can={() => true} />);
+    await waitFor(() =>
+      expect(screen.queryByText(/notiops-tb-rds-prod/)).not.toBeNull());
+    openDrawer(/notiops-tb-rds-prod/);
+    await waitFor(() =>
+      expect(document.querySelectorAll('[role="dialog"]').length).toBe(1));
+    fireEvent.click(judgeBtn()!);
+    await waitFor(() => expect(judgeModalEl()).not.toBeNull());
+    const txt = judgeModalEl()!.textContent || "";
+    expect(txt, "高负载弹窗里出现了闲置的问法").not.toMatch(/闲置/);
+    expect(txt).toMatch(/高负载/);
+    expect(txt, "高负载应当给实测值").toContain("85.3");
+    expect(txt).toContain("444455556666");
+  });
+
   it("★★★ 确认后才带着备注派发", async () => {
     vi.mocked(api.judgeInspectionFinding).mockResolvedValue(
       { ok: true, task_id: "t-9", agent_space_id: "sp" } as never);
@@ -987,7 +1042,7 @@ describe("确认弹窗（备注与按钮不再隔 350px）", () => {
     fireEvent.change(dlg.querySelector("textarea")!,
       { target: { value: "  这台是灾备备库  " } });
     fireEvent.click([...dlg.querySelectorAll("button")]
-      .find((b) => /派发判读|Dispatch review/.test(b.textContent || ""))!);
+      .find((b) => /开始分析|Start analysis/.test(b.textContent || ""))!);
     await waitFor(() => {
       expect(vi.mocked(api.judgeInspectionFinding)).toHaveBeenCalled();
     });
@@ -1001,7 +1056,7 @@ describe("确认弹窗（备注与按钮不再隔 350px）", () => {
     await openModal();
     const dlg = document.querySelector('[role="dialog"]')!;
     fireEvent.click([...dlg.querySelectorAll("button")]
-      .find((b) => /派发判读|Dispatch review/.test(b.textContent || ""))!);
+      .find((b) => /开始分析|Start analysis/.test(b.textContent || ""))!);
     /* 🔴 失败时也要关：错误提示条在弹窗**后面**的页面上（弹窗有遮罩），
        留着弹窗客户看不见它，只觉得点了没反应。 */
     await waitFor(() => {
@@ -1012,7 +1067,7 @@ describe("确认弹窗（备注与按钮不再隔 350px）", () => {
       ).toBe(1);
     });
     await waitFor(() => {
-      expect(screen.queryByText(/kill switch/)).not.toBeNull();
+      expect(screen.queryByText(/巡检已被管理员暂停/)).not.toBeNull();
     });
   });
 
@@ -1432,6 +1487,8 @@ describe("闲置评分条的满格分数", () => {
     await waitFor(() => {
       expect(document.querySelectorAll('[role="dialog"]').length).toBe(1);
     });
+    // 2026-10 第三版：评分明细默认折起，先展开
+    fireEvent.click(screen.getByRole("button", { name: /评分明细/ }));
   };
 
   it("★★★ ElastiCache 的满格是 35 不是写死的 40", async () => {
@@ -1555,7 +1612,7 @@ describe("抽屉的判读等待态", () => {
     render(<InspectionDashboardPanel judged onClose={() => {}}
       row={HIGH_ROW({ da_task_id: "t-1", da_parse_status: "empty" })} />);
     await waitFor(() => {
-      expect(screen.queryByText(/判读已返回但没有内容/),
+      expect(screen.queryByText(/这次分析没有拿到结果/),
         "终态被说成等待态 —— 那个状态永远不会退出",
       ).not.toBeNull();
     });

@@ -414,7 +414,7 @@ describe("「全部账号」在触发弹层里的接线（源码层）", () => {
 
   it("★★★ `submitted` 相位显示成 warning 而不是 success（绿色 ✓）", () => {
     const s = stripped();
-    expect(/phase === "timeout" \|\| runs\[rt\]\.phase === "submitted"\)\s*\n?\s*\? "warning"/
+    expect(/phase === "timeout" \|\| runs\[rt\]\.phase === "submitted"[\s\S]{0,80}\)\s*\n?\s*\? "warning"/
       .test(s),
     "submitted 落到了 success —— 绿色 ✓「已提交」读起来就是「跑完了」，"
     + "而我们对每个账号跑成没跑成一无所知",

@@ -73,16 +73,17 @@ def lambda_handler(event, context):
         logger.info("web notif: filtered by normalizer (source=%s)", source)
         return {"statusCode": 200, "body": "filtered"}
 
-    if not _claim_dedupe(pe.dedupe_key):
-        logger.info("web notif: duplicate within window; key=%s", pe.dedupe_key)
-        return {"statusCode": 200, "body": "duplicate"}
-
     # AWS Health:仅 issue(真实影响)进实时收件箱;scheduledChange /
     # accountNotification(计划维护 / EOL 等)不逐条刷屏,与 IM 端策略一致。
+    # 放在去重认领之前:反正要跳过的事件不该占一个去重键(重投时也如实回 skipped)。
     if source == "aws.health" and pe.raw_event_excerpt.get("category") != "issue":
         logger.info("web notif: non-issue health event (category=%s) skipped",
                     pe.raw_event_excerpt.get("category"))
         return {"statusCode": 200, "body": "health-non-issue-skipped"}
+
+    if not _claim_dedupe(pe.dedupe_key):
+        logger.info("web notif: duplicate within window; key=%s", pe.dedupe_key)
+        return {"statusCode": 200, "body": "duplicate"}
 
     ok = _write_inbox(pe)
     logger.info("web notif: %s source=%s key=%s",
@@ -108,18 +109,27 @@ def _normalize(event: dict):
 # 去重 —— conditional put on notif_dedupe#<key>,5 分钟窗口
 # ---------------------------------------------------------------------------
 def _claim_dedupe(key: str) -> bool:
-    """首次命中返回 True;窗口内重复返回 False。DDB 出错则 fail-open(放行)。"""
+    """首次命中返回 True;窗口内重复返回 False。DDB 出错则 fail-open(放行)。
+
+    窗口靠条件里比对 `ttl` 结束,不靠 DynamoDB TTL 删条目:TTL 是后台异步删除
+    (官方口径「通常几天内」),删之前过期条目对条件写照样可见。只写
+    `attribute_not_exists(PK)` 的话,同一个告警一小时后、隔天再进 ALARM 也会被当成
+    重复静默丢掉(2026-10-11 查出)。过期条目由这次认领直接覆盖。
+    """
     if not _ddb_table or not key:
         return True
+    now = int(time.time())
     try:
         _ddb_table.put_item(
             Item={
                 "PK": f"notif_dedupe#{key}",
                 "SK": "dedupe",
-                "claimed_at": int(time.time()),
-                "ttl": int(time.time()) + DEDUPE_TTL_SECONDS,
+                "claimed_at": now,
+                "ttl": now + DEDUPE_TTL_SECONDS,
             },
-            ConditionExpression="attribute_not_exists(PK)",
+            ConditionExpression="attribute_not_exists(PK) OR #t < :now",
+            ExpressionAttributeNames={"#t": "ttl"},
+            ExpressionAttributeValues={":now": now},
         )
         return True
     except _ddb_table.meta.client.exceptions.ConditionalCheckFailedException:

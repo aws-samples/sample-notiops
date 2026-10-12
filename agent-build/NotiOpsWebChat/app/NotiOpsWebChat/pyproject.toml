@@ -16,6 +16,12 @@ requires-python = ">=3.10"
 # 等于"他哪天跑 setup.sh",而我们验证过的是另一个版本 —— 与 agentcore CLI 不钉版本
 # 同一类问题(见 scripts/deploy_agent.sh 的 AGENTCORE_CLI_VERSION)。
 #
+# 2026-10-12 起:部署时**实际装到**的版本由 ../../agent-constraints.txt 逐个钉死
+# (deploy_agent.sh / package_artifacts.sh 把它设成 UV_CONSTRAINT,CLI 调的 uv 会读)。
+# 这里的范围仍然有用:它是版本表必须落在里面的边界(tests/test_agent_constraints.py 守),
+# 也是 `verify_agent_deps.py --latest` 金丝雀盯上游的范围。**改了这里的范围,就要跑
+# bash scripts/refresh_agent_constraints.sh 重新钉版本** —— 否则部署装的还是旧版本表。
+#
 # 上界取法:**当天能解析出来的那个版本再上一个边界**(>=1.0 取下一个 major,0.x 取下一个
 # minor,因为 0.x 的破坏性变更走 minor)。这样既挡住下一次大版本重写,又不把今天能装上的
 # 版本挡在外面。抬上界的前提是在验证账号真跑一遍 setup.sh 且 agent 能回答。

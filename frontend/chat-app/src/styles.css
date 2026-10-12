@@ -291,6 +291,13 @@ a.um-item:visited { color: var(--text); }
 }
 /* 表格行 hover —— AWS Console 的表格靠它让「我正在看哪一行」不用靠数格子。 */
 .insp-row:hover { background: var(--menu-hover); }
+/* 可点的表格行（闲置与成本）：整行是按钮。hover 只换底色（不描边 —— 行与行之间
+   只有一条底线，描边会让那条线变蓝）；键盘焦点给一圈内描边；› 在 hover 时亮起。 */
+.insp-trow { cursor: pointer; transition: background .12s; outline: none; }
+.insp-trow:hover { background: var(--menu-hover); }
+.insp-trow:focus-visible { background: var(--menu-hover); box-shadow: inset 0 0 0 2px var(--blue); }
+.insp-trow .insp-chev { opacity: .45; transition: opacity .12s, transform .12s; display: inline-block; }
+.insp-trow:hover .insp-chev, .insp-trow:focus-visible .insp-chev { opacity: 1; transform: translateX(2px); }
 /* 可点卡片的 hover：整卡可点时必须有反馈，否则用户不知道它能点。 */
 .insp-clickable { transition: border-color .12s, background .12s; }
 .insp-clickable:hover { border-color: var(--blue); background: var(--menu-hover); }

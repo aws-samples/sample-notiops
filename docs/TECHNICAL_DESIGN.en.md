@@ -2,7 +2,7 @@
 
 > 🌐 **Language**: [中文](TECHNICAL_DESIGN.md) · [English](TECHNICAL_DESIGN.en.md)
 >
-> **One-liner**: a **read-only Web Chat ops console** as the primary surface — talk to the AWS ops agent (Strands / Bedrock **AgentCore Runtime**) right in the browser to run investigations / FinOps / cases / Skills, fully read-only and never mutating the environment; as a necessary supplement, it also brings **AWS DevOps Agent** (the agentic investigation service exposed by the `aidevops` API) into enterprise IM (Feishu / Slack / DingTalk), so users can `@bot 一句话` in alert channels to launch investigations, watch real-time progress, and receive localized reports — **without ever logging into the AWS console**.
+> **One-liner**: a **read-only Web Chat ops console** as the primary surface — talk to the AWS ops agent (Strands / Bedrock **AgentCore Runtime**) right in the browser to run investigations / FinOps / cases / Skills, read-only on the customer's infrastructure and never mutating the environment (the only write: AWS Support cases the user confirms); as a necessary supplement, it also brings **AWS DevOps Agent** (the agentic investigation service exposed by the `aidevops` API) into enterprise IM (Feishu / Slack / DingTalk), so users can `@bot 一句话` in alert channels to launch investigations, watch real-time progress, and receive localized reports — **without ever logging into the AWS console**.
 
 **Version**: v1.3 · 2026-06-10
 
@@ -80,7 +80,7 @@ The core idea is "**deliver the capability where the user already is**": the pri
 
 1. **Don't touch the DevOps Agent backend protocol**: all enhancements live on the IM-adapter and front-end Lambda side
 2. **Platform-agnostic**: shared `core/` code + per-platform `platforms/<name>/` adapter; adding a new IM platform should not touch `core/`
-3. **Zero-change promise**: the entire bot path is read-only and never mutates the customer's cloud environment (see §5)
+3. **Zero-change promise**: the entire bot path is read-only on the customer's infrastructure and never mutates the customer's cloud environment (the only write: AWS Support cases the user confirms; see §5)
 4. **Always degrade on failure**: Bedrock errors / mode disabled / parsing failures all fall back to the read-only investigate path; never silently drop a message
 5. **Least privilege**: the IM Lambda execution role is granted action by action from an allowlist (see §5.1) and has no write access to the customer's infrastructure (EC2 / RDS / IAM, ...)
 
@@ -634,7 +634,7 @@ Code: [core/bedrock_intent.py:53](../core/bedrock_intent.py) `_agentic_chat_mode
 
 #### 4.2.1 Zero-change promise
 
-The bot is **read-only** and never mutates the customer's cloud environment. This is a product-level hard boundary, **not a tunable per tier** — even with `AGENTIC_CHAT_MODE=disabled`, mutation requests are refused.
+The bot is **read-only** on the customer's infrastructure and never mutates the customer's cloud environment (the only write: AWS Support cases the user confirms). This is a product-level hard boundary, **not a tunable per tier** — even with `AGENTIC_CHAT_MODE=disabled`, mutation requests are refused.
 
 #### 4.2.2 Three-layer defense
 
@@ -1095,8 +1095,10 @@ Event arrives → dedup check
    ▼ DDB conditional put:
 key = "push_dedupe#<dedupe_key>"
 TTL = now + 5 min
-ConditionExpression: attribute_not_exists(lookup_key)
-   │  Failure (same resource fired in the last 5 min) → drop
+ConditionExpression: attribute_not_exists(lookup_key) OR #t < :now
+   │  Failure (same resource fired in the last 5 min, ttl not passed yet) → drop
+   │  (compare ttl instead of waiting for DynamoDB TTL to delete the row: the TTL sweep is asynchronous,
+   │   typically within a few days, and an expired row still blocks the conditional write until then)
    ▼
 Immediately push a heads-up card to the target channel
    │
@@ -1446,7 +1448,7 @@ Design principle: even if the bot is fully compromised (IM token leaked + prompt
 
 ### 5.3 Zero-Change Defense: One Hard Boundary Plus Defense in Depth per Entry Point
 
-The hard boundary is the **read-only IAM role** (§5.1): whichever entry point is in play, the
+The hard boundary is **IAM** (§5.1): whichever entry point is in play, the
 customer account is reached through a role that is read-only on the customer's infrastructure, so
 a call that changes a resource simply has no permission. On the conversation / investigation path,
 the one write grant that touches anything of the customer's own is for AWS Support cases
@@ -1505,7 +1507,7 @@ audit still runs (see `_audit_response`)", which is a stale statement (there is 
 `bedrock_chat._audit_response_for_change`, is called from `bedrock_chat.respond()` and nowhere
 else); that docstring was corrected in place on 2026-09-03. Adding that audit means wiring it
 into `bot_llm`. The risk is bounded: the output of these two is a case summary / a service
-classification rather than runnable commands, and the hard boundary (the read-only role) holds as
+classification rather than runnable commands, and the hard boundary (IAM) holds as
 before — but "the docs claim it exists while the code does not" has to go, hence this note.
 
 ### 5.4 Data Retention and Privacy

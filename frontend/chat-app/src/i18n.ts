@@ -10,6 +10,10 @@ type Dict = Record<string, { zh: string; en: string }>;
 
 export const STRINGS: Dict = {
   "app.newChat": { zh: "新对话", en: "New chat" },
+  "app.configLoadFailed": {
+    zh: "无法加载 NotiOps 的运行配置（/config.json）。请刷新页面重试；一直这样的话，请联系部署这套 NotiOps 的管理员。",
+    en: "Could not load the NotiOps runtime configuration (/config.json). Refresh the page to try again; if it keeps happening, contact the administrator who deployed NotiOps.",
+  },
   "topic.investigate": { zh: "调查", en: "Investigation" },
   "topic.cost": { zh: "成本", en: "Cost" },
   "topic.cases": { zh: "案例", en: "Cases" },
@@ -92,8 +96,8 @@ export const STRINGS: Dict = {
   //    上一版的判据是 `dispatched && !hasJudgment` → 恒真 → 永远显示
   //    蓝色「1~3 分钟后回来」，客户一直刷新等一个不会来的东西。
   "insp.judge.failed": {
-    zh: "判读已返回但没有内容 —— 不会再变了，需要重新派发",
-    en: "The analysis came back empty; it will not change - dispatch again",
+    zh: "这次分析没有拿到结果",
+    en: "This analysis returned no result",
   },
   // 🔴 有正文但解析没对上号 —— 那段正文可能是**同批别的 finding** 的分析
   //    （一个 task 最多装 6 条，parse_failed 时挂的是整份报告原文）。
@@ -216,6 +220,18 @@ export const STRINGS: Dict = {
     zh: "这一条没有出现在判读里（同批其它条目对上了）",
     en: "this finding did not appear in the analysis (others in the batch did)",
   },
+  "insp.parse.investigation_failed": {
+    zh: "DevOps Agent 那侧的任务执行失败",
+    en: "the DevOps Agent task failed",
+  },
+  "insp.parse.investigation_timed_out": {
+    zh: "DevOps Agent 那侧的任务超时，没有完成",
+    en: "the DevOps Agent task timed out",
+  },
+  "insp.parse.no_callback": {
+    zh: "任务已结束，但结果没有传回来",
+    en: "the task finished but its result never came back",
+  },
   // 🔴 「本轮被跳过」必须与「跑完了」分开说。后端 try_acquire_run_lock 的条件
   //    不放行「今天已有成功的一轮」，而跳过是静默的（消息删除、不进 DLQ）。
   //    原来前端把这种情况显示成绿字「跑完了」—— 客户以为看到的是刚拉的指标。
@@ -230,8 +246,9 @@ export const STRINGS: Dict = {
   "insp.run.takesTodaySlot": {
     // ⚠️ 纯文本容器（tooltip），不能用 `**`。
     zh: "手动一轮会占用今天的巡检槽位：跑完之后当天的定时轮不再执行"
-      + "（调度只看「今天有没有成功的一轮」）。也就是说当天不会有状态机推进、"
-      + "不会判「已解决」、不会推送。"
+      + "（调度只看「今天有没有成功的一轮」）。已有巡检结果的账号，当天不会有"
+      + "状态机推进、不会判「已解决」、不会推送；还没有任何结果的账号，这一轮按"
+      + "正式轮落库，跑完就能在看板上看到。"
       // 🔴 「会派 AI 判读」这半必须说 —— 它花 DA 额度（按秒计费）。
       //    2026-08-29 之前手动轮**不派** DA（`dry_run` 顺带关掉了它），
       //    所以客户点完永远看不到根因分析，而界面上不说为什么。现在派了，
@@ -239,8 +256,10 @@ export const STRINGS: Dict = {
       + "会派 AI 判读（按秒计费）。",
     en: "A manual run takes today's inspection slot: the scheduled run for "
       + "today will be skipped (scheduling only checks whether a successful run "
-      + "happened today). That means no state-machine progress, no resolved "
-      + "detection and no push for the day. "
+      + "happened today). For accounts that already have results, that means no "
+      + "state-machine progress, no resolved detection and no push for the day; "
+      + "for an account with no results yet, this run is recorded as the official "
+      + "one and shows up on the dashboard when it finishes. "
       + "It does dispatch AI judgement (billed per second).",
   },
   /* ── 批量触发的护栏（2026-09-01 从五行确认屏压成一行）────────────────────
@@ -283,11 +302,11 @@ export const STRINGS: Dict = {
         那份 skill 的 idle 那一半成了死代码 —— 而它回答的正是客户唯一真正
         关心的问题：这台是真闲，还是**有理由地**闲着。 */
     // 按钮 tooltip。🔴 从 128 字压到一行 —— 没人读 128 字的 tooltip，
-  // 而且它与 `insp.judge.what`（弹窗正文）内容 80% 重复：点一下就看到完整说明，
+  // 而且它与 `insp.judge.what.*`（弹窗正文）内容 80% 重复：点一下就看到完整说明，
   // tooltip 只需要回答「点下去会不会立刻花钱」。
   "insp.judge.hint": {
-    zh: "派一次 AI 判读（会先确认）",
-    en: "Dispatch an AI review (asks first)",
+    zh: "让 AI 复查这一条（确认后才开始）",
+    en: "Have AI review this finding (asks first)",
   },
   "insp.judge.ok": {
     // 成功提示条。1~3 分钟 + 刷新的说明已经在卡片徽章与抽屉那块里了，
@@ -309,47 +328,76 @@ export const STRINGS: Dict = {
         触发了深度分析」—— 派发之后列表回到 N 条一模一样的卡片，唯一的痕迹是
         顶部那条会被关掉的提示条。于是客户不知道派过哪一条，会重复点。 */
   "insp.judge.badge": { zh: "⏳ 判读中", en: "⏳ Reviewing" },
-  "insp.judge.go": { zh: "派发判读", en: "Dispatch review" },
-  "insp.judge.noteLabel": { zh: "补充背景（可选）", en: "Add context (optional)" },
-  /* 弹窗里「会做什么」那一段。
-     🔴 「在**这个资源所在的账号**里」这半句必须写出来 —— 客户实测时问过
-        「我这个深入分析是在哪个账号内进行的」，而旧实现的答案是「聊天页顶部
-        选择器选的那个账号」，与这条 finding 无关。现在是对的，但那个疑问
-        本身说明这件事不明说就没人知道。 */
-  "insp.judge.what": {
-    // 🔴 从 143 字压到两行。原文把三件事（在哪跑 / 判什么 / 代价）揉成一段
-    //    散文，而弹窗的任务只是「这件事花钱，确认吗」。
-    // ⚠️ 不能用 `**` 加粗 —— 渲染容器是纯文本，星号会字面显示。
-    //    「这个资源所在的账号」也不再是抽象指代：`{where}` 由调用方填成
-    //    真实的「<账号> · <region>」，客户当初问的就是「在哪个账号内进行」。
-    // ⚠️ 「判断是真闲置还是有理由地闲着」后面那四个例子挪进备注框的
-    //    placeholder（那里本来就有同一批词，原来是重复的）。
-    zh: "在 {where} 里跑，判断它是真闲置还是有理由地闲着。\n"
-      + "按秒计费 · 1~3 分钟后回填 · 不能撤回、不能重复派。",
-    en: "Runs in {where}. Decides whether the resource is genuinely idle or "
-      + "idle for a reason.\n"
-      + "Billed per second · lands in 1-3 min · cannot be cancelled or repeated.",
+  // ⚠️ 2026-10 起面向客户的弹窗里不再用「派发 / 判读 / 回填」这类内部词
+  //    （客户原话：「这里面废话真多」）。
+  "insp.judge.go": { zh: "开始分析", en: "Start analysis" },
+  "insp.judge.noteLabel": { zh: "补充说明（可选）", en: "Add context (optional)" },
+  /* 弹窗里「会发生什么」那一句，按 finding 类型分四档。
+     🔴 `{where}` 由调用方填成**真实账号号** —— 客户实测时问过「我这个深入分析
+        是在哪个账号内进行的」，而旧实现的答案是「聊天页顶部选择器选的那个
+        账号」，与这条 finding 无关。现在是对的，但那个疑问本身说明这件事
+        不明说就没人知道；写「这个资源所在的账号」这种指代等于没回答。
+     🔴 分档是因为同一个弹窗也给高负载 / 结构性风险用 ——「是真闲置还是有原因
+        地闲着」放在一条 CPU 90% 的发现上是错话。
+     ⚠️ 不能用 `**` 加粗 —— 渲染容器是纯文本，星号会字面显示。 */
+  //    ⚠️ 中文控制在弹窗一行内（540px / 13px）—— 折行时第二行只剩「着。」
+  //       一个字，看起来像排版坏了。资源是哪台上面的卡片已经写了，这里不重复。
+  "insp.judge.what.idle": {
+    zh: "AI 会在账号 {where} 内复查，判断它是真闲置还是另有原因。",
+    en: "AI will check it in account {where}: genuinely idle, or idle for a reason?",
   },
-  "insp.judge.notePlaceholder": {
-    zh: "例：这台是灾备备库，平时确实没流量／只在月末跑批／缓存刻意保持预热",
-    en: "e.g. this is the DR standby, batch only runs at month end, cache is "
-      + "deliberately kept warm",
+  "insp.judge.what.capacity": {
+    zh: "AI 会在账号 {where} 内复查，判断这份配置是否确实超出实际需要。",
+    en: "AI will check it in account {where}: is it really over-provisioned?",
+  },
+  "insp.judge.what.high_load": {
+    zh: "AI 会在账号 {where} 内复查，判断这次高负载需要处理，还是预期内的波动。",
+    en: "AI will check it in account {where}: does the high load need action, "
+      + "or is it expected?",
+  },
+  "insp.judge.what.structural": {
+    zh: "AI 会在账号 {where} 内复查，判断这项风险是否需要处理。",
+    en: "AI will check it in account {where}: does this risk need action?",
+  },
+  // 确认前必须知道的代价。🔴「按秒计费」「不能撤回」两项不能删 —— 这是确认
+  // 弹窗存在的理由；「不能重复提交」说的是已派过就不再给按钮（重复派会重复
+  // 计费，两份结果写到同一行只会互相覆盖）。
+  "insp.judge.terms": {
+    zh: "约 1~3 分钟出结果 · 按秒计费 · 提交后不能撤回，也不能重复提交",
+    en: "About 1-3 min · Billed per second · Cannot be cancelled or repeated",
+  },
+  // 备注框示例，按 finding 类型分档（同 `insp.judge.what.*`）。
+  // 🔴 闲置的例子（「灾备备库，没流量」）挂在一条高负载上会误导客户该写什么。
+  "insp.judge.notePlaceholder.idle": {
+    zh: "例如：这是灾备备库，平时本就没有流量；或只在月末跑批",
+    en: "e.g. DR standby with no traffic by design, or a month-end batch job",
+  },
+  "insp.judge.notePlaceholder.capacity": {
+    zh: "例如：为大促预留的容量；或数据量预计半年内翻倍",
+    en: "e.g. headroom reserved for a sales event, or data expected to double soon",
+  },
+  "insp.judge.notePlaceholder.high_load": {
+    zh: "例如：每天凌晨 2 点有批量任务；或本周在做压测",
+    en: "e.g. a nightly 2am batch job, or a load test running this week",
+  },
+  "insp.judge.notePlaceholder.structural": {
+    zh: "例如：升级已经排期；或受上游依赖限制暂时不能改",
+    en: "e.g. upgrade already scheduled, or blocked by an upstream dependency",
   },
   /* 🔴 「不是指令」这句必须在。不说的话客户会写「这台没问题别报了」——
         而严重度是判定层的事。skill 那侧的第 6 条硬边界就是为此加的
         （它会把这句话当成**待核实的主张**而不是指令），
         但界面上也要先说清，否则客户以为写了就能关掉这条。 */
   "insp.judge.noteHint": {
-    // 🔴 从 130 字压到两行（原来这段提示比输入框本身还高）。
-    // ⚠️ 「是背景不是指令」这一句**不能删** —— 不说的话客户会写「这台没问题
+    // 🔴 2026-10 压到一行（原来两行，加上单独一行计数器，比输入框还高）。
+    // ⚠️ 「是背景不是指令」这层意思**不能删** —— 不说的话客户会写「这台没问题
     //    别报了」，然后照样被报，他会认为「填了没用」。但一句话够了，
     //    不需要解释 skill 那侧怎么处理它。
+    // ⚠️ 「写一句为什么它看起来闲」那半句删了：placeholder 的例子已经在示范。
     // ⚠️ 不能用 `**`（纯文本容器，星号字面显示）。
-    zh: "写一句「为什么它看起来闲」—— 规则看得出低利用率，看不出原因。\n"
-      + "这是背景不是指令：不会改严重度，也不会让这条消失。",
-    en: "Say WHY it looks idle - the rules see low utilisation, not the reason.\n"
-      + "This is context, not an instruction: it changes neither the severity "
-      + "nor whether the finding shows.",
+    zh: "仅作为背景供 AI 参考，不会改变严重度，也不会让这条发现消失。",
+    en: "Context, not an instruction: it won't change the severity or hide the "
+      + "finding.",
   },
   "insp.scope.neverExpiresNoRenew": {
     zh: "这条排除永不过期，不需要续期 —— 点续期反而会给它加上 30 天后的到期日",

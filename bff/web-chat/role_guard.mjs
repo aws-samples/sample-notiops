@@ -48,3 +48,63 @@ export function assertRoleBelongsTo(roleArn, accountId, code = "bad_request") {
   }
   return got;
 }
+
+/* ── 成员账号跨账号角色的新旧两代名字（2026-10 改名）──────────────────────────
+ *
+ * 成员账号里的采集 / 只读角色原名 `notiops-idle-detection-role-<系统账号>`（老
+ * idle-detector 遗留名），新接入改成 `notiops-cross-account-role-<系统账号>`。
+ *
+ * 🔴 改名 = CloudFormation 替换角色，而触发更新的路径（setup.sh / stager 的
+ *    update-stack-set 异步滚动、非 Org 客户自己更新栈）时机不由我们控制 ——
+ *    注册表 `account#<id>.role_arn` 存的那一代随时可能已被删、或新的那一代还没建。
+ *    所以 AssumeRole 时把两代当别名：先用注册表里的，AccessDenied 再换另一代试一次。
+ *
+ * ⚠️ 与 Python 侧 `shared/account_scope.py::sibling_role_arn` 同一条规则，改一边
+ *    必须改另一边。只认**带 12 位后缀**的两种形态；账号段不变，所以
+ *    `assertRoleBelongsTo` 对原 ARN 的结论对别名同样成立。
+ */
+export const CROSS_ACCOUNT_ROLE_PREFIX = "notiops-cross-account-role";
+export const LEGACY_CROSS_ACCOUNT_ROLE_PREFIX = "notiops-idle-detection-role";
+const ALIAS_RE =
+  /^(arn:aws(?:-[a-z-]+)?:iam::\d{12}:role\/)(notiops-cross-account-role|notiops-idle-detection-role)-(\d{12})$/;
+
+/** 给一代名字，返回同账号、同后缀的另一代；不是这两种形态 → 空串。 */
+export function siblingRoleArn(roleArn) {
+  const m = ALIAS_RE.exec(String(roleArn || "").trim());
+  if (!m) return "";
+  const other = m[2] === CROSS_ACCOUNT_ROLE_PREFIX
+    ? LEGACY_CROSS_ACCOUNT_ROLE_PREFIX : CROSS_ACCOUNT_ROLE_PREFIX;
+  return `${m[1]}${other}-${m[3]}`;
+}
+
+/** STS AssumeRole 的「角色不存在 / 不信任我」—— 只有这类错误才值得换别名再试。 */
+export function isAccessDenied(e) {
+  const code = e?.name || e?.Code || e?.code || "";
+  return code === "AccessDenied" || code === "AccessDeniedException";
+}
+
+/** 进程内记忆：注册表 ARN → 上次实际成功的别名（与 Python 侧 `_ALIAS_MEMO` 同语义）。
+ *  🔴 没有它，栈已换名而注册表没换的账号每次都要先吃一次 AccessDenied —— 一个看板页
+ *     对每个成员账号就是好几条 CloudTrail AccessDenied，容易触发客户的安全告警。 */
+const _aliasMemo = new Map();
+
+/** AssumeRole 要试的 ARN 顺序：注册表里那个优先，别名（若有）其次；
+ *  本进程上次已证明别名才对，就反过来。 */
+export function roleArnCandidates(roleArn) {
+  const alt = siblingRoleArn(roleArn);
+  if (!alt) return [roleArn];
+  return _aliasMemo.get(roleArn) === alt ? [alt, roleArn] : [roleArn, alt];
+}
+
+/** 仅供测试：清空进程内别名记忆，让用例之间互不影响。 */
+export function _resetRoleArnMemoForTest() { _aliasMemo.clear(); }
+
+/** 记下这次实际成功的是哪一个（`used === registered` 时清掉记忆）。 */
+export function rememberRoleArnHit(registered, used) {
+  if (!registered) return;
+  if (used && used !== registered && siblingRoleArn(registered) === used) {
+    _aliasMemo.set(registered, used);
+  } else {
+    _aliasMemo.delete(registered);
+  }
+}

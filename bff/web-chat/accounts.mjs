@@ -3,7 +3,8 @@
  *
  * 登记沿用 idle 时代的 config 表布局（PK=account#<id>, GSI1PK="accounts"）。成员账号的写侧现在是
  * Web Chat「更多 → 管理 → 账户」（member_accounts.mjs：组织内一键接入 / 手动接入；目标账号里的
- * 采集角色由接入时部署的 CloudFormation 栈建出）。
+ * 采集角色由接入时部署的 CloudFormation 栈建出，名为 notiops-cross-account-role-<系统账号>；
+ * 2026-10 之前接入的叫 notiops-idle-detection-role-<系统账号>，两代互为别名）。
  * 部署账号默认不在这份登记里：部署时（CDK 的 AutoOnboardResource / 一键部署的 stager）只写它的
  * da# 行（GSI1PK="da#accounts"，listAccounts 那条 GSI 查询读不到）。它的 account# 行通常只在管理员
  * 给部署账号配巡检 region 时由 member_accounts.mjs::setAccountRegions 建出；有人对部署账号走过

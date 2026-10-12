@@ -99,8 +99,39 @@ export interface FindingRow {
   severity: Severity;
   first_seen_date: string;
   last_run_date: string;
-  /** 由 first_seen_date 与今天相减算出（R6.5），不是存储字段。 */
+  /**
+   * 由 first_seen_date 与**最后一次评估**那天相减算出（R6.5），不是存储字段。
+   * ⚠️ 2026-10-10 起算到 `last_run_date` 而不是今天 —— 停更的 finding 不再把没看过的
+   *    那些天算进「已持续」。
+   */
   days_active: number | null;
+  /** 距最后一次评估过去了几天（0 = 今天评估过）。老 BFF 不给 → undefined。 */
+  days_since_eval?: number | null;
+  /**
+   * 资源已不存在的核实日期（`YYYY-MM-DD`）。空 = 没有证据说它没了。
+   * 🔴 有值时**不给「深入分析」**，并写清资源已经不存在（2026-10-10 客户实测）。
+   */
+  resource_missing_on?: string;
+  /** 结束方式（resolved 的行才有）：fixed / out_of_scope / resource_gone …。 */
+  resolution_kind?: string;
+  /**
+   * 停更：该类型最近一次正式轮跑过之后，这条没被评估到（BFF 按 run 记录算）。
+   * 老 BFF 不给 → undefined，调用方回退到 `days_since_eval >= 2`。
+   */
+  stale?: boolean;
+  /** 已「移出巡检范围」时是哪一层；空 = 没被排除。正式巡检关掉它之前这段时间用。 */
+  excluded_by?: string;
+  /** 排除到期日（`YYYY-MM-DD`）；空 = 永久或不知道。 */
+  excluded_until?: string;
+  /** 派发 / 结果落库时刻（epoch 秒）。 */
+  da_dispatched_at?: number | null;
+  da_updated_at?: number | null;
+  /** 当前那个 task 还没回来。 */
+  judge_in_flight?: boolean;
+  /** 回来了、没内容、重派次数没用完 → 可以「重新分析」（与后端同判据）。 */
+  judge_retryable?: boolean;
+  /** 本段生命周期里已经「重新分析」过几次。 */
+  judge_retries?: number | null;
   rule_version: string;
   consecutive_hits: number | null;
   consecutive_misses: number | null;
@@ -278,6 +309,8 @@ export interface RunRow {
   data_date: string;
   source: string;
   mode: string;
+  /** 手点的首轮被转正成 official（executor `_promote_bootstrap`）。老 BFF 不回这个字段。 */
+  bootstrap?: boolean;
   tier: string;
   catch_up: boolean;
   config_version: string;
@@ -363,7 +396,17 @@ export interface FindingsData {
      * （不是「没有失败」）。
      */
     regions_failed?: string[];
+    /** 这一轮属于哪个账号（统一视图下 BFF 挑出的那一个）。 */
+    account_id?: string;
+    /** 这一轮算出几条。 */
+    findings?: number | null;
+    /** 试运行算出、看板上还没有的新命中（不落库）。 */
+    dry_run_new_hits?: number | null;
   } | null;
+  /** 巡检 kill switch。`false` = 管理员暂停了巡检，「深入分析」「跑一轮」都不可用。 */
+  inspection_enabled?: boolean;
+  /** `{<账号>: {ok, reason}}`：「深入分析」在这个账号上走不走得通。 */
+  judge_ready?: Record<string, { ok: boolean; reason: string }>;
 }
 
 export interface OverviewData {
@@ -472,7 +515,18 @@ export interface OverviewData {
     last_run_date: string;
     last_status: string;
     completeness: number | null;
+    mode?: string;
   }>;
+  /**
+   * 逐账号的 diff（`diff` 在多账号时是加总）。手动「跑一轮」的轮询看这个 ——
+   * 看加总会把别的账号的那一轮当成自己的。
+   */
+  diff_by_account?: Record<string, OverviewData["diff"]>;
+  /** 部署账号 id（前端的「部署账号」选项是空串）。 */
+  self_account_id?: string;
+  /** 有 run 记录读失败了：缺口数可能偏低。 */
+  runs_partial?: boolean;
+  runs_failed_days?: number;
   runs: RunRow[];
   /**
    * 截断**之前**有多少轮。

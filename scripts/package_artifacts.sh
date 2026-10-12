@@ -287,7 +287,11 @@ if [ "$REUSE_AGENT" -eq 1 ]; then
   echo "  reusing $AGENT_ZIP ($(du -h "$AGENT_ZIP" | cut -f1))"
 else
   # 拉 linux/aarch64 + cp313 的 wheel 到本地再打包，几分钟量级。
-  (cd "$AGENT_DIR" && agentcore package -d . -r NotiOpsWebChat)
+  # 版本表与 deploy_agent.sh 是同一份（UV_CONSTRAINT，CLI 调的 uv 会读它）：方式 A 的 agent-code.zip
+  # 与方式 B 部署装到的依赖逐个同版本 —— 不钉的话，两条路径装到哪个版本取决于各自哪天打包。
+  AGENT_CONSTRAINTS="$AGENT_DIR/agent-constraints.txt"
+  [ -f "$AGENT_CONSTRAINTS" ] || die "missing $AGENT_CONSTRAINTS (the agent's pinned dependency versions)"
+  (cd "$AGENT_DIR" && UV_CONSTRAINT="$AGENT_CONSTRAINTS" agentcore package -d . -r NotiOpsWebChat)
   [ -f "$AGENT_ZIP" ] || die "agentcore package produced no $AGENT_ZIP"
 fi
 cp "$AGENT_ZIP" "$OUT_DIR/agent-code.zip"

@@ -222,9 +222,17 @@ export function idleTier(score: number): IdleTier {
   return "low";
 }
 
-/** 档位 → 颜色变量名。与 `idleTier` 同源，调用方不再自己写阈值。 */
+/**
+ * 档位 → 颜色。与 `idleTier` 同源，调用方不再自己写阈值。
+ *
+ * 🔴 原来是 `var(--red)` / `var(--orange)` —— 而 **`--red` 在 styles.css 里从没定义过**，
+ *    浏览器把整条 `color` 丢掉、回落到继承色，于是「高」档的分数一直是普通黑字，
+ *    档位颜色这件事从上线起就没生效（2026-10 截图核对时发现）。
+ * ⚠️ 高档用 `--orange2`（深橙）而不是红：这一页上几乎每条都是高档，一整列红字读起来
+ *    像告警；档名在 aria-label / title 里，不只靠颜色。
+ */
 export function idleTierColor(score: number): string {
-  return { high: "var(--red)", mid: "var(--orange)", low: "var(--muted)" }[
+  return { high: "var(--orange2)", mid: "#b7791f", low: "var(--muted)" }[
     idleTier(score)];
 }
 
@@ -242,9 +250,13 @@ export function idleTierText(score: number, zh: boolean): string {
 export type IdleBadgeKind = "score" | "undecided" | "severity";
 
 export function idleBadgeKind(
-  row: { kind: string; idle_score: number | null },
+  row: { kind: string; idle_score: number | null; rule?: string },
 ): IdleBadgeKind {
   if (row.kind !== "idle") return "severity";
+  // 🔴 闲置页上还有容量审计那两条（`oversized_storage` / `oversized_memory`）。
+  //    它们的判据是占用比值，**本来就没有闲置分** —— `null` 是正常形态，不是
+  //    「判据不足」。原来一律落 `undecided`，每条超配都挂琥珀色「未判定」（2026-10）。
+  if (row.rule === "oversized_storage" || row.rule === "oversized_memory") return "severity";
   return row.idle_score === null ? "undecided" : "score";
 }
 
@@ -333,6 +345,7 @@ export function staleEvidenceText(
     ? `数据截至 ${asOf}（${days} 天前）`
     : `data as of ${asOf} (${days}d ago)`;
 }
+
 
 /**
  * 闲置评分各维度的显示名与实测值单位。
@@ -624,6 +637,7 @@ export function judgementState(row: {
   //    在每个调用点各处理一遍。
   conclusion?: string;
   skip_reason?: string;
+  judge_in_flight?: boolean;
 }, opts: {
   /** 派过判读没有。由列表那一层算（含乐观状态），比 `da_task_id` 更早为真。 */
   dispatched?: boolean;
@@ -664,8 +678,10 @@ export function judgementState(row: {
 
   // ② 没正文但**派过** —— 分「还在路上」与「回来了是空的」。
   //    判据是 `da_parse_status` 有没有值：callback 写它的时候判读已经回来了。
+  //    ⚠️ `judge_in_flight`：批量派发保留上一份结果，行上的 parse_status 可能是上一个
+  //       task 的 —— 新 task 还在路上时那不是「失败」。
   if (dispatched) {
-    return status ? "failed" : "pending";
+    return status && !row.judge_in_flight ? "failed" : "pending";
   }
 
   // ③ 没派过 —— 有确定性结论就是 `rule`，结构上不需要就是 `not_needed`，
@@ -676,6 +692,31 @@ export function judgementState(row: {
     return "not_needed";
   }
   return "missing";
+}
+
+/**
+ * 停更：BFF 给的 `stale`（该类型最近一次正式轮跑过之后没被评估到）。
+ * 老 BFF 不给时回退到「≥ 2 天没评估」。
+ */
+export function isStale(f: { stale?: boolean; days_since_eval?: number | null }): boolean {
+  if (typeof f.stale === "boolean") return f.stale;
+  return (f.days_since_eval ?? 0) >= 2;
+}
+
+/** pending 超过这么久就不再说「1~3 分钟后回来」（review B8）。 */
+export const JUDGE_SLOW_MINUTES = 30;
+
+/**
+ * 派发后已经等了几分钟；超过 `JUDGE_SLOW_MINUTES` 才返回数字，否则 null。
+ * 🔴 改前 pending 恒写「1~3 分钟后回来」—— callback 丢了 / DA 排队时它永远不会退出。
+ */
+export function judgeSlowMinutes(
+  f: { da_dispatched_at?: number | null }, nowMs: number = Date.now(),
+): number | null {
+  const at = f.da_dispatched_at;
+  if (typeof at !== "number" || !Number.isFinite(at)) return null;
+  const min = Math.floor((nowMs / 1000 - at) / 60);
+  return min >= JUDGE_SLOW_MINUTES ? min : null;
 }
 
 /* 动态拼 i18n 键的前缀，**必须提成命名常量**（而不是内联进模板字符串）。

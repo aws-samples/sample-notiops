@@ -367,14 +367,16 @@ def check_runtime_role_permissions(template: dict) -> CheckResult:
             r.err(L(f"AgentCore Runtime Role 缺少 {action}",
                     f"AgentCore Runtime Role is missing {action}"))
 
-    # 检查 AssumeRole 目标是否包含 notiops-idle-detection-role
+    # 检查 AssumeRole 目标是否同时覆盖成员账号跨账号角色的两代名字：
+    # 2026-10 起接入的 notiops-cross-account-role-*，与之前接入的 notiops-idle-detection-role*。
+    # 只有新名 → 存量成员账号全部 AccessDenied；只有旧名 → 新接入的账号全部 AccessDenied。
     targets = extract_assume_target_role_names(stmts)
-    if any("notiops-idle-detection-role" in t for t in targets):
-        r.ok(L("AssumeRole 目标包含 notiops-idle-detection-role",
-               "AssumeRole targets include notiops-idle-detection-role"))
-    else:
-        r.err(L("AssumeRole 目标不包含 notiops-idle-detection-role（cost_explorer_query 将失败）",
-                "AssumeRole targets do not include notiops-idle-detection-role (cost_explorer_query will fail)"))
+    for name in ("notiops-cross-account-role", "notiops-idle-detection-role"):
+        if any(name in t for t in targets):
+            r.ok(L(f"AssumeRole 目标包含 {name}", f"AssumeRole targets include {name}"))
+        else:
+            r.err(L(f"AssumeRole 目标不包含 {name}（对应那一代成员账号的跨账号取数将失败）",
+                    f"AssumeRole targets do not include {name} (cross-account calls into that generation of member accounts will fail)"))
 
     return r
 

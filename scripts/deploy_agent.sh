@@ -4,6 +4,7 @@
 # 由 setup.sh 调用（也可单独跑）。流程：
 #   0. 确保 uv 可用（agentcore 打 Python 包的硬依赖，缺它必失败 → 静默退化成 echo）。
 #   1. 确保 agentcore CLI 可用（公共 npm 包 @aws/agentcore，版本钉在 AGENTCORE_CLI_VERSION）。
+#   1.5 agent 依赖按 agent-constraints.txt 钉死版本；本机缓存够就离线打包（见该节注释）。
 #   2. （可选）provision web-search Gateway 并把 URL 注入 agentcore.json 的 envVars。
 #   3. agentcore deploy（CodeZip 构建，无需 docker/finch）。
 #   4. 从 CloudFormation 输出捕获 Runtime ARN，打印 + 写入 $AGENT_ARN_OUT（若设了）。
@@ -120,7 +121,29 @@ fi
 
 export AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" CDK_DEFAULT_REGION="$REGION"
 
+# ── 1.5 agent 依赖：钉死版本 + 本机缓存够就离线打包 ──
+# 🔴 2026-10-11 一次 agent 部署用了 81 分钟，其中 78 分钟耗在 agentcore CLI 打包时的
+# `uv pip install -r pyproject.toml`（往 AWS 部署只用了 2 分钟）：pyproject 里只有版本**范围**，
+# CLI 又不读 uv.lock，于是每次都去 PyPI 现场解析、重新下载；而那台机器到 PyPI 只有约 60 KB/s。
+# 治法两步：
+#   ① UV_CONSTRAINT 指向 agent-constraints.txt —— CLI 调的 uv 会自动读这个环境变量，版本固定
+#     （解析 26 秒 → 0.05 秒），上游哪天发了坏版本也打不到这次部署；
+#   ② 打包前先离线试解析一次（见 §3「离线探测」）：本机缓存里已经有全部 wheel，就只给
+#     `agentcore deploy` 那一条命令加 UV_OFFLINE=1；缺任何一个就照常联网（新机器第一次部署）。
+# 这一节必须在 §2.9 门禁之前：那道依赖门禁也按同一份版本表验证。
+AGENT_CONSTRAINTS="$AGENT_DIR/agent-constraints.txt"
+if [ ! -f "$AGENT_CONSTRAINTS" ]; then
+  echo "  $(t "❌ 缺少 ${AGENT_CONSTRAINTS}（agent 依赖的精确版本表），部署无法继续 —— 检出不完整？" "❌ Missing $AGENT_CONSTRAINTS (the agent's pinned dependency versions); cannot continue — incomplete checkout?")" >&2
+  exit 1
+fi
+export UV_CONSTRAINT="$AGENT_CONSTRAINTS"
+# 各阶段耗时（bash 内置 SECONDS）。2026-10-11 那次慢在哪，当时只能事后从 CLI 日志倒推；
+# 现在每段结束都打一行「用时 N 秒」，下次慢了一眼就能看出是哪段。
+_t_total=$SECONDS
+_took() { local s=$(( SECONDS - $1 )); echo "    $(t "（用时 ${s} 秒）" "(took ${s}s)")"; }
+
 # ── 2. Web Search Gateway（可选）──
+_t_gw=$SECONDS
 # AgentCore web search 仅 us-east-1。非该区时自动跳过（不阻断部署，但该部署没有联网搜索）。
 GATEWAY_URL=""
 if [ "$ENABLE_WEBSEARCH" = "true" ] && [ "$REGION" = "us-east-1" ]; then
@@ -133,6 +156,7 @@ if [ "$ENABLE_WEBSEARCH" = "true" ] && [ "$REGION" = "us-east-1" ]; then
     echo "$GW_OUT" | sed 's/^/    /'
     echo "  $(t "⚠ Gateway provision 失败 —— 不阻断部署，但本部署将没有联网搜索能力（界面开关按无能力处理）。" "⚠ Gateway provisioning failed — deployment continues, but this deployment will have no web-search capability (the UI toggle is treated as unavailable).")" >&2
   fi
+  _took "$_t_gw"
 elif [ "$ENABLE_WEBSEARCH" = "true" ]; then
   echo "  $(t "（AgentCore Web Search 仅 us-east-1 可用，当前 $REGION 跳过；本部署没有联网搜索能力。）" "(AgentCore Web Search is only available in us-east-1; skipping in $REGION — this deployment has no web-search capability.)")"
 fi
@@ -218,19 +242,22 @@ PY
 #     所以这类事故**没有回滚这条路**，只能向前修 —— 那就必须在**上线之前**拦住。
 #
 # 这道门禁把风险从「时间维度」搬回「动作维度」：**每一次部署**都重新验证一次，
-# 而不是指望某个定时任务。代价约 60 秒（在临时 venv 里装约束集并逐个 import）。
+# 而不是指望某个定时任务。装的是 agent-constraints.txt 里钉死的版本（= 本次真正打进包的版本），
+# 本机缓存命中时几秒、否则约 1 分钟（在临时 venv 里装并逐个 import）。
 # 跳过（只在明确知道自己在干什么时）：SKIP_DEP_VERIFY=true
 if [ "${SKIP_DEP_VERIFY:-false}" != "true" ]; then
-  echo "  $(t "校验依赖约束下装出来的组合能不能 import（约 1 分钟）…" "Verifying that the constrained dependency set actually imports (~1 min)...")"
+  _t_verify=$SECONDS
+  echo "  $(t "校验钉死的依赖版本能不能 import（缓存命中时几秒，否则约 1 分钟）…" "Verifying that the pinned dependency set actually imports (a few seconds with a warm cache, ~1 min otherwise)...")"
   if ! python3 "$PROJECT_ROOT/scripts/verify_agent_deps.py"; then
     echo "" >&2
     echo "  $(t "❌ 拒绝部署：当前依赖约束会装出一个 import 不起来的组合。" "❌ Refusing to deploy: the current dependency constraints resolve to a set that fails to import.")" >&2
     echo "     $(t "这正是 2026-09-20 现网事故的形态 —— 部上去的表现是「四个栈全绿、runtime status READY、" "This is exactly the 2026-09-20 production incident shape -- deploying anyway looks like \"all stacks green, runtime status READY,")" >&2
     echo "     $(t "聊天永久转圈」，而且 AgentCore 的 DEFAULT endpoint **不能回滚到旧版本**。" "chat spins forever\", and AgentCore's DEFAULT endpoint CANNOT be rolled back to an older version.")" >&2
     echo "     $(t "修法：按上面点名的那个包收紧 agent/pyproject.toml 与 agent-build/.../pyproject.toml" "Fix: tighten the upper bound of the package named above in BOTH agent/pyproject.toml and")" >&2
-    echo "     $(t "的上界（两份必须逐字一致），再重跑本脚本。" "agent-build/.../pyproject.toml (they must match word for word), then re-run this script.")" >&2
+    echo "     $(t "的上界（两份必须逐字一致），再跑 bash scripts/refresh_agent_constraints.sh 重新钉版本，然后重跑本脚本。" "agent-build/.../pyproject.toml (they must match word for word), run bash scripts/refresh_agent_constraints.sh to re-pin, then re-run this script.")" >&2
     exit 1
   fi
+  _took "$_t_verify"
 fi
 
 # ── 3. 部署 ──
@@ -281,10 +308,56 @@ path = sys.argv[1]
 targets = [{'name': 'default', 'account': sys.argv[2], 'region': sys.argv[3]}]
 json.dump(targets, open(path, 'w'), indent=2)
 " "$AGENT_DIR/agentcore/aws-targets.json" "$ACCT" "$REGION"
+# ── 离线探测（§1.5 ②）──
+# 用与 CLI 完全相同的参数（同一份 pyproject、同一个 UV_CONSTRAINT、托管运行时的 Python 版本、
+# CLI 的第一个平台候选 aarch64-manylinux2014、只要 wheel）离线 dry-run 一次：解析成功、而且
+# 没有任何「Would download」，才说明本机缓存里已经有全部 wheel —— 这时给 CLI 加 UV_OFFLINE=1，
+# 整个打包不碰网络。任何一条不满足（新机器、缓存被清、版本表刚升级）都照常联网，行为与改动前一样。
+AGENT_PYVER="$(python3 - "$AGENTCORE_JSON" <<'PY' 2>/dev/null || true
+import json, re, sys
+rt = json.load(open(sys.argv[1]))["runtimes"][0].get("runtimeVersion", "")   # 例如 PYTHON_3_13
+m = re.fullmatch(r"PYTHON_(\d+)_(\d+)", rt)
+print(f"{m.group(1)}.{m.group(2)}" if m else "")
+PY
+)"
+UV_OFFLINE_FOR_CLI=""
+if [ -n "$AGENT_PYVER" ]; then
+  _probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/notiops-uv-probe.XXXXXX")"
+  if _probe_out="$(UV_OFFLINE=1 uv pip install -r "$AGENT_DIR/app/NotiOpsWebChat/pyproject.toml" \
+        --target "$_probe_dir/t" --python-version "$AGENT_PYVER" \
+        --python-platform aarch64-manylinux2014 --only-binary :all: --dry-run 2>&1)" \
+     && ! printf '%s\n' "$_probe_out" | grep -q "Would download"; then
+    UV_OFFLINE_FOR_CLI=1
+  fi
+  rm -rf "$_probe_dir"
+fi
+if [ -n "$UV_OFFLINE_FOR_CLI" ]; then
+  echo "  $(t "依赖全部命中本机缓存 → 本次打包不联网（UV_OFFLINE=1）" "All dependencies are in the local cache → packaging offline this time (UV_OFFLINE=1)")"
+else
+  echo "  $(t "本机缓存里依赖不全 → 打包时联网下载（网络慢时这是最耗时的一步）" "The local cache is missing some dependencies → packaging will download them (the slowest step on a slow network)")"
+fi
+
 # agentcore CLI 自己会把完整的分步日志写到 agentcore/.cli/logs/deploy/deploy-<ts>.log，
 # 但失败时终端上往往只剩一句概括。2026-08-26 那次事故里，真正的原因（tsc TS2561）
 # 只存在于这份文件里 —— 没人知道去看它，于是排查绕了好几轮。失败即把它打出来。
-if ! ( cd "$AGENT_DIR" && agentcore deploy -y ); then
+#
+# 离线那一次如果失败，只在**确实是缓存没命中**（CLI 日志里出现 uv 的「not found in the cache」/
+# 「Network connectivity is disabled」）时联网重试一次 —— 那时 CLI 还停在本机打包、没碰 AWS。
+# 其它失败（tsc、CloudFormation……）照原样报错退出，不重试。
+_t_deploy=$SECONDS
+_deploy_ok=""
+if ( cd "$AGENT_DIR" && env ${UV_OFFLINE_FOR_CLI:+UV_OFFLINE=1} agentcore deploy -y ); then
+  _deploy_ok=1
+elif [ -n "$UV_OFFLINE_FOR_CLI" ]; then
+  _offline_log="$(ls -t "$AGENT_DIR/agentcore/.cli/logs/deploy/"*.log 2>/dev/null | head -1 || true)"
+  if [ -n "$_offline_log" ] && grep -q -E "found in the cache|Network connectivity is disabled" "$_offline_log"; then
+    echo "  $(t "⚠ 离线打包时缓存里缺了文件 —— 改为联网重试一次。" "⚠ Offline packaging hit a cache miss — retrying once with network access.")" >&2
+    if ( cd "$AGENT_DIR" && agentcore deploy -y ); then
+      _deploy_ok=1
+    fi
+  fi
+fi
+if [ -z "$_deploy_ok" ]; then
   CLI_LOG="$(ls -t "$AGENT_DIR/agentcore/.cli/logs/deploy/"*.log 2>/dev/null | head -1 || true)"
   echo "" >&2
   echo "  $(t "❌ agentcore deploy 失败。" "❌ agentcore deploy failed.")" >&2
@@ -296,6 +369,7 @@ if ! ( cd "$AGENT_DIR" && agentcore deploy -y ); then
   fi
   exit 1
 fi
+_took "$_t_deploy"
 
 # 部署已读取注入后的 agentcore.json；这里**还原为出厂值**，保持 git 跟踪文件干净
 # （避免把本部署账号的 gateway URL / 桶名提交进仓库；客户每次部署时脚本会重新注入）。
@@ -364,6 +438,7 @@ echo "  $(t "✓ Agent Runtime ARN:" "✓ Agent Runtime ARN:") $ARN"
 #   · org 模式首次安装 → 闸门从未被设上 → 跨账号被默认拒绝(功能坏,静默)。
 #   · 从 org 模式回退成单账号重跑 → 闸门仍是上次的 "1" → 跨账号一直开着(fail-open,更糟)。
 # 显式传值把闸门变成部署模式的确定性函数:--multi-account → "1",否则 → ""。
+_t_backfill=$SECONDS
 REGION="$REGION" RT_ARN="$ARN" SET_IDLE=3600 UI_LANG="$UI_LANG" \
   bash "$PROJECT_ROOT/scripts/backfill_runtime_env.sh" \
     "SKILLS_BUCKET=$SKILLS_BUCKET" \
@@ -373,6 +448,7 @@ REGION="$REGION" RT_ARN="$ARN" SET_IDLE=3600 UI_LANG="$UI_LANG" \
     "NOTIOPS_ALLOW_CROSS_ACCOUNT=$ALLOW_CROSS_ACCOUNT" \
     "COST_AGENT_MCP_URL=$COST_AGENT_MCP_URL" \
   || echo "  $(t "⚠ env 回填/idle 设置未完成(不阻断);可稍后重跑。" "⚠ env backfill / idle setting did not complete (non-blocking); re-run later.")" >&2
+_took "$_t_backfill"
 
 # ── 5. 部署后 smoke：容器**真的起来了**吗 ─────────────────────────────────────
 #
@@ -386,15 +462,44 @@ REGION="$REGION" RT_ARN="$ARN" SET_IDLE=3600 UI_LANG="$UI_LANG" \
 # ⚠️ 判据**不是** `status: READY` —— 那只表示配置与 ARN 已注册，它在事故当天也是 READY。
 # 不阻断（部署已经发生、拦不住了），但必须**大声说**，因为这是唯一能在客户之前
 # 发现"上线即挂"的时机。
+#
+# 🔴 2026-10-12 现网部署时的误报：这里原来直接调 `python3`。那台机器的 python3（Homebrew）
+# 没装 boto3，探针在 `import boto3` 那一行就崩了，脚本却打出「容器起不来 —— 聊天现在是坏的」；
+# 用装了 boto3 的解释器重跑同一段逻辑，13.9 秒就收到了 ready 帧，容器其实是好的。
+# 「探针没跑成」和「容器坏了」是两回事，报错必须分开：
+#   ① 先找一个真能 import boto3 的解释器（仓库的 .venv 优先，再 python3）；都没有就用
+#     `uv run --with boto3`（uv 是本脚本的硬前置，版本也由 UV_CONSTRAINT 钉住）；
+#   ② 探针用不同的退出码：10 = 流结束了也没见到 ready 帧，11 = 调用本身出错 —— 只有这两种才报红；
+#     其它（包括 12 = import boto3 失败、uv 起不来）一律报「冒烟没跑成」，并给出手动验证的办法。
 if [ "${SKIP_DEPLOY_SMOKE:-false}" != "true" ]; then
+  _t_smoke=$SECONDS
   echo "  $(t "部署后 smoke:发一次最小请求,确认容器真的能起来…" "Post-deploy smoke: sending one minimal request to confirm the container actually starts...")"
-  if REGION="$REGION" RT_ARN="$ARN" python3 - <<'SMOKE'
+  SMOKE_PY=""
+  for _py in "$PROJECT_ROOT/.venv/bin/python" "$(command -v python3 2>/dev/null || true)"; do
+    if [ -n "$_py" ] && [ -x "$_py" ] && "$_py" -c 'import boto3' >/dev/null 2>&1; then
+      SMOKE_PY="$_py"
+      break
+    fi
+  done
+  _smoke_py() {
+    if [ -n "$SMOKE_PY" ]; then
+      env REGION="$REGION" RT_ARN="$ARN" "$SMOKE_PY" "$@"
+    else
+      env REGION="$REGION" RT_ARN="$ARN" uv run --no-project --quiet --with boto3 python "$@"
+    fi
+  }
+  _smoke_rc=0
+  _smoke_py - <<'SMOKE' || _smoke_rc=$?
 import json
 import os
 import sys
 import uuid
 
-import boto3
+try:
+    import boto3
+except Exception as e:           # noqa: BLE001 —— 探针自己没跑成，不代表容器坏了
+    print(f"    (cannot import boto3: {type(e).__name__})", file=sys.stderr)
+    sys.exit(12)
 
 arn = os.environ["RT_ARN"]
 c = boto3.client("bedrock-agentcore", region_name=os.environ["REGION"])
@@ -416,13 +521,18 @@ try:
             continue
         if ev.get("ready"):
             sys.exit(0)          # 容器活过 import —— 这是我们唯一要确认的事
-    sys.exit(2)                  # 流结束了却没见过 ready 帧
+    sys.exit(10)                 # 流结束了却没见过 ready 帧
 except Exception as e:           # noqa: BLE001
     print(f"    ({type(e).__name__})", file=sys.stderr)
-    sys.exit(3)
+    sys.exit(11)
 SMOKE
-  then
+  if [ "$_smoke_rc" = "0" ]; then
     echo "  $(t "✓ 容器起来了(收到 agent 的第一帧)" "✓ The container starts (got the agent's first frame)")"
+  elif [ "$_smoke_rc" != "10" ] && [ "$_smoke_rc" != "11" ]; then
+    echo "" >&2
+    echo "  $(t "⚠ 部署后 smoke 没跑成(退出码 ${_smoke_rc}) —— 这既不说明容器坏了,也不说明它好了。" "⚠ The post-deploy smoke could not run (exit code $_smoke_rc) — that says nothing about whether the container is healthy.")" >&2
+    echo "     $(t "常见原因:本机没有装了 boto3 的 Python,uv 也没能临时装上(离线/网络问题)。" "Usual cause: no local Python with boto3, and uv could not fetch it either (offline / network).")" >&2
+    echo "     $(t "手动确认:在 Web Chat 里发一条消息,能收到回答就说明容器是好的。" "Check by hand: send one message in Web Chat — if it answers, the container is healthy.")" >&2
   else
     echo "" >&2
     echo "  $(t "🔴 部署成功了,但容器起不来 —— 聊天现在是坏的。" "🔴 The deploy succeeded but the container does not start -- chat is broken right now.")" >&2
@@ -433,4 +543,6 @@ SMOKE
     echo "       python3 scripts/verify_agent_deps.py" >&2
     echo "     $(t "⚠️ AgentCore 的 DEFAULT endpoint **不能回滚到旧版本**,只能向前修再重部。" "⚠️ AgentCore's DEFAULT endpoint CANNOT be rolled back to an older version -- you must fix forward and redeploy.")" >&2
   fi
+  _took "$_t_smoke"
 fi
+echo "  $(t "⏱ agent 部署总用时 $(( SECONDS - _t_total )) 秒" "⏱ Agent deploy total: $(( SECONDS - _t_total ))s")"

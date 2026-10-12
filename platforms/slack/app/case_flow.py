@@ -228,14 +228,18 @@ def start_view(client, channel_id: str, thread_ts: str,
 def start_reply(client, channel_id: str, thread_ts: str,
                 display_id: str, raw_text: str, user_id: str,
                 internal_id: str = "",
-                locale: str = "en", account_id: str = "") -> None:
+                locale: str = "en", account_id: str = "",
+                explicit: bool = False) -> None:
+    # `explicit`:只有用户自己打的显式命令(`/reply-case <号> <正文>`)才直发;自然语言识别出来的回复
+    # (默认 False)走下面那个「打开回复表单」的按钮,识别出的正文预填进表单,核对后提交才写进工单 ——
+    # 识别器会把「what should I reply to case <号> …」这种疑问句也认成回复(2026-10-11)。
     locale = _normalize_locale(locale)
     if not display_id and not internal_id:
         start_list(client, channel_id, thread_ts, locale=locale,
                    account_id=account_id)
         return
     body = _extract_reply_body(raw_text, display_id) if display_id else ""
-    if body and len(body) >= 4:
+    if body and len(body) >= 4 and explicit:
         ok = case_management.add_communication(display_id, body,
                                                internal_id=internal_id or None,
                                                account_id=account_id)
@@ -248,22 +252,16 @@ def start_reply(client, channel_id: str, thread_ts: str,
         )
         return
     # Need a modal — but again no trigger_id from @mention. Post a button.
-    pm = _json.dumps({
-        "channel_id": channel_id,
-        "thread_ts": thread_ts,
-        "display_id": display_id,
-        "internal_id": internal_id,
-        "locale": locale,
-        # 账号「章」—— `internal_id` 是**账号内**唯一的（见
-        # `core/case_management.py` 模块 docstring 口径 1），两者必须成对带回来。
-        "case_account_id": account_id,
-    }, ensure_ascii=False)
+    prefill = body[:1000] if body and len(body) >= 4 else ""
+    pm = _reply_opener_value(channel_id, thread_ts, display_id, internal_id,
+                             locale, account_id, prefill)
     client.chat_postMessage(
         channel=channel_id, thread_ts=thread_ts or None,
         text=i18n.t("case.reply.opener.fallback_text", locale,
                     display_id=display_id),
         blocks=[
-            blocks.section(i18n.t("case.reply.opener.title", locale,
+            blocks.section(i18n.t("case.reply.confirm_opener.title" if prefill
+                                  else "case.reply.opener.title", locale,
                                   display_id=display_id)),
             blocks.actions(
                 blocks.button(
@@ -273,6 +271,31 @@ def start_reply(client, channel_id: str, thread_ts: str,
             ),
         ],
     )
+
+
+def _reply_opener_value(channel_id: str, thread_ts, display_id: str, internal_id: str,
+                        locale: str, account_id: str, prefill: str) -> str:
+    """「打开回复表单」按钮的 value(JSON)。
+
+    Slack 按钮 value 上限 2000 字符,`blocks.button` 会**硬截断** —— 截断的 JSON 解析不了,
+    表单就打不开、连案例号都丢了。所以超长时缩短预填的正文,而不是让整串被截。
+    """
+    while True:
+        pm = _json.dumps({
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "display_id": display_id,
+            "internal_id": internal_id,
+            "locale": locale,
+            # 账号「章」—— `internal_id` 是**账号内**唯一的（见
+            # `core/case_management.py` 模块 docstring 口径 1），两者必须成对带回来。
+            "case_account_id": account_id,
+            # 自然语言回复识别出的正文:带到表单里预填(表单本身的上限是 1000)。
+            "prefill": prefill,
+        }, ensure_ascii=False)
+        if len(pm) <= 2000 or not prefill:
+            return pm
+        prefill = prefill[: max(0, len(prefill) - (len(pm) - 2000) - 1)]
 
 
 def start_analyze(client, channel_id: str, thread_ts: str,
@@ -498,6 +521,7 @@ def handle_action(action_id: str, body: dict, client) -> None:
             thread_ts=v.get("thread_ts", thread_ts),
             locale=locale,
             account_id=account_id,
+            prefill=str(v.get("prefill") or "")[:1000],
         )
         try:
             client.views_open(trigger_id=trigger_id, view=view)
@@ -900,7 +924,7 @@ def _dispatch_for_case(client, channel_id: str, thread_ts: str,
         f"customer gets a faster diagnostic. Reference the case as needed."
     )
     # 幂等：一个案例只起一次调查。`imtask#` 那行的 TTL 覆盖整个调查生命周期，比
-    # `claim_inflight` 的短时效在飞（几秒）更可靠 —— 用户隔一分钟再点一次也拦得住。
+    # `claim_inflight` 那把一次性锁（默认 1 小时，到点就能再抢）更可靠 —— 用户隔多久再点都拦得住。
     try:
         if ddb_state.get_im_task(incident_id):
             client.chat_postEphemeral(
@@ -1220,7 +1244,8 @@ def _build_create_view(*, channel_id: str, thread_ts: str,
 
 def _build_reply_view(*, display_id: str, internal_id: str,
                       channel_id: str, thread_ts: str,
-                      locale: str = "en", account_id: str = "") -> dict:
+                      locale: str = "en", account_id: str = "",
+                      prefill: str = "") -> dict:
     pm = _json.dumps({
         "display_id": display_id,
         "internal_id": internal_id,
@@ -1245,6 +1270,7 @@ def _build_reply_view(*, display_id: str, internal_id: str,
                 i18n.t("case.reply.body_label_short", locale),
                 "reply_body", block_id="reply_body_block",
                 placeholder=i18n.t("case.reply.body_placeholder_short", locale),
+                initial_value=prefill,
                 multiline=True, max_length=1000,
             ),
         ],

@@ -20,7 +20,7 @@
 | You're on call and want to ask right in the group chat, with colleagues looking on | **IM bot** | @ the bot to ask or to dispatch a deep investigation; answers and reports are visible to the whole group (note: in this release alarms are **not** pushed into IM groups — they show up under Notifications in the web; see §14) |
 | Ask one quick question from your phone and move on | **IM bot** | No laptop needed |
 
-> Both surfaces are **read-only by default**; the one write is an **AWS Support case** (create / reply / close), and it runs only after you confirm it (§1.5, §12). Each surface guarantees read-only **its own way** — Web Chat relies on "read-only IAM role (the hard boundary) + read-only tool layer + command-level denylist + read-only system prompt"; on IM, the default DevOps Agent direct path relies on "the read-only agent and read-only role on the DevOps Agent side", while after `/agent notiops` the same AgentCore Runtime as Web Chat answers with its read-only role and read-only tools (as in §8.1); on both IM paths NotiOps adds one change-wording regex. See §8 and "Who guarantees this 'read-only'" in §9. Anything that would change your AWS environment produces a preview for you to confirm on either surface, or sends you to the relevant console instead.
+> Both surfaces are **read-only by default**; the one write is an **AWS Support case** (create / reply / close), and it runs only after you confirm it (§1.5, §12). Each surface guarantees read-only **its own way** — Web Chat relies on "IAM permissions (the hard boundary, read-only on your infrastructure) + read-only tool layer + command-level denylist + read-only system prompt"; on IM, the default DevOps Agent direct path relies on "the read-only agent and read-only role on the DevOps Agent side", while after `/agent notiops` the same AgentCore Runtime as Web Chat answers with its read-only role and read-only tools (as in §8.1); on both IM paths NotiOps adds one change-wording regex. See §8 and "Who guarantees this 'read-only'" in §9. Anything that would change your AWS environment produces a preview for you to confirm on either surface, or sends you to the relevant console instead.
 
 ---
 
@@ -127,7 +127,7 @@ Enter sends, `Shift + Enter` inserts a newline. A caption under the composer alw
 
 ### 1.5 Three things to know immediately
 
-1. **It is read-only.** It can read your CloudWatch, CloudTrail, EC2, RDS, cost, security findings and Support cases, and it **changes nothing**. The single exception is AWS Support cases (create / reply / close), and even those only execute after you click a confirm button — see §8.
+1. **It is read-only on your infrastructure.** It can read your CloudWatch, CloudTrail, EC2, RDS, cost, security findings and Support cases, and it **changes nothing**. The single exception is AWS Support cases (create / reply / close), and even those only execute after you click a confirm button — see §8.
 2. **Every question targets one specific AWS account.** The account picker in the topbar decides which account this turn is about, and every answer's footer prints the 12-digit account it actually answered for, so you can't mistake an old answer for the current account.
 3. **Conversations are kept for 30 days by default.** The server expires them (touching a conversation refreshes the clock). Anything you need long-term, export via **long-report download** (§4.8).
 
@@ -853,9 +853,9 @@ Use the "<skill name>" skill
 
 Web Chat's read-only property is **four layers** deep — but **the four layers are not equally strong**:
 
-1. **A read-only IAM role** — **this is the only hard boundary**. Even if all three layers above it were bypassed, the permissions themselves don't allow a change to your resources: the roles Web Chat uses to reach your account are read-only on your infrastructure; apart from NotiOps' own resources (its tables, buckets and the like), the only write they carry is AWS Support case create / reply / resolve, and that only runs after you confirm it (see the end of this section; a member account's role can be made strictly read-only with the template parameter `EnableSupportCaseWrite=false`). ⚠️ Method A's deploy parameter `AgentReadOnlyAccess` (default Yes) only decides how widely the agent **can read** and doesn't touch this boundary: Yes attaches the AWS managed `ReadOnlyAccess` policy to the agent's role; No leaves only the curated read-only grants (cost, logs, metrics, RDS / EC2 describe and the like), a narrower set. Either way, the agent's role has no permission to change your infrastructure.
+1. **IAM permissions** — **this is the only hard boundary**. Even if all three layers above it were bypassed, the permissions themselves don't allow a change to your resources: the roles Web Chat uses to reach your account are read-only on your infrastructure; apart from NotiOps' own resources (its tables, buckets and the like), the only write they carry is AWS Support case create / reply / resolve, and that only runs after you confirm it (see the end of this section; a member account's role can be made strictly read-only with the template parameter `EnableSupportCaseWrite=false`). ⚠️ Method A's deploy parameter `AgentReadOnlyAccess` (default Yes) only decides how widely the agent **can read** and doesn't touch this boundary: Yes attaches the AWS managed `ReadOnlyAccess` policy to the agent's role; No leaves only the curated read-only grants (cost, logs, metrics, RDS / EC2 describe and the like), a narrower set. Either way, the agent's role has no permission to change your infrastructure.
 2. **A read-only tool layer** — the tools handed to the model are describe / get / list only.
-3. **A command-level denylist** — it blocks calls that are technically reads but shouldn't happen: `secretsmanager get-secret-value`, `ssm get-parameter --with-decryption`, `kms decrypt`, `ecr get-login-password`. ⚠️ **This layer is only in effect on the deployment-account general-query path** (the global read-only fallback MCP's `call_aws`). Querying a **member account** switches to native read-only APIs behind an assumed role, and that path has only a **read-verb prefix allowlist** and **no command-level denylist on top** — it relies on the member account's own read-only IAM role.
+3. **A command-level denylist** — it blocks calls that are technically reads but shouldn't happen: `secretsmanager get-secret-value`, `ssm get-parameter --with-decryption`, `kms decrypt`, `ecr get-login-password`. ⚠️ **This layer is only in effect on the deployment-account general-query path** (the global read-only fallback MCP's `call_aws`). Querying a **member account** switches to native read-only APIs behind an assumed role, and that path has only a **read-verb prefix allowlist** and **no command-level denylist on top** — it relies on the member account's own IAM role (read-only on your infrastructure).
 4. **A read-only system prompt** — it requires evidence before conclusions, **forbids emitting any change command**, forbids invented resource IDs, and only ever shows `describe-*` / `get-*` / `list-*` examples. ⚠️ The source comments say it plainly: **don't over-trust this layer, it is defence in depth, not a security boundary**. The same goes for layers 2 and 4.
 
 > A known residual gap (acknowledged by design): `lambda get-function-configuration` and `ecs describe-task-definition` are legitimate reads, but their responses carry environment variables. Don't put secrets in either place.
@@ -959,10 +959,10 @@ Method A is a minimal footprint that installs only Web Chat. Compared with the f
 > **Who enforces "read-only" (the wording changed on 2026-09-03 — go by the new version)**:
 > on the IM side your question **by default goes straight to AWS DevOps Agent** with no LLM on the NotiOps
 > side (that's why it costs 0 token), so on that path **refusing mutations is enforced by DevOps Agent plus
-> the read-only IAM role it assumes** — not by NotiOps spending an LLM call to guess whether you
+> the IAM role it assumes (read-only on your infrastructure)** — not by NotiOps spending an LLM call to guess whether you
 > meant to change something. In a chat / DM that has sent `/agent notiops`, the question is answered
 > with a model by the **same** AgentCore Runtime as Web Chat, and read-only rests on that runtime's scheme:
-> the read-only IAM role (the hard boundary) + a narrow tool set of AWS docs search and read-only queries
+> IAM permissions (the hard boundary, read-only on your infrastructure) + a narrow tool set of AWS docs search and read-only queries
 > (see §8.1, §15.5). In front of both paths NotiOps keeps one **regex second gate**
 > (`platforms/common/router.py`) for obvious mutation wording and prompt injection.
 > The net effect: **mutation requests never reach execution.** The one write is an AWS Support case
@@ -1198,6 +1198,8 @@ The bot returns case details + the latest reply history.
 ```
 
 > The **full** case ID is required (the long number AWS gave the case; a number shorter than 6 digits is not taken as a case ID), otherwise the bot lists your recent cases first so you can pick one.
+>
+> 🔒 **A reply phrased like this is not sent straight away**: the bot puts the text it picked up from your message into the reply form (Feishu / Slack; on DingTalk, a confirmation message), and it is added to the case only after you check it, edit it if needed, and press Send. To do it in one step, use the explicit command `/reply-case 177968247000414 <text>` (Chinese `/回复案例`) — the text is in the command, so the command itself is the confirmation and it is sent directly. **The leading slash is required**: without it, "reply-case 177968247000414 …" reads no differently from a sentence, so it too goes into the reply form for you to confirm first.
 
 ### 12.5 Smart case analysis (LLM rollup + next steps)
 
@@ -1214,7 +1216,7 @@ When you want the LLM to read the entire case thread and tell you "what now":
 @bot 案例分析 177968247000414
 ```
 
-> Phrasings like "review case …", "help me understand case …" or "what's wrong with case …" do **not** trigger smart analysis — they only open the case's details; use one of the phrasings above, with the full case ID. ⚠️ Also don't ask "what should I reply to case …": it is read as a **reply**, and if anything follows the case ID, that text is sent straight to AWS Support as your reply.
+> Phrasings like "review case …", "help me understand case …" or "what's wrong with case …" do **not** trigger smart analysis — they only open the case's details; use one of the phrasings above, with the full case ID. Questions like "what should I reply to case …" are read as a **reply**: the bot does not send anything — it puts the text it picked up into the reply form for you to confirm (see §12.4). To ask how to reply, use one of the "summarize case …" / "analyze case …" phrasings above — the analysis card includes a suggested reply.
 
 The bot first sends an "Analyzing case xxx…" placeholder, then 5-15s later returns a **purple smart-analysis card** with up to 6 sections:
 
@@ -1607,8 +1609,8 @@ The bot supports both Chinese and English — pick whichever you prefer.
 
 ### Q1: Can I have the bot restart an EC2 for me?
 
-**No**. The bot is read-only — a product-level hard rule that cannot be bypassed: by default it is
-enforced by AWS DevOps Agent plus the read-only IAM role it assumes; after `/agent notiops`, by the
+**No**. The bot is read-only on your infrastructure (the only write is an AWS Support case that runs only after you confirm it) — a product-level hard rule that cannot be bypassed: by default it is
+enforced by AWS DevOps Agent plus the IAM role it assumes (read-only on your infrastructure); after `/agent notiops`, by the
 NotiOps AgentCore Runtime's read-only role and read-only tools; on both paths NotiOps adds a regex
 second gate (see §9). See [TECHNICAL_DESIGN.en.md §5 Security design](TECHNICAL_DESIGN.en.md#5-security-design).
 

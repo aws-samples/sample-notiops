@@ -12,7 +12,10 @@ AWSTemplateFormatVersion: "2010-09-09"
 #
 # 中文原文（本模板做什么）：
 #   在业务账号内创建 NotiOps 多账号接入所需的全部资源：
-#   1. notiops-idle-detection-role — 系统账号跨账号只读采集角色
+#   1. notiops-cross-account-role-<系统账号> — 系统账号跨账号只读采集角色
+#      （2026-10 之前叫 notiops-idle-detection-role-<系统账号>，老 idle-detector 遗留名。
+#        改名 = CFN 替换角色；执行侧把两代名字当别名，见 shared/account_scope.py
+#        的 sibling_role_arn —— 存量账号的注册表行不用迁移）
 #      （RDS/ElastiCache/CW/TA/CE/COH 等）——**巡检采集就靠它**
 #      · 可选 inline notiops-support-case-write（`EnableSupportCaseWrite=true`，
 #        默认开）：**本模板唯一的写权限**，且只能写 AWS Support 工单
@@ -153,22 +156,23 @@ Conditions:
   EnableDevOpsForwarding: !Not [!Equals [!Ref DevOpsEventBusArn, ""]]
   IsPrimaryRegion: !Equals [!Ref "AWS::Region", !Ref PrimaryRegion]
   HasOrgId: !Not [!Equals [!Ref OrganizationId, ""]]
-  # 不用叠 IsPrimaryRegion：这个条件只在 IdleDetectionRole（本身已 Condition:
+  # 不用叠 IsPrimaryRegion：这个条件只在 CrossAccountRole（本身已 Condition:
   # IsPrimaryRegion）的 Policies 里用。
   HasSupportCaseWrite: !Equals [!Ref EnableSupportCaseWrite, "true"]
 
 Resources:
   # ─── 1. 跨账号只读采集角色 ───
-  # 权限与系统账号 notiops-backend-stack.ts 的 IdleDetectionRole 保持一致。
-  # 信任系统账号的 notiops-lambda-execution-role（lambda1/5、API、Web Chat BFF 共用）。
+  # 权限与系统账号 notiops-backend-stack.ts 的 IdleDetectionRole（部署账号自身那个，
+  # 逻辑 ID 未改）保持一致。
+  # 信任系统账号 root（见下方信任策略的注释）；由系统账号侧 IAM 决定谁能 assume。
   # RoleName 带 SystemAccountId 后缀：与目标账号内可能存在的【独立 NotiOps 部署】
   # （其 NotiOpsBackendStack 拥有无后缀的 notiops-idle-detection-role）解耦共存，
   # 也支持同一成员账号被多个管理部署纳管。
-  IdleDetectionRole:
+  CrossAccountRole:
     Type: AWS::IAM::Role
     Condition: IsPrimaryRegion
     Properties:
-      RoleName: !Sub "notiops-idle-detection-role-${SystemAccountId}"
+      RoleName: !Sub "notiops-cross-account-role-${SystemAccountId}"
       Description: "Allows NotiOps system account read-only access to this member account (RDS/EC2/CloudWatch/Cost/Support/Security etc.), plus AWS Support case writes when EnableSupportCaseWrite is true"
       # 挂 AWS 托管 ReadOnlyAccess：与部署账号自身 agent 的广只读范围对齐，
       # 让跨账号调查(EC2/成本/任意只读 API)与单账号体验一致。
@@ -431,11 +435,11 @@ Resources:
       LabelTemplate: "$AccountName"
 
 Outputs:
-  IdleDetectionRoleArn:
+  CrossAccountRoleArn:
     Condition: IsPrimaryRegion
     # 中文：跨账号只读角色 ARN（登记到系统账号目标账户配置的 role_arn）
     Description: >
       ARN of the cross-account read-only role. NotiOps registers this so
       resource inspection can assume it. You normally do not need to copy it
       manually - the admin page derives it and verifies with a real AssumeRole.
-    Value: !GetAtt IdleDetectionRole.Arn
+    Value: !GetAtt CrossAccountRole.Arn

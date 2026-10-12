@@ -182,8 +182,12 @@ def _k_inflight(key: str) -> str:
 # Persistent inflight lock — replaces in-process dicts so duplicate-action
 # protection survives process restarts and works across multiple replicas.
 #
-# Lock lifetime is bounded by the DDB TTL; after expiry the row auto-deletes
-# and a retry by the user goes through. Pick the TTL based on the expected
+# Lock lifetime is `ttl_seconds`: the claim condition treats a row whose `ttl`
+# has passed as free, so a retry by the user goes through once it expires. It
+# does NOT wait for DynamoDB's TTL sweep to delete the row — that runs in the
+# background ("typically within a few days" per the DynamoDB docs) and an
+# expired row stays visible to conditional writes until then; the sweep only
+# reclaims storage (2026-10-11 fix). Pick the TTL based on the expected
 # end-to-end completion time of the operation:
 #
 #   - case create / reply / resolve / sync   → ~5 min plenty
@@ -199,7 +203,8 @@ def claim_inflight(key: str, ttl_seconds: int = INFLIGHT_TTL_SECONDS) -> bool:
     caller is the first to claim it within the TTL window.
 
     Implemented as a DDB conditional put: succeeds when no row with the
-    inflight key exists, fails (returns False) when one already does.
+    inflight key exists or the existing row's `ttl` has passed, fails
+    (returns False) when an unexpired one is there.
 
     On any DDB error (throttling, network) we **fail-open** and return
     True — better to let the user proceed than to deadlock the workflow
@@ -211,14 +216,17 @@ def claim_inflight(key: str, ttl_seconds: int = INFLIGHT_TTL_SECONDS) -> bool:
     """
     if not key:
         return True
+    now = int(time.time())
     try:
         _table.put_item(
             Item={
                 "lookup_key": _k_inflight(key),
-                "claimed_at": int(time.time()),
-                "ttl": int(time.time()) + ttl_seconds,
+                "claimed_at": now,
+                "ttl": now + ttl_seconds,
             },
-            ConditionExpression="attribute_not_exists(lookup_key)",
+            ConditionExpression="attribute_not_exists(lookup_key) OR #t < :now",
+            ExpressionAttributeNames={"#t": "ttl"},
+            ExpressionAttributeValues={":now": now},
         )
         return True
     except ClientError as e:
@@ -898,8 +906,8 @@ def clear_im_agent_session(platform: str, chat_id: str) -> None:
 # （会话 12 小时，租约几分钟）。
 #
 # 为什么条件里要自己比 `ttl` 而不是靠 DDB 的 TTL 清理：TTL 删除是**尽力而为**，官方
-# 口径是 48 小时内。worker 被 Lambda 超时杀掉（或 OOM）时不会走到 release，如果只靠
-# TTL 清理，这个会话最坏会被一条死租约堵**两天**。
+# 口径是「通常几天内」，没有上限保证。worker 被 Lambda 超时杀掉（或 OOM）时不会走到
+# release，如果只靠 TTL 清理，这个会话最坏会被一条死租约堵上好几天。
 
 #: 租约兜底时长。取 worker Lambda 的 timeout（900s）—— 真实值由调用方按
 #: `context.get_remaining_time_in_millis()` 算（见 `platforms/common/lambda_deadline.py`）。

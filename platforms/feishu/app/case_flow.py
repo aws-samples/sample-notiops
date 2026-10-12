@@ -337,7 +337,13 @@ def start_view(chat_id: str, display_id: str,
 
 def start_reply(chat_id: str, display_id: str, raw_text: str,
                 internal_id: str = "", locale: str = "zh",
-                account_id: str = "") -> None:
+                account_id: str = "", explicit: bool = False) -> None:
+    """回复一个案例。
+
+    `explicit`:用户自己打的显式命令(`/回复案例 <号> <正文>`)才直发;自然语言识别出来的回复
+    (默认 False)只把识别出的正文**预填**进回复表单,用户核对后点「发送」才写进工单 —— 识别器
+    会把「该怎么回复 case <号> 的工程师」这种疑问句也认成回复(2026-10-11)。
+    """
     if not chat_id:
         return
     locale = _normalize_locale(locale)
@@ -345,14 +351,16 @@ def start_reply(chat_id: str, display_id: str, raw_text: str,
         start_list(chat_id, locale=locale, account_id=account_id)
         return
     body = _extract_reply_body(raw_text, display_id) if display_id else ""
-    if body and len(body) >= 4:
+    if body and len(body) >= 4 and explicit:
         _send_reply(chat_id, display_id, body, internal_id=internal_id,
                     locale=locale, account_id=account_id)
         return
+    prefill = body if body and len(body) >= 4 else ""
     feishu_utils.send_card(
         chat_id=chat_id,
         card=_reply_form_card(display_id, internal_id=internal_id,
-                              locale=locale, account_id=account_id),
+                              locale=locale, account_id=account_id,
+                              prefill=prefill),
     )
 
 
@@ -1001,7 +1009,7 @@ def _dispatch_for_case(chat_id: str, display_id: str,
     )
 
     # 幂等：一个案例只起一次调查。`imtask#` 那行的 TTL 覆盖整个调查生命周期，比
-    # `claim_inflight` 的短时效在飞（几秒）更可靠 —— 用户隔一分钟再点一次也拦得住。
+    # `claim_inflight` 那把一次性锁（默认 1 小时，到点就能再抢）更可靠 —— 用户隔多久再点都拦得住。
     try:
         if ddb_state.get_im_task(incident_id):
             logger.info("Investigation already dispatched for case %s — skipping",
@@ -1862,7 +1870,10 @@ def _view_card(c: CaseSummary, comms: list[Communication],
 
 
 def _reply_form_card(display_id: str, internal_id: str = "",
-                     locale: str = "zh", account_id: str = "") -> dict:
+                     locale: str = "zh", account_id: str = "",
+                     prefill: str = "") -> dict:
+    # `prefill`:从用户那句话里识别出的正文(自然语言回复走这里,见 start_reply)。填进输入框、
+    # 换一句「核对后再发」的说明;不填就是原来那张空表单。
     locale = _normalize_locale(locale)
     submit_value = {"action": "case_reply_submit",
                     "case_display_id": display_id,
@@ -1878,7 +1889,8 @@ def _reply_form_card(display_id: str, internal_id: str = "",
         "body": {"elements": [
             *_account_banner(account_id, locale),
             {"tag": "markdown",
-             "content": i18n.t("case.reply.intro", locale)},
+             "content": i18n.t("case.reply.confirm_intro" if prefill
+                                else "case.reply.intro", locale)},
             {"tag": "form",
              "name": "case_reply_form",
              "elements": [
@@ -1888,7 +1900,7 @@ def _reply_form_card(display_id: str, internal_id: str = "",
                   "placeholder": {"tag": "plain_text",
                                   "content": i18n.t(
                                       "case.reply.body_placeholder", locale)},
-                  "default_value": "",
+                  "default_value": prefill[:1000],
                   "max_length": 1000,
                   "rows": 5,
                   "required": True,

@@ -115,8 +115,37 @@ ok("_assumeAndCheckPayer 也有防御（ARN 来自 DA 关联配置，同属外�
 ok("support.mjs 的注册表 ARN 过 role_guard 校验账号段（不许手写第二份）",
   /roleArnAccount\(arn\) !== acct/.test(read("support.mjs"))
   && /from "\.\/role_guard\.mjs"/.test(read("support.mjs")));
+// 2026-10 改名后它试两个名字（新名 + 别名旧名），但两个都必须**从**
+// collectionRoleArn(id, ...) 推出来 —— 别名只换角色名、不换账号段。
 ok("verifyCollectionRole 的 ARN 仍来自 collectionRoleArn(id",
-  /const roleArn = collectionRoleArn\(id/.test(member));
+  /const preferred = collectionRoleArn\(id/.test(member)
+  && /roleArnCandidates\(preferred\)/.test(member));
+
+/* ── ③b 成员账号角色新旧两代互为别名（2026-10 改名）── */
+{
+  const { siblingRoleArn, roleArnCandidates, isAccessDenied } =
+    await import("../role_guard.mjs");
+  const NEW = "arn:aws:iam::444455556666:role/notiops-cross-account-role-111122223333";
+  const OLD = "arn:aws:iam::444455556666:role/notiops-idle-detection-role-111122223333";
+  ok("新名 → 旧名别名（同账号、同后缀）", siblingRoleArn(NEW) === OLD);
+  ok("旧名 → 新名别名（同账号、同后缀）", siblingRoleArn(OLD) === NEW);
+  ok("别名不改账号段（role_guard 校验结论对别名同样成立）",
+    roleArnAccount(siblingRoleArn(OLD)) === "444455556666");
+  ok("aws-cn 分区同样适用",
+    siblingRoleArn(OLD.replace("arn:aws:", "arn:aws-cn:"))
+      === NEW.replace("arn:aws:", "arn:aws-cn:"));
+  ok("无后缀的老名字（部署账号自身 / 历史手工接入）不参与换名",
+    siblingRoleArn("arn:aws:iam::444455556666:role/notiops-idle-detection-role") === "");
+  ok("trigger role 等别的角色不参与换名",
+    siblingRoleArn("arn:aws:iam::444455556666:role/notiops-agent-trigger-444455556666-m111122223333") === "");
+  ok("后缀不是 12 位数字不参与换名",
+    siblingRoleArn("arn:aws:iam::444455556666:role/notiops-idle-detection-role-x") === "");
+  ok("candidates：注册表里那个优先", JSON.stringify(roleArnCandidates(OLD)) === JSON.stringify([OLD, NEW]));
+  ok("candidates：非别名形态只有自己",
+    roleArnCandidates("arn:aws:iam::444455556666:role/custom").length === 1);
+  ok("isAccessDenied 认 SDK v3 的 name", isAccessDenied({ name: "AccessDenied" }));
+  ok("限流不算 AccessDenied（换名没意义）", !isAccessDenied({ name: "Throttling" }));
+}
 
 /* ── ④ StackSetNotFound → 可执行的报错 ── */
 ok("onboardAccount 把 StackSetNotFoundException 翻译成带出路的 config_error",

@@ -322,7 +322,7 @@ export class NotiOpsBackendStack extends cdk.Stack {
       ],
     });
 
-    // STS AssumeRole 权限（跨账户采集：Lambda1 Collector / Lambda5 CostAnalyzer 对目标账户 IdleDetectionRole AssumeRole；
+    // STS AssumeRole 权限（跨账户采集：巡检 executor / Lambda5 CostAnalyzer 对目标账户的跨账号角色 AssumeRole；
     // Lambda4 Notifier / Callback Lambda 对目标账户 DevOpsAgentTrigger-* AssumeRole 触发 DevOps Agent 调查 / 拉取摘要）
     lambdaRole.addToPolicy(new iam.PolicyStatement({
       actions: ["sts:AssumeRole"],
@@ -330,7 +330,10 @@ export class NotiOpsBackendStack extends cdk.Stack {
         // 只匹配两种合法形态：无后缀(自身/遗留) 与 -<12位账号>(org 模式成员账号)。
         // 带 -12位 边界避免旧的 role* 松散通配误匹配 ...roleFOO 之类名字。
         "arn:aws:iam::*:role/notiops-idle-detection-role", // 无后缀=自身/遗留手动接入
-        "arn:aws:iam::*:role/notiops-idle-detection-role-*", // 带账号后缀=org 模式成员账号（见 member-account-onboarding.yaml）
+        "arn:aws:iam::*:role/notiops-idle-detection-role-*", // 带账号后缀=2026-10 之前接入的成员账号（改名前的旧名）
+        // 2026-10 起接入模板建的成员账号角色（见 member-account-onboarding.yaml）。
+        // 两代名字执行侧互为别名（shared/account_scope.py::sibling_role_arn），所以两条都要留。
+        "arn:aws:iam::*:role/notiops-cross-account-role-*",
         "arn:aws:iam::*:role/notiops-agent-trigger-*",
       ],
     }));
@@ -491,7 +494,9 @@ export class NotiOpsBackendStack extends cdk.Stack {
       assumedBy: new iam.CompositePrincipal(
         new iam.ArnPrincipal(lambdaRole.roleArn),
       ),
-      description: "Allows idle detection system to read RDS/ElastiCache/CloudWatch data",
+      // ⚠️ 逻辑 ID `IdleDetectionRole` 与 roleName 都**不改**：改名 = 替换角色，而这是部署账号
+      //    自己的角色（CfnOutput / setup.sh 孤儿检测都按名字认它）。Description 是原地更新，可以改。
+      description: "Allows the NotiOps backend to read RDS/ElastiCache/CloudWatch data in this account",
     });
 
     idleDetectionRole.addToPolicy(new iam.PolicyStatement({
@@ -2878,7 +2883,9 @@ def handler(event, context):
     });
     new cdk.CfnOutput(this, "LambdaExecutionRoleArn", {
       value: lambdaRole.roleArn,
-      description: "Lambda 执行 Role ARN — 用于目标账户 IdleDetectionRole 的信任策略",
+      // ⚠️ 原描述教客户把它填进「目标账户 IdleDetectionRole 的信任策略」—— 那是已删除的
+      //    老控制台手工接入流程。现在成员账号模板信任的是系统账号 root，不需要抄这个 ARN。
+      description: "Lambda execution role ARN (informational; member accounts are onboarded from Web Chat Admin > Accounts)",
     });
     // 下面这条与 LiteLlmConfigSecretArn 的 description 2026-10-10 改写过（原文指向已退役的
     // Dashboard「目标账户管理」/「AI 认证」）。改写时用纯 ASCII：CFN 收模板时会把 Outputs
@@ -2887,6 +2894,7 @@ def handler(event, context):
     // 自身角色（lambda_inspection_executor `_session_for`），账号选择器里它是内置项。
     new cdk.CfnOutput(this, "IdleDetectionRoleArn", {
       value: idleDetectionRole.roleArn,
+      // ⚠ Output 名与角色本身不改（改名 = 替换角色），只改说明。
       description:
         "Read-only collection role in this (deploy) account -- nothing to register, the deploy " +
         "account is built in. Onboard member accounts in Web Chat under More > Admin > Accounts.",

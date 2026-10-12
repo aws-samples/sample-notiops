@@ -445,14 +445,18 @@ def _reconcile_task(
 
     reason = v.degraded_reason
     if not reason:
-        # COMPLETED：事件丢了但判读内容我们这里拿不到（要 journal + 报告全文，
-        # 那是 callback 的活）。**不写降级原因** —— 写了会让一条其实成功的
-        # 判读在报告上显示成「判读缺失」。
+        # COMPLETED 且已过 2 小时：事件丢了，判读内容我们这里拿不到（要 journal +
+        # 报告全文，那是 callback 的活）。
+        #
+        # 🔴 **要落 `no_callback`**（2026-10-10 review B8）。改前只打日志：行上永远是
+        #    「派了、没回来」，看板一直显示「1~3 分钟后回来」，按钮被藏、后端也拒绝
+        #    重派 —— 那条 finding 被锁死。落了之后读侧显示「没拿到结果」并给
+        #    「重新分析」（`manual_judge.RETRYABLE_PARSE_STATUSES` 含它）。
+        #    事件若之后被重放回来，`attach_judgment` 会用真实结果覆盖掉它。
+        from inspection.domain.degraded import DegradedReason
         logger.warning(
-            "task=%s 已 COMPLETED 但判读未回填 —— 事件可能丢了，"
-            "需人工重放 callback 或等下一轮巡检", task_id)
-        stats["resolved"] += 1
-        return
+            "task=%s 已 COMPLETED 但判读未回填 —— 事件丢了，标 no_callback", task_id)
+        reason = DegradedReason.NO_CALLBACK.value
 
     finding_ids = [str(f) for f in (mapping.get("finding_ids") or [])]
     _attach_reason(store, account_id, finding_ids, task_id=task_id,

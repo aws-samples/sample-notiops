@@ -116,6 +116,26 @@ class ResolutionKind(str, Enum):
       是「负载自己降了」、`prediction_missed` 是「误报」—— 三句对客户都是**假的**。
       尤其第三类：客户排掉一台已知的灾备备库，会被记成我们报错了一条。
     """
+    RESOURCE_GONE = "resource_gone"
+    """资源本身已经不存在了（被删除）。与 `out_of_scope` 同样**不进** R9.7 准确率统计。
+
+    🔴 2026-10-10 实机暴露（677 账号 18 条 finding）：资源在 9/14 被删，而 9/14、
+    9/15、9/16 三轮**正式**巡检都 `success`、`expected.instances = 0`，那 18 条却
+    一直停在 `active`、`last_run_date = 9/13`。原因与 `out_of_scope` 那次同构：
+
+    ```
+    describe 列不出那台 → 不在 attrs 里 → 不在评估集合里
+      → lifecycle._in_scope 判假 → R6.2「原地不动」
+    ```
+
+    R6.2 的「原地不动」是为**采集失败**设计的（那时我们不知道它怎样了）；资源
+    被删除时我们是**知道**的 —— 那个 region 的 describe 成功了、列表里没有它。
+    后果：看板上一直挂着「已持续 34 天 · 每月可省 $387」，客户点「深入分析」
+    才被告知资源不存在，而 KPI 的合计金额里还算着它。
+
+    ⚠️ 为什么不复用 `fixed`：那是「我们的建议起作用了」—— 资源被删可能正是
+       客户按建议做的，也可能是别的原因（换了一台），我们分不出来。
+    """
 
 
 class TransitionKind(str, Enum):
@@ -265,6 +285,7 @@ def reconcile_findings(
     *,
     today: date,
     rule_version: str = "",
+    frozen: Iterable[str] = (),
 ) -> list[Transition]:
     """R14.4 的纯函数状态机。
 
@@ -277,6 +298,11 @@ def reconcile_findings(
         observations: 本轮的观察结果。**只含被评估到的**。
         today: R14.2 —— 由入参传入，SHALL NOT 在函数内取当前时间。
         rule_version: 当前规则版本。与记录里的不同 → 强制 resolve + 新建（R6.9）。
+        frozen: 实例被评估到、但**这几条 finding 的判据本轮缺失**的 finding_id
+            （闲置分没算出来、refdata 缺、warm-up 抑制、出口过滤……）。原地不动，
+            与「实例没被评估」同一语义（R6.2a，2026-10-10 交叉 review A3）。
+            ⚠️ 不传它的后果：「判不了」被当成「没命中」—— 停机的 RDS 正是我们
+               建议客户做的处置，却会被记成一条误报（prediction_missed）。
 
     Returns:
         每条**被评估到**的 finding 一个 Transition，加上 `prev` 里
@@ -284,7 +310,7 @@ def reconcile_findings(
         ⚠️ **未被评估的 finding 不出现在返回值里**（R6.2：状态原地不动）。
     """
     evaluated_set = set(evaluated)
-    obs_by_id = {o.finding_id: o for o in observations}
+    frozen_set = set(frozen)
     out: list[Transition] = []
 
     # 只处理评估集合覆盖到的 finding。这是 R6.2 的核心：
@@ -293,6 +319,10 @@ def reconcile_findings(
 
     for obs in observations:
         fid = obs.finding_id
+        if fid in frozen_set or fid in seen:
+            # frozen 优先于观测（判据缺失时不该有观测，有也不认）；同一 id 两条观测
+            # 只认第一条 —— 两个 Transition 落库时后写覆盖前写，结果取决于顺序。
+            continue
         if not _in_scope(fid, evaluated_set):
             # 观察到了但不在评估集合里 —— 上游给错了输入。
             # 静默丢弃比处理它安全：它可能来自一批已知失败的实例。
@@ -310,6 +340,8 @@ def reconcile_findings(
     for fid, rec in prev.items():
         if fid in seen or not rec.state.is_open:
             continue
+        if fid in frozen_set:
+            continue        # R6.2a：被评估到了但这条判不了 → 原地不动
         if not _in_scope(fid, evaluated_set):
             continue        # R6.2：原地不动
         out.append(_step_missed(rec, None, today=today, rule_version=rule_version))
@@ -353,11 +385,33 @@ def _in_scope(finding_id: str, evaluated: set[str]) -> bool:
     parts = finding_id.split("#")
     if len(parts) < 4:
         return False
-    # ② region 限定 —— 生产路径
+    # ①′ region + service 限定 —— 生产路径（2026-10-10 reviewer A10）。
+    #    资源 id 只在 `(region, service)` 内唯一：同 region 同名的 RDS 与 ElastiCache
+    #    用 ② 会互相串号（一个被评估、另一个被判「未命中」）。
+    if resource_key(finding_id) in evaluated:
+        return True
+    # ② region 限定 —— 存量形状
     if f"{parts[1]}#{parts[3]}" in evaluated:
         return True
     # ③ 裸实例 id —— 存量契约
     return parts[3] in evaluated
+
+
+def resource_key(finding_id: str) -> str:
+    """finding_id → 资源键 `<region>#<service>#<instance>`（评估集合 / 排除 / present 共用）。
+
+    ⚠️ 带 service（reviewer A10）：资源 id 只在 `(region, service)` 内唯一。
+    """
+    parts = (finding_id.split("#") + [""] * 6)[:6]
+    return f"{parts[1]}#{parts[2]}#{parts[3]}"
+
+
+def _key_in(finding_id: str, keys: set[str]) -> bool:
+    """`resource_key` 或存量的 `<region>#<instance>` 任一在 `keys` 里。"""
+    parts = finding_id.split("#")
+    if len(parts) < 4:
+        return False
+    return resource_key(finding_id) in keys or f"{parts[1]}#{parts[3]}" in keys
 
 
 def _step_observed(
@@ -397,6 +451,34 @@ def _step_observed(
         return Transition(
             obs.finding_id, TransitionKind.CREATED, FindingState.NEW,
             _new_record(obs, today, rule_version),
+        )
+
+    # 🔴 **已解决的行：再命中就新起一段生命周期，没命中就原地不动**（2026-10-10）。
+    #
+    #    这一支此前不存在，`resolved` 行直接落进下面的 `_step_hit` / `_step_missed`：
+    #
+    #    ```
+    #    resolved + 命中   → _step_hit 认不出 RESOLVED → UNCHANGED，state 仍是 resolved
+    #                        ⇒ 真风险每天在越线，看板「待处置」里永远看不到它
+    #    resolved + 健康   → _step_missed → resolving（重新上看板）→ 再「resolved」，
+    #                        resolution_kind 被改写成 fixed（「客户修好了」是假话）
+    #    ```
+    #
+    #    进入 resolved 的入口很多（一日抖动、排除、资源删除、高负载 worst 指标切换），
+    #    任何一个之后同一 `(实例, 规则, 指标)` 就被永久静音。三个 reviewer 独立报了这条。
+    #
+    # ⚠️ 新建而不是「重开」（保留 first_seen）：与 `resolve_out_of_scope` 的设计一致
+    #    （排除过期后「我们从 X 日重新开始看」）—— 中间那段我们没在看 / 资源不存在，
+    #    「已持续 N 天」把它算进去是一句假话。新记录照常要两轮确认（R1.0c）。
+    # ⚠️ 放在规则版本判断**之前**：对 resolved 行做 `_force_resolve` 没有意义
+    #    （它已经是关的），新记录直接带上新版本号。
+    if rec.state is FindingState.RESOLVED:
+        if not obs.hit:
+            return None
+        return Transition(
+            obs.finding_id, TransitionKind.CREATED, FindingState.NEW,
+            _new_record(obs, today, rule_version),
+            note="reopened-after-resolved",
         )
 
     # R6.9：规则变了 → 强制 resolve 旧的，同时新建一条。
@@ -578,8 +660,7 @@ def resolve_out_of_scope(
         if fid in done or not rec.state.is_open:
             continue
         # finding_id 六段定长：account#region#service#instance#rule#metric（R6.1）
-        parts = fid.split("#")
-        if len(parts) < 4 or f"{parts[1]}#{parts[3]}" not in keys:
+        if not _key_in(fid, keys):
             continue
         out.append(Transition(
             fid, TransitionKind.FORCE_RESOLVED, FindingState.RESOLVED,
@@ -588,6 +669,101 @@ def resolve_out_of_scope(
             note="excluded-from-scope",
         ))
     out.sort(key=lambda t: t.finding_id)      # R14：可重放，顺序确定
+    return out
+
+
+def resolve_gone(
+    prev: Mapping[str, FindingRecord],
+    present_keys: Iterable[str],
+    covered: Iterable[str],
+    *,
+    today: date,
+    already: Iterable[str] = (),
+) -> list[Transition]:
+    """把「资源已经不存在」的那些 finding 关掉（见 `ResolutionKind.RESOURCE_GONE`）。
+
+    Args:
+        prev: 上一轮的 finding 状态（本轮规则域内的，与 `reconcile` 同一份）。
+        present_keys: 本轮 describe 列出来的**全部**资源（排除之前的），
+            `"<region>#<instance>"`。⚠️ 与 `evaluated` / `resolve_out_of_scope`
+            同一种形状。
+        covered: 本轮**确实列成功了**的 `"<region>#<service>"`。
+        already: 本轮已由 `reconcile` / `resolve_out_of_scope` 处理过的 finding_id。
+
+    ## 🔴 只在「列成功了、而且列表里没有它」时才关
+
+    `covered` 是这个函数唯一的安全边界。漏判（资源还在却被关掉）的代价是一条
+    真风险从看板上消失，所以三种「不知道」一律原地不动（R6.2）：
+
+    ```
+    region 发现阶段整体失败         不在 covered 里（调用方不给）
+    那个 service 的 describe 失败   不在 covered 里（`describe_failed` 标记）
+    region 不在本轮扫描范围          不在 covered 里（没扫，不是没有）
+    finding 的 service 段认不出      不在 covered 里（例如将来的 ec2 / ebs）
+    ```
+
+    ## 只动**开着的**
+
+    已经 resolved 的不动 —— 它的 `resolution_kind` 记录着当初为什么结束。
+    """
+    done = set(already)
+    present = set(present_keys)
+    cov = set(covered)
+    out: list[Transition] = []
+    for fid, rec in prev.items():
+        if fid in done or not rec.state.is_open:
+            continue
+        parts = fid.split("#")       # account#region#service#instance#rule#metric
+        if len(parts) < 4:
+            continue
+        if f"{parts[1]}#{parts[2]}" not in cov:
+            continue                  # 没列成功 / 没扫 → 不知道 → 原地不动
+        if _key_in(fid, present):
+            continue
+        out.append(Transition(
+            fid, TransitionKind.FORCE_RESOLVED, FindingState.RESOLVED,
+            replace(rec, state=FindingState.RESOLVED, last_run_date=today),
+            resolution_kind=ResolutionKind.RESOURCE_GONE,
+            note="resource-gone",
+        ))
+    out.sort(key=lambda t: t.finding_id)      # R14：可重放，顺序确定
+    return out
+
+
+def resolve_region_out_of_scope(
+    prev: Mapping[str, FindingRecord],
+    scanned_regions: Iterable[str],
+    *,
+    today: date,
+    already: Iterable[str] = (),
+) -> list[Transition]:
+    """客户把「采集 Region」收窄之后，范围外 region 的开着的 finding 关成 out_of_scope。
+
+    🔴 2026-10-10 reviewer A8：从 `*` 改成 `us-east-1` 之后，其余 region 的 finding
+       永远不再被评估（R6.2 原地不动）→ 永久挂在看板、周报、KPI 里。范围是客户的
+       显式意图，与「移出巡检范围」同构，所以用同一个结束方式。
+
+    ⚠️ **只在显式收窄时调**（账号配置里写了 region 列表）。`task.region` 的单
+       region 运维重跑、region 发现失败都**不是**收窄，调用方不能传。
+    """
+    done = set(already)
+    keep = {r for r in scanned_regions if r}
+    if not keep:
+        return []                     # 空范围不是「全部移出」，是调用方没给
+    out: list[Transition] = []
+    for fid, rec in prev.items():
+        if fid in done or not rec.state.is_open:
+            continue
+        parts = fid.split("#")
+        if len(parts) < 4 or parts[1] in keep or parts[1] in ("", "-"):
+            continue
+        out.append(Transition(
+            fid, TransitionKind.FORCE_RESOLVED, FindingState.RESOLVED,
+            replace(rec, state=FindingState.RESOLVED, last_run_date=today),
+            resolution_kind=ResolutionKind.OUT_OF_SCOPE,
+            note="region-out-of-scope",
+        ))
+    out.sort(key=lambda t: t.finding_id)
     return out
 
 
@@ -647,6 +823,7 @@ def reconcile(
     today: date,
     rule_version: str = "",
     dry_run: bool = False,
+    frozen: Iterable[str] = (),
 ) -> ReconcileResult:
     """`reconcile_findings` + R6.9 的新建 + dry-run 包装。
 
@@ -654,7 +831,8 @@ def reconcile(
     不产出 R6.9 要求的「强制关闭后新建的那条」。
     """
     transitions = reconcile_findings(
-        prev, evaluated, observations, today=today, rule_version=rule_version)
+        prev, evaluated, observations, today=today, rule_version=rule_version,
+        frozen=frozen)
     obs_by_id = {o.finding_id: o for o in observations}
 
     full: list[Transition] = []

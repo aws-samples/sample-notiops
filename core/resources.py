@@ -82,7 +82,7 @@ def _scoped(region: str | None, items: list, key: str) -> dict:
 def _cross_account_error(account_id: str | None) -> dict:
     return {"error": "cross_account_denied",
             "message": f"无法访问账号 {account_id} 的资源（跨账号未开启或 AssumeRole 失败）。"
-                       f"当前仅支持部署账号；多账号需配置 notiops-idle-detection-role 并解除 LOCKED 闸门。"}
+                       f"当前仅支持部署账号；多账号需先在「管理 → 账户」接入该账号并解除 LOCKED 闸门。"}
 
 
 def _err(e: Exception) -> dict:

@@ -44,6 +44,7 @@ from inspection.adapters import keys
 from inspection.domain.lifecycle import (
     FindingRecord,
     FindingState,
+    ResolutionKind,
     Transition,
     TransitionKind,
 )
@@ -75,6 +76,13 @@ DISPATCH_TTL_DAYS = 14
 
 ⚠️ SHALL NOT 取 0 / 不设 TTL：读取模式是按 task_id 点查，无界增长不影响
 性能但会一直付存储费，而 14 天以后的映射对任何代码路径都没有意义。
+"""
+
+JUDGE_LEASE_SECONDS = 120
+"""「深入分析」派发租约（`claim_judge_attempt`）的有效期。
+
+一次手动派发从领租约到打标通常 5~20 秒（describe + skill 同步 + CreateBacklogTask）。
+120 秒覆盖 BFF 那侧 30 秒上限之外的尾巴；进程被杀时最多锁这么久。
 """
 
 PUSH_STATE_TTL_DAYS = 60
@@ -748,6 +756,21 @@ class InspectionStore:
             snapshot = "evidence_as_of" in item
             stale = (sorted(_EVIDENCE_FIELDS - set(item))
                      if (resolved or snapshot) else [])
+            # 🔴 「资源已不存在」的标记：本轮又评估到了这台（命中或未命中都说明
+            #    describe 列得出它）→ 清掉。不清的表现是一台被删后同名重建的
+            #    资源永远顶着「已不存在」、按钮永远不给。
+            if RESOURCE_MISSING_ATTR not in item:
+                stale = [*stale, RESOURCE_MISSING_ATTR]
+            # 🔴 状态机的附属字段**本轮没给就清掉**（2026-10-10）。这一段是 SET-only，
+            #    不清的表现：重开的行顶着上一段生命周期的 `resolution_kind=resource_gone`
+            #    / `note=excluded-from-scope`，读侧与准确率统计会把它当成「已结束」的证据。
+            stale = [*stale, *(k for k in _LIFECYCLE_AUX if k not in item)]
+            # 🔴 新起一段生命周期（CREATED）时清掉上一段的 DA 判读。不清的表现：
+            #    新一轮的这条挂着几周前的结论，`da_task_id` 非空让「深入分析」不给按钮、
+            #    后端回 `already_dispatched` —— 新风险永远拿不到判读。
+            #    ⚠️ 本轮的派发发生在 `apply_transitions` **之后**，所以这里清的只可能是旧的。
+            if t.kind is TransitionKind.CREATED:
+                stale = [*stale, *_DA_FIELDS]
             if stale:
                 names.update({f"#r{i}": k for i, k in enumerate(stale)})
                 expr += " REMOVE " + ", ".join(f"#r{i}" for i in range(len(stale)))
@@ -949,7 +972,7 @@ class InspectionStore:
 
         ⚠️ 只写 `attribute_not_exists(PK)` 会让**崩在中途的 run 永久占锁**：
         Lambda 超时/OOM 时 `finish_run` 不会执行，行就一直是 `running`。
-        DynamoDB 的 TTL 删除是最长 48 小时的后台过程，不是到点即删，
+        DynamoDB 的 TTL 删除是后台过程（官方口径「通常几天内」，没有上限保证），不是到点即删，
         所以「等 TTL 把行删掉」不是可用的释放路径 —— 必须让条件自己判过期。
 
         ⚠️ 反过来，`completed` / `partial` **不放行**。写成
@@ -1152,6 +1175,11 @@ class InspectionStore:
 
         ⚠️ 带 `ProjectionExpression` 只取三个字段。取全行会把判读全文
         （1~3KB/条）也读回来，而对账压根不看它 —— 那是纯粹的 RCU 浪费。
+
+        ⚠️ 另一半判据 `da_updated_at < da_dispatched_at`：批量派发打标时**保留**
+           上一份判读（`mark_judge_dispatched(clear_previous=False)`，好让看板与
+           gating 的复用照旧读得到它），于是行上的 `da_updated_at` 是旧 task 的。
+           只认「不存在」会让这一次的新 task 永远进不了对账。
         """
         acct = (account_id or "").strip()
         if not acct:
@@ -1161,13 +1189,15 @@ class InspectionStore:
             # `da_task_id` 与 `da_updated_at` 都不是保留字，但 `#pk` 是必须的，
             # 而混用 names 与字面量容易漏 —— 统一走 names。
             "FilterExpression": (
-                "attribute_exists(#tid) AND attribute_not_exists(#upd)"
+                "attribute_exists(#tid) AND "
+                "(attribute_not_exists(#upd) OR #upd < #disp)"
             ),
             "ProjectionExpression": "#fid, #tid, #st",
             "ExpressionAttributeNames": {
                 "#pk": "PK",
                 "#tid": "da_task_id",
                 "#upd": "da_updated_at",
+                "#disp": "da_dispatched_at",
                 "#fid": "finding_id",
                 "#st": "state",
             },
@@ -1177,6 +1207,7 @@ class InspectionStore:
 
     def mark_judge_dispatched(
         self, account_id: str, finding_id: str, *, task_id: str,
+        clear_previous: bool = False, now_epoch: int | None = None,
     ) -> bool:
         """派发**成功那一刻**就把 `da_task_id` 落到 finding 行上。
 
@@ -1207,13 +1238,35 @@ class InspectionStore:
         ⚠️ **不写 `da_updated_at`**。`store` 里有一处判据是「`da_task_id` 存在
         而 `da_updated_at` 不存在 = 派了但还没回来」——那正是这个方法要造出的
         状态。写了它会让对账把一条还在跑的 task 当成已完成。
+
+        ## `da_dispatched_at` 与 `clear_previous`（2026-10-10 review B8 / B10）
+
+        ```
+        da_dispatched_at   派发时刻（epoch 秒）。读侧据此把等了 30 分钟以上的
+                           pending 升级成「比预期慢」；「da_updated_at < 它」
+                           = 这一次的 task 还没回来（上一份判读是旧的）
+        clear_previous     手动派发 True：重新分析时把上一份失败的结果清掉，
+                           否则行上同时挂着新 task_id 与旧的 parse_status，
+                           读侧会把还在跑的这次显示成「失败」
+                           批量派发 False：保留上一份判读，看板在新结果回来前
+                           照旧显示它，gating 的复用也还读得到
+        ```
+
+        顺手 REMOVE `judge_claimed_at`（`claim_judge_attempt` 的租约）。
         """
+        sets = ["da_task_id = :t", "da_dispatched_at = :d"]
+        removes = ["judge_claimed_at"]
+        if clear_previous:
+            removes += list(_DA_RESULT_FIELDS)
         try:
             self._t.update_item(
                 Key={"PK": keys.finding_pk(account_id), "SK": finding_id},
-                UpdateExpression="SET da_task_id = :t",
+                UpdateExpression="SET " + ", ".join(sets)
+                                 + " REMOVE " + ", ".join(removes),
                 ConditionExpression="attribute_exists(PK)",
-                ExpressionAttributeValues={":t": task_id},
+                ExpressionAttributeValues={
+                    ":t": task_id,
+                    ":d": _now_epoch() if now_epoch is None else int(now_epoch)},
             )
             return True
         except ClientError as e:
@@ -1223,6 +1276,119 @@ class InspectionStore:
             raise StoreError(f"标记判读已派发失败: {e}") from e
         except BotoCoreError as e:
             raise StoreError(f"标记判读已派发失败: {e}") from e
+
+    def claim_judge_attempt(
+        self, account_id: str, finding_id: str, *, seen_task_id: str,
+        retry: bool, now_epoch: int | None = None,
+        lease_seconds: int = JUDGE_LEASE_SECONDS,
+    ) -> int | None:
+        """「深入分析」真正花钱之前的那一步：拿租约 + 递增尝试序号。
+
+        Returns:
+            这一次的尝试序号（从 1 起，**单调递增、永不归零**）；被别的请求
+            抢先（租约未过期 / task 已换）时返回 `None`。
+
+        ## 为什么要有它（2026-10-10 review B2 / B14）
+
+        ```
+        clientToken = sha256(finding_id#manual-judge)    ← 改前：每条 finding 恒定
+          DA 的幂等缓存长期有效 ⇒ 重新分析拿回的是上一次那个已结束的 task
+        clientToken = sha256(finding_id#manual-judge#<序号>)
+          序号由这里的 ADD 给出 ⇒ 每一次尝试一个新 token
+        ```
+
+        🔴 序号**不随生命周期清零**（不在 `_DA_FIELDS` 里）：清零的话新一段生命周期
+           的第 1 次又是 `#1`，撞上几周前那次的 token。
+
+        租约（`judge_claimed_at`）堵的是两个请求同时点的窗口：两边都读到「没派过」，
+        都往下走到 CreateBacklogTask。条件是「没有租约或租约已过期」且
+        「`da_task_id` 仍是我读到的那个」—— 后者挡住「另一边刚派完」。
+        `mark_judge_dispatched` 成功时清租约；中途失败调 `release_judge_claim`；
+        进程被杀则 `lease_seconds` 后自然过期。
+
+        `retry=True` 时同时 `judge_retries += 1`（本段生命周期内的重派次数，
+        在 `_DA_FIELDS` 里，CREATED 时清零）。
+        """
+        now = _now_epoch() if now_epoch is None else int(now_epoch)
+        names = {"#c": "judge_claimed_at", "#n": "judge_attempt", "#tid": "da_task_id"}
+        values: dict[str, Any] = {":now": now, ":stale": now - int(lease_seconds),
+                                  ":one": 1}
+        cond = ("attribute_exists(PK) AND "
+                "(attribute_not_exists(#c) OR #c < :stale) AND ")
+        if seen_task_id:
+            cond += "#tid = :seen"
+            values[":seen"] = seen_task_id
+        else:
+            cond += "attribute_not_exists(#tid)"
+        update = "SET #c = :now ADD #n :one"
+        if retry:
+            names["#r"] = "judge_retries"
+            update += ", #r :one"
+        try:
+            r = self._t.update_item(
+                Key={"PK": keys.finding_pk(account_id), "SK": finding_id},
+                UpdateExpression=update,
+                ConditionExpression=cond,
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+                ReturnValues="UPDATED_NEW",
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") \
+                    == "ConditionalCheckFailedException":
+                return None
+            raise StoreError(f"领取判读租约失败: {e}") from e
+        except BotoCoreError as e:
+            raise StoreError(f"领取判读租约失败: {e}") from e
+        return int((r.get("Attributes") or {}).get("judge_attempt") or 0) or None
+
+    def release_judge_claim(self, account_id: str, finding_id: str) -> None:
+        """派发中途失败时放掉租约（尽力而为，失败只记日志 —— 租约会自己过期）。"""
+        try:
+            self._t.update_item(
+                Key={"PK": keys.finding_pk(account_id), "SK": finding_id},
+                UpdateExpression="REMOVE judge_claimed_at",
+                ConditionExpression="attribute_exists(PK)",
+            )
+        except (ClientError, BotoCoreError) as e:
+            logger.warning("放判读租约失败（%ss 后自然过期）%s: %s",
+                           JUDGE_LEASE_SECONDS, finding_id, e)
+
+    def mark_resource_missing(
+        self, account_id: str, finding_id: str, *, today: date,
+    ) -> bool:
+        """「深入分析」那一步 describe 确认资源已经不存在时，在 finding 行上打标。
+
+        ## 🔴 为什么要打标（2026-10-10 客户实测）
+
+        资源已删除的 finding 在看板上和正常的一模一样，客户点「深入分析」→
+        executor describe 找不到 → 回 `not_found` → 前端对 `not_found` 刻意**不记**
+        乐观状态（「真的没派成，要留重试入口」）→ 按钮还在，再点还是同一句报错。
+
+        打了标之后前端据此**不再给按钮**，并在抽屉顶部写清「这台资源已经不存在」。
+
+        ⚠️ **只打标，不动状态机**（`state` / `last_run_date` / 计数都不碰）。状态推进
+           只属于正式巡检（`apply_transitions` + `lifecycle.resolve_gone`）——
+           这一步只是一次 describe，不是一轮评估；动了状态会绕过 R6.8 的同日幂等。
+        ⚠️ 下一次正式巡检**又评估到**这台时，`apply_transitions` 会把标清掉
+           （同名重建的资源不该永远顶着「已不存在」）。
+        """
+        try:
+            self._t.update_item(
+                Key={"PK": keys.finding_pk(account_id), "SK": finding_id},
+                UpdateExpression="SET #m = :d",
+                ConditionExpression="attribute_exists(PK)",
+                ExpressionAttributeNames={"#m": RESOURCE_MISSING_ATTR},
+                ExpressionAttributeValues={":d": today.isoformat()},
+            )
+            return True
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") \
+                    == "ConditionalCheckFailedException":
+                return False
+            raise StoreError(f"标记资源已不存在失败: {e}") from e
+        except BotoCoreError as e:
+            raise StoreError(f"标记资源已不存在失败: {e}") from e
 
     def attach_judgment(
         self,
@@ -1360,8 +1526,15 @@ class InspectionStore:
         agent_space_id: str = "",
         client_token: str = "",
         is_heartbeat: bool = False,
+        ttl_from: date | None = None,
     ) -> None:
         """记下「这个 task 装了哪些 finding」（7.4b / R5.5a）。
+
+        `ttl_from`：TTL 的起算日，缺省 = `data_date`（定时轮：回填历史数据时不该给
+        一条早该过期的映射续命）。⚠️ 手动「深入分析」必须传**写入当天**：它的
+        `data_date` 是 finding 的 `evidence_as_of`，停更的 finding 可能是几周前 ——
+        按它算，映射一写进去就已过期，赶在 callback 之前被 TTL 删掉，
+        判读永远挂不上（2026-10-10 review B9）。取两者较晚的那个。
 
         ⚠️ 这是**回拼的唯一锚点**。callback 事件里只有 `task_id`，而一个 task
         因装箱（R5.4）可能含最多 6 条 finding。没有这一行，判读文本就只能
@@ -1390,7 +1563,9 @@ class InspectionStore:
             "finding_count": len(finding_ids),
             "is_heartbeat": is_heartbeat,
             "dispatched_at": _now_epoch(),
-            "ttl": _ttl_epoch(data_date, DISPATCH_TTL_DAYS),
+            "ttl": _ttl_epoch(
+                max(data_date, ttl_from) if ttl_from else data_date,
+                DISPATCH_TTL_DAYS),
         }
         if agent_space_id:
             item["agent_space_id"] = agent_space_id
@@ -1580,6 +1755,29 @@ class InspectionStore:
 # ---------------------------------------------------------------------------
 
 
+_LIFECYCLE_AUX: tuple[str, ...] = ("resolution_kind", "note", "prev_severity")
+"""`_finding_to_item` 按需写的状态机附属字段。本轮的 Transition 没带就要 REMOVE。"""
+
+_DA_RESULT_FIELDS: tuple[str, ...] = (
+    "da_verdict", "da_body", "da_parse_status", "da_updated_at",
+    "da_report_md_key", "da_gate_trustworthy", "da_degradations", "da_skills_loaded",
+)
+"""一次判读**回来的结果**（`attach_judgment` 写）。重新分析时清掉的就是这些。"""
+
+_DA_FIELDS: tuple[str, ...] = (
+    "da_task_id", "da_dispatched_at", *_DA_RESULT_FIELDS,
+    "judge_retries", "judge_claimed_at",
+)
+"""DA 判读写在 finding 行上的全部字段（`mark_judge_dispatched` / `attach_judgment`）。
+
+⚠️ 刻意**不含** `judge_attempt`：它是 clientToken 的盐，跨生命周期单调递增，
+   清零会让新一段的第 1 次撞上旧 token（见 `claim_judge_attempt`）。"""
+
+RESOURCE_MISSING_ATTR = "resource_missing_on"
+"""「资源已不存在」的核实日期（`YYYY-MM-DD`）。两个写点：正式巡检的
+`lifecycle.resolve_gone`（经 `_finding_to_item`）与「深入分析」的
+`mark_resource_missing`。读侧（BFF `shapeFinding` → 前端）只认这一个字段。"""
+
 _EVIDENCE_FORBIDDEN: frozenset[str] = frozenset({
     # 键位
     "PK", "SK",
@@ -1678,6 +1876,10 @@ def _finding_to_item(
     }
     if t.resolution_kind is not None:
         item["resolution_kind"] = t.resolution_kind.value
+        # 「资源已不存在」的核实日期。与「深入分析」那条路打的是**同一个标**
+        # （`mark_resource_missing`），读侧只认这一个字段。
+        if t.resolution_kind is ResolutionKind.RESOURCE_GONE:
+            item[RESOURCE_MISSING_ATTR] = today.isoformat()
     if t.prev_severity is not None:
         item["prev_severity"] = t.prev_severity.value
     if t.note:

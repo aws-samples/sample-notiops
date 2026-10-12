@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 
 import { authorize, PRESET_ROLES, satisfies, visibleTree } from "../authz.mjs";
 import { matchRoute } from "../capabilities.mjs";
-import { FINDING_KINDS, worstRunAcross } from "../inspection.mjs";
+import { FINDING_KINDS, shapeFinding, worstRunAcross } from "../inspection.mjs";
 import { PREFIX, allPrefixes, assertPrefixesDisjoint, SCHEDULE_PK, findingPk, runPk, scopePk, seriesPk, targetPk } from "../inspection_keys.mjs";
 import {
   FIELDS as rlFIELDS, SERVICES as rlSERVICES, countFor as rlCountFor,
@@ -46,6 +46,37 @@ function t(name, fn) {
   }
   pass += 1;
 }
+
+// ---------------------------------------------------------------------------
+// ⓪ 停更 / 资源已不存在（2026-10-10，677 实测）
+// ---------------------------------------------------------------------------
+t("days_active 算到最后一次评估那天，不算到今天；days_since_eval 单独给", () => {
+  // 🔴 677：first_seen 9/07、last_run 9/13，今天 10/10。原来写「已持续 34 天」，
+  //    后 27 天我们压根没看过它。
+  const f = shapeFinding({
+    SK: "123456789012#ap-northeast-1#rds#insp-mysql-m8g#idle#-",
+    first_seen_date: "2026-09-07", last_run_date: "2026-09-13",
+  }, "2026-10-10");
+  assert.equal(f.days_active, 7);
+  assert.equal(f.days_since_eval, 27);
+  // 每天都在跑的部署：两种算法一致
+  const g = shapeFinding({
+    SK: "a#r#rds#i#idle#-", first_seen_date: "2026-10-01", last_run_date: "2026-10-10",
+  }, "2026-10-10");
+  assert.equal(g.days_active, 10);
+  assert.equal(g.days_since_eval, 0);
+});
+t("resource_missing_on / resolution_kind 透出，缺省是空串", () => {
+  const f = shapeFinding({
+    SK: "a#r#rds#i#idle#-", first_seen_date: "2026-10-01", last_run_date: "2026-10-01",
+    resource_missing_on: "2026-10-10", resolution_kind: "resource_gone",
+  }, "2026-10-10");
+  assert.equal(f.resource_missing_on, "2026-10-10");
+  assert.equal(f.resolution_kind, "resource_gone");
+  const g = shapeFinding({ SK: "a#r#rds#i#idle#-" }, "2026-10-10");
+  assert.equal(g.resource_missing_on, "");
+  assert.equal(g.days_since_eval, null);
+});
 
 // ---------------------------------------------------------------------------
 // ① 键前缀与 Python 侧一致

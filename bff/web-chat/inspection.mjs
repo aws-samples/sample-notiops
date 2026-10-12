@@ -57,6 +57,9 @@ import {
    见 `infra/lib/constructs/web-chat-core.ts` 的 `INSPECTION_TABLE`。 */
 const TABLE = process.env.INSPECTION_TABLE || "";
 
+/** 配置表（kill switch / account# / da#）。与 member_accounts.mjs 等同一个兜底。 */
+const CONFIG_TABLE = process.env.CONFIG_TABLE || "notiops-config";
+
 /** 这套部署里有没有巡检后端。`false` = 方式 A（一键部署）的最小底座。 */
 export const inspectionConfigured = () =>
   String(process.env.INSPECTION_TABLE || "").trim() !== "";
@@ -268,6 +271,47 @@ export function kindOfFinding(row) {
 }
 
 /**
+ * 高负载轮产出的 `<rule>` 段（`assemble.rules_for_run_type(RunType.HIGH)`），其余归闲置轮。
+ *
+ * 决定一条 finding 受**哪一份排除清单**管、该拿**哪一类** run 判停更。
+ * ⚠️ 不能按 kind 分：`no_capacity_metadata` / `unsupported_engine` 在配置检查页，
+ *    却由高负载轮产出、受高负载那份清单管。
+ * ⚠️ 与 Python 一致由 `tests/test_inspection_bff_contract.py` 钉住。
+ */
+export const HIGH_RUN_RULES = Object.freeze(new Set([
+  "threshold_high", "no_capacity_metadata", "unsupported_engine",
+]));
+
+export function runTypeOfRule(rule) {
+  return HIGH_RUN_RULES.has(String(rule || "")) ? "high" : "idle";
+}
+
+/**
+ * 判读回来了但**没有内容**、可以「重新分析」的 `da_parse_status`，与重派上限。
+ * 与 `inspection/manual_judge.py` 的 `RETRYABLE_PARSE_STATUSES` / `MAX_JUDGE_RETRIES`
+ * 同一份（元断言钉住）。读侧据此决定给不给「重新分析」，后端据此放不放行。
+ */
+export const JUDGE_RETRYABLE = Object.freeze(new Set([
+  "empty", "missing_section", "investigation_failed", "investigation_timed_out",
+  "no_callback",
+]));
+export const MAX_JUDGE_RETRIES = 2;
+
+/**
+ * 这条 finding 当前的那个 task 还没回来（与 `manual_judge.judge_in_flight` 同判据）。
+ *
+ * `da_updated_at` 早于 `da_dispatched_at` = 行上那份结果是上一个 task 的
+ * （批量派发保留旧判读，新结果回来前看板照旧显示它）。
+ */
+export function judgeInFlight(item) {
+  if (!item?.da_task_id) return false;
+  const upd = num(item.da_updated_at);
+  if (upd === null) return true;
+  const disp = num(item.da_dispatched_at);
+  return disp !== null && upd < disp;
+}
+
+/**
  * `begins_with(SK, prefix)` 分页查询。
  *
  * ⚠️ 必须分页。DDB 单页上限 1MB，而一个账号的 finding 行数
@@ -326,14 +370,34 @@ function isoDaysAgo(n, today = new Date()) {
  * Python 侧 `FindingRecord` 刻意没有这个字段（R6.5）：存一个可增量写的计数
  * 在 SQS at-least-once 下必然被放大。这里照同样的口径算。
  */
-function shapeFinding(item, todayIso) {
+export function shapeFinding(item, todayIso) {
   const firstSeen = String(item.first_seen_date || "");
+  const lastRun = String(item.last_run_date || "");
+  const dayMs = (iso) => Date.parse(String(iso).slice(0, 10) + "T00:00:00Z");
   let daysActive = null;
+  /**
+   * 「已持续 N 天」算到**最后一次评估**那天，不是今天（2026-10-10）。
+   *
+   * 🔴 算到今天的表现（677 实测）：资源 9/14 删除、定时巡检 9/16 起关闭，finding
+   *    的 `last_run_date` 停在 9/13，而卡片上写「已持续 34 天」—— 后 26 天我们压根
+   *    没看过它。对每天都在跑的部署两种算法结果相同（last_run = 今天）。
+   *    多久没评估过，另由 `days_since_eval` 说。
+   */
+  const until = lastRun && lastRun < todayIso ? lastRun : todayIso;
   if (firstSeen) {
-    const a = Date.parse(firstSeen + "T00:00:00Z");
-    const b = Date.parse(todayIso + "T00:00:00Z");
+    const a = dayMs(firstSeen);
+    const b = dayMs(until);
     if (Number.isFinite(a) && Number.isFinite(b)) {
-      daysActive = Math.floor((b - a) / 86400000) + 1;   // 首见当天算 1 天
+      daysActive = Math.max(1, Math.floor((b - a) / 86400000) + 1);   // 首见当天算 1 天
+    }
+  }
+  // 距最后一次评估过去了几天（0 = 今天评估过）。缺 last_run_date 时 null。
+  let daysSinceEval = null;
+  if (lastRun) {
+    const a = dayMs(lastRun);
+    const b = dayMs(todayIso);
+    if (Number.isFinite(a) && Number.isFinite(b)) {
+      daysSinceEval = Math.max(0, Math.floor((b - a) / 86400000));
     }
   }
   const fid = String(item.SK || item.finding_id || "");
@@ -358,8 +422,18 @@ function shapeFinding(item, todayIso) {
     state: String(item.state || ""),
     severity: String(item.severity || "INFO").toUpperCase(),
     first_seen_date: firstSeen,
-    last_run_date: String(item.last_run_date || ""),
+    last_run_date: lastRun,
     days_active: daysActive,
+    days_since_eval: daysSinceEval,
+    /**
+     * 资源已不存在的核实日期（`store.RESOURCE_MISSING_ATTR`）。空串 = 没有证据说它没了。
+     *
+     * 🔴 前端据此**不再给「深入分析」**，并写清「这台资源已经不存在」（2026-10-10
+     *    客户实测：资源早被删了，按钮还在，点了才被告知，再点还是同一句）。
+     */
+    resource_missing_on: String(item.resource_missing_on || ""),
+    /** 结束方式（resolved 的行才有）：fixed / prediction_missed / out_of_scope / resource_gone …。 */
+    resolution_kind: String(item.resolution_kind || ""),
     rule_version: String(item.rule_version || ""),
     consecutive_hits: num(item.consecutive_hits),
     consecutive_misses: num(item.consecutive_misses),
@@ -475,6 +549,35 @@ function shapeFinding(item, todayIso) {
     // ⚠️ 列表里**不带** da_body：判读全文每条 1~3KB，300 条就是 1MB 响应。
     //    详情页用 /inspection/finding 单独取。
     has_judgment: Boolean(item.da_body),
+    /**
+     * 派发时刻 / 结果落库时刻（epoch 秒）。前端拿前者把等了 30 分钟以上的
+     * pending 升级成「比预期慢」（2026-10-10 review B8）。
+     */
+    da_dispatched_at: num(item.da_dispatched_at),
+    da_updated_at: num(item.da_updated_at),
+    /** 当前那个 task 还没回来。见 `judgeInFlight`。 */
+    judge_in_flight: judgeInFlight(item),
+    /**
+     * 可以「重新分析」：回来了、没内容、重派次数没用完（review B2）。
+     * 🔴 判据与后端 `manual_judge.load_finding` 同一份 —— 读侧给了按钮而后端拒，
+     *    就是这一轮要消掉的那种「按钮在、点了必败」。
+     */
+    judge_retryable: Boolean(item.da_task_id) && !judgeInFlight(item)
+      && JUDGE_RETRYABLE.has(String(item.da_parse_status || ""))
+      && (num(item.judge_retries) ?? 0) < MAX_JUDGE_RETRIES,
+    judge_retries: num(item.judge_retries) ?? 0,
+    /**
+     * 停更：该类型该账号最近一次正式轮跑过之后，这条没被评估到（`queryFindings` 填）。
+     * 🔴 不是「`days_since_eval >= 2`」：周度 / 工作日调度下那会天天误报（review F-10）。
+     */
+    stale: false,
+    /**
+     * 已被「移出巡检范围」时是哪一层（instance / container / service / account），
+     * 空串 = 没被排除（`queryFindings` 填，review B7）。finding 要等下一次**正式**
+     * 巡检才会关闭；这段时间里读侧据此不计入、不给「深入分析」。
+     */
+    excluded_by: "",
+    excluded_until: "",
     /**
      * 7.9a skill 门禁的结论（D22，2026-09-03）。**「这条判读的方法论生效了吗」。**
      *
@@ -652,6 +755,15 @@ async function queryFindings(acct, { kind = "", severityMin = "", visible = null
     rows = rows.filter((r) => sevRank(r.severity) <= cap);
   }
 
+  // 🔴 「移出巡检范围」之后到下一次正式巡检关闭之前，finding 照挂（review B7）。
+  //    标上是哪一层，读侧据此不计入、不给「深入分析」。读不到清单就不标（fail-open：
+  //    排除是客户偏好，不是安全边界；后端 manual_judge 自己还会再查一次）。
+  try {
+    annotateExclusions(rows, await exclusionsByAccount({ acct, visible }), todayIso);
+  } catch (e) {
+    console.warn("[inspection] 读排除清单失败，finding 不标 excluded_by:", safeErr(e));
+  }
+
   // 排序：严重度降 → 已持续天数降 → finding_id（稳定）
   // ⚠️ 第三键必须有：只按前两键排时同severity同天数的条目每次请求顺序不同，
   //    表现是「刷新一下列表就跳」。
@@ -707,8 +819,15 @@ async function queryFindings(acct, { kind = "", severityMin = "", visible = null
   //    也就是说光靠那两个字段只能修新写入的行。任何客户升级后打开看板，
   //    顶部仍然写着「另有 N 项未做根因分析」，要等下一轮 official 跑完才好。
   //    而 `rule` 段（`kindOfFinding` 的输入）是行上本来就有的，立刻生效。
+  //
+  // 🔴 只数**还需要处置**的（review F-08）：已解决、资源已不存在、已移出巡检范围的
+  //    不算。改前它们都进了这个数，顶部写「另有 4 项未做根因分析」，真正要处理的
+  //    是 1 条，其中一条抽屉里刚说过「资源已不存在，不需要再分析」。
   const missingJudgment = rows.filter(
-    (r) => !r.has_judgment
+    (r) => r.state !== "resolved"
+      && !r.resource_missing_on
+      && !r.excluded_by
+      && !r.has_judgment
       && !r.conclusion
       && !NEEDS_NO_AI.has(r.skip_reason || "")
       && !DETERMINISTIC_KINDS.has(kindOfFinding(r)));
@@ -831,22 +950,42 @@ async function queryFindings(acct, { kind = "", severityMin = "", visible = null
   // 两个接口分别取数会出现「列表是空的但状态说跑过了」的时间窗，
   // 而那正是这条要消掉的歧义。
   let lastRun = null;
+  /** `{<账号>: {ok, reason}}` —— 「深入分析」在这个账号上走不走得通（review B6）。 */
+  let judgeReady = {};
+  /** 巡检 kill switch（`appconfig#inspection/enabled`）。读不到按开启（与 Python 同口径）。 */
+  let inspectionEnabled = true;
   // ⚠️ `kind` 为空 = 总览调用。`getOverview` 自己拉 `getRuns(days:14)` 建 diff，
   //    **不读**这个字段 —— 为它发一次 Query 是纯浪费（算好了没人取）。
   if (kind) {
+    const runType = kind === "high_load" ? "high" : "idle";
     try {
-      const runs = await getRuns(acct, { days: 3 });
+      // ⚠️ 8 天而不是 3 天：停更判据要「该类型最近一次正式轮」，周度调度下它可能
+      //    在 7 天前（review F-10）。
+      const { rows: runs, failed } = await fetchRuns(acct, { days: 8 });
+      markStale(rows, runs);
       // 该 kind 属于哪一轮：structural 与 idle 同属闲置轮（run_type=idle）。
       // ⚠️ 配置检查页里有两条规则（no_capacity_metadata / unsupported_engine）
       //    其实由**高负载轮**产出。这里仍按 idle 归类是有意的：前端的
       //    `lastRuns` 同时拿 high 与 idle 两条并取「最值得说」的那一条
       //    （`TriageEmpty` 的 `rank`），所以两轮都会被考虑到。
-      lastRun = worstRunAcross(runs, {
-        runType: kind === "high_load" ? "high" : "idle",
-        crossAccount: !acct,
-        visible,
-      });
+      //
+      // 🔴 这一类有某天的 run 读失败了 → 留 null（「状态未知」，review F-11）。
+      //    挑剩下的会把「今天那条读不到」说成「今天还没巡检」。
+      if (!failed[runType]) {
+        lastRun = worstRunAcross(runs, {
+          runType,
+          crossAccount: !acct,
+          visible,
+          // 🔴 可见集合是 `"*"`（管理员 / 未配置可见性）时，用已启用账号补缺席检查
+          //    （review F-09）：否则一个三天没跑的账号在统一视图里毫无存在感。
+          expected: (!acct && visible === "*") ? await allTriggerTargets() : null,
+        });
+      }
     } catch { /* 读不到 run 记录时留 null，前端会说「状态未知」而不是「没风险」 */ }
+    [judgeReady, inspectionEnabled] = await Promise.all([
+      judgeReadiness([...new Set(rows.map((r) => r.account_id).filter(Boolean))]),
+      inspectionSwitchOn(),
+    ]);
   }
 
   return {
@@ -887,7 +1026,165 @@ async function queryFindings(acct, { kind = "", severityMin = "", visible = null
      * 前端据此区分「跑过没风险」/「还没跑」/「跑失败了」/「状态未知」。
      */
     last_run: lastRun,
+    /**
+     * 巡检 kill switch。`false` 时「深入分析」与「跑一轮」后端都会拒/吞（review B5），
+     * 前端不渲染这两个按钮，页头写一句「巡检已被管理员暂停」。
+     */
+    inspection_enabled: inspectionEnabled,
+    /** `{<账号>: {ok, reason}}`。见 `judgeReadiness`。 */
+    judge_ready: judgeReady,
   };
+}
+
+/**
+ * 巡检 kill switch 开着吗。**读失败按开着**（与 `switches.is_enabled` 的 fail-open 同口径）。
+ */
+async function inspectionSwitchOn() {
+  try {
+    const r = await ddb.send(new GetCommand({
+      TableName: CONFIG_TABLE, Key: { PK: "appconfig#inspection", SK: "enabled" },
+    }));
+    return switchValueOn(r?.Item?.config_value);
+  } catch {
+    return true;
+  }
+}
+
+/** `switches._as_bool` 的同一判据：空 / 缺失 = 开；`0 / false / no / off / disabled / n / f` = 关。 */
+export function switchValueOn(v) {
+  if (typeof v === "boolean") return v;
+  if (v === null || v === undefined) return true;
+  const s = String(v).trim().toLowerCase();
+  if (!s) return true;
+  return !["0", "false", "no", "off", "disabled", "n", "f"].includes(s);
+}
+
+/**
+ * 每个账号上「深入分析」走不走得通（review B6）。与 executor 那侧同一组前置：
+ *
+ * ```
+ * 部署账号      恒 ok（凭证是自己的，space 由 CDK 注入）
+ * 成员账号      account#<id>/meta.role_arn          ← 跨账号 describe 要它
+ *               da#<id>/meta.inspect_agent_space_id  ← 判读派进哪个 space
+ *               da#<id>/meta.trigger_role_arn        ← 跨账号建 task 要它
+ * ```
+ *
+ * 缺任何一个后端都必拒，而且改前是先跑完跨账号 describe 才拒。读侧据此不给按钮，
+ * 改成一行原因。⚠️ 读失败按 ok（不藏按钮；后端会给出真实原因）。
+ */
+async function judgeReadiness(accounts) {
+  const out = {};
+  let self = "";
+  try {
+    const { selfAccountId } = await import("./accounts.mjs");
+    self = String((await selfAccountId()) || "");
+  } catch { /* 拿不到就都按成员账号查 */ }
+  await Promise.all(accounts.map(async (a) => {
+    if (!a || a === self) { out[a] = { ok: true, reason: "" }; return; }
+    try {
+      const [acc, da] = await Promise.all([
+        ddb.send(new GetCommand({ TableName: CONFIG_TABLE, Key: { PK: `account#${a}`, SK: "meta" } })),
+        ddb.send(new GetCommand({ TableName: CONFIG_TABLE, Key: { PK: `da#${a}`, SK: "meta" } })),
+      ]);
+      out[a] = judgeReadyOf(acc?.Item, da?.Item);
+    } catch {
+      out[a] = { ok: true, reason: "" };
+    }
+  }));
+  return out;
+}
+
+/** 纯函数：两行配置 → `{ok, reason}`。`reason` 是机器码，文案在前端。 */
+export function judgeReadyOf(accountItem, daItem) {
+  if (!String(accountItem?.role_arn || "").trim()) {
+    return { ok: false, reason: "no_collect_role" };
+  }
+  if (!String(daItem?.inspect_agent_space_id || "").trim()
+      || !String(daItem?.trigger_role_arn || "").trim()) {
+    return { ok: false, reason: "no_inspect_space" };
+  }
+  return { ok: true, reason: "" };
+}
+
+/**
+ * 两份排除清单 → `Map<账号, {high: [], idle: []}>`，只留生效中的、可见账号的条目。
+ *
+ * ⚠️ 单账号查询时可见集合给 `Set([acct])`（与 `getResources` 同理：`acct` 已过了
+ *    路由层的账号门禁，这里给最小集合）。
+ */
+async function exclusionsByAccount({ acct, visible }) {
+  const vis = acct ? new Set([acct]) : visible;
+  const today = isoDaysAgo(0);
+  const out = new Map();
+  for (const kind of ["high", "idle"]) {
+    const items = await queryAll({
+      TableName: TABLE,
+      KeyConditionExpression: "#pk = :pk",
+      ExpressionAttributeNames: { "#pk": "PK" },
+      ExpressionAttributeValues: { ":pk": scopePk(kind) },
+    });
+    for (const e of filterScopeRows(items, { account: acct || "", visible: vis })
+      .map((it) => shapeExclusion(it, today))) {
+      if (e.expired) continue;
+      if (!out.has(e.account_id)) out.set(e.account_id, { high: [], idle: [] });
+      out.get(e.account_id)[kind].push(e);
+    }
+  }
+  return out;
+}
+
+/**
+ * 给 finding 行标 `excluded_by` / `excluded_until`。**纯函数**（就地改 rows）。
+ *
+ * ⚠️ finding 行上没有 `cluster_id`，所以集群 / 副本组级的排除这里认不出
+ *    （后端 `manual_judge` 用 describe 出的 attrs 再查一次，那里认得出）。
+ */
+export function annotateExclusions(rows, byAccount, today) {
+  const keyCache = new Map();
+  for (const r of rows) {
+    const lists = byAccount.get(r.account_id);
+    if (!lists) continue;
+    const kind = runTypeOfRule(r.rule);
+    const entries = lists[kind] || [];
+    if (!entries.length) continue;
+    const ck = `${r.account_id}#${kind}`;
+    if (!keyCache.has(ck)) keyCache.set(ck, exclusionKeys(entries, { today }));
+    const res = { resource_id: r.instance, service: r.service, region: r.region };
+    const layer = exclusionLayer(res, keyCache.get(ck));
+    if (!layer) continue;
+    r.excluded_by = layer;
+    const hit = entries.find(
+      (e) => exclusionLayer(res, exclusionKeys([e], { today })) === layer);
+    r.excluded_until = hit ? String(hit.expires_at || "") : "";
+  }
+}
+
+/**
+ * 标停更（review F-10）。**纯函数**（就地改 rows）。
+ *
+ * ```
+ * 该账号该类型最近一次正式终态轮（success / partial，非 dry_run）跑在 D
+ *   这条 last_run_date ≥ D        → 那一轮评估到了它 → 不停更（哪怕 D 是 6 天前：周度调度）
+ *   这条 last_run_date < D        → 正式轮跑了却没评估到它 → 停更
+ * 窗口里没有正式轮                  → 退回「距上次评估 ≥ 2 天」（定时关着的账号，677）
+ * ```
+ *
+ * ⚠️ 只看开着的行；已解决的行本来就不再评估。
+ */
+export function markStale(rows, runs) {
+  const latest = new Map();          // `${acct}#${rt}` → 那一轮的数据日
+  for (const r of runs || []) {
+    if (r.status !== "success" && r.status !== "partial") continue;
+    if (r.mode === "dry_run") continue;
+    const k = `${r.account_id}#${r.run_type}`;
+    const d = String(r.data_date || r.run_date || "");
+    if (d && (!latest.has(k) || d > latest.get(k))) latest.set(k, d);
+  }
+  for (const f of rows) {
+    if (f.state === "resolved" || f.days_since_eval === null) continue;
+    const lo = latest.get(`${f.account_id}#${runTypeOfRule(f.rule)}`);
+    f.stale = lo ? f.last_run_date < lo : f.days_since_eval >= 2;
+  }
 }
 
 /**
@@ -917,13 +1214,23 @@ async function queryFindings(acct, { kind = "", severityMin = "", visible = null
  *   前端对空 run_date 渲染「今天还没巡检，最近一轮是（无记录）」——
  *   比 `null` 的「状态未知」更准确（我们知道它没跑，不是读不到）。
  */
-export function worstRunAcross(runs, { runType, crossAccount = false, visible = null } = {}) {
-  let mine = (runs || []).filter((r) => r.run_type === runType);
+export function worstRunAcross(runs, {
+  runType, crossAccount = false, visible = null, expected = null,
+} = {}) {
+  let mine = collapseRuns((runs || []).filter((r) => r.run_type === runType));
   // 🔴 跨账号时按可见账号过滤 —— 与上面 finding 列表的过滤保持一致。
   //    不过滤会让不可见账号的运行状态（跑没跑、完整度）漏给调用者，
   //    而那道过滤在 finding 那一侧是显式做过的。
   if (crossAccount && visible && visible !== "*") {
     mine = mine.filter((r) => visible.has(String(r.account_id || "")));
+  }
+  // 🔴 `"*"` 时可见集合说不出「应该有哪些账号」，由调用方传已启用账号列表
+  //    （review F-09）。不传的话，一个三天没跑的账号在统一视图里毫无存在感。
+  if (crossAccount && visible === "*" && Array.isArray(expected) && expected.length) {
+    const seen = new Set(mine.map((r) => String(r.account_id || "")));
+    if (expected.some((a) => !seen.has(String(a)))) {
+      return { run_date: "", status: "", completeness: null, mode: "" };
+    }
   }
   if (!mine.length) return null;
 
@@ -955,18 +1262,28 @@ export function worstRunAcross(runs, { runType, crossAccount = false, visible = 
   //    表现：某个 region 整轮漏扫 → 那个 region 里内存 98% 的库一条 finding
   //    都没出 → 界面给绿色对勾。`api/inspection.ts` 的 `regions` 注释
   //    自己写着「**必须显示出来**」。
+  //
+  // 🔴 `dry_run` 排在 success 之前（review F-09 / F-02）：试运行不更新看板，
+  //    「最近一轮是试运行」比「今天跑完了」更值得说。改前两者同分，返回先插入的那条，
+  //    677 的试运行在空态、停更提示里都看不见。
   const rank = (r) => {
     if (!r) return 0;
     if (r.status === "failed") return 1;
     if (r.run_date !== today) return 2;
     if (r.status === "running") return 3;
     if (r.status === "partial") return 4;
-    return 5;
+    if (r.mode === "dry_run") return 5;
+    return 6;
   };
   const cur = [...latestByAcct.values()].sort((a, b) => rank(a) - rank(b))[0];
   return {
     run_date: cur.run_date, status: cur.status,
     completeness: cur.completeness, mode: cur.mode,
+    account_id: String(cur.account_id || ""),
+    // 这一轮算出几条；试运行时另带「看板上还没有的新命中」（不落库），
+    // 前端据此说「试运行算出 N 条，不更新看板」而不是「本轮未发现风险」。
+    findings: cur.findings ?? null,
+    dry_run_new_hits: cur.dry_run_new_hits ?? null,
     // 🔴 带上没扫成的 region 名字。`partial` 只说「不完整」，说不出**少了谁**
     //    —— 而失败的 region 在 `by_region` 里连键都没有（不是 0），
     //    所以这是唯一能回答「哪个 region 漏了」的地方。
@@ -1006,17 +1323,57 @@ export async function getFinding(accountId, findingId) {
 // run 记录与总览
 // ---------------------------------------------------------------------------
 
+/**
+ * run 行的账号 → 12 位基础账号 + 补齐序号。
+ *
+ * 🔴 补齐轮（reconciler 补缺行 / 缺口）的 run 行 SK 与 `account_id` 属性都是
+ *    `<账号>#bf<n>`（executor 的 `lock_key`）。原样当账号用的后果（2026-10-11 698 实测）：
+ *    部署账号的闲置轮这两天只有 `#bf1` / `#bf2` 两行 → 「已启用账号里有谁一条 run 都没有」
+ *    判成 698 缺席 → 闲置页的最近一轮变成空，空态说「今天还没巡检」；非管理员的可见集合
+ *    里也没有 `698…#bf1`，那些行被静默滤掉。
+ */
+export function runAccountOf(raw) {
+  const s = String(raw || "");
+  const m = /^(\d{12})#bf(\d+)$/.exec(s);
+  return m ? { account: m[1], backfill: Number(m[2]) } : { account: s, backfill: 0 };
+}
+
+/**
+ * 同一 (类型, 日期, 账号) 只留一行：有原轮就用原轮，否则用序号最大的那次补齐。
+ * ⚠️ 只给「按账号比较」的地方用（最近一轮、diff、停更）；runs 表与缺口累计照旧逐行。
+ */
+export function collapseRuns(rows) {
+  const best = new Map();
+  for (const r of rows || []) {
+    const k = `${r.run_type}#${r.run_date}#${r.account_id}`;
+    const cur = best.get(k);
+    const bf = r.backfill || 0;
+    const curBf = cur ? (cur.backfill || 0) : -1;
+    // 原轮（0）最优先；都是补齐轮时取序号大的。
+    const better = !cur || (curBf !== 0 && (bf === 0 || bf > curBf));
+    if (better) best.set(k, r);
+  }
+  return (rows || []).filter((r) => best.get(`${r.run_type}#${r.run_date}#${r.account_id}`) === r);
+}
+
 function shapeRun(item) {
   const stats = item.stats || {};
   const dispatch = item.dispatch || stats.dispatch || {};
+  const who = runAccountOf(item.account_id || item.SK);
   return {
     run_type: String(item.run_type || ""),
     run_date: String(item.run_date || ""),
-    account_id: String(item.account_id || ""),
+    account_id: who.account,
+    /** 补齐序号（`#bf<n>`）；0 = 原轮。 */
+    backfill: who.backfill,
     status: String(item.status || ""),
     data_date: String(item.data_date || ""),
     source: String(item.source || ""),
     mode: String(item.mode || ""),
+    // 手点的首轮被转正成 official 时为真（executor `_promote_bootstrap`）。
+    // ⚠️ 不带出去的话它在 runs 表里与定时轮长得一模一样 —— 事后分不清那一天
+    //    的正式轮是调度跑的还是客户点出来的。
+    bootstrap: Boolean(item.bootstrap),
     tier: String(item.tier || ""),
     catch_up: Boolean(item.catch_up),
     config_version: String(item.config_version || ""),
@@ -1024,6 +1381,8 @@ function shapeRun(item) {
     expected: item.expected || null,
     actual: stats.actual || item.actual || null,
     findings: num(dispatch.findings),
+    /** 试运行算出、看板上还没有的新命中（executor `dry_run_new_hits`；正式轮恒 0 / 缺）。 */
+    dry_run_new_hits: num(dispatch.dry_run_new_hits),
     dispatched_tasks: num(dispatch.dispatched_tasks),
     // ⚠️ `mapped_tasks` 与 `dispatched_tasks` 都给前端：两者不等意味着有 task
     //    发出去了却没落映射 → 那些判读回不来。合成一个数字会让这个缺口
@@ -1061,6 +1420,19 @@ function shapeRun(item) {
  * 没有跨日期的 PK。Scan 在表变大后会变慢且贵，且拿不到稳定顺序。
  */
 export async function getRuns(accountId, { days = 14 } = {}) {
+  return (await fetchRuns(accountId, { days })).rows;
+}
+
+/**
+ * `getRuns` 的本体，另带「哪一类有几天读失败了」（review F-11）。
+ *
+ * 🔴 单天查失败仍然不拖垮整列表，但**要说出来**：改前吞成 `[]`，总览的派发缺口
+ *    归零、红色徽章消失、runs 表空着也不说「读不到」；`last_run` 会回落成昨天，
+ *    空态写「今天还没巡检」。
+ *
+ * @returns `{ rows, failed: {high: n, idle: n} }`
+ */
+async function fetchRuns(accountId, { days = 14 } = {}) {
   // 🔴 `accountId === null` = **明确要跨账号**，跳过 resolveAccount。
   //
   //    下面那段查询早就支持跨账号（`acct` 为空时不加 SK 条件，而 run 记录的
@@ -1073,6 +1445,7 @@ export async function getRuns(accountId, { days = 14 } = {}) {
   const acct = accountId === null ? null : await resolveAccount(accountId);
   const n = Math.min(Math.max(Number(days) || 14, 1), 60);
   const jobs = [];
+  const failed = Object.fromEntries(RUN_TYPES.map((rt) => [rt, 0]));
   for (const rt of RUN_TYPES) {
     for (let i = 0; i < n; i++) {
       const pk = runPk(rt, isoDaysAgo(i));
@@ -1081,7 +1454,11 @@ export async function getRuns(accountId, { days = 14 } = {}) {
         KeyConditionExpression: "#pk = :pk" + (acct ? " AND #sk = :sk" : ""),
         ExpressionAttributeNames: acct ? { "#pk": "PK", "#sk": "SK" } : { "#pk": "PK" },
         ExpressionAttributeValues: acct ? { ":pk": pk, ":sk": acct } : { ":pk": pk },
-      })).catch(() => ({ Items: [] })));   // 单天查失败不拖垮整列表
+      })).catch((e) => {                    // 单天查失败不拖垮整列表，但要记下来
+        failed[rt] += 1;
+        console.warn(`[inspection] 读 run 记录失败 ${pk}:`, safeErr(e));
+        return { Items: [] };
+      }));
     }
   }
   const results = await Promise.all(jobs);
@@ -1090,7 +1467,67 @@ export async function getRuns(accountId, { days = 14 } = {}) {
   // 日期降序 → 类型（high 在前，与侧栏顺序一致）
   rows.sort((a, b) => b.run_date.localeCompare(a.run_date)
     || RUN_TYPES.indexOf(a.run_type) - RUN_TYPES.indexOf(b.run_type));
-  return rows;
+  return { rows, failed };
+}
+
+/**
+ * 一组 run（已按日期降序）→ 每个 run_type 的「本轮 vs 上一轮」。**按账号分开算**。
+ *
+ * 🔴 改前按 run_type 取前两行、不分账号（review F-09）：A 今天 2 条、677 今天试运行
+ *    9 条 → `delta: -7`，系统状态卡显示绿色「↓ 7」—— 两个账号的数相减。
+ *
+ * @returns `{ diff, byAccount }`：`byAccount[<账号>][<rt>]` 是单账号的；`diff[<rt>]`
+ *   单账号时就是那一个，多账号时是逐账号**之和**（delta 只在每个账号都有上一轮时给），
+ *   `last_run_date` 取最旧、`last_status` 取最差。
+ */
+export function diffByAccount(runs) {
+  const per = new Map();               // acct → rt → [cur, prev]
+  // ⚠️ 同一天的原轮与补齐轮（`#bf<n>`）只算一行，否则 bf1 / bf2 会被当成「本轮 vs 上一轮」。
+  for (const r of collapseRuns(runs)) {
+    const a = String(r.account_id || "");
+    if (!per.has(a)) per.set(a, {});
+    const m = per.get(a);
+    if (!m[r.run_type]) m[r.run_type] = [];
+    if (m[r.run_type].length < 2) m[r.run_type].push(r);
+  }
+  const one = (cur, prev) => ({
+    current: cur ? cur.findings : null,
+    previous: prev ? prev.findings : null,
+    delta: (cur && prev && cur.findings !== null && prev.findings !== null)
+      ? cur.findings - prev.findings : null,
+    last_run_date: cur ? cur.run_date : "",
+    last_status: cur ? cur.status : "",
+    completeness: cur ? cur.completeness : null,
+    mode: cur ? cur.mode : "",
+  });
+  const byAccount = {};
+  for (const [a, m] of per) {
+    byAccount[a] = Object.fromEntries(RUN_TYPES.map((rt) => {
+      const [cur, prev] = m[rt] || [];
+      return [rt, one(cur, prev)];
+    }));
+  }
+  const sevOfStatus = { failed: 0, running: 1, partial: 2, success: 3 };
+  const diff = {};
+  for (const rt of RUN_TYPES) {
+    const ds = Object.values(byAccount).map((d) => d[rt]).filter((d) => d.last_run_date);
+    if (ds.length <= 1) { diff[rt] = ds[0] || one(null, null); continue; }
+    const sum = (k) => (ds.every((d) => d[k] !== null)
+      ? ds.reduce((s, d) => s + d[k], 0) : null);
+    const worst = [...ds].sort((x, y) => (sevOfStatus[x.last_status] ?? 9)
+      - (sevOfStatus[y.last_status] ?? 9))[0];
+    diff[rt] = {
+      current: sum("current"),
+      previous: sum("previous"),
+      delta: ds.every((d) => d.delta !== null) ? sum("delta") : null,
+      last_run_date: ds.map((d) => d.last_run_date).sort()[0],
+      last_status: worst.last_status,
+      completeness: ds.some((d) => d.completeness === null) ? null
+        : Math.min(...ds.map((d) => d.completeness)),
+      mode: ds.some((d) => d.mode === "dry_run") ? "dry_run" : worst.mode,
+    };
+  }
+  return { diff, byAccount };
 }
 
 /**
@@ -1126,9 +1563,9 @@ export async function getOverview(accountId, {
 
   // ⚠️ `queryFindings` 而不是 `getFindings` —— 后者强制 kind，总览要的是
   //    跨 kind 全量。写成 getFindings(acct) 的表现是总览页恒 `bad_kind`。
-  const [findings, runsRaw] = await Promise.all([
+  const [findings, { rows: runsRaw, failed: runsFailed }] = await Promise.all([
     queryFindings(acct, { visible }),
-    getRuns(acct, { days: 14 }),
+    fetchRuns(acct, { days: 14 }),
   ]);
   // run 记录也要按可见账号过滤 —— 它带 account_id，而统一视图会把所有账号
   // 的运行状态摊开（哪个账号今天跑失败了本身也是信息）。
@@ -1137,24 +1574,8 @@ export async function getOverview(accountId, {
     : runsRaw;
   if (findings.ok === false) return findings;
 
-  const latestByType = {};
-  for (const r of runs) {
-    if (!latestByType[r.run_type]) latestByType[r.run_type] = [];
-    if (latestByType[r.run_type].length < 2) latestByType[r.run_type].push(r);
-  }
-  const diff = {};
-  for (const rt of RUN_TYPES) {
-    const [cur, prev] = latestByType[rt] || [];
-    diff[rt] = {
-      current: cur ? cur.findings : null,
-      previous: prev ? prev.findings : null,
-      delta: (cur && prev && cur.findings !== null && prev.findings !== null)
-        ? cur.findings - prev.findings : null,
-      last_run_date: cur ? cur.run_date : "",
-      last_status: cur ? cur.status : "",
-      completeness: cur ? cur.completeness : null,
-    };
-  }
+  const { diff, byAccount: diffAcct } = diffByAccount(runs);
+  const runsFailedDays = Object.values(runsFailed).reduce((s, n) => s + n, 0);
 
   // 状态分布：R6 的 finding 状态机四态
   const byState = {};
@@ -1239,6 +1660,19 @@ export async function getOverview(accountId, {
     /** 失败批次累计（>0 = 有资源压根没被评估过）。 */
     batches_failed: batchesFailed,
     diff,
+    /**
+     * 逐账号的 diff（`diff` 在多账号时是加总）。手动「跑一轮」的轮询必须看这个，
+     * 看加总会把别的账号的那一轮当成自己的（review F-09 第 4 条）。
+     */
+    diff_by_account: diffAcct,
+    /** 部署账号 id。前端的「部署账号」选项是空串，轮询时用它查 `diff_by_account`。 */
+    self_account_id: await resolveAccount(""),
+    /**
+     * 有几天的 run 记录读失败了（review F-11）。>0 时上面的派发缺口 / 采集缺口
+     * 可能偏低，前端要说出来并保持系统状态区展开。
+     */
+    runs_partial: runsFailedDays > 0,
+    runs_failed_days: runsFailedDays,
     runs: runs.slice(0, RUNS_LIMIT),
     /**
      * 截断**之前**有多少轮。
@@ -2483,6 +2917,9 @@ async function sha256Hex16(body) {
  * 🔴 `mode` 默认 **dry_run**。official 会推进 finding 状态机并参与
  *    resolved 判定 —— 一次手点的补跑不该改变「这条风险是不是已解决」
  *    这种带日期语义的结论。要 official 必须显式传。
+ * ⚠️ 例外在 executor：refetch + 当天 + 账号在本轮规则域里没有任何更早的 finding
+ *    时，dry_run 会被转成 official（`_promote_bootstrap`）—— 没有结论可改，而
+ *    dry_run 会让新部署的客户点完看到一片空白。
  *
  * ⚠️ `InvocationType: "Event"`（异步）。一轮 refetch 是分钟级，同步 invoke
  *    会顶到 Function URL 的 30 秒上限 —— 表现是前端超时报错而巡检**其实

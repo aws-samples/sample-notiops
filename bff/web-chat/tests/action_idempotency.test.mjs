@@ -68,7 +68,14 @@ ok("指纹带 actidem# 前缀（与其他 PK 段不撞）", actionIdemKey(CASE, 
 ok("读到了 support.mjs（自检）", src.length > 5000 && /export async function executeAction/.test(src));
 
 ok("认领是条件写（attribute_not_exists），不是无条件 Put",
-  /_idemClaim[\s\S]{0,900}ConditionExpression: "attribute_not_exists\(PK\) OR/.test(src));
+  /_idemClaim[\s\S]{0,1400}ConditionExpression: "attribute_not_exists\(PK\) OR/.test(src));
+
+// 窗口必须在条件里比 ttl 才会按时结束：DynamoDB TTL 是后台异步删除（官方口径「通常几天内」），
+// 删之前过期行照样让条件写失败 —— 不比的话「30 分钟窗口内重放」会拖成好几天（2026-10-11）。
+ok("过了 30 分钟窗口（ttl 已过、行还没被 TTL 删掉）可以重新认领",
+  /_idemClaim[\s\S]{0,1400}ConditionExpression: "attribute_not_exists\(PK\) OR #ttl < :nowSec OR/.test(src)
+  && /"#ttl": "ttl"/.test(src)
+  && /":nowSec": Math\.floor\(now \/ 1000\)/.test(src));
 
 ok("超时的认领可以被抢（否则 Lambda 被掐死就把操作堵到 TTL 过期）",
   /_IDEM_INFLIGHT_STALE_MS/.test(src) && /":stale": now - _IDEM_INFLIGHT_STALE_MS/.test(src));

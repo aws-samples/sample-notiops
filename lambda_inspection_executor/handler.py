@@ -164,7 +164,8 @@ def _session_for(account_id: str, region: str = ""):
 
     ```
     account#<id>/meta 的 role_arn        onboard 时写入（member_accounts.mjs）
-      = arn:aws:iam::<id>:role/notiops-idle-detection-role-<部署账号>
+      = arn:aws:iam::<id>:role/notiops-cross-account-role-<部署账号>
+        （2026-10 前接入的是 notiops-idle-detection-role-<部署账号>，两代互为别名）
     成员账号侧的角色                       infra/member-account-onboarding.yaml
       信任 部署账号 root（+ 可选 aws:PrincipalOrgID 条件）
       挂 ReadOnlyAccess + inline notiops-readonly
@@ -260,7 +261,7 @@ def _session_for(account_id: str, region: str = ""):
     #
     #    ⚠️ 巡检刻意不接 `LOCKED_ACCOUNT_ID` 闸门（见本模块 docstring），
     #       所以闸门拦不住这条 —— 只能在真要 assume 之前查。
-    from shared.account_scope import assert_role_belongs_to
+    from shared.account_scope import assert_role_belongs_to, assume_role_with_alias
 
     assert_role_belongs_to(role_arn, target, what=f"account#{target}.role_arn")
 
@@ -268,11 +269,20 @@ def _session_for(account_id: str, region: str = ""):
     try:
         # ⚠️ 会话名带账号后缀 —— CloudTrail 里能一眼看出这次 assume 是替谁做的。
         #    RoleSessionName 只允许 [\w+=,.@-]，账号 ID 是纯数字所以安全。
-        cred = sts.assume_role(
-            RoleArn=role_arn,
+        # ⚠️ 走别名版：成员账号角色 2026-10 改过名，注册表里存的可能是另一代
+        #    （见 `shared.account_scope.sibling_role_arn`）。
+        registered = role_arn
+        resp, role_arn = assume_role_with_alias(
+            sts, role_arn,
             RoleSessionName=f"notiops-inspection-{target}",
             DurationSeconds=3600,
-        )["Credentials"]
+        )
+        cred = resp["Credentials"]
+        if role_arn != registered:
+            # 别名成功 = 注册表里那一代已经不在了。条件回写一次，之后就不用每轮
+            # 先吃一次 AccessDenied（CloudTrail 里那类事件很容易触发客户的安全告警）。
+            from shared.account_scope import persist_aliased_role_arn
+            persist_aliased_role_arn(cfg_table, target, registered, role_arn)
     except Exception as e:                                 # noqa: BLE001
         raise RuntimeError(
             f"AssumeRole 进账号 {target} 失败（{role_arn}）: "
@@ -327,6 +337,9 @@ class Task:
     """只巡检这几台（补齐重投，R13.15）。空 = 全量。"""
     backfill_run_id: str = ""
     """非空 = 这是给该 run 的补齐轮。见 `InspectionMessage.backfill_run_id`。"""
+    bootstrap: bool = False
+    """手动 dry_run 被转正成 official 的「首轮」。只由 `_promote_bootstrap` 置真，
+    随 run 行落库，事后据此区分「定时轮」与「手点的首轮」。"""
 
     @property
     def is_dry_run(self) -> bool:
@@ -344,6 +357,10 @@ class Task:
         前端写死 `mode: "dry_run"`（那是对的，理由是 ①），于是客户点完看到
         finding 与全部确定性数值，而根因分析那半永远是空的，界面上不说为什么。
         2026-08-29 三方交叉 review 发现。
+
+        ⚠️ 本轮规则域里没有任何历史 finding 时，手动 dry_run 会在抢锁之后被
+           `_promote_bootstrap` 转成 official（2026-10-08）—— 否则新部署的客户
+           点完按钮看到一片空白，还占掉当天的正式轮。
         """
         return self.mode is RunMode.DRY_RUN
 
@@ -1006,6 +1023,10 @@ def _process_one(record: Mapping[str, Any], context: Any) -> str:
                 f"跳过（消息删除，不进 DLQ）")
 
     try:
+        # ⚠️ 必须在抢锁**之后**、`_run_inspection` 之前：下游的 reconcile、
+        #    `apply_transitions`、`build_stats`、run 行的 `mode` 读的都是同一个
+        #    `task`，在这里换一次就全链一致，不用逐处判断。
+        task = _promote_bootstrap(store, task)
         stats = _run_inspection(store, task, now=now, region=scan_region,
                                 context=context, run_sk=lock_key)
     except Exception as e:                     # noqa: BLE001
@@ -1031,6 +1052,66 @@ def _process_one(record: Mapping[str, Any], context: Any) -> str:
     _emit_run_metrics(task, stats)
     return (f"{task.run_type.value}/{task.account_id} {stats['status']}: "
             f"{stats['actual']['instances']}/{stats['expected']['instances']} 实例")
+
+
+def _promote_bootstrap(store: InspectionStore, task: Task) -> Task:
+    """新账号的手动首轮：`dry_run` → `official`（2026-10-08）。
+
+    客户实测：刚部署完点「跑高负载 / 跑闲置」→ 拉了指标、付了 GetMetricData，
+    而看板一条都没有。原因是前端写死 `mode: "dry_run"`，而 dry_run 不落
+    finding（`apply_transitions` 被跳过），看板又只读 DDB 的 finding 行。
+    更糟的是这一轮照样写 success，占掉当天的槽位 —— 当天 02:00 的正式轮也
+    被跳过，第一次有内容要等到第二天。
+
+    dry_run 的理由是「一次手点的补跑不该改变带日期语义的结论」。这个理由
+    只在**有结论可改**时成立。本轮规则域里没有任何**更早**的 finding 时：
+
+    ```
+    prev 为空 → reconcile 只可能产出 CREATED（state=NEW）
+              → 不会 CONFIRMED / RESOLVED / REOPENED（都需要 rec）
+              → NEW 不具备推送资格（`Transition.pushable`；推送侧也按
+                `state == "new"` 跳过，见 push_policy）
+    ```
+
+    所以转正不会把一个毛刺确认成 active，也不会把风险点成 resolved。
+
+    「更早」两个字是有意的（R1 review A-1）：prev 里**只有今天写下的**记录
+    （`first_seen == last_run == data_date`）也照样转正。来源有两种 ——
+    本轮转正后半途抛错被 SQS 重投（没写完的那部分要补上，run 行也不该变回
+    dry_run），或者 02:00 的正式轮写了一半就挂了、客户再点一次。同日记录上的
+    推进写不进去：`apply_transitions` 的 R6.8 条件 `last_run_date < :today`
+    判假 → ConditionalCheckFailed → 跳过，只有 CREATED 能补齐没写成的那几条。
+
+    ⚠️ 只收窄到**本轮的规则域**（`scope_prev_findings`），与 reconcile 读的
+       是同一份 `prev`。HIGH 轮的历史不该挡住 IDLE 轮的首轮。
+    ⚠️ 只转正**看板按钮那种形状**：`refetch` + `data_date == run_date`（R1 review
+       A-2）。`reuse` 的预演读的是 D-k 的旧批次，转正会把旧数据落成今天的正式轮、
+       还挡掉当天 02:00 的 refetch。显式 refetch + dry_run 的预演（IM / 脚本）在
+       新账号上仍会转正 —— 那一轮本来就要占掉当天的槽位，转正至少让它有结果。
+    ⚠️ 带 `region` / `instance_subset` 的运维重跑、补齐轮**不转正**：
+       它们只扫了一部分范围，拿来当首轮会让没扫到的那部分「凭空没有风险」。
+    ⚠️ 转正轮写下的 NEW 不计入确认轮数（见 `_assemble_and_dispatch` 里
+       `task.bootstrap` 那段）—— 首轮只负责「看得见」，确认仍要两个定时轮。
+    ⚠️ 零 finding 的账号 prev 一直为空，每次手点都是 official。同一天最多一次
+       success（锁），等于把当天的定时轮提前跑，可以接受。
+    """
+    if (not task.is_dry_run or task.is_backfill
+            or task.region or task.instance_subset
+            or task.source is not DataSource.REFETCH
+            or task.data_date != task.run_date):
+        return task
+    from inspection import assemble as asm
+
+    prev = asm.scope_prev_findings(
+        store.load_findings(task.account_id), task.run_type)
+    if any(rec.first_seen_date != task.data_date
+           or rec.last_run_date != task.data_date
+           for rec in prev.values()):
+        return task
+    logger.info("账号 %s 的 %s 轮没有更早的 finding（同日 %d 条）→ 手动首轮按 "
+                "official 跑（bootstrap），结果直接落库可见",
+                task.account_id, task.run_type.value, len(prev))
+    return replace(task, mode=RunMode.OFFICIAL, bootstrap=True)
 
 
 def _emit_run_metrics(task: Task, stats: Mapping[str, Any]) -> None:
@@ -1156,6 +1237,11 @@ class RegionScan:
     rows: list = field(default_factory=list)
     """这个 region 的序列行。**主线程写完会把它清空**（见 6.9 那段）——
     与 `bundle` 同时活着会让内存按实例总数翻倍。"""
+    listed: frozenset = frozenset()
+    """这个 region 里**确实列成功了**的 service（`rds` / `elasticache`）。
+
+    `lifecycle.resolve_gone` 的安全边界：只有列成功了、列表里又没有那台，才算
+    「资源已不存在」。describe 失败的 service 不在这里 —— 那时我们不知道它怎样了。"""
 
 
 def _fan_regions(fn, items, *, what: str, max_workers: int = 8,
@@ -1246,8 +1332,12 @@ def _assemble_and_dispatch(
     insp_cfg: Any, ref: Any, price_table: Mapping[str, Any] | None = None,
     threshold_cfg: Any = None,
     space_id: str = "", da_target: Any = None,
+    scoped_regions: Sequence[str] = (),
 ) -> dict[str, Any]:
     """判定结果 → 出口过滤 → rollup → 闸门 → 排序配额 → 派 task。
+
+    `scoped_regions`：客户在账号配置里**显式**收窄的 region 列表（`*` / 单 region 重跑
+    时为空）。范围外 region 的开着的 finding 关成 out_of_scope（reviewer A8）。
 
     ⚠️ 判定逻辑全在 `inspection/assemble.py`（纯函数、有单测），
     这里只做 IO：读 prior、写 finding 状态机、调 `CreateBacklogTask`。
@@ -1337,15 +1427,18 @@ def _assemble_and_dispatch(
     # ⚠️ 不复用 `DEFAULT_LOCALE`：那个 env 在 `report_delivery/push_handler.py`
     #    里的兜底是 `"en"`，共用会把巡检拖成英文 —— 而 R11b.10 的 ⚠️ 说的正是
     #    「中文客户收英文卡片」这件事。
-    report_locale = (_env("INSPECTION_REPORT_LOCALE", "zh") or "zh").strip().lower()
-    if report_locale not in ("zh", "en"):
-        logger.warning("INSPECTION_REPORT_LOCALE=%r 不认识，按 zh 处理",
-                       report_locale)
-        report_locale = "zh"
+    report_locale = _report_locale()
 
     # ── 6.9 / 6.10 / 6.12 / 6.13 / 6.14 **逐 region** 判定
     findings: list = []
     obs: list = []
+    # worst 之外也越线的指标的证据（`asm.AlsoHit`），与 `to_evidence(findings)` 合并落库。
+    also_evidence: dict = {}
+    # 本轮「判了没命中」/「判不了」的 finding_id（2026-10-10 交叉 review A3 / A4）。
+    healthy_ids: list[str] = []
+    frozen_ids: set[str] = set()
+    # 出口过滤剔掉的实例（`resource_key` 形状），它们已有的 finding 一律原地不动。
+    dropped_keys: set[str] = set()
     evaluated: set[str] = set()
     gate_counts: dict[str, int] = {}
     groups: list = []
@@ -1375,6 +1468,9 @@ def _assemble_and_dispatch(
         #    `_step_missed` → 若它是昨天刚建的（未确认），直接判
         #    **RESOLVED + prediction_missed** —— 一条真实风险被记成误报并消失。
         not_evaluable: list[str] = []
+        also_hit: list = []
+        h_ids: list[str] = []
+        z_ids: list[str] = []
         f_r = asm.judge_findings(
             run_type=task.run_type, bundle=sc.bundle, attrs_by_id=attrs_by_id,
             cfg=insp_cfg, refdata=ref, data_date=task.data_date,
@@ -1405,12 +1501,23 @@ def _assemble_and_dispatch(
             #    主动查证（结论仍然基于 payload）；反过来（把不可达当可达）才会
             #    产出假陈述。
             reachable=(task.account_id == _deploy_account_id()
-                       or not _deploy_account_id()))
+                       or not _deploy_account_id()),
+            # 🔴 worst 之外也越线的指标（只进状态机，不派 DA）—— 见 `asm.AlsoHit`。
+            also_hit_out=also_hit,
+            healthy_ids_out=h_ids, frozen_ids_out=z_ids)
+        healthy_ids.extend(h_ids)
+        frozen_ids.update(z_ids)
 
         # ── 6.10 出口过滤
         f_r, dropped = asm.exit_filter(
             f_r, exclusions, today=task.data_date,
             attrs_by_id=attrs_by_id, list_kind=list_kind)
+        # 出口过滤剔掉的实例（排除清单在本轮中途改了），它的其余指标一起剔。
+        _dropped_iids = {fid.split("#")[3] for fid in dropped if fid.count("#") >= 3}
+        also_hit = [h for h in also_hit if h.instance_id not in _dropped_iids]
+        # 🔴 被剔掉的不是「没命中」（reviewer A3③）—— 那台的 finding 本轮一律冻结，
+        #    下一轮入口过滤会排掉它，`resolve_out_of_scope` 再以正确的理由关掉。
+        dropped_keys |= {lifecycle_mod.resource_key(fid) for fid in dropped}
         dropped_total += len(dropped)
 
         # ── 6.12 群体 rollup
@@ -1473,8 +1580,10 @@ def _assemble_and_dispatch(
         # ⚠️ `_in_scope` 那侧**仍然接受**裸实例 id（存量契约）。所以这一处
         #    退回裸 id 不会让任何 lifecycle 测试变红 —— 守卫在
         #    `tests/test_inspection_executor.py` 的接缝断言上。
+        # ⚠ 2026-10-10 起带 service（`<region>#<service>#<实例>`，reviewer A10）：
+        #    同 region 同名的 RDS 与 ElastiCache 用两段键会互相串号。
         evaluated |= {
-            f"{attrs_by_id[i].region}#{i}" if i in attrs_by_id else i
+            f"{attrs_by_id[i].region}#{attrs_by_id[i].service}#{i}" if i in attrs_by_id else i
             for i in _evaluated_ids
         }
 
@@ -1485,6 +1594,8 @@ def _assemble_and_dispatch(
         # ⚠️ healthy 观测**必须在 region 循环里**建：它要靠 `attrs_by_id` 拼出
         #    finding_id 的 region 段，用合并版会拼出另一个 region 的 id。
         obs += asm.to_observations(f_r, rule_version=task.config_version)
+        obs += asm.also_hit_observations(also_hit, rule_version=task.config_version)
+        also_evidence.update({h.finding_id: dict(h.evidence) for h in also_hit})
         obs += asm.healthy_observations(
             healthy_pairs, attrs_by_id, rule_version=task.config_version)
         findings.extend(f_r)
@@ -1500,14 +1611,15 @@ def _assemble_and_dispatch(
     #
     #    ⚠️ `prev` 要先读出来才能判 —— 多一次 Query，但那是本来就要做的
     #      （下面立刻用它）。
-    prev_all = asm.scope_prev_findings(
-
-        store.load_findings(task.account_id), task.run_type)
+    # ⚠ 整个账号的全部 finding（不按规则域收窄）。只有 `resolve_gone` 用它 ——
+    #    资源在不在与规则域无关，见下面那段说明。
+    loaded_all = store.load_findings(task.account_id)
+    prev_all = asm.scope_prev_findings(loaded_all, task.run_type)
     # ⚠️ 判据是合并后的 `obs` 而不是 `healthy_pairs` —— 后者现在是 region
     #    循环里的局部变量，全部 region 都空时它压根没被绑定
     #    （`UnboundLocalError`，被 `test_空_region_不参与判定也不影响心跳` 抓到）。
     #    `obs` 里已经含 healthy 观测。
-    if findings or obs or prev_all:
+    if findings or obs or prev_all or loaded_all:
         # 🔴 按**本轮自己的规则域**收窄。`load_findings` 读的是整个账号所有
         #    finding 行，而 `_in_scope` 只按实例段匹配 —— 不收窄的话
         #    HIGH 轮会把昨天的 gp2_volume 判 miss、IDLE 轮会把 threshold_high
@@ -1519,10 +1631,18 @@ def _assemble_and_dispatch(
         #    region 段）。这里**不能**再算一次 —— 那时 `attrs_by_id` 只剩最后
         #    一个 region 的，会把其余 region 的实例全部漏出评估集合，
         #    于是它们的 finding 原地冻结（R6.2），永远不 resolved。
+        # 判不了的（frozen）+ 出口过滤剔掉的那几台的全部 finding。
+        frozen_all = frozen_ids | {
+            fid for fid in prev if lifecycle_mod.resource_key(fid) in dropped_keys}
+        # 「判了没命中」→ healthy 观测。⚠️ 与本轮命中的同 id 不会重复：
+        #    `idle_domain_coverage` / `high_load_findings` 已排除 produced。
+        obs = [*obs, *(lifecycle_mod.Observation(
+            finding_id=fid, hit=False, healthy=True, rule_version=task.config_version)
+            for fid in healthy_ids if fid not in frozen_all)]
         res = reconcile(
             prev, evaluated, obs,
             today=task.data_date, rule_version=task.config_version,
-            dry_run=task.is_dry_run)
+            dry_run=task.is_dry_run, frozen=frozen_all)
         # 🔴 **把「已被移出巡检范围」的那些 finding 关掉**（R1.8，2026-09-01）。
         #
         #    排除是**入口过滤**（`apply_exclusions` 在拉指标之前跑，为的是不给
@@ -1542,7 +1662,7 @@ def _assemble_and_dispatch(
         #    结果取决于列表顺序。
         oos = lifecycle_mod.resolve_out_of_scope(
             prev,
-            {f"{s.region}#{ref.instance_id}"
+            {f"{s.region}#{ref.service}#{ref.instance_id}"
              for s in scans for ref, _d in s.excluded},
             today=task.data_date,
             already={t.finding_id for t in res.transitions})
@@ -1550,6 +1670,64 @@ def _assemble_and_dispatch(
             logger.info("移出巡检范围 → 关闭 %d 条既有 finding: %s",
                         len(oos), [t.finding_id.split("#")[3] for t in oos][:5])
             res = replace(res, transitions=(*res.transitions, *oos))
+        # 🔴 **把「资源已经不存在」的那些 finding 关掉**（2026-10-10）。
+        #
+        #    与上面 out_of_scope 同构的缺口：被删除的资源 describe 列不出来 →
+        #    不在评估集合里 → R6.2「原地不动」→ 永远停在 active。677 账号实测：
+        #    资源 9/14 删除，9/14~9/16 三轮正式巡检都 success、0 台，18 条 finding
+        #    照样挂着「已持续 34 天」，客户点「深入分析」才被告知资源不存在。
+        #
+        # ⚠️ `present` 用 `all_attrs`（**排除之前**）：被客户排除的资源还在，
+        #    它的 finding 由上面 out_of_scope 关，不能被当成「已删除」。
+        # ⚠️ `covered` 只含**列成功了**的 `<region>#<service>`。region 发现失败
+        #    （不在 scans 里）、某个 service describe 失败、不在本轮扫描范围的
+        #    region —— 都不在里面，那些 finding 原地不动（R6.2）。
+        # ⚠ 用**不收窄**的 `loaded_all`（2026-10-10 reviewer A9）：资源删了，它在
+        #    另一规则域的 finding 也该关。只开了一种定时（677 就是）时，另一域的
+        #    finding 原来永远等不到「它那一域」的正式轮。跨域写入安全：对方域当天
+        #    若已跑过，`last_run_date < :today` 判假自然跳过。
+        gone = lifecycle_mod.resolve_gone(
+            loaded_all,
+            {f"{s.region}#{a.service}#{a.instance_id}" for s in scans for a in s.all_attrs},
+            {f"{s.region}#{svc}" for s in scans for svc in s.listed},
+            today=task.data_date,
+            already={t.finding_id for t in res.transitions})
+        if gone:
+            logger.info("资源已不存在 → 关闭 %d 条既有 finding: %s",
+                        len(gone), [t.finding_id.split("#")[3] for t in gone][:5])
+            res = replace(res, transitions=(*res.transitions, *gone))
+            if task.is_dry_run:
+                # 🔴 **试运行也打「已不存在」标**（不动状态机，2026-10-10 reviewer A5）。
+                #    「列成功了、里面没有它」是一个事实，不是带日期语义的状态推进，
+                #    与试运行「不推进状态」的初衷不冲突。不打的表现（677 实测）：定时
+                #    巡检关着、手动只跑试运行 → 已删除资源的 finding 永远给「深入分析」，
+                #    客户得一台台点过去才知道它没了。安全边界与 `resolve_gone` 同一个 covered。
+                for t in gone:
+                    try:
+                        store.mark_resource_missing(
+                            task.account_id, t.finding_id, today=task.data_date)
+                    except Exception as e:             # noqa: BLE001
+                        logger.error("试运行打「已不存在」标失败 %s: %s", t.finding_id, e)
+        if scoped_regions:
+            ros = lifecycle_mod.resolve_region_out_of_scope(
+                loaded_all, scoped_regions, today=task.data_date,
+                already={t.finding_id for t in res.transitions})
+            if ros:
+                logger.info("region 已移出采集范围 → 关闭 %d 条既有 finding（范围 %s）",
+                            len(ros), ",".join(scoped_regions))
+                res = replace(res, transitions=(*res.transitions, *ros))
+        if task.bootstrap:
+            # 🔴 转正首轮写下的 NEW **不计入确认轮数**（R1 review A-3）。
+            #
+            #    `_new_record` 给 CREATED 记 `consecutive_hits=1`，下一次定时轮再命中
+            #    就 CONFIRMED → 当天就有推送资格。按钮可能在 UTC 23:30 点、02:00 跑
+            #    定时轮，两次观测只隔两个多小时、看的几乎是同一份按日分桶的数据 ——
+            #    R1.0c「连续 2 轮命中才推」的去抖就被压成了一轮。置 0 之后首轮只负责
+            #    「看得见」，确认仍然要两个完整的定时轮，与没有这个按钮时的时间线一致。
+            res = replace(res, transitions=tuple(
+                replace(t, record=replace(t.record, consecutive_hits=0))
+                if t.kind is lifecycle_mod.TransitionKind.CREATED else t
+                for t in res.transitions))
         if not task.is_dry_run:
             # 判定证据（实测值 / 阈值 / 余量 / 方向 / 金额）随状态一起落库。
             # 🔴 不落的话这些数字只存在于 S3 载荷里，看板卡片上就只有
@@ -1557,7 +1735,7 @@ def _assemble_and_dispatch(
             #    也看不到阈值，只能等 1~3 分钟后的 DA 判读全文。
             n_transitions = store.apply_transitions(
                 task.account_id, res.transitions, today=task.data_date,
-                evidence=asm.to_evidence(findings))
+                evidence={**also_evidence, **asm.to_evidence(findings)})
         else:
             n_transitions = len(res.transitions)
 
@@ -1585,9 +1763,22 @@ def _assemble_and_dispatch(
     run_id = f"{task.run_type.value}#{task.run_date.isoformat()}#{task.account_id}"
 
     plan, tasks = (None, [])
+    # 🔴 **试运行只给看板上已有、开着的 finding 派 DA**（2026-10-10 reviewer B16 / F-02）。
+    #    试运行不落库，本轮的**新命中**在 finding 表里没有行 → 判读回来时
+    #    `attach_judgment` 找不到行（`attribute_exists(PK)`）被丢掉：钱花了，看板上
+    #    什么都没有。新命中只计数（`dry_run_new_hits`），完成提示里说清楚。
+    #    零命中的 heartbeat 也不派：试运行的结论不进看板，那条心跳没人看得到。
+    new_hits = 0
+    to_dispatch = findings
+    if task.is_dry_run:
+        open_prev = {fid for fid, rec in prev_all.items() if rec.state.is_open}
+        to_dispatch = [f for f in findings if f.finding_id in open_prev]
+        new_hits = len(findings) - len(to_dispatch)
+        if new_hits:
+            logger.info("试运行：%d 条新命中不派 DA（看板上没有它们的行）", new_hits)
     if space_id:
         plan, tasks = asm.build_tasks(
-            findings, run_type=task.run_type, account_id=task.account_id,
+            to_dispatch, run_type=task.run_type, account_id=task.account_id,
             data_date=task.data_date, run_id=run_id,
             agent_space_id=space_id, tier=tier)
     else:
@@ -1610,7 +1801,7 @@ def _assemble_and_dispatch(
 
     # ── 7.4d 零命中 heartbeat
     hb = None
-    if space_id:
+    if space_id and not task.is_dry_run:
         hb = asm.heartbeat_if_empty(
             findings, run_type=task.run_type, account_id=task.account_id,
             data_date=task.data_date, run_id=run_id, agent_space_id=space_id,
@@ -1679,6 +1870,20 @@ def _assemble_and_dispatch(
                 mapped += 1
             except Exception as e:             # noqa: BLE001
                 logger.exception("写派发映射失败（不阻断其余）: %s", e)
+            else:
+                # 🔴 映射写上了才在 finding 行上打标（与手动派发同一个判据，review B10）。
+                #    不打的话，派发到 callback 之间（DA 并发为 1，排队可能几十分钟）
+                #    行上没有 `da_task_id`：「深入分析」照给、后端照放行 → 第二个 task，
+                #    两份判读回填同一行互相覆盖。
+                # ⚠️ `clear_previous=False`：上一份判读留着，新结果回来前看板照旧显示它，
+                #    gating 的复用也还读得到；「这一次还没回来」由
+                #    `da_updated_at < da_dispatched_at` 表达。
+                for fid in ([] if is_hb else req.finding_ids):
+                    try:
+                        store.mark_judge_dispatched(
+                            task.account_id, fid, task_id=task_id)
+                    except Exception as e:     # noqa: BLE001
+                        logger.warning("批量派发：打标失败（不影响回填）%s: %s", fid, e)
 
             # 预注册 investigation 行。`source='inspection'` 让 run 级归集
             # 能按来源筛（R5.5a）；**不是**分流主判据 —— 那个是
@@ -1704,6 +1909,8 @@ def _assemble_and_dispatch(
         "transitions": n_transitions,
         "skipped_by_gate": gate_counts,
         "heartbeat": hb is not None,
+        # 试运行里算出来、但看板上还没有的新命中（不派 DA、不落库）。
+        "dry_run_new_hits": new_hits,
         "agent_space_id": space_id or "",
         # 🔴 **两个数一起带出去，别合并**（见 region 循环里那段说明）。
         #
@@ -1838,6 +2045,8 @@ def _run_inspection(
         except Exception:                                      # noqa: BLE001
             # 预热失败不影响正确性（worker 里还会再建一次），不值得中断本轮。
             logger.warning("预热 %s 客户端模型失败（不影响正确性）", _svc)
+    # 显式收窄的 region（输入，不是收集用的出参）。
+    scoped_scope: tuple[str, ...] = ()
     if forced_region:
         scan_list = [forced_region]
         logger.info("手动重跑：只扫 %s（task.region 指定）", forced_region)
@@ -1863,6 +2072,7 @@ def _run_inspection(
                 sess, home=home_region, errors=skipped)
         else:
             scan_list = scoped
+            scoped_scope = tuple(scoped)
             logger.info("账号 %s 的巡检范围按配置收窄到 %d 个 region: %s",
                         task.account_id, len(scan_list), ",".join(scan_list))
 
@@ -1934,7 +2144,8 @@ def _run_inspection(
         return RegionScan(
             region=reg, rds=r_rds, ec=r_ec, cw=r_cw,
             all_attrs=attrs, kept=keep, excluded=drop, cluster_sizes=sizes,
-            skipped=[f"{reg}:{m}" for m in marks])
+            skipped=[f"{reg}:{m}" for m in marks],
+            listed=_listed_services(marks))
 
     # 🔴 剩余时间预算。发现阶段给 1/3，采集阶段给剩下的 —— 两个阶段都要
     #    在 Lambda 超时**之前**结束，否则走那条全静默的路：
@@ -2028,6 +2239,9 @@ def _run_inspection(
         "data_date": task.data_date.isoformat(),
         "source": task.source.value,
         "mode": task.mode.value,
+        # 手点的首轮被转正时为真（见 `_promote_bootstrap`）。与 `mode` 分开存：
+        # 只看 `mode=official` 分不出这一轮是定时跑的还是客户点出来的。
+        "bootstrap": task.bootstrap,
         "tier": task.tier,
         "catch_up": task.catch_up,
         "config_version": task.config_version,
@@ -2184,7 +2398,9 @@ def _run_inspection(
         # ⚠️ 两个配置对象都要往下传：`insp_cfg` 给闲置轮的三段规则，
         #    `threshold_cfg` 给高负载轮。少传后者等于高负载轮恒用默认阈值。
         threshold_cfg=threshold_cfg,
-        space_id=da_space_id, da_target=da_target)
+        space_id=da_space_id, da_target=da_target,
+        # 只在**显式**收窄时传（见 `resolve_region_out_of_scope` 的 ⚠️）。
+        scoped_regions=scoped_scope)
 
     # ── 6.16 stats（纯函数，见 `build_stats` 的说明）
     # 全 region 合并后的计数。⚠️ 逐项相加/并集，不能拿某一个 region 的
@@ -2319,8 +2535,11 @@ def _handle_manual_judge(req: dict[str, Any], context: Any) -> dict[str, Any]:
             home_region=home_region,
             describe_attrs=_make_describe_attrs(),
             operator_note=str(req.get("operator_note") or ""),
-            locale=str(req.get("locale") or "zh"),
+            # 🔴 与批量判读同源（review B13）：请求体里的 locale 不认 —— 判读正文的
+            #    语言是部署级的，一条 finding 一份、多个 chat 共享。
+            locale=_report_locale(),
             env_space_id=_env("INSPECT_AGENT_SPACE_ID"),
+            load_exclusions=lambda rt: load_exclusions(store, rt),
         )
     except mj.ManualJudgeError as e:
         logger.warning("按需判读被拒: account=%s finding=%s code=%s: %s",
@@ -2342,14 +2561,41 @@ def _handle_manual_judge(req: dict[str, Any], context: Any) -> dict[str, Any]:
     }
 
 
+def _report_locale() -> str:
+    """判读正文的语言：部署级 `INSPECTION_REPORT_LOCALE`（批量与手动同源）。"""
+    loc = (_env("INSPECTION_REPORT_LOCALE", "zh") or "zh").strip().lower()
+    if loc not in ("zh", "en"):
+        logger.warning("INSPECTION_REPORT_LOCALE=%r 不认识，按 zh 处理", loc)
+        loc = "zh"
+    return loc
+
+
+def _listed_services(marks: Sequence[str]) -> frozenset:
+    """从 `load_resources` 的降级标记推出「哪些 service 确实列成功了」。
+
+    ⚠️ 判据只看**实例列表**那一个 describe（RDS 的 `describe_db_instances`、
+       ElastiCache 的 `describe_cache_clusters`）：集群 / 副本组那一层失败只少了
+       HA 字段，实例本身是列全了的。
+    """
+    out = set()
+    if not any(m in ("rds:no_client", "describe_db_instances:describe_failed")
+               for m in marks):
+        out.add("rds")
+    if not any(m in ("elasticache:no_client", "describe_cache_clusters:describe_failed")
+               for m in marks):
+        out.add("elasticache")
+    return frozenset(out)
+
+
 def _make_describe_attrs():
     """造一个 `(account, region, service, instance) -> ResourceAttrs | None`。
 
-    🔴 复用 `attrs_repo.load_*_attrs` 而**不自己写一份 describe**。
-       那两个函数产出的 `ResourceAttrs` 里有 `multi_az` / `maxmemory_policy` /
-       `memory_bytes` / 副本关系 —— 正是 skill 判「是不是 standby、是不是有
-       理由地闲着」的依据。自己写一份必然只填几个字段，而缺的那些在载荷契约里
-       都有登记（`attrs_section()`），于是 skill 会去读一个永远是 null 的字段。
+    🔴 复用 `pipeline.load_resources`（批量轮的同一条采集路径）而**不自己写一份
+       describe**。它产出的 `ResourceAttrs` 里有 `multi_az` / `maxmemory_policy` /
+       副本关系，并按依赖顺序补上 `memory_bytes` → `max_connections` —— 正是 skill
+       判「是不是 standby、余量够不够」的依据。改前只调 `load_*_attrs`，这两个分母
+       在手动载荷里恒为 null（2026-10-10 review B11）。只给目标 service 的 client，
+       另一个 service 不列。
 
     ⚠️ 代价是它们**列全区再过滤**（`describe_db_instances` 无过滤参数，
        ElastiCache 同）。对单条 finding 略重，但比重写一份 describe 安全得多：
@@ -2359,7 +2605,8 @@ def _make_describe_attrs():
     ⚠️ 跨账号 assume 走既有的 `_session_for`（它带账号段校验 ——
        `role_arn` 的账号段必须等于目标账号，见 `shared.account_scope`）。
     """
-    from inspection.adapters import attrs_repo
+    from inspection import manual_judge as mj
+    from inspection import pipeline
 
     def describe(account_id: str, region: str, service: str,
                  instance_id: str):
@@ -2367,22 +2614,37 @@ def _make_describe_attrs():
         svc = (service or "").lower()
         errors: list[str] = []
         if svc in ("rds", "aurora"):
-            rows = attrs_repo.load_rds_attrs(
-                sess.client("rds", region_name=region), account_id, region,
-                errors=errors)
+            clients = pipeline.InspectionClients(
+                rds=sess.client("rds", region_name=region),
+                ec2=sess.client("ec2", region_name=region))
         elif svc == "elasticache":
-            rows = attrs_repo.load_elasticache_attrs(
-                sess.client("elasticache", region_name=region), account_id, region,
-                errors=errors)
+            clients = pipeline.InspectionClients(
+                elasticache=sess.client("elasticache", region_name=region),
+                ec2=sess.client("ec2", region_name=region))
         else:
             raise RuntimeError(f"不支持的 service: {service!r}")
-        if errors:
-            # ⚠️ describe 的部分失败**不能**静默：少一台的表现是下面返回 None，
-            #    调用方报「资源不存在」——而真相是「我们没权限看它」。
-            logger.warning("按需判读 describe 有部分失败: %s", errors[:3])
+        rows = pipeline.load_resources(
+            clients, account_id=account_id, region=region, skipped=errors)
         for a in rows:
             if a.instance_id == instance_id:
+                noisy = [m for m in errors if not m.endswith(":no_client")]
+                if noisy:
+                    logger.warning("按需判读 describe 有部分失败（但找到了这台）: %s",
+                                   noisy[:3])
                 return a
+        # ⚠️ 只有**实例列表**那个 describe 失败才算「没列全」—— 与正式轮的
+        #    `_listed_services` 同一判据（reviewer B19）。集群 / 副本组那一层失败只少了
+        #    HA 字段；若把它也算进来，长期缺集群层权限的账号里已删资源永远回
+        #    「暂时确认不了」，到不了「已不存在」。
+        svc_listed = "rds" if svc in ("rds", "aurora") else svc
+        errors = [] if svc_listed in _listed_services(errors) else [
+            m for m in errors if not m.endswith(":no_client")]
+        if errors:
+            # 🔴 列不全时**不能**回 None。None 的含义是「列成功了、里面没有它」，
+            #    调用方据此告诉客户「资源已经不存在」并打标、藏掉按钮 —— 而真相是
+            #    「我们没看全」（权限 / 限流）。说错的代价是一台在跑的库被当成已删。
+            raise mj.DescribeIncomplete(
+                f"列 {service} 资源时部分失败（{', '.join(errors[:3])}）")
         return None
 
     return describe

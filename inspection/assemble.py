@@ -216,6 +216,57 @@ def _correlated_section(
     return out
 
 
+@dataclass(frozen=True)
+class AlsoHit:
+    """同一台实例上 worst 之外、本轮也越线的那条指标。
+
+    只进状态机（`Observation(hit=True)`）与 finding 行的证据，**不派 DA** ——
+    判读随 worst 那条一起做（`skip_reason=rollup_member`，读侧按「不需要单独判读」显示）。
+    """
+
+    finding_id: str
+    instance_id: str
+    severity: Severity
+    evidence: Mapping[str, Any]
+
+
+def _also_hit(attrs: ResourceAttrs, v: Any, verdict: Any, *, worst_metric: str,
+              locale: str) -> "AlsoHit":
+    from inspection.domain import metrics_meta as mm
+    from inspection.domain import severity as sev_mod
+
+    sev = sev_mod.compute_severity(sev_mod.SeverityInput(
+        headroom=v.headroom, metric=v.metric,
+        chronic_high=v.metric in verdict.chronic_days), attrs)
+    fid = "#".join((attrs.account_id, attrs.region or "-", attrs.service,
+                    attrs.instance_id, "threshold_high", v.metric))
+    ev: dict[str, Any] = {}
+    for k in _EVIDENCE_NUMERIC:
+        fv = _as_float(getattr(v, k, None))
+        if fv is not None:
+            ev[k] = fv
+    d = getattr(mm.direction_of(v.metric), "value", "")
+    if d:
+        ev["direction"] = d
+    u = _unit_of_metric(v.metric)
+    if u and ("value" in ev or "threshold" in ev):
+        ev["unit"] = u
+    if attrs.instance_class:
+        ev["instance_class"] = attrs.instance_class
+    ev["skip_reason"] = "rollup_member"
+    ev["conclusion"] = (
+        f"同一台资源上更严重的「{worst_metric}」已一起判读，这条随它处置，不单独派 AI 判读。"
+        if locale != "en" else
+        f"Analysed together with the more severe {worst_metric} on the same resource.")
+    return AlsoHit(finding_id=fid, instance_id=attrs.instance_id, severity=sev, evidence=ev)
+
+
+def also_hit_observations(hits: Sequence[AlsoHit], *, rule_version: str) -> list[Observation]:
+    """`AlsoHit` → 状态机的命中观测（与 `to_observations` 同形）。"""
+    return [Observation(finding_id=h.finding_id, hit=True, severity=h.severity,
+                        healthy=False, rule_version=rule_version) for h in hits]
+
+
 def high_load_findings(
     bundle: Any,
     attrs_by_id: Mapping[str, ResourceAttrs],
@@ -229,8 +280,16 @@ def high_load_findings(
     healthy_out: list[tuple[str, str]] | None = None,
     not_evaluable_out: list[str] | None = None,
     reachable: bool = True,
+    also_hit_out: list["AlsoHit"] | None = None,
+    healthy_ids_out: list[str] | None = None,
+    frozen_ids_out: list[str] | None = None,
 ) -> list[AssembledFinding]:
     """高负载轮的阈值判定 → `AssembledFinding`（的剩余部分）。
+
+    `healthy_ids_out`：两条盲区通知（`no_capacity_metadata` / `unsupported_engine`）
+    本轮已不成立时的 finding_id —— 分母补上了 / 引擎能判了（reviewer A4）。
+    `frozen_ids_out`：被 warm-up / 事件 / 平台期抑制的越线指标 —— 判了但本轮不报，
+    不能被当成「未命中」（reviewer A3②）。
 
     ⚠️ 只返回 finding。**未命中且水位已回健康区**的那些由
     `judge_high_load()` 一起给出（同一次判定，不重算）—— 见那个函数的说明。
@@ -276,6 +335,10 @@ def high_load_findings(
         if mm.is_unsupported_engine(attrs.engine):
             blind.append(_unsupported_engine_finding(attrs, data_date=data_date))
             continue
+        # 引擎能判了 → 「引擎不受支持」那条盲区通知不再成立（恢复证据，reviewer A4）。
+        if healthy_ids_out is not None:
+            healthy_ids_out.append(
+                _fid(attrs, StructuralRule.UNSUPPORTED_ENGINE.value))
         metrics = list(mm.alerting_metrics(attrs.service, attrs.engine))
         if not metrics:
             # 这个服务/引擎没有任何 alerting 指标 → 本轮判不了它。
@@ -381,6 +444,12 @@ def high_load_findings(
             not_evaluable.append(iid)
 
         missing = verdict.missing_denominator
+        # 分母补上了（或这个规格本来就没有固定分母）→ 「缺容量元数据」不再成立。
+        # ⚠️ 只在本轮判得了时说（判不了的实例整台不进评估集合）。
+        if (healthy_ids_out is not None and verdict.evaluable
+                and not (missing and specs.has_fixed_memory(attrs.instance_class))):
+            healthy_ids_out.append(
+                _fid(attrs, StructuralRule.NO_CAPACITY_METADATA.value))
         if missing and specs.has_fixed_memory(attrs.instance_class):
             # ⚠️ Serverless v2（`db.serverless`）被 `has_fixed_memory` 挡在
             #    这里：它的内存随 ACU 秒级伸缩，压根没有固定分母 ——
@@ -443,6 +512,26 @@ def high_load_findings(
         #    比抛 IndexError 好（后者会让整轮失败）。
         worst = verdict.worst or verdict.chronic_worst
         metric = worst.metric if worst else metrics[0]
+        # 🔴 **其余越线的指标也要给状态机一条「命中」观测**（2026-10-10）。
+        #    每台实例只出 worst 那一条 finding（只派它的 DA，成本不变），但 finding_id
+        #    第 6 段是指标名 —— 其余仍越线的指标若不出观测，上一轮以它为 id 的 finding
+        #    会被判「未命中」。实测形态：CPU 与可用内存天天 CRITICAL、worst 轮流，
+        #    两条轮流被打成 resolved，看板 0 条。
+        if also_hit_out is not None:
+            for v in verdict.verdicts:
+                if not v.hit or v.metric == metric or (iid, v.metric) in supp:
+                    continue
+                also_hit_out.append(_also_hit(attrs, v, verdict, worst_metric=metric,
+                                              locale=locale))
+        # 🔴 越线但被抑制（warm-up / 事件 / 平台期）的指标：判了、本轮不报 ——
+        #    **不是**「未命中」。不冻结的话：昨天刚建的 CRITICAL 今天被一次 modify
+        #    事件抑制 → 记成 prediction_missed 并推一条「已缓解」（reviewer A3② / A7）。
+        if frozen_ids_out is not None:
+            for v in verdict.verdicts:
+                if (iid, v.metric) in supp and (v.hit or v.metric == metric):
+                    frozen_ids_out.append(_fid(attrs, "threshold_high", v.metric))
+            if (iid, metric) in supp:
+                frozen_ids_out.append(_fid(attrs, "threshold_high", metric))
         if (iid, metric) in supp:
             # R8.5：warm-up / 平台期内不上报。判定已经跑过，证据在序列库里。
             logger.info("warm-up 抑制 %s/%s（%s）", iid, metric, supp[(iid, metric)])
@@ -836,6 +925,84 @@ def idle_findings(
     return out
 
 
+def _fid(attrs: ResourceAttrs, rule: str, metric: str = "-") -> str:
+    return "#".join((attrs.account_id, attrs.region or "-", attrs.service,
+                     attrs.instance_id, rule, metric))
+
+
+def idle_domain_coverage(
+    attrs_by_id: Mapping[str, ResourceAttrs],
+    *,
+    measured_ids: set[str],
+    pairs: Sequence[tuple[Any, ResourceAttrs]],
+    outcomes: Sequence[Any],
+    refdata: Any,
+    cfg: Any,
+    produced: set[str],
+) -> tuple[list[str], list[str]]:
+    """闲置轮每台资源、每条规则：本轮是「判了没命中」还是「判不了」。
+
+    ## 🔴 为什么要有它（2026-10-10 交叉 review A3 / A4）
+
+    状态机只有高负载有恢复信号（`healthy_observations`），闲置域（结构性 / 容量 /
+    闲置）完全没有，于是：
+
+    ```
+    gp2 换了 gp3 / 开了备份 / 升了版本 / 不再闲置   → 只能进 chronic，永远关不掉，
+                                                    旧金额继续算在 KPI 里
+    停机的 RDS（不发指标）/ refdata 加载失败 /       → 被当成「没命中」：new 记成误报
+      判据不足 / 集群信息缺失                          active 走向 chronic
+    ```
+
+    闲置域的规则大多是**二值属性判定**，「本轮判得了且没命中」本身就是恢复证据。
+
+    Returns:
+        `(healthy_ids, frozen_ids)`。`produced`（本轮命中的）两边都不进。
+    """
+    from inspection.domain.dto import CapacityRule, VetoOutcome
+    from inspection.domain.scoring.capacity import AUDITS, capacity_judgeable
+    from inspection.domain.structural.rules import RULES, applies_to, judgeable
+
+    healthy: list[str] = []
+    frozen: list[str] = []
+
+    def put(fid: str, ok: bool) -> None:
+        if fid in produced:
+            return
+        (healthy if ok else frozen).append(fid)
+
+    cand_by_id = {a.instance_id: c for c, a in pairs}
+    outcome_by_id = {o.instance_id: o for o in outcomes}
+    cap_rules = {
+        "rds": CapacityRule.OVERSIZED_STORAGE,
+        "elasticache": CapacityRule.OVERSIZED_MEMORY,
+    }
+    for iid, attrs in attrs_by_id.items():
+        # 结构性：纯属性 + refdata，与采集成败无关
+        for rule in RULES:
+            if applies_to(rule, attrs.service):
+                put(_fid(attrs, rule.value), judgeable(rule, attrs, refdata))
+        # 容量与闲置：要指标
+        crule = cap_rules.get(attrs.service)
+        measured = iid in measured_ids and iid in cand_by_id
+        if crule is not None and attrs.service in AUDITS:
+            put(_fid(attrs, crule.value),
+                measured and capacity_judgeable(crule, cand_by_id[iid], attrs, cfg.capacity))
+        if attrs.service in ("rds", "elasticache"):
+            o = outcome_by_id.get(iid)
+            if not measured or o is None:
+                put(_fid(attrs, pl.HIT_IDLE), False)
+            elif not o.passed:
+                # 被否决 = 确认不闲（业务高峰 / 隐形负载）—— 但只认**真的否决了**，
+                # 「缺数据保守放行」那一档不算判定。
+                put(_fid(attrs, pl.HIT_IDLE),
+                    any(v.outcome is VetoOutcome.VETOED for v in o.vetoes))
+            else:
+                # 通过否决但没算出分 = 判据不足（停机、维度缺太多）
+                put(_fid(attrs, pl.HIT_IDLE), bool(o.score and o.score.is_judged))
+    return healthy, frozen
+
+
 def judge_findings(
     *,
     run_type: Any,
@@ -854,8 +1021,15 @@ def judge_findings(
     healthy_out: list[tuple[str, str]] | None = None,
     not_evaluable_out: list[str] | None = None,
     reachable: bool = True,
+    also_hit_out: list[AlsoHit] | None = None,
+    healthy_ids_out: list[str] | None = None,
+    frozen_ids_out: list[str] | None = None,
 ) -> list[AssembledFinding]:
     """按轮次类型产出 finding（的总入口）。
+
+    `healthy_ids_out` / `frozen_ids_out`（2026-10-10 交叉 review A3 / A4）：本轮
+    **判了、没命中**（恢复证据）与**判不了**（原地不动）的 finding_id。见
+    `idle_domain_coverage` 与 `high_load_findings` 里同名参数的说明。
 
     ```
     RunType.HIGH  阈值 + 慢性              → high_load_findings
@@ -895,7 +1069,10 @@ def judge_findings(
             #    `InstanceVerdict.evaluable`。留在里面会让上一轮的 finding
             #    被判 resolved（昨天刚建的直接记成 prediction_missed）。
             not_evaluable_out=not_evaluable_out,
-            reachable=reachable)
+            reachable=reachable,
+            # worst 之外也越线的指标 —— 只进状态机，不派 DA。见 `AlsoHit`。
+            also_hit_out=also_hit_out,
+            healthy_ids_out=healthy_ids_out, frozen_ids_out=frozen_ids_out)
 
     attrs_list = list(attrs_by_id.values())
 
@@ -929,6 +1106,15 @@ def judge_findings(
     out += idle_findings(
         ranked, attrs_by_id, bundle=bundle, data_date=data_date,
         locale=locale, config_version=config_version, reachable=reachable)
+    if healthy_ids_out is not None or frozen_ids_out is not None:
+        healthy_ids, frozen_ids = idle_domain_coverage(
+            attrs_by_id, measured_ids={a.instance_id for a in measured},
+            pairs=pairs, outcomes=outcomes, refdata=refdata, cfg=cfg,
+            produced={f.finding_id for f in out})
+        if healthy_ids_out is not None:
+            healthy_ids_out.extend(healthy_ids)
+        if frozen_ids_out is not None:
+            frozen_ids_out.extend(frozen_ids)
     logger.info(
         "闲置轮判定: 结构性 %d + 容量 %d + 闲置 %d（候选 %d，已判定 %d）",
         len(structural), len(capacity), len(ranked), len(pairs),

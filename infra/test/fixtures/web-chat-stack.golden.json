@@ -1763,6 +1763,7 @@
               "Resource": [
                 "arn:aws:iam::*:role/notiops-idle-detection-role",
                 "arn:aws:iam::*:role/notiops-idle-detection-role-*",
+                "arn:aws:iam::*:role/notiops-cross-account-role-*",
                 "arn:aws:iam::*:role/notiops-agent-trigger-*"
               ]
             },

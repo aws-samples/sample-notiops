@@ -142,6 +142,8 @@ class PushSkip(str, Enum):
     BACKOFF_NOT_DUE = "backoff_not_due"
     ALREADY_PUSHED_TODAY = "already_pushed_today"
     RESOLVED_AND_ANNOUNCED = "resolved_and_announced"
+    RESOLVED_NEVER_ANNOUNCED = "resolved_never_announced"
+    RESOURCE_GONE = "resource_gone"
 
 
 _SKIP_TEXT_ZH: dict[PushSkip, str] = {
@@ -154,6 +156,8 @@ _SKIP_TEXT_ZH: dict[PushSkip, str] = {
     PushSkip.BACKOFF_NOT_DUE: "无变化且退避间隔还没到",
     PushSkip.ALREADY_PUSHED_TODAY: "今天已经推过",
     PushSkip.RESOLVED_AND_ANNOUNCED: "已关闭且缓解通报已发过",
+    PushSkip.RESOLVED_NEVER_ANNOUNCED: "从没告警过的，不通报缓解（一日抖动）",
+    PushSkip.RESOURCE_GONE: "资源已经不存在",
 }
 
 
@@ -470,6 +474,11 @@ class FindingView:
     days_active: int = 0
     has_judgment: bool = False
     verdict: str = ""
+    last_run_date: str = ""
+    """最后一次被评估的日期。`transition_kind` 只在这一天是「今天发生的变化」。"""
+    resource_missing_on: str = ""
+    """资源已不存在的核实日期（`store.RESOURCE_MISSING_ATTR`）。"""
+    prev_severity: str = ""
 
     @property
     def is_structural(self) -> bool:
@@ -500,6 +509,9 @@ def view_from_item(item: Mapping[str, Any]) -> FindingView:
         days_active=max(0, days),
         has_judgment=item.get("da_updated_at") is not None,
         verdict=str(item.get("da_verdict") or ""),
+        last_run_date=str(item.get("last_run_date") or "")[:10],
+        resource_missing_on=str(item.get("resource_missing_on") or ""),
+        prev_severity=str(item.get("prev_severity") or "").strip().upper(),
     )
 
 
@@ -541,6 +553,11 @@ def decide(
 
     if sev == Severity.INFO.value:
         return Decision(view, False, PushSkip.INFO_NEVER_PUSHED.value)
+
+    # 🔴 资源已经不存在（「深入分析」或试运行核实过）—— 正式轮关掉它之前，
+    #    周报里不该还把它列为「仍未关闭」（reviewer F-16）。
+    if view.resource_missing_on and view.is_open:
+        return Decision(view, False, PushSkip.RESOURCE_GONE.value)
 
     if kind in (PushKind.MONTHLY, PushKind.WEEKLY):
         # ── 摘要类（周度 / 月度）────────────────────────────────────
@@ -588,9 +605,19 @@ def decide(
     if state.last_pushed_date == today:
         return Decision(view, False, PushSkip.ALREADY_PUSHED_TODAY.value)
 
-    if view.transition_kind in _TRANSITION_WORTH_SAYING:
-        if view.transition_kind == "resolved" and state.resolved_announced:
-            return Decision(view, False, PushSkip.RESOLVED_AND_ANNOUNCED.value)
+    # 🔴 **跃迁只在它发生的那一天算「今日变化」**（reviewer A6 / F-03）。
+    #    `transition_kind` 是行上的持久字段，冻结的行（region 发现失败、角色失效、
+    #    判不了）停在最后一次的值 → 原来每天都按「状态变化」重推，绕过退避。
+    #    ⚠️ 老行没有 `last_run_date`（空串）时按原行为走，不让存量行一夜静默。
+    fresh = not view.last_run_date or view.last_run_date == today.isoformat()
+    if fresh and view.transition_kind in _TRANSITION_WORTH_SAYING:
+        if view.transition_kind == "resolved":
+            if state.resolved_announced:
+                return Decision(view, False, PushSkip.RESOLVED_AND_ANNOUNCED.value)
+            # 🔴 从没告警过的，不通报缓解（reviewer A7）：一日抖动（new 次日消失）
+            #    会让客户收到一条从没见过的风险「已缓解」。
+            if not state.ever_pushed:
+                return Decision(view, False, PushSkip.RESOLVED_NEVER_ANNOUNCED.value)
         return Decision(view, True, PUSH_BECAUSE_TRANSITION)
 
     if not view.is_open:
@@ -788,6 +815,17 @@ _L: dict[str, dict[str, str]] = {
         "detail": "详情",
         "snooze": "不想再收到这类提醒？[调整巡检范围]({url})",
         "empty": "本轮没有需要提醒的变化。",
+        "st_resolved": "已缓解",
+        "st_worsened": "恶化",
+        "st_reopened": "复发",
+        "st_confirmed": "新确认",
+        "st_ongoing": "持续",
+        "days_resolved": "持续 {n} 天后缓解",
+        "as_of": "数据截至 {d}",
+        "v_real_degradation": "确有劣化",
+        "v_expected_behaviour": "预期行为",
+        "v_warm_up": "预热期，证据不足",
+        "v_insufficient_evidence": "证据不足",
     },
     "en": {
         "daily": "Resource Inspection · Changes today",
@@ -801,6 +839,17 @@ _L: dict[str, dict[str, str]] = {
         "detail": "details",
         "snooze": "Too noisy? [Adjust inspection scope]({url})",
         "empty": "Nothing worth flagging this run.",
+        "st_resolved": "Resolved",
+        "st_worsened": "Worsened",
+        "st_reopened": "Reopened",
+        "st_confirmed": "Confirmed",
+        "st_ongoing": "Ongoing",
+        "days_resolved": "resolved after {n}d",
+        "as_of": "data as of {d}",
+        "v_real_degradation": "real degradation",
+        "v_expected_behaviour": "expected behaviour",
+        "v_warm_up": "warm-up, too early",
+        "v_insufficient_evidence": "insufficient evidence",
     },
 }
 
@@ -808,6 +857,24 @@ _L: dict[str, dict[str, str]] = {
 def _t(locale: str, key: str, **kw: Any) -> str:
     table = _L["en"] if str(locale or "zh").lower().startswith("en") else _L["zh"]
     return table[key].format(**kw) if kw else table[key]
+
+
+def _state_label(v: FindingView, today: date, locale: str) -> str:
+    """这一条在这次推送里是什么：已缓解 / 恶化 / 复发 / 新确认 / 持续。"""
+    if not v.is_open:
+        return _t(locale, "st_resolved")
+    fresh = not v.last_run_date or v.last_run_date == today.isoformat()
+    if fresh and v.transition_kind in ("worsened", "reopened", "confirmed"):
+        return _t(locale, f"st_{v.transition_kind}")
+    return _t(locale, "st_ongoing")
+
+
+def _verdict_text(verdict: str, locale: str) -> str:
+    """DA verdict 枚举 → 人话（reviewer F-16：原来把 `real_degradation` 直接推进客户群）。
+    认不出的原样返回（同前端 `verdictLabel` 的约定）。"""
+    key = f"v_{(verdict or '').strip()}"
+    table = _L["en"] if str(locale or "zh").lower().startswith("en") else _L["zh"]
+    return table.get(key, verdict)
 
 
 def render_selection(
@@ -846,16 +913,27 @@ def render_selection(
     lines += ["", f"{_t(locale, 'account')}: {account_id} · {today.isoformat()}"]
     lines.append("")
     for v in sel.picked:
-        bits = [f"**{v.severity}**", v.instance_id or v.finding_id]
+        # 🔴 **状态标签在最前面**（reviewer F-04）：原来一条「已缓解」通报渲染成
+        #    「**CRITICAL** · db · cpu · 已持续 13 天」，和新告警并排、长得一样 ——
+        #    周一早上客户读到的是一条看起来仍在发生的 CRITICAL。
+        label = _state_label(v, today, locale)
+        sev = (f"{v.prev_severity}→{v.severity}"
+               if v.transition_kind == "worsened" and v.prev_severity else v.severity)
+        bits = [f"{label} **{sev}**" if label else f"**{sev}**",
+                v.instance_id or v.finding_id]
         if v.region:
             bits.append(v.region)
         if v.metric and v.metric != "-":
             bits.append(v.metric)
         seg = f"- {' · '.join(bits)}"
         if v.days_active > 0:
-            seg += f" · {_t(locale, 'days', n=v.days_active)}"
+            seg += " · " + (_t(locale, "days_resolved", n=v.days_active)
+                            if not v.is_open else _t(locale, "days", n=v.days_active))
+        # 冻结的行（摘要里常见）说清数字是哪天的。
+        if v.last_run_date and v.last_run_date < today.isoformat() and v.is_open:
+            seg += f" · {_t(locale, 'as_of', d=v.last_run_date)}"
         if v.has_judgment and v.verdict:
-            seg += f" · {v.verdict}"
+            seg += f" · {_verdict_text(v.verdict, locale)}"
         elif not v.has_judgment:
             seg += _t(locale, "no_judgment")
         url = link_map.get(v.finding_id, "")
@@ -927,11 +1005,23 @@ def tab_for_rule(rule: str) -> str:
 
 
 def has_run_today(run_items: Sequence[Mapping[str, Any]], *, today: date) -> bool:
-    """今天有没有产出过 run 记录（任一类型、任一状态）。
+    """今天有没有一轮**正式、已跑完**的巡检（2026-10-10 收紧，reviewer A6 / F-03）。
 
     🔴 推送前的**最后一道闸**：没有它，把 `at_utc` 配到巡检之前就会每天推
     前一天的结论，而客户看到的日期是今天 —— 表现是「推送里的数字和看板
     不一样」，而两边都不报错。
+
+    ⚠️ 原来认「任一类型、任一状态」：试运行（不更新发现）、还在 running、
+       整轮 failed 的都算 —— 于是推的正是这道闸要防的「上一轮的结论」。
+       现在只认 `mode != dry_run` 且 `status ∈ {success, partial}`。
+       老 run 行没有 `mode` 字段时按正式轮算（存量行的语义就是正式轮）。
     """
     stamp = today.isoformat()
-    return any(str(r.get("run_date") or "") == stamp for r in run_items)
+    for r in run_items:
+        if str(r.get("run_date") or "") != stamp:
+            continue
+        if str(r.get("mode") or "official") == "dry_run":
+            continue
+        if str(r.get("status") or "success") in ("success", "partial"):
+            return True
+    return False

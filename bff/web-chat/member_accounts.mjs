@@ -1435,7 +1435,7 @@ export async function manualPayloadSave(accountId, payload) {
   // ── 顺手把巡检①的采集角色验一次并登记 ──
   //
   // 客户刚部署的那个栈（合并后的 member-devops-agent.yaml）已经把
-  // `notiops-idle-detection-role-<系统账号>` 建好了，角色名是模板固定的、
+  // `notiops-cross-account-role-<系统账号>` 建好了，角色名是模板固定的、
   // 我们能推导出来。所以这里直接 AssumeRole 一次：通了就登记，①那一栏在页面
   // 上自己变绿，客户不用再点一次「验证并登记」。
   //
@@ -1583,15 +1583,19 @@ const INSPECT_SPACE_NAME = process.env.INSPECT_AGENT_SPACE_NAME || "";
  * 采集角色的 ARN —— **推导，不让客户手填**。
  *
  * 角色名由 `member-account-onboarding.yaml` 固定（`RoleName: !Sub
- * "notiops-idle-detection-role-${SystemAccountId}"`），客户没有选择余地。
+ * "notiops-cross-account-role-${SystemAccountId}"`），客户没有选择余地。
  * 让他贴 ARN 只会引入贴错账号、贴成 trigger role 之类的错。
+ *
+ * ⚠️ 2026-10 之前的模板建的是 `notiops-idle-detection-role-<系统账号>`。
+ *    本函数只返回**新名**；旧名由 `role_guard.mjs::siblingRoleArn` 推导，
+ *    验证时两个都试（见 `verifyAndRegisterCollectionRole`）。
  *
  * ⚠️ 与 `MEMBER_ROLE_NAME` 同源：那个常量在非 org 模式下会 fallback 成
  * 不带后缀的名字，而模板建的**永远带后缀** —— 所以这里不复用它，直接按
  * 模板的规则拼。
  */
 export function collectionRoleArn(accountId, systemAccountId) {
-  return `arn:aws:iam::${accountId}:role/notiops-idle-detection-role-${systemAccountId}`;
+  return `arn:aws:iam::${accountId}:role/notiops-cross-account-role-${systemAccountId}`;
 }
 
 /** 跨账号巡检的前置状态 + 引导信息。**只读。** */
@@ -1727,6 +1731,8 @@ export async function inspectionCrossAccountStatus(accountId) {
   const acct = await getConfigAccount(id);
   const roleArn = String(acct?.role_arn || "");
   const expected = collectionRoleArn(id, sysAcct);
+  const { siblingRoleArn } = await import("./role_guard.mjs");
+  const legacyName = Boolean(roleArn) && roleArn === siblingRoleArn(expected);
 
   // ② 的状态：查巡检 space 上有没有指向这个账号的 association。
   //
@@ -1772,8 +1778,13 @@ export async function inspectionCrossAccountStatus(accountId) {
       registered: Boolean(roleArn),
       roleArn: roleArn || "",
       expectedRoleArn: expected,
-      /** 登记的与模板会建的不一致 —— 常见于手工贴错，或换过部署账号。 */
-      mismatch: Boolean(roleArn) && roleArn !== expected,
+      /** 登记的与模板会建的不一致 —— 常见于手工贴错，或换过部署账号。
+       *  🔴 2026-10 改名之前接入的账号登记的是旧名 `notiops-idle-detection-role-<系统账号>`，
+       *     它与新名互为别名（执行侧 AccessDenied 会换另一代再试），**不是**错配 ——
+       *     报 mismatch 会让每个存量账号在管理页变红并写着「巡检会失败」，而巡检是通的。 */
+      mismatch: Boolean(roleArn) && roleArn !== expected && !legacyName,
+      /** 登记的是改名前的旧名（合法，栈更新后执行侧自动换到新名）。前端只做提示，不阻塞。 */
+      legacyName,
     },
     /** ② 判读深度 */
     monitorAssociation: {
@@ -1809,19 +1820,33 @@ export async function verifyAndRegisterCollectionRole(accountId) {
       new Error("deployment account needs no cross-account role"),
       { code: "bad_request" });
   }
-  const roleArn = collectionRoleArn(id, sysAcct);
-
-  try {
-    await sts.send(new AssumeRoleCommand({
-      RoleArn: roleArn,
-      RoleSessionName: "notiops-verify-collection-role",
-      DurationSeconds: 900,
-    }));
-  } catch (e) {
+  // 🔴 新名优先、旧名兜底（2026-10 改名）。用最新模板部署的账号只有新名；
+  //    改名前接入、栈还没更新的账号只有旧名。两个都试，**登记真正通了的那一个**
+  //    —— 登记一个 assume 不进去的名字，就回到了上面说的「不验就写」。
+  const { roleArnCandidates, isAccessDenied } = await import("./role_guard.mjs");
+  const preferred = collectionRoleArn(id, sysAcct);
+  let roleArn = "";
+  let firstErr = null;
+  for (const candidate of roleArnCandidates(preferred)) {
+    try {
+      await sts.send(new AssumeRoleCommand({
+        RoleArn: candidate,
+        RoleSessionName: "notiops-verify-collection-role",
+        DurationSeconds: 900,
+      }));
+      roleArn = candidate;
+      break;
+    } catch (e) {
+      firstErr = firstErr || e;
+      if (!isAccessDenied(e)) break;
+    }
+  }
+  if (!roleArn) {
     // 带上异常名 —— 「AccessDenied」与「NoSuchEntity」指向完全不同的动作；
     // 但**不带** SDK 散文（那里面有账号 id / 别的 ARN，见 safe_err.mjs）。
-    // roleArn 是管理员自己刚填进来的值，原样回显没有新增泄漏。
-    const err = new Error(`AssumeRole ${roleArn} 失败：${safeErr(e)}`);
+    // ARN 是按模板规则推导的固定名字，原样回显没有新增泄漏。报**新名**：
+    // 客户要补的是用最新模板部署那个栈。
+    const err = new Error(`AssumeRole ${preferred} 失败：${safeErr(firstErr)}`);
     err.code = "cross_account_unavailable";
     throw err;
   }
@@ -1846,7 +1871,7 @@ export async function verifyAndRegisterCollectionRole(accountId) {
  *   → 根因调查用（每账号一个自己的 space）
  *   → 已有 URL（generateLaunchStackUrl）
  *
- * member-account-onboarding.yaml  notiops-idle-detection-role-<系统账号>
+ * member-account-onboarding.yaml  notiops-cross-account-role-<系统账号>
  *   + DevOps Agent 事件转发 +（可选）PHD 转发
  *   → **巡检采集**用 —— executor AssumeRole 进去读 RDS/EC/CloudWatch
  *   → 此前只有 StackSet 那条路会下发它，跨 Org 场景**没有任何 UI 入口**

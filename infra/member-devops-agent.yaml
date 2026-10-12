@@ -84,7 +84,7 @@ Parameters:
     Type: String
     Default: "yes"
     AllowedValues: ["yes", "no"]
-    # 中文：建不建巡检的跨账号只读采集角色 notiops-idle-detection-role-<系统账号>。
+    # 中文：建不建巡检的跨账号只读采集角色 notiops-cross-account-role-<系统账号>。
     # ⚠️ 同 Org 的账号如果已经被一键接入（StackSets）下发过同名角色，这里要选
     #    `no` —— 否则 CreateRole 报 EntityAlreadyExists，整栈 rollback。
     Description: >
@@ -161,7 +161,7 @@ Parameters:
 Conditions:
   HasOrgId: !Not [!Equals [!Ref OrganizationId, ""]]
   EnableCollectionRole: !Equals [!Ref CreateCollectionRole, "yes"]
-  # 只在 IdleDetectionRole（本身已 Condition: EnableCollectionRole）的 Policies 里用，
+  # 只在 CrossAccountRole（本身已 Condition: EnableCollectionRole）的 Policies 里用，
   # 所以不用再叠 EnableCollectionRole。
   HasSupportCaseWrite: !Equals [!Ref EnableSupportCaseWrite, "true"]
   EnableInspectionMonitor: !Not [!Equals [!Ref InspectionAgentSpaceArn, ""]]
@@ -470,7 +470,7 @@ Resources:
 
   # ─── 巡检①：跨账号只读采集角色 ───
   #
-  # 🔴 **与 `infra/member-account-onboarding.yaml` 里的 `IdleDetectionRole`
+  # 🔴 **与 `infra/member-account-onboarding.yaml` 里的 `CrossAccountRole`
   #    必须逐字一致**（角色名 / 信任策略 / 托管策略 / 内联 action 清单）。
   #    同 Org 的账号由 StackSets 下发那一份，非 Org 的账号由本模板下发这一份，
   #    而系统侧只有一套 `collectionRoleArn()` 推导逻辑 —— 两边漂了就会出现
@@ -482,11 +482,11 @@ Resources:
   #    客户被迫部署两个栈，而 UI 上要专门开一个区块教他部署第二个。
   #    `CreateCollectionRole=no` 留给已经被 StackSets 下发过的账号（否则角色
   #    撞名，整栈 rollback）。
-  IdleDetectionRole:
+  CrossAccountRole:
     Type: AWS::IAM::Role
     Condition: EnableCollectionRole
     Properties:
-      RoleName: !Sub "notiops-idle-detection-role-${SystemAccountId}"
+      RoleName: !Sub "notiops-cross-account-role-${SystemAccountId}"
       Description: "Allows NotiOps system account read-only access to this member account (RDS/EC2/CloudWatch/Cost/Support/Security etc.), plus AWS Support case writes when EnableSupportCaseWrite is true"
       # 挂 AWS 托管 ReadOnlyAccess：与部署账号自身 agent 的广只读范围对齐，
       # 让跨账号调查(EC2/成本/任意只读 API)与单账号体验一致。
@@ -766,11 +766,11 @@ Outputs:
     Value: !GetAtt AgentSpace.AgentSpaceId
   AgentSpaceArn:
     Value: !GetAtt AgentSpace.Arn
-  IdleDetectionRoleArn:
+  CrossAccountRoleArn:
     Condition: EnableCollectionRole
     # 中文：巡检采集角色 ARN。管理侧「验证并登记」会真 AssumeRole 一次再入库。
     Description: Read-only role NotiOps inspection assumes to collect data from this account
-    Value: !GetAtt IdleDetectionRole.Arn
+    Value: !GetAtt CrossAccountRole.Arn
   InspectionMonitorRoleArn:
     Condition: EnableInspectionMonitor
     # 中文：贴进控制台「添加辅助云来源 → 连接到代理」那一步的角色 ARN。

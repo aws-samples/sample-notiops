@@ -79,7 +79,8 @@ def list_scan_regions(
             f"{type(e).__name__}: {e}。"
             "缺这个权限只能扫部署 region，而那是静默漏采 —— 本轮放弃。"
             "部署账号的权限在 notiops-backend-stack.ts 的 lambdaRole，"
-            "成员账号的在 notiops-idle-detection-role-<部署账号> 上。"
+            "成员账号的在 notiops-cross-account-role-<部署账号>（2026-10 前接入的叫 "
+            "notiops-idle-detection-role-<部署账号>）上。"
         ) from e
 
     out = sorted({

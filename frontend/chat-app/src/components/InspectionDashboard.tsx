@@ -24,14 +24,22 @@ import { useLocale, useT } from "../i18n";
 import ExclusionModal, { type BatchResult } from "./inspection/ExclusionModal";
 import ConfigPage from "./inspection/ConfigPage";
 import FindingCard from "./inspection/FindingCard";
+import HighLoadTable from "./inspection/HighLoadTable";
+import { tallyAi } from "./inspection/highLoadUtil";
+import IdleTable from "./inspection/IdleTable";
+import {
+  CAPACITY_RULE_LABEL, commonConclusion, groupByResource, resourceKey, savingsByService,
+  serviceColor, serviceLabel,
+} from "./inspection/idleTableUtil";
 import JudgeModal from "./inspection/JudgeModal";
 import ScopePage from "./inspection/ScopePage";
 import InspectionDashboardPanel from "./InspectionDashboardPanel";
 import {
-  fmtMoney, isCoarse, PRECISION_LABEL, precisionRank,
+  fmtMoney, isCoarse, isStale, PRECISION_LABEL, precisionRank,
 } from "./inspection/format";
 import {
-  Alert, Badge, Btn, Chip, Container, Empty, Expandable, PageHeader, SkeletonCards, Status,
+  Alert, Badge, Btn, Chip, Container, Empty, Expandable, PageHeader, Segmented, SkeletonCards,
+  Status,
 } from "./inspection/ui";
 import { C, SEV_COLOR, inner, page, td, th } from "./inspection/tokens";
 
@@ -180,7 +188,7 @@ const ALL_KINDS: readonly FindingKind[] = VISIBLE_FINDING_KINDS;
  * 提示条那侧把 `submitted` 映成 **warning（琥珀）** 而不是 success，
  * 就是为了让颜色也说同一件事。
  */
-type RunPhase = "idle" | "sending" | "waiting" | "done" | "submitted"
+type RunPhase = "idle" | "sending" | "waiting" | "done" | "dryrun" | "submitted"
   | "error" | "timeout";
 interface RunSlot { phase: RunPhase; msg: string }
 const EMPTY_SLOT: RunSlot = { phase: "idle", msg: "" };
@@ -397,7 +405,7 @@ export default function InspectionDashboard({
     try {
       const b = await getInspectionOverview(runAcct || undefined);
       if (!isFail(b)) {
-        const brow = b.diff?.[rt];
+        const brow = pickDiff(b, runAcct, rt);
         if (brow) {
           baseline = {
             d: String(brow.last_run_date || ""),
@@ -413,6 +421,9 @@ export default function InspectionDashboard({
       source: "refetch",
       // dry_run：一次手点的补跑不该改变「这条风险是否已解决」这种带日期
       // 语义的结论（resolved 判定按 official 轮推进）。
+      // ⚠️ 账号还没有任何更早的 finding 时，executor 会把它转成 official
+      //    （`_promote_bootstrap`，2026-10）—— 没有结论可改，而 dry_run 会让
+      //    新部署的客户点完看到一片空白。
       mode: "dry_run",
       account: runAcct || undefined,
     });
@@ -442,9 +453,9 @@ export default function InspectionDashboard({
       }
       // ⚠️ 用 **overview** 轮询而不是 findings：后者要 kind，而这里是 run_type
       //    （结构性与闲置同属 idle 轮），对不上。
-      const d = await getInspectionOverview(startedFor);
+      const d = await getInspectionOverview(startedFor || undefined);
       if (!isFail(d)) {
-        const row = d.diff?.[rt];
+        const row = pickDiff(d, startedFor, rt);
         const today = new Date().toISOString().slice(0, 10);
         // 🔴 判据是「**与基线不同**」而不是「今天跑过且不在跑」——
         //    后者在点击之前就可能为真（见上面 baseline 那段的说明）。
@@ -455,12 +466,18 @@ export default function InspectionDashboard({
             && row.last_status !== "running") {
           if (polls.current[rt]) clearInterval(polls.current[rt]!);
           const bad = row.last_status === "failed";
+          /* 🔴 试运行不写看板（review F-02）。改前这里弹绿条「跑完了」+ reload，
+             列表一行没变，客户以为看到的是刚拉的数。 */
+          const dry = !bad && row.mode === "dry_run";
           setSlot(rt, {
-            phase: bad ? "error" : "done",
+            phase: bad ? "error" : dry ? "dryrun" : "done",
             msg: bad
               ? (zh ? "本轮失败，去看 notiops-inspection-executor 的日志"
                     : "Run failed; check the executor logs")
-              : (zh ? "跑完了" : "Done"),
+              : dry
+                ? (zh ? `试运行完成：算出 ${row.current ?? "—"} 条，不更新看板`
+                    : `Dry run finished: ${row.current ?? "—"} found; the list is not updated`)
+                : (zh ? "跑完了" : "Done"),
           });
           reload();
           return;
@@ -638,6 +655,14 @@ export default function InspectionDashboard({
    */
   const [justJudged, setJustJudged] = useState<ReadonlySet<string>>(
     () => new Set<string>());
+  /**
+   * 本次会话里「深入分析」回了 `resource_gone` 的资源（`resourceKey`）。
+   *
+   * 🔴 后端已经在 finding 行上打了标（`resource_missing_on`），但 `reload()` 回来之前
+   *    那几百毫秒里按钮还在。与 `justJudged` 同一个理由：乐观地把界面收敛到真实状态。
+   *    ⚠️ 按**资源**记而不是按 finding：同一台的「存储超配」那条也不该再给按钮。
+   */
+  const [goneNow, setGoneNow] = useState<ReadonlySet<string>>(() => new Set<string>());
 
   const doJudge = async (f: FindingRow, note = "") => {
     if (judging) return;                              // 防重复点
@@ -652,6 +677,14 @@ export default function InspectionDashboard({
     // 🔴 成功与失败**都**关弹窗。失败时留着的表现是：错误提示条在弹窗**后面**
     //    的页面上（弹窗有遮罩），客户看不见它，只觉得点了没反应。
     setAskJudge(null);
+    if (isFail(r) && r.code === "resource_gone") {
+      /* 🔴 资源已经不存在（2026-10-10 客户实测）。不出错误提示条 —— 抽屉顶部的
+         「这台资源已经不存在」就是回答，再挂一条同义的红条是说两遍。
+         ⚠️ 与下面其它失败码分开：那些是「真的没派成、可以重试」，这个是「不用再派了」。 */
+      setGoneNow((s) => new Set(s).add(resourceKey(f)));
+      reload();
+      return;
+    }
     if (isFail(r)) {
       /**
        * ⚠️ 后端的 `code` 各自对应一句**不同且可操作**的话，不能合成一句。
@@ -664,13 +697,25 @@ export default function InspectionDashboard({
        * http_403            没有 action:inspection:run 权限
        * ```
        */
+      /* 🔴 5xx / 网络错误：**结果未知**（review B15）。BFF 同步 invoke 有 30 秒上限，
+         超时时 task 可能已经派出去了。说「失败」会让客户再点一次 → 重复计费；
+         刷新一次让列表告诉我们真相（派出去了就会看到「判读中」）。 */
+      if (/^http_5/.test(r.code) || r.code === "error" || r.code === "invoke_failed") {
+        setJudgeMsg({
+          type: "warning",
+          text: zh ? "请求没有正常返回，结果未知 —— 正在刷新确认，先别重复点。"
+            : "The request did not complete; refreshing to confirm before you retry.",
+        });
+        reload();
+        return;
+      }
       setJudgeMsg({
-        type: r.code === "already_dispatched" ? "warning" : "error",
-        text: r.code === "http_403"
-          ? (zh ? "没有派判读的权限（action:inspection:run）" : "Not authorised")
-          // 🔴 原样显示后端的话 —— 它带着「为什么」和「下一步」。
-          //    换成一句「派发失败」等于把那些全丢掉。
-          : (r.message || (zh ? `派发失败：${r.code}` : `Failed: ${r.code}`)),
+        /* 这些都是「这次没发起、也没计费」的明确拒绝，不是故障：
+           describe_incomplete（暂时确认不了在不在）/ no_series（数据过了保留期）/
+           skill_unavailable（方法论没同步上）/ out_of_scope（已移出范围）/
+           retry_exhausted（重派用完）/ kill_switch（被暂停）。 */
+        type: JUDGE_SOFT_CODES.has(r.code) ? "warning" : "error",
+        text: judgeFailText(r.code, r.message, zh),
       });
       /**
        * 🔴 `already_dispatched` 要与其它失败**分开处理**：它说明后端那条
@@ -696,6 +741,11 @@ export default function InspectionDashboard({
         setJustJudged((s) => new Set(s).add(f.finding_id));
         reload();
       }
+      /* `conflict`（已解决）/ `not_found`（行没了）/ `out_of_scope`（已移出范围）/
+         `retry_exhausted` 说明本地列表过期了 —— 重取一次，让按钮跟着真实状态消失，
+         而不是留着让客户反复点到同一句话（reviewer B18）。 */
+      if (["conflict", "not_found", "out_of_scope", "retry_exhausted", "kill_switch"]
+        .includes(r.code)) reload();
       return;
     }
     setJudgeMsg({
@@ -921,7 +971,9 @@ export default function InspectionDashboard({
       byKind={byKind} overview={overview} loading={loading} refreshing={refreshing}
       zh={zh} t={t} kinds={wantKinds} single={alias.chip}
       opsOpen={!!alias.ops}
-      runBar={mayRun ? (
+      /* 🔴 kill switch 关着时不给「跑一轮」（review B5）：scheduler 会静默吞掉，前端却等 5 分钟
+         后说「那一轮可能还在跑」。页面上另有一行「巡检已被管理员暂停」。 */
+      runBar={mayRun && wantKinds.every((k) => byKind[k]?.inspection_enabled !== false) ? (
         <>
           {(["high", "idle"] as const).map(runButton)}
           {/*
@@ -1027,7 +1079,7 @@ export default function InspectionDashboard({
          与「手动跑一轮」同一个能力节点。没权限时**不渲染**按钮而不是灰掉：
          灰着等于在界面上摆一个用户无法解决的问题（本仓库既有约定）。 */
       onJudge={mayRun ? setAskJudge : undefined}
-      judging={judging} judgeMsg={judgeMsg} justJudged={justJudged}
+      judging={judging} judgeMsg={judgeMsg} justJudged={justJudged} goneNow={goneNow}
       onDismissJudge={() => setJudgeMsg(null)} />
     </>
   );
@@ -1083,6 +1135,65 @@ function PageSkeleton({ title }: { title: string }) {
  * 而这一页的排序**就是**处置顺序（客户从上往下做），所以「谁排第一」等于
  * 「先动哪台机器」。用一个连规格关键字都没命中的兜底常数决定那件事是不行的。
  */
+/** 这一页最近一轮的模式（`official` / `dry_run` / ""）。停更提示用来说「为什么没更新」。 */
+/**
+ * 手动「跑一轮」轮询看的那一行 diff：**这个账号自己的**（review F-09 第 4 条）。
+ *
+ * 🔴 「部署账号」选项的值是空串 → 请求走统一视图，`diff` 是全部账号的加总 ——
+ *    别的账号那一轮跑完会被当成这一轮跑完。BFF 回 `diff_by_account` + `self_account_id`，
+ *    这里按账号取。老 BFF 不给时回退到 `diff`（与改前一致）。
+ */
+function pickDiff(d: OverviewData, acct: string, rt: "high" | "idle") {
+  const per = d.diff_by_account;
+  const key = acct || d.self_account_id || "";
+  if (per && key) return per[key]?.[rt] ?? null;
+  return d.diff?.[rt] ?? null;
+}
+
+/** 「这次没发起、也没计费」的明确拒绝 —— 琥珀不是红。 */
+const JUDGE_SOFT_CODES = new Set([
+  "already_dispatched", "describe_incomplete", "no_series", "skill_unavailable",
+  "out_of_scope", "retry_exhausted", "kill_switch",
+]);
+
+/**
+ * 「深入分析」被拒时给客户看的那句话。
+ *
+ * 🔴 中文界面原样显示后端的话（它带着「为什么」和「下一步」，2026-10-10 已改成客户能读的）；
+ *    英文界面按 code 给英文（review B21：改前英文界面直接显示后端中文）。
+ * ⚠️ 两种例外在两种语言下都不用后端原文：
+ *    kill_switch  后端那句里是内部键名 `appconfig#inspection/enabled`，客户看不到也改不了
+ *    http_403     账号可见性 403 也走这里，旧文案说成「没有 action:inspection:run」（review B23）
+ */
+function judgeFailText(code: string, message: string | undefined, zh: boolean): string {
+  if (code === "http_403") {
+    return zh ? "没有权限对这个账号发起分析。" : "You are not allowed to analyse this account.";
+  }
+  if (code === "kill_switch") {
+    return zh ? "巡检已被管理员暂停，暂时不能发起分析。这次没有计费。"
+      : "Inspection is paused by an administrator; nothing was started or billed.";
+  }
+  if (zh) return message || `派发失败：${code}`;
+  const en: Record<string, string> = {
+    already_dispatched: "An analysis for this finding is already running or has a result.",
+    describe_incomplete: "Could not confirm the resource still exists (permissions or throttling). Nothing was started or billed; try again later.",
+    no_series: "The metrics for this finding are past the retention period. Nothing was started or billed; wait for the next official run.",
+    skill_unavailable: "The analysis method could not be synced to this account's Agent Space. Nothing was started or billed.",
+    out_of_scope: "This resource was removed from the inspection scope. Nothing was started or billed.",
+    retry_exhausted: "This analysis has already been re-run the maximum number of times without a result.",
+    conflict: "This finding is already resolved.",
+    not_found: "This finding no longer exists.",
+    bad_request: "This account is not ready for analysis (check its inspection Agent Space on the admin page).",
+  };
+  return en[code] || `Failed: ${code}`;
+}
+
+function lastRunMode(
+  byKind: Partial<Record<FindingKind, FindingsData>>, kind: FindingKind | undefined,
+): string {
+  return kind ? String(byKind[kind]?.last_run?.mode || "") : "";
+}
+
 function sortForKind(rows: FindingRow[], kind: FindingKind | undefined) {
   const rank = (s: Severity) => {
     const i = SEVERITIES.indexOf(s);
@@ -1120,6 +1231,29 @@ function sortForKind(rows: FindingRow[], kind: FindingKind | undefined) {
     || a.finding_id.localeCompare(b.finding_id));
 }
 
+/** 闲置页顶部三张 KPI 卡：外框 / 标签 / 数字 / 单位 / 附注 / 附注里的小标签。 */
+const kpiCard: React.CSSProperties = {
+  background: C.card, border: `1px solid ${C.line}`, borderRadius: 10,
+  padding: "14px 16px", minWidth: 0,
+};
+const kpiLabel: React.CSSProperties = { fontSize: 12, color: C.muted };
+const kpiValue: React.CSSProperties = {
+  fontSize: 26, fontWeight: 700, color: C.text, lineHeight: 1.2, marginTop: 4,
+  letterSpacing: "-.02em", fontVariantNumeric: "tabular-nums",
+};
+const kpiUnit: React.CSSProperties = {
+  fontSize: 13, fontWeight: 500, color: C.muted, marginLeft: 2, letterSpacing: 0,
+};
+const kpiNote: React.CSSProperties = {
+  fontSize: 12, color: C.muted, marginTop: 6,
+  display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap",
+};
+const kpiPill: React.CSSProperties = {
+  display: "inline-flex", alignItems: "center", height: 20, padding: "0 7px",
+  borderRadius: 5, fontSize: 11.5, fontWeight: 500, color: C.amber,
+  background: "color-mix(in srgb, #b7791f 13%, transparent)",
+};
+
 /** 每一页的标题 / 副标题 / 排序说明。 */
 const KIND_PAGE: Record<FindingKind, {
   title: string; sub: { zh: string; en: string }; order: { zh: string; en: string };
@@ -1127,8 +1261,10 @@ const KIND_PAGE: Record<FindingKind, {
   high_load: {
     title: "insp.tab.highLoad",
     sub: {
-      zh: "指标越过阈值的资源。按紧急度排 —— 最上面那条最该先看。",
-      en: "Resources past their thresholds, most urgent first.",
+      // 2026-10 与闲置页副标题同一写法：一句说这一页是什么、AI 判读从哪来。
+      // ⚠️ 「按紧急度排」不再写：后面紧跟着「（按严重度 → 已持续天数）」，两句说同一件事。
+      zh: "指标越过阈值的资源。巡检时自动派 AI 判读，结论在「AI 判读」一列。",
+      en: "Resources past their thresholds. AI analysis is requested automatically on each run.",
     },
     order: { zh: "按严重度 → 已持续天数", en: "By severity → days active" },
   },
@@ -1148,10 +1284,19 @@ const KIND_PAGE: Record<FindingKind, {
      *    而客户学会忽略之后，真正该看的「判读缺失」（额度耗尽那种）也会被一起忽略。
      */
     sub: {
-      zh: "多维加权评分判定为低利用的资源。规则判定，不派 AI 判读。按每月可省金额排。",
-      en: "Under-utilised resources by weighted score. Rule-based, no AI analysis. "
-        + "Highest monthly saving first.",
+      // 🔴 后半句（2026-10）：自动巡检确实不派 AI，但客户可以在详情里手点「深入分析」
+      //    —— 那几条会带着 AI 结论出现在这一页。只写「不派 AI 判读」的话，同一屏上
+      //    「判读结论 确有劣化」与副标题直接矛盾（客户截图）。
+      // ⚠️ 不写「深入分析」四个字：那是详情里按钮的名字，页面上再出现一次会让
+      //    按文字找按钮的地方（读屏的「查找」、测试 helper）先找到副标题。
+      // ⚠️ 这一句要在 1280 宽下放得进一行 —— 后面还跟着「（按每月可省 → 闲置分）」，
+      //    折行时只剩一个「分）」孤字挂在第二行。
+      //    （PageHeader 的描述最宽 760px。）「点开看明细」不写：行尾的 › 与 hover 已经说了。
+      zh: "低利用资源。规则判定，不派 AI 判读；需要时可在详情里手动派一次 AI 判读。",
+      en: "Under-utilised resources. Rule-based, no AI analysis; you can request one "
+        + "from the details.",
     },
+    // 2026-10 第二版：一行一台资源、不再按服务分组（服务是一列 + 筛选 chip）。
     order: { zh: "按每月可省 → 闲置分", en: "By monthly saving → idle score" },
   },
   structural: {
@@ -1169,7 +1314,7 @@ const KIND_PAGE: Record<FindingKind, {
 function TriagePage({
   byKind, overview, loading, refreshing, zh, t, kinds, single, opsOpen,
   runBar, runs, onDismissRun, accountId, highlight,
-  mayScope, reload, onJudge, judging = "", justJudged, judgeMsg, onDismissJudge,
+  mayScope, reload, onJudge, judging = "", justJudged, judgeMsg, onDismissJudge, goneNow,
 }: {
   byKind: Partial<Record<FindingKind, FindingsData>>;
   overview: OverviewData | null;
@@ -1206,6 +1351,8 @@ function TriagePage({
   justJudged?: ReadonlySet<string>;
   judgeMsg?: { type: "success" | "error" | "warning"; text: string } | null;
   onDismissJudge?: () => void;
+  /** 本次会话里确认已不存在的资源（`resourceKey`）。见外层同名 state。 */
+  goneNow?: ReadonlySet<string>;
 }) {
   /**
    * 类别筛选。单类页里只剩「本类」与「已解决」两态。
@@ -1226,6 +1373,8 @@ function TriagePage({
    * 「insp-t4g-mysql 在哪个账号」两种问法，分成两个框会让他先猜该用哪个。
    */
   const [q, setQ] = useState("");
+  /** 闲置页的服务筛选（RDS / ElastiCache …）。空 = 全部。 */
+  const [svc, setSvc] = useState("");
   /**
    * 抽屉里显示哪一条。
    *
@@ -1311,10 +1460,76 @@ function TriagePage({
   const openRows = all.filter((f) => !isDone(f));
   const doneRows = all.filter(isDone);
 
+  /**
+   * 资源已经不存在的那些（`resourceKey` → 核实日期）。**按资源**判：同一台上任一条
+   * 带了 `resource_missing_on`，整台都算 —— 「深入分析」那一步会给同一台的每条都打标，
+   * 但老数据 / 部分打标失败时只有一条有。本次会话里刚确认的（`goneNow`）也算。
+   */
+  const goneOn = useMemo(() => {
+    const m = new Map<string, string>();
+    // 🔴 **只看开着的行**（2026-10-10，reviewer B3 / C F-06）。已解决的行上的标记是
+    //    「当时它没了」的历史；资源同名重建后新出的发现没有标记，若把已解决行也算进来，
+    //    那台在跑的资源会被标「已不存在」、移出 KPI、不给「深入分析」。
+    for (const f of openRows) {
+      if (f.resource_missing_on) m.set(resourceKey(f), f.resource_missing_on);
+    }
+    for (const k of goneNow ?? []) if (!m.has(k)) m.set(k, "");
+    return m;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [all, goneNow]);
+  /** 这台资源是不是已经不存在。返回核实日期（可能是空串 = 本次会话刚确认）或 null。 */
+  const goneDate = (f: FindingRow): string | null =>
+    goneOn.has(resourceKey(f)) ? goneOn.get(resourceKey(f))! : null;
+  /**
+   * 已「移出巡检范围」、但正式巡检还没关掉的资源（`resourceKey` → 到期日，空 = 永久）。
+   * 🔴 BFF 标的 `excluded_by`（review B7）。这段时间里它不计入合计、不给「深入分析」，
+   *    改前客户刚说过「别管它」，下一秒还能对它花钱做分析。
+   */
+  const excludedOn = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const f of openRows) if (f.excluded_by) m.set(resourceKey(f), f.excluded_until || "");
+    return m;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [all]);
+  /** 这台已经不需要处置了（不存在 / 移出范围）。计数、排序、KPI 都按它排除。 */
+  const inactiveKey = (k: string) => goneOn.has(k) || excludedOn.has(k);
+  /** 巡检 kill switch。任一类说关了就是关了（同一个开关）。 */
+  const inspectionOn = kinds.every((k) => byKind[k]?.inspection_enabled !== false);
+  /**
+   * 这一条为什么现在不能「深入分析」（空串 = 能）。只管后端**必拒**的前置：
+   * kill switch、账号接入不全。资源不存在 / 已解决 / 已移出范围另有说法。
+   */
+  const judgeBlockOf = (f: FindingRow): string => {
+    if (!inspectionOn) {
+      return zh ? "巡检已被管理员暂停，暂时不能发起分析。"
+        : "Inspection is paused by an administrator; analysis is unavailable.";
+    }
+    const r = byKind[f.kind as FindingKind]?.judge_ready?.[f.account_id];
+    if (r && !r.ok) {
+      if (r.reason === "no_collect_role") {
+        return zh ? "这个账号还没完成采集角色接入（或已下线），暂时不能发起分析。到「管理 → 成员账号」检查这一行。"
+          : "This account has no collection role (or was offboarded); check it under Admin → Member accounts.";
+      }
+      return zh ? "这个账号还没有巡检 Agent Space（管理页那一行显示「待更新栈」），暂时不能发起分析。"
+        : "This account has no inspection Agent Space yet (the admin page shows “stack update needed”).";
+    }
+    return "";
+  };
+
   const shown = useMemo(() => {
     let rows = chip === "resolved" ? doneRows : openRows;
     if (chip && chip !== "resolved") rows = rows.filter((f) => f.kind === chip);
-    if (sev) rows = rows.filter((f) => f.severity === sev);
+    if (sev && single === "high_load") {
+      /* 🔴 高负载页一行 = 一台资源，严重度筛的是**那一行的**严重度（它最严重的
+         那条），不是逐条 finding。逐条筛的话一台「紧急 CPU + 高 连接数」会在
+         「高」里也冒出来（以连接数那条当主行），分段控件上的数与表格行数对不上。
+         ⚠️ 依赖 `rows` 已按严重度排好（`sortForKind`）：每台第一次出现的那条
+            就是它最严重的。 */
+      const top = new Map<string, Severity>();
+      for (const f of rows) if (!top.has(resourceKey(f))) top.set(resourceKey(f), f.severity);
+      rows = rows.filter((f) => top.get(resourceKey(f)) === sev);
+    } else if (sev) rows = rows.filter((f) => f.severity === sev);
+    if (svc) rows = rows.filter((f) => f.service === svc);
     // 账号 / 实例名 / 指标 搜索。⚠️ 大小写不敏感 —— 实例名常带大小写混排
     //    （`insp-T4g-MySQL`），要求精确大小写等于让这个框大部分时候搜不到。
     const needle = q.trim().toLowerCase();
@@ -1325,8 +1540,17 @@ function TriagePage({
         || f.metric.toLowerCase().includes(needle)
         || (f.rule || "").toLowerCase().includes(needle));
     }
+    // 🔴 已不存在 / 已移出范围的沉底（review F-12）。这一页的排序就是「先动哪台」，
+    //    改前一台 9/14 删掉的库按 $387 排在最上面。
+    if (chip !== "resolved") {
+      const live = rows.filter((f) => !inactiveKey(resourceKey(f)));
+      if (live.length !== rows.length) {
+        rows = [...live, ...rows.filter((f) => inactiveKey(resourceKey(f)))];
+      }
+    }
     return rows;
-  }, [chip, sev, q, openRows, doneRows]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chip, sev, svc, q, openRows, doneRows, single, goneOn, excludedOn]);
 
   /** 当前结果里出现过的账号（给 filter 框做提示，也用来判断要不要显示账号列）。 */
   const acctsInView = useMemo(
@@ -1402,7 +1626,7 @@ function TriagePage({
    * （dispatched > mapped），折叠一个已知的数据缺口等于把它藏起来。
    * 折叠按钮那时会说明为什么点不动。
    */
-  const opsShown = ops || gap > 0;
+  const opsShown = ops || gap > 0 || !!overview?.runs_partial;
 
   /**
    * 深链要打开的那一条（R11b.7「一跳到具体 finding，不是跳列表页让客户
@@ -1443,14 +1667,32 @@ function TriagePage({
    * return 之后调用 —— 第一版放在 `chipFor` 旁边（return 之后），
    * 26 个测试直接 "Rendered more hooks than during the previous render"。
    */
+  /* 🔴 **按资源算，不按 finding 算**（2026-10 第二版）。同一台资源上的「闲置」与
+     「超配」是二选一的处置（下线 vs 降配），各条金额加起来是重复计；每台取它
+     最大的那一笔（`groupByResource` 的 `saving`），精度跟着那一笔走。 */
+  const groups = useMemo(() => groupByResource(openRows), [openRows]);
+  /**
+   * 还需要处置的那些台（排除已不存在 / 已移出范围）。
+   * 🔴 页头计数、严重度、AI 判读卡、新增、服务 chip 都按它算（review F-12）。改前只有
+   *    金额排除了已删资源，高负载页 AI 卡提示「缺判读 3」，点开那 3 台都写着
+   *    「不需要再分析」且没有按钮。
+   */
+  const liveGroups = useMemo(() => groups.filter((g) => !inactiveKey(g.key)),
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [groups, goneOn, excludedOn]);
   const savings = useMemo(() => {
-    let sum = 0, priced = 0, unpriced = 0, coarse = 0;
+    let sum = 0, priced = 0, unpriced = 0, coarse = 0, gone = 0;
     /** 最不可信的那一档的**精度字符串**（不是 rank）—— 要拿它查
         `PRECISION_LABEL` 拿到给客户看的那句话。 */
     let worst = "", worstRank = -1;
-    for (const f of openRows) {
-      if (f.savings_usd != null) {
-        sum += f.savings_usd; priced += 1;
+    for (const g of groups) {
+      // 🔴 已不存在的资源**不计入**合计 —— 删掉的库省不出钱。计入的表现（677 实测）：
+      //    KPI 写「每月可省 $1,527」，而那 10 台全都在 9/14 删掉了。
+      //    已移出范围的同理：客户说了不管它。
+      if (inactiveKey(g.key)) { gone += 1; continue; }
+      const f = [g.primary, ...g.others].find((x) => x.savings_usd === g.saving);
+      if (g.saving != null && f) {
+        sum += g.saving; priced += 1;
         /* 🔴 **合计里有几条是粗估的**。当前没有任何代码路径产出 `exact_api`
            （`isCoarse` 的注释写着这件事），所以这个数实际恒等于 `priced`
            —— 但判据仍按字段算而不是写死，否则将来真接上 Price List API
@@ -1461,8 +1703,97 @@ function TriagePage({
         if (r > worstRank) { worstRank = r; worst = f.savings_precision; }
       } else unpriced += 1;
     }
-    return { sum, priced, unpriced, coarse, worst };
-  }, [openRows]);
+    return { sum, priced, unpriced, coarse, worst, gone };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groups, goneOn, excludedOn]);
+  /** 待处置资源里**同时**挂着容量超配的台数（KPI 第二张卡的副标题）。 */
+  const alsoCapacity = useMemo(() => groups.filter((g) =>
+    g.primary.rule === "idle" && g.others.some((f) => f.rule in CAPACITY_RULE_LABEL)).length,
+  [groups]);
+  /**
+   * 卡片页上「每条都一样」的那句规则说明。**至少两条相同**才收进页面底部 ——
+   * 只有一条时它就是那一条自己的信息，留在卡片上。
+   */
+  const cardCommon = useMemo(() => {
+    const c = commonConclusion(shown, isJudged);
+    return c && shown.filter((f) => (f.conclusion || "").trim() === c).length >= 2 ? c : "";
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shown, justJudged]);
+  /** 闲置页 KPI「按服务」那张卡。 */
+  const byService = useMemo(
+    () => savingsByService(openRows.filter((f) => !inactiveKey(resourceKey(f)))),
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [openRows, goneOn, excludedOn]);
+  /** 开着的资源里已经不存在的台数（KPI 附注用）。 */
+  const goneCount = useMemo(() => groups.filter((g) => goneOn.has(g.key)).length,
+    [groups, goneOn]);
+  /** 开着的资源里已移出巡检范围、等正式巡检关闭的台数（KPI 附注用）。 */
+  const excludedCount = useMemo(
+    () => groups.filter((g) => !goneOn.has(g.key) && excludedOn.has(g.key)).length,
+    [groups, goneOn, excludedOn]);
+  /**
+   * 停更的资源（排除已不存在 / 已移出范围 —— 那些另有说法）。
+   *
+   * 🔴 677 实测：定时巡检 9/16 起关闭、10/09 那次手动跑是试运行（不推进状态），于是
+   *    18 条的数据都停在 9/13，而页面上没有任何一处说这件事。
+   * 🔴 判据用 BFF 的 `stale`（该类型最近一次正式轮跑过之后没被评估到，review F-10），
+   *    不再是固定的「≥ 2 天」—— 周度 / 工作日调度下那会天天误报。老 BFF 不给时回退。
+   * ⚠️ 给出最早与最晚两个日期：「数据停在 X」把不同日期压成一个（review F-14）。
+   */
+  const staleInfo = useMemo(() => {
+    let n = 0, oldest = "", newest = "";
+    for (const g of liveGroups) {
+      const f = g.primary;
+      if (isStale(f)) {
+        n += 1;
+        if (!oldest || f.last_run_date < oldest) oldest = f.last_run_date;
+        if (!newest || f.last_run_date > newest) newest = f.last_run_date;
+      }
+    }
+    return { n, oldest, newest };
+  }, [liveGroups]);
+  /** 表格页（一行一台资源）：闲置与高负载。配置检查页仍是卡片。 */
+  const tablePage = single === "idle" || single === "high_load";
+  /**
+   * 高负载页按**台**算的严重度分布 —— 每台取它最严重的那条（`groups` 的 primary，
+   * `openRows` 已按严重度排好）。KPI 分段条与严重度筛选用同一份数，与表格行数一致。
+   */
+  const sevByResource = useMemo(() => {
+    const out: Record<string, number> = {};
+    for (const s of SEVERITIES) out[s] = 0;
+    for (const g of liveGroups) if (g.primary.severity in out) out[g.primary.severity] += 1;
+    return out;
+  }, [liveGroups]);
+  /** 严重度**筛选控件**上的数：与筛出来的表格行数一致（沉底的那些也在表里）。 */
+  const sevFilterCount = useMemo(() => {
+    const out: Record<string, number> = {};
+    for (const s of SEVERITIES) out[s] = 0;
+    for (const g of groups) if (g.primary.severity in out) out[g.primary.severity] += 1;
+    return out;
+  }, [groups]);
+  /** 高负载页 KPI「AI 判读」那张卡（按行，即每台最严重的那条）。 */
+  const aiTally = useMemo(() => tallyAi(liveGroups.map((g) => g.primary), isJudged),
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [liveGroups, justJudged]);
+  /** 新增的台数（任一条是 new 就算）。 */
+  const newResources = useMemo(() => liveGroups.filter((g) =>
+    [g.primary, ...g.others].some((f) => f.state === "new")).length, [liveGroups]);
+  /** 闲置页的服务 chip（只在页面上真有多个服务时才有意义）。计数按**台**，与表格行一致。 */
+  // ⚠️ 用 `groups`（含沉底的那些）：这是**筛选控件**上的数，要与筛出来的表格行数一致。
+  const services = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const g of groups) {
+      const k = g.primary.service || "";
+      m.set(k, (m.get(k) ?? 0) + 1);
+    }
+    return [...m.entries()].sort((a, b) => b[1] - a[1]);
+  }, [groups]);
+  /**
+   * 抽屉里「同一台资源还有」那几条。只在表格页有意义（闲置 / 高负载，一行 = 一台资源）。
+   * ⚠️ 从 `all` 取而不是 `shown`：服务 chip / 搜索筛掉的那条也属于这台资源。
+   */
+  const relatedOf = (f: FindingRow) => !tablePage ? [] : all.filter((x) =>
+    x.finding_id !== f.finding_id && !isDone(x) && resourceKey(x) === resourceKey(f));
 
   // 骨架也用本页标题 —— 写死「待处置」会让加载中的闲置页顶着别的页名。
   if (loading) {
@@ -1497,7 +1828,8 @@ function TriagePage({
       <div style={inner}>
         <PageHeader
           title={meta ? t(meta.title) : (zh ? "待处置" : "To act on")}
-          count={openRows.length}
+          /* 表格页数**台**（与表格行数一致），配置检查页数 finding。 */
+          count={tablePage ? liveGroups.length : openRows.length}
           description={meta
             ? `${zh ? meta.sub.zh : meta.sub.en}（${zh ? meta.order.zh : meta.order.en}）`
             : (zh
@@ -1537,6 +1869,14 @@ function TriagePage({
 
         {refreshing && <div className="insp-bar" style={{ marginBottom: 8 }} />}
 
+        {!inspectionOn && (
+          <Alert type="warning"
+            header={zh ? "巡检已被管理员暂停" : "Inspection is paused"}>
+            {zh ? "暂停期间不会有定时巡检，也不能手动跑或发起分析。下面是暂停前的数据。"
+              : "No scheduled or manual runs and no analysis while paused. The data below predates the pause."}
+          </Alert>
+        )}
+
         {/* 触发结果条。**按 run_type 各一条** —— 合并会让「高负载失败了」
             与「闲置失败了」分不开。 */}
         {(["high", "idle"] as const).map((rt) => runs[rt].msg ? (
@@ -1546,7 +1886,8 @@ function TriagePage({
                 不知道任何一个账号跑成没跑成。给绿色 ✓ 等于替后端做了一个
                 我们没有证据的承诺 —— 而这个按钮存在的理由就是客户不信数。 */
             type={runs[rt].phase === "error" ? "error"
-              : (runs[rt].phase === "timeout" || runs[rt].phase === "submitted")
+              : (runs[rt].phase === "timeout" || runs[rt].phase === "submitted"
+                 || runs[rt].phase === "dryrun")
                 ? "warning" : "success"}
             header={`${rt === "high" ? (zh ? "高负载轮" : "High-load") : (zh ? "闲置轮" : "Idle")}：${runs[rt].msg}`}
             onDismiss={() => onDismissRun(rt)} />
@@ -1631,55 +1972,203 @@ function TriagePage({
           这一页的决策依据是每月能省多少。
         */}
         {single === "idle" ? (
+          /* 🔴 2026-10 改版：一长行灰字拆成三张 KPI 卡（可省 / 待处置 / 按服务）。
+             客户原话「每条信息一行一行的文字，不易读，很乱」。
+             第二版：标签在上、数字在下、附注一行；口径一律按**台**（与表格行一致）。 */
           <div style={{
-            display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 12,
-            alignItems: "baseline", background: C.card,
-            border: `1px solid ${C.line}`, borderLeft: `3px solid ${C.green}`,
-            borderRadius: 9, padding: "10px 14px",
+            display: "grid", gridTemplateColumns: "1.1fr 1fr 1.4fr", gap: 12,
+            marginBottom: 16,
           }}>
-            {/* 🔴 走 `fmtMoney` 而不是自己 `Math.round`。
-                `Math.round(0.4)` = 0 → 判据 `sum > 0` 为真 → 渲染 **`$0`**，
-                而这一页 22px 最醒目的位置写着「每月合计可省 $0」。
-                `fmtMoney` 对 (0, 1) 给 `<$1` —— 那是这个数字的真实形态。
-
-                ⚠️ 这也是全页唯一一处自己拼 `$` 的地方，卡片那侧一直走
-                   `fmtMoney`。同一个金额两套格式化就是这类缺陷的来源。 */}
-            <span style={{ fontSize: 22, fontWeight: 700, color: C.green }}>
-              {savings.priced > 0 ? fmtMoney(savings.sum) : "—"}
-            </span>
-            <span style={{ fontSize: 12, color: C.muted }}>
-              {/* 🔴 **口径写清楚：待处置的全部，不是当前筛选结果。**
-                  这个合计基于 `openRows`，而下面的列表是 `shown`（受 chip /
-                  severity / 搜索词影响）。筛掉一半之后金额不变，客户会以为
-                  「筛选没生效」或者「这个数是筛出来的那几条的和」。 */}
-              {zh ? `每月合计可省 · 待处置全部 ${savings.priced} 条已估价`
-                : `total monthly saving · ${savings.priced} priced (all open)`}
-            </span>
-            {/* 🔴 **粗估要标出来。** 22px 的绿色数字看起来像一个可入账的数，
-                而 `coarse_default` 那一档的含义是「连规格关键字都没命中，
-                用的是全局兜底常数」—— `PRECISION_LABEL` 里那句话原文是
-                「不要拿它做预算」。而这一行此前没有任何精度提示。 */}
-            {savings.coarse > 0 && (
-              <span style={{ fontSize: 12, color: C.amber }}
-                /* 最不可信那一档的原话（`PRECISION_LABEL` 是与后端
-                   `PricePrecision` 对齐的单一来源，这里**不另写一份文案**）。
-                   ⚠️ 认不出的档位不给 title —— 编一句话比留空更糟。 */
-                title={PRECISION_LABEL[savings.worst]
-                  ? (zh ? PRECISION_LABEL[savings.worst].zh
-                    : PRECISION_LABEL[savings.worst].en)
-                  : undefined}>
-                {zh ? `⚠️ 全部为粗估，不要直接拿去做预算`
-                  : "⚠️ coarse estimates — do not budget against this"}
-              </span>
-            )}
-            {/* 🔴 估不出价的条数必须显示。不显示的表现是客户拿合计金额去做
-                预算，而真实可省额可能是它的数倍。 */}
-            {savings.unpriced > 0 && (
-              <span style={{ fontSize: 12, color: C.amber }}>
-                {zh ? `另有 ${savings.unpriced} 条估不出价（未计入）`
-                  : `${savings.unpriced} without a price estimate (excluded)`}
-              </span>
-            )}
+            <div style={kpiCard}>
+              <div style={kpiLabel}>{zh ? "每月可省" : "Monthly saving"}</div>
+              {/* 🔴 走 `fmtMoney` 而不是自己 `Math.round`。
+                  `Math.round(0.4)` = 0 → 判据 `sum > 0` 为真 → 渲染 **`$0`**。
+                  `fmtMoney` 对 (0, 1) 给 `<$1` —— 那是这个数字的真实形态。
+                  判据用 `priced > 0`：全部估不出价时 sum 是 0，那不代表「可省 $0」。 */}
+              <div style={{ ...kpiValue, color: C.green }}>
+                {savings.priced > 0 ? fmtMoney(savings.sum) : "—"}
+                {savings.priced > 0 && <span style={kpiUnit}>{zh ? "/月" : "/mo"}</span>}
+              </div>
+              {/* 🔴 **粗估要标出来。** 26px 的绿色数字看起来像一个可入账的数。
+                  ⚠️ 「全部」只在**确实全部**粗估时说 —— 原来只要有一条粗估就写
+                     「全部为粗估」，混合精度时是一句假话。
+                  🔴 **口径：待处置的全部，不是当前筛选结果**（合计基于 `openRows`，
+                     列表是 `shown`）—— 写进 title，不再占一整行。 */}
+              <div style={kpiNote}
+                title={zh ? `待处置全部 ${savings.priced} 台已估价的合计，不随筛选变化`
+                  : `Sum over all ${savings.priced} priced open resources; ignores filters`}>
+                {savings.coarse > 0 ? (
+                  <>
+                    <span style={kpiPill}
+                      title={PRECISION_LABEL[savings.worst]
+                        ? (zh ? PRECISION_LABEL[savings.worst].zh
+                          : PRECISION_LABEL[savings.worst].en)
+                        : undefined}>
+                      {savings.coarse === savings.priced
+                        ? (zh ? "全部为粗估" : "all coarse")
+                        : (zh ? `其中 ${savings.coarse} 台为粗估` : `${savings.coarse} coarse`)}
+                    </span>
+                    {zh ? "不要直接拿去做预算" : "do not budget against this"}
+                  </>
+                ) : (zh ? `${savings.priced} 台已估价` : `${savings.priced} priced`)}
+              </div>
+            </div>
+            <div style={kpiCard}>
+              <div style={kpiLabel}>{zh ? "待处置资源" : "Open resources"}</div>
+              <div style={kpiValue}>
+                {liveGroups.length}<span style={kpiUnit}>{zh ? "台" : ""}</span>
+              </div>
+              <div style={kpiNote}>
+                {zh ? `${openRows.length} 条发现` : `${openRows.length} findings`}
+                {alsoCapacity > 0 && (zh ? ` · ${alsoCapacity} 台同时容量超配`
+                  : ` · ${alsoCapacity} also oversized`)}
+                {/* 🔴 估不出价的台数必须显示。不显示的表现是客户拿合计金额去做
+                    预算，而真实可省额可能是它的数倍。 */}
+                {savings.unpriced > 0 && (
+                  <span style={{ color: C.amber }}>
+                    {zh ? ` · ${savings.unpriced} 台估不出价（未计入）`
+                      : ` · ${savings.unpriced} without a price (excluded)`}
+                  </span>
+                )}
+                {goneCount > 0 && (
+                  <span style={{ color: C.amber }}>
+                    {zh ? ` · ${goneCount} 台已不存在（未计入）`
+                      : ` · ${goneCount} no longer exist (excluded)`}
+                  </span>
+                )}
+                {excludedCount > 0 && (
+                  <span style={{ color: C.muted }}>
+                    {zh ? ` · ${excludedCount} 台已移出巡检范围（未计入）`
+                      : ` · ${excludedCount} removed from scope (excluded)`}
+                  </span>
+                )}
+              </div>
+            </div>
+            <div style={kpiCard}>
+              <div style={kpiLabel}>{zh ? "按服务" : "By service"}</div>
+              {byService.length > 0 ? (
+                <>
+                  <div aria-hidden="true" style={{
+                    display: "flex", height: 8, borderRadius: 4, overflow: "hidden",
+                    margin: "14px 0 9px",
+                    background: "color-mix(in srgb, var(--text) 7%, transparent)",
+                  }}>
+                    {byService.map((x) => (
+                      <span key={x.svc} style={{
+                        width: `${savings.sum > 0 ? (x.usd / savings.sum) * 100 : 0}%`,
+                        background: serviceColor(x.svc),
+                      }} />
+                    ))}
+                  </div>
+                  <div style={{ display: "flex", gap: 14, flexWrap: "wrap", fontSize: 12,
+                    color: C.muted }}>
+                    {byService.map((x) => (
+                      <span key={x.svc} style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                        <span aria-hidden="true" style={{
+                          width: 8, height: 8, borderRadius: 2, background: serviceColor(x.svc),
+                        }} />
+                        {serviceLabel(x.svc)}
+                        <b style={{ color: C.text, fontWeight: 600 }}>{fmtMoney(x.usd)}</b>
+                        {zh ? `· ${x.n} 台` : `· ${x.n}`}
+                      </span>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 8 }}>—</div>
+              )}
+            </div>
+          </div>
+        ) : single === "high_load" ? (
+          /* 🔴 高负载页 KPI（2026-10，与闲置页对齐）：四个可点的严重度大按钮换成三张卡。
+             严重度筛选挪进下面的分段控件 —— 与服务筛选同一排、同一种控件。
+             口径一律按**台**（与表格行一致）。 */
+          <div style={{
+            display: "grid", gridTemplateColumns: "1fr 1.3fr 1.3fr", gap: 12,
+            marginBottom: 16,
+          }}>
+            <div style={kpiCard}>
+              <div style={kpiLabel}>{zh ? "待处置资源" : "Open resources"}</div>
+              <div style={kpiValue}>
+                {liveGroups.length}<span style={kpiUnit}>{zh ? "台" : ""}</span>
+              </div>
+              <div style={kpiNote}>
+                {zh ? `${openRows.length} 条发现` : `${openRows.length} findings`}
+                {newResources > 0 && (zh ? ` · ${newResources} 台新增` : ` · ${newResources} new`)}
+                {goneCount > 0 && (
+                  <span style={{ color: C.amber }}>
+                    {zh ? ` · 另有 ${goneCount} 台已不存在` : ` · ${goneCount} more no longer exist`}
+                  </span>
+                )}
+                {excludedCount > 0 && (
+                  <span style={{ color: C.muted }}>
+                    {zh ? ` · ${excludedCount} 台已移出巡检范围`
+                      : ` · ${excludedCount} removed from scope`}
+                  </span>
+                )}
+              </div>
+            </div>
+            <div style={kpiCard}>
+              <div style={kpiLabel}>{zh ? "按严重度" : "By severity"}</div>
+              {liveGroups.length > 0 ? (
+                <>
+                  <div aria-hidden="true" style={{
+                    display: "flex", gap: 2, height: 8, borderRadius: 4, overflow: "hidden",
+                    margin: "14px 0 9px",
+                    background: "color-mix(in srgb, var(--text) 7%, transparent)",
+                  }}>
+                    {SEVERITIES.filter((s) => sevByResource[s] > 0).map((s) => (
+                      <span key={s} style={{
+                        width: `${(sevByResource[s] / liveGroups.length) * 100}%`,
+                        background: SEV_COLOR[s],
+                      }} />
+                    ))}
+                  </div>
+                  <div style={{ display: "flex", gap: 14, flexWrap: "wrap", fontSize: 12,
+                    color: C.muted }}>
+                    {SEVERITIES.filter((s) => sevByResource[s] > 0).map((s) => (
+                      <span key={s} style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                        <span aria-hidden="true" style={{
+                          width: 8, height: 8, borderRadius: 2, background: SEV_COLOR[s],
+                        }} />
+                        {t(`insp.sev.${s}`)}
+                        <b style={{ color: C.text, fontWeight: 600 }}>{sevByResource[s]}</b>
+                      </span>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 8 }}>—</div>
+              )}
+            </div>
+            <div style={kpiCard}>
+              {/* 头图是「AI 确认确有劣化」的台数 —— 那是今天真要动手的；其余几档一行小字。
+                  ⚠️ 各档措辞刻意**不复用**表格里的原句（「判读缺失」「判读已返回但没有
+                     内容」）：同一屏上同一句话出现两次，读屏会念两遍，按文字找那一行的
+                     人（和测试）也会先撞上这里。 */}
+              <div style={kpiLabel}>{zh ? "AI 判读" : "AI analysis"}</div>
+              <div style={{ ...kpiValue, color: aiTally.real > 0 ? C.red : C.text }}>
+                {aiTally.real}
+                <span style={kpiUnit}>{zh ? "台确有劣化" : " confirmed"}</span>
+              </div>
+              <div style={kpiNote}>
+                {[
+                  aiTally.expected && (zh ? `预期行为 ${aiTally.expected}` : `expected ${aiTally.expected}`),
+                  aiTally.insufficient && (zh ? `证据不足 ${aiTally.insufficient}` : `inconclusive ${aiTally.insufficient}`),
+                  aiTally.warmup && (zh ? `预热期 ${aiTally.warmup}` : `warm-up ${aiTally.warmup}`),
+                ].filter(Boolean).join(" · ") || (zh ? "其余暂无 AI 结论" : "no other verdicts")}
+                {(aiTally.pending + aiTally.missing + aiTally.failed) > 0 && (
+                  <span style={{ color: C.amber }}>
+                    {" · "}
+                    {[
+                      aiTally.pending && (zh ? `判读中 ${aiTally.pending}` : `${aiTally.pending} pending`),
+                      aiTally.missing && (zh ? `缺判读 ${aiTally.missing}` : `${aiTally.missing} missing`),
+                      aiTally.failed && (zh ? `判读为空 ${aiTally.failed}` : `${aiTally.failed} empty`),
+                    ].filter(Boolean).join(" · ")}
+                  </span>
+                )}
+              </div>
+            </div>
           </div>
         ) : (
         /* 严重度分档。**可点** —— 客户的第一维度就是严重度。 */
@@ -1734,6 +2223,32 @@ function TriagePage({
               {zh ? "待处置" : "Open"} {openRows.length}
             </Chip>
           )}
+          {/* 服务筛选是**单选**（全部 / 某一个服务），画成分段控件而不是可叠加的 chip。 */}
+          {/* 高负载页的严重度筛选（2026-10）：原来是 KPI 区四个可点的大按钮。
+              计数按**台**、只列有数的档位（选中的那档即使变成 0 也留着，否则无法取消）。 */}
+          {single === "high_load" && groups.length > 0 && (
+            <Segmented value={sev} onChange={(v) => setSev(v as Severity | "")}
+              label={zh ? "按严重度筛选" : "Filter by severity"}
+              options={[
+                { value: "" as Severity | "", label: zh ? "全部" : "All", count: groups.length,
+                  name: "sev_all" },
+                ...SEVERITIES.filter((s) => sevFilterCount[s] > 0 || s === sev).map((s) => ({
+                  value: s as Severity | "", label: t(`insp.sev.${s}`),
+                  count: sevFilterCount[s], name: `sev_${s}`,
+                })),
+              ]} />
+          )}
+          {tablePage && services.length > 1 && (
+            <Segmented value={svc} onChange={setSvc}
+              label={zh ? "按服务筛选" : "Filter by service"}
+              options={[
+                { value: "", label: zh ? "全部" : "All", count: groups.length,
+                  name: "chip_svc_all" },
+                ...services.map(([k, n]) => ({
+                  value: k, label: serviceLabel(k), count: n, name: `chip_svc_${k}`,
+                })),
+              ]} />
+          )}
           {doneRows.length > 0 && (
             <Chip active={chip === "resolved"} name="chip_resolved"
               onClick={() => setChip(chip === "resolved" ? "" : "resolved")}>
@@ -1757,14 +2272,38 @@ function TriagePage({
               border: `1px solid ${q ? "var(--orange)" : C.line}`,
               background: "var(--bg)", color: C.text,
             }} />
-          {(sev || chip || q) && (
+          {(sev || chip || q || svc) && (
             <Btn size="small" variant="link"
-              onClick={() => { setSev(""); setChip(""); setQ(""); }}>
+              onClick={() => { setSev(""); setChip(""); setQ(""); setSvc(""); }}>
               {zh ? "清除筛选" : "Clear filters"}
             </Btn>
           )}
         </div>
 
+        {/* 🔴 停更提示（2026-10-10）。一行、页面级，不逐行挂。 */}
+        {/* 🔴 配置检查页同样会停更（review F-14），不再只在表格页提示。 */}
+        {staleInfo.n > 0 && (
+          <div style={{ marginBottom: 8 }}>
+            <Status type="warning">
+              {zh
+                ? `${staleInfo.n} 台资源`
+                  + (staleInfo.oldest === staleInfo.newest
+                    ? `的数据停在 ${staleInfo.oldest}`
+                    : `最近一次评估在 ${staleInfo.oldest} 到 ${staleInfo.newest} 之间`)
+                  + "，之后的正式巡检没有更新过它们"
+                  + (lastRunMode(byKind, single) === "dry_run"
+                    ? "（最近一轮是试运行，不更新发现）" : "")
+                  + "。下面的状态与天数是那时的。"
+                : `${staleInfo.n} resource(s) were last evaluated `
+                  + (staleInfo.oldest === staleInfo.newest
+                    ? `on ${staleInfo.oldest}` : `between ${staleInfo.oldest} and ${staleInfo.newest}`)
+                  + "; no official run has updated them since"
+                  + (lastRunMode(byKind, single) === "dry_run"
+                    ? " (the latest run was a dry run, which does not update findings)" : "")
+                  + "."}
+            </Status>
+          </div>
+        )}
         {/* R10.6 + 完整度提示 */}
         {noJudgment > 0 && (
           <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>
@@ -1813,11 +2352,24 @@ function TriagePage({
           <TriageEmpty rows={openRows} chip={chip} sev={sev} q={q}
             lastRuns={lastRuns}
             zh={zh} noKinds={kinds.length === 0}
-            onClear={() => { setChip(""); setSev(""); setQ(""); }} />
+            onClear={() => { setChip(""); setSev(""); setQ(""); setSvc(""); }} />
+        ) : single === "idle" ? (
+          /* 🔴 闲置页是表格（2026-10）：17 条同类资源要横向比，钱右对齐 + 比例条。 */
+          <IdleTable rows={shown} zh={zh} t={t} highlight={highlight} goneDate={goneDate}
+            showAccount={acctsInView.length > 1}
+            onOpen={(f) => setManualSnap(f)} isJudged={isJudged}
+            markCoarse={savings.coarse > 0 && savings.coarse < savings.priced} />
+        ) : single === "high_load" ? (
+          /* 🔴 高负载页也是表格（2026-10，与闲置页对齐）：一行一台资源、单行、56px。
+             同一台多个指标越线 → 一行（最严重那条），其余在指标列挂「+N」、抽屉里切换。 */
+          <HighLoadTable rows={shown} zh={zh} t={t} highlight={highlight} goneDate={goneDate}
+            showAccount={acctsInView.length > 1}
+            onOpen={(f) => setManualSnap(f)} isJudged={isJudged} />
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
             {shown.map((f) => (
               <FindingCard key={f.finding_id} f={f} zh={zh} t={t}
+                commonConclusion={cardCommon}
                 highlighted={!!highlight && f.finding_id === highlight}
                 // 只在**真的跨账号**时显示徽章。单账号部署下每张卡挂一个
                 // 恒定的账号号是纯噪音（还挤掉规格与 region 的位置）。
@@ -1830,6 +2382,12 @@ function TriagePage({
                    ⚠️ `judged` 仍要传：它决定「⏳ 判读中」徽章渲不渲染。 */
                 judged={isJudged(f)} />
             ))}
+            {cardCommon && (
+              <div style={{ fontSize: 12, color: C.muted }}>
+                <span style={{ fontWeight: 600 }}>{t("insp.field.ruleVerdict")}</span>
+                {zh ? "：" : ": "}{cardCommon}
+              </div>
+            )}
           </div>
         )}
 
@@ -1873,7 +2431,17 @@ function TriagePage({
           judgeMsg={judgeMsg} onDismissJudge={onDismissJudge}
           /* 🔴 抽屉**不再自己判** `!row.da_task_id` —— 那个判据在过期快照上
              恒为真。用列表这一层算好的 `isJudged`（它还含乐观状态）。 */
-          judged={isJudged(open)} />
+          judged={isJudged(open)}
+          /* 同一台资源上的其余发现（闲置页一行 = 一台资源，「超配」不再单独占一行），
+             在抽屉里切过去。 */
+          related={relatedOf(open)} onOpenRelated={(f) => setManualSnap(f)}
+          /* 🔴 资源已经不存在：抽屉不再给「深入分析」/「移出巡检范围」，顶部写清楚。 */
+          goneOn={goneDate(open)}
+          /* 🔴 后端必拒的几种前置（kill switch / 账号接入不全），读侧提前知道就不给按钮，
+             改成一行原因（review B5 / B6）。 */
+          judgeBlock={judgeBlockOf(open)}
+          /* 回来了但没内容 → 「重新分析」（review B2）。刚派过的那条在列表刷新前不给。 */
+          retryable={!!open.judge_retryable && !justJudged?.has(open.finding_id)} />
       )}
 
       {excluding && (
@@ -2001,7 +2569,8 @@ function TriageEmpty({ rows, chip, sev, q, lastRuns, zh, onClear, noKinds = fals
     if (r.run_date !== today) return 2;
     if (r.status === "running") return 3;
     if (r.status === "partial") return 4;
-    return 5;
+    if (r.mode === "dry_run") return 5;
+    return 6;
   };
   const worst = [...lastRuns].sort((a, b) => rank(a.run) - rank(b.run))[0];
   const run = worst?.run ?? null;
@@ -2065,6 +2634,23 @@ function TriageEmpty({ rows, chip, sev, q, lastRuns, zh, onClear, noKinds = fals
     );
   }
 
+  /**
+   * 🔴 试运行**不写看板**（review F-02）。改前这里落到下面的绿勾「本轮未发现风险」，
+   *    而列表是上一次正式巡检的样子 —— 试运行可能算出了 3 条 CRITICAL。
+   */
+  if (run.mode === "dry_run") {
+    const n = run.dry_run_new_hits ?? null;
+    return (
+      <Empty icon="◇" tone={C.amber}
+        title={zh ? "最近一轮是试运行，不更新看板" : "Latest run was a dry run"}
+        hint={zh
+          ? `${run.run_date} 试运行${n == null ? "" : `算出 ${n} 条新发现，`}`
+            + "结果没有写入这个列表。正式结果要等下一次定时巡检。"
+          : `Dry run on ${run.run_date}${n == null ? "" : ` found ${n} new`}; `
+            + "results are not written to this list. Wait for the next scheduled run."} />
+    );
+  }
+
   const pct = run.completeness == null ? null : Math.round(run.completeness * 100);
   return (
     <Empty icon="✓" tone={C.green}
@@ -2075,7 +2661,6 @@ function TriageEmpty({ rows, chip, sev, q, lastRuns, zh, onClear, noKinds = fals
         // 是两个不同的保证，而后者被当成前者会让客户对覆盖面产生错误信心。
         pct != null && pct < 100
           ? (zh ? `⚠️ 数据完整度仅 ${pct}%` : `only ${pct}% complete`) : "",
-        run.mode === "dry_run" ? (zh ? "（试运行，未推进状态机）" : "(dry run)") : "",
       ].filter(Boolean).join(" · ")} />
   );
 }
@@ -2242,6 +2827,16 @@ function OpsPanel({ overview, lastRuns, zh, t }: {
 
   return (
     <div style={{ paddingTop: 12 }}>
+      {/* 🔴 run 记录有几天读失败了（review F-11）。改前吞成空，缺口数归零、表格空着也不说。 */}
+      {overview.runs_partial && (
+        <div style={{ marginBottom: 10 }}>
+          <Status type="warning">
+            {zh
+              ? `有 ${overview.runs_failed_days ?? "?"} 天的运行记录读取失败，下面的缺口数与运行表可能不全。稍后刷新。`
+              : `${overview.runs_failed_days ?? "?"} day(s) of run records could not be read; the numbers below may be incomplete.`}
+          </Status>
+        </div>
+      )}
       {/* 🔴 派发缺口：有 task 发出去了却没落映射 → 那些判读永久回不来。
           放最上面 —— 它不是「有多少风险」而是「我们的链路漏了东西」。 */}
       {/* 🔴 派发缺口的**告警在页首**（`truncatedAt` / `unclassified` 旁边），
@@ -2609,6 +3204,16 @@ function OpsPanel({ overview, lastRuns, zh, t }: {
                         title={zh ? "试运行：占了当天的槽位但不推进状态机"
                                   : "dry run: took the slot without advancing state"}>
                         {zh ? "试运行" : "dry"}
+                      </Badge></>
+                    )}
+                    {/* 首轮：账号还没有任何更早的 finding，手点那一轮被按正式轮跑
+                        （否则新部署的客户点完看到一片空白）。与定时轮区分开，
+                        事后才说得清那一天的正式轮是谁触发的。 */}
+                    {r.bootstrap && (
+                      <> <Badge
+                        title={zh ? "首轮：账号还没有历史结果，这次手动巡检按正式轮落库"
+                                  : "first run: no earlier results, so this manual run was recorded as official"}>
+                        {zh ? "首轮" : "first"}
                       </Badge></>
                     )}
                     {/* 补跑轮：时刻没对上、在 catch_up_hours 内补的。

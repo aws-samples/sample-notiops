@@ -434,10 +434,14 @@ def _mark(
             #    而这个错了那个群**再也**收不到这条的缓解通报。
             #    一条 finding 被「总览群（accounts=*）」与「业务群」同时选中
             #    是设计里的常态，那时部分失败必然发生。
-            resolved_announced = prev.resolved_announced or (
+            # ⚠️ 这条又开着了（resolved 再命中 → 新一段生命周期，2026-10-10）→ 清掉。
+            #    不清的表现：第二次 resolved 时 `decide()` 见到旧的 True 直接不推，
+            #    那个群再也收不到这条的缓解通报。
+            reopened = view is not None and view.is_open
+            resolved_announced = (not reopened) and (prev.resolved_announced or (
                 all_delivered
                 and view is not None and view.transition_kind == "resolved"
-            )
+            ))
             # 摘要类（周度/月度）**不推进退避计数、也不动 `last_pushed_date`**
             # —— 那两份是「保证没有东西静默腐烂」的兜底，让它们消耗
             # CRITICAL 的退避档位（或它的起算点）会让每日重推被周报挤掉。

@@ -15,7 +15,7 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
                                     │  RDS / ElastiCache / EC2 / CloudWatch    │
                                     │  Cost Explorer / Trusted Advisor / Health│
                                     │                    ▲                     │
-                                    │  IdleDetectionRole (只读)                │
+                                    │  CrossAccountRole (只读)                 │
                                     └──────────────────┼───────────────────────┘
                                                        │ STS AssumeRole
                                                        │ (shared/account_scope.py:

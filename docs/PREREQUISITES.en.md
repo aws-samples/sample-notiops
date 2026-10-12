@@ -144,9 +144,12 @@ Activating the venv in your outer shell is what makes a bare `python3` resolve i
 `.venv/bin/python3` -- that is what covers all four call sites at once.
 
 > ℹ️ Pre-creating `.venv` is safe: the `python3 -m venv .venv` inside `setup.sh` does not clear
-> already-installed packages when the venv already exists, and its internal `activate` /
-> `deactivate` do not undo an activation you did in the outer shell. The four lines above will not
-> be washed away.
+> already-installed packages when the venv already exists (it even adds pip if missing, e.g. for a
+> venv created by uv), and its internal `activate` / `deactivate` do not undo an activation you did
+> in the outer shell. The one exception: if the `.venv` Python minor version differs from the
+> current `python3`, `setup.sh` deletes and recreates it, because the layer wheels follow the
+> interpreter. That is fine too: after activating the venv `setup.sh` runs
+> `pip install -r requirements.txt` itself, so the post-deploy scripts still have boto3.
 
 ---
 

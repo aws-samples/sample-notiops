@@ -393,16 +393,18 @@ def _analyze_blocks(result: case_analyze.AnalyzeResult,
 
 
 # ===========================================================================
-# 入口：回复（写操作，但**不需要**二次确认）
+# 入口：回复（写操作：只有带斜杠的显式命令直发，其余先给确认说明，见 start_reply）
 # ===========================================================================
 def start_reply(display_id: str, raw_text: str, *, internal_id: str = "",
-                locale: str = "zh", account_id: str = "") -> bool:
+                locale: str = "zh", account_id: str = "",
+                explicit: bool = False) -> bool:
     """给案例追加一条回复。
 
-    为什么这个写操作不走二次确认：用户打的就是
-    `/案例 回复 12345 <正文>` —— 正文已经在那句话里了，再让他回一句「确认」是
-    纯噪音。而开案例/关案例的参数是我们**推断**出来的（主题、严重等级、目标账号），
-    那才需要给他看一眼。
+    只有**显式命令**(`/回复案例 12345 <正文>`,`explicit=True`)才直发:正文就在那句命令里,
+    那句命令本身就是确认。自然语言识别出来的回复(默认 `explicit=False`)**不发** —— 识别器会把
+    「该怎么回复 case 12345 的工程师」这种疑问句也认成回复,案例号后面那段就会被写进客户的
+    Support 工单(2026-10-11)。钉钉只有文字消息,所以这里把识别出的正文原样给用户看,并给出
+    那条显式命令:确认无误就照着发一次。
     """
     locale = _normalize_locale(locale)
     if not display_id:
@@ -413,6 +415,19 @@ def start_reply(display_id: str, raw_text: str, *, internal_id: str = "",
         # 只给了案例号没给正文 → 当成"看一眼这个案例"，而不是回一句"参数不对"。
         return start_view(display_id, internal_id=internal_id, locale=locale,
                          account_id=account_id)
+    if not explicit:
+        command = i18n.t("case.reply.confirm_text.command", locale,
+                         display_id=display_id,
+                         body=body if len(body) <= 800 else
+                         i18n.t("case.reply.confirm_text.body_placeholder", locale))
+        return _info(i18n.t("case.reply.confirm_text.title", locale),
+                     _compose(banner,
+                              i18n.t("case.reply.confirm_text.intro", locale,
+                                     display_id=display_id),
+                              f"> {_escape_md(_trim(body, 800))}",
+                              i18n.t("case.reply.confirm_text.how", locale),
+                              f"`{command.replace('`', "'")}`"),
+                     locale)
     ok = case_management.add_communication(
         display_id, body, internal_id=internal_id, account_id=account_id)
     if ok:

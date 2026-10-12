@@ -198,18 +198,59 @@ export async function getAssumedCredentialsForAccount(accountId, roleArn) {
     console.error(`getAssumedCredentialsForAccount: ${e.message}`);
     return null;
   }
+  // ⚠️ 成员账号角色 2026-10 改过名：注册表里的那一代 AccessDenied 时换另一代再试
+  //    （见 role_guard.mjs::siblingRoleArn）。别名不改账号段，上面的校验对它同样成立。
+  const { roleArnCandidates, isAccessDenied, rememberRoleArnHit } =
+    await import("./role_guard.mjs");
+  for (const candidate of roleArnCandidates(arn)) {
+    try {
+      const resp = await _sts.send(new AssumeRoleCommand({
+        RoleArn: candidate,
+        RoleSessionName: "notiops-web-chat-bff-cost-query",
+        DurationSeconds: 3600,
+      }));
+      rememberRoleArnHit(arn, candidate);
+      if (candidate !== arn) await persistAliasedRoleArn(accountId, arn, candidate);
+      return {
+        accessKeyId: resp.Credentials.AccessKeyId,
+        secretAccessKey: resp.Credentials.SecretAccessKey,
+        sessionToken: resp.Credentials.SessionToken,
+      };
+    } catch (e) {
+      if (!isAccessDenied(e)) { rememberRoleArnHit(arn, ""); return null; }
+    }
+  }
+  rememberRoleArnHit(arn, "");
+  return null;
+}
+
+/**
+ * 别名成功后把注册表 `account#<id>/meta.role_arn` 条件改成实际那一代
+ * （与 Python 侧 `shared/account_scope.py::persist_aliased_role_arn` 同语义）。
+ *
+ * 条件 `role_arn = :registered`：注册表还是我们刚用的那个值才改 —— 不会覆盖管理页上
+ * 同时发生的人工登记；调用方传进来的 ARN 若不是注册表里那一行（例如 DA 关联的角色），
+ * 条件自然不成立、什么都不写。
+ *
+ * ⚠️ 尽力而为、永不抛：写不进去只是下次多吃一次 AccessDenied（进程内记忆兜着）。
+ * ⚠️ 只接受**互为别名**的两个值，不能变成「按调用方意思改 role_arn」的口子。
+ */
+export async function persistAliasedRoleArn(accountId, registered, actual) {
   try {
-    const resp = await _sts.send(new AssumeRoleCommand({
-      RoleArn: arn,
-      RoleSessionName: "notiops-web-chat-bff-cost-query",
-      DurationSeconds: 3600,
+    const { siblingRoleArn } = await import("./role_guard.mjs");
+    if (!actual || siblingRoleArn(registered) !== actual) return false;
+    const { DynamoDBClient } = await import("@aws-sdk/client-dynamodb");
+    const { DynamoDBDocumentClient, UpdateCommand } = await import("@aws-sdk/lib-dynamodb");
+    const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+    await ddb.send(new UpdateCommand({
+      TableName: process.env.CONFIG_TABLE || "notiops-config",
+      Key: { PK: `account#${String(accountId || "").trim()}`, SK: "meta" },
+      UpdateExpression: "SET role_arn = :actual",
+      ConditionExpression: "role_arn = :registered",
+      ExpressionAttributeValues: { ":actual": actual, ":registered": registered },
     }));
-    return {
-      accessKeyId: resp.Credentials.AccessKeyId,
-      secretAccessKey: resp.Credentials.SecretAccessKey,
-      sessionToken: resp.Credentials.SessionToken,
-    };
+    return true;
   } catch {
-    return null;
+    return false;
   }
 }

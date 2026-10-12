@@ -13,23 +13,73 @@
     其余账号一律拒绝（与 shared/account_scope.py 同语义）。默认安全、可逆。
 
 约定：
-  - 跨账号只读/操作角色名沿用 notiops 的 `notiops-idle-detection-role`（部署到
-    目标账号、信任部署账号）。也可在 config 表的账号条目里显式给 role_arn 覆盖。
+  - 目标账号里的跨账号角色由接入模板建：`notiops-cross-account-role-<系统账号>`
+    （2026-10 之前接入的叫 `notiops-idle-detection-role-<系统账号>`）。角色 ARN
+    **只取** config 表账号条目的 role_arn，不按名字约定拼。
   - Support API 是全局服务，调用方仍用 region us-east-1。
 """
 from __future__ import annotations
 
 import logging
 import os
+import re
 
 import boto3
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-# 跨账号角色名约定（目标账号里部署的角色）。可被 config 表条目的 role_arn 覆盖。
-_DEFAULT_ROLE_NAME = os.environ.get("NOTIOPS_CROSS_ACCOUNT_ROLE", "notiops-idle-detection-role")
 _LOCKED_ENV = "LOCKED_ACCOUNT_ID"
+
+# 成员账号跨账号角色的新旧两代名字互为别名（2026-10 改名）。
+# ⚠️ 与 `shared/account_scope.py::sibling_role_arn` 同一条规则 —— agent 包不含
+#    shared/**，只能在这里再写一份；改一边必须改另一边（两边都有测试钉着）。
+#    为什么要别名：改名 = CFN 替换角色，而触发更新的路径（StackSet 异步滚动、
+#    客户自己更新栈）时机不由我们控制，注册表里存的名字随时可能指向已删的那一代。
+_ALIAS_RE = re.compile(
+    r"^(arn:aws(?:-[a-z-]+)?:iam::\d{12}:role/)"
+    r"(notiops-cross-account-role|notiops-idle-detection-role)-(\d{12})$")
+
+
+def _sibling_role_arn(role_arn: str) -> str | None:
+    """给一代名字，返回同账号、同后缀的另一代；不是这两种带后缀的形态 → None。"""
+    m = _ALIAS_RE.match(str(role_arn or "").strip())
+    if not m:
+        return None
+    other = ("notiops-idle-detection-role" if m.group(2) == "notiops-cross-account-role"
+             else "notiops-cross-account-role")
+    return f"{m.group(1)}{other}-{m.group(3)}"
+
+
+#: 注册表 ARN → 本进程上次实际成功的别名。没有它，栈已换名而注册表没换的账号每次都要
+#: 先吃一次 AccessDenied（CloudTrail 噪音）。与 shared/account_scope.py::_ALIAS_MEMO 同语义。
+_ALIAS_MEMO: dict[str, str] = {}
+
+
+def _assume_with_alias(sts, role_arn: str, kw: dict) -> dict:
+    """AssumeRole；AccessDenied 时换另一代名字再试。两次都失败抛注册表那个 ARN 的错。"""
+    alt = _sibling_role_arn(role_arn)
+    order = [alt, role_arn] if alt and _ALIAS_MEMO.get(role_arn) == alt else [role_arn, alt]
+    errs: dict[str, ClientError] = {}
+    for candidate in order:
+        if not candidate:
+            continue
+        try:
+            resp = sts.assume_role(RoleArn=candidate, **kw)
+        except ClientError as e:
+            errs[candidate] = e
+            if e.response.get("Error", {}).get("Code") not in (
+                    "AccessDenied", "AccessDeniedException"):
+                break
+            continue
+        if candidate == role_arn:
+            _ALIAS_MEMO.pop(role_arn, None)
+        else:
+            _ALIAS_MEMO[role_arn] = candidate
+            logger.info("AssumeRole via alias: %s -> %s", role_arn, candidate)
+        return resp
+    _ALIAS_MEMO.pop(role_arn, None)
+    raise errs.get(role_arn) or next(iter(errs.values()))
 
 _deploy_account_cache: str | None = None
 
@@ -111,11 +161,8 @@ def get_session(account_id: str | None = None):
         return None  # 未接入/无 role_arn → 拒绝（调用方报 cross_account_unavailable）
     try:
         sts = boto3.client("sts")
-        resp = sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName=f"NotiOpsWebChat-{acct}",
-            DurationSeconds=3600,
-        )
+        kw = {"RoleSessionName": f"NotiOpsWebChat-{acct}", "DurationSeconds": 3600}
+        resp = _assume_with_alias(sts, role_arn, kw)
         c = resp["Credentials"]
         return boto3.Session(
             aws_access_key_id=c["AccessKeyId"],

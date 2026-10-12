@@ -17,7 +17,10 @@ import {
   DescribeServicesCommand,
 } from "@aws-sdk/client-support";
 import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
-import { roleArnAccount } from "./role_guard.mjs";
+import {
+  isAccessDenied, rememberRoleArnHit, roleArnAccount, roleArnCandidates,
+} from "./role_guard.mjs";
+import { persistAliasedRoleArn } from "./devops_agent_accounts.mjs";
 import { fillAccountNames } from "./accounts.mjs";
 // safeErr：异常一律压成"类型名/错误码"再进响应体（见 safe_err.mjs）。
 import { safeErr } from "./safe_err.mjs";
@@ -103,20 +106,27 @@ async function supportClientFor(accountId) {
   if (LOCKED_ACCOUNT_ID && acct !== LOCKED_ACCOUNT_ID) return null; // 跨账号 disabled
   const roleArn = await _registryRoleArn(acct);
   if (!roleArn) return null;
-  try {
-    const out = await _sts.send(new AssumeRoleCommand({
-      RoleArn: roleArn,
-      RoleSessionName: `NotiOpsWebChat-${acct}`,
-      DurationSeconds: 3600,
-    }));
-    const c = out.Credentials;
-    return new SupportClient({
-      region: "us-east-1",
-      credentials: { accessKeyId: c.AccessKeyId, secretAccessKey: c.SecretAccessKey, sessionToken: c.SessionToken },
-    });
-  } catch {
-    return null;
+  // ⚠️ 成员账号角色 2026-10 改过名：注册表里那一代 AccessDenied 时换另一代再试
+  //    （role_guard.mjs::siblingRoleArn）。别名不改账号段，上面的校验仍成立。
+  for (const candidate of roleArnCandidates(roleArn)) {
+    try {
+      const out = await _sts.send(new AssumeRoleCommand({
+        RoleArn: candidate,
+        RoleSessionName: `NotiOpsWebChat-${acct}`,
+        DurationSeconds: 3600,
+      }));
+      rememberRoleArnHit(roleArn, candidate);
+      if (candidate !== roleArn) await persistAliasedRoleArn(acct, roleArn, candidate);
+      const c = out.Credentials;
+      return new SupportClient({
+        region: "us-east-1",
+        credentials: { accessKeyId: c.AccessKeyId, secretAccessKey: c.SecretAccessKey, sessionToken: c.SessionToken },
+      });
+    } catch (e) {
+      if (!isAccessDenied(e)) return null;
+    }
   }
+  return null;
 }
 
 function wrapErr(e) {
@@ -430,10 +440,15 @@ async function _idemClaim(pk) {
     await _aggDdb.send(new _AggPut({
       TableName: _AGG_TABLE,
       Item: { PK: pk, SK: "v1", state: "inflight", at: now, ttl: Math.floor(now / 1000) + _IDEM_TTL_SEC },
-      // 没人认领过，或上一个认领已经超时（Lambda 被掐死 / 超时 → 不能永久堵住）。
-      ConditionExpression: "attribute_not_exists(PK) OR (#s = :inflight AND #at < :stale)",
-      ExpressionAttributeNames: { "#s": "state", "#at": "at" },
-      ExpressionAttributeValues: { ":inflight": "inflight", ":stale": now - _IDEM_INFLIGHT_STALE_MS },
+      // 没人认领过；或上一个认领的 30 分钟窗口已过（`ttl` 是秒）；或上一个认领已经超时
+      // （Lambda 被掐死 / 超时 → 不能永久堵住）。窗口要在条件里比 `ttl` 才会按时结束：DynamoDB
+      // 的 TTL 是后台异步删除（官方口径「通常几天内」），删之前过期行照样让条件写失败，
+      // 「窗口内重放」就会拖成好几天（2026-10-11，与 web 收件箱去重同一个根因）。
+      ConditionExpression: "attribute_not_exists(PK) OR #ttl < :nowSec OR (#s = :inflight AND #at < :stale)",
+      ExpressionAttributeNames: { "#s": "state", "#at": "at", "#ttl": "ttl" },
+      ExpressionAttributeValues: {
+        ":inflight": "inflight", ":stale": now - _IDEM_INFLIGHT_STALE_MS, ":nowSec": Math.floor(now / 1000),
+      },
     }));
     return { mode: "go" };
   } catch (e) {

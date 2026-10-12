@@ -2282,6 +2282,37 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "✏️ 打开回复表单",
         "en": "✏️ Open reply form",
     },
+    # ── 自然语言识别出的回复:先预览、确认后再发(2026-10-11)────────────────────────────
+    # 识别器会把「该怎么回复 case <号> 的工程师」这种疑问句也认成回复;回复是写进客户 AWS Support
+    # 工单的对外动作,所以只有显式命令(`/回复案例 <号> <正文>`)才直发,见 platforms/common/router.py。
+    "case.reply.confirm_intro": {
+        "zh": "下面是从你那句话里识别出的回复内容，**还没有发出** —— 核对无误再点「发送」，要改直接改。它会作为客户消息附加到该 case，AWS Support 工程师会看到。",
+        "en": "This is the reply text taken from your message. **It has not been sent yet** — check it, edit it if needed, then press Send. It will be added to the case as a customer message that AWS Support engineers will see.",
+    },
+    "case.reply.confirm_opener.title": {
+        "zh": "*✏️ 回复 Case `{display_id}`*\n从你那句话里识别出了一段回复，**还没有发出**。点下方按钮打开表单，核对（或修改）后再提交。",
+        "en": "*✏️ Reply to Case `{display_id}`*\nI picked up a reply from your message — *it has not been sent yet*. Open the form below, check or edit it, then submit.",
+    },
+    "case.reply.confirm_text.title": {
+        "zh": "✏️ 这条回复还没有发出",
+        "en": "✏️ This reply has not been sent",
+    },
+    "case.reply.confirm_text.intro": {
+        "zh": "从你那句话里识别出要回复 case {display_id} 的内容是：",
+        "en": "The reply to case {display_id} I picked up from your message is:",
+    },
+    "case.reply.confirm_text.how": {
+        "zh": "确认无误的话，发下面这条命令就会发出（正文可以改成你真正要发的内容）：",
+        "en": "If that is right, send the command below and it will be posted (you can change the text to what you actually want to send):",
+    },
+    "case.reply.confirm_text.command": {
+        "zh": "/回复案例 {display_id} {body}",
+        "en": "/reply-case {display_id} {body}",
+    },
+    "case.reply.confirm_text.body_placeholder": {
+        "zh": "<正文>",
+        "en": "<your text>",
+    },
     "case.resolve.opener.title": {
         "zh": "*⚠️ 确认关闭 Case `{display_id}`?*\n关闭后 AWS 工程师不会再处理。_(如需重开,新增一条回复即可让 case 回到 pending 状态。)_",
         "en": "*⚠️ Confirm closing Case `{display_id}`?*\nAfter closing, AWS engineers will stop working on it. _(To reopen, just add a new reply — that brings the case back to pending.)_",

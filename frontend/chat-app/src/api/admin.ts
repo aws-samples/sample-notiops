@@ -698,7 +698,7 @@ export async function verifyInspectionCollectionRole(
  * 采集角色模板的 Launch Stack URL —— **兜底用**。
  *
  * ⚠️ 2026-08-26 起采集角色已经合并进手动接入那个模板
- * （`infra/member-devops-agent.yaml` 的 `IdleDetectionRole`），所以正常流程
+ * （`infra/member-devops-agent.yaml` 的 `CrossAccountRole`），所以正常流程
  * 客户只部署**一个**栈，不需要这个。留着它是给两种账号收尾：
  * 用合并前的老模板部署过的、以及部署时把 `CreateCollectionRole` 选成了 no 的。
  */

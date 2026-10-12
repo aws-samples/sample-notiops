@@ -103,8 +103,10 @@ ok("没有 `|| _localClient` / `?? _localClient` 这类兜底",
   !/(\|\||\?\?)\s*_localClient/.test(code));
 ok("`_registryRoleArn` 拿不到就 return null",
   /if \(!roleArn\) return null;/.test(code));
+// 2026-10：成员账号角色改名后这里按「注册表那一代 → 别名」逐个试，只有 AccessDenied
+// 才试下一个；试完仍是 return null —— 不回落这一条不变。
 ok("AssumeRole 失败也 return null（catch 里不回落）",
-  /catch \{\s*return null;\s*\}/.test(code));
+  /catch \(e\) \{\s*if \(!isAccessDenied\(e\)\) return null;\s*\}\s*\}\s*return null;/.test(code));
 /* `_localClient` 在代码里只许出现三次：声明、部署账号那一支、
  * `DescribeServices`（服务目录是全局只读数据，与账号无关）。多出来的第四处
  * 极可能就是一次回落。 */

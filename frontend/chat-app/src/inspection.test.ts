@@ -157,6 +157,17 @@ const INSPECTION_SRC = [
   // 「深入分析」的确认弹窗（2026-08-31）。备注框与派发按钮在同一个 dialog 里 ——
   // 上一版备注在详情面板正文中间、按钮在 footer，隔了约 350px。
   "components/inspection/JudgeModal.tsx",
+  // 「闲置与成本」页的表格视图 + 它的纯函数（2026-10 看板改版）。
+  "components/inspection/IdleTable.tsx",
+  "components/inspection/idleTableUtil.ts",
+  // 闲置抽屉「结论先行」版（2026-10 第三版）：排版 + 纯函数。
+  "components/inspection/IdleDetail.tsx",
+  "components/inspection/idleDetailUtil.ts",
+  // 高负载页对齐闲置页（2026-10）：表格 + 结论先行抽屉 + 纯函数；两张表共用的小部件。
+  "components/inspection/HighLoadTable.tsx",
+  "components/inspection/HighLoadDetail.tsx",
+  "components/inspection/highLoadUtil.ts",
+  "components/inspection/tableParts.tsx",
 ] as const;
 
 const readAll = () => INSPECTION_SRC.map(read).join("\n");
@@ -269,6 +280,16 @@ describe("dashboard components", () => {
     for (const m of ["FreeableMemory", "FreeStorageSpace", "CPUCreditBalance"]) {
       expect(code, `${m} 不该出现在前端代码里（方向由后端给）`)
         .not.toContain(m);
+    }
+  });
+
+  it("★★ 指标显示名那份表只有名字，不许长出方向 / 阈值判断", () => {
+    /* `inspectionMetricLabels.ts` 是上面那条看门断言的**唯一**豁免（它必须写指标原名
+       才能映射显示名）。豁免的前提是它只做显示名 —— 一旦里面出现方向词，就是
+       那份被删掉的 `BAD_DOWN` 清单换了个文件复活。 */
+    const lbl = stripComments(read("components/inspectionMetricLabels.ts"));
+    for (const w of ["bad_down", "bad_up", "direction", "threshold", "BAD_", "higher", "lower"]) {
+      expect(lbl, `指标显示名表里出现了 ${w}`).not.toContain(w);
     }
   });
 
@@ -1120,6 +1141,14 @@ describe("idle_score = null 与「分很低」必须分开", () => {
     expect(idleBadgeKind({ kind: "idle", idle_score: 99.3 })).toBe("score");
   });
 
+  it("★★★ 闲置页上的容量审计（超配）没有闲置分是正常形态，不是「未判定」", () => {
+    // 2026-10 截图：每条「内存超配」都挂着琥珀色「未判定」。
+    for (const r of ["oversized_storage", "oversized_memory"]) {
+      expect(idleBadgeKind({ kind: "idle", rule: r, idle_score: null })).toBe("severity");
+    }
+    expect(idleBadgeKind({ kind: "idle", rule: "idle", idle_score: null })).toBe("undecided");
+  });
+
   it("★★★ 非闲置类的 null 是正常形态 → 退回严重度", () => {
     // 高负载 / 配置检查压根没有闲置分这个概念。
     for (const k of ["high_load", "structural"]) {
@@ -1151,9 +1180,10 @@ describe("页头合计金额", () => {
        写着「每月合计可省 $0」。`fmtMoney` 对 (0, 1) 给 `<$1`。
        ⚠️ 这也是全页唯一自己拼 `$` 的地方，卡片那侧一直走 fmtMoney ——
           同一个金额两套格式化就是这类缺陷的来源。 */
-    const i = src().indexOf("每月合计可省");
+    // 2026-10 第二版：标签在数字**上面**（「每月可省」），所以往后找。
+    const i = src().indexOf(`"每月可省"`);
     expect(i, "合计那一段不在了").toBeGreaterThan(0);
-    const seg = src().slice(i - 700, i);
+    const seg = src().slice(i, i + 700);
     expect(/fmtMoney\(savings\.sum\)/.test(seg), "合计没走 fmtMoney").toBe(true);
     expect(/Math\.round\(savings\.sum\)/.test(seg),
       "又自己 Math.round 了 —— $0.4 会显示成 $0",
@@ -1170,8 +1200,9 @@ describe("页头合计金额", () => {
   it("★★★ 口径要写清是「待处置全部」而不是当前筛选结果", () => {
     /* 合计基于 `openRows`，列表是 `shown`（受 chip / severity / 搜索词影响）。
        筛掉一半之后金额不变，客户会以为筛选没生效。 */
-    const i = src().indexOf("每月合计可省");
-    const seg = src().slice(i, i + 200);
+    // ⚠️ 第二版把口径放进那张卡的 title（不再占一整行），仍必须在同一张卡里。
+    const i = src().indexOf(`"每月可省"`);
+    const seg = src().slice(i, i + 1200);
     expect(/待处置全部/.test(seg), "合计口径没说明").toBe(true);
   });
 

@@ -38,6 +38,7 @@ import {
   Badge, SevBadge,
 } from "./ui";
 import { C, SEV_COLOR } from "./tokens";
+import { metricLabel } from "../inspectionMetricLabels";
 
 /*
  * ⚠️ `NEEDS_NO_AI` / `DETERMINISTIC_KINDS` / 七档状态判据都搬到
@@ -48,7 +49,7 @@ import { C, SEV_COLOR } from "./tokens";
 
 
 export default function FindingCard({
-  f, zh, t, highlighted = false, showAccount = false, onOpen, judged,
+  f, zh, t, highlighted = false, showAccount = false, onOpen, judged, commonConclusion = "",
 }: {
   f: FindingRow;
   zh: boolean;
@@ -77,6 +78,11 @@ export default function FindingCard({
    * 那几百毫秒里客户点完看不到任何变化，会以为没反应。
    */
   judged?: boolean;
+  /**
+   * 这一页上「每条都一样」的那句规则说明（列表那一层算好、页面上说一次）。
+   * 与它相同的 `conclusion` 不再逐卡重复 —— 截图里那一整行一字不差的长句。
+   */
+  commonConclusion?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const ev = evidenceText(f, zh);
@@ -231,19 +237,12 @@ export default function FindingCard({
           {f.service} · {f.region}
         </span>
         <div style={{ flex: 1 }} />
-        {f.was_confirmed && (
-          <Badge tone="neutral"
-            title={zh ? "连续多轮命中，已过确认门槛（R6.3）" : "confirmed across runs"}>
-            {zh ? "已确认" : "confirmed"}
-          </Badge>
-        )}
-        {f.state && <Badge>{t(`insp.state.${f.state}`)}</Badge>}
-        {/* 「可点」的可见提示。删掉「详情」按钮之后，整卡可点这件事没有任何
-            视觉线索 —— hover 变色对触屏无效，而列表里没有别的箭头。
-            ⚠️ `aria-hidden`：卡片自己已经有 `aria-label`，这个字符念出来是噪音。 */}
-        <span aria-hidden="true" style={{
-          color: C.muted, fontSize: 15, lineHeight: 1, marginLeft: 2,
-        }}>›</span>
+        {/* 🔴 2026-10 看板改版：「已确认」「持续」不再逐卡挂着。截图里每张卡都是
+            同一对徽标 —— 没有区分度的信息只会把真正不同的那几个徽标（判读中 /
+            判读不可信 / 新增 / 缓解中）淹掉。
+            ⚠️ 只在状态**不是** active 时显示：new / resolving / chronic / resolved
+               各自意味着不同的动作，那才是信号。「已确认」挪进详情抽屉的诊断信息。 */}
+        {f.state && f.state !== "active" && <Badge>{t(`insp.state.${f.state}`)}</Badge>}
         {/* 🔴 **「已派 AI 判读」徽章**（2026-08-31 客户实测提的）。
             客户原话：「这里也没有标注出来哪一条 finding 触发了深度分析。
             我认为 findings 这一行至少有一个醒目的标识，证明他已经被触发了
@@ -301,6 +300,13 @@ export default function FindingCard({
               .replace("{n}", String(f.da_degradations?.length ?? 0))}
           </Badge>
         )}
+        {/* 「可点」的可见提示。删掉「详情」按钮之后，整卡可点这件事没有任何
+            视觉线索 —— hover 变色对触屏无效，而列表里没有别的箭头。
+            ⚠️ 放在**最后**：原来在徽标之前，「⏳ 判读中」挂在箭头右边（2026-10 截图）。
+            ⚠️ `aria-hidden`：卡片自己已经有 `aria-label`，这个字符念出来是噪音。 */}
+        <span aria-hidden="true" style={{
+          color: C.muted, fontSize: 15, lineHeight: 1, marginLeft: 2,
+        }}>›</span>
       </div>
 
       {/* ── 第二行：判定证据。缺就整行不渲染，不显示 0 ── */}
@@ -309,7 +315,30 @@ export default function FindingCard({
           marginTop: 7, fontSize: 13, color: C.text,
           display: "flex", alignItems: "baseline", gap: 6, flexWrap: "wrap",
         }}>
-          <span style={{ color: C.muted }}>{f.metric || t("insp.field.metric")}</span>
+          <span style={{ color: C.muted }} title={f.metric || undefined}>
+            {f.metric ? metricLabel(f.metric, zh) : t("insp.field.metric")}
+          </span>
+          {/* 🔴 百分比指标给一根带阈值刻度的小条（2026-10）。「85.3% 高于阈值 70%」要读完
+              整句才知道离线多远；条上一眼就是「越过阈值多少」。
+              ⚠️ 只对 `%` 单位画 —— 字节 / 计数没有 0~100 的天然刻度，硬画会误导。 */}
+          {f.unit === "%" && f.observed_value !== null && f.threshold_value !== null && (
+            <span aria-hidden="true" style={{
+              width: 90, height: 6, borderRadius: 3, alignSelf: "center",
+              background: C.line, position: "relative",
+              overflow: "hidden", flexShrink: 0,
+            }}>
+              <span style={{
+                position: "absolute", left: 0, top: 0, bottom: 0, borderRadius: 3,
+                width: `${Math.max(1.5, Math.min(100, f.observed_value))}%`,
+                background: SEV_COLOR[f.severity],
+              }} />
+              <span style={{
+                position: "absolute", top: 0, bottom: 0, width: 2,
+                left: `calc(${Math.max(0, Math.min(100, f.threshold_value))}% - 1px)`,
+                background: "var(--text)", opacity: .55,
+              }} />
+            </span>
+          )}
           <b style={{ fontSize: 15, color: SEV_COLOR[f.severity] }}>{ev.value}</b>
           {/* 🔴 `relation` 为空 = 后端没给 `direction`。那时**只说阈值是多少**，
               不猜「高于」还是「低于」—— 猜错的表现是 FreeableMemory
@@ -330,6 +359,15 @@ export default function FindingCard({
               命中时的 —— 不标注就等于宣称那是今天的水位，而客户会照着它
               判断「现在有多严重」。
               ⚠️ 等于本轮时 `staleEvidenceText` 返回 null，这里整块不渲染。 */}
+          {/* 已持续天数并进这一行（2026-10）：单独一行让每张卡多出一行，而它只是一个数。 */}
+          {f.days_active !== null && !showMoney && (
+            <span style={{ color: C.muted, fontSize: 12, marginLeft: 6 }}
+              title={f.first_seen_date
+                ? `${t("insp.field.firstSeen")} ${f.first_seen_date}` : undefined}>
+              · {t("insp.field.daysActive")}{" "}
+              <b style={{ color: C.text }}>{f.days_active}{t("insp.field.days")}</b>
+            </span>
+          )}
           {stale && (
             <Badge tone="amber" title={zh
               ? "这条本轮未命中但水位没回到健康区，显示的是最后一次命中时的数值"
@@ -339,12 +377,14 @@ export default function FindingCard({
           )}
         </div>
       ) : f.metric ? (
-        <div style={{ marginTop: 7, fontSize: 13, color: C.muted }}>
-          {f.metric}
+        <div style={{ marginTop: 7, fontSize: 13, color: C.muted }} title={f.metric}>
+          {metricLabel(f.metric, zh)}
         </div>
       ) : null}
 
-      {/* ── 第三行：持续时间 + 金额 ── */}
+      {/* ── 第三行：持续时间 + 金额 ──
+          有证据行且没有金额（高负载）时，持续天数已经并进证据行，这一行整行不渲染。 */}
+      {(showMoney || !ev) && (
       <div style={{
         marginTop: 6, display: "flex", gap: 14, flexWrap: "wrap",
         fontSize: 12, color: C.muted,
@@ -379,6 +419,7 @@ export default function FindingCard({
           </span>
         )}
       </div>
+      )}
 
       {/*
         ── 闲置评分因子 ──
@@ -446,6 +487,9 @@ export default function FindingCard({
                  空白则那一行凭空消失、看起来像后端没给。 */}
           <b title={f.da_verdict}>{verdictLabel(f.da_verdict, t)}</b>
         </div>
+      ) : state === "rule" && (f.conclusion || "").trim() === commonConclusion ? (
+        /* 与页面共用说明一样 → 不逐卡重复（列表下方已说一次）。 */
+        null
       ) : state === "rule" ? (
         /* **确定性结论** —— 不经 AI 算出来的那句话（2026-08-31 实机暴露）。
            闲置轮不派 DA（`gating.DETERMINISTIC_RUN_TYPES`），判定是纯计算的，

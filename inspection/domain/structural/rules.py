@@ -483,3 +483,59 @@ RULE_SERVICES: dict[StructuralRule, frozenset[str]] = {
 def applies_to(rule: StructuralRule, service: str) -> bool:
     allowed = RULE_SERVICES.get(rule)
     return True if allowed is None else service in allowed
+
+
+def judgeable(rule: StructuralRule, attrs: ResourceAttrs, ref: StructuralRefData) -> bool:
+    """这条规则本轮对这台**判得了**吗（输入齐不齐）。
+
+    ## 🔴 为什么要有它（2026-10-10 交叉 review A3 / A4）
+
+    `check_*` 对「不命中」与「判不了」都返回 `None`。状态机分不出两者：
+
+    ```
+    判了、没命中    = 恢复证据       → 该给 healthy 观测，2 轮后 RESOLVED / fixed
+    判不了（缺输入）= 不知道         → 必须原地不动（R6.2）
+    ```
+
+    原来两种都当「没观测」→ `_step_missed` 恒走 CHRONIC：gp2 换了 gp3、开了备份、
+    升了版本，那条 finding 照样永远挂着；refdata 加载失败那天，所有 EOL / 证书
+    finding 又被一起判成「未命中」。
+
+    ⚠️ 判据**逐条对着上面的 `check_*` 写**，只挑「因为输入是 None 而 return None」的
+       分支；「不适用」（Memcached、只读副本、非生产 tier、引擎是 Aurora）算判了 ——
+       规则对它就是不命中。改任何一个 `check_*` 的缺数据分支时这里要一起改，
+       一致性由 `test_inspection_structural_judgeable` 用全组合钉住。
+    """
+    if rule is StructuralRule.GP2_VOLUME:
+        return attrs.storage_type is not None
+    if rule is StructuralRule.SINGLE_AZ_IN_PROD:
+        if attrs.service == "elasticache":
+            if attrs.read_replica_count == 0 or metrics_meta.is_memcached(
+                    attrs.service, attrs.engine):
+                return True
+            return not (attrs.cluster_multi_az is None and attrs.automatic_failover is None)
+        if attrs.cluster_id and not attrs.is_read_replica:
+            return not (attrs.cluster_multi_az is None and attrs.cluster_az_count is None)
+        return True
+    if rule is StructuralRule.BACKUP_DISABLED:
+        if metrics_meta.is_memcached(attrs.service, attrs.engine) or attrs.is_read_replica:
+            return True
+        return attrs.backup_retention_days is not None
+    if rule is StructuralRule.NO_READ_REPLICA:
+        if metrics_meta.is_memcached(attrs.service, attrs.engine) or attrs.is_read_replica:
+            return True
+        return attrs.read_replica_count is not None
+    if rule is StructuralRule.CA_CERT_EXPIRING:
+        if not attrs.ca_cert_identifier:
+            return True
+        return ref.ca_cert_expiry.get(attrs.ca_cert_identifier) is not None
+    if rule is StructuralRule.ENGINE_EOL:
+        if not attrs.engine or not attrs.engine_version:
+            return False
+        major = major_version(attrs.engine, attrs.engine_version)
+        if major is None:
+            return False
+        lc = ref.engine_lifecycles.get((attrs.engine.lower(), major))
+        return lc is not None and lc.standard_end is not None
+    # BURSTABLE_IN_PROD 只看规格与 tier，恒判得了。
+    return True

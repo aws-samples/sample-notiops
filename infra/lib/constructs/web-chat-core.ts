@@ -762,7 +762,7 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       AGENT_RUNTIME_ARN: agentRuntimeArn,
       // 多账号：config 表名（复用 notiops-config）+ 跨账号角色名 + 单账号锁定
       CONFIG_TABLE: "notiops-config",
-      NOTIOPS_CROSS_ACCOUNT_ROLE: orgSwitch(`notiops-idle-detection-role-${stack.account}`, "notiops-idle-detection-role"),
+      NOTIOPS_CROSS_ACCOUNT_ROLE: orgSwitch(`notiops-cross-account-role-${stack.account}`, "notiops-idle-detection-role"),
       /* 部署账号 ID —— **恒有值，与 orgMode 无关**。
          与下面 `LOCKED_ACCOUNT_ID` 是两件事：那个是**闸门**（解锁时留空），
          这个是**身份**（永远要知道「我是谁」）。
@@ -796,7 +796,9 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       // 多账号：Admin「账户」页一键接入用（StackSets）；单账号留空 = 功能禁用
       // （BFF 侧 stackSetName() 见空就抛 org_mode_disabled，不会走到 API 调用）。
       MEMBER_ONBOARDING_STACKSET_NAME: orgSwitch("notiops-member-onboarding", ""),
-      NOTIOPS_MEMBER_ROLE_NAME: orgSwitch(`notiops-idle-detection-role-${stack.account}`, ""),
+      // 2026-10 改名：成员账号角色从 notiops-idle-detection-role-<系统账号> 改为
+      // notiops-cross-account-role-<系统账号>（与 member-account-onboarding.yaml 同步）。
+      NOTIOPS_MEMBER_ROLE_NAME: orgSwitch(`notiops-cross-account-role-${stack.account}`, ""),
       MEMBER_DA_STACKSET_NAME: orgSwitch("notiops-member-devops-agent", ""),
       // 一键接入要带的 `CallAs`（SELF / DELEGATED_ADMIN）。**每一个** StackSet 调用都得带，
       // 漏一处就在那一处 AccessDenied 或「StackSet 不存在」（委派管理员看不见不带 CallAs
@@ -1043,7 +1045,9 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       // 只匹配两种合法形态，避免 role* 松散通配误匹配 ...roleFOO：
       resources: [
         "arn:aws:iam::*:role/notiops-idle-detection-role", // 无后缀=部署账号自身/遗留手动接入
-        "arn:aws:iam::*:role/notiops-idle-detection-role-*", // 带账号后缀=org 模式成员账号
+        "arn:aws:iam::*:role/notiops-idle-detection-role-*", // 带账号后缀=2026-10 之前接入的成员账号（旧名）
+        // 2026-10 起成员账号角色的新名。两代执行侧互为别名（role_guard.mjs::siblingRoleArn），两条都要留。
+        "arn:aws:iam::*:role/notiops-cross-account-role-*",
         // 跨 payer DevOps Agent 接入：testDaConnection AssumeRole 进成员账号的触发角色
         // （member-devops-agent.yaml 建的 notiops-agent-trigger-<acct>-m<sys>）。
         "arn:aws:iam::*:role/notiops-agent-trigger-*",
@@ -1775,7 +1779,9 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       // 只匹配两种合法形态，避免 role* 松散通配误匹配 ...roleFOO：
       resources: [
         "arn:aws:iam::*:role/notiops-idle-detection-role", // 无后缀=部署账号自身/遗留手动接入
-        "arn:aws:iam::*:role/notiops-idle-detection-role-*", // 带账号后缀=org 模式成员账号
+        "arn:aws:iam::*:role/notiops-idle-detection-role-*", // 带账号后缀=2026-10 之前接入的成员账号（旧名）
+        // 2026-10 起成员账号角色的新名。两代执行侧互为别名（role_guard.mjs::siblingRoleArn），两条都要留。
+        "arn:aws:iam::*:role/notiops-cross-account-role-*",
         // 跨 payer DevOps Agent 接入：testDaConnection AssumeRole 进成员账号的触发角色
         // （member-devops-agent.yaml 建的 notiops-agent-trigger-<acct>-m<sys>）。
         "arn:aws:iam::*:role/notiops-agent-trigger-*",

@@ -108,6 +108,33 @@ else
   fi
 fi
 
+# ── python3 的 pyexpat:坏了 pip / venv 都起不来 ────────────────────────────
+# 实测(2026-10,客户现场):macOS 26.x 上 Homebrew 的 python@3.14 / python@3.12
+# bottle,pyexpat 链接系统 /usr/lib/libexpat.1.dylib,而系统那份没导出
+# _XML_SetAllocTrackerActivationThreshold → `import xml.parsers.expat` ImportError
+# → ensurepip / pip 全挂。setup.sh 开头有同一条 fail-fast(notiops_expat_fail),
+# 处方两边保持一致。
+if [ "$PY_OK" = true ]; then
+  if _EXPAT_ERR=$(python3 -c 'import xml.parsers.expat' 2>&1); then
+    ok "$(t "python3 能加载 pyexpat(pip / venv 可用)" "python3 loads pyexpat (pip / venv usable)")"
+  else
+    bad "$(t "python3 加载不了 pyexpat —— pip / venv 都起不来,setup.sh 会在开头停下" \
+            "python3 cannot load pyexpat -- pip / venv cannot start; setup.sh will stop at the start")"
+    printf '%s\n' "$_EXPAT_ERR" | grep -E 'ImportError|Symbol not found|Expected in' | head -3 \
+      | sed 's/^ */         /'
+    if printf '%s' "$_EXPAT_ERR" | grep -q '/usr/lib/libexpat'; then
+      hint "$(t "原因:这份 Python 的 pyexpat 链接到 macOS 自带的旧 libexpat。处方(brew upgrade/reinstall 该 python 后要重做):" \
+              "Cause: this Python's pyexpat links to the old macOS system libexpat. Fix (redo after brew upgrade/reinstall of that python):")"
+      hint "  brew install expat"
+      hint "  PYEXPAT=\$(python3 -c \"import sysconfig,os,sys; print(os.path.join(sysconfig.get_path('stdlib'),'lib-dynload','pyexpat.cpython-%d%d-darwin.so' % sys.version_info[:2]))\")"
+      hint "  install_name_tool -change /usr/lib/libexpat.1.dylib \"\$(brew --prefix expat)/lib/libexpat.1.dylib\" \"\$PYEXPAT\""
+      hint "  codesign --sign - --force \"\$PYEXPAT\""
+      hint "  python3 -c 'import xml.parsers.expat' && echo expat-ok"
+      hint "$(t "然后 rm -rf .venv 再跑 setup.sh。" "Then rm -rf .venv and run setup.sh.")"
+    fi
+  fi
+fi
+
 # ── node / npm / jq / git ───────────────────────────────────────────────────
 if ! command -v node >/dev/null 2>&1; then
   bad "$(t "Node.js 未安装(CDK 要求 ≥ 22)" "Node.js not installed (CDK needs >= 22)")"

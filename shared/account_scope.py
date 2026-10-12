@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+from typing import Any
 
 logger = logging.getLogger("shared.account_scope")
 
@@ -139,8 +141,9 @@ def assert_role_belongs_to(
     ⚠️ **一律抛，不返回 bool。** 返回 bool 会让调用方漏掉 `if` —— 而漏掉的
        表现是静默通过。抛异常时最坏情况是那个账号这一轮失败，可见。
 
-    ⚠️ 只查账号段，**不查角色名**。角色名有三种合法形态
-       （`notiops-idle-detection-role-<系统账号>`、
+    ⚠️ 只查账号段，**不查角色名**。角色名有几种合法形态
+       （`notiops-cross-account-role-<系统账号>`、它改名前的
+        `notiops-idle-detection-role-<系统账号>`、
         `notiops-agent-trigger-<账号>-m<系统账号>`、历史手工建的），
        写死会把合法接入挡掉。账号段是唯一在所有形态里都成立的判据。
     """
@@ -174,4 +177,133 @@ def role_belongs_to(role_arn: str, target_account_id: str) -> bool:
         assert_role_belongs_to(role_arn, target_account_id)
     except CrossAccountRoleMismatch:
         return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 成员账号跨账号角色的新旧两代名字（2026-10 改名）
+# ---------------------------------------------------------------------------
+#
+# 成员账号里那个采集 / 只读角色原名 `notiops-idle-detection-role-<系统账号>`
+# —— 老 idle-detector 时代的名字，老系统已删，客户在成员账号里看到它会问
+# 「怎么还有 idle detector」。新接入改成 `notiops-cross-account-role-<系统账号>`。
+#
+# 🔴 为什么要「别名」而不是一次性迁移：角色名一改，CloudFormation 就是**替换**
+#    （建新删旧），而触发更新的路径不止一条、时机也不由我们控制：
+#
+#    ```
+#    setup.sh 重跑          update-stack-set → 异步滚动，不等完成
+#    一键部署 stager        同上
+#    非 Org 成员账号        客户自己在控制台更新栈，什么时候都可能
+#    ```
+#
+#    而注册表 `account#<id>.role_arn` 里存的是接入那一刻的名字。任何一条路径先走
+#    一步，存的名字就指向一个已删除（或尚未建出）的角色 —— 那个账号的巡检、跨账号
+#    问答、案例全部 AccessDenied，看起来像「客户没给权限」。
+#
+#    所以执行侧把两个名字当**同一个角色的别名**：按注册表里的那个先 assume，
+#    AccessDenied 时换成同账号、同后缀的另一个再试一次。
+#
+# ⚠️ 只认**带 12 位后缀**的这两种形态。无后缀的 `notiops-idle-detection-role` 是
+#    部署账号自身的角色 / 历史手工接入的名字，没有对应的新名，不参与换名。
+# ⚠️ 换名不改变账号段（正则保证），所以 `assert_role_belongs_to` 对原 ARN 的
+#    校验结论对别名同样成立。
+CROSS_ACCOUNT_ROLE_PREFIX = "notiops-cross-account-role"
+LEGACY_CROSS_ACCOUNT_ROLE_PREFIX = "notiops-idle-detection-role"
+
+_ALIAS_RE = re.compile(
+    r"^(arn:aws(?:-[a-z-]+)?:iam::\d{12}:role/)"
+    rf"({re.escape(CROSS_ACCOUNT_ROLE_PREFIX)}|{re.escape(LEGACY_CROSS_ACCOUNT_ROLE_PREFIX)})"
+    r"-(\d{12})$")
+
+
+def sibling_role_arn(role_arn: str) -> str | None:
+    """新旧两代跨账号角色互为别名：给一个，返回同账号、同后缀的另一个。
+
+    不是这两种形态（包括无后缀的老名字、trigger role 等别的角色）→ `None`。
+    """
+    m = _ALIAS_RE.match(str(role_arn or "").strip())
+    if not m:
+        return None
+    other = (LEGACY_CROSS_ACCOUNT_ROLE_PREFIX
+             if m.group(2) == CROSS_ACCOUNT_ROLE_PREFIX
+             else CROSS_ACCOUNT_ROLE_PREFIX)
+    return f"{m.group(1)}{other}-{m.group(3)}"
+
+
+def _is_access_denied(e: BaseException) -> bool:
+    resp = getattr(e, "response", None)
+    code = (resp.get("Error", {}) or {}).get("Code") if isinstance(resp, dict) else ""
+    return code in ("AccessDenied", "AccessDeniedException")
+
+
+#: 进程内记忆：注册表里的 ARN → 上次实际 assume 成功的别名。
+#: 🔴 没有它的话，栈已换成新名而注册表还是旧名的账号**每一次**都先吃一次
+#:    AccessDenied 再换名（R2/R3 review）：STS 调用翻倍，CloudTrail 里长期挂着
+#:    AssumeRole AccessDenied —— 客户的安全告警很爱盯这种事件。条件回写注册表
+#:    （`persist_aliased_role_arn`）是根治，这个记忆兜住没有写权限的调用方。
+_ALIAS_MEMO: dict[str, str] = {}
+
+
+def assume_role_with_alias(sts: Any, role_arn: str, **kwargs: Any) -> tuple[dict, str]:
+    """`sts.assume_role(RoleArn=role_arn, **kwargs)`；AccessDenied 时换别名再试一次。
+
+    Returns:
+        `(assume_role 的响应, 实际 assume 成功的那个 ARN)`。
+
+    ⚠️ 只在 **AccessDenied** 时换名。限流 / 网络错误换个名字不会好，原样抛。
+    ⚠️ 两个都失败时抛**注册表那个 ARN** 的错 —— 排障要从它查起。
+    ⚠️ 本进程上次已经证明别名才是对的，就先试别名（见 `_ALIAS_MEMO`）。
+    ⚠️ 调用方仍须在调用前对 `role_arn` 做 `assert_role_belongs_to`。
+    """
+    alt = sibling_role_arn(role_arn)
+    order = [alt, role_arn] if alt and _ALIAS_MEMO.get(role_arn) == alt else [role_arn, alt]
+    errs: dict[str, BaseException] = {}
+    for candidate in order:
+        if not candidate:
+            continue
+        try:
+            resp = sts.assume_role(RoleArn=candidate, **kwargs)
+        except Exception as e:                             # noqa: BLE001
+            errs[candidate] = e
+            if not _is_access_denied(e):
+                break
+            continue
+        if candidate == role_arn:
+            _ALIAS_MEMO.pop(role_arn, None)
+        else:
+            _ALIAS_MEMO[role_arn] = candidate
+            logger.info("跨账号角色按别名 assume 成功: 注册表=%s 实际=%s", role_arn, candidate)
+        return resp, candidate
+    # 两个都失败（或第一个就是非 AccessDenied）。别名记忆作废，抛注册表那个 ARN 的错；
+    # 它没被试到（记忆顺序下第一个就是非 AccessDenied）时抛实际遇到的那个。
+    _ALIAS_MEMO.pop(role_arn, None)
+    raise errs.get(role_arn) or next(iter(errs.values()))
+
+
+def persist_aliased_role_arn(config_table: Any, account_id: str,
+                             registered: str, actual: str) -> bool:
+    """别名成功后把注册表 `account#<id>/meta.role_arn` 条件改成实际那一代。
+
+    条件是 `role_arn = :registered` —— 只在注册表还是我们刚读到的那个值时才改，
+    不会覆盖管理页上同时发生的人工登记。
+
+    ⚠️ **尽力而为，永不抛**：写不进去（无权限 / 条件不成立 / 限流）只是下次再多吃
+       一次 AccessDenied，不该让一次已经拿到凭证的巡检失败。
+    ⚠️ 只接受**互为别名**的两个值。别的组合（调用方传错）一律不写 —— 这个函数不能
+       变成一个「按调用方的意思改 role_arn」的口子。
+    """
+    if not actual or sibling_role_arn(registered) != actual:
+        return False
+    try:
+        config_table.update_item(
+            Key={"PK": f"account#{account_id}", "SK": "meta"},
+            UpdateExpression="SET role_arn = :actual",
+            ConditionExpression="role_arn = :registered",
+            ExpressionAttributeValues={":actual": actual, ":registered": registered},
+        )
+    except Exception as e:                                 # noqa: BLE001
+        logger.info("别名回写注册表未成功（不影响本次）: %s", type(e).__name__)
+        return False
+    logger.info("注册表 role_arn 已换成实际那一代: account=%s", account_id)
     return True

@@ -20,7 +20,7 @@
 | 值班时想在群里就地问一句、顺手拉上同事 | **IM bot** | 在群里 @ 一下就能问、能派深度调查,回答和报告全组可见(注意:本版本告警**不会**自动推进 IM 群,告警在 Web 的「通知」里看,见 §14)|
 | 手机上快速问一句,@ 一下就走 | **IM bot** | 不用开电脑 |
 
-> 两个入口**默认只读**,唯一的写是 **AWS Support case**(建案 / 回复 / 关闭),而且要你确认之后才执行(§1.5、§12)。只读是**各自**保证的 —— Web Chat 靠「只读 IAM 角色(硬边界)+ 工具层只读 + 命令级 denylist + 只读 system prompt」;IM 端默认的 DevOps Agent 直连靠「DevOps Agent 侧的只读 agent + 只读角色」,切到 `/agent notiops` 之后则由 Web Chat 那同一个 AgentCore Runtime 用它的只读角色和只读工具来答(同 §8.1);两条路上 NotiOps 侧都再加一条变更措辞正则。详见 §8 与 §9 的「这个『只读』是谁保证的」。任何会变更 AWS 环境的动作,两边都只出预览等你确认,或者直接让你去对应控制台完成。
+> 两个入口**默认只读**,唯一的写是 **AWS Support case**(建案 / 回复 / 关闭),而且要你确认之后才执行(§1.5、§12)。只读是**各自**保证的 —— Web Chat 靠「IAM 权限(硬边界,对你的基础设施只读)+ 工具层只读 + 命令级 denylist + 只读 system prompt」;IM 端默认的 DevOps Agent 直连靠「DevOps Agent 侧的只读 agent + 只读角色」,切到 `/agent notiops` 之后则由 Web Chat 那同一个 AgentCore Runtime 用它的只读角色和只读工具来答(同 §8.1);两条路上 NotiOps 侧都再加一条变更措辞正则。详见 §8 与 §9 的「这个『只读』是谁保证的」。任何会变更 AWS 环境的动作,两边都只出预览等你确认,或者直接让你去对应控制台完成。
 
 ---
 
@@ -127,7 +127,7 @@ Web Chat 是 NotiOps 的网页控制台:一个浏览器页面,左边是导航,�
 
 ### 1.5 第一次就该知道的三件事
 
-1. **它只读**。它能看你的 CloudWatch、CloudTrail、EC2、RDS、成本、安全发现、Support case,但**不会改任何东西**。唯一会写的是 AWS Support case(建案 / 回复 / 关闭),而且必须你点确认按钮才执行 —— 详见 §8。
+1. **它对你的基础设施只读**。它能看你的 CloudWatch、CloudTrail、EC2、RDS、成本、安全发现、Support case,但**不会改任何东西**。唯一会写的是 AWS Support case(建案 / 回复 / 关闭),而且必须你点确认按钮才执行 —— 详见 §8。
 2. **每一次提问都针对一个具体的 AWS 账号**。顶栏的账号选择器决定这一句问的是哪个账号;每条回答的页脚都会印出它到底答的是哪个 12 位账号 ID,避免你把旧回答当成当前账号的结论。
 3. **会话默认保存 30 天**。服务端到期自动清理(每次使用会刷新这个计时)。要长期留存的结论,用**长报告下载**(§4.8)存到本地。
 
@@ -855,9 +855,9 @@ Claude Sonnet 5.5 / Opus 5.5 和 GPT-6 Sol 要部署账号接受过它们的 AWS
 
 Web Chat 的只读是**四层**叠出来的,但**四层不是同等强度**:
 
-1. **只读 IAM 角色** —— **这是唯一的硬边界**。就算上面三层全被绕过,权限本身也不允许改你的资源:Web Chat 访问你账号用的角色对你的基础设施只读;NotiOps 自己的资源(表、桶等)之外,唯一的写权限是 AWS Support case 的建 / 回 / 关,而且要你确认后才执行(见本节末尾;成员账号的角色可用模板参数 `EnableSupportCaseWrite=false` 收成严格只读)。⚠️ 方式 A 的部署参数 `AgentReadOnlyAccess`(默认 Yes)只决定 agent **能读多宽**,不影响这条边界:Yes 给 agent 的角色挂上 AWS 托管的 `ReadOnlyAccess`;No 只留精选的几组只读授权(成本、日志、指标、RDS / EC2 describe 等),范围更窄。两种取值下,agent 的角色都没有改你基础设施的权限。
+1. **IAM 权限** —— **这是唯一的硬边界**。就算上面三层全被绕过,权限本身也不允许改你的资源:Web Chat 访问你账号用的角色对你的基础设施只读;NotiOps 自己的资源(表、桶等)之外,唯一的写权限是 AWS Support case 的建 / 回 / 关,而且要你确认后才执行(见本节末尾;成员账号的角色可用模板参数 `EnableSupportCaseWrite=false` 收成严格只读)。⚠️ 方式 A 的部署参数 `AgentReadOnlyAccess`(默认 Yes)只决定 agent **能读多宽**,不影响这条边界:Yes 给 agent 的角色挂上 AWS 托管的 `ReadOnlyAccess`;No 只留精选的几组只读授权(成本、日志、指标、RDS / EC2 describe 等),范围更窄。两种取值下,agent 的角色都没有改你基础设施的权限。
 2. **工具层只读** —— 挂给模型的工具本身就只有 describe / get / list 这一类。
-3. **命令级 denylist** —— 挡住那些「技术上算读、但不该读」的调用:`secretsmanager get-secret-value`、带 `--with-decryption` 的 `ssm get-parameter`、`kms decrypt`、`ecr get-login-password`。⚠️ **这一层只在「部署账号」那条通用只读查询路径上生效**(全局只读兜底 MCP 的 `call_aws`)。查**成员账号**时改走按角色 AssumeRole 的原生只读接口,那条路径只有**读动词前缀允许清单**、**不再叠加命令级 denylist**,靠成员账号自己的只读 IAM 角色兜底。
+3. **命令级 denylist** —— 挡住那些「技术上算读、但不该读」的调用:`secretsmanager get-secret-value`、带 `--with-decryption` 的 `ssm get-parameter`、`kms decrypt`、`ecr get-login-password`。⚠️ **这一层只在「部署账号」那条通用只读查询路径上生效**(全局只读兜底 MCP 的 `call_aws`)。查**成员账号**时改走按角色 AssumeRole 的原生只读接口,那条路径只有**读动词前缀允许清单**、**不再叠加命令级 denylist**,靠成员账号自己的 IAM 角色兜底(它对你的基础设施只读)。
 4. **只读 system prompt** —— 要求先证据后结论,**禁止输出任何变更命令**、禁止编造资源 ID,示例一律只给 `describe-*` / `get-*` / `list-*`。⚠️ 源码注释明确写了:**别高估这一层,它是纵深防御,不是安全边界**。第 2、4 两层同理。
 
 > 残留的已知口子(设计上承认):`lambda get-function-configuration` 和 `ecs describe-task-definition` 属于合法只读,但它们的返回里会带出环境变量。别把敏感值放在这两个地方。
@@ -960,9 +960,9 @@ Web Chat 的只读是**四层**叠出来的,但**四层不是同等强度**:
 
 > **这个"只读"是谁保证的(2026-09-03 起口径变了,请照新的看)**:IM 侧的问答**默认直连
 > AWS DevOps Agent**、NotiOps 自己不过 LLM(所以 0 token),这条路上
-> **拒绝变更是由 DevOps Agent 侧 + 它使用的只读 IAM 角色保证的** —— 不再是"NotiOps 先用
+> **拒绝变更是由 DevOps Agent 侧 + 它使用的 IAM 角色(对你的基础设施只读)保证的** —— 不再是"NotiOps 先用
 > 一次 LLM 判断你是不是想改东西"。发过 `/agent notiops` 的群 / DM,问题改由 Web Chat 那**同一个**
-> AgentCore Runtime 用模型来答,只读靠的是它那一套:只读 IAM 角色(硬边界)+ 只挂 AWS 文档检索和
+> AgentCore Runtime 用模型来答,只读靠的是它那一套:IAM 权限(硬边界,对你的基础设施只读)+ 只挂 AWS 文档检索和
 > 只读查询的窄工具集(见 §8.1、§15.5)。两条路前面 NotiOps 侧都有一条**正则二道门**
 > (`platforms/common/router.py`),用来拦明显的变更措辞与 prompt injection。
 > 叠起来的实际效果:**变更类请求到不了执行**。唯一会写的是 AWS Support case(开 / 回复 / 关闭),
@@ -1188,6 +1188,8 @@ bot 返回 case 详情 + 最新回复历史。
 ```
 
 > 必须带上**完整的** case ID(AWS 给的那一长串数字;不到 6 位的数字不会被当成 case ID),否则 bot 会先列出最近的 case 让你选一个。
+>
+> 🔒 **这样说的回复不会直接发出**:bot 把它从你那句话里识别出的正文放进回复表单(飞书 / Slack;钉钉是一条确认说明),你核对、需要的话改一改,点「发送」才写进工单。想一步到位,用显式命令 `/回复案例 177968247000414 <正文>`(英文 `/reply-case`)—— 正文写在命令里,那句命令本身就是确认,会直接发出。**开头的斜杠不能省**:不带斜杠的「回复案例 177968247000414 …」读起来和一句话没有区别,也会先放进回复表单等你确认。
 
 ### 12.5 让 bot 智能分析 case(LLM 复盘 + 下一步建议)
 
@@ -1204,7 +1206,7 @@ bot 返回 case 详情 + 最新回复历史。
 @bot analyze case 177968247000414 — what's wrong with it
 ```
 
-> 「复盘 case …」「帮我看 case …」「case … 应该回什么」这类说法**不会**触发智能分析,只会打开这个 case 的详情 —— 请用上面这几种说法,并带上完整的 case ID。⚠️ 也别用「怎么回复 case …」来问该怎么回:它会被当成**回复**,case ID 后面要是还跟着话,那段话会被直接当成回复发给 AWS Support。
+> 「复盘 case …」「帮我看 case …」「case … 应该回什么」这类说法**不会**触发智能分析,只会打开这个 case 的详情 —— 请用上面这几种说法,并带上完整的 case ID。「怎么回复 case …」这类问法会被认成**回复**:bot 不会发出,而是把识别出的那段话放进回复表单等你确认(见 §12.4)—— 要问该怎么回,用上面「分析 case … 该怎么回」的说法。
 
 bot 会先发"正在分析 case xxx…"提示,5-15 秒后返回**紫色智能分析卡片**,包含 6 个 section:
 
@@ -1588,8 +1590,8 @@ bot 决定每条消息回什么语言时,**按这个顺序找答案**:
 
 ### Q1: 我能让 bot 帮我重启某个 EC2 吗?
 
-**不能**。bot 是 read-only,产品级硬规则,不可绕过 —— 默认由 AWS DevOps Agent 侧 + 它使用的
-只读 IAM 角色保证;`/agent notiops` 时由 NotiOps AgentCore Runtime 的只读角色和只读工具保证;
+**不能**。bot 对你的基础设施是 read-only(唯一的写是你确认后才执行的 AWS Support case),产品级硬规则,不可绕过 —— 默认由 AWS DevOps Agent 侧 + 它使用的
+IAM 角色(对你的基础设施只读)保证;`/agent notiops` 时由 NotiOps AgentCore Runtime 的只读角色和只读工具保证;
 两条路上 NotiOps 侧都再加一条正则二道门(见 §9)。详见
 [TECHNICAL_DESIGN.md §5 安全设计](TECHNICAL_DESIGN.md#5-安全设计)。
 

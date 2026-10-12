@@ -738,6 +738,50 @@ export function Chip({ active, onClick, children, disabled = false, name, title 
   );
 }
 
+/**
+ * 分段选择（单选、互斥）。与 `Chip` 的区别：Chip 是可叠加的筛选开关，这个是
+ * 「同一维度里选一个值」—— 「全部 / ElastiCache / RDS」只能选一个，画成一组
+ * 连着的按钮，读的人不用试就知道它们互斥。
+ */
+export function Segmented<V extends string>({ value, onChange, options, label }: {
+  value: V;
+  onChange: (v: V) => void;
+  options: { value: V; label: React.ReactNode; count?: number; name?: string }[];
+  /** 给读屏的组名（例如「按服务筛选」）。 */
+  label: string;
+}) {
+  return (
+    <div role="group" aria-label={label} style={{
+      display: "inline-flex", padding: 2, gap: 2, borderRadius: 8,
+      border: `1px solid ${C.line}`,
+      background: "color-mix(in srgb, var(--text) 4%, transparent)",
+    }}>
+      {options.map((o) => {
+        const on = o.value === value;
+        return (
+          <button key={o.value} type="button" name={o.name} aria-pressed={on}
+            onClick={() => onChange(o.value)}
+            style={{
+              height: 26, padding: "0 11px", borderRadius: 6, border: 0,
+              display: "inline-flex", alignItems: "center", gap: 5,
+              fontSize: 12.5, cursor: "pointer", whiteSpace: "nowrap",
+              background: on ? C.card : "transparent",
+              color: on ? C.text : C.muted, fontWeight: on ? 600 : 400,
+              boxShadow: on ? "0 1px 2px rgba(0,0,0,.12)" : undefined,
+            }}>
+            {o.label}
+            {o.count !== undefined && (
+              <span style={{ fontSize: 11.5, color: C.muted, fontWeight: 400 }}>
+                {" "}{o.count}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 表格
 // ---------------------------------------------------------------------------
@@ -1017,14 +1061,14 @@ export function Drawer({ title, subtitle, children, onClose, footer, width = 520
           boxShadow: "-12px 0 32px rgba(0,0,0,.35)",
         }}>
         <div style={{
-          padding: "13px 16px", borderBottom: `1px solid ${C.line}`,
+          padding: "18px 24px", borderBottom: `1px solid ${C.line}`,
           display: "flex", alignItems: "flex-start", gap: 10,
         }}>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div id={titleId}
               style={{ fontSize: 15, fontWeight: 700, color: C.text }}>{title}</div>
             {subtitle && (
-              <div style={{ color: C.muted, fontSize: 12, marginTop: 3 }}>{subtitle}</div>
+              <div style={{ color: C.muted, fontSize: 12, marginTop: 6 }}>{subtitle}</div>
             )}
           </div>
           <button onClick={onClose} aria-label="close" style={{
@@ -1032,13 +1076,13 @@ export function Drawer({ title, subtitle, children, onClose, footer, width = 520
             cursor: "pointer", fontSize: 16, lineHeight: 1,
           }}>✕</button>
         </div>
-        <div style={{ padding: "14px 16px", overflowY: "auto", flex: 1 }}>
+        <div style={{ padding: "20px 24px 28px", overflowY: "auto", flex: 1 }}>
           {children}
         </div>
         {footer && (
           <div style={{
-            padding: "11px 16px", borderTop: `1px solid ${C.line}`,
-            display: "flex", gap: 8, flexWrap: "wrap",
+            padding: "14px 24px", borderTop: `1px solid ${C.line}`,
+            display: "flex", gap: 10, flexWrap: "wrap",
           }}>{footer}</div>
         )}
       </div>

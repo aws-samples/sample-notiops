@@ -8,7 +8,9 @@ Web 侧同一个 bug 在 2026-08-05（`acea5ac`）修过一次，这里是同一
 四条不变量（改这个文件之前先读完）：
 
 1. **`role_arn` 只信 config 表，绝不按角色名约定拼。** org 模式下成员账号的采集角色
-   名字带管理账号后缀（`notiops-idle-detection-role-<系统账号>`），而手工接入 /
+   名字带管理账号后缀（`notiops-cross-account-role-<系统账号>`，2026-10 之前接入的是
+   `notiops-idle-detection-role-<系统账号>`；两代互为别名，见
+   `shared.account_scope.sibling_role_arn` —— 那是唯一允许的「换名」），而手工接入 /
    历史部署的可能是无后缀的那个名字。按约定拼出来的 ARN 在一半的部署里是错的，
    而错的表现是 `AccessDenied`（看起来像"客户没给权限"），不是"我们拼错了"。
    ⇒ 与 `agent-build/.../core/aws_session.py::_role_arn_for` 同一条口径。
@@ -163,8 +165,9 @@ def get_session(account_id: str) -> boto3.Session | None:
         creds = cached["creds"]
     else:
         try:
-            r = boto3.client("sts", region_name=_REGION).assume_role(
-                RoleArn=arn,
+            # 别名版：成员账号角色 2026-10 改过名（见 shared.account_scope.sibling_role_arn）。
+            r, _used = account_scope.assume_role_with_alias(
+                boto3.client("sts", region_name=_REGION), arn,
                 RoleSessionName=f"NotiOpsCase-{acct}"[:64],
                 DurationSeconds=3600,
             )

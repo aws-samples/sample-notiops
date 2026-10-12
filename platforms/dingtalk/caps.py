@@ -349,7 +349,8 @@ class DingtalkCaps(Caps):
             account=str(info.get("account_id") or msg.account_id or ""),
             deploy=im_accounts.deploy_account_id()), at_user=self._at(msg))
 
-    def case(self, msg: ImMessage, command: str, case_id: str, text: str) -> None:
+    def case(self, msg: ImMessage, command: str, case_id: str, text: str,
+             explicit: bool = False) -> None:
         """案例路径 —— 默认配置下唯一会烧 NotiOps 侧 token 的能力（`case_analyze`
         与开案例时的主题摘要）。
 
@@ -375,7 +376,7 @@ class DingtalkCaps(Caps):
                                      account_id=account_id)
             elif command == "case_reply":
                 case_text.start_reply(case_id, text or "", locale=msg.locale,
-                                      account_id=account_id)
+                                      account_id=account_id, explicit=explicit)
             elif command == "case_resolve":
                 case_text.start_resolve(case_id, chat_id=msg.chat_id,
                                         user_id=msg.user_id, locale=msg.locale,

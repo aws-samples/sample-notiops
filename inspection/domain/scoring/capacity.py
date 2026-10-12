@@ -230,6 +230,38 @@ def audit_oversized_memory(
     )
 
 
+def capacity_judgeable(
+    rule: CapacityRule, candidate: CandidateRecord, attrs: ResourceAttrs,
+    cfg: CapacityRuleConfig,
+) -> bool:
+    """这条容量审计本轮对这台**判得了**吗（2026-10-10 交叉 review A3 / A4）。
+
+    与 `audit_*` 逐分支对应：「因为输入是 None 而 return None」= 判不了（原地不动）；
+    「不适用 / 没过阈值 / 被否决」= 判了、没命中（恢复证据）。
+    ⚠️ 改 `audit_*` 的缺数据分支时这里要一起改。
+    """
+    if rule is CapacityRule.OVERSIZED_STORAGE:
+        if storage_is_consumption_based(attrs):
+            return True
+        ratio = free_storage_ratio(candidate, attrs)
+        if ratio is None:
+            return False
+        if ratio < cfg.free_storage_pct / 100.0:
+            return True
+        return candidate.peak_cpu_7d is not None
+    if rule is CapacityRule.OVERSIZED_MEMORY:
+        if metrics_meta.is_memcached(attrs.service, attrs.engine):
+            return True
+        if candidate.swap_usage_bytes is None or candidate.memory_usage_pct is None:
+            return False
+        if candidate.swap_usage_bytes / _BYTES_PER_GIB >= cfg.swap_max_gb:
+            return True
+        if candidate.memory_usage_pct >= cfg.memory_util_max:
+            return True
+        return candidate.peak_cpu_7d is not None
+    return False
+
+
 AuditFn = Callable[
     [CandidateRecord, ResourceAttrs, CapacityRuleConfig, "date | None"],
     "Finding | None",

@@ -122,8 +122,16 @@ def decide(text: str) -> tuple[str, dict]:
         # 落回 chat。判据在 `core.nl_router.parse_investigation_ref`。
         return kind, {"ref_id": route.ref_id, "explicit": route.ref_explicit}
     if kind == "case":
+        # `explicit`:这条案例指令是不是用户**自己打的显式命令**(`/回复案例 <号> <正文>`)。
+        # 回复是直接写进客户 AWS Support 工单的对外动作:只有显式命令才直发,自然语言识别出来的
+        # (「该怎么回复 case <号> 的工程师」)一律先给预览、确认后再发 —— 识别器会把疑问句也认成
+        # 回复,案例号后面那段就会被当成回复写进工单(2026-10-11 发 v1.0.30 后修)。
+        # 显式 = 命令形态**并且真打了斜杠**:识别器里命令词前的 `/` 是可选的(`@bot 回复案例 …`
+        # 也算命令形态),可「回复案例 <号> 该怎么写?」这种裸词开头的疑问句读起来就是一句话,
+        # 不看斜杠的话后半句照样直接写进工单(同日部署前评审查出)。文档与帮助卡给的一直是带斜杠的写法。
         return kind, {"command": route.case_command, "case_id": route.case_id,
-                      "text": route.arg or s}
+                      "text": route.arg or s,
+                      "explicit": route.form == "command" and s.startswith("/")}
     return kind, {}
 
 

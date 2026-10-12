@@ -4,7 +4,8 @@
  * credsFor(accountId):
  *   · 空 / 部署账号自身 → null（调用方用默认凭证）
  *   · 成员账号 → 读 config 表 account#<id> 的 role_arn（接入时由 StackSet 写入，
- *     带管理账号后缀的 notiops-idle-detection-role-<mgmt>）→ STS AssumeRole
+ *     带管理账号后缀的 notiops-cross-account-role-<mgmt>；2026-10 前接入的是
+ *     notiops-idle-detection-role-<mgmt>，两代互为别名）→ STS AssumeRole
  *   · 账号未接入 / 角色不可用 → 抛 cross_account_unavailable（调用方降级展示）
  *
  * 所有仪表盘模块（security/cases/health/...）统一走这里拿凭证，

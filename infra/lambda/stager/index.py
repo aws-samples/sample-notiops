@@ -1025,10 +1025,13 @@ def _org_setup(props: dict) -> dict:
         auto_deployment=True, call_as=call_as,
     )
     # 🔴 CreateCollectionRole 必须显式传 no（与 setup.sh 的 DA_SS_PARAMS 同口径）。模板 Default 是
-    # "yes"，而采集角色 `notiops-idle-detection-role-<系统账号>` 已由上面那个 onboarding StackSet
+    # "yes"，而采集角色 `notiops-cross-account-role-<系统账号>`（2026-10 之前叫
+    # `notiops-idle-detection-role-<系统账号>`，两代互为别名）已由上面那个 onboarding StackSet
     # 在成员账号里建好（第二步要求第一步先 ACTIVE）。两份都建 → EntityAlreadyExists → 第二步
     # 「一键关联」的成员栈整栈回滚、账号记 failed、巡检零信号。BFF 建实例时不带参数覆盖，
     # 所以 StackSet 这一层的值就是最终值。2026-10-10 用户报告、对照 setup.sh 核实。
+    # ⚠️ 两份模板 2026-10 一起改名之后更要紧：过渡期里两边可能各建成一代名字，
+    #    onboarding 实例滚到新模板时会永久撞名、卡在旧模板上。
     report["DevOpsAgentStackSet"] = _stackset_upsert(
         cfn, props["DevOpsStackSetName"], props["DevOpsTemplateBody"],
         {**common, "CreateCollectionRole": "no"},

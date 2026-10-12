@@ -33,7 +33,8 @@ import { useLocale, useT } from "../i18n";
 import {
   basisLabel, capacityText, degradationLabel, evidenceText, fmtMoney,
   idleFactorText, IDLE_DIM,
-  idleBadgeKind, idleTierColor, idleTierText, isCoarse, judgementState,
+  idleBadgeKind, idleTierColor, idleTierText, isCoarse, isStale, judgementState,
+  judgeSlowMinutes,
   parseStatusLabel, PRECISION_LABEL,
   skillsLoadedText, staleEvidenceText, verdictLabel,
 } from "./inspection/format";
@@ -41,10 +42,15 @@ import {
   Alert, Badge, Btn, Drawer, Expandable, KV, KVGrid, SevBadge, Skeleton, Status,
 } from "./inspection/ui";
 import { C } from "./inspection/tokens";
+import { CAPACITY_RULE_LABEL, methodNote, serviceLabel } from "./inspection/idleTableUtil";
+import HighLoadDetail from "./inspection/HighLoadDetail";
+import IdleDetail from "./inspection/IdleDetail";
+import { SevTag } from "./inspection/tableParts";
 
 export default function InspectionDashboardPanel({
   row, onClose, onExclude, onJudge, judging, judged,
-  judgeMsg, onDismissJudge,
+  judgeMsg, onDismissJudge, related = [], onOpenRelated, goneOn = null,
+  judgeBlock = "", retryable = false,
 }: {
   /** 列表里那一行。**先用它渲染头部**，判读全文再异步补 —— 见下。 */
   row: FindingRow;
@@ -110,6 +116,30 @@ export default function InspectionDashboardPanel({
    */
   judgeMsg?: { type: "success" | "error" | "warning"; text: string } | null;
   onDismissJudge?: () => void;
+  /**
+   * 同一台资源上的**其余** finding（2026-10 第二版）。闲置页一行 = 一台资源，
+   * 「内存超配」不再单独占一行，于是它只能从这里到达 —— 不传就等于那条看不到。
+   */
+  related?: FindingRow[];
+  onOpenRelated?: (f: FindingRow) => void;
+  /**
+   * 资源已经不存在时为核实日期（可能是空串 = 本次会话刚确认），否则 `null`。
+   *
+   * 🔴 2026-10-10 客户实测：资源 9/14 就删了，抽屉里「深入分析」还在，点了才被告知
+   *    「资源不存在」，再点还是同一句。有值时：不给「深入分析」/「移出巡检范围」，
+   *    正文顶部写清「这台资源已经不存在」。
+   */
+  goneOn?: string | null;
+  /**
+   * 现在为什么不能「深入分析」（kill switch 关着 / 账号接入不全）。非空时不给按钮，
+   * 改成这一行原因（review B5 / B6）—— 改前按钮照给、点了必败，失败原因还是内部键名。
+   */
+  judgeBlock?: string;
+  /**
+   * 判读回来了但没内容、还能再派（与后端 `load_finding` 同判据，review B2）。
+   * 改前这一态写着「需要重新派发」，而按钮藏着、后端也永久拒绝。
+   */
+  retryable?: boolean;
 }) {
   const t = useT();
   const { locale } = useLocale();
@@ -163,6 +193,12 @@ export default function InspectionDashboardPanel({
    * 且它是列表那层从最新取数算出来的。
    */
   const dispatched = judged ?? Boolean(row.da_task_id);
+  /**
+   * 这一条**能不能**发起分析（不看前置，前置由 `judgeBlock` 说原因）。
+   * 资源不存在 / 已解决 / 已移出巡检范围 —— 后端必拒，读侧直接不给。
+   */
+  const judgeOpen = !!onJudge && goneOn === null && row.state !== "resolved"
+    && !row.excluded_by;
 
 
   /**
@@ -187,6 +223,8 @@ export default function InspectionDashboardPanel({
   const state = judgementState(row, {
     dispatched, detailBody: detail?.da_body,
   });
+  /** pending 等了 30 分钟以上时的分钟数，否则 null（review B8）。 */
+  const slowMin = state === "pending" ? judgeSlowMinutes(row) : null;
 
   /**
    * 要不要渲染「AI 判读」那一整节。
@@ -314,333 +352,193 @@ export default function InspectionDashboardPanel({
   const ev = evidenceText(row, zh);
   const cap = capacityText(row);
   const showMoney = row.kind === "idle" && row.savings_usd !== null;
+  /** 闲置与高负载两页是表格（一行一台资源），抽屉标题与之同一读序。 */
+  const tableKind = row.kind === "idle" || row.kind === "high_load";
   // 证据是不是上一轮留下的（chronic / resolving 保留最后一次已知水位）。
   const stale = staleEvidenceText(row, zh);
 
-  return (
-    /* 560 → 680（2026-09-01，客户要求「更宽一些」）。判读正文里常有表格与
-       代码块（skill 的输出），560px 下 GFM 表格要横向滚。
-       ⚠️ `Drawer` 内部是 `min(width, 100vw)`，窄屏不会溢出。 */
-    <Drawer onClose={onClose} width={680}
-      title={
-        <span style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          {/* 🔴 与卡片首格**同一个判据**（2026-09-01）。卡片对闲置类放评分而不放
-              严重度，理由是「闲置的 severity 恒为 INFO，一整页 20 个同样的灰
-              『提示』徽标零信息量」—— 而抽屉标题原来仍然挂着那个「提示」。
-              同一条 finding 在列表上是「99/100」、点开变成「提示」，
-              客户会以为这是两个不同的分级。 */}
-          {/* 🔴 判据不足单独一档（与卡片首格**同一个** `idleBadgeKind`）——
-              退回 `SevBadge` 的表现是灰色「提示」，与「闲置分很低」不可区分，
-              而后端专门把 0 改成 `None` 就是为了区分这两件事。 */}
-          {idleBadgeKind(row) === "undecided" ? (
-            <span title={t("insp.idle.undecidedWhy")}
-              style={{
-                fontSize: 12.5, fontWeight: 700, padding: "2px 9px",
-                borderRadius: 100, whiteSpace: "nowrap",
-                color: "var(--amber)", border: "1px solid var(--amber)",
+  // ── 诊断信息（默认折起）── 规则码、规则版本、状态、状态机计数 —— 排查用的，
+  //    对「今天要不要处置这条」没有影响。⚠️ 不是删掉：`rule_version` 是解释
+  //    「为什么这条的天数重新计过」的唯一凭据（R6.9）。闲置页挪到抽屉最后。
+  const diagnosticsKv = (
+    <KVGrid cols={2}>
+          <KV label={zh ? "规则" : "Rule"}>
+            <code style={{ fontSize: 12 }}>{row.rule || "—"}</code>
+          </KV>
+          <KV label={zh ? "状态" : "State"}>
+            {row.state ? t(`insp.state.${row.state}`) : "—"}
+            {/* 「已确认」挪到这里（2026-10 看板改版）：列表上几乎每条都是
+                「已确认 · 持续」，逐行挂着等于没有区分度。 */}
+            {row.was_confirmed && (zh ? "（已确认）" : " (confirmed)")}
+          </KV>
+          <KV label={zh ? "连续命中 / 未命中" : "Hits / misses"}>
+            {row.consecutive_hits ?? "—"} / {row.consecutive_misses ?? "—"}
+          </KV>
+          <KV label={zh ? "规则版本" : "Rule version"}>
+            <code style={{ fontSize: 11 }}>{row.rule_version || "—"}</code>
+          </KV>
+    </KVGrid>
+  );
+  const diagnostics = (
+    <div style={{ marginTop: 12 }}>
+      <Expandable title={zh ? "诊断信息" : "Diagnostics"}
+        open={diagOpen} onToggle={() => setDiagOpen((v) => !v)}>
+        {diagnosticsKv}
+      </Expandable>
+    </div>
+  );
+
+  // ── 闲置抽屉的 slot（排版在 `IdleDetail`，内容与高负载共用判据，留在这里）──
+  /*
+    ── 闲置评分明细：四维（或三维）逐行 ──
+
+    🔴 这是「凭什么说它闲」的完整回答。卡片上只有总分 + 主因两维，
+    点进来要能看到每一维的**权重、实测值、贡献分、归一化依据**。
+
+    `deterministic_conclusion` 的文案指向「本条的评分明细」—— 在这一段
+    落地之前那句话指向的东西并不存在。（它曾经还承诺「降配目标」，而那个数
+    从来没人算过，2026-10 已从文案里删掉。）
+
+    ⚠️ 权重列显示的是**重归一化后**的生效权重，所以各维之和 = 100%。
+    显示配置里的原始权重会让四维加起来不等于 1，客户会以为算错了；
+    少掉的那几维在下面「已丢弃维度」里单独说。
+  */
+  const breakdown = row.kind === "idle" && (row.idle_factors?.length ?? 0) > 0 ? (
+    <>
+      <div style={{ marginTop: 12 }}>
+        {[...(row.idle_factors ?? [])]
+          .sort((a, b) => (b.points ?? 0) - (a.points ?? 0))
+          .map((fac) => {
+            const x = idleFactorText(fac, zh);
+            // 条宽按**贡献分**，满格 = 本条里权重最大那一维的上限（`barMax`）。
+            // ⚠️ 不按归一化值画：那会让权重 0.10 的 IOPS 画出和权重
+            //    0.40 的 CPU 一样长的条，而它对总分的影响只有 1/4。
+            const pct = Math.max(0, Math.min(100,
+              ((fac.points ?? 0) / barMax) * 100));
+            return (
+              <div key={fac.name} style={{
+                display: "flex", alignItems: "center", gap: 12,
+                fontSize: 13, padding: "12px 0",
+                borderBottom: `1px solid ${C.line}`,
               }}>
-              {t("insp.idle.undecided")}
+                <span style={{ width: 82, color: C.text }}>{x.label}</span>
+                <span style={{
+                  width: 62, textAlign: "right", color: C.text,
+                  fontWeight: 600,
+                }}>{x.observed || "—"}</span>
+                <span style={{
+                  width: 44, textAlign: "right", color: C.muted,
+                  fontSize: 11,
+                }}>
+                  {fac.weight !== null ? `${(fac.weight * 100).toFixed(0)}%` : "—"}
+                </span>
+                {/* 🔴 `role="progressbar"` + 值语义。
+                    纯 div 拼的条对读屏是**完全不存在**的 —— 而这条是
+                    「凭什么说它闲」里唯一表达「各维度贡献多少」的东西，
+                    剩下四列都是裸数字。
+                    ⚠️ `aria-valuenow` 报**贡献分**而不是那个百分比：
+                       百分比是相对 `barMax` 的画图口径，读出来是
+                       「87%」而列头写的是「贡献分（满格 40）」，
+                       两个数对不上。 */}
+                <div role="progressbar"
+                  aria-label={x.label}
+                  aria-valuenow={fac.points ?? undefined}
+                  aria-valuemin={0}
+                  aria-valuemax={Number(barMax.toFixed(0))}
+                  aria-valuetext={fac.points === null
+                    ? (zh ? "本维度未参与评分" : "not scored")
+                    : `${x.points} / ${barMax.toFixed(0)}`}
+                  style={{
+                    flex: 1, height: 7, background: "var(--menu-hover)",
+                    borderRadius: 4, overflow: "hidden", minWidth: 40,
+                  }}>
+                  <div style={{
+                    width: `${pct}%`, height: "100%", background: C.green,
+                  }} />
+                </div>
+                <span style={{ width: 52, textAlign: "right", color: C.text }}>
+                  {x.points}
+                </span>
+              </div>
+            );
+          })}
+      </div>
+      {/* 列头说明放在**下面**：五列里三列是数字，先看数字再看它们是什么
+          比反过来快。放上面会在窄抽屉里挤成两行。 */}
+      <div style={{ marginTop: 10, fontSize: 11.5, color: C.muted }}>
+        {/* ⚠️ 满格分数**跟着资源类型变**（RDS 40 / ElastiCache 35），
+            不能写死 —— 写死 40 时 ElastiCache 的条永远满不了，
+            而列头还告诉客户「满格 40」，于是那个 30.0 分看起来像没算对。 */}
+        {zh ? `维度 · 实测值 · 生效权重 · 贡献分（满格 ${barMax.toFixed(0)}）`
+          : `dimension · observed · effective weight · points (full = ${barMax.toFixed(0)})`}
+      </div>
+      {/* 🔴 丢弃的维度必须列出来，且说清「权重去哪了」。
+          不说的表现是客户对着一个 87 分问「存储那一维呢」，
+          而看板上没有任何地方回答得了。 */}
+      {(row.idle_degraded?.length ?? 0) > 0 && (
+        <div style={{ marginTop: 12, fontSize: 12, lineHeight: 1.6, color: C.amber }}>
+          {zh
+            ? `已丢弃 ${(row.idle_degraded ?? []).length} 维（缺数据，权重已按比例重分给上面各维）：`
+            : `${(row.idle_degraded ?? []).length} dimension(s) dropped, weights redistributed: `}
+          {(row.idle_degraded ?? [])
+            .map((d) => IDLE_DIM[d]?.[zh ? "zh" : "en"] || d)
+            .join(zh ? "、" : ", ")}
+          {row.idle_weight_avail !== null && (
+            // ⚠️ 间距用 marginLeft，不用全角空格 —— eslint 的
+            //    `no-irregular-whitespace` 会直接报错。
+            <span style={{ color: C.muted, marginLeft: 8 }}>
+              {zh ? `判据覆盖 ${(row.idle_weight_avail * 100).toFixed(0)}%`
+                : `(basis coverage ${(row.idle_weight_avail * 100).toFixed(0)}%)`}
             </span>
-          ) : row.kind === "idle" && row.idle_score !== null ? (
-            /* 档位与颜色都走 `idleTier*`（与卡片首格**同源**）——
-               原来两处各写一遍 `>= 80` / `>= 60`，漂开就是
-               「同一条 finding 在列表上是红的、点开变成橙的」。
-               档名进 `aria-label`：档位此前**只由颜色表达**。 */
-            <span
-              title={`${zh ? "闲置分" : "Idle score"} ${row.idle_score.toFixed(0)}/100`
-                + `（${idleTierText(row.idle_score, zh)}）`}
-              aria-label={`${zh ? "闲置分" : "Idle score"} ${row.idle_score.toFixed(0)}`
-                + `/100，${idleTierText(row.idle_score, zh)}`}
-              style={{
-                fontSize: 12.5, fontWeight: 700, padding: "2px 9px",
-                borderRadius: 100, whiteSpace: "nowrap",
-                color: idleTierColor(row.idle_score),
-                border: `1px solid ${idleTierColor(row.idle_score)}`,
-              }}>
-              {row.idle_score.toFixed(0)}
-              <span style={{ fontSize: 10, fontWeight: 400, opacity: .75 }}>/100</span>
-            </span>
-          ) : (
-            <SevBadge sev={row.severity} label={t(`insp.sev.${row.severity}`)} />
           )}
-          {row.instance}
-        </span>
-      }
-      subtitle={`${row.service} · ${row.region} · ${row.account_id}`}
-      footer={
-        <>
-          {onExclude && (
-            <Btn onClick={onExclude}>{zh ? "移出巡检范围" : "Exclude"}</Btn>
-          )}
-          {/* 🔴 三态，**互斥**：
-                 已派过        不渲染按钮，只给一行状态 + DA 后台链接
-                 没派过        [深入分析]（点了走 onJudge，带上备注框里的话）
-                 无权/无回调    什么都不渲染
-
-              ⚠️ 已派过时按钮**不渲染**而不是灰掉：灰着等于在界面上摆一个
-                 用户无法解决的问题（本仓库既有约定），而且重复派发会重复烧
-                 DA 额度、两份判读回填到同一行只会互相覆盖。 */}
-          {/* 点了开确认弹窗（`JudgeModal`），不直接派。
-              ⚠️ 已派过时**不渲染**而不是灰掉：灰着等于在界面上摆一个用户
-                 无法解决的问题，而重复派发会重复烧额度、两份判读回填到同一行
-                 只会互相覆盖。 */}
-          {onJudge && !dispatched && (
-            <Btn variant="primary" onClick={onJudge}
-              loading={!!judging}
-              title={t("insp.judge.hint")}>
-              {zh ? "深入分析" : "Investigate"}
-            </Btn>
-          )}
-          {/* 🔴 **footer 里不再有「取消」**（2026-09-01）。
-              抽屉是只读视图，没有「提交 / 取消」这一对语义 —— 而「取消」这个词
-              暗示「刚才那些操作会被撤销」，而它其实只是关闭。
-              关闭已经有三条路：右上角 ✕、Esc、点遮罩。 */}
-        </>
-      }>
-
-      {/* ── 派发回执 ──
-          🔴 与列表区那一份**是同一条**（同一个 `judgeMsg` state），这里再渲染
-             一遍。理由是抽屉 `zIndex: 1000` 盖住列表区，而派发**只能从抽屉里
-             发起**（卡片上的按钮 2026-09-01 删了）—— 也就是说不在这里渲染，
-             那条提示 100% 落在客户看不见的地方。
-
-          ⚠️ 放在**正文最上面**而不是 footer：footer 里的内容会被长正文
-             （判读全文能有 46vh）挤到视口外，而回执是刚点完那一下要看的。
-          ⚠️ 成功那一支也留着：reload 之后的「⏳ 判读中」要 1~2 秒才到，
-             中间那段空白就是客户以为「点了没反应」的窗口。 */}
-      {judgeMsg && (
-        <div style={{ marginBottom: 12 }}>
-          <Alert type={judgeMsg.type} header={judgeMsg.text}
-            onDismiss={onDismissJudge} />
         </div>
       )}
-
-      {/* ── 判定证据 ──
-          🔴 这里**只放卡片上没有的、且影响决策的**（2026-09-01）。
-             原来 9~11 项平铺，其中对一条闲置 finding 是这样：
-
-             ```
-             规则 idle                  ← 页面本身就叫「闲置与成本」
-             状态 新增                   ← 卡片右上角已有同名徽章
-             已持续 2天                  ← 卡片已有
-             首次发现 2026-08-31        ← 卡片已有
-             预计月节省 $15 + 精度说明   ← 卡片已有
-             规则版本 2026-08-31T02:09:52.670805+00:00   ← 带微秒的 ISO 串
-             连续命中/连续未命中 1 / 0    ← 状态机内部计数
-             ```
-
-             7 项里 4 项与卡片重复、3 项是内部标识 —— 上半屏零决策价值，
-             而真正的内容（评分明细、AI 判读）被推到折叠线以下。
-             规则 / 规则版本 / 连续命中 / 状态 收进下面的「诊断信息」。 */}
-      <KVGrid cols={2}>
-        {ev && (
-          <>
-            <KV label={row.metric || t("insp.field.metric")}>
-              <b style={{ fontSize: 15 }}>{ev.value}</b>
-              {/* `relation` 为空 = 后端没给 `direction` —— 只说阈值，不猜方向。
-                  见 `format.ts::evidenceText` 那段说明。 */}
-              <span style={{ color: C.muted, fontSize: 12, marginLeft: 6 }}>
-                {ev.relation
-                  ? `${ev.relation} ${ev.threshold}`
-                  : (zh ? `阈值 ${ev.threshold}` : `threshold ${ev.threshold}`)}
-              </span>
-              {/* 🔴 陈旧证据的标注在**数字紧邻处**，不在页脚。
-                  放远了等于没标 —— 客户读到数字就已经形成判断了。 */}
-              {stale && (
-                <div style={{ color: C.amber, fontSize: 11, marginTop: 3 }}>
-                  {stale}
-                  <div style={{ color: C.muted, marginTop: 2 }}>
-                    {zh
-                      ? "本轮未命中，但水位没回到健康区 —— 显示的是最后一次命中时的数值。"
-                      : "Not hit this run, but the level has not recovered; showing last known values."}
-                  </div>
-                </div>
-              )}
-            </KV>
-            {cap && <KV label={zh ? "原始值 / 规格" : "Raw / capacity"}>{cap}</KV>}
-          </>
-        )}
-        {/* ⚠️ 「已持续 N 天」卡片上已经有了，这里**只留首次发现的日期** ——
-            卡片上那个 `（2026-08-31）` 括号是冗余的，已从卡片移到这里。 */}
-        <KV label={t("insp.field.firstSeen")}>{row.first_seen_date || "—"}</KV>
-        {/* 🔴 越线的 finding 这一栏必然是**负数**（`headroom = (T - x)/|T|`，
-            `is_breached` 就是靠它 ≤ 0 判的）。而标签写「余量」，读起来像
-            「剩余容量 -21.4%」—— 客户要反应一下才明白是超了。
-            负值改说「已超出 21.4%」，正值才叫余量。 */}
-        {row.headroom !== null && (
-          row.headroom < 0 ? (
-            <KV label={zh ? "已超出阈值" : "Over threshold"}
-            >{(Math.abs(row.headroom) * 100).toFixed(1)}%</KV>
-          ) : (
-            <KV label={zh ? "余量" : "Headroom"}
-            >{(row.headroom * 100).toFixed(1)}%</KV>
-          )
-        )}
-        {showMoney && (
-          <KV label={t("insp.field.savings")}>
-            <b style={{ color: C.green }}>{fmtMoney(row.savings_usd)}</b>
-            {row.savings_precision && isCoarse(row.savings_precision) && (
-              <div style={{ color: C.amber, fontSize: 11, marginTop: 3 }}>
-                {PRECISION_LABEL[row.savings_precision]?.[zh ? "zh" : "en"]
-                  || row.savings_precision}
-              </div>
-            )}
-          </KV>
-        )}
-      </KVGrid>
-
-      {/* ── 诊断信息（默认折起）──
-          规则码、规则版本、状态、状态机计数 —— 这些是**排查用的**，
-          对「今天要不要处置这条」没有影响。默认展开时它们占掉上半屏，
-          把评分明细和 AI 判读挤到折叠线以下。
-          ⚠️ 不是删掉：`rule_version` 是解释「为什么这条的天数重新计过」的
-             唯一凭据（R6.9），排查时必须拿得到。 */}
-      <div style={{ marginTop: 12 }}>
-        <Expandable title={zh ? "诊断信息" : "Diagnostics"}
-          open={diagOpen} onToggle={() => setDiagOpen((v) => !v)}>
-          <KVGrid cols={2}>
-            <KV label={zh ? "规则" : "Rule"}>
-              <code style={{ fontSize: 12 }}>{row.rule || "—"}</code>
-            </KV>
-            <KV label={zh ? "状态" : "State"}>
-              {row.state ? t(`insp.state.${row.state}`) : "—"}
-            </KV>
-            <KV label={zh ? "连续命中 / 未命中" : "Hits / misses"}>
-              {row.consecutive_hits ?? "—"} / {row.consecutive_misses ?? "—"}
-            </KV>
-            <KV label={zh ? "规则版本" : "Rule version"}>
-              <code style={{ fontSize: 11 }}>{row.rule_version || "—"}</code>
-            </KV>
-          </KVGrid>
-        </Expandable>
+      {/* 归一化依据 —— 回答「这个百分比的分母是哪来的」。
+          ⚠️ 折叠成一行小字：它是追溯用的，不该和主表争注意力。 */}
+      <div style={{ marginTop: 8, fontSize: 11.5, lineHeight: 1.6, color: C.muted }}>
+        {(row.idle_factors ?? []).filter((fc) => fc.basis).map((fc) => {
+          const dim = IDLE_DIM[fc.name];
+          return `${dim ? (zh ? dim.zh : dim.en) : fc.name}: ${basisLabel(fc.basis, zh)}`;
+        }).join(zh ? " · " : "  ·  ")}
       </div>
+    </>
+  ) : null;
 
-      {/*
-        ── 闲置评分明细：四维（或三维）逐行 ──
+  /* ── 判定方式 ──
+      🔴 原来是闲置表格**下方**两段「规则结论：……」（每类一句，2026-10 第一版），
+         客户截图里圈出来的那一块。方法说明属于单条的「为什么」，放在评分明细
+         旁边；文案走界面（`methodNote`），不读库里那句可能过时的 `conclusion`。 */
+  const methodBox = row.kind === "idle" && methodNote(row, zh) ? (
+      <div style={{
+        marginTop: 16, padding: "14px 16px", borderRadius: 10, fontSize: 12.5,
+        lineHeight: 1.75, color: C.muted,
+        background: "color-mix(in srgb, var(--text) 4%, transparent)",
+      }}>
+        <b style={{ color: C.text, fontWeight: 600, marginRight: 8 }}>
+          {zh ? "判定方式" : "How this was decided"}
+        </b>
+        {methodNote(row, zh)}
+      </div>
+  ) : null;
 
-        🔴 这是「凭什么说它闲」的完整回答。卡片上只有总分 + 主因两维，
-        点进来要能看到每一维的**权重、实测值、贡献分、归一化依据**。
+  /* 判读原文（markdown）。闲置抽屉的结论卡把它折进「查看完整判读」。 */
+  const rawBody = detail?.da_body ? (
+      <div className="insp-md" style={{
+        fontSize: 12.5, lineHeight: 1.75,
+        color: C.text, background: "var(--code-bg)",
+        border: `1px solid ${C.line}`, borderRadius: 8,
+        padding: "14px 16px", maxHeight: "46vh", overflowY: "auto",
+      }}>
+        <ReactMarkdown remarkPlugins={[remarkGfm]}
+          components={{
+            a: ({ ...props }) => (
+              <a target="_blank" rel="noopener noreferrer" {...props} />),
+          }}>{detail.da_body}</ReactMarkdown>
+      </div>
+  ) : null;
 
-        `deterministic_conclusion` 的文案写着「结论与降配目标见本条的评分
-        明细」—— 在这一段落地之前那句话指向的东西并不存在。
-
-        ⚠️ 权重列显示的是**重归一化后**的生效权重，所以各维之和 = 100%。
-        显示配置里的原始权重会让四维加起来不等于 1，客户会以为算错了；
-        少掉的那几维在下面「已丢弃维度」里单独说。
-      */}
-      {row.kind === "idle" && (row.idle_factors?.length ?? 0) > 0 && (
-        <>
-          <div style={{
-            marginTop: 18, fontSize: 13, fontWeight: 700, color: C.text,
-            display: "flex", alignItems: "baseline", gap: 8,
-          }}>
-            {zh ? "闲置评分明细" : "Idle score breakdown"}
-            {row.idle_score !== null && (
-              <span style={{ fontSize: 12, color: C.muted, fontWeight: 400 }}>
-                {zh ? "总分 " : "total "}
-                <b style={{ color: C.text }}>{row.idle_score.toFixed(1)}</b>/100
-              </span>
-            )}
-          </div>
-          <div style={{ marginTop: 8 }}>
-            {[...(row.idle_factors ?? [])]
-              .sort((a, b) => (b.points ?? 0) - (a.points ?? 0))
-              .map((fac) => {
-                const x = idleFactorText(fac, zh);
-                // 条宽按**贡献分**，满格 = 本条里权重最大那一维的上限（`barMax`）。
-                // ⚠️ 不按归一化值画：那会让权重 0.10 的 IOPS 画出和权重
-                //    0.40 的 CPU 一样长的条，而它对总分的影响只有 1/4。
-                const pct = Math.max(0, Math.min(100,
-                  ((fac.points ?? 0) / barMax) * 100));
-                return (
-                  <div key={fac.name} style={{
-                    display: "flex", alignItems: "baseline", gap: 8,
-                    fontSize: 12.5, padding: "5px 0",
-                    borderBottom: `1px solid ${C.line}`,
-                  }}>
-                    <span style={{ width: 82, color: C.text }}>{x.label}</span>
-                    <span style={{
-                      width: 62, textAlign: "right", color: C.text,
-                      fontWeight: 600,
-                    }}>{x.observed || "—"}</span>
-                    <span style={{
-                      width: 44, textAlign: "right", color: C.muted,
-                      fontSize: 11,
-                    }}>
-                      {fac.weight !== null ? `${(fac.weight * 100).toFixed(0)}%` : "—"}
-                    </span>
-                    {/* 🔴 `role="progressbar"` + 值语义。
-                        纯 div 拼的条对读屏是**完全不存在**的 —— 而这条是
-                        「凭什么说它闲」里唯一表达「各维度贡献多少」的东西，
-                        剩下四列都是裸数字。
-                        ⚠️ `aria-valuenow` 报**贡献分**而不是那个百分比：
-                           百分比是相对 `barMax` 的画图口径，读出来是
-                           「87%」而列头写的是「贡献分（满格 40）」，
-                           两个数对不上。 */}
-                    <div role="progressbar"
-                      aria-label={x.label}
-                      aria-valuenow={fac.points ?? undefined}
-                      aria-valuemin={0}
-                      aria-valuemax={Number(barMax.toFixed(0))}
-                      aria-valuetext={fac.points === null
-                        ? (zh ? "本维度未参与评分" : "not scored")
-                        : `${x.points} / ${barMax.toFixed(0)}`}
-                      style={{
-                        flex: 1, height: 7, background: "var(--menu-hover)",
-                        borderRadius: 4, overflow: "hidden", minWidth: 40,
-                      }}>
-                      <div style={{
-                        width: `${pct}%`, height: "100%", background: C.green,
-                      }} />
-                    </div>
-                    <span style={{ width: 52, textAlign: "right", color: C.text }}>
-                      {x.points}
-                    </span>
-                  </div>
-                );
-              })}
-          </div>
-          {/* 列头说明放在**下面**：五列里三列是数字，先看数字再看它们是什么
-              比反过来快。放上面会在窄抽屉里挤成两行。 */}
-          <div style={{ marginTop: 5, fontSize: 11, color: C.muted }}>
-            {/* ⚠️ 满格分数**跟着资源类型变**（RDS 40 / ElastiCache 35），
-                不能写死 —— 写死 40 时 ElastiCache 的条永远满不了，
-                而列头还告诉客户「满格 40」，于是那个 30.0 分看起来像没算对。 */}
-            {zh ? `维度 · 实测值 · 生效权重 · 贡献分（满格 ${barMax.toFixed(0)}）`
-              : `dimension · observed · effective weight · points (full = ${barMax.toFixed(0)})`}
-          </div>
-          {/* 🔴 丢弃的维度必须列出来，且说清「权重去哪了」。
-              不说的表现是客户对着一个 87 分问「存储那一维呢」，
-              而看板上没有任何地方回答得了。 */}
-          {(row.idle_degraded?.length ?? 0) > 0 && (
-            <div style={{ marginTop: 8, fontSize: 12, color: C.amber }}>
-              {zh
-                ? `已丢弃 ${(row.idle_degraded ?? []).length} 维（缺数据，权重已按比例重分给上面各维）：`
-                : `${(row.idle_degraded ?? []).length} dimension(s) dropped, weights redistributed: `}
-              {(row.idle_degraded ?? [])
-                .map((d) => IDLE_DIM[d]?.[zh ? "zh" : "en"] || d)
-                .join(zh ? "、" : ", ")}
-              {row.idle_weight_avail !== null && (
-                // ⚠️ 间距用 marginLeft，不用全角空格 —— eslint 的
-                //    `no-irregular-whitespace` 会直接报错。
-                <span style={{ color: C.muted, marginLeft: 8 }}>
-                  {zh ? `判据覆盖 ${(row.idle_weight_avail * 100).toFixed(0)}%`
-                    : `(basis coverage ${(row.idle_weight_avail * 100).toFixed(0)}%)`}
-                </span>
-              )}
-            </div>
-          )}
-          {/* 归一化依据 —— 回答「这个百分比的分母是哪来的」。
-              ⚠️ 折叠成一行小字：它是追溯用的，不该和主表争注意力。 */}
-          <div style={{ marginTop: 6, fontSize: 11, color: C.muted }}>
-            {(row.idle_factors ?? []).filter((fc) => fc.basis).map((fc) => {
-              const dim = IDLE_DIM[fc.name];
-              return `${dim ? (zh ? dim.zh : dim.en) : fc.name}: ${basisLabel(fc.basis, zh)}`;
-            }).join(zh ? " · " : "  ·  ")}
-          </div>
-        </>
-      )}
-
+  const aiSection = (
+    <>
       {/* 🔴 **这里原来还有一个独立的「判读已派发」琥珀块**，2026-09-01 删掉、
              并进下面「AI 判读」那一节的等待态。删之前这一屏是（客户截图）：
 
@@ -704,7 +602,7 @@ export default function InspectionDashboardPanel({
              （从不派发）的行为完全不变 —— 上面那几段理由仍然成立。 */}
       {showAi && (
       <div style={{
-        marginTop: 18, fontSize: 13, fontWeight: 700, color: C.text,
+        marginTop: 28, fontSize: 13.5, fontWeight: 700, color: C.text,
         display: "flex", alignItems: "center", gap: 8,
       }}>
         {zh ? "AI 判读" : "AI analysis"}
@@ -813,18 +711,7 @@ export default function InspectionDashboardPanel({
                 （GFM 是为了表格），不引新依赖、不自己写解析。
                 ⚠️ 链接一律新标签打开：抽屉在 SPA 里，同标签跳走会丢掉整个会话。
                 ⚠️ 没有 `rehype-raw` —— 原始 HTML 不解析，这是 XSS 的防线。 */}
-            <div className="insp-md" style={{
-              fontSize: 12.5, lineHeight: 1.75,
-              color: C.text, background: "var(--code-bg)",
-              border: `1px solid ${C.line}`, borderRadius: 8,
-              padding: "11px 13px", maxHeight: "46vh", overflowY: "auto",
-            }}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]}
-                components={{
-                  a: ({ ...props }) => (
-                    <a target="_blank" rel="noopener noreferrer" {...props} />),
-                }}>{detail.da_body}</ReactMarkdown>
-            </div>
+            {rawBody}
           </>
         ) : state === "pending" ? (
           /* 🔴 派发了、还没回来 —— **正常等待态，一行说完**。
@@ -836,6 +723,22 @@ export default function InspectionDashboardPanel({
              ⚠️ task id 只在**后端真的回来之后**显示（乐观状态下没有它）——
                 编一个出来会让「我们以为派了」和「真的派了」无法区分。
              ⚠️ 全屏只此一处 task id。 */
+          slowMin !== null ? (
+            /* 🔴 等了 30 分钟以上就不再说「1~3 分钟后回来」（review B8）。callback 丢了 /
+               DA 排队时那句话永远不会退出；对账会在 2 小时后把它标成「没拿到结果」。 */
+            <Status type="warning">
+              {zh
+                ? `比预期慢：已等 ${slowMin} 分钟。可以到 DevOps Agent 后台看这个任务的进度；`
+                  + "超过 2 小时仍没有结果，会标成「没拿到结果」，那时可以重新分析。"
+                : `Slower than expected: ${slowMin} min so far. Check the task in the DevOps Agent console; `
+                  + "after 2 hours it is marked as no result and can be re-run."}
+              {row.da_task_id && (
+                <span style={{ marginLeft: 6, fontSize: 11, color: C.muted }}>
+                  <code>{row.da_task_id}</code>
+                </span>
+              )}
+            </Status>
+          ) : (
           <Status type="in-progress">
             {t("insp.judge.dispatched")}
             {row.da_task_id && (
@@ -844,6 +747,7 @@ export default function InspectionDashboardPanel({
               </span>
             )}
           </Status>
+          )
         ) : state === "failed" ? (
           /* 🔴 判读**回来了但是空的** —— 与 pending 分开，因为它**不会再变**。
              `callback_apply.py` 对 `ParseStatus.EMPTY` 与 `res.missing` 只写
@@ -853,6 +757,18 @@ export default function InspectionDashboardPanel({
           <Alert type="warning" header={t("insp.judge.failed")}>
             {row.da_parse_status
               ? parseStatusLabel(row.da_parse_status, t) : ""}
+            {/* 🔴 能重派就说怎么重派，不能就说为什么（review B2）。 */}
+            {retryable && !judgeBlock && judgeOpen ? (
+              <div style={{ marginTop: 4 }}>
+                {zh ? "可以点下面的「重新分析」再试一次（会再次计费）。"
+                  : "Use “Re-run analysis” below to try again (billed again)."}
+              </div>
+            ) : (row.judge_retries ?? 0) > 0 && !retryable ? (
+              <div style={{ marginTop: 4 }}>
+                {zh ? `已经重新分析过 ${row.judge_retries} 次仍没有结果，不再继续重派。`
+                  : `Already re-run ${row.judge_retries} time(s) without a result; no further retries.`}
+              </div>
+            ) : null}
           </Alert>
         ) : state === "rule" ? (
           /* 确定性结论（规则算出来的，不是 AI）。
@@ -890,14 +806,292 @@ export default function InspectionDashboardPanel({
       </div>
       )}
 
-      {/* 🔴 趋势曲线不在本期范围（`/inspection/series` 未接线）。
-          这里**不放一个空图表占位** —— 空图表看起来像「这台没有数据」，
-          而真相是我们还没做这个功能。 */}
-      <div style={{ marginTop: 14, fontSize: 11, color: C.muted }}>
-        <Status type="info">
-          {zh ? "指标曲线在后续版本提供" : "Metric charts land in a later version"}
-        </Status>
-      </div>
+    </>
+  );
+
+  return (
+    /* 560 → 680（2026-09-01，客户要求「更宽一些」）。判读正文里常有表格与
+       代码块（skill 的输出），560px 下 GFM 表格要横向滚。
+       ⚠️ `Drawer` 内部是 `min(width, 100vw)`，窄屏不会溢出。 */
+    <Drawer onClose={onClose} width={680}
+      title={
+        <span style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          {/* 🔴 与卡片首格**同一个判据**（2026-09-01）。卡片对闲置类放评分而不放
+              严重度，理由是「闲置的 severity 恒为 INFO，一整页 20 个同样的灰
+              『提示』徽标零信息量」—— 而抽屉标题原来仍然挂着那个「提示」。
+              同一条 finding 在列表上是「99/100」、点开变成「提示」，
+              客户会以为这是两个不同的分级。 */}
+          {/* 🔴 判据不足单独一档（与卡片首格**同一个** `idleBadgeKind`）——
+              退回 `SevBadge` 的表现是灰色「提示」，与「闲置分很低」不可区分，
+              而后端专门把 0 改成 `None` 就是为了区分这两件事。 */}
+          {idleBadgeKind(row) === "undecided" ? (
+            <span title={t("insp.idle.undecidedWhy")}
+              style={{
+                fontSize: 12.5, fontWeight: 700, padding: "2px 9px",
+                borderRadius: 100, whiteSpace: "nowrap",
+                color: "var(--amber)", border: "1px solid var(--amber)",
+              }}>
+              {t("insp.idle.undecided")}
+            </span>
+          ) : row.kind === "idle" && row.idle_score !== null ? (
+            /* 档位与颜色都走 `idleTier*`（与卡片首格**同源**）——
+               原来两处各写一遍 `>= 80` / `>= 60`，漂开就是
+               「同一条 finding 在列表上是红的、点开变成橙的」。
+               档名进 `aria-label`：档位此前**只由颜色表达**。 */
+            /* 2026-10 第二版：与表格「发现」列的标签同形（「闲置 97」，带底色），
+               点开前后看到的是同一个东西。 */
+            <span
+              title={`${zh ? "闲置分" : "Idle score"} ${row.idle_score.toFixed(0)}/100`
+                + `（${idleTierText(row.idle_score, zh)}）`}
+              aria-label={`${zh ? "闲置分" : "Idle score"} ${row.idle_score.toFixed(0)}`
+                + `/100，${idleTierText(row.idle_score, zh)}`}
+              style={{
+                fontSize: 12, fontWeight: 500, padding: "0 8px", height: 22,
+                display: "inline-flex", alignItems: "center", gap: 4,
+                borderRadius: 6, whiteSpace: "nowrap", color: C.text,
+                background: "color-mix(in srgb, var(--orange) 13%, transparent)",
+              }}>
+              {zh ? "闲置" : "Idle"}
+              <b style={{ color: idleTierColor(row.idle_score), fontWeight: 700 }}>
+                {row.idle_score.toFixed(0)}
+              </b>
+            </span>
+          ) : CAPACITY_RULE_LABEL[row.rule] ? (
+            <span style={{
+              fontSize: 12, fontWeight: 500, padding: "0 8px", height: 22,
+              display: "inline-flex", alignItems: "center", borderRadius: 6,
+              whiteSpace: "nowrap", color: C.muted,
+              background: "color-mix(in srgb, var(--text) 7%, transparent)",
+            }}>{CAPACITY_RULE_LABEL[row.rule][zh ? "zh" : "en"]}</span>
+          ) : row.kind === "high_load" ? (
+            /* 高负载（2026-10）：与表格「严重度」列同一个标签，点开前后看到的是同一个东西。 */
+            <SevTag sev={row.severity} label={t(`insp.sev.${row.severity}`)} small />
+          ) : (
+            <SevBadge sev={row.severity} label={t(`insp.sev.${row.severity}`)} />
+          )}
+          {/* 闲置 / 高负载：名字在前、标签在后（与表格一行的读序一致）；
+              配置检查页仍是卡片，沿用徽章在前。 */}
+          <span style={{ order: tableKind ? -1 : 0 }}>{row.instance}</span>
+        </span>
+      }
+      subtitle={tableKind
+        ? [serviceLabel(row.service), row.instance_class, row.region, row.account_id]
+          .filter(Boolean).join(" · ")
+        : `${row.service} · ${row.region} · ${row.account_id}`}
+      footer={
+        <>
+          {/* ⚠️ 资源已不存在时两个动作都不给：排除一台已经没了的资源只会在清单里留一个
+              孤儿条目，派判读则注定被拒。 */}
+          {onExclude && goneOn === null && !row.excluded_by && (
+            <Btn onClick={onExclude}>{zh ? "移出巡检范围" : "Exclude"}</Btn>
+          )}
+          {/* 🔴 三态，**互斥**：
+                 已派过        不渲染按钮，只给一行状态 + DA 后台链接
+                 没派过        [深入分析]（点了走 onJudge，带上备注框里的话）
+                 无权/无回调    什么都不渲染
+
+              ⚠️ 已派过时按钮**不渲染**而不是灰掉：灰着等于在界面上摆一个
+                 用户无法解决的问题（本仓库既有约定），而且重复派发会重复烧
+                 DA 额度、两份判读回填到同一行只会互相覆盖。 */}
+          {/* 点了开确认弹窗（`JudgeModal`），不直接派。
+              ⚠️ 已派过时**不渲染**而不是灰掉：灰着等于在界面上摆一个用户
+                 无法解决的问题，而重复派发会重复烧额度、两份判读回填到同一行
+                 只会互相覆盖。 */}
+          {/* ⚠️ 已解决的不给：后端必拒 `conflict`（reviewer B1，与 2026-10-10 那次
+              「资源已删还给按钮」同一个形状）。 */}
+          {/* ⚠️ 已移出巡检范围的也不给（review B7）：客户刚说过「别管它」。 */}
+          {judgeOpen && judgeBlock && (!dispatched || retryable) && (
+            <span style={{ fontSize: 12, color: C.muted, maxWidth: 420, lineHeight: 1.5 }}>
+              {judgeBlock}
+            </span>
+          )}
+          {judgeOpen && !judgeBlock && !dispatched && (
+            <Btn variant="primary" onClick={onJudge}
+              loading={!!judging}
+              title={t("insp.judge.hint")}>
+              {zh ? "深入分析" : "Investigate"}
+            </Btn>
+          )}
+          {judgeOpen && !judgeBlock && dispatched && retryable && (
+            <Btn variant="primary" onClick={onJudge}
+              loading={!!judging}
+              title={zh ? "上一次分析没拿到结果，再发起一次（会再次计费）"
+                : "The last analysis returned nothing; run it again (billed again)"}>
+              {zh ? "重新分析" : "Re-run analysis"}
+            </Btn>
+          )}
+          {/* 🔴 **footer 里不再有「取消」**（2026-09-01）。
+              抽屉是只读视图，没有「提交 / 取消」这一对语义 —— 而「取消」这个词
+              暗示「刚才那些操作会被撤销」，而它其实只是关闭。
+              关闭已经有三条路：右上角 ✕、Esc、点遮罩。 */}
+        </>
+      }>
+
+      {/* ── 派发回执 ──
+          🔴 与列表区那一份**是同一条**（同一个 `judgeMsg` state），这里再渲染
+             一遍。理由是抽屉 `zIndex: 1000` 盖住列表区，而派发**只能从抽屉里
+             发起**（卡片上的按钮 2026-09-01 删了）—— 也就是说不在这里渲染，
+             那条提示 100% 落在客户看不见的地方。
+
+          ⚠️ 放在**正文最上面**而不是 footer：footer 里的内容会被长正文
+             （判读全文能有 46vh）挤到视口外，而回执是刚点完那一下要看的。
+          ⚠️ 成功那一支也留着：reload 之后的「⏳ 判读中」要 1~2 秒才到，
+             中间那段空白就是客户以为「点了没反应」的窗口。 */}
+      {judgeMsg && (
+        <div style={{ marginBottom: 12 }}>
+          <Alert type={judgeMsg.type} header={judgeMsg.text}
+            onDismiss={onDismissJudge} />
+        </div>
+      )}
+
+      {/* 🔴 资源已经不存在（2026-10-10）。放在正文最上面 —— 下面的金额 / 实测值 /
+          「已持续」都是它被删之前的数据，先说清这一句，客户才不会照着那些去处置。 */}
+      {goneOn !== null && (
+        <div style={{ marginBottom: 18 }}>
+          <Alert type="warning" header={zh ? "这台资源已经不存在" : "This resource no longer exists"}>
+            {zh
+              /* ⚠️ 不承诺「下一次正式巡检会关闭它」：定时巡检关着时那一轮不会来
+                 （677 就是），那是又一句空话（reviewer B4）。 */
+              ? `在账号 ${row.account_id} 的 ${row.region} 里查不到 ${row.instance}`
+                + `${goneOn ? `（${goneOn} 核实）` : ""}，它已经被删除。不需要再分析或处置，`
+                + "也不计入合计。"
+                + (row.last_run_date ? `下面是 ${row.last_run_date} 最后一次评估时的数据。` : "")
+              : `${row.instance} can no longer be found in ${row.account_id} / ${row.region}`
+                + `${goneOn ? ` (checked ${goneOn})` : ""}. Nothing to analyse; it is excluded `
+                + "from the totals."}
+          </Alert>
+        </div>
+      )}
+      {/* 已经因为资源不存在而关闭的（「已解决」里点开）—— 用过去时说一句，不再挂横幅。 */}
+      {row.state === "resolved" && row.resolution_kind === "resource_gone" && (
+        <div style={{ marginBottom: 16 }}>
+          <Status type="info">
+            {zh
+              ? `已于 ${row.last_run_date || "—"} 关闭：巡检时账号里已经查不到这台资源。`
+              : `Closed on ${row.last_run_date || "—"}: the resource no longer existed.`}
+          </Status>
+        </div>
+      )}
+      {/* 停更（资源还在、只是很久没有正式巡检更新过）。已不存在时上面那段已经说了。 */}
+      {/* 已移出巡检范围、正式巡检还没关掉它（review B7）。 */}
+      {goneOn === null && row.excluded_by && row.state !== "resolved" && (
+        <div style={{ marginBottom: 16 }}>
+          <Status type="info">
+            {zh
+              ? `已移出巡检范围${row.excluded_until ? `（到 ${row.excluded_until}）` : ""}。`
+                + "这条不计入合计，也不再分析；要恢复请到「巡检范围」删掉那条排除。"
+              : `Removed from scope${row.excluded_until ? ` (until ${row.excluded_until})` : ""}. `
+                + "Not counted and not analysed; remove the exclusion under Scope to restore it."}
+          </Status>
+        </div>
+      )}
+      {goneOn === null && isStale(row) && row.state !== "resolved" && (
+        <div style={{ marginBottom: 16 }}>
+          <Status type="warning">
+            {zh
+              ? `最后一次评估是 ${row.last_run_date}（${row.days_since_eval} 天前），之后没有正式巡检`
+                + "更新过这条 —— 下面的状态与数字是那天的。"
+              : `Last evaluated on ${row.last_run_date} (${row.days_since_eval}d ago); `
+                + "no official run has updated it since."}
+          </Status>
+        </div>
+      )}
+
+      {row.kind === "idle" ? (
+        <IdleDetail row={row} zh={zh} t={t} related={related} gone={goneOn !== null}
+          onOpenRelated={onOpenRelated} dispatched={dispatched}
+          canJudge={judgeOpen && !judgeBlock && !dispatched}
+          state={state} detail={detail} breakdown={breakdown} methodBox={methodBox}
+          aiFallback={aiSection} rawBody={rawBody} diagnostics={diagnosticsKv} />
+      ) : row.kind === "high_load" ? (
+        /* 高负载抽屉「结论先行」（2026-10，与闲置抽屉对齐）：实测值 vs 阈值 → 一句结论 →
+           AI 判读结论卡 → 判定依据 → 同一台资源 → 诊断信息（折起）。
+           ⚠️ AI 判读拆不开 / 等待 / 失败时照样渲染原来那一节（`aiSection`）——
+              门禁三态、解析失败的原文警告这些判据都在那里，不复制第二份。 */
+        <HighLoadDetail row={row} zh={zh} t={t} related={related}
+          onOpenRelated={onOpenRelated} state={state} detail={detail}
+          aiFallback={aiSection} rawBody={rawBody} diagnostics={diagnosticsKv} />
+      ) : (
+        <>
+        {/* ── 判定证据 ──
+            🔴 这里**只放卡片上没有的、且影响决策的**（2026-09-01）。
+               原来 9~11 项平铺，其中对一条闲置 finding 是这样：
+
+               ```
+               规则 idle                  ← 页面本身就叫「闲置与成本」
+               状态 新增                   ← 卡片右上角已有同名徽章
+               已持续 2天                  ← 卡片已有
+               首次发现 2026-08-31        ← 卡片已有
+               预计月节省 $15 + 精度说明   ← 卡片已有
+               规则版本 2026-08-31T02:09:52.670805+00:00   ← 带微秒的 ISO 串
+               连续命中/连续未命中 1 / 0    ← 状态机内部计数
+               ```
+
+               7 项里 4 项与卡片重复、3 项是内部标识 —— 上半屏零决策价值，
+               而真正的内容（评分明细、AI 判读）被推到折叠线以下。
+               规则 / 规则版本 / 连续命中 / 状态 收进下面的「诊断信息」。 */}
+        <KVGrid cols={2}>
+          {ev && (
+            <>
+              <KV label={row.metric || t("insp.field.metric")}>
+                <b style={{ fontSize: 15 }}>{ev.value}</b>
+                {/* `relation` 为空 = 后端没给 `direction` —— 只说阈值，不猜方向。
+                    见 `format.ts::evidenceText` 那段说明。 */}
+                <span style={{ color: C.muted, fontSize: 12, marginLeft: 6 }}>
+                  {ev.relation
+                    ? `${ev.relation} ${ev.threshold}`
+                    : (zh ? `阈值 ${ev.threshold}` : `threshold ${ev.threshold}`)}
+                </span>
+                {/* 🔴 陈旧证据的标注在**数字紧邻处**，不在页脚。
+                    放远了等于没标 —— 客户读到数字就已经形成判断了。 */}
+                {stale && (
+                  <div style={{ color: C.amber, fontSize: 11, marginTop: 3 }}>
+                    {stale}
+                    <div style={{ color: C.muted, marginTop: 2 }}>
+                      {zh
+                        ? "本轮未命中，但水位没回到健康区 —— 显示的是最后一次命中时的数值。"
+                        : "Not hit this run, but the level has not recovered; showing last known values."}
+                    </div>
+                  </div>
+                )}
+              </KV>
+              {cap && <KV label={zh ? "原始值 / 规格" : "Raw / capacity"}>{cap}</KV>}
+            </>
+          )}
+          {/* ⚠️ 「已持续 N 天」卡片上已经有了，这里**只留首次发现的日期** ——
+              卡片上那个 `（2026-08-31）` 括号是冗余的，已从卡片移到这里。 */}
+          <KV label={t("insp.field.firstSeen")}>{row.first_seen_date || "—"}</KV>
+          {/* 🔴 越线的 finding 这一栏必然是**负数**（`headroom = (T - x)/|T|`，
+              `is_breached` 就是靠它 ≤ 0 判的）。而标签写「余量」，读起来像
+              「剩余容量 -21.4%」—— 客户要反应一下才明白是超了。
+              负值改说「已超出 21.4%」，正值才叫余量。 */}
+          {row.headroom !== null && (
+            row.headroom < 0 ? (
+              <KV label={zh ? "已超出阈值" : "Over threshold"}
+              >{(Math.abs(row.headroom) * 100).toFixed(1)}%</KV>
+            ) : (
+              <KV label={zh ? "余量" : "Headroom"}
+              >{(row.headroom * 100).toFixed(1)}%</KV>
+            )
+          )}
+          {showMoney && (
+            <KV label={t("insp.field.savings")}>
+              <b style={{ color: C.green }}>{fmtMoney(row.savings_usd)}</b>
+              {row.savings_precision && isCoarse(row.savings_precision) && (
+                <div style={{ color: C.amber, fontSize: 11, marginTop: 3 }}>
+                  {PRECISION_LABEL[row.savings_precision]?.[zh ? "zh" : "en"]
+                    || row.savings_precision}
+                </div>
+              )}
+            </KV>
+          )}
+        </KVGrid>
+        {diagnostics}
+        {aiSection}
+        {/* ⚠️ 这里原来还有一行「指标曲线在后续版本提供」（2026-10 删掉）：
+            它对这一条发现没有任何信息，而且配置检查本来就不看指标。 */}
+        </>
+      )}
     </Drawer>
   );
 }

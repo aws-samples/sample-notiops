@@ -155,6 +155,38 @@ command -v python3 >/dev/null 2>&1 || { echo "$(t "错误: 需要安装 Python 3
 command -v aws >/dev/null 2>&1 || { echo "$(t "错误: 需要安装 AWS CLI" "Error: AWS CLI is required")"; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "$(t "错误: 需要安装 jq" "Error: jq is required")"; exit 1; }
 
+# ─── python3 的 pyexpat：坏了 pip 就起不来，必须在部署任何东西之前 fail fast ───
+# 实测踩过(2026-10)：macOS 26.x 上 Homebrew 的 python@3.14(3.14.7)/ python@3.12 bottle，
+# pyexpat 链接系统 /usr/lib/libexpat.1.dylib，而系统那份没导出
+# _XML_SetAllocTrackerActivationThreshold → `import xml.parsers.expat` ImportError →
+# ensurepip / pip 全挂。以前要等 AgentCore 部署完(~5-10 分钟)到 [2/4] `python3 -m venv .venv`
+# 才炸，而且 venv 吞掉了真实 stderr，只剩一句 "ensurepip ... returned non-zero exit status 1"。
+# 处方与 scripts/preflight.sh 的同名检查保持一致。
+notiops_expat_fail() {
+  # $1 = import 失败时的完整输出
+  echo ""
+  echo "$(t "❌ python3 加载不了 pyexpat —— pip / venv 都起不来，部署会在 [2/4] 失败。已在部署前停下。" \
+            "❌ python3 cannot load pyexpat -- pip / venv cannot start and the deploy would fail at [2/4]. Stopped before deploying.")"
+  echo "   python3 = $(command -v python3)  ($(python3 --version 2>&1))"
+  printf '%s\n' "$1" | grep -E 'ImportError|Symbol not found|Expected in' | head -3 | sed 's/^ */   /'
+  if printf '%s' "$1" | grep -q '/usr/lib/libexpat'; then
+    echo "$(t "   原因：这份 Python 的 pyexpat 链接到 macOS 自带的 libexpat，系统那份太旧。处方(改 Homebrew Cellar 里的一个文件，" \
+              "   Cause: this Python's pyexpat links to the macOS system libexpat, which is too old. Fix (patches one file in the Homebrew Cellar;")"
+    echo "$(t "   brew upgrade/reinstall 该 python 后要重做)：" "   redo after brew upgrade/reinstall of that python):")"
+    echo "     brew install expat"
+    echo "     PYEXPAT=\$(python3 -c \"import sysconfig,os,sys; print(os.path.join(sysconfig.get_path('stdlib'),'lib-dynload','pyexpat.cpython-%d%d-darwin.so' % sys.version_info[:2]))\")"
+    echo "     install_name_tool -change /usr/lib/libexpat.1.dylib \"\$(brew --prefix expat)/lib/libexpat.1.dylib\" \"\$PYEXPAT\""
+    echo "     codesign --sign - --force \"\$PYEXPAT\""
+    echo "     python3 -c 'import xml.parsers.expat' && echo expat-ok"
+    echo "$(t "   然后 rm -rf .venv 再重跑 ./setup.sh。" "   Then rm -rf .venv and re-run ./setup.sh.")"
+  fi
+  exit 1
+}
+if ! _EXPAT_ERR=$(python3 -c 'import xml.parsers.expat' 2>&1); then
+  notiops_expat_fail "$_EXPAT_ERR"
+fi
+
+
 # ─── uv：agent 部署的**硬前置**,必须在这里 fail fast ───
 # `agentcore deploy` 打 Python CodeZip 时无条件调 `uv pip install`（@aws/agentcore 的
 # dist/lib/packaging/python.js → ensureBinaryAvailable('uv')）。机器上没有 uv,那一步必失败。
@@ -1521,9 +1553,59 @@ cd "$PROJECT_ROOT"
 # 清理旧包(避免 psycopg2 等已废弃包残留 + dist-info 堆积)
 rm -rf lambda_layer/python/
 mkdir -p lambda_layer/python/
-python3 -m venv .venv
+# .venv 已存在时先判健康（客户现场合入的防护，2026-10；R3 review 后收窄）：
+#   · 只在**解释器 minor 版本**与当前 python3 不一致时删除重建 —— `python3 -m venv` 不会换
+#     解释器（实测 3.12 的 venv 被 3.14 覆盖后 bin/python 仍指向 3.12），而层里 wheel 的 ABI
+#     跟着 .venv 走(下面 PLAT_ARGS 不带 --python-version，Lambda 运行时是 3.14)。
+#   · **缺 pip 不删**：`python3 -m venv` 作用在已存在的 venv 上会把 pip 补上（实测），而 uv 建的
+#     venv 默认就不带 pip —— 按「缺 pip = 坏了」删掉会把客户装好的包一起冲掉。
+# 健康的不删：preflight / PREREQUISITES 的处方让客户事先在 .venv 里装 requirements.txt。
+_VENV_PREEXIST=false
+if [ -d .venv ]; then
+  _VENV_PREEXIST=true
+  _PY_MV=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "")
+  _VENV_MV=$(.venv/bin/python -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "")
+  if [ "$_VENV_MV" != "$_PY_MV" ]; then
+    echo "  $(t "⚠ 现有 .venv 的解释器是 python ${_VENV_MV:-?}，当前 python3 是 ${_PY_MV:-?} —— 删除重建（依赖会在下面重装）" \
+                "⚠ Existing .venv uses python ${_VENV_MV:-?} but python3 is ${_PY_MV:-?} -- recreating (dependencies are reinstalled below)")"
+    rm -rf .venv
+    _VENV_PREEXIST=false
+  fi
+fi
+# ⚠️ 输出要接住而不是丢进 /dev/null：失败原因常常跟 `.venv` 这个具体路径有关（目录不可写、
+#    `.venv` 是个坏软链 / 普通文件、磁盘满；Debian 系还会提示装 python3.X-venv）——
+#    换个临时目录重跑一遍往往就成功了，只剩一段误导人的「Successfully installed pip」。
+if ! _VENV_OUT=$(python3 -m venv .venv 2>&1) \
+   || ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
+  # 不留自己建的半成品（下次重跑不会踩到）；客户原有的那个不动。
+  [ "$_VENV_PREEXIST" = true ] || rm -rf .venv
+  # 最常见的根因在开头已经拦过一次；这里再测一遍，兜住"跑到一半换了 python3"的情况。
+  if ! _EXPAT_ERR=$(python3 -c 'import xml.parsers.expat' 2>&1); then
+    notiops_expat_fail "$_EXPAT_ERR"
+  fi
+  echo ""
+  echo "  $(t "❌ python3 -m venv .venv 失败（或建出来的 venv 里没有 pip）。原始输出：" "❌ python3 -m venv .venv failed (or the resulting venv has no pip). Raw output:")"
+  printf '%s\n' "${_VENV_OUT:-<empty>}" | tail -15 | sed 's/^/     /'
+  # venv 会吞掉 ensurepip 的 stderr，只剩 "returned non-zero exit status 1"。
+  # 拆成 --without-pip + 手跑 ensurepip，把底层错误也打出来（补充诊断，不是替代上面那段）。
+  echo "  $(t "补充诊断（在临时目录里拆开重跑一次）：" "Extra diagnosis (re-run step by step in a temp dir):")"
+  _VT=$(mktemp -d)
+  python3 -m venv --without-pip "$_VT/v" 2>&1 | tail -10 | sed 's/^/     /'
+  [ -x "$_VT/v/bin/python" ] && "$_VT/v/bin/python" -m ensurepip --upgrade --default-pip 2>&1 | tail -15 | sed 's/^/     /'
+  rm -rf "$_VT"
+  echo "  $(t "修好后重跑 ./setup.sh(已部署的栈会走更新，不会重建)。也可先跑 bash scripts/preflight.sh 自检。" \
+              "Fix it and re-run ./setup.sh (already-deployed stacks are updated, not recreated). You can also run bash scripts/preflight.sh first.")"
+  exit 1
+fi
 source .venv/bin/activate
 pip install --upgrade pip --quiet
+# 🔴 本机依赖装进 .venv（R3 review）。收尾几个脚本（upload_inspection_skills.py /
+#    backfill_finding_gsi.py / seed_llm_catalog.py）要本机 boto3；setup.sh 以前从不往 .venv
+#    里装它，全靠客户照 PREREQUISITES 预装 —— 而 .venv 一旦被重建（换了 python 小版本、照
+#    pyexpat 处方 rm -rf .venv）那批包就没了，收尾那几步静默降级。已装好时这一步是秒级 no-op。
+# ⚠️ 失败不阻断：只影响收尾那几步，而且下面打层同样要联网，真断网会在那里报。
+pip install -r requirements.txt --quiet \
+  || echo "  $(t "⚠ 本机依赖(requirements.txt)没装成 —— 部署照常，但收尾的 skill 上传 / 数据回填可能跳过" "⚠ Local dependencies (requirements.txt) failed to install -- deploy continues, but the post-deploy skill upload / backfill may be skipped")"
 # --platform 确保安装 Linux x86_64 二进制(Lambda 运行环境)；用单行命令, 避免 \ 续行被编辑器/换行/尾随空格破坏(更 robust)
 PLAT_ARGS="--platform manylinux2014_x86_64 --implementation cp --only-binary=:all:"
 # boto3/botocore 钉 1.43.65 —— **不许往下调**。Lambda 运行时自带的版本不可控，
@@ -2282,8 +2364,6 @@ STACK_NAME="NotiOpsBackendStack"
 # CloudFrontUrl / ApiUrl 已随老控制台退役（2026-09-04）——容错读取，老栈升级时可能还有
 CLOUDFRONT_URL=$(jq -r ".[\"$STACK_NAME\"].CloudFrontUrl" cdk-outputs.json 2>/dev/null || echo "N/A")
 USER_POOL_ID=$(jq -r ".[\"$STACK_NAME\"].UserPoolId" cdk-outputs.json)
-IDLE_ROLE_ARN=$(jq -r ".[\"$STACK_NAME\"].IdleDetectionRoleArn" cdk-outputs.json)
-LAMBDA_ROLE_ARN=$(jq -r ".[\"$STACK_NAME\"].LambdaExecutionRoleArn" cdk-outputs.json)
 API_URL=$(jq -r ".[\"$STACK_NAME\"].ApiUrl" cdk-outputs.json 2>/dev/null || echo "N/A")
 DATA_BUCKET=$(jq -r ".[\"$STACK_NAME\"].DataBucketName" cdk-outputs.json 2>/dev/null || echo "N/A")
 FEISHU_SECRET=$(jq -r ".[\"$STACK_NAME\"].FeishuSecretArn" cdk-outputs.json 2>/dev/null || echo "N/A")
@@ -2582,8 +2662,10 @@ echo "  $(t "Support 案例 / 通知 / 巡检看板 / 管理配置(阈值·账�
 echo ""
 echo "$(t "── 其它地址(排查 / 高级用途,平时不用管)──" "── Other URLs (troubleshooting / advanced, usually ignore) ──")"
 echo "  $(t "· Web Chat BFF Function URL(排查用):              " "· Web Chat BFF Function URL (troubleshooting):   ")$CHAT_BFF_URL"
-echo "  · IdleDetectionRole:  $IDLE_ROLE_ARN"
-echo "  · LambdaExecutionRole: $LAMBDA_ROLE_ARN  $(t "← 跨账户信任策略填这个" "← use this in cross-account trust policy")"
+# ⚠️ 这里原来还印两行老 idle-detector 时代的角色（IdleDetectionRole / LambdaExecutionRole
+#    「← 跨账户信任策略填这个」）。那是给已删除的老控制台「目标账户管理」手工接入用的；
+#    现在成员账号走「管理 → 账户」一键接入，模板信任的是系统账号 root，不需要客户抄任何 ARN。
+#    印出来只会让客户照着去手工建角色（2026-10 客户现场就照做了）。
 echo ""
 if [ -n "$ENABLED_PLATFORMS" ]; then
   echo "$(t "── IM Bot(Webhook + Lambda）── 本次启用: " "── IM Bot (webhook + Lambda) ── enabled: ")$ENABLED_PLATFORMS"
@@ -2679,22 +2761,23 @@ else
   echo "  $(t "⚠ 上面的 Agent 问题修好之前,聊天只会回显,不要按下面的流程验收。" "⚠ Until the agent issue above is fixed, chat only echoes — do not sign off on the steps below yet.")"
 fi
 echo ""
-# ⚠️ 这里必须单独说一句巡检看板在哪 —— 不说的话客户跑完 setup.sh 压根不知道有这个页面（入口
+# ⚠ 这里必须单独说一句巡检看板在哪 —— 不说的话客户跑完 setup.sh 压根不知道有这个页面（入口
 #    是 fail-CLOSED 的，只有拿到 nav:inspection 能力才显示；2026-10-10 起还收在默认收起的「更多」里），
 #    于是整个 feature 交付了等于没交付。老的「巡检 & 报告」外链控制台已于 2026-09-04 退役，别再提它。
-# ⚠️ 目录名照 frontend/chat-app/src/components/InspectionDashboardBrowser.tsx 的 ENTRIES 抄，
+# ⚠ 目录名照 frontend/chat-app/src/components/InspectionDashboardBrowser.tsx 的 ENTRIES 抄，
 #    并扣掉 api/inspection.ts::HIDDEN_KINDS 隐藏的那类（「配置检查」2026-08-31 起隐藏）。
 #    「待处置」「巡检总览」只是老深链 id 的别名（LEGACY_TAB → 高负载），目录里没有这两页 ——
 #    这里曾经列过它们，客户照着找不到，会以为部署没装全。
 echo "  $(t "  📋 资源巡检看板(站内):" "  📋 Resource Inspection dashboard (in-app):")"
 echo "     $(t "左侧「更多 → 巡检」→ 巡检发现(高负载 / 闲置与成本)· 配置(巡检范围 / 阈值与定时)。" "Left menu \"More → Inspection\" → Findings (High Load / Idle & Cost) · Settings (Scope / Thresholds & Schedule).")"
-echo "     $(t "两类巡检默认都在每天 UTC 02:00(= 北京时间 10:00)跑,首轮结果在那之后可见;时刻可在「阈值与定时」页改。" "Both run types default to 02:00 UTC daily; first results appear after that. Change it on the \"Thresholds & Schedule\" page.")"
+echo "     $(t "两类巡检默认都在每天 UTC 02:00(= 北京时间 10:00)跑;时刻可在「阈值与定时」页改。" "Both run types default to 02:00 UTC daily; change it on the \"Thresholds & Schedule\" page.")"
+echo "     $(t "不想等:部署完直接在看板上点「跑高负载」/「跑闲置」,首轮结果跑完即可见。" "No need to wait: click \"Run high-load\" / \"Run idle\" on the dashboard right after deploying; the first results show once it finishes.")"
 echo "     $(t "改排除清单 / 改执行时刻需要 action:inspection:scope / :schedule 权限(默认只有 admin 有)。" "Editing exclusions / schedule needs action:inspection:scope / :schedule (admin only by default).")"
 echo "     $(t "出问题要立刻停:见 inspection/adapters/switches.py 顶部的 kill switch 命令(改 DDB 一行,不用重新部署)。" "To stop it immediately: see the kill switch commands atop inspection/adapters/switches.py (one DDB write, no redeploy).")"
 echo ""
 echo "  $(t "2️⃣  (可选)填 Bedrock API Key —— 跨账号调模型才需要:" "2️⃣  (Optional) Set a Bedrock API Key — only needed for cross-account model calls:")"
 echo "      $(t "Web Chat 左侧「更多 → 管理」→「模型」→「凭证方式」选 Bedrock API Key,填入并保存。" "In Web Chat open \"More → Admin\" → \"Models\", set \"Credentials\" to Bedrock API key, paste it and save.")"
-echo "      $(t "留空则 Agent 用本地 AWS 凭证调当前账号 Bedrock 模型,不影响使用。" "If left empty, the Agent uses local AWS credentials to call the current account's Bedrock models — works fine.")"
+echo "      $(t "不填就保持默认的「IAM 角色」:Agent 用自己的运行时角色调本账号的 Bedrock 模型,不影响使用。" "Leave it on the default \"IAM role\": the Agent calls this account's Bedrock models with its own runtime role — works fine.")"
 echo ""
 if [ -n "$ENABLED_PLATFORMS" ]; then
   echo "  ┌──────────────────────────────────────────────────────────────────┐"
@@ -2760,11 +2843,23 @@ else
   echo "      $(t "以后想加飞书 / Slack / 钉钉:重跑 ./setup.sh 选对应平台即可,无需重建其余资源。" "To add Feishu / Slack / DingTalk later: re-run ./setup.sh and pick the platform — no need to rebuild anything else.")"
 fi
 echo ""
-# 老的「目标账户管理」外链控制台已于 2026-09-04 退役（那时这一步要手填账户 ID / Role ARN / Region）。
-# 现在多账号走「管理 → 账户」接入，资源级的排除在巡检看板的「巡检范围」里做。
-echo "  $(t "4️⃣  (可选)把成员账号也纳入巡检 / 多账号排查 —— 不配也不影响 Web Chat:" "4️⃣  (Optional) Bring member accounts into inspection / cross-account troubleshooting — does not affect Web Chat:")"
-echo "      $(t "Web Chat 左侧「更多 → 管理」→「账户」→「成员账号接入」(组织内可一键接入)。" "In Web Chat open \"More → Admin\" → \"Accounts\" → \"Member account onboarding\" (one-click inside an Organization).")"
-echo "      $(t "不想扫的资源在「更多 → 巡检」→「巡检范围」里加排除;巡检默认每天 UTC 02:00 跑。" "Exclude resources you don't want scanned under \"More → Inspection\" → \"Scope\"; inspection runs daily at 02:00 UTC by default.")"
+# ⚠ 这一步原来教客户去老控制台「目标账户管理」手填 Role ARN、说「每天 00:00 UTC 扫描」。
+#    老控制台（2026-09-04 退役）与那条 00:00 的采集（lambda1）都已随老 idle-detector 删除（efe1eec），
+#    照做只会找不到入口。部署账号本身不需要任何配置，巡检默认就覆盖它。
+echo "  $(t "4️⃣  (可选)接入其他 AWS 账号 —— 部署账号本身不用配,巡检 / 问答默认就覆盖它:" "4️⃣  (Optional) Onboard other AWS accounts — the deploy account itself needs nothing; inspection / chat cover it by default:")"
+# ⚠ 两种模式能做的事不一样，不能一句话说完（R3 review）：单账号模式下 CDK 把
+#    LOCKED_ACCOUNT_ID 写死成部署账号（web-chat-core.ts 的 orgSwitch），跨账号问答 /
+#    调查 / 案例一律被拒；只有巡检刻意不走那道闸门。一键接入也只有 org 模式才有。
+if [ "$ORG_MODE" = true ]; then
+  echo "      $(t "Web Chat 左侧「更多 → 管理」→「账户」→「成员账号接入」一键接入(经 StackSets 下发成员账号的跨账号只读角色)。" "In Web Chat open \"More → Admin\" → \"Accounts\" → \"Member account onboarding\" for one-click onboarding (StackSets roll out the member cross-account read-only role).")"
+  echo "      $(t "接入成功后,该账号自动进入每日巡检与跨账号问答 / 调查 / 案例,不用再回来改配置。" "Once onboarded, the account joins the daily inspection and cross-account chat / investigation / cases automatically.")"
+else
+  echo "      $(t "Web Chat 左侧「更多 → 管理」→「账户」→「手动接入账号」,生成 Launch Stack 链接,到成员账号里部署。" "In Web Chat open \"More → Admin\" → \"Accounts\" → \"Manual onboarding\": generate a Launch Stack link and deploy it in the member account.")"
+  echo "      $(t "接入后该账号进入每日巡检,也能在 Web 上用「深度调查」/「DevOps 对话」去查。" "Once onboarded, the account joins the daily inspection and can be investigated on the web with \"Deep Dive\" / \"DevOps Chat\".")"
+  echo "      $(t "IM、NotiOps 模型的对话、Support 案例和每日成本异常扫描要跨到它,需要多账号模式:" "Taking IM, NotiOps-model chat, Support cases and the daily cost-anomaly scan across to it needs multi-account mode:")"
+  echo "      $(t "在组织管理账号(或 StackSets 委派管理员)上重跑 ./setup.sh --multi-account。" "re-run ./setup.sh --multi-account from the Organizations management account (or a StackSets delegated admin).")"
+fi
+echo "      $(t "不想扫的资源在「更多 → 巡检」→「巡检范围」里加排除。" "Exclude resources you don't want scanned under \"More → Inspection\" → \"Scope\".")"
 echo ""
 echo "  $(t "ℹ️  FinOps 的 DevOps Agent 调用成本卡需 CUR/Athena 数据源,首次部署后约 24h" "ℹ️  The FinOps DevOps Agent cost card needs the CUR/Athena data source; ~24h after first deploy")"
 echo "      $(t "才有数据(占位卡片会先显示),其余 FinOps/Budget 数据即时可用。" "before data appears (a placeholder card shows first). All other FinOps/Budget data is available immediately.")"
@@ -3015,7 +3110,7 @@ if [ "$ORG_MODE" = true ]; then
   # 🔴 **CreateCollectionRole 必须显式传 no**（2026-08-30 补）。
   #
   #    模板的 Default 是 `"yes"`，而 org 这条路上采集角色
-  #    `notiops-idle-detection-role-<系统账号>` 由**另一份**模板
+  #    `notiops-cross-account-role-<系统账号>` 由**另一份**模板
   #    （上面那个 `notiops-member-onboarding` StackSet）负责建。
   #
   #    两份都建 → `EntityAlreadyExists`（IAM 角色是全局资源，而那个名字里只有

@@ -132,8 +132,10 @@ venv。所以必须装进 `.venv`(或者预先建好这个 `.venv`,见下)。
 提前在外层激活 venv,裸 `python3` 才会解析到 `.venv/bin/python3`,四处才能一次覆盖全。
 
 > ℹ️ 提前建好 `.venv` 不会被覆盖:`setup.sh` 里那句 `python3 -m venv .venv` 作用在**已存在**的
-> venv 上不会清掉已装的包;它内部的 `activate` / `deactivate` 也不会撤销你在外层做的激活。
-> 所以上面四行的顺序是安全的,不用担心被 `setup.sh` 洗掉。
+> venv 上不会清掉已装的包(缺 pip 时还会补上,uv 建的 venv 也一样);它内部的 `activate` /
+> `deactivate` 也不会撤销你在外层做的激活。唯一的例外:`.venv` 的 Python 小版本与当前 `python3`
+> 不一致时,`setup.sh` 会删掉重建 —— 层里的 wheel 要跟着解释器走。重建也不用担心:`setup.sh`
+> 激活 venv 之后会自己 `pip install -r requirements.txt`,收尾那几个脚本照样有 boto3。
 
 ---
 

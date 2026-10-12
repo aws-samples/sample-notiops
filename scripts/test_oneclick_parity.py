@@ -1099,7 +1099,7 @@ def test_operator_app_enabled_everywhere() -> None:
     #          698 部署账号 = notiops-agent-operator-444455556666 无后缀，与 CDK 侧一致），
     #         于是这条断言在**代码正确**的情况下报红，指向一个不存在的问题。
     #
-    # ⚠️ `notiops-idle-detection-role-${SystemAccountId}` 不带 ${AWS::AccountId}，
+    # ⚠️ `notiops-cross-account-role-${SystemAccountId}` 不带 ${AWS::AccountId}，
     #    因此不在这个判据的范围内 —— 它靠把系统账号 id 嵌进名字本身来避撞
     #    （成员账号自建的那套会嵌它自己的 id），满足同一个意图、形态不同。
     role_names = re.findall(r"RoleName:\s*!Sub\s*\"([^\"]+)\"", member)

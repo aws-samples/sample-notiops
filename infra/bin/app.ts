@@ -44,7 +44,7 @@ const env = { account, region };
 
 const main = new NotiOpsBackendStack(app, "NotiOpsBackendStack", {
   env,
-  description: "AWS resource idle-detection & optimization system (fully automated deployment)",
+  description: "NotiOps backend: resource inspection, notifications, cost analysis (fully automated deployment)",
 });
 
 // 报告 CDN 域名（在线报告链接：Web 端「深度调查（直连）」+ IM 端长回答落报告）。

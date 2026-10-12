@@ -2,7 +2,7 @@
 
 > 🌐 **Language**: [中文](TECHNICAL_DESIGN.md) · [English](TECHNICAL_DESIGN.en.md)
 >
-> **一句话定位**:一个 **只读的 Web Chat 运维控制台** 为主入口 —— 在浏览器里直接和 AWS 运维 agent(Strands / Bedrock **AgentCore Runtime**)对话,做调查 / FinOps / 案例 / Skills,全程只读、绝不改环境;作为必要补充,同时把 **AWS DevOps Agent**(AWS 推出的 agentic 调查服务,`aidevops` API)接入企业 IM(飞书 / Slack / 钉钉),让用户在告警群里 `@bot 一句话` 也能调起调查、看实时进度、收到本地化报告 —— **不再需要登陆 AWS 控制台**。
+> **一句话定位**:一个 **只读的 Web Chat 运维控制台** 为主入口 —— 在浏览器里直接和 AWS 运维 agent(Strands / Bedrock **AgentCore Runtime**)对话,做调查 / FinOps / 案例 / Skills,对客户基础设施只读、绝不改环境(唯一的写操作是用户确认过的 AWS Support 工单);作为必要补充,同时把 **AWS DevOps Agent**(AWS 推出的 agentic 调查服务,`aidevops` API)接入企业 IM(飞书 / Slack / 钉钉),让用户在告警群里 `@bot 一句话` 也能调起调查、看实时进度、收到本地化报告 —— **不再需要登陆 AWS 控制台**。
 
 **版本**:v1.3 · 2026-06-10
 
@@ -80,7 +80,7 @@ NotiOps 的目标:**让 SRE 随时随地掌控云环境**。主入口是一个 *
 
 1. **不动 DevOps Agent 后端协议**:所有增强都做在 IM 适配 + 前置 Lambda 这一侧
 2. **平台无关**:`core/` 共享代码 + `platforms/<name>/` 适配层,新增 IM 平台不需要碰 `core/`
-3. **零变更承诺**:bot 全链路只读,绝不替客户改云环境(详见 §5)
+3. **零变更承诺**:bot 全链路对客户基础设施只读,绝不替客户改云环境(唯一的写操作是用户确认过的 AWS Support 工单;详见 §5)
 4. **失败永远可降级**:Bedrock 错误 / 模式禁用 / 解析失败,统统降级到 read-only investigate 路径,绝不静默丢失
 5. **最小权限**:IM Lambda 执行角色按允许清单逐条授权(见 §5.1),对客户基础设施(EC2 / RDS / IAM 等)没有写权限
 
@@ -619,7 +619,7 @@ good morning / good afternoon
 
 #### 4.2.1 零变更承诺(Zero-Change Promise)
 
-bot 是 **read-only**,绝不替客户改云环境。这是产品级硬边界,**不是档位的可调项** —— 即使 `AGENTIC_CHAT_MODE=disabled`,变更类请求也走拒绝。
+bot 对客户基础设施是 **read-only**,绝不替客户改云环境(唯一的写操作是用户确认过的 AWS Support 工单)。这是产品级硬边界,**不是档位的可调项** —— 即使 `AGENTIC_CHAT_MODE=disabled`,变更类请求也走拒绝。
 
 #### 4.2.2 三层防御
 
@@ -1074,8 +1074,9 @@ class PushEvent:
    ▼ DDB conditional put:
 key = "push_dedupe#<dedupe_key>"
 TTL = 现在 + 5 分钟
-ConditionExpression: attribute_not_exists(lookup_key)
-   │  失败(同一资源 5 分钟内已触发) → 直接丢弃
+ConditionExpression: attribute_not_exists(lookup_key) OR #t < :now
+   │  失败(同一资源 5 分钟内已触发、ttl 还没过) → 直接丢弃
+   │  (比 ttl 而不是等 DynamoDB TTL 删行:TTL 是后台异步删除,通常几天内,删之前过期行照样挡住条件写)
    ▼
 立即推送 heads-up 卡到目标群
    │
@@ -1418,7 +1419,7 @@ Body 文本 + 📚 来源块(列出每个引用的 URL)
 
 ### 5.3 零变更防御:硬边界 + 按入口的纵深防御
 
-硬边界是 **只读 IAM 角色**(§5.1):无论哪条入口,访问客户账号用的都是对客户基础设施只读的角色,
+硬边界是 **IAM 权限**(§5.1):无论哪条入口,访问客户账号用的都是对客户基础设施只读的角色,
 改资源的写操作拿不到权限。对话 / 调查链路上,唯一会动到客户自己东西的写授权是 AWS Support 工单的
 建 / 回 / 关:IM 执行角色、BFF 角色,以及成员账号的采集角色(模板参数 `EnableSupportCaseWrite`
 默认 `true`,可设为 `false` 关掉)上带 `support:CreateCase` / `AddCommunicationToCase` / `ResolveCase`,
@@ -1462,7 +1463,7 @@ Body 文本 + 📚 来源块(列出每个引用的 URL)
 那是陈旧说法(全仓库没有 `_audit_response`;唯一的审计函数 `bedrock_chat._audit_response_for_change`
 只在 `bedrock_chat.respond()` 里调用),该 docstring 已于 2026-09-03 就地更正。
 要补这条审计,得把它接到 `bot_llm` 上。风险有限:这两处的输出是案例摘要 / 服务分类,不含可执行
-命令,且硬边界(只读角色)照旧;但「文档说有、代码里没有」本身必须消掉,故在此记明。
+命令,且硬边界(IAM 权限)照旧;但「文档说有、代码里没有」本身必须消掉,故在此记明。
 
 ### 5.4 数据保留与隐私
 

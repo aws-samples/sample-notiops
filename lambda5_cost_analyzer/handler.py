@@ -75,7 +75,7 @@ def _assume_role(role_arn: str, account_id: str) -> boto3.Session | None:
           也就是说判据一直在手里、只是没人取。
     """
     from shared.account_scope import (
-        CrossAccountRoleMismatch, assert_role_belongs_to,
+        CrossAccountRoleMismatch, assert_role_belongs_to, assume_role_with_alias,
     )
 
     try:
@@ -89,8 +89,9 @@ def _assume_role(role_arn: str, account_id: str) -> boto3.Session | None:
 
     try:
         sts = boto3.client("sts")
-        resp = sts.assume_role(
-            RoleArn=role_arn,
+        # 别名版：成员账号角色 2026-10 改过名（见 shared.account_scope.sibling_role_arn）。
+        resp, _used = assume_role_with_alias(
+            sts, role_arn,
             RoleSessionName="CostAnalyzer",
             DurationSeconds=3600,
         )

@@ -235,20 +235,29 @@ def _normalize(event: dict):
 
 
 # ---------------------------------------------------------------------------
-# Dedupe — opaque conditional put on inflight#push:<key>
+# Dedupe — conditional put on push_dedupe#<key>; the window ends when its ttl passes
 # ---------------------------------------------------------------------------
 def _claim_dedupe(key: str) -> bool:
-    """Returns True if first time within window, False if a duplicate."""
+    """Returns True if first time within window, False if a duplicate.
+
+    The window ends when the row's `ttl` passes — the condition compares it — not when
+    DynamoDB's TTL sweep deletes the row (asynchronous, "typically within a few days";
+    until then an expired row is still visible to conditional writes). Same fix and
+    reasoning as `web_push_handler._claim_dedupe` (2026-10-11).
+    """
     if not _ddb_table or not key:
         return True
+    now = int(time.time())
     try:
         _ddb_table.put_item(
             Item={
                 "lookup_key": f"push_dedupe#{key}",
-                "claimed_at": int(time.time()),
-                "ttl": int(time.time()) + DEDUPE_TTL_SECONDS,
+                "claimed_at": now,
+                "ttl": now + DEDUPE_TTL_SECONDS,
             },
-            ConditionExpression="attribute_not_exists(lookup_key)",
+            ConditionExpression="attribute_not_exists(lookup_key) OR #t < :now",
+            ExpressionAttributeNames={"#t": "ttl"},
+            ExpressionAttributeValues={":now": now},
         )
         return True
     except _ddb_table.meta.client.exceptions.ConditionalCheckFailedException:

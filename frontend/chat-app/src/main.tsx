@@ -6,6 +6,7 @@ import { initRum } from "./rum";
 import { configureAuth } from "./auth/config";
 import App from "./App";
 import { refreshModelCatalog } from "./models";
+import { STRINGS, detectLocale } from "./i18n";
 
 // 先加载运行时配置，再初始化 RUM/认证并渲染（与 frontend-app 同款启动顺序）
 loadConfig().then(() => {
@@ -21,4 +22,13 @@ loadConfig().then(() => {
       <App />
     </StrictMode>,
   );
+}, (err) => {
+  // 没有运行配置什么都做不了（认证、BFF 地址都在里面）—— 明说，别留一个白屏。
+  // 用 then 的第二个参数而不是 .catch：渲染里抛的错不该被说成「配置没加载出来」。
+  console.error(err);
+  const root = document.getElementById("root");
+  if (root) {
+    root.textContent = STRINGS["app.configLoadFailed"][detectLocale()];
+    root.setAttribute("role", "alert");
+  }
 });

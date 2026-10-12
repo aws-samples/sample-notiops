@@ -1475,9 +1475,14 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         //     缺这一条：接入向导会成功、目标账号在下拉里能选，但每个跨账号问题都失败 ——
         //     最坏情况是模型退化用**部署账号**的数据回答（错误归因）。
         new iam.PolicyStatement({
-          sid: "AssumeMemberIdleDetectionRoles",
+          sid: "AssumeMemberCrossAccountRoles",
           actions: ["sts:AssumeRole"],
-          resources: [`arn:${this.partition}:iam::*:role/notiops-idle-detection-role*`],
+          // 两代名字都要：2026-10 起接入的叫 notiops-cross-account-role-<系统账号>，
+          // 之前接入的叫 notiops-idle-detection-role-<系统账号>（执行侧互为别名）。
+          resources: [
+            `arn:${this.partition}:iam::*:role/notiops-idle-detection-role*`,
+            `arn:${this.partition}:iam::*:role/notiops-cross-account-role-*`,
+          ],
         }),
         // (b) 到成员账号的 trigger 角色去发起深度调查（core/devops_agent.py `_assume_client`，
         //     角色 ARN 来自 Admin 接入时写的 da# 配置行）。

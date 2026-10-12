@@ -407,7 +407,8 @@ class SlackCaps(Caps):
                               chat_id=msg.chat_id, message_id=card_ts,
                               locale=msg.locale, user_id=msg.user_id)
 
-    def case(self, msg: ImMessage, command: str, case_id: str, text: str) -> None:
+    def case(self, msg: ImMessage, command: str, case_id: str, text: str,
+             explicit: bool = False) -> None:
         """案例路径 —— **默认配置下唯一会烧 NotiOps 侧 token 的能力**。
         成因与两处真实调用点见 `platforms/feishu/caps.py::Caps.case` 的 docstring
         （🔴 不是 `analyze_intent`：那是 2026-09-06 校正掉的旧说法；同一天把"唯一"
@@ -439,7 +440,8 @@ class SlackCaps(Caps):
             elif command == "case_reply":
                 case_flow.start_reply(client, msg.chat_id, thread_ts, case_id,
                                       text or "", msg.user_id,
-                                      locale=msg.locale, account_id=account_id)
+                                      locale=msg.locale, account_id=account_id,
+                                      explicit=explicit)
             elif command == "case_resolve":
                 case_flow.start_resolve(client, msg.chat_id, thread_ts, case_id,
                                         locale=msg.locale,

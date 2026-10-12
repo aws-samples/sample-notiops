@@ -424,15 +424,17 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
     resources: [
       "arn:aws:iam::*:role/notiops-agent-trigger-*",
       // 案例多账号（2026-09-07）：`/account` 切到成员账号后开 / 回复 / 关工单，走的是
-      // 成员账号的**采集角色** `notiops-idle-detection-role[-<系统账号>]`
+      // 成员账号的**采集角色** `notiops-cross-account-role-<系统账号>`
+      // （2026-10 之前接入的叫 `notiops-idle-detection-role[-<系统账号>]`，两代互为别名）
       // （由 member-account-onboarding.yaml 建，`EnableSupportCaseWrite=true` 时
       // 带那三条 support 写权限）。
       //
       // ⚠️ 这是与上面 Trigger Role **不同的一族角色**，别以为一条通配盖住了两者：
       // 少了这条的症状是「Web 上跨账号能开工单、IM 上同一个账号 AssumeRole 就 AccessDenied」
       // —— 又一个只在一个入口上出现的不对称。与 web-chat-core.ts 里 BFF 那条对齐
-      // （那边是 `notiops-idle-detection-role*`，同一族）。
+      // （那边是 `notiops-idle-detection-role*` + `notiops-cross-account-role-*`，同一族）。
       "arn:aws:iam::*:role/notiops-idle-detection-role*",
+      "arn:aws:iam::*:role/notiops-cross-account-role-*",
     ],
   }));
 

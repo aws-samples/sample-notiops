@@ -225,7 +225,7 @@ export class AgentCoreStack extends Stack {
       // 覆盖白名单工具用到的服务：Cost Explorer（含 RI/SP 利用率）、Cost Optimization Hub、
       // Compute Optimizer、Budgets、AWS Pricing（Price List）、Free Tier、S3 Storage Lens、
       // 成本分配标签、CUR。这些 API 多不支持资源级限定，故 Resource 用 "*"。全只读、
-      // 客户首次部署即生效。跨账号查别的账号时，目标账号的 notiops-idle-detection-role
+      // 客户首次部署即生效。跨账号查别的账号时，目标账号的跨账号角色
       // 也需同等只读权限（已在 notiops-backend-stack 一并授予）。
       env.runtime.role.addToPrincipalPolicy(
         new iam.PolicyStatement({
@@ -372,9 +372,14 @@ export class AgentCoreStack extends Stack {
       // 多账号：agent 工具跨账号 AssumeRole 进成员采集角色（cases/资源巡检按目标账号取数）。
       // 缺此权限的事故：跨账号被拒 → 模型退化用部署账号数据回答（错误归因）。
       env.runtime.role.addToPrincipalPolicy(new iam.PolicyStatement({
-        sid: 'AssumeMemberIdleDetectionRoles',
+        sid: 'AssumeMemberCrossAccountRoles',
         actions: ['sts:AssumeRole'],
-        resources: ['arn:aws:iam::*:role/notiops-idle-detection-role*'],
+        // 两代名字都要：2026-10 起接入的成员账号角色叫 notiops-cross-account-role-<系统账号>，
+        // 之前的叫 notiops-idle-detection-role-<系统账号>（core/aws_session.py 里互为别名）。
+        resources: [
+          'arn:aws:iam::*:role/notiops-idle-detection-role*',
+          'arn:aws:iam::*:role/notiops-cross-account-role-*',
+        ],
       }));
 
       // 跨账号取数前需先读 config 表拿目标账号的 role_arn（core/aws_session._role_arn_for）。

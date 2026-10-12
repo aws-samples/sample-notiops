@@ -309,8 +309,11 @@ describe("陈旧证据标注（chronic 保留上一轮数字）", () => {
     vi.mocked(api.getInspectionFindings).mockResolvedValue(d);
     vi.mocked(api.getInspectionOverview).mockResolvedValue(OVERVIEW);
     render(<InspectionDashboard dashboardId="high-load" />);
-    await waitFor(() =>
-      expect(screen.getByText(/数据截至 2026-08-10（9 天前）/)).toBeTruthy());
+    /* 2026-10 高负载页改成单行表格：一格放不下整句，面上是短标注「截至 8/10」，
+       整句在 title / aria-label 里（悬浮与读屏拿得到，抽屉里也有整句）。 */
+    await waitFor(() => expect(screen.getByText("截至 8/10")).toBeTruthy());
+    expect(screen.getByText("截至 8/10").getAttribute("title"))
+      .toMatch(/数据截至 2026-08-10（9 天前）/);
   });
 
   it("★★ 证据就是本轮的时候**不标注**（避免每条都挂噪音）", async () => {
@@ -322,7 +325,9 @@ describe("陈旧证据标注（chronic 保留上一轮数字）", () => {
     vi.mocked(api.getInspectionOverview).mockResolvedValue(OVERVIEW);
     render(<InspectionDashboard dashboardId="high-load" />);
     await waitFor(() => expect(screen.getByText(/db-1/)).toBeTruthy());
-    expect(screen.queryByText(/数据截至/)).toBeNull();
+    // ⚠️ 整句挪进了 title —— 只查文字的话这条否定断言恒绿。
+    expect(screen.queryByText(/截至/)).toBeNull();
+    expect(document.querySelector('[title*="数据截至"]')).toBeNull();
   });
 
   it("★ evidence_as_of 缺失（存量行）也不标注", async () => {
@@ -332,7 +337,9 @@ describe("陈旧证据标注（chronic 保留上一轮数字）", () => {
     vi.mocked(api.getInspectionOverview).mockResolvedValue(OVERVIEW);
     render(<InspectionDashboard dashboardId="high-load" />);
     await waitFor(() => expect(screen.getByText(/db-1/)).toBeTruthy());
-    expect(screen.queryByText(/数据截至/)).toBeNull();
+    // ⚠️ 整句挪进了 title —— 只查文字的话这条否定断言恒绿。
+    expect(screen.queryByText(/截至/)).toBeNull();
+    expect(document.querySelector('[title*="数据截至"]')).toBeNull();
   });
 });
 
@@ -416,7 +423,7 @@ describe("finding cards", () => {
     vi.mocked(api.getInspectionFindings).mockResolvedValue(d);
     render(<InspectionDashboard dashboardId="high-load" />);
     await waitFor(() => expect(screen.getByText(/判读缺失/)).toBeTruthy());
-    expect(screen.queryByText(/判读已返回但没有内容/),
+    expect(screen.queryByText(/这次分析没有拿到结果/),
       "「本该判却没派」被说成「回来了是空的」—— 那会让人去重派，而重派"
       + "同样会被额度门拦住",
     ).toBeNull();
@@ -437,7 +444,7 @@ describe("finding cards", () => {
     vi.mocked(api.getInspectionFindings).mockResolvedValue(d);
     render(<InspectionDashboard dashboardId="high-load" />);
     await waitFor(() => expect(
-      screen.getByText(/判读已返回但没有内容/)).toBeTruthy());
+      screen.getByText(/这次分析没有拿到结果/)).toBeTruthy());
     /* 解析状态要**译过** —— `verdictLabel` 早就修过同型问题（客户原话
        「看起来不像是人类可读的词」），`da_parse_status` 是它的未修版本。 */
     expect(screen.queryByText(/parse_failed/),
@@ -3797,6 +3804,16 @@ describe("判读可信度徽标（D22）", () => {
     return d;
   }
 
+  /**
+   * 「判读有降级 N」那个标记。2026-10 高负载页改成表格之后面上只剩一个 ⚠，
+   * 条数在 `aria-label` 里（读屏念的就是它），整句在 `title`。
+   * ⚠️ 文字与 aria-label **都要查**：只查文字的话下面几条「不渲染」的否定断言恒绿。
+   */
+  const caveat = (re: RegExp): HTMLElement | null =>
+    screen.queryByText(re)
+    ?? ([...document.querySelectorAll<HTMLElement>("[aria-label]")]
+      .find((el) => re.test(el.getAttribute("aria-label") || "")) ?? null);
+
   async function renderWith(over: Parameters<typeof withGate>[0]) {
     vi.mocked(api.getInspectionFindings).mockResolvedValue(withGate(over));
     vi.mocked(api.getInspectionOverview).mockResolvedValue(OVERVIEW);
@@ -3828,7 +3845,7 @@ describe("判读可信度徽标（D22）", () => {
     });
     expect(screen.queryByText(/判读不可信/),
       "把「门禁没跑过」显示成了「不可信」—— 存量行会全部误报").toBeNull();
-    expect(screen.queryByText(/判读有降级/)).toBeNull();
+    expect(caveat(/判读有降级/)).toBeNull();
   });
 
   it("★★ 旧 BFF 完全不返回这三个字段（undefined）→ 同样不渲染、不白屏", async () => {
@@ -3843,7 +3860,7 @@ describe("判读可信度徽标（D22）", () => {
     render(<InspectionDashboard dashboardId="high-load" />);
     await waitFor(() => expect(screen.getByText(/db-1/)).toBeTruthy());
     expect(screen.queryByText(/判读不可信/)).toBeNull();
-    expect(screen.queryByText(/判读有降级/)).toBeNull();
+    expect(caveat(/判读有降级/)).toBeNull();
   });
 
   it("★★★ 门禁跑过且干净（空数组）→ 也不渲染徽标", async () => {
@@ -3855,7 +3872,7 @@ describe("判读可信度徽标（D22）", () => {
       da_skills_loaded: ["inspection-high-load"],
     });
     expect(screen.queryByText(/判读不可信/)).toBeNull();
-    expect(screen.queryByText(/判读有降级/)).toBeNull();
+    expect(caveat(/判读有降级/)).toBeNull();
   });
 
   it("★★★ 可信但有降级 → 琥珀徽标带条数，且不说「不可信」", async () => {
@@ -3864,7 +3881,7 @@ describe("判读可信度徽标（D22）", () => {
       da_degradations: ["compaction", "analysis_gap"],
       da_skills_loaded: ["inspection-high-load"],
     });
-    const badge = screen.getByText(/判读有降级 2/);
+    const badge = caveat(/判读有降级 2/)!;
     expect(badge).toBeTruthy();
     expect(screen.queryByText(/判读不可信/),
       "方法论生效了却说「不可信」—— 那会让长载荷/部分成功的正常判读被整批丢掉")
@@ -3882,7 +3899,7 @@ describe("判读可信度徽标（D22）", () => {
     });
     // ⚠️ 原样返回而不是空串：空白会让那一条凭空消失、看起来像后端没给字段；
     //    一个陌生的英文枚举至少能拿去搜代码。与 parseStatusLabel 同套。
-    const title = screen.getByText(/判读有降级 1/).getAttribute("title") || "";
+    const title = caveat(/判读有降级 1/)?.getAttribute("title") || "";
     expect(title).toMatch(/some_future_code/);
   });
 
@@ -3985,7 +4002,7 @@ describe("判读可信度 · 详情抽屉（D22 第二步）", () => {
     await waitFor(() => expect(screen.queryByText(/db-1/)).not.toBeNull());
     // 判读失败的既有提示还在（`insp.judge.failed` 的 zh 文案）
     await waitFor(() =>
-      expect(screen.queryByText(/判读已返回但没有内容/)).not.toBeNull());
+      expect(screen.queryByText(/这次分析没有拿到结果/)).not.toBeNull());
     // 门禁块同屏出现 —— 它解释了「为什么会失败」
     expect(screen.getByText(/这份判读没能证明是按我们的判读方法论做出来的/))
       .toBeTruthy();

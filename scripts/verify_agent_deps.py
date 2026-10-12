@@ -24,11 +24,18 @@
 
 ## 用法
 
-    ./scripts/verify_agent_deps.py              # 按 manifest 约束装（默认）
-    ./scripts/verify_agent_deps.py --latest     # 金丝雀：装上游最新版
-    ./scripts/verify_agent_deps.py --full       # 装 manifest 的全部依赖（慢，最忠实）
+    ./scripts/verify_agent_deps.py                  # 按 agent-constraints.txt 的精确版本装（默认）
+    ./scripts/verify_agent_deps.py --no-constraints # 只按 manifest 的范围装（当天能解析到的最新版）
+    ./scripts/verify_agent_deps.py --latest         # 金丝雀：装上游最新版（无视范围和版本表）
+    ./scripts/verify_agent_deps.py --full           # 装 manifest 的全部依赖（慢，最忠实）
 
 只用标准库，不需要先装任何东西（有 `uv` 就用 `uv`，没有就退回 `python -m venv` + pip）。
+
+## 版本表（2026-10-12 起）
+
+部署时实际装到的版本由 `agent-build/NotiOpsWebChat/agent-constraints.txt` 钉死（deploy_agent.sh
+把它设成 UV_CONSTRAINT）。所以这里默认也按那份版本表装 —— 验的就是**真正打进包的那一组**。
+有 uv 时先离线装（本机缓存命中就几秒），缓存不全才联网重来；`--latest` 金丝雀照旧去拿上游最新版。
 """
 
 from __future__ import annotations
@@ -59,6 +66,8 @@ except ModuleNotFoundError:  # Python 3.10
 REPO_ROOT = Path(__file__).resolve().parent.parent
 APP_DIR = REPO_ROOT / "agent-build" / "NotiOpsWebChat" / "app" / "NotiOpsWebChat"
 BUILD_MANIFEST = APP_DIR / "pyproject.toml"
+# 部署时真正装到的版本（deploy_agent.sh / package_artifacts.sh 都把它设成 UV_CONSTRAINT）。
+CONSTRAINTS = REPO_ROOT / "agent-build" / "NotiOpsWebChat" / "agent-constraints.txt"
 
 # 观测的两个顶层包 —— 也就是「上游一发版就能打挂我们」的那两个。
 WATCHED_ROOTS = ("strands", "bedrock_agentcore")
@@ -202,18 +211,56 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, text=True, **kw)
 
 
-def main() -> int:
+def _clean_env() -> dict[str, str]:
+    """子进程环境：去掉外层（deploy_agent.sh）设的 UV_CONSTRAINT / UV_OFFLINE。
+
+    用哪份版本表、要不要离线，由本脚本自己显式决定 —— 否则 `--latest` 金丝雀会被外层的
+    UV_CONSTRAINT 悄悄钉回旧版本，「装上游最新版」就成了一句空话。
+    """
+    return {k: v for k, v in os.environ.items() if k not in ("UV_CONSTRAINT", "UV_OFFLINE")}
+
+
+def _uv_install(uv: str, venv: Path, python: str, install: list[str],
+                constraints: Path | None, offline: bool) -> int:
+    """用 uv 建 venv 并装依赖；offline=True 时只用本机缓存、不输出（失败了由调用方联网重来）。"""
+    env = _clean_env()
+    if offline:
+        env["UV_OFFLINE"] = "1"
+    quiet = {"capture_output": True} if offline else {}
+    if run([uv, "venv", str(venv), "--python", python], env=env, **quiet).returncode:
+        return 2
+    cmd = [uv, "pip", "install", "--python", str(venv / "bin" / "python"), "--quiet", *install]
+    if constraints:
+        cmd += ["--constraint", str(constraints)]
+    return run(cmd, env=env, **quiet).returncode
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--latest", action="store_true",
-                    help="金丝雀模式：忽略 manifest 上界，装上游最新版")
+                    help="金丝雀模式：忽略 manifest 上界和版本表，装上游最新版")
     ap.add_argument("--full", action="store_true",
                     help="装 manifest 的全部依赖（最忠实，但慢）")
+    ap.add_argument("--constraints", default=str(CONSTRAINTS),
+                    help="版本表（默认 agent-constraints.txt = 部署时真正装到的版本）")
+    ap.add_argument("--no-constraints", action="store_true",
+                    help="不用版本表，只按 manifest 的范围装（当天能解析到的最新版）")
     # 默认钉 3.13 而不是「当前解释器」：托管运行时是 PYTHON_3_13（见 AgentRuntimeArtifact
     # 的 Runtime 字段），要验的就是它。跟着当前解释器走会在本机（.venv 是 3.14）验出一个
     # 客户永远遇不到的组合 —— botocore[crt] 之类连 wheel 都可能还没有，那是假红。
     ap.add_argument("--python", default="3.13",
                     help="venv 的 Python 版本（默认 3.13 = 托管运行时的版本）")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+
+    # 版本表：金丝雀和 --no-constraints 不用；默认必须存在 —— 缺了它，「验证通过」验的就不是
+    # 部署时真正装到的那一组了，不许静默退回「按范围装」。
+    constraints: Path | None = None
+    if not (args.latest or args.no_constraints):
+        constraints = Path(args.constraints)
+        if not constraints.is_file():
+            print(f"[verify-deps] ✗ 找不到版本表 {constraints} —— 部署按它装，验证也必须按它；"
+                  f"确实只想按范围验证就加 --no-constraints")
+            return 2
 
     reqs = manifest_requirements()
     surface = import_surface()
@@ -243,6 +290,8 @@ def main() -> int:
         print("[verify-deps] 金丝雀模式：忽略约束，装上游最新版")
 
     print(f"[verify-deps] 安装：{' '.join(install)}")
+    if constraints:
+        print(f"[verify-deps] 版本按 {constraints.name} 钉死（= 部署时真正打进包的版本）")
 
     uv = shutil.which("uv")
     # mktemp 走 TMPDIR。⚠️ 别硬写 /tmp：本机 /tmp 下有个 gettext.py 会遮蔽标准库，
@@ -250,10 +299,16 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="notiops-verify-deps-") as tmp:
         venv = Path(tmp) / "venv"
         if uv:
-            if run([uv, "venv", str(venv), "--python", args.python]).returncode:
+            # 先离线：本机缓存里都有就几秒完事；缓存不全（新机器、刚升级版本表）再联网重来。
+            # 联网那次用一个新的 venv 目录，不在离线失败留下的半成品上继续。
+            rc = _uv_install(uv, venv, args.python, install, constraints, offline=True)
+            if rc:
+                print("[verify-deps] 本机缓存不全，联网安装…")
+                venv = Path(tmp) / "venv-online"
+                rc = _uv_install(uv, venv, args.python, install, constraints, offline=False)
+            if rc == 2:
                 return 2
             py = venv / "bin" / "python"
-            rc = run([uv, "pip", "install", "--python", str(py), "--quiet", *install]).returncode
         else:
             # `python -m venv` 挑不了版本 —— 它只会用当前解释器。对不上就必须说出来，
             # 否则「验的是 3.14、客户跑的是 3.13」这件事会静默混过去。
@@ -265,7 +320,10 @@ def main() -> int:
             if run([sys.executable, "-m", "venv", str(venv)]).returncode:
                 return 2
             py = venv / "bin" / "python"
-            rc = run([str(py), "-m", "pip", "install", "--quiet", *install]).returncode
+            pip_cmd = [str(py), "-m", "pip", "install", "--quiet", *install]
+            if constraints:
+                pip_cmd += ["-c", str(constraints)]
+            rc = run(pip_cmd, env=_clean_env()).returncode
         if rc:
             print("[verify-deps] ✗ 依赖装不上 —— 约束本身解析不出来，或者网络问题")
             return 1
@@ -295,6 +353,9 @@ def main() -> int:
         print("[verify-deps] 金丝雀红了 = 上游最新版与我们的代码不兼容。"
               "**不要**抬 manifest 上界；把坏版本记进 "
               "tests/test_agent_dep_bounds.py 的 KNOWN_BAD_VERSIONS。")
+    elif constraints:
+        print(f"[verify-deps] {constraints.name} 里钉的这组版本 import 不起来 —— 这是部署时真正会装的东西。"
+              "先在 manifest 里排除坏版本，再跑 bash scripts/refresh_agent_constraints.sh 重新钉版本。")
     else:
         print("[verify-deps] manifest 约束下就装出了坏组合 —— 这是客户会装到的东西，"
               "先收紧约束再谈别的。")

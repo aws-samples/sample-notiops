@@ -1,6 +1,7 @@
-import { useEffect, useRef } from "react";
+import { Fragment, useEffect, useRef, type ReactNode } from "react";
 import { useT } from "../i18n";
 import type { TimelineStep } from "../thinking";
+import { parseStepText, type StepSpan } from "../stepText";
 
 /**
  * 右侧「思考过程」面板 —— **所有**路径的过程展示（模型思考 + 工具调用/返回摘要）。
@@ -33,6 +34,30 @@ function StepIcon({ kind }: { kind?: TimelineStep["kind"] }) {
   if (kind === "result") return <svg {...p}><path d="M20 6 9 17l-5-5" /></svg>;
   // thought / status：一个"想"的气泡
   return <svg {...p}><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg>;
+}
+
+const renderSpans = (spans: StepSpan[]): ReactNode[] => spans.map((sp, j) => {
+  const inner: ReactNode = sp.code ? <code>{sp.text}</code> : sp.text;
+  return <Fragment key={j}>{sp.bold ? <strong>{inner}</strong> : inner}</Fragment>;
+});
+
+/**
+ * 一步的文字。深度调查进度行 / DevOps 对话过程行 / 模型明文思考里有 `**粗体**`、`` `代码` ``、
+ * `# 标题` 这几样 markdown（格式由生产者定，IM 卡片也读同一份，不能在源头改成纯文本），这里按
+ * `stepText.ts` 的极小子集渲染，其余照旧是纯文本。**只拼 React 节点、不经 HTML 解析。**
+ * 行之间补回换行符：`.inv-step-tx` 是 pre-wrap，段落靠它分。
+ */
+function StepText({ text }: { text: string }) {
+  return (
+    <>
+      {parseStepText(text).map((ln, i) => (
+        <Fragment key={i}>
+          {i > 0 && "\n"}
+          {ln.heading ? <strong>{renderSpans(ln.spans)}</strong> : renderSpans(ln.spans)}
+        </Fragment>
+      ))}
+    </>
+  );
 }
 
 export default function ThinkingPanel({
@@ -86,7 +111,7 @@ export default function ThinkingPanel({
                 <div className={"inv-step think-step think-" + (s.kind || "status")} key={i}>
                   <span className="think-ic"><StepIcon kind={s.kind} /></span>
                   <div className="inv-step-tx">
-                    {s.text}
+                    <StepText text={s.text} />
                     {s.repeat && s.repeat > 1 && (
                       <span className="think-repeat">{t("think.repeat").replace("{n}", String(s.repeat))}</span>
                     )}

@@ -1114,10 +1114,14 @@ _TIER1_TOOLS: list[dict] = [
     {
         "name": _TOOL_NAME_DOCS_READ,
         "description": (
-            "Fetch the full text of a single AWS documentation page. Pass a "
+            "Fetch the text of a single AWS documentation page. Pass a "
             "URL returned by aws_docs_search. Returns up to 4000 characters "
-            "of the page (truncated if longer). Use this only after a search "
-            "to get authoritative details that the search excerpt didn't cover."
+            "of the page per call; a longer page ends with a [page …] line "
+            "and starts with a Table of Contents giving each section's char "
+            "range — pass start_index to continue or to jump to a section. "
+            "Never repeat a call with the same url and start_index. Use this "
+            "only after a search to get authoritative details that the search "
+            "excerpt didn't cover."
         ),
         "input_schema": {
             "type": "object",
@@ -1125,7 +1129,13 @@ _TIER1_TOOLS: list[dict] = [
                 "url": {
                     "type": "string",
                     "description": "URL from a previous aws_docs_search result.",
-                }
+                },
+                "start_index": {
+                    "type": "integer",
+                    "description": "Char offset to read from (default 0). The previous "
+                                   "[page …] line's next start_index continues the page; "
+                                   "a Table-of-Contents offset jumps to that section.",
+                },
             },
             "required": ["url"],
         },
@@ -1547,7 +1557,8 @@ def _summarize_tool_args(tool_name: str, args: dict) -> str:
             tail = p.path.rstrip("/").rsplit("/", 1)[-1] or p.path
             host = p.hostname or "unknown"
             short = f"{host}/.../{tail}" if p.path.count("/") > 1 else f"{host}{p.path}"
-            return f'page={short}'
+            start = args.get("start_index") if tool_name == _TOOL_NAME_DOCS_READ else None
+            return f'page={short}' + (f' start_index={start}' if start else '')
         except Exception:
             return f'page={url[:60]}…'
     if tool_name == _TOOL_NAME_LIST_REGIONS:
@@ -1578,6 +1589,21 @@ def _summarize_tool_args(tool_name: str, args: dict) -> str:
                 break
         return " ".join(bits)
     return ""
+
+
+def _docs_page_line(r: dict) -> str:
+    """The `[page …]` line appended to an aws_docs_read result: where this chunk sits and
+    where the next one starts. Without it the model sees a page cut mid-sentence plus a
+    Table of Contents full of char offsets it has no way to use, and re-reads the same
+    URL (seen on the web agent, 2026-10-14). "" when the server sent no paging fields."""
+    start, end, total = r.get("start_index"), r.get("end_index"), r.get("total_length")
+    if not all(isinstance(v, int) for v in (start, end, total)):
+        return ""
+    if r.get("truncated"):
+        return f"\n\n[page: chars {start}-{end} of {total}; next start_index={end}]"
+    if not r.get("content") and 0 < total <= start:
+        return f"[page: start_index={start} is past the end (total_length={total}); nothing more to read]"
+    return f"\n\n[page: chars {start}-{end} of {total}; end of page]" if start else ""
 
 
 def _exec_tool(name: str, args: dict) -> tuple[bool, str, list[dict]]:
@@ -1618,7 +1644,8 @@ def _exec_tool(name: str, args: dict) -> tuple[bool, str, list[dict]]:
         if not url:
             return False, "url is empty", []
         try:
-            r = _aws_docs_mcp.read_documentation_ex(url, max_chars=4000)
+            r = _aws_docs_mcp.read_documentation_ex(url, max_chars=4000,
+                                                    start_index=args.get("start_index") or 0)
         except Exception as e:
             logger.warning("bedrock_chat: tool read exception: %s", e)
             return False, f"read failed: {e}", []
@@ -1631,7 +1658,7 @@ def _exec_tool(name: str, args: dict) -> tuple[bool, str, list[dict]]:
             logger.warning("bedrock_chat: docs read unavailable: %s", r["error"])
             return False, ("docs service unavailable — say the page could not be fetched; "
                            "do not answer from memory"), []
-        return True, r["content"], [{"title": url, "url": url}]
+        return True, r["content"] + _docs_page_line(r), [{"title": url, "url": url}]
 
     if name == _TOOL_NAME_DOCS_RECOMMEND:
         url = (args.get("url") or "").strip()

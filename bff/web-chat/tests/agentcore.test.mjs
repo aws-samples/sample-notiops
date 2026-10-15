@@ -243,5 +243,64 @@ t("ready 帧只在 ready===true 时为真，且不产生正文（它只切等待
   assert.equal(extract({ event: { contentBlockDelta: { delta: { text: "hi" } } } }).ready, false);
 });
 
+/* ── invokeAgent：段落分隔符帧必须原样流给前端、并进落库的全文 ──
+ *
+ * 2026-10-13 现网（v94 / Kimi K3）：工具调用前后的两段正文被拼成一段，`…再查：# 排查结果` 里的
+ * `#` 原样露出。修在 agent 发出端（agent-build/…/paragraphs.py）：工具调用之后的第一段正文前面，
+ * 先单独发一帧只有 "\n\n" 的正文。BFF 这一层什么都不用改，但有两件事必须一直成立，否则修复
+ * 在 BFF 这里被悄悄吃掉：
+ *   ① 纯空白的正文帧照样当 token 转发（谁要是加一句 `if (text.trim())`，空行就没了）；
+ *   ② invokeAgent 返回的全文（/stream 拿它落 DynamoDB，刷新后回放的就是它）与流出去的
+ *      token 逐字相同 —— 实时看到的和历史里存的必须是同一份。
+ * Python 那半（agent 真的会发出这些帧、IM 的 NotiOps 路径同样拼得出空行）：tests/test_agent_paragraphs.py。
+ */
+console.log("\nagentcore — invokeAgent: 段落分隔符帧（工具调用前后的两段正文）");
+
+{
+  const { BedrockAgentCoreClient } = await import("@aws-sdk/client-bedrock-agentcore");
+  const { invokeAgent } = await import("../agentcore.mjs");
+  const td = (text) => ({ event: { contentBlockDelta: { delta: { text }, contentBlockIndex: 0 } } });
+  const frames = [
+    { ready: true },
+    td("我先取证：查当前告警与最近 24 小时的变更事件。"),
+    { progress: { text: "正在查询 CloudWatch 告警…", kind: "tool" } },
+    { event: { messageStart: { role: "assistant" } } },
+    td("\n\n"),
+    td("当前活跃告警里没有 p99 告警，我重试一下，再查："),
+    { progress: { text: "正在查询 CloudTrail 事件…", kind: "tool" } },
+    td("\n\n"),
+    td("# 排查结果：orders-api p99 延迟\n\n"), td("最近 24 小时内没有相关部署。"),
+    { usage: { totalTokens: 10 } },
+  ].map((f) => `data: ${JSON.stringify(f)}\n\n`).join("");
+  // 故意在帧中间、甚至在 UTF-8 多字节字符中间切块：SSE 缓冲 + TextDecoder(stream) 都要扛住。
+  const bytes = new TextEncoder().encode(frames);
+  const cuts = [7, 61, 62, 63, 130, 200, bytes.length];
+  const orig = BedrockAgentCoreClient.prototype.send;
+  BedrockAgentCoreClient.prototype.send = async () => ({
+    response: (async function* () {
+      let at = 0;
+      for (const c of cuts) { yield { chunk: { bytes: bytes.slice(at, c) } }; at = c; }
+    })(),
+  });
+  const tokens = [];
+  let full = "";
+  try {
+    full = await invokeAgent({ conversationId: "c-paragraphs", prompt: "p99?", model: "m", locale: "zh" },
+      { onToken: (d) => tokens.push(d) });
+  } finally {
+    BedrockAgentCoreClient.prototype.send = orig;
+  }
+  t("纯空白的分隔符帧照样当 token 转发（两段之间的空行不许被吃掉）", () => {
+    assert.equal(tokens.filter((x) => x === "\n\n").length, 2, JSON.stringify(tokens));
+  });
+  t("落库全文 == 流出去的 token 逐字拼接，且标题独占一段", () => {
+    assert.equal(full, tokens.join(""));
+    assert.equal(full,
+      "我先取证：查当前告警与最近 24 小时的变更事件。\n\n当前活跃告警里没有 p99 告警，我重试一下，再查：\n\n"
+      + "# 排查结果：orders-api p99 延迟\n\n最近 24 小时内没有相关部署。");
+    assert.ok(!full.includes("再查：#"), "标题又粘回旁白后面了");
+  });
+}
+
 console.log(`\n${fail === 0 ? "PASSED" : "FAILED"}: ${pass} ok, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

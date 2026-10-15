@@ -540,6 +540,8 @@ await t("rollback probes the default model and refuses a broken one", async () =
   state.converseError = null;
   assert.equal(r.status, 400, JSON.stringify(r));
   assert.ok(/forbidden/.test(r.error), r.error);
+  assert.deepEqual(r.probe, { source: "iam", model_id: "global.anthropic.claude-sonnet-5",
+                              alias: "claude-sonnet-5", result: "forbidden" });
   // 错误必须给出下一步，否则管理员只知道"不行"，不知道能怎么办
   assert.ok(/different entry|corrected configuration/.test(r.error), r.error);
   // 且真的没写进去
@@ -1266,8 +1268,10 @@ await t("probe reports which credential it used, and honours credential_mode", a
   // 关键断言：Key 明文确实被交给了客户端（否则探测仍在用 BFF 角色，绿勾是假绿）
   assert.equal(state.runtimeBuilds.at(-1).cred.key, "test-bedrock-api-key-value");
 
-  // 选了 api_key 但 Key 是空的 → 运行时会回退 IAM，探测跟着回退才诚实
-  await mod.apiPutBedrockKey({ clear: true }, ACTOR);
+  // Key 正在被第一来源使用 → 管理页不许清（409）；清了运行时会静默退回部署角色。
+  assert.equal((await mod.apiPutBedrockKey({ clear: true }, ACTOR)).status, 409);
+  // 选了 api_key 但 Key 是空的（Secret 在管理页之外被清掉）→ 运行时会回退 IAM，探测跟着回退才诚实
+  state.secret = "{}";
   state.runtimeBuilds.length = 0;
   const fellBack = await mod.apiTestLlmModel({
     model_id: "global.anthropic.claude-sonnet-5", kind: "bedrock_anthropic",
@@ -1406,6 +1410,9 @@ await t("a default model that fails a deterministic probe is rejected on save", 
       assert.equal(r.status, 400, `${expect}: ${JSON.stringify(r)}`);
       assert.ok(/failed a live check/.test(r.error), r.error);
       assert.ok(r.error.includes(expect), `error should name the verdict: ${r.error}`);
+      // 结构化细节：前端按它标出来源行 / 模型行，不靠解析英文句子
+      assert.deepEqual(r.probe, { source: "iam", model_id: "global.anthropic.claude-sonnet-5",
+                                  alias: "claude-sonnet-5", result: expect });
       // **不得落盘**：拦在写入之前，而不是先存再靠一个标记去追
       assert.equal(state.item.generation, genBefore, "a rejected save must not be persisted");
     } finally {
@@ -1789,6 +1796,27 @@ await t("GET backend-tasks distinguishes 'never configured' from 'in sync'", asy
     assert.equal(row.status, "unbound", `${row.task}: ${row.status}`);
     assert.equal(row.in_sync, false, `${row.task} must not report in_sync when unbound`);
   }
+});
+
+await t("GET backend-tasks reports 'preset' (not drift) for an unbound task over a seeded row", async () => {
+  // 方式 B 的 SeedDataResource 给 appconfig#devops_agent 预置了一行（没有 projected_from）。
+  // 未绑定时保存故意不动它，所以报 drift 叫人「重新保存」是一句永远修不好的话（698 实测）。
+  await mod.apiPutLlmConfig(GOOD(), ACTOR);
+  state.appconfig["appconfig#devops_agent|bedrock_model_id"] = {
+    PK: "appconfig#devops_agent", SK: "bedrock_model_id",
+    config_value: "global.anthropic.claude-opus-4-6-v1", updated_at: "2026-01-01T00:00:00Z",
+  };
+  const r = await mod.apiGetBackendTasks();
+  const dv = r.tasks.find((x) => x.task === "devops_report_summarize");
+  assert.equal(dv.status, "preset", dv.status);
+  assert.equal(dv.projected_model_id, "global.anthropic.claude-opus-4-6-v1");
+  assert.equal(dv.in_sync, false);
+  // 绑一个模型并保存 → 接管（投影覆盖预置行），状态变 in_sync
+  const cfg = GOOD();
+  cfg.backend_tasks = { devops_report_summarize: "claude-sonnet-5" };
+  await mod.apiPutLlmConfig(cfg, ACTOR);
+  const r2 = await mod.apiGetBackendTasks();
+  assert.equal(r2.tasks.find((x) => x.task === "devops_report_summarize").status, "in_sync");
 });
 
 await t("GET backend-tasks reports 'unknown' when the projection cannot be read", async () => {

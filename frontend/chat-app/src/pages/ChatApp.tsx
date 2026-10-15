@@ -915,7 +915,8 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
             if (p?.text) pushThinking(appendStep(thinkTimeline, { text: p.text, kind: p.kind }, Date.now()));
           },
           // 思考过程增量：**只**并进右侧「思考过程」面板的思考段（气泡里不再另起一份折叠灰字 ——
-          // 那会和面板入口同名同内容，见 Message.tsx 入口规矩 3）。语言由 agent 端锁定跟随本轮。
+          // 那会和面板入口同名同内容，见 Message.tsx 入口规矩 3）。语言由 agent 端在 prompt 里**引导**跟随本轮，
+          // 不是锁定：思考是模型自己写的，偶尔仍会是英文（见 agent main.py 的 _lang_lock）—— 别据此假设它和正文同语言。
           onReasoning: (r) => {
             if (r?.text) pushThinking(appendReasoning(thinkTimeline, r.text, Date.now()));
           },

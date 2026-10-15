@@ -10,6 +10,7 @@ import { getSupportServices, type SupportService, type AccountInfo } from "../ap
 // 因为候选集现在由管理员在服务端决定，不再是编译期常量。
 import { modelDisplayName } from "../models";
 import { SHOW_TOKEN_USAGE } from "../featureFlags";
+import { formatMessageTime } from "../messageTime";
 
 // 署名文案："AWS Bedrock (DeepSeek V3.2) · 1,234 tokens"
 // 所有模型均经 Amazon Bedrock 提供（GPT-5.6 经 Bedrock Mantle），故 provider 统一。
@@ -37,7 +38,9 @@ function modelSignature(model: string | undefined, usage: ChatMessage["usage"], 
   if (via === "builtin") return "NotiOps";
   const name = modelDisplayName(model);
   if (!name) return "";
-  let base = `AWS Bedrock (${name})`;
+  // via="gateway"：管理员把「OpenAI 兼容网关」排在模型来源第一位，这一轮由网关答（数据去了网关
+  // 运营方及其上游，不经 Bedrock）。署成「AWS Bedrock (…)」就是把来源与计费主体说错。
+  let base = via === "gateway" ? `Model gateway (${name})` : `AWS Bedrock (${name})`;
   // token 用量当前**只藏显示**（`SHOW_TOKEN_USAGE = false`），`usage` 本身照旧收、照旧落库。
   // 开关的完整理由与消费点清单写在 featureFlags.ts 那个常量上。
   const tot = usage?.totalTokens;
@@ -70,13 +73,6 @@ function PulseWave() {
   return (
     <span className="pulsewave"><i /><i /><i /><i /><i /></span>
   );
-}
-
-function fmtTime(ts: number, locale: string) {
-  const d = new Date(ts);
-  const hh = d.getHours();
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  return (locale === "en" ? "Today " : "今天 ") + hh + ":" + mm;
 }
 
 // AWS Support 控制台案例页 URL
@@ -646,7 +642,7 @@ export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAct
     return (
       <div className="row user">
         <div className="msg">
-          <div className="ts">{fmtTime(m.ts, locale)}</div>
+          <div className="ts">{formatMessageTime(m.ts, locale)}</div>
           <p className="bubble">{m.text}</p>
           {/* 用户消息也提供复制按钮（与 assistant 一致） */}
           <div className="msgbar user">
@@ -697,7 +693,7 @@ export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAct
   return (
     <div className="row bot">
       <div className="msg">
-        <div className="ts">{fmtTime(m.ts, locale)}</div>
+        <div className="ts">{formatMessageTime(m.ts, locale)}</div>
 
         {thinkEntry}
 

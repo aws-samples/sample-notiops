@@ -394,6 +394,11 @@ CJK_ALLOWLIST = {
     #    ② `PROBE` 是**嵌到子进程里执行的源码字符串**，本 linter 会把它当普通字面量
     #      扫（`:112` 那条就是）。它连"文案"都不是。
     "scripts/verify_agent_deps.py",
+    # 输出崩坏守卫的离线端到端检查(与 `check_repeat_call_guard.py` 同类:开发者升级 strands
+    # 时在 agent venv 里手动跑,不在任何客户路径上)。CJK 全是**脚本化假模型吐出来的 fixture**
+    # —— 守卫判的正是「汉字和英文字母用 `-` 粘在一起」,反例必须真的是中文才撞得上它;另有一条
+    # 「日志行里不许出现汉字」的断言正则。翻译它们等于把被测对象换掉。Developer-facing only。
+    "scripts/check_degeneration_guard.py",
     # Sanitizer denylist — internal blocklist of OpenAI ChatML
     # protocol fragments + Chinese SEO/gambling spam tokens that
     # must NEVER reach end users. These strings are pattern fixtures,

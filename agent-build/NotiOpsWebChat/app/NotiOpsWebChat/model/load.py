@@ -9,7 +9,9 @@ DDB 不可用时该模块回退内置兜底目录）。加一个模型现在是�
   · load_model(model_key)      → Strands 模型实例
   · resolve_model_id(model_key) → wire-level model id（用于「模型自身知识」来源标注与落款）
 
-两条路径：
+三条路径：
+  · kind == openai_compatible        → OpenAIModel（Chat Completions）+ Admin 配的网关
+                                        （LiteLLM / New API 这类，见 `_make_gateway_model`）
   · kind == bedrock_mantle_responses → OpenAIResponsesModel + Bedrock Mantle（GPT 系）
   · 其余                             → 标准 BedrockModel（Converse）
 """
@@ -290,6 +292,89 @@ def _attach_key_rejection_listener(model) -> None:
         logger.warning("could not attach key-rejection listener: %s", e)
 
 
+# ── OpenAI 兼容网关 ──────────────────────────────────────────────────────────
+# 网关重试次数。openai-python 默认 2 次重试（共 3 次尝试）：300s × 3 = 900s，恰好等于 BFF
+# Lambda 的 15 分钟 —— 客户端还在重试、Lambda 先被杀，前端拿到「（无响应）」。与 Bedrock
+# 那条路同一个算法（见 `_BOTO_CLIENT_CONFIG` 的 max_attempts=2）：1 次重试，最坏 600s。
+GATEWAY_MAX_RETRIES = 1
+# 读超时与 Bedrock 那条路同一个数；**建连**单独 10s（与 `_BOTO_CLIENT_CONFIG.connect_timeout` 一致）。
+# 只给一个 float 的话 httpx 会把建连超时也设成 300s：网关主机丢 SYN 时一次尝试就等 5 分钟、
+# 两次 10 分钟，客户看到的却是「模型在长推理」—— 诊断方向全错。
+GATEWAY_CONNECT_TIMEOUT_SEC = 10.0
+
+
+def _gateway_timeout():
+    # `openai.Timeout` 就是 openai-python 3.x 内部 httpx2 的 Timeout —— 别用 `httpx.Timeout`，
+    # 那是另一个包（httpx 0.28），类型对不上。
+    import openai
+    return openai.Timeout(float(BEDROCK_READ_TIMEOUT_SEC), connect=GATEWAY_CONNECT_TIMEOUT_SEC)
+
+
+def _make_gateway_model(spec: llm_config.ResolvedModel):
+    """构造走 OpenAI 兼容网关的模型实例（`/chat/completions`，流式 + 工具调用）。
+
+    为什么用 Strands 的 `OpenAIModel` 而不是 `LiteLLMModel`：后者要在 runtime 里装 litellm
+    整个包（依赖面大，且它会按 model_id 前缀改写路由，参考项目里那套 `bedrock/` 前缀改写就是
+    为了绕它），而 LiteLLM Proxy 与 New API 对外都是标准的 OpenAI Chat Completions ——
+    LiteLLM 文档里客户端就是 `openai.OpenAI(base_url=<proxy>)`，New API 的
+    `POST /v1/chat/completions` 也写明 OpenAI 兼容。直连那一层，一个实现两边都通。
+
+    连接信息**每请求重读**（`_resolve_client_args` 本来就每请求调一次，`get_gateway_config`
+    是 TTL 缓存读，并按 `gateway_rev` 立即失效）。在构造时取一次的后果是 Mantle 那条路实测过的：
+    模型实例活在被缓存的 Agent 里（session 最长 8h），Admin 换了 Key 整个会话还用旧的。
+    读不到连接信息时抛 `GatewayNotConfigured`，**不回退 Bedrock**（用户决策：第一来源坏了直接
+    失败，由 Admin 手动换来源），main.py 把它报成一条说明去哪里改的回答。
+
+    参数用 `max_tokens`：OpenAI 官方已把它标为 deprecated、推理模型要 `max_completion_tokens`，
+    但网关后面挂的多半不是 OpenAI 本家 —— `max_tokens` 是各家兼容面最大的那个，LiteLLM 对
+    o 系列会自己改写成 `max_completion_tokens`。
+    """
+    import openai as _openai
+    from strands.models.openai import OpenAIModel
+
+    class _GatewayModel(OpenAIModel):
+        def _resolve_client_args(self):  # type: ignore[override]
+            gw = llm_config.get_gateway_config()     # 抛 GatewayNotConfigured；含凭证，不记日志
+            args = dict(super()._resolve_client_args())
+            args["base_url"] = gw["base_url"]
+            args["api_key"] = gw["api_key"]
+            timeout = _gateway_timeout()
+            args["timeout"] = timeout
+            args["max_retries"] = GATEWAY_MAX_RETRIES
+            # **不跟随重定向**。openai-python 默认的 httpx 客户端 follow_redirects=True：307 / 308
+            # 会把整段对话（含工具返回的账号、成本、工单内容）原样 POST 到 Location，包括 http://
+            # 地址。httpx 跨域时会摘掉 Authorization，但请求体照发。BFF 那侧同样拒绝重定向。
+            # Strands 每请求建一次 AsyncOpenAI 并在结束时关闭，这个客户端跟着它的生命周期走。
+            args["http_client"] = _openai.DefaultAsyncHttpxClient(
+                follow_redirects=False, timeout=timeout)
+            return args
+
+        def format_request(self, *args, **kwargs):  # type: ignore[override]
+            # Strands 无工具时也发 `"tools": []`（寒暄快路径就是 tools=[]）。空数组各家处理不一：
+            # OpenAI 报过 400「Invalid 'tools': empty array」，xAI 对「空 tools + tool_choice」
+            # 也报 400（CLIProxyAPI issue #4491），收下的又会多计 token。没有工具就不带这两个键。
+            request = super().format_request(*args, **kwargs)
+            if not request.get("tools"):
+                request.pop("tools", None)
+                request.pop("tool_choice", None)
+            return request
+
+        async def stream(self, *args, **kwargs):  # type: ignore[override]
+            # 401 = 本进程缓存的 Key 已被 Admin 换掉（或在网关侧被吊销）。清缓存，下一轮重读
+            # Secret；这一轮照常失败，由 main.py 报给用户。
+            try:
+                async for event in super().stream(*args, **kwargs):
+                    yield event
+            except _openai.AuthenticationError:
+                llm_config.invalidate_gateway_config()
+                raise
+
+    return _GatewayModel(
+        model_id=spec.model_id,
+        params={"max_tokens": spec.max_output_tokens},
+    )
+
+
 def _bedrock_fallback_spec() -> llm_config.ResolvedModel:
     """Mantle 构造失败时的兜底：一个**非 Mantle** 的可用模型。
 
@@ -316,6 +401,9 @@ def load_model(model_key: str | None = None):
       支持 prompt cache 的模型额外开工具/提示缓存。
     """
     spec = llm_config.resolve(model_key)
+    if spec.is_gateway:
+        # 不包 try/回退：网关是 Admin 选的第一来源，坏了就该让人看见（见 _make_gateway_model）。
+        return _make_gateway_model(spec)
     if spec.is_mantle:
         try:
             return _make_mantle_responses_model(spec)

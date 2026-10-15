@@ -53,7 +53,7 @@ import { apiGetNotificationConfig, apiPutNotificationConfig, apiTestNotification
 import { apiGetDingtalkConfig, apiPutDingtalkConfig, apiTestDingtalkSend } from "./dingtalk_config.mjs";
 import { apiGetSlackConfig, apiPutSlackConfig, apiTestSlackSend } from "./slack_config.mjs";
 import { apiGetAliyunConfig, apiPutAliyunConfig } from "./aliyun_config.mjs";
-import { apiGetLlmConfig, apiPutLlmConfig, apiGetCandidates, apiPutBedrockKey, apiTestLlmModel, apiListLlmAudit, apiRollbackLlmConfig, apiGetModels, apiGetBackendTasks, apiPutBackendTasks, apiGetLlmStatus, resolveForStream } from "./llm_config.mjs";
+import { apiGetLlmConfig, apiPutLlmConfig, apiGetCandidates, apiPutBedrockKey, apiPutGateway, apiGetGatewayModels, apiTestLlmModel, apiListLlmAudit, apiRollbackLlmConfig, apiGetModels, apiGetBackendTasks, apiPutBackendTasks, apiGetLlmStatus, resolveForStream } from "./llm_config.mjs";
 
 const enc = new TextEncoder();
 const sse = (event, data) => enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -482,13 +482,24 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
       const r = await apiPutBedrockKey(authBody, actorOf());
       return r.error ? json(r.status || 400, { message: r.error }) : json(200, r);
     }
+    if (method === "PUT" && path.endsWith("/admin/llm-config/gateway")) {
+      const r = await apiPutGateway(authBody, actorOf());
+      return r.error ? json(r.status || 400, { message: r.error, result: r.result }) : json(200, r);
+    }
+    if (method === "GET" && path.endsWith("/admin/llm-config/gateway/models")) {
+      const r = await apiGetGatewayModels();
+      return r.error ? json(r.status || 400, { message: r.error }) : json(200, r);
+    }
     if (method === "POST" && path.endsWith("/admin/llm-config/test")) {
       const r = await apiTestLlmModel(authBody);
       return r.error ? json(r.status || 400, { message: r.error }) : json(200, r);
     }
     if (method === "POST" && path.endsWith("/admin/llm-config/rollback")) {
       const r = await apiRollbackLlmConfig(authBody, actorOf());
-      return r.error ? json(r.status || 400, { message: r.error }) : json(200, r);
+      // 探测拒绝时带上结构化的 `probe`（来源 / 条目 / 枚举结果），前端据此给本地化文案。
+      return r.error
+        ? json(r.status || 400, { message: r.error, ...(r.probe ? { probe: r.probe } : {}) })
+        : json(200, r);
     }
     if (method === "GET" && path.endsWith("/admin/llm-config/audit")) {
       return json(200, await apiListLlmAudit());
@@ -514,7 +525,9 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
         // 并且**记一行日志** —— 4xx 此前完全不记，CloudWatch 里查不到任何线索，
         // 而配置校验失败恰恰是最需要事后追溯的一类请求。不记请求体（含目录全文）。
         console.warn(`[BFF] 400 PUT /admin/llm-config rejected: ${r.error}`);
-        return json(r.status || 400, { error: r.error, message: r.error });
+        // 保存时现场探测没过 → 带上结构化的 `probe`：前端按它把来源行、模型行、保存条一起标出，
+        // 并给出本地化原因（`message` 是英文、给日志与老前端看的）。
+        return json(r.status || 400, { error: r.error, message: r.error, ...(r.probe ? { probe: r.probe } : {}) });
       }
       return json(200, r);
     }

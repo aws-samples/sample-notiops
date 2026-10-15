@@ -36,9 +36,23 @@ async function req<T>(method: string, pathSuffix: string, body?: unknown): Promi
     const reason = (rec.error as string) || (rec.message as string) || "";
     const keys = Array.isArray(rec.keys) ? ` (${(rec.keys as string[]).join(", ")})` : "";
     const hint = rec.hint ? ` — ${String(rec.hint)}` : "";
-    throw new Error(reason ? `${reason}${keys}${hint}` : `http_${r.status}`);
+    // `result`：服务端给的枚举态（如网关保存被拒时的 unauthorized / redirect），界面据此给出
+    // 本地化文案，而不是把英文原句直接摆给中文管理员。
+    // `probe`：保存 / 回滚时现场探测没过的那一条（来源 / 条目 / 结果），界面据此标出是哪一行。
+    throw Object.assign(new Error(reason ? `${reason}${keys}${hint}` : `http_${r.status}`),
+                        { status: r.status, result: typeof rec.result === "string" ? rec.result : undefined,
+                          probe: parseSaveProbe(rec.probe) });
   }
   return j as T;
+}
+
+/** 只认形状完整的 `probe`：来源在三种之内、三个字符串字段齐全。别把任意服务端对象塞给 UI。 */
+function parseSaveProbe(v: unknown): LlmSaveProbe | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const p = v as Record<string, unknown>;
+  if (!["iam", "api_key", "gateway"].includes(String(p.source))) return undefined;
+  if (typeof p.model_id !== "string" || typeof p.alias !== "string" || typeof p.result !== "string") return undefined;
+  return { source: p.source as LlmSource, model_id: p.model_id, alias: p.alias, result: p.result as LlmProbeResult };
 }
 
 export async function fetchAllCapabilities(): Promise<FullCapabilityNode[]> {
@@ -488,8 +502,24 @@ export async function testDaConnection(
 
 // ── LLM 模型目录与凭证（DDB llmcfg + Secrets Manager；spec: llm-provider-and-model-management）──
 // 真源在 DynamoDB，管理员在这里勾选启用集；普通用户经 GET /models 只读到启用集。
-export type ModelKind = "bedrock_anthropic" | "bedrock_converse" | "bedrock_mantle_responses";
+export type ModelKind = "bedrock_anthropic" | "bedrock_converse" | "bedrock_mantle_responses"
+  | "openai_compatible";
 export type ModelSurface = "webchat" | "im";
+/** 模型来源（2026-10）：本账号 IAM / 他账号 Bedrock API Key / OpenAI 兼容网关。
+ *  Admin 拖出一个次序，**只用第一个**，坏了不自动降级。 */
+export type LlmSource = "iam" | "api_key" | "gateway";
+
+/** 连通性探测的枚举结果（BFF probeConverse / probeMantle / probeGateway 的返回集合）。
+ *  `upstream_auth`：网关认这把 Key（GET /models 能列），但它调这个模型的上游时没有授权。 */
+export type LlmProbeResult = "ok" | "forbidden" | "unauthorized" | "upstream_auth" | "invalid_model"
+  | "not_found" | "throttled" | "not_ready" | "timeout" | "error" | "probe_error" | "needs_profile"
+  | "no_tools" | "not_configured" | "unreachable" | "redirect" | "bad_response" | "blocked_host";
+
+/** 保存 / 回滚被现场探测拒绝时，服务端回的结构化细节（只有枚举与目录里的 alias / model_id）。 */
+export interface LlmSaveProbe { source: LlmSource; model_id: string; alias: string; result: LlmProbeResult }
+
+/** `req()` 抛出的错误：HTTP 状态 + 服务端给的枚举态 / 探测细节。 */
+export type AdminApiError = Error & { status?: number; result?: string; probe?: LlmSaveProbe };
 
 export interface LlmModelEntry {
   alias: string;
@@ -524,14 +554,44 @@ export interface BedrockKeyStatus {
   error?: string;
 }
 
+/** 网关连接状态。地址照实回（管理员要看见它），Key 只有后 4 位。 */
+export interface GatewayStatus {
+  configured: boolean;
+  base_url?: string;
+  /** 存着的地址不合法（手改过 Secret / 规则收紧）—— 解释为什么「未配置」。 */
+  base_url_valid?: boolean;
+  has_key?: boolean;
+  last_4?: string;
+  length?: number;
+  set_at?: string;
+  set_by?: string;
+  error?: string;
+}
+
+/** 网关 GET /models 的结果（已滤掉通配符与非对话模型）。 */
+export interface GatewayModelList {
+  result: string;
+  models: { id: string; owned_by?: string }[];
+  hidden: { id: string; reason: string }[];
+  total: number;
+  latency_ms?: number;
+}
+
 export interface LlmConfig {
   provider: string;
-  credential_mode: "iam" | "api_key";
+  /** 第一来源（= source_order[0]）。 */
+  credential_mode: LlmSource;
+  source_order: LlmSource[];
+  /** 每个来源各自的默认模型 alias；第一来源那一格与 default_model 相同。 */
+  source_defaults: Partial<Record<LlmSource, string>>;
+  /** IM 端实际用的来源（IM 不接网关，网关排第一时是排在最前的 Bedrock 来源）。 */
+  im_source?: LlmSource;
   default_model: string;
   generation: number;
   models: LlmModelEntry[];
   backend_tasks: Record<string, string | null>;
   bedrock_api_key: BedrockKeyStatus;
+  gateway?: GatewayStatus;
   seeded: boolean;
   updated_at: string;
   updated_by: string;
@@ -561,6 +621,8 @@ export interface LlmCandidate {
 export interface BackendTaskRow {
   task: string;
   alias: string;
+  /** 实际生效的条目。与 alias 不同 = 第一来源换了家族（如切到网关），任务跟着用该来源的默认模型。 */
+  effective_alias?: string;
   model_id: string;
   projected_model_id: string;
   projected_at: string;
@@ -574,7 +636,8 @@ export interface BackendTaskRow {
    * 三态而非布尔：旧的 `in_sync` 在什么都没配时是 `"" === ""` → true，
    * 于是从未配置过的系统显示为「已同步」，而这是唯一的漂移信号。
    */
-  status: "unbound" | "in_sync" | "drift" | "unknown";
+  /** preset：未绑定，但后端读到的是一份预置 / 人手填的值（projected_model_id），不是我们投影的。 */
+  status: "unbound" | "in_sync" | "drift" | "unknown" | "preset";
   in_sync: boolean;
 }
 
@@ -584,9 +647,20 @@ export async function fetchLlmConfig(): Promise<LlmConfig> {
 /** 整份保存。generation 由服务端生成，请求体里带也会被忽略。并发冲突返回 409。 */
 export async function putLlmConfig(cfg: {
   provider: string; credential_mode: string; default_model: string;
+  source_order?: LlmSource[]; source_defaults?: Partial<Record<LlmSource, string>>;
   models: LlmModelEntry[]; backend_tasks?: Record<string, string | null>;
 }): Promise<{ message: string; generation: number; warning?: string }> {
   return req("PUT", "/admin/llm-config", cfg);
+}
+/** 设置 / 清除网关连接信息。服务端先用新信息 GET {base}/models 验证（不花 token），过了才落库。
+ *  `api_key` 省略 = 沿用已存的 Key。响应里只有脱敏状态 + 刚拉到的模型列表。 */
+export async function putGateway(body: { base_url?: string; api_key?: string; clear?: boolean }):
+Promise<{ message: string; gateway: GatewayStatus; warning?: string } & Partial<GatewayModelList>> {
+  return req("PUT", "/admin/llm-config/gateway", body);
+}
+/** 用已保存的网关连接信息列模型（GET {base}/models，不花 token）。 */
+export async function fetchGatewayModels(): Promise<GatewayModelList> {
+  return req("GET", "/admin/llm-config/gateway/models");
 }
 /** 候选枚举。
  *  `source_identity` = 这份列表是用**哪个身份**问出来的：
@@ -606,14 +680,18 @@ Promise<{ message: string; bedrock_api_key: BedrockKeyStatus }> {
 /** 连通性探测。只回枚举态（ok / forbidden / unauthorized / not_found / …），不透传上游原文。
  *  `credential` 是这次探测**实际使用**的凭证（`api_key` / `iam`）—— 必须知道它才能说清
  *  「已验证」的含义：api_key 模式下若 Key 为空，服务端会回退 IAM，那时绿勾与 Key 无关。 */
-export async function testLlmModel(body: { model_id: string; kind: ModelKind; region?: string }):
-Promise<{ model_id: string; result: string; latency_ms?: number; detail?: string;
+export async function testLlmModel(body: { model_id: string; kind: ModelKind; region?: string;
+                                           /** 用哪个 Bedrock 来源的凭证去验（不传 = 排在最前的那个）。 */
+                                           source?: "iam" | "api_key" }):
+Promise<{ model_id: string; result: LlmProbeResult; latency_ms?: number; detail?: string;
           credential?: string }> {
   return req("POST", "/admin/llm-config/test", body);
 }
 export async function fetchLlmAudit(): Promise<{
   entries: { SK: string; at: string; actor_name?: string; actor_sub?: string;
-             generation_before?: number; generation_after?: number }[];
+             generation_before?: number; generation_after?: number;
+             /** 这一条改了什么（`gateway_set:<旧主机>-><新主机>` / `key_set` / `backend_tasks` / `rollback_to:<sk>`），旧记录没有 */
+             note?: string }[];
 }> {
   return req("GET", "/admin/llm-config/audit");
 }

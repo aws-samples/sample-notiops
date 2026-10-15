@@ -180,8 +180,11 @@ def test_send_report_posts_markdown():
                i18n.t("progress.btn.open_link", "en") not in text)
         _check("body has NO console-login warning",
                i18n.t("progress.link_login_warning", "en") not in text)
-        _check("body has link-validity footnote",
-               i18n.t("report.link_validity", "en") in text)
+        # 2026-10-13 起那句说明按链接**形状**挑（shared/report_delivery/link_validity.py）：
+        # 这里两条都是不带签名参数的 https 链接 = ReportsCDN 的形状 → 「7 天」那句。
+        _check("body has link-validity footnote (CDN-shaped links → 7 days)",
+               i18n.t("report.link_validity_cdn", "en") in text
+               and i18n.t("report.link_validity", "en") not in text)
         _check("body has next-step",        "Check ALB" in text)
 
 

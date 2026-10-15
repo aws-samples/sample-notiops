@@ -6,7 +6,9 @@
  *   PUT  /admin/llm-config              写配置（校验不变量 + 原子更新 generation + 审计快照）
  *   GET  /admin/llm-config/candidates   候选模型全集（ListFoundationModels + Mantle 型号表）
  *   PUT  /admin/llm-config/bedrock-key  设置/清除 Bedrock API Key
- *   POST /admin/llm-config/test         逐模型连通性探测（只回枚举态）
+ *   PUT  /admin/llm-config/gateway      设置/清除 OpenAI 兼容网关（base_url + api_key，先 GET /models 验证）
+ *   GET  /admin/llm-config/gateway/models  用已保存的网关连接信息列模型（不花 token）
+ *   POST /admin/llm-config/test         逐模型连通性探测（只回枚举态；网关模型带一个工具定义）
  *   POST /admin/llm-config/rollback     回滚到上一 generation（数据源 = 审计快照）
  *   GET  /admin/llm-config/audit        审计列表（不含快照正文，避免响应过大）
  *   GET/PUT /admin/llm-config/backend-tasks
@@ -47,6 +49,8 @@ import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-r
 import {
   SecretsManagerClient, GetSecretValueCommand, UpdateSecretCommand, CreateSecretCommand,
 } from "@aws-sdk/client-secrets-manager";
+import net from "node:net";
+import dns from "node:dns/promises";
 
 const TABLE = process.env.CONFIG_TABLE || "notiops-config";
 const SECRET_ID = process.env.BEDROCK_API_KEY_SECRET || "notiops/bedrock-api-key";
@@ -122,9 +126,56 @@ export function __setClients(overrides = {}) {
   if (overrides.sm) sm = overrides.sm;
   if (overrides.runtimeFactory) runtimeFactory = overrides.runtimeFactory;
   if (overrides.bedrockFactory) bedrockFactory = overrides.bedrockFactory;
+  if (overrides.dnsLookup) dnsLookup = overrides.dnsLookup;
+  if (overrides.gatewayFetch) gatewayFetch = overrides.gatewayFetch;
 }
 
-const KINDS = new Set(["bedrock_anthropic", "bedrock_converse", "bedrock_mantle_responses"]);
+// 打网关用的 fetch，可注入（测试不触网）。**不跟随重定向**：公网网关 302 到内网地址
+// 是最直接的 SSRF 绕法，且重定向会把 Authorization 带过去。
+let gatewayFetch = (url, init) => fetch(url, { ...init, redirect: "manual" });
+
+// Node 20+ 的 happy-eyeballs 每个地址只给 250ms 建连，超时就掐掉换下一个
+// （nodejs/node#54359）。网关多半挂在 CDN 后面、解析出一串 IP，链路 RTT 一过 250ms，
+// 每个 IPv4 都在握手完成前被掐掉，最后报 AggregateError ETIMEDOUT —— curl 同一地址是好的。
+// 2026-10-13 本机实测：对 CloudFront 上的测试网关 fetch 失败、curl 200。网关可能在任何地方，
+// 离部署区远的就会中。调到 2.5s：只推迟「换下一个地址」的时机，不影响正常连接。
+// 进程级设置，对本 Lambda 里的 AWS SDK 连接同样无害。
+if (typeof net.setDefaultAutoSelectFamilyAttemptTimeout === "function"
+    && net.getDefaultAutoSelectFamilyAttemptTimeout() < 2500) {
+  net.setDefaultAutoSelectFamilyAttemptTimeout(2500);
+}
+
+/* ───────────────── 模型来源（2026-10）─────────────────
+ * 三种来源：本账号 IAM（iam）、他账号的 Bedrock API Key（api_key）、OpenAI 兼容网关
+ * （gateway：LiteLLM / New API 这类）。Admin 拖成一个次序 `source_order`，**只用第一个**；
+ * 坏了不自动降级，由 Admin 手动把备用项拖到最上面（用户决策 —— 静默换来源等于静默换掉
+ * 数据驻留与计费主体）。每个来源只调自己家族的条目，各自记一个默认模型 `source_defaults`。
+ * IM 原生链路（core/bedrock_chat）一期只会调 Bedrock：网关排第一时 IM 用排在最前的那个
+ * Bedrock 来源。与 core/llm_config.py 的 `_SURFACE_SOURCES` 同一条规则。
+ */
+const BEDROCK_KINDS = new Set(["bedrock_anthropic", "bedrock_converse", "bedrock_mantle_responses"]);
+const GATEWAY_KIND = "openai_compatible";
+const KINDS = new Set([...BEDROCK_KINDS, GATEWAY_KIND]);
+const SOURCES = ["iam", "api_key", "gateway"];
+const SURFACE_SOURCES = { webchat: SOURCES, im: ["iam", "api_key"] };
+// 网关连接信息 `{base_url, api_key}`。名字沿用 infra 早就建好的那个 Secret。
+const GATEWAY_SECRET_ID = process.env.GATEWAY_CONFIG_SECRET || "notiops/litellm-config";
+// 方式A 的一键模板不预建这两个 secret（网关、Bedrock API Key），由这里在首次保存时 CreateSecret 建出来 ——
+// 栈级 Tags 盖不到它们，不在这里打就永远没有 `project` / `auto-delete` 标签（本仓强制标签规则，先例
+// 见 aliyun_config.mjs）。带 Tags 的 CreateSecret 要 `secretsmanager:TagResource`（web-chat-core.ts 的
+// `BedrockApiKeySecretAccess` / `GatewayConfigSecretAccess`），少了它症状是保存直接 AccessDenied。
+const OWN_SECRET_TAGS = [
+  { Key: "project", Value: "notiops" },
+  { Key: "auto-delete", Value: "no" },
+];
+// 网关的模型名比 Bedrock id 自由得多：LiteLLM 的 model_name 常带 provider 前缀
+// （`anthropic/claude-opus-4-7`、`bedrock/…:0`），New API 透传上游名（`Qwen/Qwen3-235B-A22B`、
+// `models/gemini-2.5-pro`），还有 `@` / `+` 的版本后缀。它只进 JSON body、不拼进 URL，
+// 所以放宽到这些字符；仍然不收空白与引号，不收 `..`（免得被当成路径到处传）。
+const GATEWAY_MODEL_ID_RE = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$/;
+// 新增网关条目的默认输出上限。网关不告诉我们后端模型的硬上限；8192 是主流对话模型都
+// 接受的值（再高有的后端直接 400），要更大由 Admin 在条目上改。
+export const GATEWAY_DEFAULT_OUTPUT_LIMIT = 8192;
 const SURFACES = new Set(["webchat", "im"]);
 const BACKEND_TASKS = ["phd_translate", "devops_report_summarize"];
 // bedrock-mantle 端点所在区域白名单；region 白名单化，避免被写进 base_url 打到任意主机。
@@ -151,6 +202,128 @@ const ALIAS_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 // short 是 IM 侧的输入短名（`@bot model gpt_sol`），历史命名带下划线，比 canonical alias
 // 多允许一个 `_`。canonical alias 不放开：它会进 URL / 缓存键 / DDB 属性名。
 const SHORT_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+/* ───────────────── 来源次序 ───────────────── */
+
+/** `source_order` 规整成三种来源各一次。缺失 → 以 `credential_mode` 打头；缺的按默认次序补。
+ *  与 core/llm_config.py `_normalise_source_order` 逐条一致。 */
+export function normalizeSourceOrder(order, legacyMode) {
+  const out = [];
+  if (Array.isArray(order)) {
+    for (const s of order) {
+      const v = String(s || "").trim().toLowerCase();
+      if (SOURCES.includes(v) && !out.includes(v)) out.push(v);
+    }
+  }
+  if (!out.length) {
+    const m = String(legacyMode || "iam").trim().toLowerCase();
+    out.push(SOURCES.includes(m) ? m : "iam");
+  }
+  for (const s of SOURCES) if (!out.includes(s)) out.push(s);
+  return out;
+}
+
+/** 第一来源（全局）。 */
+function activeSource(cfg) {
+  return normalizeSourceOrder(cfg?.source_order, cfg?.credential_mode)[0];
+}
+
+/** 某一端实际用的来源：次序里第一个该端支持的。 */
+function effectiveSource(cfg, surface = "webchat") {
+  const allowed = SURFACE_SOURCES[surface] || SOURCES;
+  return normalizeSourceOrder(cfg?.source_order, cfg?.credential_mode)
+    .find((s) => allowed.includes(s)) || "iam";
+}
+
+/** 条目能否由该来源调用。没写 kind 的按 Bedrock 算（与 Python 侧一致）。 */
+function inFamily(m, source) {
+  const gw = m?.kind === GATEWAY_KIND;
+  return source === "gateway" ? gw : !gw;
+}
+
+/** 某来源的默认 alias：`source_defaults[source]`，没有再看全局 `default_model`。 */
+function defaultAliasFor(cfg, source) {
+  const sd = cfg?.source_defaults;
+  const v = sd && typeof sd === "object" ? String(sd[source] || "") : "";
+  // 与 Python `_normalise` 同：只认「存在、启用、且属于该来源家族」的那一个；否则回落 default_model。
+  const models = Array.isArray(cfg?.models) ? cfg.models : [];
+  const hit = v && models.find((m) => m && String(m.alias) === v && m.enabled === true && inFamily(m, source));
+  return hit ? v : String(cfg?.default_model || "");
+}
+
+/**
+ * 网关地址规整成 OpenAI 根路径；不合法返回 ""。与 core/llm_config.py
+ * `normalise_gateway_base_url`、shared/llm_provider.py `_normalise_gateway_base_url` 同规则：
+ *   · 只收 https；带 query / fragment / 用户名密码的不收
+ *   · 去掉末尾 `/` 与误贴的 `/chat/completions`、`/models`
+ *   · 路径为空补 `/v1`（LiteLLM 两种路径都认；New API 文档只给 /v1/...）
+ *   · 主机是字面量的非公网 IP 或 localhost → ""（DNS 解析后的检查另见 assertPublicHost）
+ */
+export function normalizeGatewayBaseUrl(url) {
+  const s = String(url ?? "").trim();
+  if (!s) return "";
+  let u;
+  try { u = new URL(s); } catch { return ""; }
+  if (u.protocol !== "https:" || !u.hostname) return "";
+  if (u.search || u.hash || u.username || u.password) return "";
+  // WHATWG URL 会把 `?` 后为空的 query 也吞掉；原串里出现过就拒，免得「看起来没 query」。
+  if (/[?#]/.test(s)) return "";
+  const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host === "localhost" || host.endsWith(".localhost")) return "";
+  if (isBlockedAddress(host)) return "";
+  let path = u.pathname.replace(/\/+$/, "");
+  for (const suffix of ["/chat/completions", "/models"]) {
+    if (path.toLowerCase().endsWith(suffix)) path = path.slice(0, -suffix.length).replace(/\/+$/, "");
+  }
+  if (!path) path = "/v1";
+  return `https://${u.host}${path}`;
+}
+
+// 非公网地址段。网关一期只接公网（HTTPS + key）；内网网关要走 VPC，是二期。
+// 段落与 shared/llm_provider._is_blocked_ip 对齐（私网 / 回环 / 链路本地 / 保留 / 组播），
+// 另加 CGNAT 100.64/10 —— Python 的 ipaddress 把它算作非 global，那边 core 侧也会拒。
+const _blocked = (() => {
+  const bl = new net.BlockList();
+  for (const [a, p] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
+    ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.168.0.0", 16],
+    ["198.18.0.0", 15], ["224.0.0.0", 4], ["240.0.0.0", 4]]) bl.addSubnet(a, p, "ipv4");
+  for (const [a, p] of [["::", 128], ["::1", 128], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8],
+    ["64:ff9b::", 96], ["2001:db8::", 32]]) bl.addSubnet(a, p, "ipv6");
+  return bl;
+})();
+
+function isBlockedAddress(host) {
+  const v = net.isIP(host);
+  if (!v) return false;
+  if (v === 6) {
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(host);
+    if (mapped) return _blocked.check(mapped[1], "ipv4");
+    return _blocked.check(host, "ipv6");
+  }
+  return _blocked.check(host, "ipv4");
+}
+
+// DNS 解析可注入（测试不触网）。
+let dnsLookup = (host) => dns.lookup(host, { all: true, verbatim: true });
+
+/**
+ * 解析主机名，任一地址落在非公网段就拒（堵「公网域名解析到内网 IP」）。
+ * 解析失败也拒：与 Python 侧 best-effort 放行不同，这里是 Admin 保存时的一次性检查，
+ * 解析不了的地址本来也调不通，拒掉比存进去好。返回错误串或 ""。
+ */
+async function assertPublicHost(baseUrl) {
+  let host;
+  try { host = new URL(baseUrl).hostname.replace(/^\[|\]$/g, ""); } catch { return "invalid base_url"; }
+  if (net.isIP(host)) return isBlockedAddress(host) ? "base_url points to a non-public address" : "";
+  let addrs;
+  try { addrs = await dnsLookup(host); } catch { return `base_url host ${host} does not resolve`; }
+  for (const a of addrs || []) {
+    if (isBlockedAddress(String(a?.address || ""))) {
+      return `base_url host ${host} resolves to a non-public address; only public gateways are supported`;
+    }
+  }
+  return (addrs || []).length ? "" : `base_url host ${host} does not resolve`;
+}
 
 /* ───────────────── 读写底座 ───────────────── */
 
@@ -251,11 +424,16 @@ function validateEntry(m, idx) {
   if (!ALIAS_RE.test(String(m.alias || ""))) {
     return `${where}.alias invalid (expect [a-z0-9-], got ${JSON.stringify(m.alias)})`;
   }
-  if (!MODEL_ID_RE.test(String(m.model_id || ""))) {
-    return `${where}.model_id invalid (got ${JSON.stringify(m.model_id)})`;
-  }
   if (!KINDS.has(m.kind)) {
     return `${where}.kind must be one of ${[...KINDS].join(" | ")} (got ${JSON.stringify(m.kind)})`;
+  }
+  const idRe = m.kind === GATEWAY_KIND ? GATEWAY_MODEL_ID_RE : MODEL_ID_RE;
+  if (!idRe.test(String(m.model_id || ""))) {
+    return `${where}.model_id invalid (got ${JSON.stringify(m.model_id)})`;
+  }
+  if (m.kind === GATEWAY_KIND && (Array.isArray(m.surfaces) ? m.surfaces : []).includes("im")) {
+    // IM 原生链路一期不接网关（见 SURFACE_SOURCES）。放进来也调不到，只会让人以为能用。
+    return `${where}.surfaces: gateway models are web-chat only for now (remove 'im')`;
   }
   if (m.kind === "bedrock_mantle_responses") {
     if (!MANTLE_REGIONS.has(String(m.region || ""))) {
@@ -308,7 +486,7 @@ function validateEntry(m, idx) {
   }
   for (const [k, v] of Object.entries(m.model_id_override || {})) {
     if (!SURFACES.has(k)) return `${where}.model_id_override has unknown surface ${k}`;
-    if (!MODEL_ID_RE.test(String(v))) return `${where}.model_id_override.${k} invalid`;
+    if (!idRe.test(String(v))) return `${where}.model_id_override.${k} invalid`;
   }
   return null;
 }
@@ -316,12 +494,31 @@ function validateEntry(m, idx) {
 /** 服务端强校验（spec R2.6 / R2.7）。返回错误字符串或 null。导出供单测直接调用。 */
 export function validateConfig(cfg) {
   if (!cfg || typeof cfg !== "object") return "body must be an object";
+  // `provider` 是 2026-10 之前的字段，只认 bedrock。网关走的是 `source_order` 里的
+  // gateway 来源 + `openai_compatible` 条目，不是这个字段 —— 别把它当开关重新启用。
   if (cfg.provider !== undefined && cfg.provider !== "bedrock") {
-    return "provider must be 'bedrock' (litellm ships in a later phase)";
+    return "provider must be 'bedrock'; use source_order with the 'gateway' source instead";
   }
-  if (cfg.credential_mode !== undefined
-      && !["iam", "api_key"].includes(cfg.credential_mode)) {
-    return "credential_mode must be 'iam' or 'api_key'";
+  if (cfg.credential_mode !== undefined && !SOURCES.includes(cfg.credential_mode)) {
+    return `credential_mode must be one of ${SOURCES.join(" | ")}`;
+  }
+  if (cfg.source_order !== undefined) {
+    const o = cfg.source_order;
+    if (!Array.isArray(o) || o.length !== SOURCES.length
+        || new Set(o).size !== SOURCES.length || o.some((s) => !SOURCES.includes(s))) {
+      return `source_order must list each of ${SOURCES.join(", ")} exactly once`;
+    }
+    if (cfg.credential_mode !== undefined && cfg.credential_mode !== o[0]) {
+      return "credential_mode must equal source_order[0] (the active source)";
+    }
+  }
+  if (cfg.source_defaults !== undefined
+      && (cfg.source_defaults === null || typeof cfg.source_defaults !== "object"
+          || Array.isArray(cfg.source_defaults))) {
+    return "source_defaults must be an object";
+  }
+  for (const k of Object.keys(cfg.source_defaults || {})) {
+    if (!SOURCES.includes(k)) return `source_defaults has unknown source ${k}`;
   }
   const models = cfg.models;
   if (!Array.isArray(models) || models.length === 0) return "models must be a non-empty array";
@@ -357,10 +554,28 @@ export function validateConfig(cfg) {
   const enabled = models.filter((m) => m.enabled === true);
   if (enabled.length === 0) return "at least one model must be enabled";
 
+  const active = activeSource(cfg);
   const def = String(cfg.default_model || "");
   const defEntry = models.find((m) => String(m.alias) === def);
   if (!defEntry) return `default_model ${def || "(empty)"} is not in the catalogue`;
   if (defEntry.enabled !== true) return `default_model ${def} must be enabled`;
+  // 默认模型是**第一来源**的默认：它必须是那个来源调得动的条目，否则「只用第一来源」与
+  // 「默认模型」两句话互相矛盾，消费端只能二选一（Python 侧会回落到该家族第一个启用项）。
+  if (!inFamily(defEntry, active)) {
+    return `default_model ${def} cannot be served by the active source '${active}' `
+      + `(${active === "gateway" ? "pick a gateway model" : "pick a Bedrock model"})`;
+  }
+  // 每个来源各自的默认：只要写了，就必须是该来源家族里启用着的条目。
+  for (const [src, alias] of Object.entries(cfg.source_defaults || {})) {
+    if (alias === null || alias === "" || alias === undefined) continue;
+    const e = models.find((m) => String(m.alias) === String(alias));
+    if (!e || e.enabled !== true) return `source_defaults.${src} must be an enabled alias`;
+    if (!inFamily(e, src)) return `source_defaults.${src} (${alias}) belongs to another source`;
+  }
+  if (cfg.source_defaults && cfg.source_defaults[active]
+      && String(cfg.source_defaults[active]) !== def) {
+    return `default_model must equal source_defaults.${active} (the active source's default)`;
+  }
   // 这里曾经有 `if (defEntry.verified === false) return "... is unverified; test it first"`。
   // 已删除，连同 `verified` 这个持久化字段本身 —— 它是**一个快照冒充事实**：它断言的是
   // (模型 × 区域 × 凭证 × 时间) 这个组合成立，而其中任何一维变了它就失效，我们却只能感知
@@ -369,10 +584,12 @@ export function validateConfig(cfg) {
   // 取而代之的是**保存时现场探测默认模型**（见 apiPutLlmConfig 的 probeDefaultModel）——
   // 决策那一刻的事实，不可能过期。
 
-  // 每个端至少要有一个可用模型，否则该端会没有任何模型可选
+  // 每个端至少要有一个可用模型，否则该端会没有任何模型可选。按该端**实际用的来源**数：
+  // 网关排第一时 webchat 要有启用的网关模型，IM 仍要有启用的 Bedrock 模型。
   for (const surface of SURFACES) {
-    if (!enabled.some((m) => (m.surfaces || []).includes(surface))) {
-      return `no enabled model available for surface '${surface}'`;
+    const src = effectiveSource(cfg, surface);
+    if (!enabled.some((m) => (m.surfaces || []).includes(surface) && inFamily(m, src))) {
+      return `no enabled model available for surface '${surface}' from source '${src}'`;
     }
   }
 
@@ -480,26 +697,84 @@ async function probeCredential(modeOverride) {
   //   api_key → iam：用一个已被收窄/吊销的 Key 去验证「退回 IAM」，403 硬拦 ——
   //                  而这恰好是管理员从坏 Key 逃生的唯一出口，等于把门锁死
   // 不传时（独立的连通性测试按钮、候选枚举）读持久值才是对的：那些操作不改变凭证维度。
+  // 不传时取**排在最前的 Bedrock 来源**（而不是第一来源）：这个函数只服务 Bedrock 探测与
+  // 候选枚举，网关排第一时，Bedrock 条目将来由谁调用？由排在最前的那个 Bedrock 来源 ——
+  // 与 IM 端、后端任务同一条规则（effectiveSource 的 "im" 行就是 Bedrock 两种来源）。
   const mode = modeOverride !== undefined && modeOverride !== null && modeOverride !== ""
     ? String(modeOverride)
-    : String((await readConfig())?.credential_mode || "iam");
+    : effectiveSource((await readConfig()) || {}, "im");
   if (mode !== "api_key") return { mode: "iam", key: "" };
   const { key } = await readKeySecret();
   // 选了 api_key 但 Secret 是空的 → 运行时也会回退 IAM，探测跟着回退才诚实。
   return key ? { mode: "api_key", key } : { mode: "iam", key: "" };
 }
 
+/* ───────────────── 网关连接信息 ───────────────── */
+
+/** 读网关 Secret。**只在本模块内部用**：api_key 绝不出现在任何响应体里。 */
+async function readGatewaySecret() {
+  try {
+    const r = await sm.send(new GetSecretValueCommand({ SecretId: GATEWAY_SECRET_ID }));
+    let parsed = {};
+    try { parsed = JSON.parse(r.SecretString || "{}") || {}; } catch { parsed = {}; }
+    if (typeof parsed !== "object" || Array.isArray(parsed)) parsed = {};
+    return {
+      raw_base_url: String(parsed.base_url || "").trim(),
+      base_url: normalizeGatewayBaseUrl(parsed.base_url),
+      key: String(parsed.api_key || "").trim(),
+      created: r.CreatedDate || null,
+      error: "",
+    };
+  } catch (e) {
+    if (e?.name === "ResourceNotFoundException") {
+      return { raw_base_url: "", base_url: "", key: "", created: null, error: "" };
+    }
+    return { raw_base_url: "", base_url: "", key: "", created: null, error: e?.name || "read_failed" };
+  }
+}
+
+function _hostOnly(u) {
+  try { return u ? new URL(u).host : ""; } catch { return ""; }
+}
+
+/** 网关状态：地址（不是凭证，管理员需要看见它）+ Key 后 4 位，**绝不回 Key 明文**。 */
+async function gatewayStatus(item) {
+  const g = await readGatewaySecret();
+  if (g.error) return { configured: false, error: g.error };
+  const cfg = item !== undefined ? item : await readConfig();
+  const setAt = g.created ? new Date(g.created).toISOString() : "";
+  return {
+    configured: Boolean(g.base_url && g.key),
+    // 存着的地址不合法时只回主机名：被拒的形态里正好有带凭证的（`https://u:p@host`、`?api_key=`）。
+    base_url: g.base_url || _hostOnly(g.raw_base_url),
+    // 存进去的地址不合法（手改 Secret / 规则收紧之后）—— 让 UI 能说清为什么「未配置」。
+    base_url_valid: Boolean(g.base_url),
+    has_key: Boolean(g.key),
+    last_4: g.key ? g.key.slice(-4) : "",
+    length: g.key ? g.key.length : 0,
+    set_at: g.key || g.base_url ? setAt : "",
+    set_by: String(cfg?.gateway_set_by || ""),
+  };
+}
+
 export async function apiGetLlmConfig() {
   const item = await readConfig();
   const cfg = item || {};
+  const order = normalizeSourceOrder(cfg.source_order, cfg.credential_mode);
   return {
     provider: cfg.provider || "bedrock",
-    credential_mode: cfg.credential_mode || "iam",
+    credential_mode: order[0],
+    source_order: order,
+    source_defaults: cfg.source_defaults && typeof cfg.source_defaults === "object"
+      ? cfg.source_defaults : {},
+    // IM 端实际用的来源（网关排第一时是排在最前的 Bedrock 来源），UI 据此提示。
+    im_source: effectiveSource(cfg, "im"),
     default_model: cfg.default_model || "",
     generation: Number(cfg.generation || 0),
     models: Array.isArray(cfg.models) ? cfg.models : [],
     backend_tasks: cfg.backend_tasks || {},
     bedrock_api_key: await keyStatus(item),
+    gateway: await gatewayStatus(item),
     seeded: Boolean(item),
     updated_at: cfg.updated_at || "",
     updated_by: cfg.updated_by || "",
@@ -543,8 +818,11 @@ export async function apiGetModels(surface = "webchat") {
   }
   const cfg = item;
   const want = SURFACES.has(surface) ? surface : "webchat";
+  // 只列该端**实际所用来源**能调的条目：网关排第一时选择器里只有网关模型。
+  const src = effectiveSource(cfg, want);
   const models = (Array.isArray(cfg.models) ? cfg.models : [])
-    .filter((m) => m && m.enabled === true && (m.surfaces || []).includes(want))
+    .filter((m) => m && m.enabled === true && (m.surfaces || []).includes(want)
+      && inFamily(m, src))
     .map((m) => ({
       id: String(m.alias),
       name: String(m.label || m.alias),
@@ -556,9 +834,10 @@ export async function apiGetModels(surface = "webchat") {
       // IAM 动作 bedrock-mantle:CallWithBearerToken），只是我们三条 Mantle 代码路径
       // 都没把 Key 传进去 —— 实测表现为 Claude 那几轮 CloudTrail caller 是 Key 的
       // IAM user，GPT 那轮是部署角色。三条路径已补齐，故所有模型一律受 Key 影响。
-      uses_api_key: true,
+      // 网关条目不经 Bedrock，也就不受 Bedrock API Key 影响。
+      uses_api_key: m.kind !== GATEWAY_KIND,
     }));
-  const def = String(cfg.default_model || "");
+  const def = defaultAliasFor(cfg, src);
   return {
     models,
     default_model: models.some((m) => m.id === def) ? def : (models[0]?.id || ""),
@@ -805,6 +1084,10 @@ async function writeAudit(prevItem, nextCfg, actor) {
         user_agent: (actor?.ua || "").slice(0, 200),
         generation_before: Number(prevItem?.generation || 0),
         generation_after: Number(nextCfg.generation || 0),
+        // 这一条改了什么（`gateway_set:<旧主机>-><新主机>` / `key_set` / `backend_tasks` / `rollback_to:<sk>`）。
+        // 以前调用方传了、这里没存 —— 「谁在什么时候把对话流量指到了哪个网关」在审计里查不到。
+        // 只记主机与动作，从不记凭证。
+        note: String(actor?.note || "").slice(0, 200),
         // 全量快照（变更前）—— 支撑一键回滚与「还原某时刻配置」演练
         snapshot_before: tooBig ? "" : snapshot,
         ...(tooBig ? { snapshot_omitted: true, snapshot_bytes: snapshot.length } : {}),
@@ -850,6 +1133,26 @@ const PROJECTION_SK_KIND = "bedrock_model_kind";
 const PROJECTION_SK_REGION = "bedrock_model_region";
 
 /**
+ * 后端任务实际要投影的条目 —— 「只用第一来源」对后端任务同样成立。
+ *
+ *   · 绑定的条目属于第一来源家族 → 用它
+ *   · 第一来源是网关、而绑定项是 Bedrock 模型（或没绑定）→ 用网关的默认模型。
+ *     不这样做的话，切到网关的客户（典型是本账号压根没开 Bedrock）PHD 翻译与报告精简
+ *     会继续打 Bedrock 并失败，而管理页上看着一切正常。
+ *   · 第一来源是 Bedrock、而绑定项是网关模型 → 当作未绑定，后端走自己的 Bedrock 兜底链
+ *     （env / 硬编码），与「从没配过」一致。
+ * 切回 Bedrock 时绑定恢复原样：真源 `backend_tasks` 不改，只有投影跟着来源走。
+ */
+function backendTaskEntry(cfg, models, alias, active) {
+  const entry = alias ? models.find((m) => String(m.alias) === alias) : null;
+  if (entry && entry.enabled === true && inFamily(entry, active)) return entry;
+  if (active !== "gateway") return null;
+  const def = defaultAliasFor(cfg, "gateway");
+  const gw = models.find((m) => String(m.alias) === def && m.enabled === true && inFamily(m, "gateway"));
+  return gw || models.find((m) => m.enabled === true && inFamily(m, "gateway")) || null;
+}
+
+/**
  * 把 cfg.backend_tasks 投影成 appconfig#* 行。返回失败的任务名数组。
  * **不抛异常**：llmcfg 本体已经写成功，投影失败只是后端暂时还用旧模型 —— 属可降级，
  * 由调用方把警告透给 UI，而不是回滚一次成功的保存（回滚会让 admin 更困惑）。
@@ -859,11 +1162,11 @@ async function projectBackendTasks(cfg, actor = {}) {
   const models = Array.isArray(cfg.models) ? cfg.models : [];
   const tasks = cfg.backend_tasks || {};
   const now = new Date().toISOString();
+  const active = activeSource(cfg);
   for (const task of BACKEND_TASKS) {
     const pk = TASK_PROJECTION[task];
     if (!pk) continue;
-    const alias = String(tasks[task] || "");
-    const entry = alias ? models.find((m) => String(m.alias) === alias) : null;
+    const entry = backendTaskEntry(cfg, models, String(tasks[task] || ""), active);
     const bound = Boolean(entry && entry.enabled === true);
     const modelId = bound ? String(entry.model_id) : "";
     // 这两项决定后端走 Converse 还是 Mantle Responses、以及打哪个区。
@@ -954,9 +1257,12 @@ export async function apiGetBackendTasks() {
   const models = Array.isArray(cfg.models) ? cfg.models : [];
   const tasks = cfg.backend_tasks || {};
   const out = [];
+  const active = activeSource(cfg);
   for (const task of BACKEND_TASKS) {
     const alias = String(tasks[task] || "");
-    const entry = alias ? models.find((m) => String(m.alias) === alias) : null;
+    // 与投影同一套解析（见 backendTaskEntry）：比对的是「此刻应该投影成什么」，否则网关排第一时
+    // 每个绑着 Bedrock 模型的任务都会显示成 drift。
+    const entry = backendTaskEntry(cfg, models, alias, active);
     let projected = "";
     let projected_at = "";
     let projected_by_us = false;
@@ -979,11 +1285,17 @@ export async function apiGetBackendTasks() {
     let status;
     if (!readOk) status = "unknown";                    // 读失败，不知道那行是什么
     else if (!wanted && !projected) status = "unbound"; // 未绑定，后端走自己的兜底
+    // 未绑定、但那一行有值且**不是我们投影的**（方式 B 的 SeedDataResource 预置值 / 人手填的）。
+    // 曾经落进下面的 drift，界面叫管理员「重新保存」—— 可保存故意不动非投影行，重存一万次
+    // 也还是 drift。如实说：后端此刻用的是那个预置值，要接管就在这里绑一个模型。
+    else if (!wanted && projected && !projected_by_us) status = "preset";
     else if (wanted === projected) status = "in_sync";
     else status = "drift";                              // 上次投影失败 / 被人手改过
     out.push({
       task,
       alias,
+      // 实际生效的条目。与 alias 不同 = 第一来源换了家族，任务跟着用了该来源的默认模型。
+      effective_alias: entry ? String(entry.alias) : "",
       model_id: wanted,
       projected_model_id: projected,
       projected_at,
@@ -1114,24 +1426,88 @@ function normaliseModels(models) {
   });
 }
 
+/**
+ * 把一次保存请求补全成完整的来源设置（次序 / 第一来源 / 各来源默认）。
+ *
+ * 老前端（发版窗口里还开着的页面）只发 `credential_mode`：那就在库里现有次序上把它挪到最前，
+ * 而不是重置成默认次序 —— 否则一次普通保存会把管理员排好的备用顺序打乱。
+ * 什么都没发 → 沿用库里的次序。各来源默认同理：没发就沿用；第一来源的那一格总是跟
+ * `default_model` 对齐（两者语义相同，存两份是为了切来源时各自的默认不丢）。
+ */
+function withSources(body, prev) {
+  let order;
+  if (Array.isArray(body?.source_order)) {
+    order = [...body.source_order];
+  } else {
+    order = normalizeSourceOrder(prev?.source_order, prev?.credential_mode);
+    const head = body?.credential_mode;
+    if (SOURCES.includes(head)) order = [head, ...order.filter((s) => s !== head)];
+  }
+  const sdIn = body?.source_defaults !== undefined ? body.source_defaults
+    : (prev?.source_defaults && typeof prev.source_defaults === "object" ? prev.source_defaults : {});
+  const sd = {};
+  if (sdIn && typeof sdIn === "object" && !Array.isArray(sdIn)) {
+    const models = Array.isArray(body?.models) ? body.models : [];
+    for (const [k, v] of Object.entries(sdIn)) {
+      if (v === null || v === undefined || v === "") continue;
+      // 备用来源的默认指向一个已删除 / 已停用 / 换了家族的条目 → 静默丢掉，等切到那个来源时
+      // 再选。不丢的话，管理员删掉一个网关模型就再也存不了目录（报的是一个他没碰过的字段）。
+      // 未知来源名原样留着，交给 validateConfig 报错。
+      if (SOURCES.includes(k)) {
+        const e = models.find((m) => m && String(m.alias) === String(v));
+        if (!e || e.enabled !== true || !inFamily(e, k)) continue;
+      }
+      sd[k] = v;
+    }
+  }
+  // 客户端发来的 credential_mode 若非法、或与它自己发的 source_order 打架，原样留着交给
+  // validateConfig 报错 —— 在这里「修正」它等于静默吞掉一个坏请求。
+  const cm = body?.credential_mode;
+  const keepRaw = cm !== undefined && (!SOURCES.includes(cm) || Array.isArray(body?.source_order));
+  const out = { ...body, source_order: order, credential_mode: keepRaw ? cm : order[0] };
+  if (out.default_model) sd[order[0]] = String(out.default_model);
+  out.source_defaults = sd;
+  return out;
+}
+
+/** 只描述凭证、不属于目录的字段：任何整份重写都必须原样带过去（回滚也不还原它们）。 */
+const CREDENTIAL_META_FIELDS = ["bedrock_key_set_by", "gateway_rev", "gateway_set_by"];
+function credentialMeta(prev) {
+  const out = {};
+  for (const k of CREDENTIAL_META_FIELDS) if (prev && prev[k] !== undefined) out[k] = prev[k];
+  return out;
+}
+
 export async function apiPutLlmConfig(body, actor = {}) {
-  const err = validateConfig(body);
+  if (!body || typeof body !== "object") return { error: "body must be an object", status: 400 };
+  const prev = await readConfig();
+  const candidate = withSources(body, prev);
+  const err = validateConfig(candidate);
   if (err) return { error: err, status: 400 };
 
   // 现场探测默认模型，取代已删除的持久化 `verified`。在写入**之前**做：让不可用的默认
-  // 模型根本进不了 DDB，而不是先落地再靠一个会过期的标记去追。
-  const probe = await probeDefaultModel(body);
-  if (!probe.ok) return { error: probe.error, status: 400 };
+  // 模型根本进不了 DDB，而不是先落地再靠一个会过期的标记去追。第一来源是网关时探的是
+  // 网关（带工具定义的最小 chat 调用，见 probeGateway），并加探 IM 要用的那个 Bedrock 来源。
+  //
+  // **服务端是唯一的门槛**（2026-10 改版）：前端不再要求「先点测试才能存」。只有确定性失败
+  // 拦保存（网关看 GATEWAY_HARD_FAIL，Bedrock 看 HARD_FAIL_PROBE_RESULTS）；限流 / 超时 /
+  // error 只说明这一次没问对上 —— 照存并回一条 warning。用户决策是「不自动降级，坏了就直接
+  // 失败，由管理员自己改次序」，所以换上去的来源事后真坏了，管理员能在同一页把次序改回来。
+  // 拒绝时回结构化的 `probe`（来源 / 条目 / 枚举结果），让前端把来源行、模型行、保存条一起标出。
+  const probe = await probeBeforeWrite(candidate, prev);
+  if (!probe.ok) return { error: probe.error, status: 400, probe: probe.probe };
 
-  const prev = await readConfig();
   const generation = nextGeneration(prev); // epoch-ms 语义，服务端生成且严格单调
   const item = {
     PK, SK,
-    provider: body.provider || "bedrock",
-    credential_mode: body.credential_mode || prev?.credential_mode || "iam",
-    default_model: String(body.default_model),
-    models: normaliseModels(body.models),
-    backend_tasks: body.backend_tasks || prev?.backend_tasks || {},
+    ...credentialMeta(prev),
+    provider: candidate.provider || "bedrock",
+    credential_mode: candidate.credential_mode,
+    source_order: candidate.source_order,
+    source_defaults: candidate.source_defaults,
+    default_model: String(candidate.default_model),
+    models: normaliseModels(candidate.models),
+    backend_tasks: candidate.backend_tasks || prev?.backend_tasks || {},
     generation,
     updated_at: new Date(generation).toISOString(),
     updated_by: actor?.username || actor?.sub || "",
@@ -1183,6 +1559,16 @@ export async function apiPutBedrockKey(body, actor = {}) {
   const clear = body.clear === true;
   const key = String(body.api_key || "").trim();
   if (!clear && !key) return { error: "api_key is required (or pass clear:true)", status: 400 };
+  if (clear) {
+    // Key 正在被用（它是第一来源，或网关排第一时 IM 用的那个 Bedrock 来源）→ 不许清。清了运行时会
+    // 静默退回部署角色 —— 正是「不自动换来源」要杜绝的。与网关那条 409 同一个道理。
+    const cur = await readConfig();
+    if (cur && (activeSource(cur) === "api_key" || effectiveSource(cur, "im") === "api_key"
+                && activeSource(cur) === "gateway")) {
+      return { error: "the Bedrock API key is in use by the active model source; move another source "
+                      + "to the top and save before clearing it", status: 409 };
+    }
+  }
   if (!clear && (key.length < 8 || key.length > 4096)) {
     return { error: "api_key length looks wrong", status: 400 };
   }
@@ -1192,7 +1578,7 @@ export async function apiPutBedrockKey(body, actor = {}) {
     await sm.send(new UpdateSecretCommand({ SecretId: SECRET_ID, SecretString: payload }));
   } catch (e) {
     if (e?.name === "ResourceNotFoundException") {
-      await sm.send(new CreateSecretCommand({ Name: SECRET_ID, SecretString: payload }));
+      await sm.send(new CreateSecretCommand({ Name: SECRET_ID, SecretString: payload, Tags: OWN_SECRET_TAGS }));
     } else throw e;
   }
 
@@ -1383,11 +1769,22 @@ export async function apiTestLlmModel(body) {
   const modelId = String(body?.model_id || "").trim();
   const kind = String(body?.kind || "bedrock_converse");
   const region = String(body?.region || "").trim();
+  if (kind === GATEWAY_KIND) {
+    if (!GATEWAY_MODEL_ID_RE.test(modelId)) return { error: "invalid model_id", status: 400 };
+    return { ...(await probeGateway(modelId)), credential: "gateway" };
+  }
   if (!MODEL_ID_RE.test(modelId)) return { error: "invalid model_id", status: 400 };
 
   // 用**运行时会用的那种凭证**探测。回给客户端 `credential`，让 UI 能说清这一次验的是
   // 什么 —— 「用 Key 验过」和「用部署角色验过」是两个不同的保证。
-  const cred = await probeCredential();
+  // `source`：管理页来源列表上每一行的「测试」按钮要验**那一行**的凭证（备用来源也要能在
+  // 拖上去之前先验），所以允许显式指定 iam / api_key；不传就是排在最前的 Bedrock 来源。
+  const src = String(body?.source || "");
+  const cred = await probeCredential(["iam", "api_key"].includes(src) ? src : undefined);
+  if (src === "api_key" && cred.mode !== "api_key") {
+    // 指名要验 Key、Key 却没配：别悄悄换成部署角色去验，那是假绿。
+    return { model_id: modelId, result: "not_configured", latency_ms: 0, credential: "api_key" };
+  }
 
   if (kind === "bedrock_mantle_responses") {
     if (!MANTLE_REGIONS.has(region)) return { error: "invalid region for mantle model", status: 400 };
@@ -1417,12 +1814,25 @@ const HARD_FAIL_PROBE_RESULTS = new Set([
   "needs_profile",    // 本区不支持按需直调，要改用 global./apac. 前缀
 ]);
 
+/** 拒绝时回给前端的结构化细节：只放我们自己的枚举与目录里的 alias / model_id，
+ *  不放上游原文、不放 Key 的任何片段（LiteLLM 的鉴权失败会回显收到的 Key）。 */
+function probeDetail(source, alias, entry, result) {
+  return { source, model_id: String(entry?.model_id || ""), alias: String(alias || ""), result: String(result || "") };
+}
+
 async function probeDefaultModel(cfg) {
   const def = String(cfg.default_model || "");
   const entry = (cfg.models || []).find((m) => String(m.alias) === def);
   if (!entry) return { ok: true };                     // validateConfig 已经拦过
+  if (activeSource(cfg) === "gateway") return probeGatewayDefault(def, entry);
   // 用**这份 cfg 里**的 credential_mode，不是 DDB 里的旧值 —— 见 probeCredential 的说明。
-  const cred = await probeCredential(cfg.credential_mode);
+  return probeBedrockDefault(activeSource(cfg), cfg.credential_mode, def, entry, "default_model");
+}
+
+/** 用某个 Bedrock 来源的凭证探一个条目，按 HARD_FAIL_PROBE_RESULTS 判定拦不拦。
+ *  `what` 只进英文 error / warning 文案（default_model / IM default）。 */
+async function probeBedrockDefault(source, credMode, def, entry, what) {
+  const cred = await probeCredential(credMode);
   const region = String(entry.region || "");
   let r;
   try {
@@ -1432,20 +1842,490 @@ async function probeDefaultModel(cfg) {
   } catch (e) {
     // 探测本身炸了（网络 / SDK）——不能因此拦住一次合法保存。
     console.error(`[llm-config] default-model probe threw: ${e?.name || e}`);
-    return { ok: true, warning: `could not verify default_model ${def} (probe error)` };
+    return { ok: true, warning: `could not verify ${what} ${def} (probe error)` };
   }
   if (r.result === "ok") return { ok: true, credential: cred.mode };
   if (HARD_FAIL_PROBE_RESULTS.has(r.result)) {
     return { ok: false,
-             error: `default_model ${def} failed a live check (${r.result}` +
+             error: `${what} ${def} failed a live check (${r.result}` +
                     `${cred.mode === "api_key" ? ", using the configured API key" : ""}); `
-                    + "fix the model id/region or pick another default" };
+                    + "fix the model id/region or pick another default",
+             probe: probeDetail(source, def, entry, r.result) };
   }
   // 文案保持中性、不含「saved」/「rolled back」—— 调用方（保存 / 回滚）各自加前缀。
   // 写死 "saved, but" 曾让回滚拼出「rolled back, but saved, but …」。
   return { ok: true,
-           warning: `default_model ${def} could not be verified right now `
+           warning: `${what} ${def} could not be verified right now `
                     + `(${r.result}) — re-run the connectivity test later` };
+}
+
+/** IM 端此刻会用的条目：与 apiGetModels("im") 同一条规则（排在最前的 Bedrock 来源、它的默认，
+ *  不在 IM 可选集里就退到第一个）。 */
+function imDefaultEntry(cfg) {
+  const src = effectiveSource(cfg, "im");
+  const models = (Array.isArray(cfg?.models) ? cfg.models : [])
+    .filter((m) => m && m.enabled === true && (m.surfaces || []).includes("im") && inFamily(m, src));
+  const def = defaultAliasFor(cfg, src);
+  return { source: src, entry: models.find((m) => String(m.alias) === def) || models[0] || null };
+}
+
+/**
+ * 写入（保存 / 回滚）之前的现场探测。覆盖三种「线上会换一个模型 / 凭证去调」的改动：
+ *   · 第一来源换了 · 第一来源的默认换了  → 每次都探第一来源的默认（probeDefaultModel）
+ *   · 网关排第一时 IM 那条 Bedrock 链路换了（换了来源、换了默认、或刚把网关挪上去）
+ *     → 加探 IM 的默认。以前这一条只靠前端「IM 将改用…先测试」挡，前端门槛删掉后由这里兜。
+ * IM 那条没变就不探：它此刻就在线上跑着，每存一次目录都去调一遍 Bedrock 没有信息量。
+ */
+async function probeBeforeWrite(cfg, prev) {
+  const first = await probeDefaultModel(cfg);
+  if (!first.ok) return first;
+  const warnings = [first.warning || ""];
+  if (activeSource(cfg) === "gateway") {
+    const now = imDefaultEntry(cfg);
+    const was = prev ? imDefaultEntry(prev) : null;
+    const changed = !prev || activeSource(prev) !== "gateway" || !was?.entry || !now.entry
+      || was.source !== now.source || String(was.entry.alias) !== String(now.entry.alias)
+      || String(was.entry.model_id) !== String(now.entry.model_id);
+    if (changed && now.entry) {
+      const alias = String(now.entry.alias);
+      // IM 落到 Bedrock API Key、Key 却没配：probeCredential 会回退部署角色去探 —— 那是假绿，而运行时
+      // 同样会静默退回 IAM，正是「不自动降级」要杜绝的。直接按确定性失败拦（与 apiTestLlmModel 指名测
+      // Key 时同一结论），不再只靠前端预检（直接调 API / 老前端绕得过去）。
+      // Secret 读失败（非「不存在」）是瞬时的：不拦，只提醒。
+      let skip = false;
+      if (now.source === "api_key") {
+        const ks = await readKeySecret();
+        if (!ks.key && !ks.error) {
+          return { ok: false,
+                   error: `IM default ${alias} cannot be served: the Bedrock API key source is not configured `
+                          + "(not_configured); configure the key or move another Bedrock source above it",
+                   probe: probeDetail("api_key", alias, now.entry, "not_configured") };
+        }
+        if (!ks.key) {
+          skip = true;
+          warnings.push(`IM default ${alias} could not be verified right now (error) — re-run the connectivity test later`);
+        }
+      }
+      if (!skip) {
+        const im = await probeBedrockDefault(now.source, now.source, alias, now.entry, "IM default");
+        if (!im.ok) return im;
+        warnings.push(im.warning || "");
+      }
+    }
+  }
+  const warning = warnings.filter(Boolean).join("; ");
+  return { ok: true, ...(warning ? { warning } : {}) };
+}
+
+/* ───────────────── Admin: OpenAI 兼容网关 ─────────────────
+ *
+ * 对接面只用 OpenAI 格式的两个端点，LiteLLM Proxy 与 New API 都提供：
+ *   GET  {base}/models             列模型（`{"data":[{"id":…}]}`），**不花 token**
+ *   POST {base}/chat/completions   对话（Bearer 鉴权）
+ * {base} 是规整后的 OpenAI 根（见 normalizeGatewayBaseUrl）。
+ */
+
+const GATEWAY_LIST_TIMEOUT_MS = 10_000;
+// chat 探测给得比列模型宽：网关后面常挂推理模型，首 token 慢；仍远低于 API Gateway 的 29s。
+const GATEWAY_PROBE_TIMEOUT_MS = 20_000;
+const GATEWAY_MAX_MODELS = 2000;
+const GATEWAY_MAX_BODY = 5 * 1024 * 1024;
+
+/**
+ * 「拉取模型列表」里藏起来的条目：通配符（LiteLLM 的 `*`、`anthropic/*` 是路由规则，不是模型）
+ * 与非对话模型（embedding / rerank / 图像 / 语音 / realtime / 审核）。只影响展示，
+ * 手动添加不受限 —— 判错了管理员仍能加，漏判一个对话模型却会让人以为网关上没有它。
+ */
+const GATEWAY_NON_CHAT_RE = /(^|[/._:-])(embed|embeds|embedding|embeddings|rerank|reranker|reranking|moderation|whisper|tts|transcribe|transcription|speech|audio|realtime|image|images|imagen|dall-e|dalle|stable-diffusion|sdxl|flux|midjourney|video|sora|veo)(?=$|[/._:-]|\d)/i;
+
+export function classifyGatewayModelId(id) {
+  const s = String(id || "");
+  if (!s) return "invalid";
+  if (s.includes("*")) return "wildcard";
+  if (!GATEWAY_MODEL_ID_RE.test(s)) return "unsupported_id";
+  if (GATEWAY_NON_CHAT_RE.test(s)) return "non_chat";
+  return "chat";
+}
+
+function gatewayHeaders(key, json = false) {
+  return {
+    authorization: `Bearer ${key}`,
+    accept: "application/json",
+    ...(json ? { "content-type": "application/json" } : {}),
+  };
+}
+
+async function readJsonCapped(r) {
+  const declared = Number(r.headers?.get?.("content-length") || 0);
+  if (declared > GATEWAY_MAX_BODY) throw Object.assign(new Error("too large"), { name: "TooLarge" });
+  const txt = await r.text();
+  if (txt.length > GATEWAY_MAX_BODY) throw Object.assign(new Error("too large"), { name: "TooLarge" });
+  return JSON.parse(txt);
+}
+
+function _netFailure(e) {
+  const n = e?.name || "";
+  return n === "TimeoutError" || n === "AbortError" ? "timeout" : "unreachable";
+}
+
+/** 用给定连接信息列网关模型。返回 `{result, models, hidden, total}`，result 为枚举态。 */
+async function listGatewayModels(base, key) {
+  const hostErr = await assertPublicHost(base);
+  if (hostErr) return { error: hostErr, status: 400 };
+  const started = Date.now();
+  let r;
+  try {
+    r = await gatewayFetch(`${base}/models`, {
+      method: "GET", headers: gatewayHeaders(key),
+      signal: AbortSignal.timeout(GATEWAY_LIST_TIMEOUT_MS),
+    });
+  } catch (e) {
+    return { result: _netFailure(e), models: [], hidden: [], total: 0, latency_ms: Date.now() - started };
+  }
+  const latency_ms = Date.now() - started;
+  if (r.status >= 300 && r.status < 400) {
+    return { result: "redirect", models: [], hidden: [], total: 0, latency_ms };
+  }
+  if (!r.ok) {
+    const byStatus = { 401: "unauthorized", 403: "forbidden", 404: "not_found", 429: "throttled" };
+    return { result: byStatus[r.status] || "error", models: [], hidden: [], total: 0, latency_ms };
+  }
+  let body;
+  try { body = await readJsonCapped(r); } catch {
+    return { result: "bad_response", models: [], hidden: [], total: 0, latency_ms };
+  }
+  const data = Array.isArray(body?.data) ? body.data : (Array.isArray(body) ? body : null);
+  if (!data) return { result: "bad_response", models: [], hidden: [], total: 0, latency_ms };
+  const seen = new Set();
+  const models = [];
+  const hidden = [];
+  for (const m of data) {
+    const id = String((m && typeof m === "object" ? m.id : m) || "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const cls = classifyGatewayModelId(id);
+    if (cls === "chat") {
+      if (models.length < GATEWAY_MAX_MODELS) {
+        models.push({ id, owned_by: typeof m?.owned_by === "string" ? m.owned_by.slice(0, 64) : "" });
+      }
+    } else if (hidden.length < GATEWAY_MAX_MODELS) {
+      hidden.push({ id: id.slice(0, 200), reason: cls });
+    }
+  }
+  models.sort((a, b) => a.id.localeCompare(b.id));
+  return { result: "ok", models, hidden, total: seen.size, latency_ms };
+}
+
+function _originOf(u) {
+  try { return u ? new URL(u).origin.toLowerCase() : ""; } catch { return ""; }
+}
+
+/** Admin：用**已保存**的连接信息列网关模型。 */
+export async function apiGetGatewayModels() {
+  const g = await readGatewaySecret();
+  if (g.error) return { error: `could not read the gateway settings (${g.error})`, status: 502 };
+  if (!g.base_url || !g.key) return { error: "the gateway is not configured yet", status: 409 };
+  return listGatewayModels(g.base_url, g.key);
+}
+
+/** 网关调上游时缺凭证 / 上游鉴权失败的文字形态（LiteLLM）。与 Python 侧
+ *  `main.py::_GATEWAY_UPSTREAM_AUTH_RE` 同一条**正则**，改一处要改两处。只用于分类，原文不外传。
+ *
+ *  ⚠️ 两边**判定次序有意不同**（正则相同、次序不同）：
+ *    · 这里（管理页测试 / 保存时探测）：HTTP 401 先判 `unauthorized`，再由 probeGateway 用同一把 Key
+ *      GET /models 复核 —— 200 才改判 `upstream_auth`；复核没过就维持 `unauthorized`（产品要求：
+ *      能证明 Key 有效才说「上游」）。只有**非 401** 才看这条文字。
+ *    · Python 对话路径（`_gateway_error_kind`）：不能为分类再发一次请求，文字是唯一信号，所以先看文字。
+ *  所以「401 + litellm.AuthenticationError 且 /models 恰好也失败」时，管理页说「凭证无效」、对话里说
+ *  「上游未授权」。这是有意的：管理页那句有复核兜底，更可信；要分辨就以管理页「测试」为准。 */
+const GATEWAY_UPSTREAM_AUTH_RE = /litellm\.authenticationerror|missing [a-z0-9 _.-]{0,40}api[ _-]?key|missing credentials/i;
+
+/**
+ * 网关上游错误 → 枚举态。只看 status / code / message 做**分类**，绝不把原文带出去
+ * （LiteLLM 的鉴权失败会回显收到的 Key 片段）。
+ *
+ * 「模型不存在」各家说法不一：LiteLLM 是 400 + "Invalid model name passed in model=…"，
+ * New API 是 503 + 「当前分组 … 下对于模型 … 无可用渠道」/ code `model_not_found`，
+ * OpenAI 本家是 404 + `model_not_found`。所以先看文字、再看状态码。
+ */
+export function classifyGatewayError(status, body) {
+  const err = body && typeof body === "object" ? (body.error ?? body) : {};
+  const msg = String((typeof err === "string" ? err : err?.message) || body?.message || "").toLowerCase();
+  const code = String((err && typeof err === "object" && (err.code || err.type)) || "").toLowerCase();
+  if (status === 401) return "unauthorized";
+  // 网关自己认了 Key、调上游时缺凭证：有的 LiteLLM 版本把它报成 500 / 400 而不是 401
+  // （「Missing Anthropic API Key」「Missing credentials」被包成 InternalServerError）。
+  // 401 那条由 probeGateway 用 GET /models 复核，这里只认非 401 的文字形态。
+  if (GATEWAY_UPSTREAM_AUTH_RE.test(msg)) return "upstream_auth";
+  if (status === 403) return "forbidden";
+  if (status === 429) return "throttled";
+  if (status === 408 || status === 504) return "timeout";
+  if (code.includes("model_not_found")
+      || /invalid model|model[^.]{0,80}(not found|does not exist|not exist|unknown|not available|not supported)|no available channel|无可用渠道|模型.{0,40}不存在/.test(msg)) {
+    return "invalid_model";
+  }
+  if (/(tool|function)[^.]{0,80}(not supported|unsupported|does not support|not support)|does not support (tools|tool|function)/.test(msg)) {
+    return "no_tools";
+  }
+  if (status === 404) return "not_found";
+  if (status === 400 || status === 422) return "probe_error";
+  return "error";
+}
+
+/**
+ * 网关模型连通性探测 —— 发**一次最小的 chat 请求，带一个工具定义**。
+ *
+ * 为什么要带工具：webchat 的 agent 每一轮都带着整套工具调用，后端模型不支持 function
+ * calling 的话，「ping 能通」毫无意义，真对话时第一句就 400。带一个永远不会被调用的空工具，
+ * 就把「支不支持工具」也一起问了。
+ *
+ * 这一次会花网关那边几十个 token（输出上限 PROBE_MAX_TOKENS）。只在管理员点「测试」或
+ * 保存时探默认模型才发生，与 Bedrock 那两条探测同一个代价级别。
+ */
+async function probeGateway(modelId) {
+  const started = Date.now();
+  const g = await readGatewaySecret();
+  if (g.error || !g.base_url || !g.key) {
+    return { model_id: modelId, result: "not_configured", latency_ms: 0 };
+  }
+  const hostErr = await assertPublicHost(g.base_url);
+  if (hostErr) return { model_id: modelId, result: "blocked_host", latency_ms: 0 };
+  const payload = JSON.stringify({
+    model: modelId,
+    messages: [{ role: "user", content: "ping" }],
+    max_tokens: PROBE_MAX_TOKENS,
+    stream: false,
+    tools: [{
+      type: "function",
+      function: {
+        name: "notiops_probe",
+        description: "Connectivity check. Never call this tool.",
+        parameters: { type: "object", properties: {} },
+      },
+    }],
+  });
+  let r;
+  try {
+    r = await gatewayFetch(`${g.base_url}/chat/completions`, {
+      method: "POST", headers: gatewayHeaders(g.key, true), body: payload,
+      signal: AbortSignal.timeout(GATEWAY_PROBE_TIMEOUT_MS),
+    });
+  } catch (e) {
+    return { model_id: modelId, result: _netFailure(e), latency_ms: Date.now() - started };
+  }
+  const latency_ms = Date.now() - started;
+  if (r.status >= 300 && r.status < 400) return { model_id: modelId, result: "redirect", latency_ms };
+  let body = null;
+  try { body = await readJsonCapped(r); } catch { body = null; }
+  if (r.ok) {
+    // 有的网关 200 里也会塞 `error`；没有 choices 就不是 OpenAI 形状的回答。
+    if (body && body.error) return { model_id: modelId, result: classifyGatewayError(r.status, body), latency_ms };
+    if (!body || !Array.isArray(body.choices)) return { model_id: modelId, result: "bad_response", latency_ms };
+    return { model_id: modelId, result: "ok", latency_ms };
+  }
+  // 401 有两种来历，下一步完全不同（2026-10-13 实测：网关 Key 能列模型，测 Claude 却报「凭证无效」）：
+  //   · 网关不认这把 Key                     → Key 失效 / 被吊销 / 无权调这个模型（unauthorized）
+  //   · 网关认 Key，但它调上游时没有凭证      → 网关没配这个模型供应商的上游 Key（upstream_auth）
+  // 只看 chat 那一次的 401 分不出来；用同一把 Key 再 GET 一次 /models（不花 token）就能分：
+  // 能列 = 网关这一层认这把 Key，问题在网关到上游那一段。
+  if (r.status === 401 && await _gatewayKeyAccepted(g.base_url, g.key)) {
+    return { model_id: modelId, result: "upstream_auth", latency_ms };
+  }
+  return { model_id: modelId, result: classifyGatewayError(r.status, body), latency_ms };
+}
+
+/**
+ * 这把网关 Key 在**网关那一层**是否有效：同一把 Key `GET {base}/models` 回 200。
+ *
+ * 依据：LiteLLM 一次请求要过两道鉴权 —— 客户端 → LiteLLM（虚拟 Key），LiteLLM → 上游
+ * （供应商凭证）[https://docs.litellm.ai/docs/proxy/client_setup/overview]；它的 `/v1/models`
+ * 要求虚拟 Key，且按这把 Key 的模型权限过滤 [https://docs.litellm.ai/docs/proxy/model_access]。
+ * New API 的 `/v1/models` 挂着与 `/v1/chat/completions` 同一个 `TokenAuth()` 中间件
+ * [https://github.com/QuantumNous/new-api/blob/main/router/relay-router.go]。所以「能列模型、
+ * chat 却 401」= Key 在网关这一层有效，401 来自网关调上游那一段。
+ *
+ * 安全面与列模型完全相同：同一个不跟随重定向的 `gatewayFetch`、同一次公网主机检查、短超时；
+ * 只看状态码，**不读、不回显**响应体。
+ * 局限：网关若把 `/models` 做成免鉴权，这里会把「Key 无效」误判成 upstream_auth —— 但保存网关
+ * 设置时已用这把 Key 验过一次 GET /models，Key 本身无效的情形在那一步就被拦下了。
+ */
+async function _gatewayKeyAccepted(base, key) {
+  try {
+    if (await assertPublicHost(base)) return false;
+    const r = await gatewayFetch(`${base}/models`, {
+      method: "GET", headers: gatewayHeaders(key),
+      signal: AbortSignal.timeout(GATEWAY_LIST_TIMEOUT_MS),
+    });
+    return r.status === 200;
+  } catch {
+    return false;
+  }
+}
+
+// 网关默认模型探测里，哪些结论是确定性的（拦保存）。比 Bedrock 那份多：
+//   no_tools      后端模型不支持工具调用 —— webchat 每一轮都要用工具
+//   not_configured / blocked_host / redirect / bad_response  连接信息本身不成立
+const GATEWAY_HARD_FAIL = new Set([
+  ...HARD_FAIL_PROBE_RESULTS, "not_configured", "blocked_host", "redirect", "bad_response",
+  "no_tools", "unreachable",
+  // Key 在网关这一层有效，但网关调这个模型的上游时没有凭证 —— 每一轮都会撞同一堵墙，
+  // 重试不会好转（要网关管理员补上游 Key，或换一个网关能调通的模型）。
+  "upstream_auth",
+  // 网关的 400 / 422 是确定性的（这条最小请求就被拒，真对话只会更复杂），不是 Bedrock 那种
+  // 「探测参数自己的问题」—— 对话每一轮都会撞上同一堵墙。
+  "probe_error",
+]);
+
+async function probeGatewayDefault(def, entry) {
+  let r;
+  try {
+    r = await probeGateway(String(entry.model_id));
+  } catch (e) {
+    console.error(`[llm-config] gateway default-model probe threw: ${e?.name || e}`);
+    r = { result: "error" };
+  }
+  if (r.result === "ok") return { ok: true, credential: "gateway" };
+  // 只有确定性失败拦。「刚把网关挪到第一」不再从严（此前任何非 ok 都拦，含限流 / 超时）：
+  // 不自动降级的前提下，换上去之后真坏了管理员能在同一页把次序改回来；而网关抖一下就存不进去，
+  // 等于把「先测试才能存」的门槛换个地方又立了一遍。
+  if (GATEWAY_HARD_FAIL.has(r.result)) {
+    return { ok: false,
+             error: `default_model ${def} failed a live check through the gateway (${r.result}); `
+                    + "fix the gateway settings / model, or keep another source on top",
+             probe: probeDetail("gateway", def, entry, r.result) };
+  }
+  return { ok: true,
+           warning: `default_model ${def} could not be verified through the gateway right now `
+                    + `(${r.result}) — re-run the connectivity test later` };
+}
+
+/**
+ * Admin：设置 / 清除网关连接信息。
+ *
+ * body: `{ base_url, api_key? }` 或 `{ clear: true }`。api_key 省略 = 沿用已存的 Key
+ * （只改地址时不必重贴 Key）。保存前先用新连接信息 GET 一次 `/models`：这一步**不花 token**，
+ * 却能把「地址不对 / Key 无效 / 被重定向」挡在落库之前。
+ */
+export async function apiPutGateway(body, actor = {}) {
+  if (!body || typeof body !== "object") return { error: "body must be an object", status: 400 };
+  const prev = await readConfig();
+  const clear = body.clear === true;
+  let payload;
+  let check = null;
+  let existing = null;
+  if (clear) {
+    if (prev && activeSource(prev) === "gateway") {
+      return { error: "the gateway is the active model source; drag another source to the top "
+                      + "and save before clearing its settings", status: 409 };
+    }
+    payload = "{}";
+  } else {
+    const base = normalizeGatewayBaseUrl(body.base_url);
+    if (!base) {
+      return { error: "base_url must be the https:// address of a public gateway, without query "
+                      + "string or credentials (e.g. https://gateway.example.com/v1)", status: 400 };
+    }
+    let key = String(body.api_key ?? "").trim();
+    existing = await readGatewaySecret();
+    if (!key) {
+      if (existing.error) return { error: `could not read the current gateway key (${existing.error})`, status: 502 };
+      if (!existing.key) return { error: "api_key is required", status: 400 };
+      // 只有**同一个 origin** 才沿用已存的 Key。换了主机还沿用，就等于把 Key 发给一个刚填进来的
+      // 地址（保存前那次 GET /models 就会带上它）—— 网关 Key 往往属于 NotiOps 之外的系统。
+      if (_originOf(existing.base_url || existing.raw_base_url) !== _originOf(base)) {
+        return { error: "re-enter the API key when the gateway host changes "
+                        + "(the saved key is only reused for the same host)", status: 400,
+                 result: "key_required" };
+      }
+      key = existing.key;
+    }
+    // 只收可打印 ASCII、不含空白：它要原样进 `Authorization` 头，换行等于头注入。
+    if (key.length < 8 || key.length > 4096 || !/^[\x21-\x7e]+$/.test(key)) {
+      return { error: "api_key looks wrong (8-4096 printable characters, no spaces)", status: 400 };
+    }
+    check = await listGatewayModels(base, key);
+    if (check.error) return { error: check.error, status: check.status || 400 };
+    if (check.result !== "ok") {
+      return { error: `the gateway did not accept these settings (${check.result} on GET /models); `
+                      + "nothing was saved", status: 400, result: check.result };
+    }
+    // 网关正排第一时换地址，等于「换上一个新的第一来源」：新网关至少要认得当前在用的默认模型，
+    // 否则保存之后每一轮对话都失败。只比对 GET /models 的结果（不花 token）。
+    if (prev && activeSource(prev) === "gateway") {
+      const def = defaultAliasFor(prev, "gateway");
+      const entry = (prev.models || []).find((m) => String(m.alias) === def);
+      const ids = new Set([...check.models.map((m) => m.id), ...check.hidden.map((m) => m.id)]);
+      // 列表里有通配符（LiteLLM 的 `*` / `anthropic/*`）时没法逐个比对，放行。
+      const wildcard = check.hidden.some((m) => m.reason === "wildcard");
+      if (entry && !wildcard && !ids.has(String(entry.model_id))) {
+        return { error: `the gateway is the active source, but the new gateway does not list its default `
+                        + `model ${entry.model_id}; nothing was saved. Move another source to the top first, `
+                        + "or update the model ids", status: 409, result: "default_missing" };
+      }
+    }
+    payload = JSON.stringify({ base_url: base, api_key: key });
+  }
+
+  try {
+    await sm.send(new UpdateSecretCommand({ SecretId: GATEWAY_SECRET_ID, SecretString: payload }));
+  } catch (e) {
+    if (e?.name === "ResourceNotFoundException") {
+      await sm.send(new CreateSecretCommand({
+        Name: GATEWAY_SECRET_ID, SecretString: payload,
+        Description: "NotiOps OpenAI-compatible model gateway (base_url + api_key), set from Admin",
+        Tags: OWN_SECRET_TAGS,
+      }));
+    } else throw e;
+  }
+
+  // 推 gateway_rev + generation：webchat runtime 看到新 generation 立即重读目录，看到新
+  // gateway_rev 立即重读这个 Secret（不等 300s 的 Key 缓存）。与 Bedrock Key 那条同一个写法。
+  // 与 Bedrock Key 那条不同，并发冲突时要**重试一次**：那边只需要 generation 前进（并发保存
+  // 已经做到了），这边还要 gateway_rev 前进 —— 并发保存不会替我们推它，不重试的话读取方要等
+  // 满 Key 缓存的 TTL 才换新 Key。
+  let cur = prev;
+  let bumpFailed = false;
+  const hostBefore = _hostOnly(existing?.base_url || existing?.raw_base_url || "");
+  const hostAfter = clear ? "" : _hostOnly(JSON.parse(payload).base_url || "");
+  const auditNote = `${clear ? "gateway_cleared" : "gateway_set"}:${hostBefore || "-"}->${hostAfter || "-"}`;
+  for (let attempt = 0; cur && attempt < 2; attempt++) {
+    const generation = nextGeneration(cur);
+    try {
+      await ddb.send(new PutCommand({
+        TableName: TABLE,
+        Item: { ...cur, generation,
+                models: normaliseModels(cur.models),
+                gateway_rev: generation,
+                gateway_set_by: clear ? "" : (actor?.username || actor?.sub || ""),
+                updated_at: new Date(generation).toISOString(),
+                updated_by: actor?.username || actor?.sub || "" },
+        ConditionExpression: "generation = :g",
+        ExpressionAttributeValues: { ":g": Number(cur.generation || 0) },
+      }));
+      // 审计里记主机变更（只记主机，不是凭证）：事后要能回答「网关地址什么时候被谁改到了哪里」。
+      await writeAudit(cur, { generation }, { ...actor, note: auditNote });
+      break;
+    } catch (e) {
+      if (e?.name === "ConditionalCheckFailedException" && attempt === 0) {
+        cur = await readConfig();
+        continue;
+      }
+      console.error(`[llm-config] generation bump after gateway change failed: ${e?.name || e}`);
+      bumpFailed = true;
+      break;
+    }
+  }
+  // Secret 已经写进去了，但 generation / gateway_rev 没推动：运行中的 runtime 最多还会用旧的地址和 Key
+  // 300 秒（Key 缓存的 TTL）。照样记一条审计（变更确实发生了），并把这件事告诉管理员 —— 以前这里只打
+  // 一行 console.error 就回「已保存」。
+  if (bumpFailed) await writeAudit(cur, { generation: cur?.generation }, { ...actor, note: `${auditNote}:not_propagated` });
+  return {
+    message: clear ? "gateway settings cleared" : "gateway settings saved",
+    ...(bumpFailed ? { warning: "gateway settings saved, but running agents were not notified; they may keep the "
+                                + "previous gateway settings for up to 5 minutes" } : {}),
+    gateway: await gatewayStatus(),
+    ...(check ? { models: check.models, hidden: check.hidden, total: check.total } : {}),
+  };
 }
 
 /** Mantle 的 region 必须在白名单内才拼得出 hostname；越界时退默认区（与 Python 侧一致）。 */
@@ -1529,7 +2409,8 @@ export async function apiListLlmAudit() {
     ScanIndexForward: false,
     Limit: AUDIT_KEEP,
     // 列表不带 snapshot_before（可能很大）；回滚时按 SK 单条取
-    ProjectionExpression: "SK, at, actor_sub, actor_name, generation_before, generation_after",
+    ProjectionExpression: "SK, at, actor_sub, actor_name, generation_before, generation_after, #note",
+    ExpressionAttributeNames: { "#note": "note" },
   }));
   return { entries: r.Items || [] };
 }
@@ -1563,10 +2444,12 @@ export async function apiRollbackLlmConfig(body, actor = {}) {
   // 选过模型的用户都受影响，且回滚会报告"成功"。
   // 瞬时故障（throttled / timeout / error）仍然只是 warning，不拦：Bedrock 抖一下不该
   // 把管理员锁在恢复路径外面。
-  const probe = await probeDefaultModel(snapshot);
+  // 与保存同一套判定（probeBeforeWrite）：只有确定性失败拦，网关排第一时加探 IM 的 Bedrock 来源。
+  const prevForProbe = await readConfig();
+  const probe = await probeBeforeWrite(snapshot, prevForProbe);
   if (!probe.ok) {
     return { error: `${probe.error} — roll back to a different entry instead, `
-                    + "or save a corrected configuration", status: 400 };
+                    + "or save a corrected configuration", status: 400, probe: probe.probe };
   }
 
   const prev = await readConfig();
@@ -1574,7 +2457,11 @@ export async function apiRollbackLlmConfig(body, actor = {}) {
   // 归一同保存路径。回滚是**最需要**它的那条：快照来自旧代，里面必然带着当时的字段
   // （`verified` 就是这么被一代代还原回来的）。只在 apiPutLlmConfig 归一等于「清理永远
   // 追不上还原」—— 白名单是写入侧的不变式，就得在每个写入侧都成立。
+  // 凭证元数据（谁设的 Key、网关版本号）取**现在**的值：回滚的是目录，不是 Secret ——
+  // Secret 本来就不随快照回去，把它的元数据还原成旧的只会让状态页说假话。
   const item = { ...snapshot, PK, SK, generation,
+                 ...Object.fromEntries(CREDENTIAL_META_FIELDS.map((k) => [k, undefined])),
+                 ...credentialMeta(prev),
                  models: normaliseModels(snapshot.models),
                  updated_at: new Date(generation).toISOString(),
                  updated_by: actor?.username || actor?.sub || "" };
@@ -1652,7 +2539,10 @@ export async function apiGetLlmStatus() {
       read_error: readError || undefined,
       generation: Number(item?.generation || 0),
       provider: item?.provider || "",
-      credential_mode: item?.credential_mode || "",
+      credential_mode: item ? activeSource(item) : "",
+      source_order: item ? normalizeSourceOrder(item.source_order, item.credential_mode) : [],
+      im_source: item ? effectiveSource(item, "im") : "",
+      gateway_rev: Number(item?.gateway_rev || 0),
       default_model: item?.default_model || "",
       models_total: models.length,
       models_enabled: enabled.length,
@@ -1663,6 +2553,7 @@ export async function apiGetLlmStatus() {
       updated_at: item?.updated_at || "",
       updated_by: item?.updated_by || "",
       bedrock_api_key: await keyStatus(item),
+      gateway: await gatewayStatus(item),
     },
     // ── 如何看到**各端实际**在服务哪一代 ──
     // 日志组名由 CDK 生成、不稳定，所以给的是筛选语句与找日志组的线索，不写死名字。
@@ -1707,8 +2598,13 @@ export async function resolveForStream(requestedAlias, surface = "webchat") {
   const cfg = (await readConfig()) || {};
   const generation = Number(cfg.generation || 0);
   const want = SURFACES.has(surface) ? surface : "webchat";
+  // 与 /models、Python 侧 `_entries` 同一个家族过滤：会话里存着一个 Bedrock alias、而第一来源
+  // 已换成网关时，这里把它换成网关的默认模型（并计 ModelSubstituted），runtime 不会拿到一个
+  // 它这一端解析不了的 alias。
+  const src = effectiveSource(cfg, want);
   const models = (Array.isArray(cfg.models) ? cfg.models : [])
-    .filter((m) => m && m.enabled === true && (m.surfaces || []).includes(want));
+    .filter((m) => m && m.enabled === true && (m.surfaces || []).includes(want)
+      && inFamily(m, src));
   if (!models.length) {
     // 目录未 seed / 全禁用：透传客户端值，由 runtime 侧内置兜底处理
     return { alias: requestedAlias || "", generation, substituted: false };
@@ -1719,7 +2615,7 @@ export async function resolveForStream(requestedAlias, surface = "webchat") {
     || (m.aliases_legacy || []).some((a) => String(a).toLowerCase() === asked));
   if (hit) return { alias: String(hit.alias), generation, substituted: false };
 
-  const def = String(cfg.default_model || "");
+  const def = defaultAliasFor(cfg, src);
   const fallback = models.find((m) => String(m.alias) === def) || models[0];
   // 空 alias 不算「被替换」（用户没指定，走默认是正常行为）
   const substituted = Boolean(asked);

@@ -100,7 +100,7 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 - **方式 A —— 一键 CloudFormation(单栈)**:合成入口 `infra/bin/standalone.ts` → `infra/lib/notiops-webchat-standalone-stack.ts`(CDK stack id `NotiOps`,发布成客户下载的 `notiops-webchat.template.json`,部署时的栈名由部署者自选)。**免本地环境、免 access key** —— 在 CloudFormation 控制台上传模板就能开栈。它建的是 Web Chat 那一套(前端 + BFF + AgentCore Runtime agent),外加一份「最小底座」(`notiops-config` 表 / Cognito 用户池 `notiops-users` / 共享数据桶 / ReportsCDN,见 `infra/lib/constructs/minimal-base-core.ts`),以及参数页 `InstallOption` 可选装的一个 IM 机器人(飞书 / Lark、Slack 或钉钉);v1.0.30 起还可以选装成本 MCP(填 `CurTable` 接已有的 CUR 表,或 `ProvisionCur=yes` 让栈连 CUR + 官方 Athena 集成一起建)。详见 [DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md)。
 - **方式 B —— `./setup.sh`(全量)**:交互式,内部编排 AgentCore Runtime 部署 + `cdk deploy --all`,建出上表的 `WebChatStack` 与 `NotiOpsBackendStack`(选了 IM 再加 `ImStack`)。
 
-两条路径跑的是**同一份** agent 代码(`agent-build/NotiOpsWebChat`,`scripts/deploy_agent.sh` 与一键模板的产物打包都指向它)与**同一个**前端(`frontend/chat-app`);Web Chat 的资源都由同一份 `infra/lib/constructs/web-chat-core.ts` 建,IM 三件套(ingress / worker / 进度轮询)都由同一份 `infra/lib/constructs/im-core.ts` 建 —— 方式 A 在**部署期**按 `InstallOption` 选装,方式 B 在**合成期**按 `-c enabledPlatforms` 决定。对等性由 `scripts/test_oneclick_parity.py` 逐条断言(runtime 授权 / 环境变量 / 出厂数据 / 生命周期 / 通知生产端 / Operator App / AgentCore Memory / 首登交付 / IM 加装项 / CUR 仪表盘 / 替客户建 CUR / DevOps 回调 / 阿里云只读凭据)。
+两条路径跑的是**同一份** agent 代码(`agent-build/NotiOpsWebChat`,`scripts/deploy_agent.sh` 与一键模板的产物打包都指向它)与**同一个**前端(`frontend/chat-app`);Web Chat 的资源都由同一份 `infra/lib/constructs/web-chat-core.ts` 建,IM 三件套(ingress / worker / 进度轮询)都由同一份 `infra/lib/constructs/im-core.ts` 建 —— 方式 A 在**部署期**按 `InstallOption` 选装,方式 B 在**合成期**按 `-c enabledPlatforms` 决定。对等性由 `scripts/test_oneclick_parity.py` 逐条断言(runtime 授权 / 环境变量 / 出厂数据 / 生命周期 / 通知生产端 / Operator App / AgentCore Memory / 首登交付 / IM 加装项 / CUR 仪表盘 / 替客户建 CUR / DevOps 回调 等)。
 
 差异落在**后台流水线**上。方式 A **不建**这些:每日自动巡检(`notiops-inspection-*` 四个 Lambda + SQS `notiops-inspection-tasks` + 它们的 EventBridge 定时规则,连 `notiops-inspection` 表也不建)、Lambda4 通知与 Lambda5 成本异常这两条 cron、往 IM 群的**主动推送**(装了 IM 也只是群里被动应答)、成员账号侧的 CloudWatch OAM Sink 与跨账号事件回流。逐条清单见 [DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md) §0.1。CUR + Athena **不在**这张清单里:v1.0.30 起方式 A 也能建(`ProvisionCur=yes`;阶段一是 custom resource `CurProvision`,阶段二是每 4 小时自愈一次的 `CurFinalizerFn`,与方式 B 共用 `cur_provisioner/spec.py` 的报告规格),已有 CUR 则填 `CurTable` 接进来,见 [DEPLOYMENT_ONECLICK.md](DEPLOYMENT_ONECLICK.md) §2.12。
 
@@ -218,9 +218,9 @@ NotiOps 以 **只读 Web Chat 控制台** 为主入口:浏览器里直接和 AWS
 | SNS | 闲置告警 + PHD 事件聚合 |
 | Custom Event Bus | DevOps Agent 跨账户事件聚合(`notiops-devops-events`) |
 | SQS | DevOps Agent Callback DLQ |
-| Secrets Manager | IM 凭据 + webhook secret + Bedrock/LiteLLM 配置 |
-| SSM Parameter Store | LLM Provider 切换(`/notiops/llm/provider`)等 |
-| Bedrock / LiteLLM Proxy | 后台 Lambda 里只有 PHD 翻译调模型(Lambda4 / Lambda5 / Callback 都不调);IM 侧是案例智能分析与建案时的服务分类。这两处都经 `shared/llm_provider.py` 跟随 SSM `/notiops/llm/provider` 切换。`/agent notiops` 的 IM 对话与 Web Chat 走 AgentCore Runtime 里的 agent,不经这一层 |
+| Secrets Manager | IM 凭据 + webhook secret + Bedrock API Key + OpenAI 兼容网关的地址与 Key |
+| SSM Parameter Store | 运行参数(如 `/notiops/agent/model_id`);旧的 `/notiops/llm/provider` 2026-10 起不再参与路由 |
+| Bedrock / OpenAI 兼容网关 | 后台 Lambda 里只有 PHD 翻译调模型(Lambda4 / Lambda5 / Callback 都不调);IM 侧是案例智能分析与建案时的服务分类。这两处都经 `shared/llm_provider.py`,按模型目录条目的 `kind` 选协议(Bedrock Converse / Mantle / 网关的 Chat Completions):IM 侧只会选到 Bedrock 条目,后台任务在网关排第一时跟着走网关;2026-10 起不再看 SSM `/notiops/llm/provider`。`/agent notiops` 的 IM 对话与 Web Chat 走 AgentCore Runtime 里的 agent,不经这一层 |
 | AWS Knowledge MCP | bot 对话引用官方文档,hosted host `knowledge-mcp.global.api.aws` |
 
 ## 技术栈

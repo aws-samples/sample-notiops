@@ -181,6 +181,8 @@ def _invoke_with_retry(
                 max_tokens=_MAX_TOKENS,
                 kind=model_kind,
                 region=model_region,
+                # 后端任务：网关是第一来源时不许落到 Bedrock 兜底（见 invoke_llm 的说明）
+                backend_task=True,
             )
             # 用 Bedrock Converse 的 envelope 包回去,后续代码不用改
             return {

@@ -132,6 +132,8 @@ const LLM_ADMIN_ROUTES = [
   ["GET", "/admin/llm-config"],
   ["PUT", "/admin/llm-config"],
   ["PUT", "/admin/llm-config/api-key"],
+  ["PUT", "/admin/llm-config/gateway"],
+  ["GET", "/admin/llm-config/gateway/models"],
   ["POST", "/admin/llm-config/rollback"],
   ["PUT", "/admin/llm-config/backend-tasks"],
   ["GET", "/admin/llm-config/audit"],

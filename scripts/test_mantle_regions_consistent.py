@@ -60,7 +60,7 @@ BFF = "bff/web-chat/llm_config.mjs"
 PY_PROVIDER = "shared/llm_provider.py"
 CDK = "agent-build/NotiOpsWebChat/agentcore/cdk/lib/cdk-stack.ts"
 SH = "scripts/grant_mantle_permissions.sh"
-FRONTEND = "frontend/chat-app/src/components/AdminPanel.tsx"
+FRONTEND = "frontend/chat-app/src/components/models/logic.ts"
 ONECLICK = "infra/lib/notiops-webchat-standalone-stack.ts"
 
 
@@ -193,7 +193,7 @@ def test_default_region_is_named_and_allowlisted() -> None:
         if not line.lstrip().startswith(("//", "*", "/*")))
     _check("frontend does not take the default from regions[0]",
            "regions?.[0]" not in code_only and "regions[0]" not in code_only,
-           "AdminPanel still derives a default region positionally")
+           "the models page still derives a default region positionally")
 
 
 def main() -> int:

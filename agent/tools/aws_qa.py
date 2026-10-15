@@ -47,21 +47,55 @@ def aws_docs_search(query: str) -> dict:
     return {"hits": hits, "sources": sources}
 
 
+# 与部署版 main.py 的 aws_docs_read 同一套语义（长页面分段读 + 失败与"没有"分开），理由见那边的注释。
+_PAGE_KEYS = ("start_index", "end_index", "total_length", "truncated", "redirected_url")
+_UNAVAILABLE_NOTE = (
+    "The AWS documentation service did not answer (transport failure) — this is NOT "
+    "'no documentation exists'. Do not answer this AWS technical question from memory: "
+    "tell the user the docs lookup failed and suggest retrying."
+)
+
+
 @tool
-def aws_docs_read(url: str) -> dict:
-    """Read the full content of a specific AWS documentation page.
+def aws_docs_read(url: str, start_index: int = 0) -> dict:
+    """Read an AWS documentation page, or the next part of a long one.
 
     Call after aws_docs_search to read the most relevant doc URL, then answer
     from it. Only docs.aws.amazon.com URLs are allowed.
 
+    Long pages come back in parts: the reply has `start_index`, `end_index`,
+    `total_length` and `truncated`, and a truncated part begins with a Table of
+    Contents giving each section's char range. Never repeat a call with the same
+    url and start_index — it returns the same text. A non-empty `error` means the
+    fetch FAILED — say so rather than answering from memory.
+
     Args:
-        url: The AWS documentation URL to read.
+        url: Exact URL from aws_docs_search results.
+        start_index: Char offset to read from (default 0 = page start). To continue,
+            pass the previous reply's `next_start_index`; to jump to a section, pass
+            its first offset from the Table of Contents.
 
     Returns:
-        dict with `content` (markdown text) and `sources` (the read URL).
+        dict with `content` (markdown text), the paging fields, and `sources` (the read URL).
     """
-    content = aws_docs_mcp.read_documentation(url)
-    return {
-        "content": content,
-        "sources": [{"icon": "doc", "title": url, "detail": url}],
-    }
+    res = aws_docs_mcp.read_documentation_ex(url, start_index=start_index)
+    if err := res.get("error"):
+        note = (_UNAVAILABLE_NOTE if err != "url_not_allowed" else
+                "That URL is not an allowed AWS documentation host. Pick a URL from "
+                "aws_docs_search results instead of constructing one.")
+        return {"content": "", "sources": [], "error": err, "note": note}
+    out = {"content": res["content"], "error": ""}
+    out.update({k: res[k] for k in _PAGE_KEYS if k in res})
+    start, end, total = res.get("start_index", 0), res.get("end_index"), res.get("total_length")
+    if res.get("truncated") and isinstance(end, int):
+        out["next_start_index"] = end
+        out["note"] = (f"Part of a longer page: chars {start}-{end} of {total}. For more, call "
+                       f"aws_docs_read again with start_index={end}, or with a section's offset "
+                       "from the Table of Contents.")
+    elif not res["content"]:
+        out["note"] = (f"start_index={start} is past the end of this page (total_length={total}); "
+                       "there is nothing more to read." if isinstance(total, int) and 0 < total <= start
+                       else "This page returned no text. Answer from the aws_docs_search excerpts "
+                            "or read another URL.")
+    out["sources"] = [{"icon": "doc", "title": url, "detail": url}]
+    return out

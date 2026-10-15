@@ -33,6 +33,37 @@
   --link: #5aa7ff;       /* 正文超链接：深色背景上要够亮，#006ce0 在近黑背景上偏暗、像普通文字 */
   --sk-bg: #1c2129;      /* 骨架屏灰块：比 --line 略亮一点，在近黑背景上才看得见 */
   --ok: #3ecf8e;         /* 正向/零成本提示色（"0 token"、DevOps 直答身份条）：品牌 --green(#00802f) 在近黑背景上几乎看不见 */
+  --err: #ff7a66;        /* 错误 / 失败提示色：#d13212 在近黑卡片底上只有约 3.5:1，小字看不清 */
+  /* 管理 → 模型（2026-10 改版 A）。只给 .mdl-* 用；深浅两套都要有值，别写死浅色 hex。 */
+  --mdl-soft: rgba(255,255,255,.035);   /* 「当前生效」条、分段控件底 */
+  --mdl-head: rgba(255,255,255,.025);   /* 表头行 */
+  --mdl-line2: #1f242b;                 /* 表格内的行分隔线（比 --line 再淡一档） */
+  /* 次要说明、占位符、行内 model_id。≥ 4.5:1（AA 正文）—— 对 --card 以及实际垫在它下面的几种底色
+     （--mdl-soft / --mdl-head / --mdl-tint / --mdl-sel / 失败行 --mdl-err-bg）都要成立。 */
+  --mdl-faint: #8b949e;
+  --mdl-ctrl: #0f1318;                  /* 输入框 / 下拉框底 */
+  --mdl-warn: #e3a33b;                  /* 琥珀：瞬时失败、建议轮换、数据外发提示 */
+  --mdl-warn-bg: rgba(227,163,59,.13);
+  --mdl-warn-text: #f0c27a;
+  --mdl-err-bg: rgba(255,122,102,.10);
+  --mdl-err-line: rgba(255,122,102,.38);
+  --mdl-ok-bg: rgba(62,207,142,.13);
+  --mdl-gray-bg: rgba(255,255,255,.07);
+  --mdl-tint: rgba(255,153,0,.08);      /* 草稿第一来源那一行 */
+  --mdl-tint2: rgba(255,153,0,.16);     /* 「默认」「当前使用」标签底 */
+  --mdl-sel: rgba(255,255,255,.05);     /* 抽屉打开的那一行：中性选中底色（不用橙色 —— 橙条是「保存后启用」） */
+  --mdl-sel-line: #6b7480;              /* 选中行的细描边（≥ 3:1） */
+  --mdl-pick-on: rgba(255,153,0,.08);
+  --mdl-sw-off: #3a414b;
+  --mdl-cb-line: #4a525d;
+  --mdl-bar-err: #1d1514;
+  --mdl-tip-bg: #2b323b;
+  --mdl-shadow: rgba(0,0,0,.55);
+  --mdl-scrim: rgba(0,0,0,.55);
+  /* 实心红 / 琥珀 / 绿底上的字：暗色主题里这三种底都是为「近黑底上当文字色」挑的亮色，配白字只有 ~2.5:1 */
+  --mdl-on-err: #1a0d0b;
+  --mdl-on-warn: #1f1400;
+  --mdl-on-ok: #06210f;
 }
 
 /* ===== Light 主题 —— 侧栏浅白、主区纯白 ===== */
@@ -58,6 +89,33 @@
   --link: #006ce0;       /* 浅色背景沿用品牌蓝 */
   --sk-bg: #e9ecf0;      /* 骨架屏灰块 */
   --ok: #00802f;         /* 正向/零成本提示色：浅色背景用品牌绿 */
+  --err: #d13212;        /* 错误 / 失败提示色（浅色底用 AWS 红） */
+  --mdl-soft: #f7f8fa;
+  --mdl-head: #fafbfc;
+  --mdl-line2: #eef0f2;
+  --mdl-faint: #687079;                 /* 同上：比 #6e7781 再深一点，才能在 --mdl-soft / 失败行底色上也过 4.5:1 */
+  --mdl-ctrl: #ffffff;
+  --mdl-warn: #8a5a00;
+  --mdl-warn-bg: #fdf5e4;
+  --mdl-warn-text: #5c4100;
+  --mdl-err-bg: #fdf1ee;
+  --mdl-err-line: #f3c7bc;
+  --mdl-ok-bg: #e9f5ec;
+  --mdl-gray-bg: #f0f2f4;
+  --mdl-tint: rgba(255,153,0,.07);
+  --mdl-tint2: rgba(255,153,0,.15);
+  --mdl-sel: #f3f5f8;
+  --mdl-sel-line: #8c96a1;
+  --mdl-pick-on: #fffaf2;
+  --mdl-sw-off: #d5dae0;
+  --mdl-cb-line: #c3c9d0;
+  --mdl-bar-err: #fff8f6;
+  --mdl-tip-bg: #1b2733;
+  --mdl-shadow: rgba(0,0,0,.14);
+  --mdl-scrim: rgba(15,20,25,.30);
+  --mdl-on-err: #ffffff;
+  --mdl-on-warn: #ffffff;
+  --mdl-on-ok: #ffffff;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body, #root { height: 100%; }
@@ -370,6 +428,11 @@ a.followup-btn { text-decoration: none; }
 .inv-step { display: flex; gap: 10px; padding: 8px 2px; position: relative; }
 .inv-step:not(:last-child)::before { content: ""; position: absolute; left: 4px; top: 20px; bottom: -8px; width: 1px; background: var(--line); }
 .inv-step-tx { font-size: 13px; line-height: 1.55; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+/* 步骤文字里的极小 markdown 子集（ThinkingPanel 的 StepText / src/stepText.ts）：粗体 + 行内代码。
+   代码与正文 `.md code` 同一套字体与底色；思考段是斜体，代码不跟着斜。 */
+.inv-step-tx strong { font-weight: 600; }
+.inv-step-tx code { background: var(--code-bg); border-radius: 4px; padding: 0.5px 5px; font-size: .9em;
+  font-family: "SF Mono", "JetBrains Mono", Consolas, monospace; font-style: normal; overflow-wrap: anywhere; }
 
 /* ── 「查看思考过程」入口：**两条 agent 路径共用这一个入口**，样式与行为必须一致 ── */
 /* 入口**必须**套在这个块级容器里：.think-entry 与 .thinking 都是 inline-flex，不套就会和
@@ -1374,3 +1437,330 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 .imx-guide-link { margin-top: 12px; background: transparent; border: none; padding: 0; cursor: pointer;
   color: var(--link, #5a96ff); font-size: 13px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; }
 .imx-guide-link:hover { text-decoration: underline; }
+
+/* ===== 管理 → 模型（2026-10 改版 A：单页 + 抽屉）=====
+   规矩：表格一行一条、行高 56（表头 42）、左右内边距 20、列距 18；状态列只放例外；
+   ⋯ 菜单常驻；细节进右侧抽屉；保存条只在有未保存修改时出现。颜色只用主题变量。 */
+.mdl { font-size: 13px; line-height: 1.5; color: var(--text); padding-bottom: 120px; color-scheme: dark; }
+/* 原生勾选框 / 下拉 / 数字框跟随主题：不设的话暗色主题下未勾选的框是一块亮白方块。 */
+:root[data-theme="light"] .mdl { color-scheme: light; }
+.mdl code, .mdl-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.mdl-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.mdl-mut { color: var(--muted); }
+.mdl-faint { color: var(--mdl-faint); }
+.mdl-smt { font-size: 12px; }
+.mdl-errtxt { color: var(--err); }
+.mdl-ell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+/* 页头 */
+.mdl-hd { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+.mdl-title { font-size: 20px; font-weight: 700; letter-spacing: -.01em; }
+.mdl-sub { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+.mdl-hbtns { display: flex; align-items: center; gap: 12px; flex: none; white-space: nowrap; }
+/* 按钮 */
+.mdl-btn { height: 32px; padding: 0 13px; border: 1px solid var(--line); border-radius: 8px; background: var(--card);
+  font: inherit; font-size: 12.5px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; color: var(--text);
+  white-space: nowrap; flex: none; cursor: pointer; }
+.mdl-btn:hover:not(:disabled) { border-color: var(--muted); }
+.mdl-btn:focus-visible, .mdl-more:focus-visible, .mdl-sw:focus-visible, .mdl-handle:focus-visible,
+.mdl-namebtn:focus-visible, .mdl-i:focus-visible, .mdl-x:focus-visible, .mdl-seg button:focus-visible,
+.mdl-mi:focus-visible { outline: 2px solid var(--orange); outline-offset: 2px; }
+.mdl-btn.pri { background: var(--orange); border-color: var(--orange); color: #fff; }
+.mdl-btn.pri:hover:not(:disabled) { background: var(--orange2); border-color: var(--orange2); }
+.mdl-btn.sm { height: 28px; padding: 0 11px; font-size: 12px; }
+.mdl-btn.danger { color: var(--err); border-color: var(--mdl-err-line); }
+.mdl-btn.red { background: var(--err); border-color: var(--err); color: var(--mdl-on-err); }
+.mdl-btn:disabled { color: var(--mdl-faint); background: var(--mdl-soft); border-color: var(--line); cursor: not-allowed; }
+.mdl-i { border: 0; background: none; padding: 0 2px; margin-left: 2px; color: var(--mdl-faint); font-size: 12.5px; cursor: help;
+  line-height: 1; font-family: inherit; }
+.mdl-i:hover { color: var(--text); }
+.mdl-tipw { position: relative; display: inline-flex; align-items: center; }
+.mdl-tip { position: absolute; z-index: 90; width: 380px; max-width: min(400px, 80vw); background: var(--mdl-tip-bg); color: #fff;
+  text-wrap: pretty;
+  translate: var(--mdl-tip-dx, 0px) 0;
+  border-radius: 9px; padding: 11px 13px; font-size: 12.5px; line-height: 1.6; font-weight: 400; white-space: normal;
+  box-shadow: 0 10px 28px var(--mdl-shadow); text-align: left; letter-spacing: 0; }
+.mdl-tip b { display: block; margin-bottom: 2px; font-weight: 700; }
+.mdl-tip.up { bottom: calc(100% + 10px); }
+.mdl-tip.down { top: calc(100% + 10px); }
+.mdl-tip.center { left: 50%; transform: translateX(-50%); }
+.mdl-tip.start { left: -14px; }
+.mdl-tip.end { right: -14px; }
+.mdl-tip::after { content: ""; position: absolute; border: 6px solid transparent; }
+.mdl-tip.up::after { top: 100%; border-top-color: var(--mdl-tip-bg); }
+.mdl-tip.down::after { bottom: 100%; border-bottom-color: var(--mdl-tip-bg); }
+.mdl-tip.center::after { left: calc(50% - 6px - var(--mdl-tip-dx, 0px)); }
+.mdl-tip.start::after { left: calc(14px - var(--mdl-tip-dx, 0px)); }
+.mdl-tip.end::after { right: calc(14px + var(--mdl-tip-dx, 0px)); }
+/* 当前生效 */
+/* 当前生效：放得下就一行（与 mock 一致）；放不下时「保存后 …」整块换到第二行，不截断模型名。 */
+.mdl-strip { display: flex; flex-wrap: wrap; align-items: center; column-gap: 18px; row-gap: 8px; min-height: 48px; padding: 8px 18px;
+  background: var(--mdl-soft); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 26px; white-space: nowrap; }
+.mdl-strip .k { font-size: 12px; color: var(--muted); font-weight: 600; flex: none; }
+.mdl-route { display: inline-flex; align-items: center; gap: 7px; flex: none; }
+.mdl-route b { font-weight: 600; flex: none; }
+.mdl-arr { color: var(--mdl-faint); flex: none; }
+.mdl-tail { margin-left: auto; display: inline-flex; align-items: center; gap: 18px; flex: none; }
+.mdl-after { display: inline-flex; align-items: center; gap: 14px; height: 32px; padding: 0 12px;
+  border: 1px dashed var(--orange); border-radius: 8px; background: var(--card); flex: none; }
+.mdl-after .k { color: var(--orange2); }
+.mdl-warnline { color: var(--mdl-warn); font-size: 12px; white-space: nowrap; flex: none; display: inline-flex; align-items: center; }
+/* 区块 + 表格 */
+.mdl-sec { margin-bottom: 28px; }
+.mdl-sh { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; min-height: 32px; white-space: nowrap; }
+.mdl-sh .t { font-size: 14.5px; font-weight: 700; }
+.mdl-sh .r { margin-left: auto; display: flex; gap: 10px; align-items: center; }
+.mdl-tbl { border: 1px solid var(--line); border-radius: 10px; position: relative; background: var(--card); }
+.mdl-tr { display: grid; column-gap: 18px; align-items: center; height: 56px; padding: 0 20px; border-bottom: 1px solid var(--mdl-line2);
+  white-space: nowrap; position: relative; }
+.mdl-tr:last-child { border-bottom: 0; border-radius: 0 0 10px 10px; }
+.mdl-tr.h { height: 42px; background: var(--mdl-head); font-size: 12px; color: var(--muted); font-weight: 500; border-radius: 10px 10px 0 0; }
+.mdl-tr.click { cursor: pointer; }
+.mdl-tr.click:hover { background: var(--mdl-soft); }
+.mdl-tr.cur, .mdl-tr.cur:hover { background: var(--mdl-sel); box-shadow: inset 0 0 0 1px var(--mdl-sel-line); }
+.mdl-tr.pend, .mdl-tr.pend:hover { background: var(--mdl-tint); box-shadow: inset 3px 0 0 var(--orange); }
+.mdl-tr.fail, .mdl-tr.fail:hover { background: var(--mdl-err-bg); box-shadow: inset 3px 0 0 var(--err); }
+/* 抽屉开着的恰好是「保存后启用」/ 失败的那一行：状态条保留，再叠一圈中性描边 */
+.mdl-tr.pend.cur, .mdl-tr.pend.cur:hover { box-shadow: inset 3px 0 0 var(--orange), inset 0 0 0 1px var(--mdl-sel-line); }
+.mdl-tr.fail.cur, .mdl-tr.fail.cur:hover { box-shadow: inset 3px 0 0 var(--err), inset 0 0 0 1px var(--mdl-sel-line); }
+/* 网关不是第一来源时的网关行（用户看不到它们）与未启用的行：名称降灰，勾选框一起淡下去。 */
+.mdl-tr.off .mdl-namebtn, .mdl-tr.off .mdl-srcc, .mdl-tr.dis .mdl-namebtn { color: var(--muted); font-weight: 500; }
+.mdl-tr.off .mdl-cb, .mdl-tr.dis .mdl-cb { opacity: .45; }
+.mdl-tr.drag { opacity: .5; }
+.mdl-tr.drop-above { box-shadow: inset 0 3px 0 var(--orange); }
+.mdl-tr.drop-below { box-shadow: inset 0 -3px 0 var(--orange); }
+.mdl-tr.fold { display: flex; justify-content: space-between; color: var(--muted); font-size: 12.5px; cursor: pointer;
+  width: 100%; border: 0; background: none; font: inherit; font-size: 12.5px; text-align: left; }
+.mdl-tr.fold:hover { background: var(--mdl-soft); }
+.mdl-tr > div, .mdl-tr > span { min-width: 0; }
+.mdl-tr.h > div { overflow: hidden; text-overflow: ellipsis; }
+/* 连接 / 默认模型两列按比例分：内容栏只有 ~880px（1440 屏 + 主侧栏）时，
+   固定 300 的默认模型列会把「连接」挤到只剩几个字；默认模型至少 240，放得下一个完整的网关模型名。 */
+.mdl-grid-src { grid-template-columns: 16px 16px 130px minmax(0,1fr) minmax(240px,1.2fr) 136px 64px; }
+.mdl-grid-mdl { grid-template-columns: 56px minmax(0,1fr) 72px 40px 40px 250px 28px; }
+.mdl-grid-task { grid-template-columns: 220px 300px minmax(0,1fr); }
+/* 英文：来源名「OpenAI-compatible gateway」、状态「Gateway upstream not authorised」、任务名都长得多。
+   宽度按语言给（每行是独立的 grid，用 max-content 会让各行列对不齐）；挤掉的是「连接」列（次要信息，全文在 title / 抽屉）。 */
+.mdl[data-lang="en"] .mdl-grid-src { grid-template-columns: 16px 16px 180px minmax(0,1fr) minmax(236px,1.1fr) 206px 72px; }
+.mdl[data-lang="en"] .mdl-grid-mdl { grid-template-columns: 44px minmax(0,1fr) 64px 40px 40px 270px 28px; }
+.mdl[data-lang="en"] .mdl-grid-task { grid-template-columns: 270px 280px minmax(0,1fr); }
+/* 「连接」列按自身宽度降级：先丢主机名只留后 4 位，再窄就整格不显示（不留半截字）。
+   选择器写成 `.mdl-grid-src > .mdl-col-conn …`：容器查询不加优先级，后面的 `.mdl-conn { display: flex }` 会盖掉更弱的写法。 */
+.mdl-grid-src > .mdl-col-conn { container-type: inline-size; }
+@container (max-width: 130px) { .mdl-grid-src > .mdl-col-conn .mdl-conn .h, .mdl-grid-src > .mdl-col-conn .mdl-conn .sep { display: none; } }
+@container (max-width: 72px) { .mdl-grid-src > .mdl-col-conn > * { display: none; } }
+.mdl-mc { display: flex; align-items: baseline; gap: 10px; min-width: 0; overflow: hidden; }
+.mdl-name { font-weight: 600; font-size: 13.5px; flex: none; color: var(--text); }
+.mdl-namebtn { border: 0; background: none; padding: 0; font: inherit; font-weight: 600; font-size: 13.5px; color: var(--text);
+  cursor: pointer; flex: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.mdl-namebtn:hover { text-decoration: underline; text-underline-offset: 3px; }
+.mdl-mid { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--mdl-faint); overflow: hidden;
+  text-overflow: ellipsis; min-width: 0; }
+.mdl-c { display: flex; justify-content: center; align-items: center; }
+.mdl-handle { border: 0; background: none; padding: 0; color: var(--mdl-faint); font-size: 15px; letter-spacing: -1px;
+  cursor: grab; line-height: 1; font-family: inherit; }
+.mdl-handle:hover:not(:disabled) { color: var(--text); }
+.mdl-handle:disabled { cursor: not-allowed; opacity: .45; }
+.mdl-rank { font-weight: 700; color: var(--muted); font-variant-numeric: tabular-nums; }
+.mdl-srcname { font-weight: 700; }
+/* 连接列：主机名可截，「· ****abcd」不截 */
+.mdl-conn { display: flex; gap: 4px; min-width: 0; white-space: nowrap; overflow: hidden; }
+.mdl-conn .k { flex: none; }
+/* 开关 / 勾选 */
+.mdl-sw { width: 30px; height: 18px; border-radius: 9px; background: var(--mdl-sw-off); position: relative; display: inline-block;
+  flex: none; border: 0; padding: 0; cursor: pointer; vertical-align: middle; }
+.mdl-sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 2px rgba(0,0,0,.2); transition: left .12s; }
+.mdl-sw.on { background: var(--orange); }
+.mdl-sw.on::after { left: 14px; }
+.mdl-sw:disabled { opacity: .5; cursor: not-allowed; }
+.mdl-cb { width: 16px; height: 16px; margin: 0; accent-color: var(--orange); cursor: pointer; flex: none; }
+.mdl-cb:disabled { cursor: not-allowed; opacity: .55; }
+.mdl-na { color: var(--mdl-cb-line); }
+.mdl-chk { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+/* 输入 / 下拉 */
+.mdl-selw { position: relative; display: block; min-width: 0; width: 100%; }
+.mdl-selw::after { content: "▾"; position: absolute; right: 10px; top: 50%; transform: translateY(-50%); pointer-events: none;
+  color: var(--mdl-faint); font-size: 11px; }
+.mdl-select { width: 100%; height: 32px; border: 1px solid var(--line); border-radius: 8px; padding: 0 26px 0 10px;
+  background: var(--mdl-ctrl); color: var(--text); font: inherit; font-size: 13px; appearance: none; -webkit-appearance: none;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.mdl-select.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.mdl-select.err { border-color: var(--err); }
+.mdl-select:disabled { color: var(--mdl-faint); cursor: not-allowed; }
+.mdl-select:focus-visible, .mdl-input:focus { outline: none; border-color: var(--orange); box-shadow: 0 0 0 3px rgba(255,153,0,.18); }
+.mdl-input { height: 34px; border: 1px solid var(--line); border-radius: 8px; padding: 0 11px; background: var(--mdl-ctrl);
+  color: var(--text); font: inherit; font-size: 13px; min-width: 0; width: 100%; }
+.mdl-input::placeholder { color: var(--mdl-faint); }
+.mdl-input:disabled { color: var(--mdl-faint); background: var(--mdl-soft); cursor: not-allowed; }
+.mdl-input.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+/* 标签 */
+/* inline-block（不是 inline-flex）：文字直接在块里，放不下时才有省略号（flex 的匿名文字项不吃 text-overflow）。 */
+.mdl-tag { display: inline-block; height: 22px; line-height: 20px; padding: 0 8px; border-radius: 6px; font-size: 11.5px;
+  font-weight: 600; white-space: nowrap; flex: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; color: var(--text);
+  border: 1px solid transparent; vertical-align: middle; }
+/* 状态列放不下时先截「默认 · …」：失败结果是例外，必须完整（英文「Gateway upstream not authorised」很长）。 */
+.mdl-cells > .mdl-tag.def, .mdl-cells > .mdl-tag.defm { flex: 0 1 auto; min-width: 3em; }
+.mdl-tag.def { border-color: var(--orange); background: var(--mdl-tint2); }
+.mdl-tag.defm { border-color: var(--line); color: var(--muted); }
+.mdl-tag.new { border: 1px dashed var(--orange2); color: var(--orange2); font-weight: 500; }
+.mdl-tag.pend { border: 1px dashed var(--orange); }
+.mdl-tag.live { background: var(--mdl-tint2); }
+.mdl-tag.err { background: var(--mdl-err-bg); color: var(--err); border-color: var(--mdl-err-line); }
+.mdl-tag.warn { background: var(--mdl-warn-bg); color: var(--mdl-warn); }
+.mdl-tag.gray { background: var(--mdl-gray-bg); color: var(--muted); font-weight: 500; }
+.mdl-tag.ok { background: var(--mdl-ok-bg); color: var(--ok); }
+.mdl-cells { display: flex; gap: 6px; align-items: center; min-width: 0; overflow: hidden; }
+.mdl-srcc { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--muted); }
+.mdl-sd { width: 7px; height: 7px; border-radius: 2px; display: inline-block; flex: none; }
+.mdl-sd.gw { background: var(--orange2); }
+.mdl-sd.br { background: var(--blue); }
+/* ⋯ 菜单（常驻）+ 浮层 */
+.mdl-more { width: 28px; height: 28px; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 17px; border: 1px solid transparent; line-height: 1; background: none; cursor: pointer; padding: 0; }
+.mdl-more:hover, .mdl-more.on { border-color: var(--line); background: var(--mdl-soft); color: var(--text); }
+.mdl-menu { position: absolute; background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 10px 28px var(--mdl-shadow); padding: 6px; z-index: 40; width: 200px; white-space: nowrap; right: 12px; }
+.mdl-menu.down { top: 48px; }
+.mdl-menu.up { bottom: 48px; }
+.mdl-mi { height: 34px; display: flex; align-items: center; padding: 0 12px; border-radius: 6px; font: inherit; font-size: 13px; gap: 8px;
+  width: 100%; border: 0; background: none; color: var(--text); cursor: pointer; text-align: left; }
+.mdl-mi:hover:not([aria-disabled="true"]), .mdl-mi:focus-visible { background: var(--mdl-soft); }
+.mdl-mi[aria-disabled="true"] { color: var(--mdl-faint); cursor: not-allowed; }
+.mdl-mi[aria-disabled="true"].red { color: var(--mdl-faint); font-weight: 500; }
+.mdl-mi[aria-disabled="true"].red:hover { background: none; }
+/* 禁用原因在第二行：可见、能被读屏读到（aria-describedby），不只藏在 title 里 */
+.mdl-mi.has-hint { height: auto; min-height: 34px; padding: 7px 12px; flex-direction: column; align-items: flex-start;
+  justify-content: center; gap: 2px; white-space: normal; }
+.mdl-mi .sub { font-size: 11.5px; line-height: 1.45; color: var(--muted); font-weight: 400; }
+.mdl-mi.red { color: var(--err); font-weight: 600; }
+.mdl-mi.red:hover:not([aria-disabled="true"]) { background: var(--mdl-err-bg); }
+.mdl-sep { height: 1px; background: var(--mdl-line2); margin: 5px 4px; }
+.mdl-pop { position: absolute; background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  box-shadow: 0 14px 36px var(--mdl-shadow); padding: 16px 18px; z-index: 45; width: 420px; white-space: normal; right: 12px; cursor: default; }
+.mdl-pop.down { top: 50px; }
+.mdl-pop.up { bottom: 50px; }
+.mdl-pop .pt { font-size: 13.5px; font-weight: 700; margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mdl-pop .ps { font-size: 12.5px; color: var(--muted); margin-bottom: 10px; }
+.mdl-pop .pf { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+/* 分段 + 搜索 */
+.mdl-seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; padding: 2px; background: var(--mdl-soft); }
+.mdl-seg button { height: 28px; padding: 0 12px; display: inline-flex; align-items: center; gap: 6px; border-radius: 6px; font: inherit;
+  font-size: 12.5px; color: var(--muted); border: 0; background: none; cursor: pointer; }
+.mdl-seg button.on { background: var(--card); color: var(--text); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+.mdl-seg em { font-style: normal; color: var(--mdl-faint); font-size: 11.5px; }
+.mdl-search { position: relative; width: 200px; flex: none; }
+.mdl-search .mdl-input { height: 32px; padding-left: 28px; font-size: 12.5px; }
+.mdl-search::before { content: "⌕"; position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--mdl-faint);
+  pointer-events: none; }
+/* 挑选器里的搜索框：同一个 ⌕，占满一行 */
+.mdl-search.wide { width: auto; flex: 1; min-width: 0; }
+.mdl-search.wide .mdl-input { height: 34px; font-size: 13px; }
+.mdl-tsum { white-space: nowrap; }
+.mdl-addw { position: relative; }
+.mdl-foot { display: flex; align-items: center; gap: 16px; padding: 10px 20px 0; font-size: 12px; color: var(--muted);
+  white-space: nowrap; min-width: 0; }
+.mdl-foot > .n { flex: none; }
+.mdl-foot > .pn { display: inline-flex; align-items: center; min-width: 0; }
+/* 保存条（固定在内容栏底部，只在有未保存修改 / 保存失败 / 刚保存完时出现） */
+/* 版面 = 左边说明（.l）+ 右边按钮（.r）。一行放不下时 .r 整组换到第二行、右对齐（flex-wrap），
+   而不是把按钮挤出视口或压到抽屉底下（抽屉 z-index 60 > 55）。
+   · dirty：.l 的 flex-basis 给小值 —— 先截摘要、实在放不下才换行
+   · fail：.l 按内容算 —— 「检查网关默认模型 · model_id · 红标签」整句优先，按钮换到下一行
+   · .mid 留最小宽度，不会被压到 0（连省略号都没有）；model_id、红标签、按钮（keepOrder 除外）不收缩 */
+.mdl-bar { position: fixed; right: 0; bottom: 0; min-height: 64px; background: var(--card); border-top: 1px solid var(--line);
+  box-shadow: 0 -6px 20px var(--mdl-shadow); display: flex; flex-wrap: wrap; align-items: center; column-gap: 16px; row-gap: 8px;
+  padding: 10px 28px; white-space: nowrap; z-index: 55; min-width: 0; }
+.mdl-bar.with-drawer { right: min(560px, 100vw); padding: 10px 20px; }
+.mdl-bar .l { display: flex; align-items: center; gap: 12px; flex: 1 1 auto; min-width: 0; min-height: 32px; }
+.mdl-bar.dirty .l { flex-basis: 200px; }
+.mdl-bar .l > .hd, .mdl-bar .l > .mdl-tipw { flex: none; }
+.mdl-bar .l > .id { flex: 0 1 auto; min-width: 8em; overflow: hidden; text-overflow: ellipsis; }
+.mdl-bar .l > .mdl-tag { flex: 0 1 auto; min-width: 5em; }
+.mdl-bar .mdl-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--orange); flex: none; }
+.mdl-bar .r { margin-left: auto; display: flex; flex-wrap: wrap; justify-content: flex-end; column-gap: 10px; row-gap: 8px;
+  align-items: center; flex: 0 1 auto; min-width: 0; max-width: 100%; }
+.mdl-bar .mid { min-width: 3.5em; flex: 0 20 auto; overflow: hidden; text-overflow: ellipsis; }
+.mdl-bar .r .hint { min-width: 2em; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.mdl-bar .r .hint + .mdl-tipw { margin-left: -8px; }
+.mdl-bar .mdl-btn.shrink { flex: 0 1 auto; min-width: 7em; max-width: 100%; overflow: hidden; }
+.mdl-bar .mdl-btn.shrink > span { min-width: 0; }
+.mdl-bar.err { background: var(--mdl-bar-err); border-top-color: var(--mdl-err-line); }
+.mdl-bar .mdl-xi { width: 20px; height: 20px; border-radius: 50%; background: var(--err); color: var(--mdl-on-err); font-size: 11px; font-weight: 700;
+  display: inline-flex; align-items: center; justify-content: center; flex: none; }
+.mdl-bar .mdl-oki { width: 20px; height: 20px; border-radius: 50%; background: var(--ok); color: var(--mdl-on-ok); font-size: 11px; font-weight: 700;
+  display: inline-flex; align-items: center; justify-content: center; flex: none; }
+.mdl-bar .mdl-warni { width: 20px; height: 20px; border-radius: 50%; background: var(--mdl-warn); color: var(--mdl-on-warn); font-size: 12px; font-weight: 700;
+  display: inline-flex; align-items: center; justify-content: center; flex: none; }
+.mdl-bar .blocked { color: var(--err); font-size: 12px; min-width: 3.5em; max-width: 420px; flex: 0 1 auto; overflow: hidden;
+  text-overflow: ellipsis; }
+/* 抽屉（非模态，不挡保存条）*/
+.mdl-drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 100vw); background: var(--card);
+  box-shadow: -14px 0 34px var(--mdl-shadow); display: flex; flex-direction: column; z-index: 60; border-left: 1px solid var(--line); }
+.mdl-dh { padding: 18px 24px; border-bottom: 1px solid var(--mdl-line2); display: flex; gap: 12px; align-items: flex-start; }
+.mdl-dh .t { font-size: 17px; font-weight: 700; display: flex; align-items: center; gap: 10px; min-width: 0; outline: none; }
+.mdl-dh .t span.nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mdl-dh .s { font-size: 12.5px; color: var(--muted); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mdl-dh > div { min-width: 0; flex: 1; }
+.mdl-x { margin-left: auto; color: var(--mdl-faint); font-size: 18px; line-height: 1; border: 0; background: none; cursor: pointer;
+  padding: 2px 4px; border-radius: 6px; flex: none; font-family: inherit; }
+.mdl-x:hover { color: var(--text); background: var(--mdl-soft); }
+.mdl-db { padding: 20px 24px; flex: 1; overflow-y: auto; }
+.mdl-blk + .mdl-blk { margin-top: 28px; }
+.mdl-bt { font-size: 13px; font-weight: 700; margin-bottom: 10px; }
+.mdl-kv { display: grid; grid-template-columns: 92px minmax(0,1fr); column-gap: 16px; align-items: center; min-height: 42px; }
+.mdl-kv .k { color: var(--muted); font-size: 12.5px; }
+.mdl-kv .v { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.mdl-kv .v > .note { font-size: 12px; color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mdl-hint { font-size: 12px; color: var(--muted); margin: 2px 0 0 108px; }
+.mdl-hint.err { color: var(--err); }
+.mdl-df { padding: 14px 24px; border-top: 1px solid var(--mdl-line2); display: flex; gap: 10px; align-items: center; }
+.mdl-callout { border-radius: 9px; padding: 11px 13px; font-size: 12.5px; line-height: 1.6; }
+.mdl-callout.warn { background: var(--mdl-warn-bg); color: var(--mdl-warn-text); }
+.mdl-msg { font-size: 12px; margin: 6px 0 0 108px; }
+.mdl-msg.ok { color: var(--ok); }
+.mdl-msg.err { color: var(--err); }
+/* 模态（挑选器）*/
+.mdl-scrim { position: fixed; inset: 0; background: var(--mdl-scrim); z-index: 65; }
+.mdl-modal { position: fixed; left: 50%; top: 36px; transform: translateX(-50%); width: min(680px, calc(100vw - 32px));
+  max-height: calc(100vh - 72px); background: var(--card); border-radius: 14px; box-shadow: 0 24px 60px var(--mdl-shadow); z-index: 70;
+  display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); }
+.mdl-mh { padding: 18px 24px; border-bottom: 1px solid var(--mdl-line2); display: flex; align-items: flex-start; gap: 12px; }
+.mdl-mh .t { font-size: 16px; font-weight: 700; outline: none; }
+.mdl-mh .s { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
+.mdl-mb { padding: 16px 24px 14px; overflow-y: auto; min-height: 0; flex: 1; }
+.mdl-msearch { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.mdl-plistw { position: relative; }
+.mdl-plist { border: 1px solid var(--line); border-radius: 10px; height: min(526px, calc(100vh - 380px)); min-height: 200px; overflow-y: auto;
+  position: relative; }
+/* 没滚到底时底部渐隐一行「还有 N 个匹配 · 向下滚动」（A-2）；不挡点击 */
+.mdl-pmore { position: absolute; left: 1px; right: 1px; bottom: 1px; height: 56px; display: flex; align-items: flex-end; justify-content: center;
+  padding-bottom: 11px; font-size: 12px; color: var(--muted); pointer-events: none; border-radius: 0 0 9px 9px;
+  background: linear-gradient(to bottom, transparent 0, var(--card) 42%); }
+.mdl-pg { height: 32px; display: flex; align-items: center; gap: 8px; padding: 0 14px; background: var(--mdl-head); font-size: 12px;
+  font-weight: 700; color: var(--muted); border-bottom: 1px solid var(--mdl-line2); position: sticky; top: 0; z-index: 1; }
+.mdl-pg em { font-style: normal; font-weight: 500; color: var(--mdl-faint); }
+.mdl-pr { min-height: 38px; display: flex; align-items: center; gap: 12px; padding: 0 14px; border-bottom: 1px solid var(--mdl-line2);
+  white-space: nowrap; cursor: pointer; }
+.mdl-pr:hover { background: var(--mdl-soft); }
+.mdl-pr code { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.mdl-pr.on { background: var(--mdl-pick-on); }
+.mdl-pr .lbl { font-weight: 600; flex: none; }
+.mdl-pr .sp { margin-left: auto; }
+.mdl-pempty { padding: 16px 14px; color: var(--muted); font-size: 12.5px; }
+.mdl-mrow { display: flex; align-items: center; gap: 10px; margin-top: 12px; white-space: nowrap; }
+.mdl-mf { padding: 14px 24px; border-top: 1px solid var(--mdl-line2); display: flex; align-items: center; gap: 10px; background: var(--mdl-head); }
+/* 变更记录 */
+.mdl-audit { display: grid; grid-template-columns: 150px minmax(0,1fr) 120px auto; column-gap: 14px; align-items: center;
+  min-height: 44px; border-bottom: 1px solid var(--mdl-line2); font-size: 12.5px; white-space: nowrap; }
+.mdl-audit.h { min-height: 34px; font-size: 12px; color: var(--muted); }
+@media (max-width: 900px) {
+  .mdl-grid-mdl { grid-template-columns: 56px minmax(0,1fr) 40px 40px 160px 28px; }
+  .mdl-grid-mdl > .mdl-col-src { display: none; }
+  .mdl[data-lang="en"] .mdl-grid-mdl { grid-template-columns: 44px minmax(0,1fr) 40px 40px 200px 28px; }
+  .mdl-grid-src { grid-template-columns: 16px 16px 130px minmax(0,1fr) 120px 64px; }
+  .mdl-grid-src > .mdl-col-conn { display: none; }
+  .mdl[data-lang="en"] .mdl-grid-src { grid-template-columns: 16px 16px 150px minmax(0,1fr) 150px 76px; }
+  .mdl-grid-task { grid-template-columns: 160px minmax(0,1fr); }
+  .mdl[data-lang="en"] .mdl-grid-task { grid-template-columns: 200px minmax(0,1fr); }
+  .mdl-grid-task > .mdl-col-note { display: none; }
+}

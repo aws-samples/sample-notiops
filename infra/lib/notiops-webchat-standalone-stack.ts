@@ -1326,6 +1326,14 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       actions: ["secretsmanager:GetSecretValue"],
       resources: [`arn:${this.partition}:secretsmanager:${this.region}:${this.account}:secret:notiops/bedrock-api-key-*`],
     }));
+    // OpenAI 兼容网关（Admin 把「网关」拖到模型来源第一位时）。读取方是 core/llm_config
+    // .get_gateway_config() → model/load.py 的网关模型。缺这条的失败模式**不静默**：网关是
+    // 第一来源时不降级，对话直接报「网关的地址或密钥读不到」。写入方是 BFF。
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      sid: "ReadGatewayConfigSecret",
+      actions: ["secretsmanager:GetSecretValue"],
+      resources: [`arn:${this.partition}:secretsmanager:${this.region}:${this.account}:secret:notiops/litellm-config-*`],
+    }));
     // Skills 读 / 报告写 —— 共享数据桶的两个前缀，与 IM 端同一个桶。
     runtimeRole.addToPolicy(new iam.PolicyStatement({
       sid: "NotiOpsSkillsRead",
@@ -2156,6 +2164,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       actions: ["secretsmanager:DeleteSecret"],
       resources: [
         "notiops/bedrock-api-key",
+        "notiops/litellm-config",
         "notiops/im-bot-feishu",
         "notiops/im-bot-dingtalk",
         "notiops/slack-bot-token",
@@ -2233,8 +2242,12 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         // 留在账号里（自定义资源的 Delete 事件只带**上一次成功部署**的属性）。名字不存在时
         // handler 会忽略 ResourceNotFoundException（见 index.py `_ignore_missing`），
         // 所以多列几个不会让删栈失败。
+        //   · notiops/litellm-config —— OpenAI 兼容网关的地址 + Key（2026-10），Admin「模型 →
+        //     模型来源 → 网关 → 设置」保存时由 BFF 建（llm_config.mjs::GATEWAY_SECRET_ID）。
+        //     方式B 是栈内资源（notiops-backend-stack.ts 的 `LiteLlmConfigSecret`），方式A 没有。
         SecretNames: cdk.Stack.of(this).toJsonString([
           "notiops/bedrock-api-key",
+          "notiops/litellm-config",
           "notiops/im-bot-feishu",
           "notiops/im-bot-dingtalk",
           "notiops/slack-bot-token",

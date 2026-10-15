@@ -22,10 +22,17 @@ import os
 
 from botocore.config import Config as BotocoreConfig
 from strands import Agent
+from strands.hooks import AfterToolCallEvent, BeforeInvocationEvent
 from strands.models import BedrockModel
 from bedrock_agentcore import BedrockAgentCoreApp
 
 from prompt import SYSTEM_PROMPT
+# 工具调用前后的两段正文之间补空行（与部署版同一个模块，逐字节相同，见 paragraphs.py 文件头）。
+from paragraphs import ParagraphJoiner
+# 同一轮里同工具、同参数、同结果的第二份 → 换成一句提示（与部署版同一个模块，逐字节相同，见其文件头）。
+from repeat_calls import RepeatCallGuard
+# 输出崩坏守卫（影子模式，只打日志；与部署版同一个模块，逐字节相同，见其文件头）。
+from degeneration import DegenerationGuard
 from tools import (aws_docs_search, aws_docs_read, web_search, WEB_SEARCH_ENABLED,
                    CASE_TOOLS, PROPOSED_ACTIONS)
 from core import finops_mcp as _finops_mcp  # 官方 awslabs cost+pricing MCP（进程内 stdio）
@@ -178,6 +185,7 @@ def _build_agent(model_key: str | None, topic: str | None = None) -> Agent:
         model=model,
         system_prompt=SYSTEM_PROMPT,
         tools=[aws_docs_search, aws_docs_read, web_search, *CASE_TOOLS, *FINOPS_TOOLS],
+        hooks=[RepeatCallGuard(BeforeInvocationEvent, AfterToolCallEvent)],
     )
 
 
@@ -285,11 +293,14 @@ def _event_has_bytes(obj, _depth: int = 0) -> bool:
     return False
 
 
-def _stream_events(event, en: bool):
+def _stream_events(event, en: bool, joiner=None):
     """把 Strands 的一个原始 stream 事件翻成 0..n 个「发给前端」的事件。
 
     只转发**看得懂的**事件：正文增量原样、工具开始 → 进度行、思考过程明文 → reasoning。
     其余（Strands 自有事件、contentBlockStart、加密思考链、任何含 bytes 的事件）一律丢弃。
+
+    `joiner`（`paragraphs.ParagraphJoiner`，可选）：工具调用之后的第一段正文前面，先单独发一个
+    补空行的正文事件 —— 不改 Strands 的 chunk（就地改会写进模型历史）。与部署版同一条规矩。
     """
     if not isinstance(event, dict) or "event" not in event:
         return []  # Strands 自有事件（init_event_loop / TextStreamEvent 等）不外发
@@ -298,10 +309,16 @@ def _stream_events(event, en: bool):
     if cbs is not None:
         _tu = (cbs.get("start") or {}).get("toolUse") or {}
         _tname = _tu.get("name") if isinstance(_tu, dict) else ""
+        if _tname and joiner is not None:
+            joiner.tool_call()
         return [{"progress": {"text": _progress_for_tool(_tname, en), "kind": "tool"}}] if _tname else []
     _delta = (_ev.get("contentBlockDelta") or {}).get("delta") or {}
     if isinstance(_delta, dict) and isinstance(_delta.get("text"), str):
-        return [event]  # 正文增量：最常见的一支，先走
+        # 正文增量：最常见的一支，先走
+        _sep = joiner.lead(_delta["text"]) if joiner is not None else ""
+        if _sep:
+            return [{"event": {"contentBlockDelta": {"delta": {"text": _sep}, "contentBlockIndex": 0}}}, event]
+        return [event]
     _rc = _delta.get("reasoningContent") if isinstance(_delta, dict) else None
     if isinstance(_rc, dict):
         # 只发明文思考；signature / redactedContent 对用户无意义，且后者是 bytes。
@@ -393,8 +410,13 @@ async def invoke(payload):
     # 额外抽出两类"处理中"信号（长耗时时聊天窗口不再干等）：
     #   · 工具开始调用 → {progress}：一句"正在做什么"（双语随本轮语言）。
     #   · reasoning 增量 → {reasoning}：模型思考过程（前端只并进右侧「思考过程」面板的思考段）。
+    _joiner = ParagraphJoiner()  # 工具调用前后的两段正文之间补空行（见 paragraphs.py）
+    # 输出崩坏守卫（影子模式）：只读事件、判定时打一行 warning，不改任何行为（见 degeneration.py）。
+    _degen = DegenerationGuard(user_message, log=app.logger,
+                               model=model_id.get("model_id") if isinstance(model_id, dict) else model_id)
     async for event in agent.stream_async(prompt):
-        for _out in _stream_events(event, _en):
+        _degen.observe(event)
+        for _out in _stream_events(event, _en, _joiner):
             yield _out
 
     # 收尾：合并强制预搜来源 + 模型额外调工具的来源，去重后作为末尾事件发出。

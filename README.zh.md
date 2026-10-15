@@ -18,8 +18,9 @@
 (CloudWatch、AWS Health、Backup、GuardDuty、成本异常、Trusted Advisor、EC2 Spot 中断预警、
 Auto Scaling 启动失败、RDS、Config)的事件**主动推送**到 Web Chat 的「通知」收件箱,每类可独立开关。
 
-所有模型都通过 **Amazon Bedrock** 接入(托管的安全、合规与成本管控),可按会话切换
-模型,并自动做中英文本地化。**只读承诺**的硬边界是 **IAM 权限**:两条入口访问你账号用的
+默认所有模型都通过 **Amazon Bedrock** 接入(托管的安全、合规与成本管控);管理员也可以
+把 OpenAI 兼容网关(LiteLLM、New API 等)排到第一,这时对话发给该网关及其上游供应商。
+可按会话切换模型,并自动做中英文本地化。**只读承诺**的硬边界是 **IAM 权限**:两条入口访问你账号用的
 角色对你的基础设施只读,改资源的写操作拿不到权限;NotiOps 自己的资源(表、桶等)之外,
 它们唯一的写权限是 AWS Support 工单的建 / 回 / 关,而且只在你确认预览之后才执行(成员账号的
 角色可用模板参数 `EnableSupportCaseWrite=false` 收成严格只读)。之上再按入口做纵深防御:
@@ -63,8 +64,9 @@ on-call 工程师使用,而无需给他们对基础设施的写权限。
 - 💬 **AWS 概念问答**:Bedrock + Knowledge MCP 检索官方文档,答案带 📚 来源引用
 - 🤖 **多模型切换**:由运维方管理的模型目录 —— 在「更多 → 管理 → 模型」里勾选本部署对外提供
   哪些模型、设默认模型、指定后端任务用哪个模型,改完即时生效无需重新部署;用户侧
-  仍按会话保存自己的模型偏好。所有模型均通过 **Amazon Bedrock** 接入(托管的安全、
-  合规与成本管控),凭证可用 IAM 或 Bedrock API Key
+  仍按会话保存自己的模型偏好。模型来源可以是 **Amazon Bedrock**(托管的安全、
+  合规与成本管控;凭证用 IAM 或 Bedrock API Key),也可以是管理员排到第一的
+  **OpenAI 兼容网关**(LiteLLM、New API 等)
 - 🌍 **双语**:中 / 英自动识别 + 显式切换
 - 🛡 **只读承诺**:硬边界是 IAM 权限(对你的基础设施只读;NotiOps 自身资源之外,唯一的写权限是 Support 工单的建 / 回 / 关,确认预览后才执行);之上按入口纵深防御 —— 网页端工具层只读 + 命令级 denylist + 只读 system prompt,IM 端 DevOps Agent 只读 agent + 强变更措辞正则二道门 —— 助手绝不改动你的云
 - 💬 **IM 渠道**:Slack / 飞书 / 钉钉 全功能 —— 提问后**立刻**有回应:飞书 / Slack 上过程 / 思考 / 答案都刷在**同一张卡**上(标题里的秒数就是"还在跑"的信号),钉钉改不了已发出的消息,同样的进度是**追加**成新消息发出来;深度调查跑完后报告卡自动回贴到发起它的那个会话。**两个 agent 可选**:默认 `/agent devops`(直连 DevOps Agent,NotiOps 侧 0 token),`/agent notiops` 切到走模型的那条路(带 `/web on` 联网开关)。每张卡最下面一行落款说清这一轮的三件事:**走的哪条路 / 哪个模型答的 / 问的哪个 AWS 账号** —— 多账号部署里最后这一段尤其要紧,`/account` 是按会话生效的,群里任何人切一次后面所有人都跟着换
@@ -139,19 +141,37 @@ bash scripts/preflight.sh
 
 - **单账号(默认)** —— `./setup.sh`。NotiOps 只在部署账号内运行。最小权限、
   最快跑通,适合绝大多数试用与单账号用户。
-- **多账号** —— `./setup.sh --multi-account`。在 AWS Organizations 内增加跨成员
-  账号的巡检 / 调查 / 事件转发。成员账号资源经 StackSets 自动下发。
-  **两种部署身份都行**:组织管理账号(payer),或一个已注册成 **CloudFormation StackSets
-  委派管理员**的成员账号 —— 脚本自动探测,不用加开关;不合格时会把管理账号要跑的那条
-  `aws organizations register-delegated-administrator` 原样打出来。
-  跑之前先对一下:`aws organizations describe-organization --query
-  'Organization.MasterAccountId' --output text` 等于
-  `aws sts get-caller-identity --query Account --output text` ⇒ 这是管理账号;不等就再查
-  `aws organizations list-delegated-administrators --service-principal
-  member.org.stacksets.cloudformation.amazonaws.com --query 'DelegatedAdministrators[].Id'
-  --output text`(**必须带 `--service-principal`**:不带会列出别的服务的委派管理员,
-  那些账号操作不了 StackSet)。
-  ⚠️ 委派管理员**对全组织有完整部署权限,管理账号无法把它收窄到某个 OU**,一个组织最多 5 个。
+- **多账号** —— `./setup.sh --multi-account`。在 AWS Organizations 内增加跨成员账号的巡检 /
+  调查 / 事件转发,成员账号资源经 StackSets 自动下发。
+
+  **部署身份(二选一,脚本自动探测,不用加开关):**
+
+  - 组织管理账号(payer);
+  - 或一个已注册成 **CloudFormation StackSets 委派管理员**的成员账号 —— 怎么注册见 AWS 官方文档
+    [Register a delegated administrator member account](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/stacksets-orgs-delegated-admin.html)。身份不合格时,脚本会把管理账号要跑的那条
+    `aws organizations register-delegated-administrator` 原样打出来。
+
+  **跑之前先自查:**
+
+  1. 下面两条输出相同 ⇒ 当前是管理账号:
+
+     ```bash
+     aws organizations describe-organization --query 'Organization.MasterAccountId' --output text
+     aws sts get-caller-identity --query Account --output text
+     ```
+
+  2. 不相同 ⇒ 再查当前账号在不在 StackSets 委派管理员名单里:
+
+     ```bash
+     aws organizations list-delegated-administrators \
+       --service-principal member.org.stacksets.cloudformation.amazonaws.com \
+       --query 'DelegatedAdministrators[].Id' --output text
+     ```
+
+     **必须带 `--service-principal`**:不带会列出别的服务的委派管理员,那些账号操作不了 StackSet。
+
+  > ⚠️ 委派管理员**对全组织有完整部署权限,管理账号无法把它收窄到某个 OU**;一个组织最多同时注册
+  > 5 个 StackSets 委派管理员(都见上面的官方文档)。
 
 完整的部署到你自己 AWS 账号的步骤(含模式对比与如何切换)见
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
@@ -180,7 +200,7 @@ bash scripts/preflight.sh
 | FinOps 仪表盘(Cost Explorer 口径) | ✅ 仅部署账号 | ✅ 可跨账号 |
 | CUR + Athena 账单明细下钻 | ✅ 可选(参数 `ProvisionCur=yes`,默认关) | ✅ |
 | 每日成本异常扫描(自建基线,每天 01:15 UTC 跑) | ❌ FinOps 页那张「每日异常扫描」卡整个不出现,不是一张空卡 | ✅ |
-| 接自己的 CUR 数据源(4 个仪表盘 sheet + 聊天里问那份账单) | ✅ 可选,见下方注 ⁵ | ✅ 可选,见下方注 ⁵ |
+| 接自己的 CUR 数据源(4 个仪表盘 sheet + 聊天里问那份账单) | ✅ 可选,默认关(开栈时选 `ProvisionCur=yes` 或填 `CurTable`),见下方注 ⁵ | ✅ 可选,默认关(要显式开:`COST_MCP_SELF_HOST=true ./setup.sh`),见下方注 ⁵ |
 | **工单与 Skills** | | |
 | AWS Support 工单全生命周期(多账号:开案例卡上直接选开到哪个账号) | ✅ | ✅ |
 | 11 个预置 Skill + 客户自建 | ✅ | ✅ |
@@ -188,6 +208,7 @@ bash scripts/preflight.sh
 | **模型** | | |
 | 多模型切换 + 模型目录管理 | ✅ | ✅ |
 | 用 Bedrock API Key 作为凭证 | ✅ | ✅ |
+| 用 OpenAI 兼容网关作模型来源 | ✅ | ✅ |
 | **主动化 / IM** | | |
 | IM 渠道(Slack / 飞书 / 钉钉) | ✅ 一个栈一个平台,见下方注 ⁴ | ✅ 三个可同时开 |
 | IM 里两个 agent 可选(`/agent devops` 默认 0 token \| `/agent notiops` 走模型)+ `/web` 联网开关 | ✅ | ✅ |
@@ -197,7 +218,7 @@ bash scripts/preflight.sh
 | 通知收件箱(10 类 EventBridge 信号源,进 Web 收件箱) | ✅ | ✅ |
 | 巡检看板(高负载 / 闲置与成本 / 巡检范围 / 阈值与定时) | ❌ 方式 A 没有巡检后端,所以侧栏里**根本不出现**这个入口(不是"点进去报错");直接调 `/inspection/*` 接口拿到的是明确的 `inspection_not_deployed`(这套部署不含巡检) | ✅ |
 | **范围** | | |
-| 多账号(AWS Organizations 跨账号)—— 两条路径都接受**管理账号**或**已注册的 StackSets 委派管理员**成员账号(自动探测);⚠️ CFN 从不把 StackSet 下发到管理账号本身:从委派管理员部署时,要查管理账号**只用** Web Chat「更多 → 管理 → 账户」里的「手动接入账号」(那个栈连采集角色一起建;方式 A 要先把与栈同版本(看栈输出 `InstalledRelease`)的 `infra/member-devops-agent.yaml` 传到 `s3://notiops-data-<账号>-<区域>/onboarding-templates/`,否则「生成链接」报 `template not found`,见 [docs/DEPLOYMENT_ONECLICK.md §2.6.1](docs/DEPLOYMENT_ONECLICK.md#261-硬性前置管理账号或-stacksets-委派管理员)),**别再**手工部 `infra/member-account-onboarding.yaml` —— 两个栈建同名角色,后部的那个 `EntityAlreadyExists`、整栈回滚;已经部过的话,在 quick-create 页把 `CreateCollectionRole` 改成 `no`(那个栈开了事件转发的话,`DevOpsEventBusArn` 也清空,否则每个调查事件投两次)。从管理账号本身部署时什么都不用做,它就是部署账号 | ✅ 开栈时选 `DeployMode=MultiAccount` + 填组织 id | ✅ `--multi-account` |
+| 多账号(AWS Organizations 跨账号)—— 两条路径都接受**管理账号**或**已注册的 [StackSets 委派管理员](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/stacksets-orgs-delegated-admin.html)**成员账号(自动探测);⚠️ CFN 从不把 StackSet 下发到管理账号本身:从委派管理员部署时,要查管理账号**只用** Web Chat「更多 → 管理 → 账户」里的「手动接入账号」(那个栈连采集角色一起建;方式 A 要先把与栈同版本(看栈输出 `InstalledRelease`)的 `infra/member-devops-agent.yaml` 传到 `s3://notiops-data-<账号>-<区域>/onboarding-templates/`,否则「生成链接」报 `template not found`,见 [docs/DEPLOYMENT_ONECLICK.md §2.6.1](docs/DEPLOYMENT_ONECLICK.md#261-硬性前置管理账号或-stacksets-委派管理员)),**别再**手工部 `infra/member-account-onboarding.yaml` —— 两个栈建同名角色,后部的那个 `EntityAlreadyExists`、整栈回滚;已经部过的话,在 quick-create 页把 `CreateCollectionRole` 改成 `no`(那个栈开了事件转发的话,`DevOpsEventBusArn` 也清空,否则每个调查事件投两次)。从管理账号本身部署时什么都不用做,它就是部署账号 | ✅ 开栈时选 `DeployMode=MultiAccount` + 填组织 id | ✅ `--multi-account` |
 | 升级 | 换新版模板 update 栈(~1 分钟) | 重跑 `./setup.sh` |
 
 > ¹ **所有 DevOps Agent 相关能力(深度调查、深度调查(直连)、DevOps 对话、把 Skill 发布到
@@ -310,7 +331,7 @@ v1.0.20–v1.0.29(原因同上:回退要重新下载那个版本的 `im-code.zip
 
 | | 保留什么 |
 |---|---|
-| `KeepData`(默认) | 保留配置表、聊天记录表、数据桶(里面有你的 Skill 和报告);装过 IM、或在「更多 → 管理 → 模型」存过 Bedrock API Key 的话,这些凭证 secret 也留着 |
+| `KeepData`(默认) | 保留配置表、聊天记录表、数据桶(里面有你的 Skill 和报告);装过 IM、或在「更多 → 管理 → 模型」存过 Bedrock API Key / 网关的话,这些凭证 secret 也留着 |
 | `DeleteEverything` | 其余全删(**含这些凭证 secret,不可恢复**),只有两类除外:选了 `ProvisionCur=yes` 时建的 CUR 相关资源,以及选了多账号模式时的两个成员账号 StackSet,见下 |
 
 ⚠️ **两个必须注意的点:**

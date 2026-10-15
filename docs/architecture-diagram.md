@@ -78,7 +78,7 @@
 | IM Bot 去重/幂等 | `core/ddb_state.py`（`event#` 行条件写）+ 各平台 `lambda_worker.py` |
 | 机器人派发 DevOps Agent | `platforms/*/caps.py::investigate` + `core/devops_agent.py`（`start_investigation` → CreateBacklogTask） |
 | 对话工具调用（MCP） | `core/aws_docs_mcp.py` + `core/mcp_http_client.py`（`sidecars/` 已随 `BotStack` 退役） |
-| LLM Provider 切换 | `shared/llm_provider.py`（读 SSM `/notiops/llm/provider`；原来写它的 `api/routes/system_config.py` 已随老 REST API 于 2026-09-04 删除） |
+| 模型调用路由 | `shared/llm_provider.py`（按模型目录条目的 `kind` 选协议：Bedrock Converse / Mantle / OpenAI 兼容网关；2026-10 起不再读 SSM `/notiops/llm/provider` 来路由，读到 `litellm` 只打一条 ERROR 并发 `LegacyProviderParamIgnored` 指标） |
 | 跨账户 AssumeRole + 锁定 | `shared/devops_agent.py::_get_cross_account_credentials` + `shared/account_scope.py`（部署账户锁定） |
 | Callback 事件处理 | `devops_agent_callback/handler.py` |
 | 报告管道（S3 单源 + summary_card） | `shared/report_delivery/report_handler.py::build_investigation_report` |

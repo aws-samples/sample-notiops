@@ -143,7 +143,7 @@ turns into `AccessDenied` at StackSet creation time.
 First command says `AWSOrganizationsNotInUseException` ⇒ this account is not in an organization at all;
 single-account is the only option.
 
-**Registering a delegated administrator (one-time, run in the management account):**
+**Registering a delegated administrator (one-time, run in the management account; official steps: [Register a delegated administrator member account](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/stacksets-orgs-delegated-admin.html)):**
 
 ```bash
 aws organizations register-delegated-administrator \
@@ -165,7 +165,7 @@ re-run `./setup.sh --multi-account` in that member account — **no extra flags*
    them (rather than "call and swallow the error", which would make people believe the script had turned
    it on). It only verifies with `describe-organizations-access --call-as DELEGATED_ADMIN` and, if it is
    off, prints both commands for you to run in the management account.
-3. **An organization allows at most 5 delegated administrators** (an AWS hard limit, across all services).
+3. **An organization can register at most five StackSets delegated administrators at a time** (an AWS limit, see the official page above; the limit is per service — other services have their own).
 4. **The StackSet entities live in the management account**, even when a delegated administrator created
    them. So `notiops-member-onboarding` / `notiops-member-devops-agent` do not show up in the **deploying**
    account's CloudFormation console (you need `--call-as DELEGATED_ADMIN` to see them); `teardown.sh`
@@ -570,7 +570,7 @@ CDK stacks always reference the secrets by ARN. **No credential files on the loc
 | `notiops/slack-app-token` | Slack app-level token (`xapp-`, Socket Mode). **Unused** in webhook mode; only needed if you roll back to the `BotStack` long connection |
 | `notiops/im-bot-dingtalk` | DingTalk bot credentials (single secret, JSON: `app_key` / `app_secret` / `webhook_url`). `app_key` / `app_secret` are **required** — miss either and the ingress function crashes on cold start; `webhook_url` (the group's custom-robot URL) is **optional** and used only as the fallback when an investigation report cannot be posted back to its conversation, and for inspection push (which cannot be set up in this release, see §3.3 step 8); the daily digest, Health and real-time event pushes are not sent to DingTalk |
 | `notiops/bedrock-api-key` | Bedrock API Key (cross-account model-invocation auth; populated manually post-deploy, leave empty to use IAM) |
-| `notiops/litellm-config` | LiteLLM credentials (JSON: `base_url` / `api_key` / `default_model`; only if you use LiteLLM) |
+| `notiops/litellm-config` | Address and key of an OpenAI-compatible gateway (LiteLLM, New API and similar; JSON: `base_url` / `api_key`). Set it under More → Admin → Models in the web console instead of editing it by hand; leave it empty if you do not use a gateway (see [USER_GUIDE §6.5](USER_GUIDE.en.md#65-models)) |
 
 > The DingTalk secret is the `notiops/im-bot-dingtalk` row above, on **the same mechanism as Feishu / Slack** — CDK creates it (empty) and you fill the JSON in after deploy; **no manual `create-secret`**. There is **no `bot-stack-*/` secret prefix, and no `notiops/devops-agent-config`** (Agent Space id and other metadata live in the DDB onboard record + CDK context, not a secret).
 

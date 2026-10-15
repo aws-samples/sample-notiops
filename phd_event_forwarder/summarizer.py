@@ -118,9 +118,8 @@ def _build_user_prompt(phd_event: PHDEvent) -> str:
 def summarize_event(phd_event: PHDEvent) -> str:
     """调用 LLM 生成 PHD 事件中文摘要。
 
-    Provider 选择由 SSM Parameter `/notiops/llm/provider` 决定
-    (走 shared.llm_provider)。Bedrock 路径下沿用原有 API Key/IAM 认证;
-    LiteLLM 路径走配置好的 Proxy。
+    协议由模型目录条目的 kind 决定（走 shared.llm_provider）：Bedrock 模型沿用
+    API Key/IAM 认证；`openai_compatible` 走 Admin 配好的 OpenAI 兼容网关。
 
     模型 ID 由 shared.phd_config 决定：DDB (appconfig#phd) → env MODEL_ID → 硬编码。
 
@@ -159,6 +158,8 @@ def summarize_event(phd_event: PHDEvent) -> str:
         max_tokens=2000,
         kind=model_kind,
         region=model_region,
+        # 后端任务：网关是第一来源时不许落到 Bedrock 兜底，失败由 handler 降级为原始事件推送
+        backend_task=True,
     )
 
     logger.info(

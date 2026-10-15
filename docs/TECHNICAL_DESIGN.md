@@ -1394,7 +1394,7 @@ Body 文本 + 📚 来源块(列出每个引用的 URL)
 ✅ s3:GetObject / PutObject                 (只限本项目数据桶的 skills/ / mcp-snapshots/ / reports/ 前缀)
    + s3:ListBucket(只限 skills/ 前缀)
 ✅ ssm:GetParameter                          (只限 /notiops/*)
-✅ secretsmanager:GetSecretValue            (只限 IM 凭据 Secret、notiops/bedrock-api-key、notiops/aliyun-credentials)
+✅ secretsmanager:GetSecretValue            (只限本项目自己的凭据 Secret:IM 凭据、notiops/bedrock-api-key 等)
 ✅ lambda:InvokeFunction                     (只限已装各 IM 平台的 worker 函数,用途是 ingress → worker
                                              异步投递;角色是共用的,所以任一用这个角色的函数都能调它们)
 ✅ AWS 托管策略 AWSLambdaBasicExecutionRole  (写自己的 CloudWatch 日志)
@@ -1436,7 +1436,7 @@ Body 文本 + 📚 来源块(列出每个引用的 URL)
   Agent Space 与关联、事件转发规则等,见 `infra/member-account-onboarding.yaml` /
   `infra/member-devops-agent.yaml`);本账号 Agent Space 的关联(`AssociateService`,配一条
   `iam:PassRole`:资源是本账号的 `role/*`,条件限定只能传给 `aidevops.amazonaws.com`)与 Skill 资产
-  (`CreateAsset` / `UpdateAsset` / `DeleteAsset`);本部署 Cognito 用户池里的用户与组;IM / 阿里云凭据
+  (`CreateAsset` / `UpdateAsset` / `DeleteAsset`);本部署 Cognito 用户池里的用户与组;IM 凭据等本项目自己的凭据
   Secret 的读写(首次保存可新建)。授权全文在 `infra/lib/constructs/web-chat-core.ts`。
 
 这一层之上是纵深防御,而**两条入口的纵深层不一样** —— 别当同一套看:
@@ -1474,6 +1474,8 @@ Body 文本 + 📚 来源块(列出每个引用的 URL)
 | DDB event_id / incident_id / task_id 路由行 | DynamoDB | 24 小时 TTL(`support#` 案例上下文 7 天) | IM 执行角色与后台 Lambda 角色读写 |
 | Push event 去重 key | DynamoDB | 5 分钟 TTL | 同上 |
 | Bedrock 调用内容 | 不持久化 | — | 走 Bedrock 标准合规 |
+| OpenAI 兼容网关调用内容(只在网关排在模型来源第一时) | NotiOps 侧不持久化;网关运营方及其上游供应商如何保留由它们决定 | — | 按网关自己的条款;对话、工具结果与后台任务(如 AWS Health 事件翻译)都会发过去 |
+| 网关地址与 Key(`notiops/litellm-config`) | Secrets Manager | 持久(「清除」写入空值;旧值作为上一个版本保留到下一次写入,彻底作废请在网关侧吊销 Key) | BFF 角色读写(「更多 → 管理 → 模型」保存时写入;方式 A 首次保存时新建,带 `project` / `auto-delete` 标签);AgentCore runtime 角色只读(两条路径);方式 B 的后台 Lambda 角色只读(后台任务) |
 | IM 凭据 Secret | Secrets Manager | 持久 | IM 执行角色与要发卡的后台 Lambda 读取;BFF 角色读写(「更多 → 管理 → 集成 IM」保存时写入,首次保存可新建);方式 B 的后台 Lambda 角色对飞书 Secret 另有写权限 |
 
 ### 5.5 跨平台数据隔离

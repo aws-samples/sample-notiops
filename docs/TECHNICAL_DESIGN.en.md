@@ -1421,8 +1421,8 @@ Code: [core/aws_docs_mcp.py](../core/aws_docs_mcp.py), [core/mcp_http_client.py]
 ✅ s3:GetObject / PutObject                 (only the skills/ / mcp-snapshots/ / reports/ prefixes of
                                              this project's data bucket) + s3:ListBucket (skills/ only)
 ✅ ssm:GetParameter                          (only /notiops/*)
-✅ secretsmanager:GetSecretValue            (only the IM credential secrets, notiops/bedrock-api-key,
-                                             notiops/aliyun-credentials)
+✅ secretsmanager:GetSecretValue            (only this project's own credential secrets: the IM
+                                             credential secrets, notiops/bedrock-api-key, etc.)
 ✅ lambda:InvokeFunction                     (only the installed IM platforms' worker functions, for the
                                              ingress → worker async hand-off; the role is shared, so any
                                              function using it can invoke them)
@@ -1474,7 +1474,8 @@ NotiOps's own resources, and an audit has to look at them too:
   (`AssociateService`, paired with an `iam:PassRole` whose resource is this account's `role/*` and
   whose condition only allows passing to `aidevops.amazonaws.com`) and skill assets (`CreateAsset` /
   `UpdateAsset` / `DeleteAsset`); users and groups in this deployment's Cognito user pool; and
-  read / write on the IM / Alibaba Cloud credential secrets (the first save may create them). The
+  read / write on this project's own credential secrets such as the IM ones (the first save may
+  create them). The
   full grant list is in `infra/lib/constructs/web-chat-core.ts`.
 
 On top of that boundary sits defense in depth — and **the layers differ between the two entry
@@ -1519,6 +1520,8 @@ before — but "the docs claim it exists while the code does not" has to go, hen
 | DDB event_id / incident_id / task_id routing rows | DynamoDB | 24-hour TTL (`support#` case context: 7 days) | Read/write by the IM execution role and the backend Lambda role |
 | Push event dedup keys | DynamoDB | 5-minute TTL | Same as above |
 | Bedrock invocation content | Not persisted | — | Subject to Bedrock standard compliance |
+| OpenAI-compatible gateway call content (only when the gateway is the first model source) | Not persisted by NotiOps; retention by the gateway operator and its upstream providers is up to them | — | Subject to the gateway's own terms; conversations, tool results and background tasks (such as AWS Health event translation) are all sent to it |
+| Gateway address and key (`notiops/litellm-config`) | Secrets Manager | Persistent ("Clear" writes an empty value; the old value stays as the previous version until the next write, so revoke the key on the gateway side to retire it) | Read / written by the BFF role (written when More → Admin → Models is saved; on Option A it is created on the first save, with the `project` / `auto-delete` tags); read-only for the AgentCore runtime role (both paths) and, on Option B, for the backend Lambda role (background tasks) |
 | IM credential secrets | Secrets Manager | Persistent | Read by the IM execution role and the backend Lambdas that post cards; read / written by the BFF role (written when "More → Admin → IM Integration" is saved; the first save may create them); on Option B the backend Lambda role can also write the Feishu secret |
 
 ### 5.5 Cross-Platform Data Isolation

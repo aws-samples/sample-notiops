@@ -408,6 +408,16 @@ export class AgentCoreStack extends Stack {
           `arn:aws:secretsmanager:${this.region}:${this.account}:secret:notiops/bedrock-api-key-*`,
         ],
       }));
+      // OpenAI 兼容网关的地址 + Key（Admin「模型来源」把网关排第一时用）。读取方是
+      // core/llm_config.get_gateway_config()；写入方是 BFF。网关是第一来源时不降级，缺这条
+      // 对话会直接报「网关的地址或密钥读不到」。
+      env.runtime.role.addToPrincipalPolicy(new iam.PolicyStatement({
+        sid: 'ReadGatewayConfigSecret',
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:notiops/litellm-config-*`,
+        ],
+      }));
 
       // 客户自建 cost-agent MCP（CUR 行级明细，见 docs/DEPLOYMENT.md §14）。
       // 而 **Function URL 里不含函数 ARN** —— 所以 ARN 只能单独给（COST_AGENT_FN_ARN）。

@@ -118,11 +118,67 @@ class _StubCacheToolsConfig:
         self.ttl = ttl
 
 
+class _StubOpenAIModel:
+    """镜像 strands.models.openai.OpenAIModel 里 load.py 依赖的那几处：
+    构造参数、`_resolve_client_args`、`format_request`、异步 `stream`。"""
+
+    #: 由测试设置：stream() 要抛的异常（None = 正常吐两个事件）
+    stream_raises = None
+
+    def __init__(self, client=None, client_args=None, **kwargs):
+        self.client_args = client_args or {}
+        self.kwargs = kwargs
+
+    def _resolve_client_args(self):
+        return dict(self.client_args)
+
+    def format_request(self, messages, tool_specs=None, system_prompt=None, tool_choice=None,
+                       **kwargs):
+        # 与 strands 1.55.1 一致：没有工具时也发 `"tools": []`
+        return {"messages": messages, "model": self.kwargs.get("model_id"), "stream": True,
+                "tools": [{"type": "function", "function": {"name": t}} for t in tool_specs or []],
+                **({"tool_choice": tool_choice} if tool_choice else {}),
+                **(self.kwargs.get("params") or {})}
+
+    async def stream(self, *args, **kwargs):
+        if _StubOpenAIModel.stream_raises is not None:
+            raise _StubOpenAIModel.stream_raises
+        yield {"messageStart": {"role": "assistant"}}
+        yield {"messageStop": {"stopReason": "end_turn"}}
+
+
+class _StubAuthenticationError(Exception):
+    """openai.AuthenticationError 的替身。"""
+
+
+class _StubTimeout:
+    """openai.Timeout（= httpx2.Timeout）的替身：只记 read / connect。"""
+
+    def __init__(self, timeout, connect=None):
+        self.read = timeout
+        self.connect = connect
+
+
+class _StubHttpClient:
+    """openai.DefaultAsyncHttpxClient 的替身：记下构造参数。"""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
 def _install_strands_stubs():
     strands = types.ModuleType("strands")
     models = types.ModuleType("strands.models")
     bedrock = types.ModuleType("strands.models.bedrock")
     openai_responses = types.ModuleType("strands.models.openai_responses")
+    openai_chat = types.ModuleType("strands.models.openai")
+    openai_chat.OpenAIModel = _StubOpenAIModel
+    openai_pkg = types.ModuleType("openai")
+    openai_pkg.AuthenticationError = _StubAuthenticationError
+    openai_pkg.Timeout = _StubTimeout
+    openai_pkg.DefaultAsyncHttpxClient = _StubHttpClient
+    # 本脚本单独成进程跑，直接替换：真 openai 的 AuthenticationError 要 response/body 才构造得出来
+    sys.modules["openai"] = openai_pkg
     # **必须注册 `strands.models.model`**：`model/load.py` 用守卫导入从这里取
     # CacheConfig / CacheToolsConfig，取不到就把 `_HAS_CACHE_CONFIG` 置 False 并走老的
     # `cache_prompt` 分支。少注册这一个模块的后果不是报错，而是**整套测试静默去测一条
@@ -137,11 +193,13 @@ def _install_strands_stubs():
     openai_responses.OpenAIResponsesModel = _StubOpenAIResponsesModel
     models.bedrock = bedrock
     models.openai_responses = openai_responses
+    models.openai = openai_chat
     models.model = model_mod
     strands.models = models
     for name, mod in (("strands", strands), ("strands.models", models),
                       ("strands.models.bedrock", bedrock),
                       ("strands.models.model", model_mod),
+                      ("strands.models.openai", openai_chat),
                       ("strands.models.openai_responses", openai_responses)):
         sys.modules[name] = mod
 
@@ -153,10 +211,11 @@ from model import load as load_mod  # noqa: E402
 
 
 class _FakeTable:
-    def __init__(self, models=None, default="claude-sonnet-5", raise_exc=False):
+    def __init__(self, models=None, default="claude-sonnet-5", raise_exc=False, extra=None):
         self.models = SEED["models"] if models is None else models
         self.default = default
         self.raise_exc = raise_exc
+        self.extra = extra or {}
 
     def get_item(self, Key=None, ConsistentRead=False):  # noqa: N803
         if self.raise_exc:
@@ -166,12 +225,13 @@ class _FakeTable:
             "generation": int(time.time() * 1000),
             "provider": "bedrock", "credential_mode": "iam",
             "default_model": self.default, "models": self.models,
+            **self.extra,
         }}
 
 
-def _use(models=None, default="claude-sonnet-5", raise_exc=False):
+def _use(models=None, default="claude-sonnet-5", raise_exc=False, extra=None):
     llm_config.reset_cache()
-    llm_config._table = lambda: _FakeTable(models, default, raise_exc)  # noqa: SLF001
+    llm_config._table = lambda: _FakeTable(models, default, raise_exc, extra)  # noqa: SLF001
 
 
 def _webchat_seed_entries():
@@ -509,6 +569,116 @@ def test_mantle_reads_the_key_per_request():
            args3.get("api_key") != "k-rotated", str(args3.get("api_key")))
 
 
+_GW_ENTRY = {
+    "alias": "gw-claude-opus", "model_id": "anthropic/claude-opus-4-7", "label": "Opus (gw)",
+    "kind": "openai_compatible", "region": None, "hard_output_limit": 8192,
+    "supports_prompt_cache": False, "surfaces": ["webchat"], "enabled": True,
+}
+_GW_EXTRA = {"credential_mode": "gateway", "source_order": ["gateway", "iam", "api_key"],
+             "source_defaults": {"gateway": "gw-claude-opus"}, "gateway_rev": 1}
+
+
+def _use_gateway(secret):
+    """网关排第一的目录 + 一份假 Secret（secret=None → 读失败）。"""
+    models = [*SEED["models"], dict(_GW_ENTRY)]
+    _use(models=models, default="gw-claude-opus", extra=dict(_GW_EXTRA))
+    calls = {"n": 0}
+
+    class _SM:
+        def get_secret_value(self, SecretId=None):  # noqa: N803
+            calls["n"] += 1
+            if secret is None:
+                raise RuntimeError("simulated secrets outage")
+            return {"SecretString": json.dumps(secret)}
+
+    llm_config.boto3.client = lambda name, **kw: _SM()  # type: ignore[assignment]
+    return calls
+
+
+def test_gateway_path():
+    """网关排第一：构造 OpenAIModel 子类，连接信息每请求重读，不回退 Bedrock。"""
+    import asyncio
+    print("test_gateway_path")
+    orig_client = llm_config.boto3.client
+    try:
+        calls = _use_gateway({"base_url": "https://gw.example.com/", "api_key": "sk-gw-1234"})
+        model = load_mod.load_model(None)
+        _check("gateway default builds an OpenAIModel subclass",
+               isinstance(model, _StubOpenAIModel), type(model).__name__)
+        _check("gateway model_id passed through untouched",
+               model.kwargs.get("model_id") == "anthropic/claude-opus-4-7", str(model.kwargs))
+        _check("max_tokens param from the catalogue (min(8192, webchat target))",
+               (model.kwargs.get("params") or {}).get("max_tokens") == 8192, str(model.kwargs))
+        _check("no bedrock_mantle_config on the gateway path",
+               "bedrock_mantle_config" not in model.kwargs, str(model.kwargs))
+        args = model._resolve_client_args()  # noqa: SLF001
+        _check("base_url normalised to the OpenAI root",
+               args.get("base_url") == "https://gw.example.com/v1", str(args.get("base_url")))
+        _check("api_key from the gateway secret", args.get("api_key") == "sk-gw-1234")
+        t = args.get("timeout")
+        _check("read timeout follows BEDROCK_READ_TIMEOUT_SEC, connect timeout is short",
+               getattr(t, "read", None) == float(load_mod.BEDROCK_READ_TIMEOUT_SEC)
+               and getattr(t, "connect", None) == load_mod.GATEWAY_CONNECT_TIMEOUT_SEC, str(vars(t)))
+        hc = args.get("http_client")
+        _check("gateway http client does not follow redirects",
+               isinstance(hc, _StubHttpClient) and hc.kwargs.get("follow_redirects") is False,
+               str(getattr(hc, "kwargs", None)))
+        _check("retries capped so worst case stays under the BFF Lambda limit",
+               args.get("max_retries") == load_mod.GATEWAY_MAX_RETRIES
+               and load_mod.BEDROCK_READ_TIMEOUT_SEC * (1 + load_mod.GATEWAY_MAX_RETRIES) < 900,
+               str(args))
+        model._resolve_client_args()  # noqa: SLF001
+        _check("connection settings cached between requests", calls["n"] == 1, str(calls))
+
+        req = model.format_request([], tool_specs=None, tool_choice={"auto": {}})
+        _check("empty tools list is dropped from the request", "tools" not in req, str(req))
+        _check("tool_choice without tools is dropped", "tool_choice" not in req, str(req))
+        req2 = model.format_request([], tool_specs=["t1"])
+        _check("non-empty tools are kept", len(req2.get("tools") or []) == 1, str(req2))
+
+        # 401 → 失效缓存，下一请求重读 Secret
+        _StubOpenAIModel.stream_raises = _StubAuthenticationError("bad key")
+
+        async def _drain():
+            async for _ in model.stream([]):
+                pass
+        try:
+            asyncio.run(_drain())
+            _check("401 propagates to the caller", False)
+        except _StubAuthenticationError:
+            _check("401 propagates to the caller", True)
+        finally:
+            _StubOpenAIModel.stream_raises = None
+        model._resolve_client_args()  # noqa: SLF001
+        _check("401 invalidates the cached gateway settings", calls["n"] == 2, str(calls))
+
+        # IM 端（本进程是 webchat 那份）无关；Bedrock alias 在网关排第一时不可用
+        _check("a Bedrock alias resolves to the gateway default while the gateway is on top",
+               llm_config.resolve("claude-sonnet-5").alias == "gw-claude-opus",
+               llm_config.resolve("claude-sonnet-5").alias)
+
+        # 读不到连接信息：构造照常（不 IO），第一次请求时抛 GatewayNotConfigured，不回退
+        _use_gateway(None)
+        model3 = load_mod.load_model(None)
+        _check("construction does not touch the secret", isinstance(model3, _StubOpenAIModel))
+        try:
+            model3._resolve_client_args()  # noqa: SLF001
+            _check("unreadable settings raise GatewayNotConfigured", False)
+        except llm_config.GatewayNotConfigured as e:
+            _check("unreadable settings raise GatewayNotConfigured", True)
+            _check("the error carries no URL or key", "gw.example" not in str(e) and "sk-" not in str(e))
+
+        _use_gateway({"base_url": "http://gw.example.com", "api_key": "sk-gw-1234"})
+        try:
+            load_mod.load_model(None)._resolve_client_args()  # noqa: SLF001
+            _check("a non-https base_url is refused at request time", False)
+        except llm_config.GatewayNotConfigured:
+            _check("a non-https base_url is refused at request time", True)
+    finally:
+        llm_config.boto3.client = orig_client
+        _use()
+
+
 def main() -> int:
     _bearer_before = os.environ.get(_BEARER)   # 快照，测试结束后原样恢复
     test_bedrock_params_match_catalogue()
@@ -523,6 +693,7 @@ def main() -> int:
     test_key_rejection_listener_is_attached()
     test_no_listener_without_a_key()
     test_mantle_reads_the_key_per_request()
+    test_gateway_path()
     llm_config.reset_cache()
     if _bearer_before is None:
         os.environ.pop(_BEARER, None)

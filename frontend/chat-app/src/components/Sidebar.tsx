@@ -251,7 +251,7 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
         {pinned.length > 0 && (
           <>
             <div className="sb-sec">{t("sidebar.pinned")}</div>
-            {/* 置顶组混合各主题 → 保留主题 tag（showTag 默认 true）便于区分 */}
+            {/* 置顶组混合各主题；showTag 默认 true → 连不知道对话对象的老通用会话也标「通用」 */}
             {pinned.map((c) => (
               <ConvItem key={c.id} conv={c} active={c.id === activeId}
                 busy={busyIds?.has(c.id)} unread={unreadIds?.has(c.id)}
@@ -274,10 +274,10 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
             </button>
           </div>
         )}
-        {/* 主题分组：组标题已标明主题，组内会话不再重复显示**主题** tag（showTag=false）。
-            ⚠️ showTag 只管主题 tag。「对话对象」tag（NotiOps / DevOps / STAROps）不受它约束、
-            照样显示 —— 组标题说得清主题，说不清"这段是哪朵云的哪个 agent 答的"，而「通用」
-            这一组恰恰全靠它才分得开。见 ConvItem 里的取舍。
+        {/* 主题分组：每条会话右侧一枚 tag，口径与顶栏一致（用户 2026-10-13，见 ConvItem）——
+            主题会话显示主题 tag（调查 / 成本 / 案例 / What's New），通用会话显示「对话对象」tag
+            （NotiOps / DevOps / STAROps：「通用」这一组全靠它才分得开）。
+            ⚠️ showTag=false 只影响**不知道对话对象**的老通用会话：组标题已写着「通用」，不再重复。
             标题可点击收起/展开该组（caret 指示，收起态持久化）。 */}
         {groups.map((g) => {
           if (g.items.length === 0) return null;

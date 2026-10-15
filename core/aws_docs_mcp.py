@@ -31,6 +31,8 @@ Operating constraints:
   - Up to 5 search hits returned to the caller; longer responses are
     truncated. Each hit's snippet capped at 600 chars to bound the
     prompt token budget.
+  - Page reads come back in chunks (`_READ_MAX_CHARS` by default) with the
+    server's paging fields; callers page on with `start_index`.
   - No HMAC signing required — the hosted endpoint is unauthenticated
     public access.
 """
@@ -63,6 +65,16 @@ _HTTP_TIMEOUT_SECONDS = float(os.environ.get("AWS_MCP_HTTP_TIMEOUT", "5.0"))
 # the top 3-5 hits than a long tail, and each hit costs prompt tokens.
 _MAX_SEARCH_HITS = 5
 _MAX_SNIPPET_CHARS = 600
+
+# Page chars per `read_documentation` call -- the hosted server's own default
+# `max_length`. Longer pages come back in chunks: the reply carries
+# `start_index` / `end_index` / `total_length` / `truncated`, and a truncated
+# chunk is prefixed with a Table of Contents giving each section's char range,
+# so the caller can continue (start_index = end_index) or jump to a section.
+# It used to be 4000 with no way to page: the Lambda runtimes page's
+# "Supported runtimes" table (chars 2467-8354) was never reachable, and the
+# model re-read the same URL until it gave up (2026-10-14).
+_READ_MAX_CHARS = 10000
 
 # URL host allowlist — only URLs from these hosts may be shown back to
 # users as "📚 来源". Anything else is dropped silently. This is a
@@ -492,23 +504,102 @@ def get_regional_availability(*, regions: list[str], resource_type: str,
         return {"raw": text[:_MAX_SNIPPET_CHARS]}
 
 
-def read_documentation_ex(url: str, *, max_chars: int = 4000) -> dict[str, Any]:
-    """`read_documentation` plus **why it came back empty**.
+def _as_int(value: Any) -> int | None:
+    """An int from the server or the model, or None. `bool` is an int subclass -- not one."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_read_result(text: str, max_chars: int) -> dict[str, Any] | None:
+    """Unwrap the hosted server's read reply into the page chunk + its paging fields.
+
+    The reply is one JSON text block::
+
+        {"content": {"result": [{"status": "SUCCESS", "url": ..., "content": "<markdown>",
+                                 "total_length": 21326, "start_index": 0, "end_index": 10000,
+                                 "truncated": true, "redirected_url": null, "error_code": null}]}}
+
+    We used to hand that whole envelope to the model, cut at `max_chars` -- and the
+    cut landed inside the page text, so the paging fields at the end never arrived:
+    the model saw a Table of Contents with char ranges, a page chopped mid-sentence,
+    no `end_index`, and no parameter to ask for more.
+
+    Returns None when the reply is not that shape (an older server revision, or a
+    per-request ERROR / validation message): the caller then keeps the old
+    raw-text behaviour, so the model still sees the server's `error_code`.
+    """
+    try:
+        data = _json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    nested = data.get("content") if isinstance(data, dict) else None
+    items = nested.get("result") if isinstance(nested, dict) else None
+    if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+        return None
+    item = items[0]
+    body = item.get("content")
+    if str(item.get("status") or "").upper() != "SUCCESS" or item.get("error_code") \
+            or not isinstance(body, str):
+        return None
+    # The server already honours max_length for the page range; on top of it, every
+    # truncated chunk carries the Table of Contents (a few hundred chars). So no
+    # cut at max_chars -- that would eat the end of the chunk -- only a loose cap
+    # against a misbehaving upstream flooding the context.
+    cut = len(body) > 2 * max_chars
+    page: dict[str, Any] = {"content": body[:2 * max_chars] if cut else body, "error": ""}
+    for key in ("start_index", "end_index", "total_length"):
+        if (n := _as_int(item.get(key))) is not None:
+            page[key] = n
+    if isinstance(item.get("truncated"), bool):
+        page["truncated"] = item["truncated"] or cut
+    # Where the server ended up after a redirect (e.g. a stale slug -> the service's
+    # welcome page). Same host allowlist as every other URL we pass on.
+    redirected = item.get("redirected_url")
+    if isinstance(redirected, str) and redirected and _is_allowed_url(redirected):
+        page["redirected_url"] = redirected
+    return page
+
+
+def read_documentation_ex(url: str, *, max_chars: int = _READ_MAX_CHARS,
+                          start_index: int = 0) -> dict[str, Any]:
+    """`read_documentation` plus **why it came back empty** and **where this chunk sits**.
 
     Returns ``{"content": str, "error": str}``. An empty string used to be the
     only answer for three very different situations -- we refused the URL, the
     docs service was unreachable, and the page genuinely had no body -- so the
     caller could only guess, and every caller guessed "just answer anyway".
     `error` is one of ``""`` / `_ERR_URL_NOT_ALLOWED` / `_ERR_UNAVAILABLE`.
+
+    On a normal read the dict also carries the server's paging fields --
+    ``start_index`` / ``end_index`` / ``total_length`` / ``truncated`` (and
+    ``redirected_url`` after a redirect). ``start_index`` picks where the chunk
+    starts: the previous ``end_index`` continues the page, a Table-of-Contents
+    offset jumps to that section. A ``start_index`` past the end is not an error:
+    ``content`` is ``""`` and ``start_index >= total_length``.
     """
     if not _is_allowed_url(url):
         return {"content": "", "error": _ERR_URL_NOT_ALLOWED}
 
+    # The server rejects max_length <= 0 and start_index < 0 with a validation
+    # message instead of a page -- clamp here rather than let a model typo cost a turn.
+    max_chars = max(1, _as_int(max_chars) or _READ_MAX_CHARS)
+    start_index = max(0, _as_int(start_index) or 0)
+
     # Hosted server takes a `requests` array (batch read). We send one
-    # request and pull its body.
-    result = _mcp_call("read_documentation", {
-        "requests": [{"url": url, "max_length": max_chars}],
-    })
+    # request and pull its body. `start_index` only when paging, so a first read
+    # is the same request as before.
+    request: dict[str, Any] = {"url": url, "max_length": max_chars}
+    if start_index:
+        request["start_index"] = start_index
+    result = _mcp_call("read_documentation", {"requests": [request]})
     if result is None:
         return {"content": "", "error": _ERR_UNAVAILABLE}
     text = _coerce_text_blocks(result)
@@ -516,23 +607,28 @@ def read_documentation_ex(url: str, *, max_chars: int = 4000) -> dict[str, Any]:
         # The server answered but handed us no body -- still not something we
         # can answer from, so it is a failure, not "this page is empty".
         return {"content": "", "error": _ERR_UNAVAILABLE}
+    page = _parse_read_result(text, max_chars)
+    if page is not None:
+        return page
     if len(text) > max_chars:
         text = text[:max_chars]
     return {"content": text, "error": ""}
 
 
-def read_documentation(url: str, *, max_chars: int = 4000) -> str:
-    """Fetch the full text of a single AWS doc page via the MCP server.
+def read_documentation(url: str, *, max_chars: int = _READ_MAX_CHARS,
+                       start_index: int = 0) -> str:
+    """Fetch the text of a single AWS doc page (one chunk) via the MCP server.
 
-    Returns the page body (truncated to ``max_chars`` chars), or an
+    Returns the chunk (``max_chars`` page chars from ``start_index``), or an
     empty string on failure. Always validates the URL against the
     host allowlist first — even our own search results have to pass it
     again because the input may have come from elsewhere.
 
     Kept for callers that only want the text; use `read_documentation_ex`
-    when "empty" and "failed" must be told apart (they almost always must).
+    when "empty" and "failed" must be told apart (they almost always must),
+    or when the caller needs the paging fields.
     """
-    return read_documentation_ex(url, max_chars=max_chars)["content"]
+    return read_documentation_ex(url, max_chars=max_chars, start_index=start_index)["content"]
 
 
 # ---------------------------------------------------------------------------

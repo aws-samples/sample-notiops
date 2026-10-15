@@ -533,9 +533,15 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "*关联 Case* · `{case_display_id}`",
         "en": "*Linked Case* · `{case_display_id}`",
     },
+    # 两句有效期说明按卡片上链接的**形状**挑（`shared.report_delivery.link_validity`）：
+    # 全是 ReportsCDN 链接 → `_cdn`（对象 7 天后被生命周期删掉）；只要有一条是 presigned → 上面这句。
     "report.link_validity": {
         "zh": "🔗 链接数小时内有效（最长约 12 小时）· 无需登录控制台即可访问",
         "en": "🔗 Links stay valid for a few hours (at most about 12) · no console login required",
+    },
+    "report.link_validity_cdn": {
+        "zh": "🔗 链接 7 天内有效 · 无需登录控制台即可访问",
+        "en": "🔗 Links stay valid for 7 days · no console login required",
     },
     "report.next_steps_header": {
         "zh": "*🤖 建议的下一步*",

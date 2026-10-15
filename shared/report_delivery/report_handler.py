@@ -5,13 +5,15 @@ Triggered by EventBridge when a DevOps Agent investigation completes or fails.
 1. Fetches the investigation summary from the DevOps Agent API
 2. Wraps it in a styled HTML report
 3. Uploads to S3
-4. Generates a 7-day pre-signed GET URL
+4. Publishes the links the card shows: ReportsCDN when configured (a copy under
+   `reports/`, ~7 days), otherwise a pre-signed GET URL (at most ~12 hours)
 5. Routes the report back to the originating Feishu chat thread
    (looked up in DynamoDB by incident_id, which the bot embeds in the
    task description as a routing tag)
 
 Environment Variables:
   S3_BUCKET:                  S3 bucket name (required; deploy-injected unique name, no hardcoded default)
+  REPORTS_CDN_DOMAIN:         ReportsCDN domain (CloudFront + OAC, serves `reports/*` only). Empty = pre-signed links
   PRESIGN_EXPIRY:             Pre-signed URL expiry in seconds (default: 604800; an upper bound only: temporary-credential signatures die within ~12h)
   FEISHU_CONVERSATIONS_TABLE: DynamoDB table written by the feishubot stack
   FEISHU_APP_ID_ARN:          Secrets Manager ARN of Feishu App ID
@@ -23,6 +25,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -46,6 +49,13 @@ S3_BUCKET = (os.environ.get("S3_BUCKET")
              or os.environ.get("SKILLS_BUCKET")
              or "")
 PRESIGN_EXPIRY = int(os.environ.get("PRESIGN_EXPIRY", "604800"))
+
+# 报告分发 CDN(CloudFront + OAC,只放行 `reports/*`)。有它 → 卡片上的报告 / trace 链接走 CDN
+# (`_delivery_url`,约 7 天);没有 → 退回 presigned。
+# 🔴 为什么不能只靠 presigned(2026-10-13 现网实测):这里用 Lambda 执行角色的**临时凭证**签名,
+#    `ExpiresIn` 写 7 天也没用 —— 凭证一过期链接就 `ExpiredToken`。现网一次飞书调查签发 71.7
+#    小时后,报告与 trace 两条都已打不开,S3 对象还在。
+REPORTS_CDN_DOMAIN = (os.environ.get("REPORTS_CDN_DOMAIN") or "").strip()
 
 # ── 卡片正文预算：**本文件是唯一的所有者** ──────────────────────────────────
 #
@@ -444,8 +454,8 @@ def _resolve_report_title(explicit: str, incident_id: str, task_id: str) -> str:
 
 # ⚠️ 这里曾有一个 `_console_deep_link(agent_space_id, task_id)`，给最终报告卡
 # 拼「🔬 查看本次调查」（DevOps Agent 控制台深链）那颗按钮用。2026-09-05 加上、
-# 当天按用户要求去掉：报告卡上其余链接都是预签名的 S3 / CDN URL（签名凭证一过期就失效，最长约 12 小时；
-# 免登录），控制台深链却必须先登录 AWS 控制台，两种混在一排按钮里，底下那行
+# 当天按用户要求去掉：报告卡上其余链接都免登录（CDN 链接约 7 天；退回 presigned 时签名凭证一过期
+# 就失效，最长约 12 小时，见 `_delivery_url`），控制台深链却必须先登录 AWS 控制台，两种混在一排按钮里，底下那行
 # 说明就只能同时写「无需登录」和「需要登录」——现网真的这么显示过。
 #
 # 进度卡 / 推送卡上那颗**保留**（那里深链是唯一的链接，说明不矛盾），它们各自
@@ -585,7 +595,10 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
         report_html = generate_html_report(summary_md=long_report or "", **common)
         upload_to_s3(report_html, report_html_key)
         artifacts.report_html_key = report_html_key
-        artifacts.report_url = generate_presigned_url(report_html_key)
+        pair_id = uuid.uuid4().hex
+        artifacts.report_url = _delivery_url(
+            report_html, report_html_key, kind="report",
+            key_prefix=key_prefix, pair_id=pair_id)
 
         # trace.html — cross-account full record listing (best-effort), sliced
         try:
@@ -627,7 +640,9 @@ def build_investigation_report(*, execution_id: str, target_account_id: str,
                 fetch_errors=fetch_errors, **common)
             upload_to_s3(trace_html, trace_html_key)
             artifacts.trace_html_key = trace_html_key
-            artifacts.trace_url = generate_presigned_url(trace_html_key)
+            artifacts.trace_url = _delivery_url(
+                trace_html, trace_html_key, kind="trace",
+                key_prefix=key_prefix, pair_id=pair_id)
         except Exception as e:
             logger.warning("trace.html build failed (non-fatal): %s", e)
 
@@ -1354,6 +1369,39 @@ def generate_presigned_url(s3_key):
         raise
 
 
+def _cdn_url(s3_key: str) -> str:
+    base = (REPORTS_CDN_DOMAIN if REPORTS_CDN_DOMAIN.startswith("http")
+            else f"https://{REPORTS_CDN_DOMAIN}")
+    return f"{base.rstrip('/')}/{s3_key}"
+
+
+def _delivery_url(html: str, stable_key: str, *, kind: str, key_prefix: str,
+                  pair_id: str) -> str:
+    """卡片上给用户点的那条链接(`kind` = report / trace)。
+
+    有 ReportsCDN:把同一份 HTML 再放一份到 `reports/<前缀>/<日期>-<pair_id>-<kind>.html`,
+    返回 CDN 链接(桶上 `expire-reports-7d` ⇒ 约 7 天)。
+      · 必须是**新 key**,不能指回 `<前缀>/<task_id>/...`:CDN 只放行 `reports/*`;而且那个
+        稳定 key 每次续查都会被覆盖,CDN 用的是 CACHING_OPTIMIZED(默认缓存 24 小时),同名
+        对象被覆盖后边缘节点会继续给旧内容。
+      · `pair_id` 是完整 UUID:CDN 链接不带签名、URL 即凭证(ReportsCDN 的安全模型),名字
+        必须不可猜。报告与 trace 共用一个 pair_id,只是便于对照。
+    没有 CDN、或副本写失败:退回 presigned(最长约 12 小时)。这不是静默降级 —— 卡片底下
+    那句有效期说明按链接**形状**判(`link_validity.validity_key`),退回时自动写短的那句。
+    """
+    if REPORTS_CDN_DOMAIN:
+        p = (key_prefix or "investigations").strip().strip("/")
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        cdn_key = f"reports/{p}/{day}-{pair_id}-{kind}.html"
+        try:
+            upload_to_s3(html, cdn_key)
+            return _cdn_url(cdn_key)
+        except Exception as e:
+            logger.warning("CDN copy of the %s page failed, falling back to a "
+                           "pre-signed URL: %s", kind, e)
+    return generate_presigned_url(stable_key)
+
+
 # ===========================================================================
 # Investigation Started → post execution-deep-link card
 # ===========================================================================
@@ -1584,9 +1632,10 @@ def _persist_support_context(incident_id: str, task_id: str, agent_space_id: str
                              platform: str, account_id: str = "") -> None:
     """Stash the report content under a `support#<incident_id>` key so the
     originating platform bot's support handler can retrieve it when the user
-    clicks 'Ask for human support' on the report card. TTL is 7 days
-    (`PRESIGN_EXPIRY`); the presigned links themselves die sooner (temporary
-    credentials, at most about 12 hours).
+    clicks 'Ask for human support' on the report card. TTL is 7 days, the same
+    as the ReportsCDN links it stores; when those fell back to presigned links
+    (no CDN configured) the links die sooner (temporary credentials, at most
+    about 12 hours) — see `_delivery_url`.
 
     `account_id`（2026-09-07 多账号，空 = 部署账号）：这次调查查的是哪个账号，也就是
     「🆘 升级到 Support」/「📎 同步到 case」应该开 / 写**哪个账号**的工单。它跟着这一行

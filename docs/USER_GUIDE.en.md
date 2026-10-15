@@ -451,7 +451,7 @@ The three most common paths, each starting from what you actually have in hand.
    - It waits synchronously for at most **14 minutes** (polling every 8 s). On timeout it tells you the investigation is still running on the AWS side, and you resume later just by saying "show me the result of that investigation" (the direct path also offers a "🔄 Check investigation result (0 tokens)" button).
    - On completion you get "✅ **Investigation complete**" followed by the DevOps Agent's own text as **Summary / Root cause / Mitigation plan** (clipped at 4000 / 6000 / 4000 characters). **NotiOps does not re-summarise it** — what you read is the original.
 5. **Want a mitigation plan**: below the conclusion is a DevOps Agent console button whose label is **conditional** — "🛠️ View this investigation in the DevOps Agent console (includes the mitigation plan)" when a plan exists, and "🛠️ Generate a mitigation plan in the DevOps Agent console (switch to the Root cause tab after it opens)" when it doesn't. You can also just ask for a mitigation plan in the conversation.
-6. **Keep a record**: the full investigation is written as a self-contained HTML report to S3 and linked in chat as "🌐 View the report online", and it also appears in Sources. Report objects are removed by a lifecycle rule after roughly 7 days, so download anything you need to keep.
+6. **Keep a record**: the full investigation is written as a self-contained HTML report to S3 and linked in chat as "🌐 View the online report", followed by "🔍 Investigation trace" — the investigation timeline: what the Agent checked at each step and what it saw (the same page as the button on the IM report card). Both also appear in Sources; the objects are removed by a lifecycle rule after roughly 7 days, so download anything you need to keep. If the trace page could not be generated, the chat says so and points you at the DevOps Agent console.
 
 > ⚠️ On a turn with **Deep Dive** on, NotiOps **removes every direct environment-query tool** and keeps only the dispatch tool — that turn it is **physically unable** to look at CloudWatch itself. So "look in seconds first, then decide whether to go deep" is usually the faster order.
 
@@ -606,6 +606,7 @@ Every answer is signed:
 | Footer | Meaning |
 |---|---|
 | `AWS Bedrock (<model name>) · N tokens` | Answered by one of our Bedrock models |
+| `Model gateway (<model name>) · N tokens` | The administrator put an OpenAI-compatible gateway first among the model sources, and the gateway answered this turn (see §6.5) |
 | `AWS DevOps Agent` | Answered by your own DevOps Agent (usage is charged to your DevOps Agent) |
 | `NotiOps` | A deterministic answer that never went through a model |
 
@@ -730,6 +731,14 @@ Which accounts a user can pick in the topbar depends on which member accounts ar
 ### 6.5 Models
 
 The user's model menu equals the set enabled on this page. When none is enabled, users are told explicitly that the administrator hasn't enabled any model for web chat and to ask them to enable one under More → Admin → Models, and **the Send button is disabled**.
+
+There are three **model sources**: this account's IAM, a Bedrock API key (Bedrock in another account), and an **OpenAI-compatible gateway** (LiteLLM, New API and similar: a public HTTPS address plus a key).
+
+- Drag the sources into order. **Only the first one is used**; if it fails, the call fails, and NotiOps **does not switch to the next source on its own**. Each source keeps its own default model.
+- The gateway address and key are stored in this deployment account's Secrets Manager (`notiops/litellm-config`); the key is never shown back on the page. Only public HTTPS addresses are accepted, and changing the gateway address does not carry the old key over: enter it again. "Clear" only writes an empty value; the old key stays in Secrets Manager as the previous version until the next write, so revoke it on the gateway side to retire it for good.
+- When the gateway is first, web chat, questions in IM after `/agent notiops` (the same agent) and background tasks (such as translating AWS Health events) all use it; if a background task cannot read the gateway settings, it does not quietly switch to Bedrock, and the Health event is pushed in its original text instead. Only the IM bot's own model features (such as case analysis in IM) always use a Bedrock source (this account's IAM or the Bedrock API key).
+- On save, the server makes one test call with the first source's default model (when the gateway is first, it also tests the Bedrock source IM uses). It blocks the save only when the configuration is definitely wrong; a transient failure is saved with a warning.
+- Answers from the gateway are signed "Model gateway (…)". When a gateway call fails, the answer says what kind of problem it was (unreachable, key rejected, no upstream credential on the gateway for this model, unknown model name, and so on) and points to this page.
 
 Claude Sonnet 5.5 / Opus 5.5 and GPT-6 Sol need their AWS Marketplace agreement accepted in the deployment account. If it has not been, see §15 for what to change on this page -- re-enabling Claude Sonnet 5 / Opus 5 alone only fixes Web; IM also needs 5.5 disabled.
 
@@ -944,7 +953,7 @@ Method A is a minimal footprint that installs only Web Chat. Compared with the f
 | **Manage Support cases** | Create / list / view / reply to / **smart-analyze** / close AWS Support cases | `@bot open a case for the RDS outage` / `@bot analyze case 177968247000414` |
 | **Answer AWS concept questions** | Cite AWS official docs to explain concepts, best practices, API usage | `@bot what's the difference between ALB and NLB` |
 | **Proactive alarm watching** | ⚠️ **Not available in IM groups in this release**: real-time alarm push has no delivery target wired up (see §14); these events show up under Notifications in the web | — |
-| **Multi-LLM switching** | When the chat object is NotiOps Agent (see §15.5), switch freely between whichever models your admin enabled (default **Kimi K3**, plus Grok 4.7, GLM 5.3, Claude Sonnet 5.5 / Opus 5.5, GPT-5.6 Terra and GPT-6 Sol — all accessed via Amazon Bedrock); per-chat / per-DM preference is remembered | `@bot model opus` / `@bot model claude` / `@bot model list` |
+| **Multi-LLM switching** | When the chat object is NotiOps Agent (see §15.5), switch freely between whichever models your admin enabled (default **Kimi K3**, plus Grok 4.7, GLM 5.3, Claude Sonnet 5.5 / Opus 5.5, GPT-5.6 Terra and GPT-6 Sol — all accessed via Amazon Bedrock); per-chat / per-DM preference is remembered. When an administrator puts an OpenAI-compatible gateway first among the model sources, these conversations are answered by the gateway's default model instead and `@bot model` has no effect (see §6.5) | `@bot model opus` / `@bot model claude` / `@bot model list` |
 | **Language switching** | Switch between Chinese and English; remembers your preference | `language zh` / `language en` / `please switch to English` |
 
 ### What the bot WILL NOT do ❌
@@ -1091,7 +1100,7 @@ which is too few — many requests are queueing up.
 [ 📊 View full report ]   [ 🔍 Investigation trace ]
 [ 🆘 Escalate to AWS Support ]
 
-🔗 Links stay valid for a few hours (at most about 12) · no console login required
+🔗 Links stay valid for 7 days · no console login required
 ```
 
 Where the three buttons go:
@@ -1103,10 +1112,13 @@ Where the three buttons go:
 | 🆘 Escalate to AWS Support | Open a Support case from this report (becomes "Sync to Case" once a case is linked) | Yes |
 
 > The report card carries **no** "🔬 Open this investigation" (DevOps Agent console
-> deep link). The first two buttons open presigned links that need no login but
-> **stay valid only for a few hours (at most about 12)** — they are signed with
-> temporary credentials and stop working once those expire, so save the page while
-> the link still works if you need to keep it. A console deep link, by contrast,
+> deep link). The first two buttons open links that need no login and **stay valid
+> for about 7 days**: the pages sit behind the report CDN (CloudFront), and after
+> 7 days the bucket's lifecycle rule deletes them, so save a page before then if you
+> need to keep it. On the few deployments without a report CDN (or when that copy
+> could not be written), the links fall back to S3 presigned URLs that stay valid only
+> for **a few hours (at most about 12)** — the footnote on the card then says exactly
+> that. A console deep link, by contrast,
 > requires an active AWS Console session. Mixing both into one row of buttons forces
 > the footnote below them to claim "no login required" and "login required" at the
 > same time. If you want the raw console page (including after those links have
@@ -1401,7 +1413,7 @@ The aliases the bot accepts are whatever your admin enabled for the IM surface i
 
 > ⚠️ **GPT-5.6 is currently an experimental tier.** Under tool-use the model occasionally leaks OpenAI internal protocol fragments or low-quality tokens into the reply, more often than Claude / Kimi. Treat it as a "try out an OpenAI model" tier, and stay on the default `kimi` or on `claude` for everyday use.
 >
-> Note: all models are accessed through Amazon Bedrock (managed security, compliance monitoring, and cost controls). This is sample code for educational/reference purposes, not production-ready; test and harden it against your organization's security and compliance requirements before any real use.
+> Note: by default all models are accessed through Amazon Bedrock (managed security, compliance monitoring, and cost controls); when an administrator puts an OpenAI-compatible gateway first among the model sources, conversations and background tasks go to that gateway and its upstream providers instead (see §6.5). This is sample code for educational/reference purposes, not production-ready; test and harden it against your organization's security and compliance requirements before any real use.
 
 ### 15.1 Commands
 
@@ -1635,7 +1647,7 @@ The bot's Lambda role can do **more** than "send messages". It can:
 | Type | TTL |
 |---|---|
 | Chat events / investigation context | 7 days |
-| Investigation report HTML (S3) | **Not deleted automatically**: there is no lifecycle rule on the `investigations/` prefix, so the objects stay in the data bucket until the bucket itself is deleted; what expires is the links on the card (valid for a few hours, at most about 12) |
+| Investigation report HTML (S3) | **Not deleted automatically**: there is no lifecycle rule on the `investigations/` prefix, so the objects stay in the data bucket until the bucket itself is deleted. The card's links point at a copy under `reports/` (deleted by the lifecycle rule after about 7 days, and the links stop working with it); without a report CDN the links are presigned URLs (valid for a few hours, at most about 12) |
 | Language preference | 90 days |
 | DM lock | 30 days |
 | Channel thread lock | 7 days |
@@ -1689,7 +1701,7 @@ To request a feature or report a problem: open an issue on the public repository
 |---|---|
 | Bot didn't reply | Internal channel admin / IT ops |
 | Bot replied but the content is clearly wrong | Send a screenshot to the admin; the admin checks the worker log `/aws/lambda/notiops-im-worker-<platform>` (on one-click deployments, `/aws/lambda/<StackName>-im-worker-<platform>`) — it holds metadata such as error types but no message text, so include your original message in the screenshot |
-| Investigation report won't open | Most likely the link has expired: the card's links are S3 presigned URLs that stay valid only for a few hours (at most about 12). The report is still in the bucket, but the link is not renewed — to look at this investigation again, use the progress card's "🔬 Open this investigation" button (on DingTalk, the link in the acknowledgement) to open it in the DevOps Agent console; that needs a console login (see §11.4) |
+| Investigation report won't open | Most likely the link has expired: the card's links stay valid for about 7 days; when the card's footnote says "a few hours (at most about 12)", the deployment has no report CDN and uses S3 presigned URLs, which stop working within hours. The report is still in the bucket, but the link is not renewed — to look at this investigation again, use the progress card's "🔬 Open this investigation" button (on DingTalk, the link in the acknowledgement) to open it in the DevOps Agent console; that needs a console login (see §11.4) |
 | I don't have permission to investigate this resource | This is a permission issue of the role of whoever answers you (by default the role your DevOps Agent uses; after `/agent notiops`, the NotiOps AgentCore Runtime's read-only role), not the bot's problem |
 | AWS Support case creation failed | Read the error the bot returned — likely Support plan limit or severity not allowed |
 

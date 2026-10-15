@@ -46,9 +46,51 @@ _MODEL_TIMEOUT_ERRORS = (
     ReadTimeoutError, ConnectionClosedError, EndpointConnectionError,
     _OpenAITimeoutError, _OpenAIConnectionError,
 )
+# HTTP 层的 4xx / 5xx（openai-python 的 APIStatusError 族）。OpenAI 兼容网关与 Mantle 都走
+# openai-python；限流与上下文溢出已被 Strands 改写成自己的异常，其余原样冒上来。
+try:
+    from openai import APIStatusError as _OpenAIStatusError
+except ImportError:  # pragma: no cover
+    class _OpenAIStatusError(Exception):  # type: ignore[no-redef]
+        """占位：未安装 openai 时永不匹配。"""
+# openai-python 的基类 APIError：网关在**流已开始之后**才出错时（LiteLLM 发 `data: {"error":…}`），
+# openai 抛的是这个基类而不是 APIStatusError。漏掉它，这类失败会一路冒出去变成「（无响应）」。
+try:
+    from openai import APIError as _OpenAIAPIError
+except ImportError:  # pragma: no cover
+    class _OpenAIAPIError(Exception):  # type: ignore[no-redef]
+        """占位：未安装 openai 时永不匹配。"""
+from core.llm_config import GatewayNotConfigured as _GatewayNotConfigured  # noqa: E402
 _MODEL_CALL_ERRORS = (
     ClientError, EventStreamError, ModelThrottledException,
+    _OpenAIStatusError, _OpenAIAPIError, _GatewayNotConfigured,
 ) + _MODEL_TIMEOUT_ERRORS
+try:
+    from strands.types.exceptions import EventLoopException as _EventLoopException
+except ImportError:  # pragma: no cover
+    class _EventLoopException(Exception):  # type: ignore[no-redef]
+        """占位：老版本 strands 无此异常类型。"""
+
+
+async def _unwrap_model_errors(agen):
+    """把 Strands 包在 EventLoopException 里的**模型调用失败**拆出来再抛。
+
+    Strands 在工具调用之后的第二轮（cycle ≥ 2）里出的任何异常都会被包成 EventLoopException
+    （strands/event_loop/event_loop.py 的 recurse 分支）。不拆的话，`except _MODEL_CALL_ERRORS`
+    只接得住第一轮的失败 —— 而网关的超时 / 5xx / 限流恰恰多出在带着工具结果的第二轮，
+    用户看到的就成了 BFF 的通用「本轮失败（EventLoopException）」，没有「去哪里换来源」。
+    只拆模型类异常；我们自己的 bug 照原样往上抛（进日志 / 告警）。
+    """
+    try:
+        async for ev in agen:
+            yield ev
+    except _EventLoopException as e:
+        orig = e
+        while isinstance(orig, _EventLoopException) and getattr(orig, "original_exception", None):
+            orig = orig.original_exception
+        if isinstance(orig, _MODEL_CALL_ERRORS + (MaxTokensReachedException,)):
+            raise orig from e
+        raise
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from model.load import BEDROCK_READ_TIMEOUT_SEC, load_model, resolve_model_id
 from memory.session import get_memory_session_manager
@@ -57,6 +99,14 @@ from capability import (SURFACE_IM, SURFACE_WEB, builtin_answer_source, capabili
                         is_capability_question)
 # Strands message 事件 → 右侧「思考过程」面板的步骤（工具入参/返回摘要）。零依赖、纯函数。
 from thinking_steps import steps_from_message
+# 工具调用前后的两段正文之间补空行（不然 "…再查：# 排查结果" 粘成一段）。零依赖、纯逻辑。
+from paragraphs import ParagraphJoiner
+# 同一轮里同工具、同参数、同结果的第二份 → 换成一句提示（判据与现网事故见 repeat_calls.py）。零依赖；
+# 挂的是 Strands 公开的两个 hook 事件（由这里传进去），不碰 Strands 内部。
+from repeat_calls import RepeatCallGuard
+from strands.hooks import AfterToolCallEvent, BeforeInvocationEvent
+# 输出崩坏守卫（影子模式）：模型一次调用中途崩成乱码时只打一行日志、不改任何行为（判据见 degeneration.py）。零依赖。
+from degeneration import DegenerationGuard
 
 app = BedrockAgentCoreApp()
 log = app.logger
@@ -85,6 +135,7 @@ DEFAULT_SYSTEM_PROMPT = """你是 NotiOps —— 面向 AWS / 云的 AI 助手�
 **语言铁律：始终用【与用户当前这句提问相同的语言】回答**（中文问→中文答，英文问→英文答，
 日/韩同理）。本 system prompt 里出现的中文示例文案/模版**只是给你的指引，不代表回答语言**——
 用户用英文提问时，即使这里写的是中文，你也必须用英文回答。不要因为指令是中文写的就默认用中文。
+**思考过程（reasoning / thinking）也用同一种语言**：用户用中文提问，你的内部推理就用中文写；用英文提问就用英文。
 
 【服务范围】你服务于**云计算相关的一切话题**，范围要放宽，包括但不限于：
 AWS 及云服务的技术问题、架构设计与选型、成本与计费、性能与容量、安全与合规、
@@ -256,13 +307,34 @@ def aws_docs_search(query: str) -> dict:
     return {"hits": hits, "sources": sources, "error": ""}
 tools.append(aws_docs_search)
 
+# 长页面分段读。托管文档 MCP 一次回一段（`_aws_docs._READ_MAX_CHARS` = 服务端默认段长），回包带
+# start_index / end_index / total_length / truncated，被截断的那段前面还有一份带字符区间的目录。
+# 2026-10-14 现网：这个工具原来只有 url 一个参数，而且本地把回包截在 4000 字 —— 截掉的正好是末尾
+# 的翻页字段。模型看得到目录里「Deprecated runtimes (char 17946-21325)」，却没有任何办法读到那里，
+# 于是同一个 URL 反复读 2–3 次、拿回逐字相同的结果；6 轮里 1 轮在第二次拿到相同结果之后输出崩成
+# 乱码、流了约 9.5 分钟直到 max_tokens。现在续读 / 跳读都靠 start_index；同参数重复调用的兜底见
+# repeat_calls.py 的 `RepeatCallGuard`。
+_DOCS_PAGE_KEYS = ("start_index", "end_index", "total_length", "truncated", "redirected_url")
+
 @tool
-def aws_docs_read(url: str) -> dict:
-    """Read the full content of a specific docs.aws.amazon.com page.
+def aws_docs_read(url: str, start_index: int = 0) -> dict:
+    """Read a docs.aws.amazon.com page, or the next part of a long one.
     Call after aws_docs_search to read the most relevant URL, then answer.
+
+    Long pages come back in parts: the reply has `start_index`, `end_index`,
+    `total_length` and `truncated`, and a truncated part begins with a Table of
+    Contents giving each section's char range, e.g. "Deprecated runtimes (char 17946-21325)".
+    Never repeat a call with the same url and start_index — it returns the same text.
     If the reply has a non-empty `error`, the fetch FAILED — say so rather than
-    answering from memory."""
-    res = _aws_docs.read_documentation_ex(url)
+    answering from memory.
+
+    Args:
+        url: Exact URL from aws_docs_search results.
+        start_index: Char offset to read from (default 0 = page start). To continue,
+            pass the previous reply's `next_start_index`; to jump to a section, pass
+            its first offset from the Table of Contents (17946 in the example).
+    """
+    res = _aws_docs.read_documentation_ex(url, start_index=start_index)
     if err := res.get("error"):
         log.warning("aws_docs_read unavailable: %s", err)
         # 只读不到这一页 ≠ 整个文档服务挂了：URL 被我们自己的允许清单拒了是另一码事，
@@ -271,8 +343,22 @@ def aws_docs_read(url: str) -> dict:
                 "That URL is not an allowed AWS documentation host. Pick a URL from "
                 "aws_docs_search results instead of constructing one.")
         return {"content": "", "sources": [], "error": err, "note": note}
-    return {"content": res["content"], "error": "",
-            "sources": [{"icon": "doc", "title": url, "detail": url}]}
+    out = {"content": res["content"], "error": ""}
+    out.update({k: res[k] for k in _DOCS_PAGE_KEYS if k in res})
+    _start, _end, _total = res.get("start_index", 0), res.get("end_index"), res.get("total_length")
+    if res.get("truncated") and isinstance(_end, int):
+        out["next_start_index"] = _end
+        out["note"] = (f"Part of a longer page: chars {_start}-{_end} of {_total}. For more, call "
+                       f"aws_docs_read again with start_index={_end}, or with a section's offset "
+                       "from the Table of Contents.")
+    elif not res["content"]:
+        # 越界（start_index ≥ total_length）是正常回答，不是故障：告诉模型这页已经读完了。
+        out["note"] = (f"start_index={_start} is past the end of this page (total_length={_total}); "
+                       "there is nothing more to read." if isinstance(_total, int) and 0 < _total <= _start
+                       else "This page returned no text. Answer from the aws_docs_search excerpts "
+                            "or read another URL.")
+    out["sources"] = [{"icon": "doc", "title": url, "detail": url}]
+    return out
 tools.append(aws_docs_read)
 
 
@@ -981,6 +1067,13 @@ _devops_agent_enabled: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
 _ui_locale: "_ctxvars.ContextVar[str]" = _ctxvars.ContextVar(
     "notiops_ui_locale", default="zh"
 )
+# 本轮提问的语言（"zh"/"en"/"ja"/"ko"，由 `_question_lang` 判），**只给 `_lang_lock()` 点名用**。
+# 不复用上面的 `_ui_locale`：那个是给 `_dv(zh, en)` 挑框架文案的，文案只有中英两版，所以它
+# 只能二值 —— 韩文提问被判成 en、带汉字的日文被判成 zh。挑文案这么判没关系；语言锁却要
+# **点名**语言，点错了就是逼模型用错的语言。空串 = 没设过（老调用方），回落到 `_ui_locale`。
+_question_lang_cv: "_ctxvars.ContextVar[str]" = _ctxvars.ContextVar(
+    "notiops_question_lang", default=""
+)
 
 
 def _dv(zh: str, en: str) -> str:
@@ -1618,6 +1711,10 @@ def _topic_has_devops(topic) -> bool:
 #   → 按主题合计：`general` **24,320**(42 个) · `investigate` 34,712 · `finops` 33,527
 #     · 深度调查强制(devops_deep) 3,311(12 个) · **`im-chat` 2,055(5 个)**
 #
+#   2026-10-14 同口径重测(每个 `{"toolSpec": t.tool_spec}` 各自 json.dumps 后计数):基础本地工具
+#   2,274 → 2,440、`im-chat` 2,273 → 2,439 —— 这 +166 来自 `aws_docs_read` 加了翻页说明(107 → 273);
+#   改之前两组就已比上表(2026-09-06)漂了约 +250。其余各行**没有重测**,用之前先按上面的方法测。
+#
 # ⚠️ 在别处引用这些数字时**指到这里**，不要抄一份：此前 `main.py` 有三处注释写「~17K
 # 工具 schema」，实际 17,045 只是 **finops 那 18 个工具自己**的量，真实总量被低估了
 # 43%~104% —— 一个被抄了三遍的错口径，比没有数字更糟。
@@ -1845,7 +1942,8 @@ def agent_factory():
                 system_prompt=(DEFAULT_SYSTEM_PROMPT + "\n\n## Degraded capability (this session)\n"
                                + _degraded) if _degraded else DEFAULT_SYSTEM_PROMPT,
                 tools=_tool_set,
-                hooks=[],
+                # 每个 Agent 实例一份（状态按轮清零），见 repeat_calls.py。
+                hooks=[RepeatCallGuard(BeforeInvocationEvent, AfterToolCallEvent, log=log)],
             )
             # 历史已经在 Agent.__init__ 末尾被 session manager 恢复进 _agent.messages
             # （Strands 在那里 invoke AgentInitializedEvent）。这里趁它还没进任何一次
@@ -1897,21 +1995,48 @@ def _lang_directive() -> str:
             "(Chinese→Chinese, English→English, 日本語→日本語, 한국어→한국어, etc.).]\n\n")
 
 
+# 日 / 韩提问在语言锁里的点名写法：(锁里大写点名, 句中写法)。中 / 英两档的锁文案见 `_lang_lock`。
+_LANG_LOCK_NAMED = {"ja": ("JAPANESE (日本語)", "Japanese"), "ko": ("KOREAN (한국어)", "Korean")}
+
+
 def _lang_lock() -> str:
-    """本轮语言的**确定性硬锁**，放在整条 prompt 的**最末尾**（紧邻模型生成、近因最强）。
+    """本轮语言的硬锁，放在整条 prompt 的**最末尾**（紧邻模型生成、近因最强）。
 
     与 `_lang_directive()`（放在 prompt 中部、软性"跟随提问语言"）互补：
-    这里用**已经算好的** `_ui_locale`（= `_is_probably_english(用户原话)` 的结果，
-    见 entrypoint）**点名**目标语言，压过前面大量中文脚手架（system prompt / 账号隔离块 /
-    skill 正文 / "[联网搜索结果…]" 头）带来的中文近因——那正是"英文提问却回中文"的根因：
-    模型生成前看到的最后一段常是中文，被带偏。故必须放最后、且显式点名，不让模型再自行判断。"""
-    en = _ui_locale.get() == "en"
-    if en:
+    这里用**已经算好的** `_question_lang_cv`（= `_question_lang(用户原话)`，见 entrypoint；
+    没设过就回落到二值的 `_ui_locale`）**点名**目标语言，压过前面大量中文脚手架（system prompt /
+    账号隔离块 / skill 正文 / "[联网搜索结果…]" 头）带来的中文近因——那正是"英文提问却回中文"的
+    根因：模型生成前看到的最后一段常是中文，被带偏。故必须放最后、且显式点名，不让模型再自行判断。
+
+    **思考过程也点名**（2026-10-13）。现网 Kimi K3 的中文提问，右侧「思考过程」里几乎全是英文
+    （「为什么这周成本上升？」一轮 12,484 字的思考里只有 277 个汉字）。这不是脚手架带偏的：一句
+    不带任何脚手架的裸中文提问，Kimi K3 / GLM 5.3 照样用英文想 —— 这两个模型默认就用英文思考，
+    Converse 也没有控制思考语言的参数（Bedrock 模型卡里 Kimi K3 没有思考相关参数，GLM 5.3 只有
+    管长短的 `reasoning_effort`）。能用的只有 prompt：在验证账号按现网代码路径（真实 system prompt、
+    工具与工具返回）实测中文提问，中文锁后面补一句**英文**写的「思考也用中文」+ system prompt 的
+    同义一句，Kimi K3 12 轮里 11 轮、GLM 5.3 5 轮全部用中文思考（不加时 0/9）；正文语言与结论不变，
+    思考 token 反而少约三成（中文更紧凑）。只放 system prompt 那一句对 Kimi 不管用（简单形状实测 0/2）。
+    ⚠️ 这是**引导不是保证**，偶尔仍会是英文 —— 别在别处把它写成"已锁定"。
+    英文锁**一字未改**：这两个模型本来就用英文想。日 / 韩（`_LANG_LOCK_NAMED`）以前分别落进
+    中 / 英两档（韩文被告知 "The user is writing in ENGLISH"、带汉字的日文被告知「用中文回答」；
+    各实测 1 次，Kimi 自己纠正了过来、照样用韩 / 日文答）—— 中文档加了「用简体中文思考」之后
+    再这样就会把日本用户带偏，所以改成点名本来的语言。改后各实测 1 次：日文思考跟着变成日文；
+    韩文正文是韩文、思考仍是英文。"""
+    lang = _question_lang_cv.get() or ("en" if _ui_locale.get() == "en" else "zh")
+    if lang == "en":
         return ("\n\n[LANGUAGE — HARD RULE: The user is writing in ENGLISH. You MUST write your "
                 "ENTIRE reply in English. All the Chinese text above (system prompt, account/skill "
                 "scaffolding, search-result headers) is INTERNAL INSTRUCTION ONLY — never let it make "
                 "you answer in Chinese. English question → English answer, always.]")
-    return ("\n\n[语言 — 硬规则：用户用【中文】提问，你必须用中文回答整条回复。]")
+    if lang in _LANG_LOCK_NAMED:
+        upper, name = _LANG_LOCK_NAMED[lang]
+        return (f"\n\n[LANGUAGE — HARD RULE: The user is writing in {upper}. You MUST write your "
+                f"ENTIRE reply in {name}, and write your internal reasoning / thinking in {name} too. "
+                "All the Chinese text above (system prompt, account/skill scaffolding, search-result "
+                "headers) is INTERNAL INSTRUCTION ONLY — never let it make you answer in Chinese or English.]")
+    return ("\n\n[语言 — 硬规则：用户用【中文】提问，你必须用中文回答整条回复。]"
+            "\n[LANGUAGE OF YOUR THINKING: The user wrote in Chinese. Write your internal reasoning / "
+            "thinking in Simplified Chinese too — not in English. 思考过程同样使用简体中文。]")
 
 
 def _date_directive() -> str:
@@ -2149,6 +2274,194 @@ def _is_im_topic(topic) -> bool:
     `_TOPIC_FOCUS["im-chat"]` 那段 prompt 管，管不到这些绕过模型的文案。
     """
     return _normalize_topic(topic) == _IM_CHAT_TOPIC
+
+
+# 模型来源的管理入口。网关坏了**不自动降级**（用户决策），所以失败文案必须把人领到这里：
+# 改网关地址 / 密钥，或把另一个来源拖到最上面。只有管理员看得到这个页面，文案照实说。
+_ADMIN_MODELS_PATH_ZH = "「更多 → 管理 → 模型」"
+_ADMIN_MODELS_PATH_EN = "More → Admin → Models"
+
+
+import re as _re_gw  # noqa: E402
+
+# 网关调上游时缺凭证 / 上游鉴权失败的文字形态（LiteLLM：「litellm.AuthenticationError: …」、
+# 「Missing Anthropic API Key」、「Missing credentials」）。与 BFF `GATEWAY_UPSTREAM_AUTH_RE`
+# 同一条**正则**，改一处要改两处。只用于分类，原文绝不回显。
+# ⚠️ 判定次序与 BFF **有意不同**：这里先看文字（对话路径不为分类多发一次请求，文字是唯一信号）；
+# BFF 的 401 先判 unauthorized、再用 GET /models 复核，复核过了才改判 upstream_auth。
+# 「401 + 上游文字 + /models 恰好也失败」时两处说法会不同，以管理页「测试」（有复核）为准。
+_GATEWAY_UPSTREAM_AUTH_RE = _re_gw.compile(
+    r"litellm\.authenticationerror|missing [a-z0-9 _.-]{0,40}api[ _-]?key|missing credentials", _re_gw.I)
+
+
+def _via_for_model(model_key) -> str:
+    """这一轮由哪类来源答：网关模型 → "gateway"（前端署名「模型网关 (…)」），其余 → ""。
+
+    署名是来源事实：网关排第一时答案出自网关运营方及其上游，写成「AWS Bedrock (…)」就是把
+    数据去向和计费主体说错。拿不准就不发（回落到原署名），不能因为这一行让整轮失败。
+    """
+    try:
+        return "gateway" if llm_config.resolve(model_key).is_gateway else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _gateway_error_kind(e) -> str:
+    """网关失败分类 —— 与 BFF `classifyGatewayError` 同一套判据（只用于分类，原文绝不回显；
+    upstream_auth 的判定次序有意不同，见 `_GATEWAY_UPSTREAM_AUTH_RE` 上的注释）。
+
+    「模型不存在」各家说法不一：LiteLLM 是 400 + "Invalid model name passed in model=…"，
+    New API 是 503 + 「…无可用渠道」/ code `model_not_found`，OpenAI 本家是 404。只看状态码会把
+    LiteLLM 的「模型名不对」说成「不支持工具调用」、把 New API 的说成「临时故障，重试就好」。
+    """
+    if isinstance(e, _GatewayNotConfigured):
+        return "not_configured"
+    if isinstance(e, _OpenAITimeoutError):
+        # 建连超时（主机丢 SYN / 网络不通）与读超时（模型在长推理）是两种病，下一步完全不同。
+        cause = e.__cause__ or e.__context__
+        name = type(cause).__name__ if cause is not None else ""
+        return "unreachable" if "Connect" in name else "timeout"
+    if isinstance(e, _MODEL_TIMEOUT_ERRORS):
+        return "unreachable"
+    status = getattr(e, "status_code", None)
+    body = getattr(e, "body", None)
+    err = body.get("error", body) if isinstance(body, dict) else body
+    msg = str((err.get("message") if isinstance(err, dict) else err) or "")
+    if not msg:
+        msg = str(getattr(e, "message", "") or "")
+    low = msg.lower()
+    code = str((err.get("code") or err.get("type") or "") if isinstance(err, dict) else
+               (getattr(e, "code", "") or "")).lower()
+    # 网关认了我们的 Key、调上游时没有凭证（网关没配这个模型供应商的上游 Key）。对话路径上
+    # 不发第二次请求去复核（BFF 的测试按钮会用 GET /models 复核），只认这几种明确的文字形态；
+    # 有的 LiteLLM 版本把它包成 500 / 400，所以不限状态码。
+    if _GATEWAY_UPSTREAM_AUTH_RE.search(msg):
+        return "upstream_auth"
+    if status in (401, 403):
+        return "auth"
+    if status == 429:
+        return "throttled"
+    if ("model_not_found" in code
+            or _re_gw.search(r"invalid model|model[^.]{0,80}(not found|does not exist|not exist|unknown|"
+                         r"not available|not supported)|no available channel", low)
+            or "无可用渠道" in msg or _re_gw.search(r"模型.{0,40}不存在", msg)):
+        return "invalid_model"
+    if _re_gw.search(r"(tool|function)[^.]{0,80}(not supported|unsupported|does not support|not support)"
+                 r"|does not support (tools|tool|function)", low):
+        return "no_tools"
+    if status == 404:
+        return "invalid_model"
+    if status in (400, 422):
+        return "bad_request"
+    return "other"
+
+
+def _gateway_failure_text(e, zh: bool, what: str, model_id: str, im: bool,
+                          model_key) -> str:
+    """OpenAI 兼容网关这一来源的失败文案；本轮不是网关模型 → ""（走原来的 Bedrock 文案）。
+
+    分类见 `_gateway_error_kind`。下一步因类而异：
+      · 连接信息读不到 / 401 / 403 → 配置问题，重试没用，找管理员。401 / 403 不断言「密钥无效」：
+        也可能是 Key 有效、网关没配这个模型的上游凭证（2026-10-13 实测就是这一种）
+      · 上游凭证缺失的明确文字（upstream_auth）→ 直说是网关上游没授权，不说「凭证无效」
+      · 模型名不对 → 让管理员改目录（IM 上不提 `/model`：IM 那份模型列表只有 Bedrock 模型，
+        换了也会被换回网关默认）
+      · 连不上 → 网关本身不可达；读超时 → 问题太重
+      · 请求格式被拒 → 多半是后端模型不支持工具调用或某个参数
+      · 其他 → 先重试，持续就换来源
+    绝不把上游 message 写进文案（可能带网关内部地址、上游账号信息），只给类型与 HTTP 码。
+    """
+    if not isinstance(e, _GatewayNotConfigured):
+        try:
+            if not llm_config.resolve(model_key).is_gateway:
+                return ""
+        except Exception:  # noqa: BLE001 — 拿不准就走原文案
+            return ""
+    kind = _gateway_error_kind(e)
+    # IM 的 `/model` 换不了网关模型（IM 那份目录只有 Bedrock 家族），所以 IM 上不给这一步。
+    can_switch = not im
+    zh_switch = "在输入框右下角"
+    en_switch = "use the model picker at the bottom right of the input box"
+    head_zh = f"\n\n---\n⚠️ 模型网关调用失败（`{what}`），本轮未能生成回答。\n\n"
+    head_en = f"\n\n---\n⚠️ The model gateway call failed (`{what}`), so this turn produced no answer.\n\n"
+    admin_zh = (f"管理员可在 {_ADMIN_MODELS_PATH_ZH} 里修正网关配置，或把另一个模型来源**拖到最上面**"
+                "并保存 —— 系统只用排在第一的来源，不会自动切换。")
+    admin_en = (f"An administrator can fix the gateway settings under {_ADMIN_MODELS_PATH_EN}, or drag "
+                "another model source **to the top** and save — only the first source is used and "
+                "there is no automatic failover.")
+
+    def steps_zh(first: str) -> str:
+        items = ([first] if first else []) + [admin_zh]
+        return "**下一步：**\n" + "".join(f"{i}. {s}\n" for i, s in enumerate(items, 1))
+
+    def steps_en(first: str) -> str:
+        items = ([first] if first else []) + [admin_en]
+        return "**Next steps:**\n" + "".join(f"{i}. {s}\n" for i, s in enumerate(items, 1))
+
+    if kind == "upstream_auth":
+        if zh:
+            return (head_zh + "当前模型来源是 **OpenAI 兼容网关**。网关接受了这次调用，但它调这个模型的"
+                    f"上游时没有授权（`{model_id}`）—— 网关没有配好这个模型供应商的上游凭证。\n\n"
+                    "**重试不会好转。** 请网关管理员补上这个供应商的上游凭证；"
+                    + ("或在输入框右下角换一个网关能调通的模型；" if can_switch else "")
+                    + admin_zh + "\n")
+        return (head_en + "The current model source is the **OpenAI-compatible gateway**. The gateway accepted "
+                f"the call but is not authorised upstream for this model (`{model_id}`) — it has no upstream "
+                "credential for this model's provider.\n\n**Retrying will not help.** Ask the gateway "
+                "administrator to add that provider's upstream credential; "
+                + (f"or {en_switch} to pick a model the gateway can serve; " if can_switch else "")
+                + admin_en + "\n")
+    if kind in ("not_configured", "auth"):
+        if zh:
+            return (head_zh + "当前模型来源是 **OpenAI 兼容网关**，但"
+                    + ("网关的地址或密钥读不到。" if kind == "not_configured"
+                       else "网关拒绝了这次调用。有两种可能：网关 Key 失效或无权调这个模型；或者 Key 有效，"
+                            "但网关没有配好这个模型的上游凭证。管理员在 "
+                            f"{_ADMIN_MODELS_PATH_ZH} 的网关设置里点「测试默认模型」可以分辨是哪一种。")
+                    + "\n\n**重试不会好转。** " + admin_zh + "\n")
+        return (head_en + "The current model source is the **OpenAI-compatible gateway**, but "
+                + ("its address or key could not be read." if kind == "not_configured"
+                   else "the gateway rejected the call. Either the gateway key is no longer valid or has no "
+                        "access to this model, or the key is valid but the gateway has no upstream credential "
+                        f"for this model. An administrator can tell which by running \"Test default model\" in "
+                        f"the gateway settings under {_ADMIN_MODELS_PATH_EN}.")
+                + "\n\n**Retrying will not help.** " + admin_en + "\n")
+    if kind == "invalid_model":
+        if zh:
+            return (head_zh + f"网关上找不到这个模型（`{model_id}`），或网关没有可用的上游渠道。\n\n"
+                    + steps_zh(f"{zh_switch}换一个模型；" if can_switch else ""))
+        return (head_en + f"The gateway does not know this model (`{model_id}`), or has no upstream "
+                "channel for it.\n\n" + steps_en(f"{en_switch} to pick another model;" if can_switch else ""))
+    if kind == "unreachable":
+        if zh:
+            return head_zh + "连不上模型网关。\n\n" + steps_zh("稍后再发一次；")
+        return head_en + "The model gateway could not be reached.\n\n" + steps_en("Try again in a moment;")
+    if kind == "timeout":
+        mins = BEDROCK_READ_TIMEOUT_SEC // 60
+        if zh:
+            return (head_zh + f"网关在 {mins} 分钟内没有返回内容。\n\n"
+                    + steps_zh("把问题拆小一点再发" + (f"，或{zh_switch}换一个模型；" if can_switch else "；")))
+        return (head_en + f"The gateway returned nothing within {mins} minutes.\n\n"
+                + steps_en("Narrow the question and send it again"
+                           + (f", or {en_switch} to switch models;" if can_switch else ";")))
+    if kind == "throttled":
+        if zh:
+            return head_zh + "网关限流了这次调用。\n\n" + steps_zh("稍等片刻再发一次；")
+        return head_en + "The gateway rate-limited this call.\n\n" + steps_en("Wait a moment and send it again;")
+    if kind in ("no_tools", "bad_request"):
+        if zh:
+            return (head_zh + ("网关后面的模型**不支持工具调用**，而对话离不开工具。"
+                               if kind == "no_tools" else
+                               "网关拒绝了本轮请求的格式。常见原因是网关后面的模型**不支持工具调用**，或不接受某个参数。")
+                    + "\n\n" + steps_zh(f"{zh_switch}换一个模型；" if can_switch else ""))
+        return (head_en + ("The backend model **does not support tool calling**, which chat needs."
+                           if kind == "no_tools" else
+                           "The gateway rejected the request format. The usual cause is a backend model "
+                           "that **does not support tool calling**, or rejects a parameter.")
+                + "\n\n" + steps_en(f"{en_switch} to switch models;" if can_switch else ""))
+    if zh:
+        return head_zh + steps_zh("直接再发一次 —— 网关或其后端的临时故障，重试通常就好；")
+    return head_en + steps_en("Send the message again — usually a transient gateway or backend fault;")
 
 
 def _extract_prompt(payload: dict):
@@ -2438,12 +2751,22 @@ def _event_has_bytes(obj, _depth: int = 0) -> bool:
     return False
 
 
-def _stream_events(event, scrubber):
+def _text_event(text: str, index: int = 0) -> dict:
+    """一个正文增量事件（与 Strands 的 contentBlockDelta 同形，BFF / IM 的 extract 认这个形状）。"""
+    return {"event": {"contentBlockDelta": {"delta": {"text": text}, "contentBlockIndex": index}}}
+
+
+def _stream_events(event, scrubber, joiner=None):
     """把 Strands 的一个原始 stream 事件翻成 0..n 个「发给前端」的事件。
 
     **唯一出口**:问候快路径与主循环都必须走这里。两处各写一遍过滤正是上面那个
     redactedContent 泄漏的成因 —— 主循环滤掉了 reasoning,快路径(寒暄/问候,如"你好")
     漏了,于是同一个模型在长问答里干净、一句"你好"就把原始事件糊到回答里。
+
+    `joiner`(`paragraphs.ParagraphJoiner`,可选):工具调用前后的两段正文之间补空行。
+    分隔符作为**单独一个**正文事件排在那段正文前面发出,**不改 Strands 的 chunk** ——
+    Strands 在我们处理完这一帧之后才把 delta 累积进 `agent.messages`,就地改会把换行写进
+    模型自己的历史。问候快路径没有工具调用,不传。
     """
     if not isinstance(event, dict):
         return []
@@ -2463,11 +2786,31 @@ def _stream_events(event, scrubber):
     if cbs is not None:
         _tu = (cbs.get("start") or {}).get("toolUse") or {}
         _tname = _tu.get("name") if isinstance(_tu, dict) else ""
-        return [{"progress": {"text": _progress_for_tool(_tname), "kind": "tool"}}] if _tname else []
+        if not _tname:
+            return []
+        _out = []
+        if joiner is not None:
+            # 上一段正文到此为止。清洗器里 hold 着的半截标记尾巴属于**上一段** —— 先放出去,
+            # 否则它会被拼到下一段开头、还排在分隔符后面。标记不会跨过工具调用,此刻 flush 是安全的。
+            _held = scrubber.flush()
+            if _held:
+                _sep = joiner.lead(_held)
+                if _sep:
+                    _out.append(_text_event(_sep))
+                _out.append(_text_event(_held))
+            joiner.tool_call()
+        _out.append({"progress": {"text": _progress_for_tool(_tname), "kind": "tool"}})
+        return _out
     _delta = (_ev.get("contentBlockDelta") or {}).get("delta") or {}
     # 正文增量:最常见的一支,先走(顺带跳过下面的 bytes 扫描)。
     if isinstance(_delta, dict) and isinstance(_delta.get("text"), str):
-        return [_scrub_event_text(event, scrubber)]
+        _scrubbed = _scrub_event_text(event, scrubber)
+        if joiner is not None:
+            _sep = joiner.lead(_delta.get("text") or "")
+            if _sep:
+                _idx = (_ev.get("contentBlockDelta") or {}).get("contentBlockIndex", 0)
+                return [_text_event(_sep, _idx if isinstance(_idx, int) else 0), _scrubbed]
+        return [_scrubbed]
     # 思考过程:只有明文 text 才发(前端只并进右侧「思考过程」面板的思考段)。signature / redactedContent 一律丢弃 ——
     # 它们对用户无意义,且 redactedContent 是 bytes(见 _event_has_bytes)。
     _rc = _delta.get("reasoningContent") if isinstance(_delta, dict) else None
@@ -2479,6 +2822,32 @@ def _stream_events(event, scrubber):
                     list(_ev) if isinstance(_ev, dict) else type(_ev).__name__)
         return []
     return [_scrub_event_text(event, scrubber)]
+
+
+def _tool_stream_events(event, joiner):
+    """流式工具（如 investigate_live）的一个中间 yield（Strands 的 ToolStreamEvent）→ 0..n 个发给前端的事件。
+
+    · 字符串 data → 正文，实时发给前端（让 DevOps Agent 的分析过程"边跑边显示"）。工具直接吐的正文
+      与模型正文是两种来源：两者交替时补空行，工具自己连续吐的几块原样相接（`joiner`，见 paragraphs.py）；
+    · `{"investigation_step": …}` → 调查**分析过程**行，前端收进右侧「思考过程」面板（不刷主聊天）；
+    · `{"progress": {...}}` → 流式工具的**瞬态**进度（如深度调查的"已用 N 分"活跃度心跳），前端当临时
+      状态行显示、收到正文即清空、不入库。不能走正文，否则会污染答案；
+    · `{"followups": [...]}` → 流式工具产出的"快捷按钮"（如调查完成后的 生成缓解方案/转人工），透传。
+    """
+    data = (event.get("tool_stream_event") or {}).get("data")
+    if isinstance(data, str) and data:
+        _sep = joiner.lead(data, source="tool") if joiner is not None else ""
+        return ([_text_event(_sep)] if _sep else []) + [_text_event(data)]
+    if isinstance(data, dict) and data.get("investigation_step") is not None:
+        _st = {"text": str(data.get("investigation_step") or "")}
+        if data.get("console_url"):
+            _st["console_url"] = data["console_url"]
+        return [{"investigation_step": _st}]
+    if isinstance(data, dict) and isinstance(data.get("progress"), dict):
+        return [{"progress": data["progress"]}]
+    if isinstance(data, dict) and isinstance(data.get("followups"), list):
+        return [{"followups": data["followups"]}]
+    return []
 
 
 def _collect_sources(messages, since_idx: int):
@@ -2572,6 +2941,33 @@ def _extract_report_download(messages, since_idx: int) -> dict | None:
 def _is_probably_english(text: str) -> bool:
     """粗判用户提问是否英文（无 CJK 字符即视为英文）。用于下载链接文案语言。"""
     return not any("一" <= ch <= "鿿" for ch in (text or ""))
+
+
+def _question_lang(text: str) -> str:
+    """本轮提问是哪种语言：``zh`` / ``en`` / ``ja`` / ``ko`` —— 只给 `_lang_lock()` 点名用。
+
+    中 / 英两档**与 `_is_probably_english` 的结论逐条一致**（有汉字 → zh，没有 → en），只在
+    日 / 韩独有的文字**占了大头**时才改判，所以中英提问的语言锁和以前完全一样：
+      · 有汉字时：假名数 ≥ 汉字数的一半 → ja（日文句子里假名总是大头；中文问题里引一个片假名词
+        不够格）；谚文同理 → ko。
+      · 没汉字时：谚文 / 假名数 ≥ 英文字母数 → ko / ja（英文问题里引一个韩 / 日文词不够格）。
+    判不准的一律留在原来的 zh / en —— 与改之前同样的结果，不会变得更糟。"""
+    t = text or ""
+    han = sum(1 for ch in t if "一" <= ch <= "鿿")
+    hangul = sum(1 for ch in t if "가" <= ch <= "힯" or "ᄀ" <= ch <= "ᇿ" or "㄰" <= ch <= "㆏")
+    kana = sum(1 for ch in t if "぀" <= ch <= "ヿ" or "ㇰ" <= ch <= "ㇿ" or "ｦ" <= ch <= "ﾟ")
+    if han:
+        if hangul * 2 >= han:
+            return "ko"
+        if kana * 2 >= han:
+            return "ja"
+        return "zh"
+    latin = sum(1 for ch in t if ch.isascii() and ch.isalpha())
+    if hangul and hangul >= latin:
+        return "ko"
+    if kana and kana >= latin:
+        return "ja"
+    return "en"
 
 
 # ── AgentCore Memory 的两个 id：都**不许**回落到全部署共用的一个字面量 ──────────
@@ -2696,6 +3092,9 @@ async def invoke(payload, context):
     # 中文提问也带偏）；无 CJK 即视为英文。这样框架文案与模型正文语言保持一致。
     _raw_q_for_locale = str(payload.get("prompt") or payload.get("text") or "")
     _ui_locale.set("en" if _is_probably_english(_raw_q_for_locale) else "zh")
+    # 语言锁点名用的那一份（能分出日 / 韩；中英两档与上面同判）。必须在寒暄快路径之前设好 ——
+    # 快路径也拼 `_lang_lock()`。
+    _question_lang_cv.set(_question_lang(_raw_q_for_locale))
     # 重置本轮"待确认写操作提议"收集器（逐请求隔离）。
     _proposed_actions.set([])
     # 重置本轮"快捷操作按钮"收集器（续查等非流式工具往里塞，收尾统一发出）。
@@ -2724,6 +3123,10 @@ async def invoke(payload, context):
                 conversation_manager=_make_conversation_manager(),
             )
             _greet_scrubber = _MarkerScrubber()
+            # 网关模型答的 → 署名行要说「模型网关」，不是「AWS Bedrock」（见 _via_for_model）。
+            _gvia = _via_for_model(payload.get("model"))
+            if _gvia:
+                yield {"via": _gvia}
             async for event in greet_agent.stream_async(f"{_lang_directive()}{_raw_q}{_lang_lock()}"):
                 # 与主循环共用 _stream_events：快路径曾自己写一遍过滤、漏掉 reasoning，
                 # 导致 Grok 的加密思考链(bytes)被 runtime 退化成 repr 灌进"你好"的回答。
@@ -2974,8 +3377,8 @@ async def invoke(payload, context):
                 + "若问题涉及最新/实时信息，明确提醒用户该信息可能不是最新、建议稍后重试联网搜索。]"
             )
 
-    # 语言硬锁：放**整条 prompt 的最末尾**（近因最强、紧邻模型生成），用已算好的 _ui_locale
-    # 点名目标语言，压过上面大量中文脚手架（system/账号块/skill 正文/搜索结果头）带来的中文近因。
+    # 语言硬锁：放**整条 prompt 的最末尾**（近因最强、紧邻模型生成），用已算好的 _question_lang_cv
+    # 点名目标语言（含思考过程），压过上面大量中文脚手架（system/账号块/skill 正文/搜索结果头）带来的中文近因。
     # 这是"英文提问却回中文"的根治点——尤其联网搜索时最后一段是中文"[联网搜索结果…]"头，最易带偏。
     prompt = prompt + _lang_lock()
 
@@ -2990,44 +3393,45 @@ async def invoke(payload, context):
     _c0 = int(getattr(_m0, "cycle_count", 0) or 0) if _m0 else 0
 
     _scrubber = _MarkerScrubber()  # 清洗模型漏出的内部标记（如 DeepSeek <｜DSML｜…>）
+    # 工具调用前后的两段正文之间补空行（见 paragraphs.py）。BFF 落库的就是这些 delta 拼起来的全文，
+    # IM（`/agent notiops`）读的也是同一条流 —— 在这里补一次，实时显示 / 历史回放 / IM 卡片三处一致。
+    _joiner = ParagraphJoiner()
     # 兜底：即使已把 max_tokens 提到各模型上限，Nova(5K)/DeepSeek(8K) 等小上限模型在极长
     # 回答下仍可能撞顶 → Strands 抛 MaxTokensReachedException。若不接住，异常会**跳过下方
     # 所有收尾代码**（尾巴 flush、下载链接、sources、usage、actions），导致正文半截且**无
     # Sources**（客户实测事故的直接表现）。这里接住它：正文保留已生成部分、追加一句"因长度
     # 上限截断"的友好提示，然后**照常往下走完收尾流程**（sources/usage 正常发出）。
     _truncated_by_max_tokens = False
+    _mvia = _via_for_model(payload.get("model"))
+    if _mvia:
+        yield {"via": _mvia}
+    # 输出崩坏守卫（影子模式，见 degeneration.py）：每次模型调用按到达顺序看思考 + 正文增量，
+    # 判定「崩成乱码了」时只打一行 warning（trace id 由 OTEL 日志处理器带上），不停流、不改事件、
+    # 不多花 token；自己出错就本轮关掉。必须在 _stream_events **之前**看 —— 那里的清洗器会就地改正文增量。
+    _degen = DegenerationGuard(_raw_q, model=_model_id, log=log)
     try:
-        async for event in agent.stream_async(
+        # `_unwrap_model_errors`：第二轮起的模型失败被 Strands 包成 EventLoopException，拆开才
+        # 进得了下面的 `except _MODEL_CALL_ERRORS`（见该函数说明）。
+        async for event in _unwrap_model_errors(agent.stream_async(
             prompt,
-        ):
+        )):
             if not isinstance(event, dict):
                 continue
-            # 流式工具（如 investigate_live）的中间 yield → ToolStreamEvent，把字符串 data
-            # 当作正文实时发给前端（让 DevOps Agent 的分析过程"边跑边显示"）。
+            _degen.observe(event)
+            # 流式工具（如 investigate_live）的中间 yield → ToolStreamEvent（见 _tool_stream_events）。
             if event.get("type") == "tool_stream":
-                data = (event.get("tool_stream_event") or {}).get("data")
-                if isinstance(data, str) and data:
-                    yield {"event": {"contentBlockDelta": {"delta": {"text": data}, "contentBlockIndex": 0}}}
-                elif isinstance(data, dict) and data.get("investigation_step") is not None:
-                    # 调查**分析过程**行 → 独立事件，前端收进右侧「思考过程」面板（不刷主聊天）。
-                    _st = {"text": str(data.get("investigation_step") or "")}
-                    if data.get("console_url"):
-                        _st["console_url"] = data["console_url"]
-                    yield {"investigation_step": _st}
-                elif isinstance(data, dict) and isinstance(data.get("progress"), dict):
-                    # 流式工具的**瞬态**进度（如深度调查的"已用 N 分"活跃度心跳）→ progress 通道，
-                    # 前端当临时状态行显示、收到正文即清空、不入库。不能走正文，否则会污染答案。
-                    yield {"progress": data["progress"]}
-                elif isinstance(data, dict) and isinstance(data.get("followups"), list):
-                    # 流式工具产出的"快捷按钮"（如调查完成后的 生成缓解方案/转人工）→ 透传给前端。
-                    yield {"followups": data["followups"]}
+                for _out in _tool_stream_events(event, _joiner):
+                    yield _out
                 continue
             # 原始事件 → 发给前端的事件，统一由 _stream_events 决定（与问候快路径同一出口）：
             #   · 工具开始调用 → 一句"正在做什么"进度行（长耗时处理时聊天窗口不再干等）；
-            #   · 思考过程明文 → {reasoning}（前端只并进右侧「思考过程」面板的思考段；语言已被
-            #     prompt 末尾 _lang_lock() 锁到本轮语言，与正文/进度行一致）；
-            #   · 加密思考链 / 任何含 bytes 的事件 → 丢弃（否则被序列化成 repr 灌进正文）。
-            for _out in _stream_events(event, _scrubber):
+            #   · 思考过程明文 → {reasoning}（前端只并进右侧「思考过程」面板的思考段）。它的语言
+            #     **只能引导、锁不死**：思考是模型自己写的，没有请求参数能管；system prompt 与
+            #     prompt 末尾的 _lang_lock() 都点名了思考语言，实测中文提问绝大多数轮次随之变成
+            #     中文，但偶尔仍是英文（数据见 _lang_lock 的 docstring）。这里原样转发、不翻译不过滤；
+            #   · 加密思考链 / 任何含 bytes 的事件 → 丢弃（否则被序列化成 repr 灌进正文）；
+            #   · 工具调用之后的第一段正文 → 前面先补一个空行事件（_joiner）。
+            for _out in _stream_events(event, _scrubber, _joiner):
                 yield _out
     except MaxTokensReachedException as e:  # 见顶部 import（撞输出上限，非故障）
         # 撞输出上限：不是故障，是回答太长。保留已生成内容，收尾照常走（下方补提示 + sources）。
@@ -3045,10 +3449,17 @@ async def invoke(payload, context):
         _code = ""
         if isinstance(e, ClientError):
             _code = str((e.response or {}).get("Error", {}).get("Code") or "")
+        elif isinstance(e, _OpenAIStatusError) and getattr(e, "status_code", None):
+            _code = f"HTTP {e.status_code}"
         log.error("model invocation failed: type=%s code=%s model=%s",
                   type(e).__name__, _code or "-", _model_id)
         _zh_err = not _is_probably_english(_raw_q)
         _what = _code or type(e).__name__
+        # 网关来源的失败另有一套说法：要点名「是网关这个来源出的问题」、以及去哪里换来源。
+        # Bedrock 那几条文案（去 Model access 开通、给运行角色补 bedrock:InvokeModel）对网关全是错话。
+        _gw_msg = _gateway_failure_text(e, _zh_err, _what, _model_id,
+                                        _is_im_topic(payload.get("topic")),
+                                        payload.get("model"))
         # 下面几条都会叫客户「换一个模型」，超时那条还会叫他去开「深度调查」—— 去哪儿做
         # **按入口不一样**，说错了客户照着做，会发现根本没有那个东西：
         #   · IM（主题 `im-chat`，即 `/agent notiops` 之后的对话，同一个 runtime）：没有输入框、
@@ -3073,7 +3484,9 @@ async def invoke(payload, context):
                       else "switch models at the bottom right of the input box")
         _en_switch_to = ("send `/model` to switch to a different model" if _im
                          else "switch to a different model at the bottom right of the input box")
-        if isinstance(e, _MODEL_TIMEOUT_ERRORS):
+        if _gw_msg:
+            _msg = _gw_msg
+        elif isinstance(e, _MODEL_TIMEOUT_ERRORS):
             # 超时是**另一种病**，给「重试通常就好」是误导：同样的问题给同一个模型，
             # 大概率再超一次。真正有用的下一步是「把问题拆小」或「换一个模型」（不点名哪个，
             # 理由见上），再就是把长排查交给专门跑长任务的那条路（深度调查）。
@@ -3103,7 +3516,10 @@ async def invoke(payload, context):
                    "that path is built for long-running work.\n"
                    if _deep_en else "")
             )
-        elif _what.startswith("AccessDenied") or _what == "ResourceNotFoundException":
+        elif (_what.startswith("AccessDenied") or _what == "ResourceNotFoundException"
+              # Mantle（GPT 系）走 openai-python，权限 / 模型不存在回的是 HTTP 码而不是 AWS 错误码；
+              # 不映射过来就会被当成「临时故障，重试就好」。
+              or _what in ("HTTP 401", "HTTP 403", "HTTP 404")):
             # 权限/未开通：**重试永远不会好**，给「重试通常就好」是把客户送进无限循环。
             # 这是新客户装完之后最容易撞的第一堵墙 —— 两条安装路径都不预检 Bedrock 模型
             # 访问权限，而默认模型同样得先在 Bedrock 里开通（docs/DEPLOYMENT.md 的前置条件）。
@@ -3208,7 +3624,10 @@ async def invoke(payload, context):
     # 流结束：把清洗器里暂存的尾巴（确认非标记的部分）补发出去
     _tail = _scrubber.flush()
     if _tail:
-        yield {"event": {"contentBlockDelta": {"delta": {"text": _tail}, "contentBlockIndex": 0}}}
+        _sep = _joiner.lead(_tail)
+        if _sep:
+            yield _text_event(_sep)
+        yield _text_event(_tail)
     # 撞上限截断 → 追加一句友好提示（让用户知道回答被截断、可让其继续）。
     if _truncated_by_max_tokens:
         _zh_tr = not _is_probably_english(_raw_q)

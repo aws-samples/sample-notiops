@@ -1,12 +1,15 @@
 /**
- * 侧栏会话条目上那枚「对话对象」tag 的契约。
+ * 侧栏会话条目上那枚 tag 的契约：**主题会话 → 主题 tag，通用会话 → 「对话对象」tag**，
+ * 与顶栏（ChatApp 的 topbar-topic）同一套口径（用户 2026-10-13）。
  *
- * 为什么值得一份测试：这枚 tag 是**跨云**的身份标识，而它错掉的方式全是「不报错」——
+ * 为什么值得一份测试：这枚 tag 错掉的方式全是「不报错」——
  *   · 老会话（服务端还没有 `obj` 这个属性）被猜成 NotiOps → 一段阿里云 STAROps 会话在
  *     侧栏写着 NotiOps，客户据此判断"这段问的是 AWS"，是纯假信息；
  *   · 顶栏与侧栏用了两套颜色/图标 → 同一段会话看着像两个不同的东西；
- *   · 有人"顺手"把它塞回 `showTag` 里 → 分组列表（showTag=false）整片消失，而「通用」
- *     那一组恰恰只能靠它区分 notiops / devops / starops，也就是这个需求的全部目的。
+ *   · 有人"顺手"把对象 tag 塞回 `showTag` 里 → 分组列表（showTag=false）整片消失，而「通用」
+ *     那一组恰恰只能靠它区分 notiops / devops / starops；
+ *   · 先看 obj 再看主题（2026-10-13 用户报的）：v1.0.28 起每条新会话都落了 obj（默认
+ *     notiops），于是调查 / 成本 / 案例 / What's New 组里一律写着 NotiOps，顶栏却写主题名。
  *
  * 刻意**渲染**组件而不是 grep 源码："用户看不看得见这枚 tag、上面写的是什么"是行为。
  *
@@ -16,7 +19,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, cleanup } from "@testing-library/react";
 
 import { STRINGS } from "../i18n";
-import type { Conversation } from "../types";
+import type { Conversation, TopicKey } from "../types";
+import { TOPICS } from "../types";
 import ConvItem from "./ConvItem";
 
 const zh = (k: string) => STRINGS[k].zh;
@@ -46,7 +50,7 @@ function tagColor(): string {
 
 beforeEach(() => cleanup());
 
-describe("侧栏「对话对象」tag", () => {
+describe("侧栏会话 tag（主题会话 → 主题，通用会话 → 对话对象）", () => {
   it("STAROps 会话显示短名 + 与顶栏同色", () => {
     render(<ConvItem {...base} conv={conv({ obj: "starops" })} />);
     expect(tagText()).toBe(zh("conv.obj.starops"));
@@ -79,11 +83,37 @@ describe("侧栏「对话对象」tag", () => {
     expect(tagText()).toBe("STAROps");
   });
 
-  it("对象已知时**不再**显示主题 tag（一行只放一枚）", () => {
+  it("通用会话在分组列表里（showTag=false）按对象区分 NotiOps / DevOps", () => {
+    render(<ConvItem {...base} conv={conv({ obj: "notiops", topic: "general" })} showTag={false} />);
+    expect(tagText()).toBe("NotiOps");
+    cleanup();
+    render(<ConvItem {...base} conv={conv({ obj: "devops" })} showTag={false} />);
+    expect(tagText()).toBe("DevOps");
+  });
+
+  it("主题会话显示主题 tag，即使对象已知（与顶栏同口径，一行只放一枚）", () => {
     render(<ConvItem {...base} conv={conv({ obj: "devops", topic: "investigate" })} />);
     expect(document.querySelectorAll(".conv-topic").length).toBe(1);
-    expect(tagText()).toBe("DevOps");
-    expect(screen.queryByText(zh("topic.investigate"))).toBeNull();
+    expect(tagText()).toBe(zh("topic.investigate"));
+    expect(screen.queryByText("DevOps")).toBeNull();
+  });
+
+  it("分组列表里（showTag=false）每个主题的会话都显示自己的主题 tag，不再一律 NotiOps", () => {
+    // 2026-10-13 用户截图里的样子：成本 / 案例 / 调查 / What's New 组里全是 NotiOps。
+    for (const td of TOPICS) {
+      cleanup();
+      render(<ConvItem {...base} conv={conv({ obj: "notiops", topic: td.key })} showTag={false} />);
+      expect(document.querySelectorAll(".conv-topic").length).toBe(1);
+      expect(tagText()).toBe(zh(td.labelKey));
+      expect(tagColor()).toBe(td.color);
+      expect(screen.queryByText("NotiOps")).toBeNull();
+    }
+  });
+
+  it("老会话头里永久存着的 topic:security 按「调查」显示", () => {
+    const legacy = "security" as unknown as TopicKey;
+    render(<ConvItem {...base} conv={conv({ obj: "notiops", topic: legacy })} showTag={false} />);
+    expect(tagText()).toBe(zh("topic.investigate"));
   });
 
   it("老会话（obj 空/缺失）回落到原来的主题 tag —— 不许猜成 NotiOps", () => {

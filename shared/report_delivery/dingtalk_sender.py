@@ -59,6 +59,7 @@ keyword calls both ways.
 from __future__ import annotations
 from core import i18n
 from shared import dingtalk_api
+from shared.report_delivery.link_validity import validity_key
 from shared.net import safe_urlopen
 
 import base64
@@ -430,7 +431,7 @@ def send_report(chat_id: str, root_message_id: str, status: str,
     if trace_url:
         link_lines.append(f"[{i18n.t('report.see_trace', locale)}]({trace_url})")
     # ⚠️ 这里**没有**「🔬 查看本次调查」（DevOps Agent 控制台深链）：上面
-    # 两条都是预签名链接、免登录（数小时内有效，最长约 12 小时），而控制台深链必须登录 AWS 控制台。
+    # 两条都免登录（CDN 链接约 7 天；退回预签名时最长约 12 小时），而控制台深链必须登录 AWS 控制台。
     # 混在同一行 `·` 分隔的链接里，底下那句说明就只能同时写「无需登录」和
     # 「需要登录」——2026-09-05 现网就是这么自相矛盾的。少一个入口换一句
     # 不骗人的说明；进度卡上那颗保留（那里深链是唯一的链接）。
@@ -449,9 +450,9 @@ def send_report(chat_id: str, root_message_id: str, status: str,
             body_parts.append(_emph(i18n.t("report.next_steps_header", locale))
                               + "\n\n" + "\n".join(nl))
 
-    # 一句话，而且无条件为真：这条消息里剩下的每个链接都是预签名的。
+    # 一句话，必须对这条消息里每个报告链接都成立：按链接形状挑（CDN 约 7 天 / 预签名最长约 12 小时）。
     # ⚠️ 别再加 `progress.link_login_warning`（它是给控制台深链的）。
-    body_parts.append(_emph(i18n.t("report.link_validity", locale)))
+    body_parts.append(_emph(i18n.t(validity_key(html_url, trace_url), locale)))
 
     text_md = "\n\n".join(body_parts).strip()
 

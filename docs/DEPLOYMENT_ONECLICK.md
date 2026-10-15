@@ -280,7 +280,7 @@ aws sts get-caller-identity --query Account --output text
 
 很多组织的管理账号是"净空"的（不落业务负载、变更走单独审批）。这种情况下把 NotiOps 开在一个成员账号里、只把**下发成员账号角色**这件事委派给它，比把整套 Web/IM 底座塞进管理账号更现实。
 
-**一次性动作，在管理账号里跑**（`<成员账号号>` 换成你打算用来部署 NotiOps 的那个账号）：
+**一次性动作，在管理账号里跑**（`<成员账号号>` 换成你打算用来部署 NotiOps 的那个账号；官方步骤见 [Register a delegated administrator member account](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/stacksets-orgs-delegated-admin.html)）：
 
 ```bash
 aws organizations register-delegated-administrator \
@@ -304,7 +304,7 @@ aws organizations list-delegated-administrators \
 
 1. ⚠️ **委派管理员对全组织有完整部署权限。** AWS 明确说明：管理账号**无法**把委派管理员的权限收窄到某几个 OU 或某几类操作。也就是说，这个成员账号一旦被注册，就能往组织里**任何**账号下发 StackSet（不只是 NotiOps 这两个）。这是 AWS StackSets 的模型，不是 NotiOps 的实现选择。
 2. **可信访问必须先由管理账号开好。** 注册委派管理员本身就要求它已经开着；而 `enable-aws-service-access` 与 `activate-organizations-access` 这两个 API **只有管理账号能调**。所以委派管理员这条路上，栈**不会**替你去开（也开不了），只会用 `describe-organizations-access --call-as DELEGATED_ADMIN` **验一遍**，没开就失败并把那两条命令给出来，让你回管理账号跑。见 [§2.6.3](#263-信任访问两半都得开)。
-3. **一个组织最多 5 个委派管理员**（AWS 的硬限制，跨所有服务合计）。
+3. **一个组织最多同时注册 5 个 StackSets 委派管理员**（AWS 的限制，见上面的官方文档；这个上限按服务各算各的，别的服务有自己的上限）。
 4. **StackSet 实体存放在管理账号里**，即使它是由委派管理员创建的。所以在管理账号的 CloudFormation 控制台里能看到 `notiops-member-onboarding` / `notiops-member-devops-agent`，而在**部署账号**的控制台里看不到（要看得加 `--call-as DELEGATED_ADMIN`）。`teardown.sh` / `TeardownMode` 也同样带这个参数，不会因此漏删。
 
 #### 2.6.3 信任访问：两半都得开
@@ -712,6 +712,7 @@ CloudFormation → 选中栈 → **Delete**。**实测**：`KeepData` ~**3 分 1
 | `KeepData` 下的两张表 + 数据桶 | 这是 `KeepData` 的**本意** | 不再用了就手工删（桶要先清空）。**想在这个账号里重新部署就必须先删** —— 见 §6.1 的第二条警告 |
 | CloudFront 的访问日志（如果你自己开过） | 不由这个栈管理 | 按需 |
 | **装过 IM 的话**：`notiops/im-bot-feishu` / `notiops/im-bot-dingtalk` / `notiops/slack-bot-token` / `notiops/slack-signing-secret` 这几个 Secrets Manager secret | 它们不是栈内资源（三个平台的 secret 都由 Web 上「更多 → 管理 → 集成 IM」那一页按需创建），所以 `KeepData` 不会动它们 | `DeleteEverything` 会**连它们一起删**（不可恢复）。`KeepData` 下想清就自己删；留着的话下次重装同名 secret 会被直接复用 |
+| **在「更多 → 管理 → 模型」存过 Bedrock API Key 或网关的话**：`notiops/bedrock-api-key` / `notiops/litellm-config` | 同上：不是栈内资源，由那一页首次保存时按需创建，所以 `KeepData` 不会动它们 | `DeleteEverything` 会**连它们一起删**（不可恢复）。`KeepData` 下想清就自己删；网关的 Key 要彻底作废，请在网关那边吊销 |
 | **多账号模式下**：`notiops-member-onboarding` / `notiops-member-devops-agent` 两个 StackSet，以及 Organizations 对 StackSets 的信任访问 | **故意留的。** ① StackSet 要先删掉全部 stack instance 才删得掉，而那等于抹掉各成员账号里的跨账号角色 —— 这种跨账号的破坏性动作不该由"删一个栈"隐式触发；② 信任访问是**组织级**开关，删我们的栈就把它关掉会打断组织里别人的 StackSets 部署。 | 确实不要了：先在 CloudFormation → StackSets 里 **Delete stacks from StackSet**（删实例），再删 StackSet 本身。信任访问除非你确认没别人在用，否则别关。 |
 
 **没有**其他孤儿：agent 的日志组、BFF 的日志组、「通知」函数的日志组、部署 Lambda 的日志组、IAM 角色、Cognito 用户池、RUM app monitor、AgentCore Runtime、网站桶、staging 桶 —— 实测全部随栈删除。⚠️ v1.0.30 预发布版**一度不成立**：新加的成本 MCP、CUR 阶段一 / 阶段二这三个函数没有栈内日志组，首次调用时 Lambda 自建的 `/aws/lambda/<栈名>-CostMcpFunction…` / `…CurProvisionerFn…` / `…CurFinalizerFn…` 不归栈管、删栈后留下、**永不过期**（2026-10-10 一次干净的删栈后实测留下了 `…CurProvisionerFn…`；已修，现在每个函数都写进栈内日志组，由判据逐个核）。这三个函数的执行角色也**不再带** `logs:CreateLogGroup`：Lambda 的日志是异步投递的，删栈时日志组被删掉之后，晚到的那几行原本会借这条权限把日志组重新建出来（同日 RC 往返实测过：删掉 1 秒后它又出现了），现在建不回来了。较早的函数里还有一些带着这条权限，所以仍有一个很窄的口子：某个函数恰好在删栈的最后几秒被调用时，它的日志组可能这样被重新建出来、留在账号里（已知问题）。遇到了就在 CloudWatch 里按完整名字删掉。选了 `ProvisionCur=yes` 的话，账号里还会留着 `notiops-cur-athena-<账号>` 栈里 AWS 官方模板那两个 Lambda 的日志组（`…AWSCURInitializer…` / `…AWSS3CURNotification…`）—— 它们跟着那个栈一起**有意保留**（见 §6.5 末尾），不是这个栈的孤儿。深度调查建的 Agent Space 与关联也随栈删除（它是栈里的普通资源）。会话记忆的 AgentCore Memory（[§2.10](#210-会话记忆agentcore-memory)）同理 —— 它是栈里的普通资源、**没有**保留策略，随栈删除，里面存的会话消息一起消失（这条是按模板声明说的，还没像上面那串一样删栈实测过）。联网搜索的 AgentCore Gateway 分两种：**这个栈建出来的**随栈删除；**它复用的别人的**（同账号里已经存在的 `notiops-websearch-gw`，比如 `setup.sh` 建的）留着不动 —— 删一个栈不该顺手拆掉另一条部署路径还在用的东西。

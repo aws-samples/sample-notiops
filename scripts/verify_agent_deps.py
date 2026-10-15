@@ -227,7 +227,10 @@ def _uv_install(uv: str, venv: Path, python: str, install: list[str],
     if offline:
         env["UV_OFFLINE"] = "1"
     quiet = {"capture_output": True} if offline else {}
-    if run([uv, "venv", str(venv), "--python", python], env=env, **quiet).returncode:
+    # `--no-project`：从仓库根跑时 uv 会读到根目录 pyproject.toml 的 `requires-python >=3.14`
+    # （那是本地 / CI 工具链的版本），对着我们要的 3.13（AgentCore 托管运行时）打一行
+    # 「incompatible with the project's Python requirement」。这里验的是 agent 包，不是根项目。
+    if run([uv, "venv", str(venv), "--python", python, "--no-project"], env=env, **quiet).returncode:
         return 2
     cmd = [uv, "pip", "install", "--python", str(venv / "bin" / "python"), "--quiet", *install]
     if constraints:

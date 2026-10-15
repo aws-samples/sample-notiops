@@ -21,6 +21,7 @@
 import { randomUUID } from "node:crypto";
 import { resolveTarget } from "./devops_agent_skills.mjs";
 import { renderReport } from "./report_html.mjs";
+import { renderTrace } from "./trace_html.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const REPORTS_BUCKET = envClean("SKILLS_BUCKET");
@@ -168,8 +169,9 @@ async function getInvestigationSummary({ client, agentSpaceId, executionId, loca
     mitigation = await readRecommendationsMd({ client, agentSpaceId, taskId, locale });
   }
   const sections = { summary: summaryText, rootCause, mitigation };
+  // `records` 一并带出：收尾时「调查过程」页（trace_html.mjs）就用这一份，不再拉第二遍。
   return { markdown: buildFullReportMd(sections, locale), sections,
-           structured: Boolean(rootCause), hasMitigation: Boolean(mitigation), taskId };
+           structured: Boolean(rootCause), hasMitigation: Boolean(mitigation), taskId, records };
 }
 
 /** 取某类 **markdown 型** journal 记录的终版原文（investigation_summary_md /
@@ -241,14 +243,41 @@ function flattenUi(node, out) {
   for (const ch of node.children || []) flattenUi(ch, out);
 }
 
-/** 从 ui_investigation_summary 终版里取**执行摘要卡**并摊平成 markdown（拿不到 → ""）。 */
-function uiSummaryFrom(records) {
+/** `ui_investigation_summary` 的**最后一条**（终版）组件树；没有 → null。移植 da_ui_tree.tree_from_records。 */
+function uiTreeFrom(records) {
   let tree = null;
   for (const r of records || []) {
     if (r?.recordType !== "ui_investigation_summary") continue;
     const obj = parseContent(r.content);
     if (obj && typeof obj === "object") tree = (obj.content && typeof obj.content === "object") ? obj.content : obj;
   }
+  return tree;
+}
+
+/** DA 控制台「Investigation timeline」那张卡（`id` 前缀 `records`）→ markdown；拿不到 → ""。
+ *  给「调查过程」页上半段用（移植 da_ui_tree.timeline_md）。
+ *  🔴 **不**退化到第一张卡：那张是执行摘要卡，退化会让调查过程页显示报告正文的复制品 ——
+ *  这种错比空着更难发现（da_ui_tree.find_card 的注释）。 */
+export function uiTimelineFrom(records) {
+  const findById = (n) => {
+    if (!n || typeof n !== "object") return null;
+    if ((n.type || "").toLowerCase() === "card" && String(n.id || "").split("__")[0] === "records") return n;
+    for (const ch of n.children || []) {
+      const got = findById(ch);
+      if (got) return got;
+    }
+    return null;
+  };
+  const card = findById(uiTreeFrom(records));
+  if (!card) return "";
+  const lines = [];
+  flattenUi(card, lines);
+  return lines.filter(Boolean).join("\n\n").trim();
+}
+
+/** 从 ui_investigation_summary 终版里取**执行摘要卡**并摊平成 markdown（拿不到 → ""）。 */
+function uiSummaryFrom(records) {
+  const tree = uiTreeFrom(records);
   if (!tree) return "";
   // 优先按 id 命中执行摘要卡（后台稳定用 "summary" 前缀），否则退化到树里第一张 card。
   const findCard = (n, byId) => {
@@ -558,16 +587,36 @@ function slug(s) {
  * ⚠️ 链接**不是永久的**：桶上有 `expire-reports-7d`（infra/lib/constructs/minimal-base-core.ts）
  * 把 `reports/` 前缀 7 天后删掉。这里原来写的是"不过期" —— 那是错的，别照它写客户文案。
  */
-async function saveHtmlReport({ markdown, title, meta, status }) {
+async function saveHtmlReport({ markdown, title, meta, status, keyBase }) {
+  let html;
+  try {
+    html = renderReport(markdown, { title, subtitle: "Investigation Report", meta, status, priority: "" });
+  } catch (e) {
+    console.warn("[direct-investigate] save_report_failed", safeErr(e));
+    return null;
+  }
+  return putHtmlPage(`${keyBase}.html`, html, "report");
+}
+
+/**
+ * 一次调查的两个页面（报告 / 调查过程）共用的 key 前缀：
+ * `reports/investigation/<日期>-<标题 slug>-<完整 UUID>`；报告 = `.html`，调查过程 = `-trace.html`。
+ * 🔴 完整 UUID（原来只取前 8 位 = 32 比特）：ReportsCDN 的链接不带签名、URL 即凭证，
+ *    minimal-base-core.ts 写的安全模型就是「key 用不可猜的 UUID」。
+ */
+function reportKeyBase(title) {
+  const today = new Date().toISOString().slice(0, 10);
+  return `${REPORTS_PREFIX}/investigation/${today}-${slug(title)}-${randomUUID()}`;
+}
+
+/** HTML 落 S3，返回可直接点开的 CDN 链接；未配置 / 失败 → null（原因进日志）。`what` = report / trace。 */
+async function putHtmlPage(key, html, what) {
   if (!REPORTS_BUCKET || !REPORTS_CDN_DOMAIN) {
-    console.warn("[direct-investigate] report_link_skipped bucket=%s cdn=%s",
+    console.warn("[direct-investigate] %s_link_skipped bucket=%s cdn=%s", what,
       Boolean(REPORTS_BUCKET), Boolean(REPORTS_CDN_DOMAIN));
     return null;
   }
   try {
-    const html = renderReport(markdown, { title, subtitle: "Investigation Report", meta, status, priority: "" });
-    const today = new Date().toISOString().slice(0, 10);
-    const key = `${REPORTS_PREFIX}/investigation/${today}-${slug(title)}-${randomUUID().slice(0, 8)}.html`;
     const { S3Client, PutObjectCommand } = await import("@aws-sdk/client-s3");
     const s3 = new S3Client({ region: REGION });
     await s3.send(new PutObjectCommand({
@@ -580,10 +629,39 @@ async function saveHtmlReport({ markdown, title, meta, status }) {
     const base = REPORTS_CDN_DOMAIN.startsWith("http") ? REPORTS_CDN_DOMAIN : `https://${REPORTS_CDN_DOMAIN}`;
     return { url: `${base.replace(/\/+$/, "")}/${key}`, key };
   } catch (e) {
-    // 报告落盘失败不该毁掉整场调查——摘要已在聊天里给出了。
-    console.warn("[direct-investigate] save_report_failed", safeErr(e));
+    // 落盘失败不该毁掉整场调查——摘要已在聊天里给出了。
+    console.warn(`[direct-investigate] save_${what}_failed`, safeErr(e));
     return null;
   }
+}
+
+const DETAIL_TYPE = {
+  COMPLETED: "Investigation Completed", FAILED: "Investigation Failed",
+  TIMED_OUT: "Investigation Timed Out", CANCELED: "Investigation Cancelled",
+  CANCELLED: "Investigation Cancelled", SKIPPED: "Investigation Skipped",
+};
+
+/**
+ * 「调查过程」页（与 IM 回调那份 trace.html 同一个页面，见 trace_html.mjs 文件头）落 S3。
+ * 起止时间取 journal 记录的首末两条（ASC）。渲染 / 落盘失败 → null（调用方要明说，不能静默少一个链接）。
+ */
+async function saveTraceHtml({ records, title, status, taskId, executionId, agentSpaceId, keyBase, locale }) {
+  let html;
+  try {
+    const stamps = (records || []).map((r) => r?.createdAt).filter(Boolean)
+      .map((d) => (d instanceof Date ? d : new Date(d))).filter((d) => !Number.isNaN(d.getTime()));
+    const fmt = (d) => (d ? `${d.toISOString().replace("T", " ").slice(0, 19)} UTC` : "");
+    html = renderTrace({
+      records, status, priority: "", detailType: DETAIL_TYPE[status] || `Investigation ${status}`,
+      taskId, executionId, agentSpaceId,
+      createdAt: fmt(stamps[0]), updatedAt: fmt(stamps[stamps.length - 1]),
+      title, timelineMd: uiTimelineFrom(records), locale,
+    });
+  } catch (e) {
+    console.warn("[direct-investigate] save_trace_failed", safeErr(e));
+    return null;
+  }
+  return putHtmlPage(`${keyBase}-trace.html`, html, "trace");
 }
 
 // ───────────────────────── 请求文本 → title / description（替代模型那层翻译）─────────────────────────
@@ -1029,17 +1107,39 @@ async function finishAndReport({ client, space, executionId, taskId, status, tit
 
   const repTitle = dv(`DevOps Agent 深度调查报告 - ${title.slice(0, 40)}`,
                       `DevOps Agent Deep Investigation Report - ${title.slice(0, 40)}`);
+  const keyBase = reportKeyBase(repTitle);
+  const tid = taskId || summary.taskId || "";
   const saved = await saveHtmlReport({
     markdown: md,
     title: repTitle,
-    meta: { execution_id: executionId, task_id: taskId || summary.taskId || "", agent_space_id: space },
+    meta: { execution_id: executionId, task_id: tid, agent_space_id: space },
     status,
+    keyBase,
   });
+  // 「调查过程」页：IM 报告卡上一直有这颗按钮，web 这边 2026-10-13 之前只有报告（用户报的）。
+  // 只在报告落成功时才做 —— 没配 CDN 时两个都没有，与原来一样只是少链接、不报错。
+  const trace = saved?.url
+    ? await saveTraceHtml({ records: summary.records || [], title, status, taskId: tid,
+                            executionId, agentSpaceId: space, keyBase, locale })
+    : null;
   if (saved?.url) {
-    emit("sources", {
-      sources: [{ icon: "file", title: repTitle + dv("（在线报告）", " (online report)"), detail: saved.url }],
-    });
+    const sources = [{ icon: "file", title: repTitle + dv("（在线报告）", " (online report)"), detail: saved.url }];
+    if (trace?.url) {
+      sources.push({ icon: "file", title: dv(`DevOps Agent 调查过程 - ${title.slice(0, 40)}（Trace）`,
+                                             `DevOps Agent Investigation Trace - ${title.slice(0, 40)}`),
+                     detail: trace.url });
+    }
+    emit("sources", { sources });
     say(dv(`\n\n🌐 [在线查看报告](${saved.url})\n`, `\n\n🌐 [View the online report](${saved.url})\n`));
+    if (trace?.url) {
+      say(dv(`\n\n🔍 [调查过程 Trace](${trace.url})\n`, `\n\n🔍 [Investigation trace](${trace.url})\n`));
+    } else {
+      // 不许静默少一个链接：说清楚没生成，并给能看到完整时间线的地方。
+      const where = consoleUrl ? dv(`[DevOps Agent 后台](${consoleUrl})`, `[DevOps Agent console](${consoleUrl})`)
+                               : dv("DevOps Agent 后台", "the DevOps Agent console");
+      say(dv(`\n\n⚠️ 调查过程页这次没生成出来，完整时间线可以在 ${where} 查看。\n`,
+             `\n\n⚠️ The investigation trace page could not be generated this time; the full timeline is in ${where}.\n`));
+    }
   }
   // 已出结论 → **不给**续查按钮（点了只是把同一份报告再刷一遍）；与老路径完成时一致：只有
   // ①去后台生成缓解方案 + ③转人工支持。

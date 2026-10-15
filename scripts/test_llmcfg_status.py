@@ -46,6 +46,8 @@ _ALLOWED_KEYS = {
     "surface", "enabled_flag", "generation", "source", "default_alias",
     "enabled_models", "credential_mode", "catalog_ttl_s",
     "force_refresh_min_interval_s", "output_target",
+    # 2026-10：第一来源名（iam / api_key / gateway），不含任何凭证。
+    "active_source",
 }
 
 

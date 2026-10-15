@@ -1,20 +1,23 @@
-"""Unified LLM provider — Bedrock / LiteLLM Proxy 共存抽象层。
+"""Unified LLM provider — Bedrock / OpenAI 兼容网关 共存抽象层。
 
 设计原则：
 1. 调用方只看到一个函数 `invoke_llm(model_id, system_prompt, user_prompt, max_tokens)`
    返回统一格式 `{"content": str, "stop_reason": str, "usage": dict}`
-2. Provider 选择来自 SSM Parameter `/notiops/llm/provider`（值: "bedrock" | "litellm"），
-   带 5 分钟 TTL 缓存。
+2. 走哪条协议**只看模型目录条目的 `kind`**（调用方从 BFF 投影的后端任务配置里拿到）：
+   `openai_compatible` → 网关；`bedrock_mantle_responses` → Mantle；其余 → Converse。
+   2026-10 之前这里还看 SSM `/notiops/llm/provider`（bedrock | litellm）。那个参数每次
+   栈更新都被 CloudFormation 写回 `bedrock`，管理页也从没能设它 —— 实际是死开关，已删。
 3. 凭证：
-   - bedrock：从 Secrets Manager `notiops/bedrock-api-key` 读 API Key（已存在）
-   - litellm：从 Secrets Manager `notiops/litellm-config` 读 base_url + api_key
+   - Bedrock：Admin 的来源次序里排在最前的 Bedrock 来源（iam / api_key）；api_key 时从
+     Secrets Manager `notiops/bedrock-api-key` 读 Key
+   - 网关：Secrets Manager `notiops/litellm-config` 读 base_url + api_key（名字是历史遗留）
 4. 失败处理：本函数只抛异常，调用方决定降级策略。
 
 兼容性：
 - 沿用现有 `bedrock_invoker.invoke_bedrock` 的签名 + 返回值；
   历史调用点零改动只需把导入换成 `from shared.llm_provider import invoke_llm`。
-- LiteLLM 路径走 OpenAI Chat Completions 协议（POST /v1/chat/completions），
-  不引入 LiteLLM Python SDK，纯 urllib + json 走 stdlib（保持 Lambda 启动快）。
+- 网关路径走 OpenAI Chat Completions 协议（POST {base}/chat/completions，LiteLLM Proxy
+  与 New API 都提供），不引入任何 SDK，纯 urllib + json（保持 Lambda 启动快）。
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import socket
 import time
 import urllib.error
@@ -48,10 +52,9 @@ def _is_blocked_ip(addr) -> bool:
     mapped = getattr(addr, "ipv4_mapped", None)
     if mapped is not None:
         addr = mapped  # treat ::ffff:169.254.x.x as the embedded IPv4
-    return (
-        addr.is_private or addr.is_loopback or addr.is_link_local
-        or addr.is_reserved or addr.is_multicast or addr.is_unspecified
-    )
+    # `not is_global` 覆盖了私网 / 回环 / 链路本地 / 保留 / 未指定，外加 CGNAT 100.64/10 ——
+    # 与 core/llm_config、BFF 的 BlockList 同一个口径。组播另判（is_global 对部分组播为真）。
+    return (not addr.is_global) or addr.is_multicast
 
 
 def _validate_base_url(url: str) -> None:
@@ -101,83 +104,17 @@ def _validate_base_url(url: str) -> None:
 
 logger = logging.getLogger("shared.llm_provider")
 
-# ---------------------------------------------------------------------------
-# Provider 配置缓存（SSM Parameter） — 5 分钟 TTL
-# ---------------------------------------------------------------------------
-
-_PROVIDER_PARAM_NAME = "/notiops/llm/provider"
-_PROVIDER_DEFAULT = "bedrock"
-_PROVIDER_CACHE_TTL = 300
-
-_cached_provider: str | None = None
-_cached_provider_ts: float = 0.0
-
-
-def _get_provider(force_refresh: bool = False) -> str:
-    """读 SSM Parameter `/notiops/llm/provider`,带缓存。
-
-    返回 "bedrock"(默认)或 "litellm"。
-    任何错误都 fallback 到 "bedrock",保证不因配置读取问题挂掉。
-
-    `LITELLM_PROVIDER_FORCE` 环境变量可以强制覆盖(测试 / debug 用)。
-
-    Args:
-        force_refresh: 跳过本进程缓存,直接读 SSM。
-            invoke_llm 路径用 False(每次 invoke 多打 SSM 不划算);
-            UI 触发的端点(如 _get_models / _get_llm_provider GET)用 True,
-            让 Provider 切换立刻反映,无需等 5min TTL。
-    """
-    global _cached_provider, _cached_provider_ts
-
-    forced = (os.environ.get("LITELLM_PROVIDER_FORCE") or "").strip().lower()
-    if forced in ("bedrock", "litellm"):
-        return forced
-
-    now = time.time()
-    if (
-        not force_refresh
-        and _cached_provider is not None
-        and (now - _cached_provider_ts) < _PROVIDER_CACHE_TTL
-    ):
-        return _cached_provider
-
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    try:
-        client = boto3.client("ssm", region_name=region)
-        resp = client.get_parameter(Name=_PROVIDER_PARAM_NAME)
-        value = (resp.get("Parameter", {}).get("Value") or "").strip().lower()
-        if value not in ("bedrock", "litellm"):
-            value = _PROVIDER_DEFAULT
-        _cached_provider = value
-        _cached_provider_ts = now
-        return value
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ParameterNotFound":
-            _cached_provider = _PROVIDER_DEFAULT
-            _cached_provider_ts = now
-            return _PROVIDER_DEFAULT
-        logger.warning("read provider from SSM failed, fallback bedrock: %s", e)
-        _cached_provider = _PROVIDER_DEFAULT
-        _cached_provider_ts = now
-        return _PROVIDER_DEFAULT
-    except Exception as e:
-        logger.warning("read provider from SSM failed, fallback bedrock: %s", e)
-        _cached_provider = _PROVIDER_DEFAULT
-        _cached_provider_ts = now
-        return _PROVIDER_DEFAULT
-
-
 def reset_cache() -> None:
-    """测试用 / 强制刷新 provider 选择(管理员页保存配置后立刻生效)。
+    """测试用 / 强制刷新（管理员页保存配置后立刻生效）。
 
-    也清 credential_mode 与 Bedrock Key 缓存 —— 三者都是「Admin 一保存就该生效」的配置，
-    只清其中一部分会让调用方拿到半新半旧的组合（例如新 provider 配旧凭证方式）。
+    清来源次序、Bedrock Key 与网关连接信息三份缓存 —— 都是「Admin 一保存就该生效」的配置，
+    只清其中一部分会让调用方拿到半新半旧的组合（例如新来源配旧凭证）。
     """
-    global _cached_provider, _cached_provider_ts, _cached_litellm, _cached_litellm_ts
-    global _cached_cred_mode, _cached_cred_mode_ts
+    global _cached_litellm, _cached_litellm_ts
+    global _cached_cred_mode, _cached_cred_mode_ts, _cached_active_source, _cached_gateway_rev
     global _cached_bedrock_key, _cached_bedrock_key_ts
-    _cached_provider = None
-    _cached_provider_ts = 0.0
+    _cached_active_source = ""
+    _cached_gateway_rev = None
     _cached_litellm = None
     _cached_litellm_ts = 0.0
     _cached_cred_mode = None
@@ -187,7 +124,7 @@ def reset_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
-# LiteLLM 配置(Secrets Manager) — 5 分钟 TTL
+# OpenAI 兼容网关连接信息（Secrets Manager） — 5 分钟 TTL
 # ---------------------------------------------------------------------------
 
 _LITELLM_SECRET_ID = os.environ.get(
@@ -199,11 +136,52 @@ _cached_litellm: dict | None = None
 _cached_litellm_ts: float = 0.0
 
 
-def _get_litellm_config() -> dict:
-    """读 LiteLLM 配置 Secret,带缓存。
+def _normalise_gateway_base_url(url) -> str:
+    """网关地址规整成 OpenAI 根路径；不合法返回 ""。
 
-    Secret 内容形如:
-      {"base_url": "https://xxx", "api_key": "sk-xxx", "default_model": "bedrock/..."}
+    与 `core/llm_config.normalise_gateway_base_url`、BFF `normalizeGatewayBaseUrl` 同一套规则
+    （本 Lambda 不一定打包 core/，所以抄一份；三份的一致性由 tests/test_llm_provider.py 守）：
+    只收 https、不带 query / fragment / 用户名密码；去尾 `/` 与误贴的 `/chat/completions`、
+    `/models`；路径为空补 `/v1`，自定义前缀原样保留。私网等地址由 `_validate_base_url` 另拦。
+    """
+    s = str(url or "").strip()
+    if not s:
+        return ""
+    try:
+        p = urllib.parse.urlsplit(s)
+        host = p.hostname or ""
+        _ = p.port
+    except ValueError:
+        return ""
+    if p.scheme.lower() != "https" or not host:
+        return ""
+    if p.query or p.fragment or p.username or p.password:
+        return ""
+    # 与 core/llm_config 同：去掉末尾的点再判；inet_aton 写法（`0x7f.1`、`2130706433`）不收。
+    bare = host.lower().rstrip(".")
+    if bare == "localhost" or bare.endswith(".localhost"):
+        return ""
+    if re.fullmatch(r"(0x[0-9a-f]+|[0-9]+)(\.(0x[0-9a-f]+|[0-9]+)){0,3}", bare):
+        try:
+            if not ipaddress.ip_address(bare).is_global:
+                return ""
+        except ValueError:
+            return ""
+    path = p.path.rstrip("/")
+    for suffix in ("/chat/completions", "/models"):
+        if path.lower().endswith(suffix):
+            path = path[: -len(suffix)].rstrip("/")
+    if not path:
+        path = "/v1"
+    return f"https://{p.netloc}{path}"
+
+
+def _get_litellm_config() -> dict:
+    """读网关连接信息 Secret（带缓存）。返回 `{"base_url", "api_key"}`，base_url 已规整。
+
+    Secret 内容形如 `{"base_url": "https://gw.example.com", "api_key": "sk-..."}`，
+    由 BFF `PUT /admin/llm-config/gateway` 写入。读不到 / 不合法 → 两个字段都是空串，
+    由调用方抛 `LiteLLMConfigError`。
     """
     global _cached_litellm, _cached_litellm_ts
     now = time.time()
@@ -215,19 +193,27 @@ def _get_litellm_config() -> dict:
         client = boto3.client("secretsmanager", region_name=region)
         resp = client.get_secret_value(SecretId=_LITELLM_SECRET_ID)
         cfg = json.loads(resp["SecretString"]) or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
     except Exception as e:
-        logger.warning("read LiteLLM config secret failed: %s", e)
+        # 只记类型：异常文本可能带 Secret ARN 以外的上下文，没必要进日志。
+        logger.warning("read gateway config secret failed: %s", type(e).__name__)
         cfg = {}
 
-    # 规范化
     cfg = {
-        "base_url": (cfg.get("base_url") or "").rstrip("/"),
-        "api_key": cfg.get("api_key") or "",
-        "default_model": cfg.get("default_model") or "",
+        "base_url": _normalise_gateway_base_url(cfg.get("base_url")),
+        "api_key": str(cfg.get("api_key") or "").strip(),
     }
     _cached_litellm = cfg
     _cached_litellm_ts = now
     return cfg
+
+
+def _invalidate_gateway_config() -> None:
+    """网关回 401：Admin 刚换了 Key 而本进程还缓存着旧的。清掉，下次重读 Secret。"""
+    global _cached_litellm, _cached_litellm_ts
+    _cached_litellm = None
+    _cached_litellm_ts = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +258,12 @@ _LLMCFG_PK = "llmcfg"
 _LLMCFG_SK = "meta"
 _cached_cred_mode: str | None = None
 _cached_cred_mode_ts: float = 0.0
+# 同一次 GetItem 顺带读出的第一来源与网关版本号（见 _credential_mode）。
+_cached_active_source: str = ""
+_cached_gateway_rev: int | None = None
+# 来源配置的缓存窗口。与对话侧 core/llm_config 的目录 TTL 同一个数：Admin 换了网关 / 次序，
+# 后端任务最迟一分钟跟上（gateway_rev 一变，网关连接信息的缓存也立刻作废）。
+_META_TTL = 60
 
 
 def _credential_mode() -> str:
@@ -287,9 +279,9 @@ def _credential_mode() -> str:
     读不到就当 "iam"：那是**不使用** Key 的一侧，失败方向保守（宁可回退部署角色，
     也不要在管理员以为已停用 Key 的情况下继续拿它计费与鉴权）。
     """
-    global _cached_cred_mode, _cached_cred_mode_ts
+    global _cached_cred_mode, _cached_cred_mode_ts, _cached_active_source, _cached_gateway_rev
     now = time.time()
-    if _cached_cred_mode is not None and (now - _cached_cred_mode_ts) < 300:
+    if _cached_cred_mode is not None and (now - _cached_cred_mode_ts) < _META_TTL:
         return _cached_cred_mode
 
     table = os.environ.get(_CONFIG_TABLE_ENV, "")
@@ -302,12 +294,60 @@ def _credential_mode() -> str:
         import boto3 as _b
         item = _b.resource("dynamodb").Table(table).get_item(
             Key={"PK": _LLMCFG_PK, "SK": _LLMCFG_SK}).get("Item") or {}
-        mode = str(item.get("credential_mode") or "iam")
+        mode = _bedrock_source(item)
+        active = _active_source(item)
+        try:
+            rev = int(item.get("gateway_rev") or 0)
+        except (TypeError, ValueError):
+            rev = 0
     except Exception as e:  # noqa: BLE001 — 配置读失败不得中断推送
-        logger.warning("read credential_mode failed, assuming iam: %s", e)
-        mode = "iam"
+        logger.warning("read credential_mode failed, assuming iam: %s", type(e).__name__)
+        # 读失败：上一次读到的第一来源与网关版本号**原样留着**（stale-while-error）。清空的话，
+        # 网关排第一的部署会在一次 GetItem 抖动后放行 Bedrock 兜底（见 invoke_llm 的 backend_task）。
+        if _cached_cred_mode is not None:
+            _cached_cred_mode_ts = now
+            return _cached_cred_mode
+        mode, active, rev = "iam", "", None
+    if rev is not None and _cached_gateway_rev is not None and rev != _cached_gateway_rev:
+        _invalidate_gateway_config()     # Admin 刚改过网关：别再用缓存的旧地址 / 旧 Key
     _cached_cred_mode, _cached_cred_mode_ts = mode, now
+    _cached_active_source = active
+    if rev is not None:
+        _cached_gateway_rev = rev
     return mode
+
+
+def _active_source(item: dict) -> str:
+    """Admin 排在第一的来源（"iam" | "api_key" | "gateway"）；与 core/llm_config 同一套规整。"""
+    order = item.get("source_order")
+    for s in (order if isinstance(order, list) else []):
+        s = str(s or "").strip().lower()
+        if s in ("iam", "api_key", "gateway"):
+            return s
+    mode = str(item.get("credential_mode") or "iam").strip().lower()
+    return mode if mode in ("iam", "api_key", "gateway") else "iam"
+
+
+def _bedrock_source(item: dict) -> str:
+    """调 Bedrock 时用哪种凭证："iam" | "api_key"。
+
+    来源次序 `source_order` 里排在最前的 Bedrock 来源；没有次序（升级前的配置）就看
+    `credential_mode`。网关排第一时后端任务本应绑网关模型（BFF 按第一来源投影），走到这里
+    说明某个任务仍绑着 Bedrock 模型 —— 那就用排在最前的 Bedrock 凭证，与 IM 端同一条规则。
+    """
+    # 与 core/llm_config._normalise_source_order 一致：未知 / 重复项丢掉；一个合法项都没有时
+    # 以 credential_mode 打头；缺的按 iam → api_key → gateway 补齐。然后取第一个 Bedrock 来源。
+    known = ("iam", "api_key", "gateway")
+    order: list[str] = []
+    for s in (item.get("source_order") if isinstance(item.get("source_order"), list) else []):
+        s = str(s or "").strip().lower()
+        if s in known and s not in order:
+            order.append(s)
+    if not order:
+        mode = str(item.get("credential_mode") or "iam").strip().lower()
+        order = [mode if mode in known else "iam"]
+    order.extend(s for s in known if s not in order)
+    return next(s for s in order if s != "gateway")
 
 
 def _get_bedrock_api_key() -> str | None:
@@ -621,48 +661,77 @@ def _invoke_mantle_responses(
 
 
 # ---------------------------------------------------------------------------
-# LiteLLM Proxy(OpenAI Chat Completions 协议)
+# OpenAI 兼容网关（LiteLLM Proxy / New API …，Chat Completions 协议）
 # ---------------------------------------------------------------------------
 
+_GATEWAY_KIND = "openai_compatible"
 
-def _invoke_litellm(
+# 错误文本里可能回显 Key（LiteLLM 的鉴权失败会带上收到的 Key 片段）。进日志、进异常之前
+# 一律抹掉形如 `sk-...` 与 `Bearer ...` 的串。
+_SECRETISH_RE = re.compile(r"(sk-[A-Za-z0-9_\-\.]{4,}|Bearer\s+[^\s\"',]+)")
+# 网关响应体读取上限：正常的 chat/completions 回答远小于它；坏掉 / 恶意的网关不能把 Lambda 内存吃光。
+_GATEWAY_MAX_BODY = 5 * 1024 * 1024
+
+
+def _redact(text: str, secret: str = "") -> str:
+    """抹掉错误文本里像凭证的串。`secret` 是本次用的 Key：上游原样回显它时（不一定是 sk- 开头）
+    也要抹掉。"""
+    out = text or ""
+    if secret and len(secret) >= 8:
+        out = out.replace(secret, "[redacted]")
+    return _SECRETISH_RE.sub("[redacted]", out)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """网关调用**不跟随重定向**：urllib 默认会把 Authorization 头原样带到 Location（含 http://），
+    POST 还会被改成 GET 重发。网关前面的代理配错一个 301 就能把 Key 明文送出去。BFF 与 webchat
+    runtime 两侧同样拒绝重定向。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_GATEWAY_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _invoke_gateway(
     model_id: str,
     system_prompt: str,
     user_prompt: str,
     max_tokens: int,
 ) -> dict:
+    """POST {base}/chat/completions（非流式）。model_id 原样透传给网关。
+
+    2026-10 之前这里叫 `_invoke_litellm`，会给不含 `/` 的 model_id 自动补 `bedrock/` 前缀，
+    并把路径写死成 `{base}/v1/chat/completions`。两样都删了：
+      · 前缀改写是参考项目「LiteLLM 后面挂 Bedrock」那一种部署的假设。New API、或 LiteLLM 里
+        自定义了 model_name 的部署，补了前缀就找不到模型。目录里填什么就发什么。
+      · 路径写死 `/v1` 让「base_url 已经带 /v1」的配置拼成 `/v1/v1/...`。base_url 现在由
+        `_normalise_gateway_base_url` 统一规整成 OpenAI 根路径。
+    """
     cfg = _get_litellm_config()
     base_url = cfg["base_url"]
     api_key = cfg["api_key"]
     if not base_url or not api_key:
-        # 别再指向「Dashboard → AI 认证 → LiteLLM」：那个页面随旧管理台 2026-09-04 退役，
-        # 而现在的「更多 → 管理 → 模型」只支持 Bedrock（`llm_config.mjs` 会拒掉 litellm）。
         raise LiteLLMConfigError(
-            "LiteLLM is selected as provider but base_url/api_key not configured "
-            "in Secrets Manager (notiops/litellm-config). The Web Chat UI cannot "
-            "set LiteLLM yet (More -> Admin -> Models is Bedrock-only): write "
-            "base_url/api_key into that secret directly, or set the provider "
-            "back to bedrock (SSM /notiops/llm/provider)."
+            "The OpenAI-compatible gateway is the model source for this task, but its "
+            "base_url/api_key are missing or invalid (Secrets Manager notiops/litellm-config). "
+            "Fix it under More -> Admin -> Models -> gateway, or move a Bedrock source to the "
+            "top and save."
         )
     _validate_base_url(base_url)
 
-    # 如果调用方传的 model_id 是 Bedrock 推理 profile(global.anthropic.* 等),
-    # 自动给它加 LiteLLM 期望的 "bedrock/" 前缀;否则原样透传。
-    if "/" not in model_id and model_id and not model_id.startswith("bedrock/"):
-        model_for_litellm = f"bedrock/{model_id}"
-    else:
-        model_for_litellm = model_id
-
     payload = {
-        "model": model_for_litellm,
+        "model": model_id,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         "max_tokens": max_tokens,
+        "stream": False,
     }
     body = json.dumps(payload).encode("utf-8")
-    url = f"{base_url}/v1/chat/completions"
+    url = f"{base_url}/chat/completions"
     req = urllib.request.Request(
         url,
         data=body,
@@ -674,43 +743,53 @@ def _invoke_litellm(
         },
     )
     try:
-        # 与 Bedrock invoker 一致用 5min 超时
-        with safe_urlopen(req, timeout=300) as resp:  # noqa: S310 (固定 https)
-            raw = resp.read().decode("utf-8")
+        # 与 Bedrock invoker 一致用 5min 超时。不经 safe_urlopen 的默认 opener：那个会跟随重定向
+        # （见 _NoRedirect）。scheme 已由 _normalise_gateway_base_url 限定为 https。
+        with _GATEWAY_OPENER.open(req, timeout=300) as resp:  # noqa: S310
+            raw_bytes = resp.read(_GATEWAY_MAX_BODY + 1)
+            if len(raw_bytes) > _GATEWAY_MAX_BODY:
+                raise LiteLLMHTTPError("gateway response too large")
+            raw = raw_bytes.decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            raise LiteLLMHTTPError(f"gateway redirected (HTTP {e.code}, not followed)") from None
         body_txt = ""
         try:
-            body_txt = e.read().decode("utf-8", errors="replace")[:1000]
-        except Exception:
+            body_txt = _redact(e.read(4096).decode("utf-8", errors="replace")[:1000], api_key)
+        except Exception:  # noqa: BLE001
             pass
-        logger.error(
-            "LiteLLM HTTP %s for model=%s url=%s body=%s",
-            e.code, model_for_litellm, url, body_txt,
-        )
+        if e.code == 401:
+            _invalidate_gateway_config()
+        # 不记 url：base_url 是客户内部信息，排障用 model + 状态码足够定位。
+        logger.error("gateway HTTP %s for model=%s body=%s", e.code, model_id, body_txt[:300])
         raise LiteLLMHTTPError(
-            f"LiteLLM proxy returned HTTP {e.code}: {body_txt[:200]}"
+            f"gateway returned HTTP {e.code}: {body_txt[:200]}"
         ) from e
     except Exception as e:
-        logger.error("LiteLLM request failed: %s url=%s", e, url)
+        logger.error("gateway request failed: %s", type(e).__name__)
         raise
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         raise LiteLLMHTTPError(
-            f"LiteLLM returned non-JSON body: {raw[:200]}"
+            f"gateway returned non-JSON body: {_redact(raw[:200], api_key)}"
         ) from e
 
-    if "error" in data:
+    if isinstance(data, dict) and "error" in data:
         err = data["error"]
         msg = err.get("message", "") if isinstance(err, dict) else str(err)
-        raise LiteLLMHTTPError(f"LiteLLM error: {msg[:300]}")
+        raise LiteLLMHTTPError(f"gateway error: {_redact(str(msg), api_key)[:300]}")
 
-    choices = data.get("choices") or []
+    choices = (data.get("choices") if isinstance(data, dict) else None) or []
     if not choices:
-        raise LiteLLMHTTPError(f"LiteLLM returned no choices: {raw[:200]}")
+        raise LiteLLMHTTPError(f"gateway returned no choices: {_redact(raw[:200], api_key)}")
     msg_obj = (choices[0] or {}).get("message") or {}
     content = msg_obj.get("content", "") or ""
+    if isinstance(content, list):
+        # 少数后端把 content 回成 parts 数组（OpenAI 的多模态形状）。只取文本段。
+        content = "".join(str(p.get("text") or "") for p in content
+                          if isinstance(p, dict) and p.get("type") in ("text", "output_text"))
     finish_reason = (choices[0] or {}).get("finish_reason", "") or ""
     usage = data.get("usage") or {}
 
@@ -733,8 +812,8 @@ def _invoke_litellm(
     }
 
     logger.info(
-        "LiteLLM converse completed: model=%s stop=%s usage=%s",
-        model_for_litellm, stop_reason, bedrock_usage,
+        "gateway chat completed: model=%s stop=%s usage=%s",
+        model_id, stop_reason, bedrock_usage,
     )
 
     return {
@@ -742,6 +821,37 @@ def _invoke_litellm(
         "stop_reason": stop_reason,
         "usage": bedrock_usage,
     }
+
+
+_legacy_checked = False
+
+
+def _warn_legacy_provider_param() -> None:
+    """升级提示：SSM `/notiops/llm/provider` 不再参与路由（2026-10）。
+
+    之前把它手动设成 `litellm` 的部署，升级后后端任务会改走 Bedrock —— 路由已改为按目录 kind，
+    网关要在 Admin「模型 → 模型来源」里配。这里每个进程只查一次，命中就打 ERROR + 指标，
+    让这次行为变化**看得见**，而不是悄悄发生。只在 Lambda 里查（单测 / 本地不碰 SSM）。
+    """
+    global _legacy_checked
+    if _legacy_checked or not os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+        return
+    _legacy_checked = True
+    try:
+        v = boto3.client("ssm").get_parameter(Name="/notiops/llm/provider")["Parameter"]["Value"]
+    except Exception:  # noqa: BLE001 — 只是提示，读不到就算了
+        return
+    if str(v or "").strip().lower() == "litellm":
+        logger.error("SSM /notiops/llm/provider=litellm is no longer honoured: backend LLM calls now "
+                     "route by the model catalogue. Configure the gateway under Web Chat > More > "
+                     "Admin > Models > Model sources and move it to the top.")
+        try:
+            print(json.dumps({"_aws": {"Timestamp": int(time.time() * 1000), "CloudWatchMetrics": [{
+                "Namespace": "NotiOps/LLMConfig", "Dimensions": [["Surface"]],
+                "Metrics": [{"Name": "LegacyProviderParamIgnored", "Unit": "Count"}]}]},
+                "Surface": "backend", "LegacyProviderParamIgnored": 1}), flush=True)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -756,22 +866,28 @@ def invoke_llm(
     max_tokens: int = 16000,
     kind: str = "",
     region: str = "",
+    backend_task: bool = False,
 ) -> dict:
-    """统一 LLM 调用入口,根据 SSM 中的 provider 选择走 Bedrock 或 LiteLLM。
+    """统一 LLM 调用入口，按目录条目的 `kind` 选协议。
 
     Args:
-        model_id: 模型 ID。Bedrock 模式用推理 profile(如 global.anthropic.claude-opus-4-7);
-                  LiteLLM 模式可以传裸名(自动加 bedrock/ 前缀)或带 provider 前缀。
+        model_id: 模型 ID。Bedrock 用推理 profile(如 global.anthropic.claude-opus-4-7);
+                  网关用网关里登记的模型名（原样透传，不改写）。
         system_prompt: 系统提示词
         user_prompt: 用户提示词
         max_tokens: 最大输出 token 数
-        kind: 模型目录里的 `kind`。`bedrock_mantle_responses` → 走 Mantle 的
-              Responses 协议；其余(含空值)→ Converse。
+        kind: 模型目录里的 `kind`。`openai_compatible` → OpenAI 兼容网关；
+              `bedrock_mantle_responses` → Mantle 的 Responses 协议；其余(含空值)→ Converse。
               **不从 model_id 猜**：靠前缀猜会在目录换代时静默走错端点，而走错端点
               的表现是 `ValidationException: model identifier is invalid`,看起来像
               「模型不存在」,归因成本很高。缺省即 Converse,与历史行为一致。
         region: Mantle 专用。模型只在特定区域上架(如 GPT-5.6 Terra 仅 us-east-1 /
                 us-east-2 / us-west-2),故区域是目录数据的一部分。非 Mantle 时忽略。
+        backend_task: Admin「后端任务模型」驱动的调用（PHD 翻译 / 报告精简）。为真且网关是第一
+                来源时，**拒绝**走 Bedrock：BFF 在网关排第一时把后端任务全部投影成网关模型，此时
+                还拿到 Bedrock 模型只可能是投影行读失败后落到了 env / 硬编码兜底 —— 那是静默换来源
+                （数据去向、计费主体一起换），用户决策是不许发生。抛 LiteLLMConfigError，调用方走
+                自己的非 LLM 降级（PHD 推原始事件）。
 
     Returns:
         {"content": str, "stop_reason": str, "usage": dict}
@@ -781,28 +897,34 @@ def invoke_llm(
     Raises:
         ClientError: Bedrock 调用失败(限流、模型不可用)
         HTTPError: Mantle 端点返回非 2xx
-        LiteLLMConfigError: 选择 LiteLLM 但配置不完整
-        LiteLLMHTTPError: LiteLLM 端点返回非 2xx 或非 JSON
+        LiteLLMConfigError: 网关模型但连接信息不完整 / 地址不合法
+        LiteLLMHTTPError: 网关返回非 2xx 或非 JSON
 
     协议覆盖:
         Converse(bedrock-runtime) / Responses(bedrock-mantle) /
-        Chat Completions(LiteLLM)。**目录里任何 Bedrock 模型,后端任务都能绑** ——
-        这一点与对话侧(webchat / IM)现在是对齐的。曾经不对齐:后端只有 Converse
-        一条路,于是 Admin 的「后端任务模型」下拉里 Mantle-only 的模型是灰的,而同
-        一个模型在对话里明明能用。改动同时放宽了两处判定:
+        Chat Completions(网关)。**目录里任何模型,后端任务都能绑** ——
+        这一点与对话侧(webchat)是对齐的。改动同时放宽过两处判定:
           · bff/web-chat/llm_config.mjs  validateConfig
           · frontend/chat-app/src/components/AdminPanel.tsx  backendEligible
         再加协议时,这三处要一起动。
     """
-    provider = _get_provider()
     logger.info(
-        "invoke_llm provider=%s model=%s kind=%s region=%s sys_len=%d "
-        "user_len=%d max_tokens=%d",
-        provider, model_id, kind or "converse", region or "-",
+        "invoke_llm model=%s kind=%s region=%s sys_len=%d user_len=%d max_tokens=%d",
+        model_id, kind or "converse", region or "-",
         len(system_prompt), len(user_prompt), max_tokens,
     )
-    if provider == "litellm":
-        return _invoke_litellm(model_id, system_prompt, user_prompt, max_tokens)
+    _warn_legacy_provider_param()
+    if kind == _GATEWAY_KIND:
+        _credential_mode()   # 顺带刷新 gateway_rev：Admin 改了网关就别用缓存的旧连接信息
+    elif backend_task:
+        _credential_mode()
+        if _cached_active_source == "gateway":
+            raise LiteLLMConfigError(
+                "the OpenAI-compatible gateway is the active model source, but this backend task "
+                "resolved to a Bedrock model (its projected config could not be read); refusing to "
+                "fall back to Bedrock")
+    if kind == _GATEWAY_KIND:
+        return _invoke_gateway(model_id, system_prompt, user_prompt, max_tokens)
     if kind == _MANTLE_KIND:
         return _invoke_mantle_responses(
             model_id, system_prompt, user_prompt, max_tokens, region,

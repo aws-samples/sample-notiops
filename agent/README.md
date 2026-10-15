@@ -8,6 +8,9 @@ BFF（`bff/web-chat`）通过 `bedrock-agentcore:InvokeAgentRuntime` 调它并�
 agent/
   main.py            # AgentCore Runtime 入口（BedrockAgentCoreApp + @app.entrypoint，SSE 流式）
   prompt.py          # 零变更 / 防幻觉 system prompt（复用 core/bedrock_chat 语言）
+  paragraphs.py      # 工具调用前后的两段正文之间补空行（与部署版逐字节相同的副本）
+  repeat_calls.py    # 同一轮里同工具、同参数、同结果的第二份 → 换成一句提示（与部署版逐字节相同的副本）
+  degeneration.py    # 输出崩坏守卫（影子模式：模型崩成乱码时只打一行日志；与部署版逐字节相同的副本）
   pyproject.toml     # strands-agents + bedrock-agentcore + boto3
   tools/
     aws_qa.py        # 第一个 tool：AWS Q&A（包 core/aws_docs_mcp 查官方文档）

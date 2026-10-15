@@ -344,6 +344,106 @@ def test_api_key_gating(mod, surface):
     _check("invalidate_api_key is safe to call", True)
 
 
+_GW_ENTRY = {
+    "alias": "gw-claude-opus", "model_id": "anthropic/claude-opus-4-7", "label": "Opus (gw)",
+    "kind": "openai_compatible", "region": None, "hard_output_limit": 8192,
+    "supports_prompt_cache": False, "surfaces": ["webchat"], "enabled": True,
+}
+
+
+def test_source_order(mod, surface):
+    """模型来源次序（2026-10）：只用第一来源；IM 不接网关，用排在最前的 Bedrock 来源。"""
+    print(f"test_source_order[{surface}]")
+    seed = json.load(open(os.path.join(ROOT, "config", "llm-model-catalog.json")))
+    models = [*seed["models"], dict(_GW_ENTRY)]
+
+    # (1) 升级前的配置：没有 source_order → 以 credential_mode 打头补全
+    item = _seed_item(models=models)
+    item["credential_mode"] = "api_key"
+    _patch_table(mod, _FakeTable(item))
+    cfg = mod.get_config()
+    _check("legacy config: order derived from credential_mode",
+           cfg["source_order"] == ["api_key", "iam", "gateway"], str(cfg["source_order"]))
+    _check("legacy config: gateway entries hidden while a Bedrock source is on top",
+           all(m["kind"] != "openai_compatible" for m in mod.enabled_entries()))
+    _check("legacy config: gateway alias is not admitted", not mod.is_enabled("gw-claude-opus"))
+
+    # (2) 网关排第一
+    item = _seed_item(models=models, default="gw-claude-opus")
+    item.update(credential_mode="gateway", source_order=["gateway", "api_key", "iam"],
+                source_defaults={"gateway": "gw-claude-opus", "iam": "moonshot-kimi-k3",
+                                 "api_key": "xai-grok-4-7"}, gateway_rev=7)
+    _patch_table(mod, _FakeTable(item))
+    cfg = mod.get_config()
+    _check("gateway_rev normalised", cfg["gateway_rev"] == 7, str(cfg.get("gateway_rev")))
+    _check("active_source() is the head of the order", mod.active_source() == "gateway")
+    if surface == "webchat":
+        _check("webchat uses the gateway", mod.credential_mode() == "gateway")
+        _check("webchat lists only gateway entries",
+               [m["alias"] for m in mod.enabled_entries()] == ["gw-claude-opus"],
+               str([m["alias"] for m in mod.enabled_entries()]))
+        _check("webchat default is the gateway default", mod.default_alias() == "gw-claude-opus")
+        r = mod.resolve("claude")
+        _check("a Bedrock alias is substituted with the gateway default",
+               r.alias == "gw-claude-opus" and r.is_gateway, r.alias)
+        _check("gateway entry resolves with its own model id and cap",
+               r.model_id == "anthropic/claude-opus-4-7" and r.max_output_tokens == 8192,
+               f"{r.model_id} {r.max_output_tokens}")
+        _check("Bedrock API key is not read while the gateway serves this surface",
+               mod.get_bedrock_api_key() is None)
+        _check("backend task bound to a Bedrock model falls back to the gateway default",
+               mod.backend_task_alias("phd_translate") == "gw-claude-opus",
+               mod.backend_task_alias("phd_translate"))
+    else:
+        _check("IM falls back to the first Bedrock source", mod.credential_mode() == "api_key",
+               mod.credential_mode())
+        _check("IM never lists gateway entries",
+               all(m["kind"] != "openai_compatible" for m in mod.enabled_entries()))
+        _check("IM default is that source's default", mod.default_alias() == "xai-grok-4-7",
+               mod.default_alias())
+        _check("IM never resolves to a gateway model",
+               not mod.resolve("gw-claude-opus").is_gateway)
+        try:
+            mod.get_gateway_config()
+            _check("IM refuses to read the gateway secret", False)
+        except mod.GatewayNotConfigured:
+            _check("IM refuses to read the gateway secret", True)
+    st = mod.status()
+    _check("status reports the active source", st["active_source"] == "gateway", str(st))
+
+    # (2b) 读失败时留着上一份 DDB 配置：网关排第一时，一次 GetItem 抖动不能把对话悄悄换到
+    #      内置目录（只有 Bedrock、来源 iam）上 —— 那是不许发生的静默换来源。
+    table = _FakeTable(item)
+    _patch_table(mod, table)
+    mod.get_config()
+    table.raise_exc = True
+    with mod._lock:  # noqa: SLF001 — 让 TTL 到期，逼它刷新
+        mod._cached_cfg_ts = 0.0  # noqa: SLF001
+    after = mod.get_config()
+    _check("failed refresh keeps the last DDB config (no silent switch to builtin)",
+           after.get("_source") == "ddb" and after["source_order"][0] == "gateway",
+           f"{after.get('_source')} {after.get('source_order')}")
+    _check("…and does not hammer DDB again inside the same TTL window",
+           (mod.get_config() is after) and table.calls == 2, f"calls={table.calls}")
+    table.raise_exc = False
+
+    # (3) 坏 source_order：未知 / 重复项丢掉，缺的补上
+    item = _seed_item(models=models)
+    item["source_order"] = ["openai", "iam", "iam", 3]
+    _patch_table(mod, _FakeTable(item))
+    _check("garbage source_order is repaired",
+           mod.get_config()["source_order"] == ["iam", "api_key", "gateway"],
+           str(mod.get_config()["source_order"]))
+
+    # (4) source_defaults 指向别的家族 → 丢掉
+    item = _seed_item(models=models)
+    item["source_defaults"] = {"iam": "gw-claude-opus", "gateway": "moonshot-kimi-k3"}
+    _patch_table(mod, _FakeTable(item))
+    _check("cross-family source_defaults are dropped",
+           mod.get_config()["source_defaults"] == {}, str(mod.get_config()["source_defaults"]))
+    mod.reset_cache()
+
+
 def test_builtin_matches_seed(mod, surface):
     """两份实现的内置兜底必须与规范种子一致（避免兜底态与正常态行为漂移）。"""
     print(f"test_builtin_matches_seed[{surface}]")
@@ -431,6 +531,7 @@ def main() -> int:
         test_per_surface_resolution(mod, surface, target)
         test_backend_task_alias(mod, surface)
         test_api_key_gating(mod, surface)
+        test_source_order(mod, surface)
         test_builtin_matches_seed(mod, surface)
         resolved_by_surface[surface] = {
             m["alias"]: m["model_id"] for m in mod._BUILTIN_CATALOG["models"]  # noqa: SLF001

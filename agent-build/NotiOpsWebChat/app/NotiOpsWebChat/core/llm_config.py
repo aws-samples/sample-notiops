@@ -53,6 +53,10 @@ _FORCED_REFRESH_MIN_INTERVAL = int(os.environ.get("LLMCFG_REFRESH_MIN_INTERVAL",
 
 _CONFIG_TABLE = os.environ.get("CONFIG_TABLE", "notiops-config")
 _BEDROCK_KEY_SECRET = os.environ.get("BEDROCK_API_KEY_SECRET", "notiops/bedrock-api-key")
+# OpenAI 兼容网关（LiteLLM / New API …）的连接信息，JSON `{base_url, api_key}`，由 BFF
+# `PUT /admin/llm-config/gateway` 写入。名字沿用 infra 早就建好的 `notiops/litellm-config`：
+# 改名要同时动三个栈的 IAM 与一键部署模板，换来的只是名字好看。
+_GATEWAY_SECRET = os.environ.get("GATEWAY_CONFIG_SECRET", "notiops/litellm-config")
 _PK = "llmcfg"
 _SK = "meta"
 
@@ -187,7 +191,22 @@ _BUILTIN_CATALOG: dict = {
     ],
 }
 
-_KINDS = {"bedrock_anthropic", "bedrock_converse", "bedrock_mantle_responses"}
+# ── 模型来源（2026-10）────────────────────────────────────────────────────────
+# 三种来源：本账号 IAM 调 Bedrock（iam）、他账号的 Bedrock API Key（api_key）、
+# OpenAI 兼容网关（gateway，LiteLLM / New API 这类）。Admin 把三者拖成一个次序
+# `source_order`，**只用第一个**；它坏了不自动降级，由 Admin 手动把备用项拖到最上面
+# （用户决策：静默换来源会把数据驻留、计费主体一起换掉，客户必须知情）。
+#
+# 每个来源只能调自己家族的条目：Bedrock 三种 kind 归 iam / api_key，`openai_compatible`
+# 归 gateway。家族过滤在 `_entries` 里做，所以「换来源」对所有读目录的地方是同一个动作。
+_BEDROCK_KINDS = frozenset({"bedrock_anthropic", "bedrock_converse", "bedrock_mantle_responses"})
+_GATEWAY_KINDS = frozenset({"openai_compatible"})
+_KINDS = _BEDROCK_KINDS | _GATEWAY_KINDS
+_SOURCES = ("iam", "api_key", "gateway")
+# 每端能用的来源。IM 原生链路（core/bedrock_chat 的 Converse / Responses 工具循环）只会
+# 调 Bedrock，一期不接网关：网关是第一来源时，IM 用排在最前的那个 Bedrock 来源。
+# IM 上的 `/agent notiops` 由 webchat runtime 作答，走的是 webchat 这一行。
+_SURFACE_SOURCES = {"webchat": _SOURCES, "im": ("iam", "api_key")}[_SURFACE]
 
 
 @dataclass(frozen=True)
@@ -205,6 +224,10 @@ class ResolvedModel:
     def is_mantle(self) -> bool:
         return self.kind == "bedrock_mantle_responses"
 
+    @property
+    def is_gateway(self) -> bool:
+        return self.kind in _GATEWAY_KINDS
+
 
 # ---------------------------------------------------------------------------
 # 缓存状态
@@ -216,6 +239,10 @@ _last_forced_refresh_ts: float = 0.0
 
 _cached_key: str | None = None
 _cached_key_ts: float = 0.0
+
+_cached_gw: dict | None = None
+_cached_gw_ts: float = 0.0
+_cached_gw_rev: int | None = None
 
 _ddb = None
 
@@ -327,10 +354,26 @@ def _normalise(raw: dict) -> dict | None:
         return None
 
     by_alias = {m["alias"]: m for m in models}
+    source_order = _normalise_source_order(raw.get("source_order"), raw.get("credential_mode"))
+    active = source_order[0]
+
+    # 每个来源各自的默认模型。只收「存在、且属于该来源家族」的 alias；其余丢掉，
+    # 由 `_default_entry` 回落到本端该家族第一个启用项。
+    source_defaults: dict[str, str] = {}
+    sd_raw = raw.get("source_defaults")
+    if isinstance(sd_raw, dict):
+        for src in _SOURCES:
+            a = str(sd_raw.get(src) or "").strip().lower()
+            if a in by_alias and _in_family(by_alias[a], src):
+                source_defaults[src] = a
+
     default = str(raw.get("default_model") or "").strip().lower()
-    # 不变量兜底：默认模型必须存在且启用；否则取第一个启用项，再退第一项。
+    # 不变量兜底：默认模型必须存在且启用；否则取第一来源家族里的第一个启用项，
+    # 再退任意启用项、再退第一项。
     if default not in by_alias or not by_alias[default]["enabled"]:
-        fallback = next((m["alias"] for m in models if m["enabled"]), models[0]["alias"])
+        fallback = next((m["alias"] for m in models if m["enabled"] and _in_family(m, active)),
+                        None) or next((m["alias"] for m in models if m["enabled"]),
+                                      models[0]["alias"])
         if default:
             logger.warning("llm_config: default_model %r unusable, falling back to %r",
                            default, fallback)
@@ -339,15 +382,58 @@ def _normalise(raw: dict) -> dict | None:
     return {
         "generation": _as_int(raw.get("generation")),
         "provider": str(raw.get("provider") or "bedrock").strip().lower(),
-        "credential_mode": (str(raw.get("credential_mode") or "iam").strip().lower()
-                            if str(raw.get("credential_mode") or "iam").strip().lower()
-                            in ("iam", "api_key") else "iam"),
+        # 第一来源。旧字段保留：老的读取方、诊断与 BFF 都按它理解「当前凭证方式」。
+        "credential_mode": active,
+        "source_order": source_order,
+        "source_defaults": source_defaults,
+        # 网关连接信息的版本号。BFF 每次改网关 Secret 都推它，读取方据此立刻重读 Secret，
+        # 不等 Key 缓存的 TTL（否则 Admin 换了 Key 之后最长 300s 还在用旧的）。
+        "gateway_rev": _as_int(raw.get("gateway_rev")),
         "default_model": default,
         "models": models,
         "backend_tasks": (raw.get("backend_tasks")
                           if isinstance(raw.get("backend_tasks"), dict) else {}),
         "_source": "ddb",
     }
+
+
+def _normalise_source_order(order, legacy_mode) -> list[str]:
+    """`source_order` 规整成三种来源各出现一次的列表。
+
+    缺失（升级前写的配置只有 `credential_mode`）→ 以 `credential_mode` 打头；
+    给了但不全 → 缺的按默认次序补到末尾；未知值、重复值丢掉。
+    """
+    out: list[str] = []
+    if isinstance(order, list):
+        for s in order:
+            s = str(s or "").strip().lower()
+            if s in _SOURCES and s not in out:
+                out.append(s)
+    if not out:
+        mode = str(legacy_mode or "iam").strip().lower()
+        out = [mode if mode in _SOURCES else "iam"]
+    out.extend(s for s in _SOURCES if s not in out)
+    return out
+
+
+def _in_family(m: dict, source: str) -> bool:
+    """条目 `m` 能否由来源 `source` 调用。没写 kind 的条目按 Bedrock 算（老测试夹具如此）。"""
+    is_gw = m.get("kind") in _GATEWAY_KINDS
+    return is_gw if source == "gateway" else not is_gw
+
+
+def _effective_source(cfg: dict) -> str:
+    """本端实际使用的来源：`source_order` 里第一个本端支持的。
+
+    webchat 就是第一来源；IM 不接网关，网关排第一时取排在最前的 Bedrock 来源。
+    """
+    order = cfg.get("source_order")
+    if not isinstance(order, list) or not order:
+        order = [str(cfg.get("credential_mode") or "iam"), *_SOURCES]
+    for s in order:
+        if s in _SURFACE_SOURCES:
+            return s
+    return "iam"
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +579,18 @@ def get_config(payload_generation=None) -> dict:
         # 一整个窗口。_fetch 内部已发过 FallbackBuiltin，这里叠一个"是强刷路径失败"。
         if force:
             _emit("RefreshFail")
+        if cached is not None and cached.get("_source") == "ddb":
+            # **读失败时留着上一份 DDB 配置**（stale-while-error），不换成内置目录。
+            # 内置目录只有 Bedrock 条目、来源是 iam：网关排第一的部署里，一次 GetItem 抖动就会
+            # 让这一个 TTL 窗口的对话悄悄改走本账号 Bedrock —— 正是「第一来源坏了不自动换」
+            # 要杜绝的那种静默换来源（数据去向、计费主体一起换掉）。旧配置最多旧一个 TTL，
+            # 而内置目录可能整份都不对。只有**从没读到过**时才用内置目录。
+            _emit("StaleConfigServed")
+            logger.warning("llm_config: refresh failed; keeping the last DDB config (generation=%s)",
+                           cached.get("generation"))
+            with _lock:
+                _cached_cfg_ts = time.time()
+            return cached
         cfg = _builtin()
 
     with _lock:
@@ -540,7 +638,10 @@ def status(cfg: dict | None = None) -> dict:
         "source": str(cfg.get("_source") or ""),
         "default_alias": str(entry["alias"]) if entry else "",
         "enabled_models": len(enabled_entries(cfg)),
-        "credential_mode": str(cfg.get("credential_mode") or "iam"),
+        # 本端实际用的来源（IM 永远是 Bedrock 那两种之一）；第一来源另列，二者不同即
+        # 「网关排第一、IM 在用备用 Bedrock」。
+        "credential_mode": _effective_source(cfg),
+        "active_source": str((cfg.get("source_order") or [cfg.get("credential_mode") or "iam"])[0]),
         "catalog_ttl_s": _CATALOG_TTL,
         "force_refresh_min_interval_s": _FORCED_REFRESH_MIN_INTERVAL,
         "output_target": _OUTPUT_TARGET,
@@ -570,7 +671,9 @@ def _default_entry(cfg: dict) -> dict | None:
     admin 的选择被吞掉（2026-08 由 的测试抓到）。
     """
     entries = _entries(cfg)
-    want = str(cfg.get("default_model") or "")
+    # 先看本端所用来源自己的默认；没配过（升级前的配置）再看全局 default_model。
+    src = _effective_source(cfg)
+    want = str((cfg.get("source_defaults") or {}).get(src) or cfg.get("default_model") or "")
     for m in entries:
         if m["alias"] == want and m.get("enabled"):
             return m
@@ -593,8 +696,15 @@ def default_alias() -> str:
 
 
 def _entries(cfg: dict | None = None) -> list[dict]:
+    """本端、且属于本端所用来源家族的条目。
+
+    家族过滤放在这里而不是各调用点：选择器、`@bot model list`、准入判定、默认回落都经过
+    这里，换来源时它们一起换，不会出现「列表里是网关模型、准入还认 Bedrock alias」的错位。
+    """
     cfg = cfg or get_config()
-    return [m for m in cfg.get("models", []) if _SURFACE in m.get("surfaces", [])]
+    src = _effective_source(cfg)
+    return [m for m in cfg.get("models", [])
+            if _SURFACE in m.get("surfaces", []) and _in_family(m, src)]
 
 
 def entries(cfg: dict | None = None) -> list[dict]:
@@ -706,15 +816,22 @@ def backend_task_alias(task: str) -> str:
     val = str((cfg.get("backend_tasks") or {}).get(task) or "").strip().lower()
     if val and is_enabled(val, cfg):
         return val
-    return str(cfg["default_model"])
+    entry = _default_entry(cfg)
+    return str(entry["alias"]) if entry else str(cfg["default_model"])
 
 
 # ---------------------------------------------------------------------------
 # Bedrock API Key（凭证模式 api_key 时生效）
 # ---------------------------------------------------------------------------
 def credential_mode() -> str:
-    """"iam" | "api_key"。"""
-    return str(get_config().get("credential_mode") or "iam")
+    """本端实际使用的来源："iam" | "api_key" | "gateway"（IM 端永不返回 gateway）。"""
+    return _effective_source(get_config())
+
+
+def active_source() -> str:
+    """Admin 排在第一的来源（全局）。与 `credential_mode()` 不同即本端在用备用来源。"""
+    order = get_config().get("source_order") or ["iam"]
+    return str(order[0])
 
 
 def get_bedrock_api_key() -> str | None:
@@ -755,6 +872,158 @@ def get_bedrock_api_key() -> str | None:
         _cached_key = key
         _cached_key_ts = time.time()
     return key
+
+
+# ---------------------------------------------------------------------------
+# OpenAI 兼容网关（来源 gateway 时生效）
+# ---------------------------------------------------------------------------
+class GatewayNotConfigured(RuntimeError):
+    """网关是本端来源，但连接信息读不到 / 不完整 / 不合法。
+
+    **不降级**：用户决策是「第一来源坏了直接失败，Admin 手动换」。调用方把它当一次普通的
+    模型调用失败报给用户，并说明去哪里换来源。message 不含任何凭证或 URL。
+    """
+
+
+def normalise_gateway_base_url(url) -> str:
+    """把 Admin 填的网关地址规整成 OpenAI 根路径；不合法返回 ""。
+
+    规则（与 BFF `normalizeGatewayBaseUrl` 逐条一致）：
+      · 只收 https；带 query / fragment / 用户名密码的一律不收。
+      · 去掉末尾 `/`，以及误贴进来的 `/chat/completions`、`/models` 后缀。
+      · 路径为空补 `/v1`。LiteLLM 两种都认（`/models` 与 `/v1/models` 实测同为 200），
+        New API 文档只给 `/v1/...`；补 `/v1` 两边都通。自定义前缀（如 `/openai/v1`、
+        `/api/v1`）原样保留。
+      · 主机是字面量的非公网 IP（回环 / 私网 / 链路本地 / 元数据地址）或 `localhost` → ""。
+        一期只接公网网关；内网网关要走 VPC 模式，是二期。
+    调用时拼 `{base}/chat/completions`、`{base}/models`。
+    """
+    import ipaddress
+    import re
+    from urllib.parse import urlsplit
+
+    s = str(url or "").strip()
+    if not s:
+        return ""
+    try:
+        p = urlsplit(s)
+        host = p.hostname or ""
+        _ = p.port  # 非法端口在这里抛 ValueError
+    except ValueError:
+        return ""
+    if p.scheme.lower() != "https" or not host:
+        return ""
+    if p.query or p.fragment or p.username or p.password:
+        return ""
+    # 末尾的点（`localhost.`、`127.0.0.1.`）是合法 FQDN 写法，解析结果与不带点相同 —— 先去掉再判。
+    bare = host.lower().rstrip(".")
+    if bare == "localhost" or bare.endswith(".localhost"):
+        return ""
+    try:
+        ip = ipaddress.ip_address(bare)
+    except ValueError:
+        ip = None
+    if ip is not None and not ip.is_global:
+        return ""
+    # `0x7f.1`、`2130706433`、`0177.0.0.1` 这类 inet_aton 写法 ipaddress 不认，getaddrinfo 却会
+    # 把它们解析成 127.0.0.1。正经网关的主机名不会长这样：全是数字 / 点 / 0x 的一律不收。
+    if ip is None and re.fullmatch(r"(0x[0-9a-f]+|[0-9]+)(\.(0x[0-9a-f]+|[0-9]+)){0,3}", bare):
+        return ""
+    path = p.path.rstrip("/")
+    for suffix in ("/chat/completions", "/models"):
+        if path.lower().endswith(suffix):
+            path = path[: -len(suffix)].rstrip("/")
+    if not path:
+        path = "/v1"
+    return f"https://{p.netloc}{path}"
+
+
+def _resolves_public(base_url: str) -> bool:
+    """主机名的全部 A / AAAA 记录都是公网地址。解析失败返回 True（连不上自然报错，不在这里猜）。"""
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+
+    try:
+        p = urlsplit(base_url)
+        infos = socket.getaddrinfo(p.hostname, p.port or 443, proto=socket.IPPROTO_TCP)
+    except (OSError, ValueError, UnicodeError):
+        return True
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        mapped = getattr(addr, "ipv4_mapped", None)
+        if not (mapped or addr).is_global:
+            return False
+    return True
+
+
+def get_gateway_config() -> dict:
+    """读网关连接信息 `{"base_url", "api_key"}`（TTL 缓存；`gateway_rev` 一变立即重读）。
+
+    本端来源不是 gateway → 抛 `GatewayNotConfigured`（调用方本不该走到这里）；
+    读取失败 / 字段缺失 / 地址不合法 → 同样抛。**不回退 Bedrock**（见异常类说明）。
+
+    ⚠️ 返回值含凭证：禁止写日志、禁止进回复、禁止进异常信息（spec R5.5）。
+    """
+    global _cached_gw, _cached_gw_ts, _cached_gw_rev
+
+    if not _ENABLED:
+        raise GatewayNotConfigured("model catalogue disabled on this surface")
+    cfg = get_config()
+    if _effective_source(cfg) != "gateway":
+        raise GatewayNotConfigured("gateway is not the active model source")
+    rev = _as_int(cfg.get("gateway_rev"))
+
+    now = time.time()
+    with _lock:
+        if (_cached_gw is not None and _cached_gw_rev == rev
+                and (now - _cached_gw_ts) < _KEY_TTL):
+            return _cached_gw
+
+    try:
+        raw = boto3.client("secretsmanager").get_secret_value(
+            SecretId=_GATEWAY_SECRET)["SecretString"]
+        parsed = _json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("not an object")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("llm_config: gateway config read failed (%s)", _safe_err(e))
+        _emit("GatewayConfigFail", reason="read_error")
+        raise GatewayNotConfigured("gateway connection settings could not be read") from None
+
+    base = normalise_gateway_base_url(parsed.get("base_url"))
+    key = str(parsed.get("api_key") or "").strip()
+    if not base or not key:
+        logger.warning("llm_config: gateway config incomplete or invalid (base_ok=%s key_ok=%s)",
+                       bool(base), bool(key))
+        _emit("GatewayConfigFail", reason="incomplete")
+        raise GatewayNotConfigured("gateway connection settings are incomplete")
+    # 主机名解析出的地址里有非公网的 → 拒。BFF 保存时查过一次，但 Secret 也可能被控制台 / CLI
+    # 直接改过，且 DNS 会变。只在缓存刷新时查（每 TTL / 每次 gateway_rev 变化一次），不进热路径。
+    if not _resolves_public(base):
+        logger.warning("llm_config: gateway host resolves to a non-public address; refusing")
+        _emit("GatewayConfigFail", reason="non_public_host")
+        raise GatewayNotConfigured("gateway host does not resolve to a public address")
+
+    gw = {"base_url": base, "api_key": key}
+    with _lock:
+        _cached_gw = gw
+        _cached_gw_ts = time.time()
+        _cached_gw_rev = rev
+    return gw
+
+
+def invalidate_gateway_config() -> None:
+    """网关回 401 时调用：下次重读 Secret（Admin 刚换了 Key、本进程缓存还是旧的）。"""
+    global _cached_gw, _cached_gw_ts, _cached_gw_rev
+    _emit("GatewayAuthFail")
+    with _lock:
+        _cached_gw = None
+        _cached_gw_ts = 0.0
+        _cached_gw_rev = None
 
 
 # ── 「这次失败是不是凭证被拒」的判据 ────────────────────────────────────────
@@ -883,12 +1152,16 @@ def reset_cache() -> None:
     """测试用：清空全部缓存。**不重置凭证纪元** —— 纪元是单调计数，重置它会让
     「纪元变了就该重建」这条不变式在测试里失真；要观察纪元就读 credential_epoch()。"""
     global _cached_cfg, _cached_cfg_ts, _last_forced_refresh_ts, _cached_key, _cached_key_ts
+    global _cached_gw, _cached_gw_ts, _cached_gw_rev
     with _lock:
         _cached_cfg = None
         _cached_cfg_ts = 0.0
         _last_forced_refresh_ts = 0.0
         _cached_key = None
         _cached_key_ts = 0.0
+        _cached_gw = None
+        _cached_gw_ts = 0.0
+        _cached_gw_rev = None
 
 
 __all__ = [
@@ -896,7 +1169,9 @@ __all__ = [
     "get_config", "generation", "config_source",
     "default_alias", "enabled_entries", "enabled_aliases", "is_enabled",
     "resolve", "was_substituted", "backend_task_alias",
-    "credential_mode", "get_bedrock_api_key", "invalidate_api_key",
+    "credential_mode", "active_source", "get_bedrock_api_key", "invalidate_api_key",
+    "GatewayNotConfigured", "normalise_gateway_base_url", "get_gateway_config",
+    "invalidate_gateway_config",
     "is_credential_rejected", "credential_epoch",
     "status",
     "reset_cache",

@@ -70,11 +70,19 @@ def _runtime_entry(alias: str, cfg: dict) -> dict | None:
 
     逐条照抄 agent 树 `core/llm_config.py` 的 `_find` → `resolve` → `_default_entry`，只是端换成
     `_RUNTIME_SURFACE`：按规范 alias / short / legacy 找本端第一条，找到的那条已停用就回落默认
-    （不接着往下找）；默认先取 `default_model`（必须启用），再取本端第一个启用项。改那三个函数
-    时要同步这里。
+    （不接着往下找）；默认先取该来源的 `source_defaults`（再取 `default_model`，必须启用），再取
+    本端第一个启用项。改那三个函数时要同步这里。
+
+    来源家族过滤（2026-10）也照抄：runtime 那一端用**第一来源**（可以是网关），本进程这一端
+    （IM）只会用 Bedrock。网关排第一时两边挑中的条目必然不同 —— 落款因此报空，不会把
+    runtime 实际用的网关模型说成某个 Bedrock 模型。
     """
+    order = cfg.get("source_order")
+    src = str((order[0] if isinstance(order, list) and order
+               else cfg.get("credential_mode")) or "iam")
     models = [m for m in (cfg.get("models") or [])
-              if isinstance(m, dict) and _RUNTIME_SURFACE in (m.get("surfaces") or [])]
+              if isinstance(m, dict) and _RUNTIME_SURFACE in (m.get("surfaces") or [])
+              and ((m.get("kind") == "openai_compatible") == (src == "gateway"))]
     a = (alias or "").strip().lower()
     if a:
         for m in models:
@@ -83,7 +91,7 @@ def _runtime_entry(alias: str, cfg: dict) -> dict | None:
                 if m.get("enabled"):
                     return m
                 break
-    want = str(cfg.get("default_model") or "")
+    want = str((cfg.get("source_defaults") or {}).get(src) or cfg.get("default_model") or "")
     for m in models:
         if m.get("alias") == want and m.get("enabled"):
             return m

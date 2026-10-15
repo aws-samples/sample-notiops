@@ -2082,7 +2082,22 @@ if [ "$SYNTH_OK" = false ]; then
   exit 1
 fi
 
-if IAM_CHECK_TEMPLATE="$CDK_OUT_DIR/NotiOpsBackendStack.template.json" python3 scripts/check-iam-consistency.py; then
+# 检查 3（AgentCore Runtime 执行角色的关键权限）不能拿 Backend 模板跑 —— 那个角色在
+# `agentcore deploy` 合成的 AgentCore-NotiOpsWebChat-default 栈里。以前一律拿 Backend 模板跑
+# 全部 4 项，检查 3 永远只报一条「未找到 Runtime Role」的 warning，从没真正执行过。
+# 现在拆成两次：Backend 模板跑 1/2/4；上面 deploy_agent.sh 刚合成的 AgentCore 模板跑 3
+# （跳过 Runtime 部署、模板不存在时就不跑，并说明一声）。
+AGENTCORE_TEMPLATE="$PROJECT_ROOT/agent-build/NotiOpsWebChat/agentcore/cdk/cdk.out/AgentCore-NotiOpsWebChat-default.template.json"
+IAM_CHECK_OK=true
+IAM_CHECK_TEMPLATE="$CDK_OUT_DIR/NotiOpsBackendStack.template.json" \
+  python3 scripts/check-iam-consistency.py --check 1 --check 2 --check 4 || IAM_CHECK_OK=false
+if [ -f "$AGENTCORE_TEMPLATE" ]; then
+  IAM_CHECK_TEMPLATE="$AGENTCORE_TEMPLATE" \
+    python3 scripts/check-iam-consistency.py --check 3 || IAM_CHECK_OK=false
+else
+  echo "  $(t "ℹ 未找到 AgentCore 栈模板，跳过 Runtime 角色权限检查：" "ℹ AgentCore stack template not found, skipping the runtime role check: ")$AGENTCORE_TEMPLATE"
+fi
+if [ "$IAM_CHECK_OK" = true ]; then
   echo "  $(t "✓ 权限检查通过" "✓ Permission check passed")"
 else
   echo ""
@@ -2343,12 +2358,18 @@ fi
 # 幂等:条件写 attribute_not_exists(GSI1PK),已经有的不动 —— 重复部署是空跑。
 # 只 SET 两个索引属性,不碰任何业务字段。
 # 不阻断:失败只影响统一视图的存量部分,新 finding 照常进索引。
+# 🔴 收尾这几步要本机 boto3，必须用 .venv 的解释器。上面打层之后已经 `deactivate`，此后裸
+#    `python3` 是系统 / Homebrew 那个 —— 多半没装 boto3（2026-10-13 实测：Homebrew 3.14，回填与
+#    模型目录 seed 两步都 `ModuleNotFoundError: boto3`，每次部署都静默跳过；目录 seed 跳过意味着
+#    generation==0 的栈永远收不到出厂目录的补齐）。判读 skill 同步那一步早就这么做了，这里对齐。
+POSTDEPLOY_PY="$PROJECT_ROOT/.venv/bin/python"
+[ -x "$POSTDEPLOY_PY" ] || POSTDEPLOY_PY="python3"
 echo "  $(t "回填存量 finding 的跨账号索引键…" "Backfilling cross-account index keys on existing findings…")"
-if AWS_REGION="$DEPLOY_REGION" python3 "$PROJECT_ROOT/scripts/backfill_finding_gsi.py" --apply; then
+if AWS_REGION="$DEPLOY_REGION" "$POSTDEPLOY_PY" "$PROJECT_ROOT/scripts/backfill_finding_gsi.py" --apply; then
   :
 else
   echo "  $(t "⚠ 索引键回填未完成(不阻断)。后果:巡检页看不到【升级前】的 finding(新的不受影响)。手动重跑:" "⚠ Index-key backfill did not complete (non-blocking). Impact: findings created BEFORE this upgrade will not show on the inspection page (new ones are fine). Re-run manually:")"
-  echo "      AWS_REGION=$DEPLOY_REGION python3 scripts/backfill_finding_gsi.py --apply"
+  echo "      AWS_REGION=$DEPLOY_REGION .venv/bin/python scripts/backfill_finding_gsi.py --apply"
 fi
 
 # 4. 部署摘要
@@ -2594,16 +2615,17 @@ fi
 # 详见 scripts/seed_llm_catalog.py 的文件头。
 echo ""
 echo "$(t "── LLM 模型目录 ──" "── LLM model catalogue ──")"
-if command -v python3 >/dev/null 2>&1; then
+if [ -x "$POSTDEPLOY_PY" ] || command -v python3 >/dev/null 2>&1; then
   # 用 $PROJECT_ROOT 而不是 $(dirname "$0")：执行到这里时已经 cd 进 infra/，
   # 相对 $0 的路径会解析成 infra/./scripts/... → No such file，seed 静默失败
-  if AWS_REGION="$DEPLOY_REGION" python3 "$PROJECT_ROOT/scripts/seed_llm_catalog.py" \
+  # 解释器用 $POSTDEPLOY_PY（.venv 优先），理由见上面索引键回填那一步。
+  if AWS_REGION="$DEPLOY_REGION" "$POSTDEPLOY_PY" "$PROJECT_ROOT/scripts/seed_llm_catalog.py" \
        --table notiops-config --region "$DEPLOY_REGION" 2>/tmp/notiops-llmcfg-seed-err.log; then
     :
   else
     echo "  $(t "⚠ 模型目录 seed 失败（各端会使用内置兜底目录，对话不受影响；Admin「模型」页将为空表）。详情：" "⚠ Model catalogue seed failed (every surface falls back to its builtin catalogue, chat is unaffected; the Admin \"Models\" tab will be empty). Details:")"
     head -5 /tmp/notiops-llmcfg-seed-err.log 2>/dev/null
-    echo "  $(t "  修好后可单独重跑：python3 scripts/seed_llm_catalog.py --region " "  Re-run on its own once fixed: python3 scripts/seed_llm_catalog.py --region ")$DEPLOY_REGION"
+    echo "  $(t "  修好后可单独重跑：.venv/bin/python scripts/seed_llm_catalog.py --region " "  Re-run on its own once fixed: .venv/bin/python scripts/seed_llm_catalog.py --region ")$DEPLOY_REGION"
   fi
   rm -f /tmp/notiops-llmcfg-seed-err.log
 else
@@ -2761,6 +2783,29 @@ else
   echo "  $(t "⚠ 上面的 Agent 问题修好之前,聊天只会回显,不要按下面的流程验收。" "⚠ Until the agent issue above is fixed, chat only echoes — do not sign off on the steps below yet.")"
 fi
 echo ""
+# ─── 没装成本 MCP、但本账号已有就绪的 CUR:给一句定向提示(2026-10-13 用户建议) ───
+# 方式 B 默认不装自建成本 MCP(COST_MCP_SELF_HOST=true 才装),交互流程也从不问;方式 A 的同一个
+# 选择是开栈表单里的参数,用户必须划过它。于是「先用方式 A 试用 → 删掉(CUR 刻意保留)→ 再跑
+# 方式 B」之后,「成本」页里那 4 张 CUR 报表悄悄消失,没有任何地方说为什么、怎么找回来
+# (v1.0.31 在验证账号实测)。
+# 🔴 只在三个条件**全中**时打印:没装自建、没接外部 server、且 cur-athena-status#<账号> 是 READY。
+#    没有 CUR 的账号打这句就成了产品宣传 —— 噪音多了,真提示也没人看。
+#    只读一次 DDB,读不到 / 没记录 / 不是 READY 一律不打印,也不影响部署结果。
+if [ "${COST_MCP_SELF_HOST:-false}" != "true" ] && [ -z "$COST_AGENT_MCP_URL" ] && [ -n "$CDK_ACCOUNT" ]; then
+  _hint_cur_json="$(aws dynamodb get-item --region "$DEPLOY_REGION" --table-name notiops-config \
+    --key "{\"PK\":{\"S\":\"cur-athena-status#$CDK_ACCOUNT\"},\"SK\":{\"S\":\"STATUS\"}}" \
+    --output json 2>/dev/null || true)"
+  [ -n "$_hint_cur_json" ] || _hint_cur_json='{}'
+  _hint_cur_state="$(echo "$_hint_cur_json" | python3 -c 'import json,sys; d=json.load(sys.stdin).get("Item",{}); print(d.get("status",{}).get("S",""))' 2>/dev/null || true)"
+  _hint_cur_table="$(echo "$_hint_cur_json" | python3 -c 'import json,sys; d=json.load(sys.stdin).get("Item",{}); db=d.get("athena_database",{}).get("S",""); tb=d.get("athena_table",{}).get("S",""); print(f"{db}.{tb}" if db and tb else "")' 2>/dev/null || true)"
+  if [ "$_hint_cur_state" = "READY" ]; then
+    echo "  $(t "ℹ 本账号已有就绪的 CUR" "ℹ This account already has a ready CUR")${_hint_cur_table:+ ($(t "Athena 表 " "Athena table ")$_hint_cur_table)}$(t ",但这次没有部署查询它的成本 MCP server," ", but this run did not deploy the cost MCP server that queries it,")"
+    echo "     $(t "所以「成本」页里没有那 4 张 CUR 报表(费用趋势 / Credit / 扩展支持 / Savings Plans),成本问题走 Cost Explorer 的聚合口径。" "so the Cost page has none of the 4 CUR reports (Cost Trend / Credits / Extended Support / Savings Plans); cost questions use Cost Explorer's aggregate view.")"
+    echo "     $(t "要装就带上开关重跑(CUR 已就绪,不用再等 24 小时首次交付):" "To add it, re-run with the switch (the CUR is ready, so no 24-hour first-delivery wait):")"
+    echo "       COST_MCP_SELF_HOST=true ./setup.sh"
+    echo ""
+  fi
+fi
 # ⚠ 这里必须单独说一句巡检看板在哪 —— 不说的话客户跑完 setup.sh 压根不知道有这个页面（入口
 #    是 fail-CLOSED 的，只有拿到 nav:inspection 能力才显示；2026-10-10 起还收在默认收起的「更多」里），
 #    于是整个 feature 交付了等于没交付。老的「巡检 & 报告」外链控制台已于 2026-09-04 退役，别再提它。

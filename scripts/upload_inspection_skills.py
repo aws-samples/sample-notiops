@@ -394,6 +394,13 @@ def main() -> int:
     #    配置文件，`AWS_REGION` 由运行时注入，那边解析本来就是对的。
     #    为一个本机专属的差异去改所有 Lambda 共用的建连代码，风险不对等。
     os.environ.setdefault("AWS_DEFAULT_REGION", args.region)
+    # 🔴 同一类问题的第二个：`--all-accounts` 对成员账号走 `shared.devops_agent`
+    #    → `shared/queries/_client.config_table()`，那里是 `os.environ["CONFIG_TABLE"]`
+    #    （Lambda 里恒有，不给默认值）。本脚本自己读表用的是带默认值的 `.get`，所以
+    #    部署账号（走 env space 捷径、不读 DDB）成功，成员账号全挂成
+    #    「解析判读目标失败 —— 'CONFIG_TABLE'」—— 2026-10-13 setup.sh 实测，一个成员账号每次部署都中。
+    #    在这里把同一个默认值放进环境，两条读表路径就是同一张表。
+    os.environ.setdefault("CONFIG_TABLE", "notiops-config")
 
     if not SKILLS_DIR.is_dir():
         print(f"❌ 找不到 {SKILLS_DIR.relative_to(ROOT)}")

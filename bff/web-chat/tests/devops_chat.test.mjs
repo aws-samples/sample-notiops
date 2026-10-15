@@ -466,5 +466,69 @@ await t("CreateChat 失败那句走 createChatFailText，且 index.mjs 把按主
   assert.ok(at > 0 && at < INDEX.indexOf("reply = await runDevopsChat({"), "toggleHere 要在调用 runDevopsChat 之前算好");
 });
 
+/* ── 过程行的状态词（2026-10-13 现网：`↳ Check EC2 instance status for i-…Done`）──
+ * `tool_summary` 块先流一句工具说明，工具跑完再补一个状态词 delta（Done / Failed），两段之间
+ * 没有分隔。面板那行是整块文字的 excerpt → 两段直接拼在一起。IM 那份（core/devops_chat.py）
+ * 同一个病、同一组判据：tests/test_im_devops_chat_step_status.py（含两边词表一致的断言）。 */
+console.log("\ndevops_chat: 过程行的状态词");
+
+const toolSummary = (...parts) => [
+  { responseCreated: {} },
+  { contentBlockStart: { index: 0, type: "tool_summary", id: "t0" } },
+  ...parts.flatMap((p, i) => (i === parts.length - 1 && parts.length > 1
+    ? [jsonDelta(0, '{"type":"tool_call","name":"use_aws","input":{}}'), textDelta(0, p)]
+    : [textDelta(0, p)])),
+  { contentBlockStop: { index: 0, type: "tool_summary", text: "" } },
+  { responseCompleted: { usage: {} } },
+];
+const tailOf = (r) => {
+  const tails = r.steps().filter((s) => s.trimStart().startsWith("↳"));
+  assert.equal(tails.length, 1, JSON.stringify(r.steps()));
+  return tails[0];
+};
+
+for (const status of ["Done", "Failed"]) {
+  await t(`状态词与说明分开（${status}）：↳ <说明> · <状态>`, async () => {
+    const r = recorder();
+    await consumeEvents(stream(toolSummary("Check EC2 instance status for i-0a1b2c3d4e5f67890", status)), r.sink, { en: true });
+    assert.equal(tailOf(r), `  ↳ Check EC2 instance status for i-0a1b2c3d4e5f67890 · ${status}`);
+    assert.ok(!r.steps().join(" ").includes("tool_call"), "入参 JSON 不许进面板");
+  });
+}
+
+await t("同一个 delta 里状态词独占最后一行，也拆开（不然换行被压成空格读成一句话）", async () => {
+  const r = recorder();
+  await consumeEvents(stream(toolSummary("Verifying against published AWS documentation\nDone")), r.sink, { en: true });
+  assert.equal(tailOf(r), "  ↳ Verifying against published AWS documentation · Done");
+});
+
+await t("说明被切成几个 delta 时原样拼回，不误拆", async () => {
+  const r = recorder();
+  await consumeEvents(stream([
+    { contentBlockStart: { index: 0, type: "tool_summary" } },
+    textDelta(0, "Check EC2 "), textDelta(0, "instance status for "), textDelta(0, "i-0abc"),
+    { contentBlockStop: { index: 0, type: "tool_summary", text: "" } },
+    { responseCompleted: {} },
+  ]), r.sink, { en: true });
+  assert.equal(tailOf(r), "  ↳ Check EC2 instance status for i-0abc");
+});
+
+for (const text of ["Mark the migration task as Done", "Check alarm OrdersApiError"]) {
+  await t(`说明里本来就带状态词（${text}）→ 不猜词尾、不拆`, async () => {
+    const r = recorder();
+    await consumeEvents(stream(toolSummary(text)), r.sink, { en: true });
+    assert.equal(tailOf(r), `  ↳ ${text}`);
+  });
+}
+
+await t("长说明给状态词让位：状态词总在行尾、说明留省略号", async () => {
+  const r = recorder();
+  const desc = "Run CloudWatch Logs Insights query over /aws/lambda/orders-api " + "x".repeat(300);
+  await consumeEvents(stream(toolSummary(desc, "Failed")), r.sink, { en: true });
+  const line = tailOf(r);
+  assert.ok(line.endsWith(" · Failed"), line);
+  assert.ok(line.includes("…"), "截断要留省略号");
+});
+
 console.log(fails ? `\nFAILED: ${fails}` : `\nPASSED: ${ok} ok, 0 failed`);
 process.exit(fails ? 1 : 0);

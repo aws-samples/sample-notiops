@@ -19,6 +19,7 @@ import boto3
 
 from core import i18n
 from core.feishu_card import card_config
+from shared.report_delivery.link_validity import validity_key
 
 logger = logging.getLogger(__name__)
 
@@ -473,8 +474,8 @@ def _action_rows_spec(*, report_url: str, trace_url: str,
     **button order**.
 
     ⚠️ 报告卡上**没有**「🔬 查看本次调查」(DevOps Agent 控制台深链)。
-    2026-09-05 加过、当天按用户要求去掉:这张卡上其余每个链接都是预签名
-    的、免登录(数小时内有效,最长约 12 小时),而控制台深链**必须登录 AWS 控制台**。两种链接放在
+    2026-09-05 加过、当天按用户要求去掉:这张卡上其余每个链接都免登录(CDN 链接
+    约 7 天;退回预签名时最长约 12 小时),而控制台深链**必须登录 AWS 控制台**。两种链接放在
     一排按钮里,底下那行说明就只能同时写「无需登录」和「需要登录」——
     用户看到的是自相矛盾的一行。少一颗按钮换一句不会骗人的说明。
     「🔍 调查过程 Trace」已经覆盖了「想看这次调查过程」这个需求。
@@ -540,10 +541,11 @@ def _action_rows_spec(*, report_url: str, trace_url: str,
     return rows
 
 
-def _note_lines(locale: str) -> list[str]:
-    """Footnotes. Exactly one line, and it is unconditionally true: every
-    link left on this card is a presigned S3 / CDN URL — valid for a few hours
-    (at most about 12: signed with temporary credentials), no console login.
+def _note_lines(locale: str, *urls: str) -> list[str]:
+    """Footnotes. Exactly one line, and it must hold for every link on this
+    card: ReportsCDN links (~7 days) or presigned S3 URLs (at most about 12
+    hours: signed with temporary credentials), never a console login. Which
+    sentence is picked from the links' shape (`link_validity.validity_key`).
 
     ⚠️ 别再往这里加「需要登录」那句(`progress.link_login_warning`)。
     它当年是为控制台深链加的,而那颗按钮已经从报告卡上去掉了(见
@@ -553,7 +555,7 @@ def _note_lines(locale: str) -> list[str]:
     现网就是这么出来的。返回列表形状保留:调用方按元素逐个渲染,以后要
     加第二条说明时不必再改渲染侧。
     """
-    return [i18n.t("report.link_validity", locale)]
+    return [i18n.t(validity_key(*urls), locale)]
 
 
 def _v2_button(spec: dict) -> dict:
@@ -699,7 +701,7 @@ def _report_card_v2(*, status: str, priority: str, detail_type: str,
                                      "report.next_steps_header", locale))})
             elements.append({"tag": "action",
                              "actions": [_v2_button(b) for b in row]})
-        for note in _note_lines(locale):
+        for note in _note_lines(locale, report_url, trace_url):
             elements.append({"tag": "markdown", "content": note})
         return {
             "schema": "2.0",
@@ -772,7 +774,7 @@ def _report_card_v1(*, status: str, priority: str, detail_type: str,
     # `elements` 里 —— 飞书把一个 `note` 的子元素**同行拼接**(不换行,连
     # 空格都不补),两句说明会连成一句话。v2 那边每条是独立 `markdown`
     # 元素,天然分行;v1 必须自己拆,否则两个 schema 的观感会不一致。
-    for n in _note_lines(locale):
+    for n in _note_lines(locale, report_url, trace_url):
         elements.append({"tag": "note",
                          "elements": [{"tag": "plain_text", "content": n}]})
     return {

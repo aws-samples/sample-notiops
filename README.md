@@ -24,9 +24,11 @@ on-demand questions, it **proactively pushes** events from 10 AWS signal sources
 Spot interruption, Auto Scaling launch failure, RDS, Config) into the Web Chat
 **Notifications** inbox, each source independently switchable.
 
-All models are served through **Amazon Bedrock** (managed security, compliance,
-and cost controls), with per-session model switching and automatic
-English/Chinese localization. The **zero-change promise** rests on IAM as its hard
+By default every model is served through **Amazon Bedrock** (managed security,
+compliance, and cost controls); an administrator can instead put an
+OpenAI-compatible gateway (LiteLLM, New API and similar) first, and conversations
+then go to that gateway and its upstream providers. Models can be switched per
+session, with automatic English/Chinese localization. The **zero-change promise** rests on IAM as its hard
 boundary: the roles both entry points use to reach your account are read-only on
 your infrastructure, so a call that changes a resource has no permission. Apart from
 the resources NotiOps owns (its tables, buckets and the like), the only write they
@@ -84,9 +86,10 @@ write access to your infrastructure.
 - 🤖 **Multi-LLM switching**: an operator-managed model catalogue — pick which
   models your deployment offers, set the default, and choose the models used by
   backend tasks, all under **More → Admin → Models** with no redeploy. Users keep a
-  per-session model preference. Every model is served through **Amazon Bedrock**
-  (managed security, compliance, and cost controls), on either IAM or a Bedrock
-  API key
+  per-session model preference. Models are served through **Amazon Bedrock**
+  (managed security, compliance, and cost controls) on either IAM or a Bedrock
+  API key, or through an **OpenAI-compatible gateway** (LiteLLM, New API and
+  similar) when an administrator puts one first
 - 🌍 **Bilingual**: Chinese / English auto-detect + explicit switching
 - 🛡 **Zero-Change Promise**: IAM as the hard boundary (read-only on your
   infrastructure; apart from NotiOps's own resources, the only write is Support case
@@ -194,24 +197,41 @@ switching later requires a redeploy.
   account only. Least privilege, fastest path to a working install; right for
   most trials and single-account users.
 - **Multi-account** — `./setup.sh --multi-account`. Adds cross-member-account
-  inspection / investigation / event forwarding across an AWS Organization.
-  Member-account resources are rolled out automatically via StackSets.
-  **Either deploying identity works**: the organization management account (payer),
-  or a member account registered as a **CloudFormation StackSets delegated
-  administrator** — the script auto-detects it, there is no flag to pass, and if the
-  account does not qualify it prints the `aws organizations
-  register-delegated-administrator` command for the management account to run.
-  Check first: `aws organizations describe-organization --query
-  'Organization.MasterAccountId' --output text` equals `aws sts
-  get-caller-identity --query Account --output text` ⇒ this is the management
-  account. If they differ, check `aws organizations list-delegated-administrators
-  --service-principal member.org.stacksets.cloudformation.amazonaws.com --query
-  'DelegatedAdministrators[].Id' --output text` (**`--service-principal` is
-  required** — without it you also get other services' delegated administrators,
-  which cannot operate StackSets).
-  ⚠️ A delegated administrator has **full deployment permissions across the whole
-  organization and cannot be scoped to specific OUs**; an organization allows at
-  most 5.
+  inspection / investigation / event forwarding across an AWS Organization;
+  member-account resources are rolled out automatically via StackSets.
+
+  **Deploying identity (either one works; the script auto-detects it, there is no flag to pass):**
+
+  - the organization management account (payer), or
+  - a member account registered as a **CloudFormation StackSets delegated administrator** —
+    see the AWS documentation: [Register a delegated administrator member account](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/stacksets-orgs-delegated-admin.html).
+    If the account does not qualify, the script prints the
+    `aws organizations register-delegated-administrator` command for the management account to run.
+
+  **Check before you run it:**
+
+  1. If these two print the same account ID, you are in the management account:
+
+     ```bash
+     aws organizations describe-organization --query 'Organization.MasterAccountId' --output text
+     aws sts get-caller-identity --query Account --output text
+     ```
+
+  2. If they differ, check whether this account is a StackSets delegated administrator:
+
+     ```bash
+     aws organizations list-delegated-administrators \
+       --service-principal member.org.stacksets.cloudformation.amazonaws.com \
+       --query 'DelegatedAdministrators[].Id' --output text
+     ```
+
+     **`--service-principal` is required** — without it you also get other services'
+     delegated administrators, which cannot operate StackSets.
+
+  > ⚠️ A delegated administrator has **full deployment permissions across the whole
+  > organization and cannot be scoped to specific OUs**; an organization can register
+  > at most five StackSets delegated administrators at a time (both per the AWS
+  > documentation above).
 
 For the full deployment walkthrough into your own AWS account — including the
 mode comparison and how to switch — see
@@ -241,7 +261,7 @@ mode comparison and how to switch — see
 | FinOps dashboard (Cost Explorer data) | ✅ deploy account only | ✅ cross-account |
 | CUR + Athena billing-detail drill-down | ✅ optional (parameter `ProvisionCur=yes`, off by default) | ✅ |
 | Daily cost-anomaly scan (self-built baseline, runs 01:15 UTC every day) | ❌ the "Daily Anomaly Scan" card on the FinOps page is not rendered at all — you do not get an empty card | ✅ |
-| Bring your own CUR data source (4 dashboard sheets + ask about that bill in chat) | ✅ optional, see note ⁵ | ✅ optional, see note ⁵ |
+| Bring your own CUR data source (4 dashboard sheets + ask about that bill in chat) | ✅ optional, off by default (pick `ProvisionCur=yes` or fill in `CurTable` when creating the stack), see note ⁵ | ✅ optional, off by default (turn it on explicitly: `COST_MCP_SELF_HOST=true ./setup.sh`), see note ⁵ |
 | **Cases and Skills** | | |
 | Full AWS Support case management (multi-account: pick the target account right on the case form) | ✅ | ✅ |
 | 11 bundled Skills + your own | ✅ | ✅ |
@@ -249,6 +269,7 @@ mode comparison and how to switch — see
 | **Models** | | |
 | Multi-LLM switching + model catalogue | ✅ | ✅ |
 | Bedrock API key as the credential | ✅ | ✅ |
+| OpenAI-compatible gateway as a model source | ✅ | ✅ |
 | **Proactive / IM** | | |
 | IM channels (Slack / Feishu / DingTalk) | ✅ one platform per stack, see note ⁴ | ✅ all three at once |
 | Two agents in IM (`/agent devops`, the 0-token default \| `/agent notiops`, model-backed) + the `/web` toggle | ✅ | ✅ |
@@ -258,7 +279,7 @@ mode comparison and how to switch — see
 | Notification inbox (10 EventBridge sources, into the web inbox) | ✅ | ✅ |
 | Inspection dashboard (high load / idle & cost / inspection scope / thresholds & schedule) | ❌ Option A has no inspection backend, so the sidebar entry **does not appear at all** (rather than failing once you open it); calling `/inspection/*` directly returns an explicit `inspection_not_deployed` code (this deployment does not include inspection) | ✅ |
 | **Scope** | | |
-| Multi-account (across an AWS Organization) — both paths accept the **management account** or a registered **StackSets delegated administrator** member account (auto-detected); ⚠️ CloudFormation never rolls a StackSet into the management account itself: when you deploy from a delegated administrator, query the management account through **"Manual onboarding" alone**, under Web Chat **More → Admin → Accounts** (that stack creates the collection role too; on Option A, first upload `infra/member-devops-agent.yaml` from the stack's release (see the `InstalledRelease` stack output) to `s3://notiops-data-<account>-<region>/onboarding-templates/`, otherwise "Generate link" fails with `template not found` — see [docs/DEPLOYMENT_ONECLICK.en.md §2.6.1](docs/DEPLOYMENT_ONECLICK.en.md#261-hard-prerequisite-management-account-or-a-stacksets-delegated-administrator)), and do **not** also deploy `infra/member-account-onboarding.yaml` by hand — both stacks create a role with the same name, so the second one fails with `EntityAlreadyExists` and rolls back; if it is already deployed, set `CreateCollectionRole` to `no` on the quick-create page (and if that stack forwards events, clear `DevOpsEventBusArn` too, or every investigation event is delivered twice). When you deploy from the management account itself there is nothing to do — it is the deploy account | ✅ set `DeployMode=MultiAccount` + your organization id | ✅ `--multi-account` |
+| Multi-account (across an AWS Organization) — both paths accept the **management account** or a registered **[StackSets delegated administrator](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/stacksets-orgs-delegated-admin.html)** member account (auto-detected); ⚠️ CloudFormation never rolls a StackSet into the management account itself: when you deploy from a delegated administrator, query the management account through **"Manual onboarding" alone**, under Web Chat **More → Admin → Accounts** (that stack creates the collection role too; on Option A, first upload `infra/member-devops-agent.yaml` from the stack's release (see the `InstalledRelease` stack output) to `s3://notiops-data-<account>-<region>/onboarding-templates/`, otherwise "Generate link" fails with `template not found` — see [docs/DEPLOYMENT_ONECLICK.en.md §2.6.1](docs/DEPLOYMENT_ONECLICK.en.md#261-hard-prerequisite-management-account-or-a-stacksets-delegated-administrator)), and do **not** also deploy `infra/member-account-onboarding.yaml` by hand — both stacks create a role with the same name, so the second one fails with `EntityAlreadyExists` and rolls back; if it is already deployed, set `CreateCollectionRole` to `no` on the quick-create page (and if that stack forwards events, clear `DevOpsEventBusArn` too, or every investigation event is delivered twice). When you deploy from the management account itself there is nothing to do — it is the deploy account | ✅ set `DeployMode=MultiAccount` + your organization id | ✅ `--multi-account` |
 | Upgrade | update the stack with the new template (~1 min) | re-run `./setup.sh` |
 
 > ¹ **Every DevOps Agent capability (deep investigation, deep investigation Direct, DevOps
@@ -406,7 +427,7 @@ cannot roll back to v1.0.20–v1.0.29 (same reason: rolling back downloads that 
 
 | | What survives |
 |---|---|
-| `KeepData` (default) | The config table, the chat-history table, and the data bucket (your Skills and reports); if you installed IM or saved a Bedrock API key under **More → Admin → Models**, those credential secrets too |
+| `KeepData` (default) | The config table, the chat-history table, and the data bucket (your Skills and reports); if you installed IM or saved a Bedrock API key or a gateway under **More → Admin → Models**, those credential secrets too |
 | `DeleteEverything` | Everything else goes (**including those credential secrets, unrecoverably**), with two exceptions: the CUR resources created by `ProvisionCur=yes`, and the two member-account StackSets of multi-account mode — see below |
 
 ⚠️ **Two things to know:**

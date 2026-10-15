@@ -10,7 +10,10 @@ IAM 权限一致性检查（CDK synth 后自动运行）。
 
 用法：
   cd infra && npx cdk synth --quiet && python scripts/check-iam-consistency.py
-  cd infra && python scripts/check-iam-consistency.py --check 2   # 只跑检查 2
+  cd infra && python scripts/check-iam-consistency.py --check 2   # 只跑检查 2（可重复 --check）
+  # 检查 3（Runtime 执行角色）要换 AgentCore 栈的模板：
+  IAM_CHECK_TEMPLATE=../agent-build/NotiOpsWebChat/agentcore/cdk/cdk.out/AgentCore-NotiOpsWebChat-default.template.json \
+    python scripts/check-iam-consistency.py --check 3
   cd infra && python scripts/check-iam-consistency.py --json       # JSON 输出（CI 友好）
 
 环境变量：
@@ -303,7 +306,23 @@ def check_agent_no_direct_db() -> CheckResult:
 # 检查 3: AgentCore Runtime Role 关键权限
 # ============================================================
 
-# 完整的必需权限清单（对齐 agentcore-stack-extension.ts）
+# 必需权限清单（对齐 agent-build/NotiOpsWebChat/agentcore/cdk/lib/cdk-stack.ts，
+# 也就是 `agentcore deploy` 合成出来的 AgentCore-NotiOpsWebChat-<target> 栈）。
+#
+# ⚠ 这张检查表**只对 AgentCore 栈的模板有意义** —— Runtime 执行角色不在
+# NotiOpsBackendStack 里。setup.sh 以前只拿 Backend 模板跑全部 4 项，检查 3 永远落进
+# 「未找到 Runtime Role」那条 warning，等于从没真正执行过；现在 setup.sh 单独拿
+# AgentCore 模板跑 `--check 3`。
+#
+# 2026-10 按现网实际清理过一轮（以前照抄的 starter-toolkit 默认角色，有三项 NotiOps 根本不用，
+# 一跑就报缺）：
+#   · ecr:GetAuthorizationToken / ecr:BatchGetImage —— 只有容器制品才要；现在是 CodeZip
+#     （AgentRuntimeArtifact.CodeConfiguration），改成按制品类型条件检查，见下方
+#     RUNTIME_CONTAINER_ACTIONS。
+#   · cloudwatch:PutMetricData —— 运行时指标走 EMF（日志里抽取），见 core/llm_config.py
+#     「Metric 发射」那段注释，不调这个 API。
+#   · bedrock-agentcore:GetWorkloadAccessToken —— skills/fetcher.py 只从
+#     BedrockAgentCoreContext 读 Runtime 注入的 workload token，不自己调 API 换。
 RUNTIME_REQUIRED_ACTIONS = [
     # Bedrock 模型调用
     # bedrock:InvokeModel 同时覆盖 Converse API
@@ -318,21 +337,105 @@ RUNTIME_REQUIRED_ACTIONS = [
     "bedrock-agentcore:CreateEvent",
     "bedrock-agentcore:ListEvents",
     "bedrock-agentcore:GetMemory",
-    # Workload Identity
-    "bedrock-agentcore:GetWorkloadAccessToken",
     # STS 跨账户
     "sts:AssumeRole",
     # Lambda invoke（API 中转）
     "lambda:InvokeFunction",
+    # 模型配置（notiops-config 里的 llmcfg 行）
+    "dynamodb:GetItem",
+    # Bedrock API Key / OpenAI 兼容网关凭据
+    "secretsmanager:GetSecretValue",
     # 可观测性
-    "cloudwatch:PutMetricData",
     "xray:PutTraceSegments",
     "logs:CreateLogStream",
     "logs:PutLogEvents",
-    # ECR
+]
+
+# 只有 AgentRuntimeArtifact 是 ContainerConfiguration（ECR 镜像）时才需要
+RUNTIME_CONTAINER_ACTIONS = [
     "ecr:GetAuthorizationToken",
     "ecr:BatchGetImage",
 ]
+
+# GetSecretValue 的资源必须覆盖到的 secret 名前缀。缺哪个，对应的模型来源在 Web Chat
+# 里就是「保存成功、一聊就失败」—— BFF 读得到（它有自己的授权），Runtime 读不到。
+RUNTIME_REQUIRED_SECRETS = [
+    "notiops/bedrock-api-key",
+    "notiops/litellm-config",
+]
+
+
+def find_runtime_role_id(template: dict) -> str | None:
+    """找 AgentCore **Runtime** 的执行角色逻辑 ID。
+
+    同一个 AgentCore 栈里信任 bedrock-agentcore.amazonaws.com 的角色不止一个 ——
+    Memory 也有自己的执行角色（ApplicationMemory…ExecutionRole，没有任何策略）。
+    以前「取第一个信任该服务的角色」会撞上 Memory 角色，把 Runtime 的权限全报成缺失。
+    所以优先认 AWS::BedrockAgentCore::Runtime 资源 RoleArn 指向的那个角色。
+    """
+    roles = get_roles(template)
+    for res in template.get("Resources", {}).values():
+        if res.get("Type") != "AWS::BedrockAgentCore::Runtime":
+            continue
+        refs: set[str] = set()
+        _extract_refs_recursive(res.get("Properties", {}).get("RoleArn"), refs)
+        for ref in refs:
+            if ref in roles:
+                return ref
+
+    # 兜底：模板里没有 Runtime 资源（老的拆栈方式）时，按信任关系找，跳过 Memory 角色
+    trusted = []
+    for rid, rprops in roles.items():
+        trust = rprops.get("AssumeRolePolicyDocument", {})
+        for stmt in trust.get("Statement", []):
+            svc = stmt.get("Principal", {}).get("Service", "")
+            svcs = [svc] if isinstance(svc, str) else svc
+            if "bedrock-agentcore.amazonaws.com" in svcs:
+                trusted.append(rid)
+                break
+    for rid in trusted:
+        if "memory" not in rid.lower():
+            return rid
+    return trusted[0] if trusted else None
+
+
+def _runtime_uses_container(template: dict) -> bool:
+    for res in template.get("Resources", {}).values():
+        if res.get("Type") == "AWS::BedrockAgentCore::Runtime":
+            artifact = res.get("Properties", {}).get("AgentRuntimeArtifact", {})
+            if "ContainerConfiguration" in artifact:
+                return True
+    return False
+
+
+def _secret_resources(stmts: list) -> list[str]:
+    """GetSecretValue 语句里所有资源的字符串形态（Fn::Join 拼接、Fn::Sub 取模板串）。"""
+    out: list[str] = []
+
+    def flatten(obj: object) -> str:
+        if isinstance(obj, str):
+            return obj
+        if isinstance(obj, dict):
+            if "Fn::Join" in obj:
+                sep, parts = obj["Fn::Join"]
+                return sep.join(flatten(p) for p in parts)
+            if "Fn::Sub" in obj:
+                sub = obj["Fn::Sub"]
+                return sub[0] if isinstance(sub, list) else str(sub)
+            return "*" if obj else ""
+        return ""
+
+    for stmt in stmts:
+        actions = stmt.get("Action", [])
+        if isinstance(actions, str):
+            actions = [actions]
+        if "secretsmanager:GetSecretValue" not in actions:
+            continue
+        resources = stmt.get("Resource", [])
+        if isinstance(resources, (str, dict)):
+            resources = [resources]
+        out.extend(flatten(r) for r in resources)
+    return out
 
 
 def check_runtime_role_permissions(template: dict) -> CheckResult:
@@ -340,32 +443,35 @@ def check_runtime_role_permissions(template: dict) -> CheckResult:
     roles = get_roles(template)
     policies = get_policies(template)
 
-    # 找 AgentCore Runtime Role
-    runtime_role_id = None
-    for rid, rprops in roles.items():
-        trust = rprops.get("AssumeRolePolicyDocument", {})
-        for stmt in trust.get("Statement", []):
-            svc = stmt.get("Principal", {}).get("Service", "")
-            if svc == "bedrock-agentcore.amazonaws.com":
-                runtime_role_id = rid
-                break
-        if runtime_role_id:
-            break
-
+    runtime_role_id = find_runtime_role_id(template)
     if not runtime_role_id:
-        r.warn(L("未找到 AgentCore Runtime Role（可能 skipRuntime=true）",
-                 "AgentCore Runtime Role not found (possibly skipRuntime=true)"))
+        r.warn(L("未找到 AgentCore Runtime Role（可能 skipRuntime=true，或拿错了模板 —— "
+                 "检查 3 要用 AgentCore-NotiOpsWebChat-*.template.json）",
+                 "AgentCore Runtime Role not found (possibly skipRuntime=true, or the wrong "
+                 "template - check 3 needs AgentCore-NotiOpsWebChat-*.template.json)"))
         return r
 
     stmts = collect_policy_statements(runtime_role_id, roles[runtime_role_id], policies)
     all_actions = collect_all_actions(stmts)
 
-    for action in RUNTIME_REQUIRED_ACTIONS:
+    required = list(RUNTIME_REQUIRED_ACTIONS)
+    if _runtime_uses_container(template):
+        required += RUNTIME_CONTAINER_ACTIONS
+    for action in required:
         if action in all_actions:
             r.ok(action)
         else:
             r.err(L(f"AgentCore Runtime Role 缺少 {action}",
                     f"AgentCore Runtime Role is missing {action}"))
+
+    secret_res = _secret_resources(stmts)
+    for prefix in RUNTIME_REQUIRED_SECRETS:
+        if any(prefix in s or s == "*" for s in secret_res):
+            r.ok(L(f"GetSecretValue 覆盖 {prefix}", f"GetSecretValue covers {prefix}"))
+        else:
+            r.err(L(f"GetSecretValue 资源不含 {prefix}（对应的模型来源在 Runtime 里读不到凭据）",
+                    f"GetSecretValue resources do not include {prefix} (that model source "
+                    f"cannot read its credentials inside the runtime)"))
 
     # 检查 AssumeRole 目标是否同时覆盖成员账号跨账号角色的两代名字：
     # 2026-10 起接入的 notiops-cross-account-role-*，与之前接入的 notiops-idle-detection-role*。
@@ -520,8 +626,9 @@ CHECKS = {
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=L("IAM 权限一致性检查", "IAM permission consistency check"))
-    parser.add_argument("--check", type=int,
-                        help=L("只运行指定编号的检查（1-4）", "run only the numbered check (1-4)"))
+    parser.add_argument("--check", type=int, action="append",
+                        help=L("只运行指定编号的检查（1-4），可重复：--check 1 --check 2",
+                               "run only the numbered check (1-4); repeatable: --check 1 --check 2"))
     parser.add_argument("--json", action="store_true",
                         help=L("JSON 输出（CI 友好）", "JSON output (CI-friendly)"))
     args = parser.parse_args()
@@ -535,7 +642,7 @@ def main() -> None:
     total_errors = 0
     json_output: dict[str, dict] = {}
 
-    checks_to_run = [args.check] if args.check else [1, 2, 3, 4]
+    checks_to_run = args.check if args.check else [1, 2, 3, 4]
 
     for check_num in checks_to_run:
         if check_num not in CHECKS:

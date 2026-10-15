@@ -30,6 +30,7 @@ from urllib.request import Request, urlopen
 import boto3
 
 from core import i18n
+from shared.report_delivery.link_validity import validity_key
 
 logger = logging.getLogger(__name__)
 
@@ -424,7 +425,7 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
             tail.append(_actions(*ns_buttons))
 
     # Exactly one escalation button. ⚠️ 报告卡上**没有**「🔬 查看本次调查」
-    # (控制台深链):这张卡上其余链接都是预签名、免登录(数小时内有效,最长约 12 小时),而深链要求登录
+    # (控制台深链):这张卡上其余链接都免登录(CDN 链接约 7 天;退回预签名时最长约 12 小时),而深链要求登录
     # AWS 控制台 —— 两者并排会逼着底下的说明同时写「无需登录」和「需要
     # 登录」。2026-09-05 加过当天去掉。进度卡上那颗保留(见 `progress_sender`)。
     action_row: list = []
@@ -446,10 +447,10 @@ def send_report(chat_id: str, root_message_id: str, status: str, priority: str,
         tail.append(_divider())
         tail.append(_actions(*action_row))
 
-    # One line, unconditionally true: every link left on this card is a
-    # presigned S3 / CDN URL. ⚠️ 别再加 `progress.link_login_warning` ——
-    # 它是给控制台深链的,而那颗按钮已不在这张卡上。
-    tail.append(_context(i18n.t("report.link_validity", locale)))
+    # One line that must hold for every link left on this card: ReportsCDN
+    # (~7 days) or presigned S3 (at most ~12h) — picked from the links' shape.
+    # ⚠️ 别再加 `progress.link_login_warning` —— 它是给控制台深链的,而那颗按钮已不在这张卡上。
+    tail.append(_context(i18n.t(validity_key(report_url, trace_url), locale)))
 
     # Body budget = whatever the block cap leaves after the chrome, minus
     # one slot for the truncation notice.

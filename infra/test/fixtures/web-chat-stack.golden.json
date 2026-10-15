@@ -1944,11 +1944,25 @@
                 "secretsmanager:PutSecretValue",
                 "secretsmanager:UpdateSecret",
                 "secretsmanager:DescribeSecret",
-                "secretsmanager:CreateSecret"
+                "secretsmanager:CreateSecret",
+                "secretsmanager:TagResource"
               ],
               "Effect": "Allow",
               "Resource": "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/bedrock-api-key*",
               "Sid": "BedrockApiKeySecretAccess"
+            },
+            {
+              "Action": [
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:PutSecretValue",
+                "secretsmanager:UpdateSecret",
+                "secretsmanager:DescribeSecret",
+                "secretsmanager:CreateSecret",
+                "secretsmanager:TagResource"
+              ],
+              "Effect": "Allow",
+              "Resource": "arn:aws:secretsmanager:us-east-1:444455556666:secret:notiops/litellm-config*",
+              "Sid": "GatewayConfigSecretAccess"
             },
             {
               "Action": [

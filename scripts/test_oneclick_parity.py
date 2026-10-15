@@ -1675,6 +1675,18 @@ def test_devops_callback_parity() -> None:
            "报告写不进桶；就算写进去了，presign 的签名方自己没有 GetObject —— "
            "链接照样生成，客户点开才 AccessDenied（静默降级）")
 
+    # ── (c2) 报告 / trace 链接走 ReportsCDN（2026-10-13）──
+    # 回调拿到 REPORTS_CDN_DOMAIN 才会在 reports/ 下放副本、给 CDN 链接（约 7 天）；
+    # 拿不到就退回 presigned —— 临时凭证签名，最长约 12 小时（现网实测 71.7 小时后已过期）。
+    im_core = _read("infra/lib/constructs/im-core.ts")
+    _check("方式 B 的回调拿到了 REPORTS_CDN_DOMAIN",
+           'devopsCallbackLambda.addEnvironment("REPORTS_CDN_DOMAIN"' in backend,
+           "少了它，方式 B 的 IM 报告卡链接退回 presigned，几小时后就打不开")
+    _check("方式 A 的回调也拿到了（经 im.commonEnv）",
+           "...im.commonEnv" in oneclick
+           and re.search(r"const commonEnv[^;]*REPORTS_CDN_DOMAIN:", im_core, re.S) is not None,
+           "两条路径的报告卡链接寿命不一样（一边约 7 天、一边几小时）")
+
     # ── (d) 代码包里真的有这个模块 ──
     excl = _read("infra/im-code-exclude.txt")
     _check("im-code.zip 没把 devops_agent_callback 剪掉",

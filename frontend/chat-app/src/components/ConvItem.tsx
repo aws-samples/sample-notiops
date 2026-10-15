@@ -3,7 +3,7 @@ import { useT } from "../i18n";
 import { IconChatBubble, IconKebab, IconPin, IconRename, IconTrash, IconInvestigate, IconFinOps, IconCases, IconSecurity, IconWhatsNew, IconCloud } from "./icons";
 import Logo from "./Logo";
 import type { Conversation } from "../types";
-import { objTagDef, tagDef } from "../types";
+import { GENERAL_TAG, normalizeTopic, objTagDef, topicDef } from "../types";
 
 // 主题 key → 标签用的线条图标（含 general：用对话气泡，与其它主题 tag 设计一致）
 const TOPIC_ICON: Record<string, React.FC<{ size?: number }>> = {
@@ -28,7 +28,9 @@ interface Props {
   active: boolean;
   busy?: boolean;    // 该会话正在生成(思考/流式输出) → 前导位显脉动活跃点
   unread?: boolean;  // 后台完成、尚未读 → 前导位显红点 + 标题加粗
-  showTag?: boolean; // 是否显示主题 tag（分组列表里由组标题标明主题，隐藏 tag；置顶组混主题，显示 tag）。默认 true。
+  // 只管「通用」会话在**不知道对话对象**时（老会话）那枚回落的「通用」tag：分组列表里隐藏
+  // （组标题已标明），置顶组显示（混主题）。主题会话、已知对象的通用会话都不受它影响。默认 true。
+  showTag?: boolean;
   onSelect: () => void;
   onRename: (title: string) => void;
   onTogglePin: () => void;
@@ -88,14 +90,20 @@ export default function ConvItem({ conv, active, busy, unread, showTag = true, o
           </span>
           <span className={"conv-title" + (unread && !busy ? " unread" : "")}>{conv.title}</span>
           {(() => {
-            // 一条会话最多一枚 tag（侧栏那一行放不下第二枚）。取谁：
-            //  · 知道「对话对象」就用它（notiops / devops / starops）——**不看 showTag**：
-            //    分组列表里组标题只说得清主题，说不清"这段是哪朵云的哪个 agent 答的"，
-            //    而通用会话恰好全挤在「通用」一组里，那才是最需要区分的地方。
-            //  · 不知道（老会话没这个属性）→ 回落到原来的主题 tag，且沿用 showTag 的老口径：
-            //    分组列表里隐藏（组标题已标明），置顶组显示（混主题）。**不许**在这里猜成
+            // 一条会话最多一枚 tag（侧栏那一行放不下第二枚）。取谁 —— 与顶栏（ChatApp 的
+            // topbar-topic）**同一套口径**（用户 2026-10-13）：
+            //  · 主题会话（调查 / 成本 / 案例 / What's New）→ **主题 tag**，不看 showTag，分组
+            //    列表里也显示。改之前这里先看「对话对象」，而 v1.0.28 起每条新会话都落了 obj
+            //    （默认 notiops），于是通用组以外的每一行都写着 NotiOps —— 顶栏写「成本」、
+            //    侧栏写「NotiOps」，同一段会话两个说法。
+            //  · 通用会话 → 「对话对象」tag（notiops / devops / starops），同样不看 showTag：
+            //    通用会话全挤在「通用」一组里，"谁答的"是唯一能把它们分开的线索。
+            //  · 通用会话但不知道对象（老会话没这个属性）→ 回落到「通用」tag，沿用 showTag 的
+            //    老口径：分组列表里隐藏（组标题已标明），置顶组显示（混主题）。**不许**在这里猜成
             //    NotiOps —— 把一段阿里云会话标成 NotiOps 是跨云假信息，比不标糟得多。
-            const od = objTagDef(conv.obj);
+            // normalizeTopic：老会话头里永久存着的 topic:"security" 按「调查」算（见 types.ts）。
+            const topic = topicDef(normalizeTopic(conv.topic));
+            const od = topic ? undefined : objTagDef(conv.obj);
             if (od) {
               const ObjIcon = OBJ_ICON[od.key];
               return (
@@ -105,9 +113,8 @@ export default function ConvItem({ conv, active, busy, unread, showTag = true, o
                 </span>
               );
             }
-            if (!showTag) return null;
-            // tagDef 永远返回可渲染 tag（general 也有，设计与其它主题一致）。
-            const td = tagDef(conv.topic);
+            if (!topic && !showTag) return null;
+            const td = topic ?? GENERAL_TAG;
             const TopicIcon = TOPIC_ICON[td.key];
             return (
               <span className="conv-topic" style={{ color: td.color, borderColor: td.color }} title={t(td.labelKey)}>

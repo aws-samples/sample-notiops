@@ -355,9 +355,11 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
     DEVOPS_AGENT_SPACE_ID: props.devopsAgentSpaceId ?? "",
     AWS_MCP_PRICING_ENABLED: "false",
     AWS_MCP_COST_ENABLED: "false",
-    // 长回答落 HTML 报告的链接域名（`core/reports.py`）。空串 = 回退 presigned。
-    // ⚠️ 与 IM **调查报告**那条链路无关 —— 那个落 `investigations/<task_id>/`，
-    // CDN 只放行 `reports/*`，所以调查报告注定是 presigned（见 §3.18，别当回归）。
+    // 报告链接的 CDN 域名。空串 = 回退 presigned（临时凭证签名，最长约 12 小时）。两处用它：
+    //   · 长回答落的 HTML 报告（`core/reports.py`）；
+    //   · 方式 A 的 DevOps 回调（展开本对象）：调查报告与 trace 在 `reports/` 下放一份副本、
+    //     卡片给 CDN 链接（`report_handler._delivery_url`，约 7 天）。原来那两条是 presigned，
+    //     2026-10-13 现网实测签发 71.7 小时后已 `ExpiredToken`。
     REPORTS_CDN_DOMAIN: props.reportsCdnDomain ?? "",
   };
   // 注：AWS_REGION 是 Lambda 运行时保留环境变量，显式设会被 CFN 拒（Fargate 上没这限制）。

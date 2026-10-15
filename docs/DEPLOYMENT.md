@@ -134,7 +134,7 @@ aws organizations list-delegated-administrators \
 **操作不了 StackSet**,照着那份清单判断会得到"应该行",然后在建 StackSet 时才 `AccessDenied`。
 第一条报 `AWSOrganizationsNotInUseException` ⇒ 这个账号根本不在组织里,只能单账号。
 
-**注册委派管理员(一次性动作,在管理账号里跑):**
+**注册委派管理员(一次性动作,在管理账号里跑;官方步骤见 [Register a delegated administrator member account](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/stacksets-orgs-delegated-admin.html)):**
 
 ```bash
 aws organizations register-delegated-administrator \
@@ -155,7 +155,7 @@ aws organizations register-delegated-administrator \
    `setup.sh` **跳过**它们(不是"调了忽略错误" —— 后者会让现场以为脚本已经帮它开好了),
    只用 `describe-organizations-access --call-as DELEGATED_ADMIN` 验一遍并在没开时把那两条
    命令打出来,让你回管理账号跑。
-3. **一个组织最多 5 个委派管理员**(AWS 硬限制,跨所有服务合计)。
+3. **一个组织最多同时注册 5 个 StackSets 委派管理员**(AWS 的限制,见上面的官方文档;这个上限按服务各算各的,别的服务有自己的上限)。
 4. **StackSet 实体存放在管理账号里**,即使是委派管理员创建的。所以在**部署账号**的
    CloudFormation 控制台里看不到 `notiops-member-onboarding` / `notiops-member-devops-agent`
    (要看得加 `--call-as DELEGATED_ADMIN`);`teardown.sh` 也一样带这个参数,不会因此漏删。
@@ -547,7 +547,7 @@ CDK 栈始终通过 ARN 引用这些 secret,**本地不落任何凭据文件**�
 | `notiops/slack-app-token` | Slack app-level token(`xapp-`,Socket Mode)。webhook 模式**用不到**,只有切回 `BotStack` 长连接回滚时才需要 |
 | `notiops/im-bot-dingtalk` | 钉钉机器人凭证(单个 Secret,JSON:`app_key` / `app_secret` / `webhook_url`)。`app_key` / `app_secret` **必填**,少一个 ingress 冷启动就崩;`webhook_url`(群里自定义机器人的地址)**可选**,只用于调查报告按会话回贴失败时的兜底和巡检推送(后者本版本还配不起来,见 §3.3 第 8 步);定时日报、Health 和实时事件推送都不投钉钉 |
 | `notiops/bedrock-api-key` | Bedrock API Key(跨账号模型调用认证;部署后手动填充,留空则走 IAM) |
-| `notiops/litellm-config` | LiteLLM 凭据(JSON:`base_url` / `api_key` / `default_model`;用 LiteLLM 才需要) |
+| `notiops/litellm-config` | OpenAI 兼容网关(LiteLLM、New API 等)的地址与 Key(JSON:`base_url` / `api_key`)。在 Web「更多 → 管理 → 模型」里填,不用手动改;不用网关就留空(见 [USER_GUIDE §6.5](USER_GUIDE.md#65-模型)) |
 
 > 钉钉的 Secret 就是上表那条 `notiops/im-bot-dingtalk`,**和飞书 / Slack 同一套机制** —— CDK 自动创建(建成空的),部署完成后填 JSON,**不需要手动 `create-secret`**。**不存在 `bot-stack-*/` 前缀的 Secret,也不存在 `notiops/devops-agent-config`**(Agent Space id 等元数据走 DDB onboard 记录 + CDK context,不落 Secret)。
 

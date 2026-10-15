@@ -984,15 +984,15 @@ export class NotiOpsBackendStack extends cdk.Stack {
       },
     });
 
-    // description 只说「预留」：填它的老 Dashboard「AI 认证 → LiteLLM」已于 2026-09-04 退役，
-    // 而 Web Chat「模型」页只认 bedrock（llm_config.mjs 拒收 litellm，providerHint 也这么写）。
+    // 2026-10 起这就是 Admin「模型 → 模型来源 → OpenAI 兼容网关」的存储（BFF 写，webchat runtime
+    // 与后端任务 Lambda 读）。名字保持 litellm-config：改名要同时动三个栈的 IAM 与一键部署模板。
     // 只改 Description 不会重新生成 secret 的值（GenerateSecretString 没动）。
     // 纯 ASCII：CFN 收模板时会把资源 Description 里的非 ASCII 换成 `?`（见 postprocess_template.py）。
     const liteLlmConfigSecret = new secretsmanager.Secret(this, "LiteLlmConfigSecret", {
       secretName: "notiops/litellm-config",
       description:
-        "LiteLLM Proxy config (base_url / api_key / default_model). Reserved for a later phase -- " +
-        "not configurable in the web UI yet (Amazon Bedrock only for now).",
+        "OpenAI-compatible model gateway (LiteLLM / New API): base_url + api_key. " +
+        "Set from Web Chat > More > Admin > Models > Model sources.",
       generateSecretString: {
         secretStringTemplate: JSON.stringify({
           base_url: "",
@@ -1010,13 +1010,12 @@ export class NotiOpsBackendStack extends cdk.Stack {
     //    现在没有任何代码写这个参数），但这一条**故意没跟着改**：SSM 没有「只改描述」的 API，
     //    描述只能经 PutParameter 改（必带 Value、Overwrite），于是 CFN 会把模板值一起写回 ——
     //    而模板值 "bedrock" 从未变过，老 Dashboard 时代切到 "litellm" 的部署会在那次升级里被
-    //    **静默**切回 bedrock（shared/llm_provider.py 仍按它路由后端的 LLM 调用）。
-    //    2026-10-10 发版前复核：要改描述只有两条出路，选哪条要产品拍板，拍板前别顺手改这一行 ——
-    //    (a) 接受这次重置：升级说明里写明切过 litellm 的部署升级后要重跑
-    //        `aws ssm put-parameter --name /notiops/llm/provider --value litellm --type String --overwrite`；
-    //    (b) 让 CFN 写回的就是现网值：setup.sh 先回读这个参数、经 `-c llmProvider=` 传进来当
-    //        stringValue（参数不存在 = 全新部署 → "bedrock"；读失败不许当成不存在），与
-    //        opsAlertEmail / inspectionReportLocale 那几项「沿用现网值」同一套做法。
+    //    切回 bedrock。
+    //    2026-10 起这个参数**不再参与任何路由**：shared/llm_provider.py 按模型目录的 kind 选协议，
+    //    网关在 Admin「模型 → 模型来源」里配。手动设过 `litellm` 的老部署，升级后后端任务会改走
+    //    Bedrock —— shared/llm_provider._warn_legacy_provider_param 会在 Lambda 冷启动时打 ERROR +
+    //    `LegacyProviderParamIgnored` 指标把这件事说出来。资源本身保留（删它会触发一次 CFN 删除，
+    //    而读它的提示逻辑还在用）。
     const llmProviderParam = new ssm.StringParameter(this, "LlmProviderParam", {
       parameterName: "/notiops/llm/provider",
       stringValue: "bedrock",
@@ -1109,13 +1108,13 @@ export class NotiOpsBackendStack extends cdk.Stack {
       resources: [agentModelIdParam.parameterArn],
     }));
 
+    // 只读（2026-10 收窄）：这个 Secret 现在决定了网关排第一时**所有**模型流量去哪，而写入方
+    // 只有 BFF（web-chat-core.ts 的 GatewayConfigSecretAccess）。这个角色由六个后端 Lambda 共用，
+    // 留着写权限等于任何一个 Lambda 被打穿都能把 base_url 改到别处。Bedrock Key 那条同理早已收窄。
     lambdaRole.addToPolicy(new iam.PolicyStatement({
       sid: "LiteLlmConfigSecretAccess",
       actions: [
         "secretsmanager:GetSecretValue",
-        "secretsmanager:PutSecretValue",
-        "secretsmanager:CreateSecret",
-        "secretsmanager:DescribeSecret",
       ],
       resources: [
         liteLlmConfigSecret.secretArn,
@@ -2534,6 +2533,12 @@ def handler(event, context):
     // Callback Lambda 读写报告(HTML report + trace 上传到 reports/ 前缀)
     dataBucket.grantReadWrite(devopsCallbackLambda);
     devopsCallbackLambda.addEnvironment("DATA_BUCKET", dataBucket.bucketName);
+    // IM 报告卡上的报告 / trace 链接走 ReportsCDN(`report_handler._delivery_url`:在 reports/
+    // 下放一份不可猜名字的副本,约 7 天)。🔴 少了它就退回 presigned:用执行角色的**临时凭证**签,
+    // 写 7 天也只能活到凭证过期(最长约 12 小时)—— 2026-10-13 现网实测,签发 71.7 小时后报告与
+    // trace 都是 `ExpiredToken`。方式 A 的回调从 `im.commonEnv` 拿同一个变量(两条路径对等,
+    // scripts/test_oneclick_parity.py 的 test_devops_callback_parity 校验)。
+    devopsCallbackLambda.addEnvironment("REPORTS_CDN_DOMAIN", reportsCdn.distributionDomainName);
 
     // CUR finalizer 在下发 FinOps 保存查询时，把 primary workgroup 结果输出位置设到
     // 数据桶的 athena-results/ 前缀（Athena 控制台手跑查询需要）。dataBucket 此处才建，
@@ -2931,8 +2936,8 @@ def handler(event, context):
     new cdk.CfnOutput(this, "LiteLlmConfigSecretArn", {
       value: liteLlmConfigSecret.secretArn,
       description:
-        "LiteLLM Config Secret ARN -- reserved for a later phase; not configurable in the web UI yet " +
-        "(Amazon Bedrock only for now)",
+        "OpenAI-compatible model gateway secret ARN (base_url + api_key); set it from " +
+        "Web Chat > More > Admin > Models > Model sources",
     });
   }
 }

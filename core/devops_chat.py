@@ -228,6 +228,76 @@ def excerpt(s, max_len: int = 180) -> str:
     return (one[:max_len] + "…") if len(one) > max_len else one
 
 
+# ---------------------------------------------------------------------------
+# 过程行的状态词 —— 2026-10-13 现网：`↳ Check EC2 instance status for i-…Done`
+# ---------------------------------------------------------------------------
+# `tool_summary` 块先流一句工具说明（一个 textDelta），工具跑完再补一个**状态词**
+# （另一个 textDelta："Done" / "Failed"），两段之间没有任何分隔。按整块拼成一行，
+# 状态词就直接粘在说明末尾。所以按 **delta 边界**拆：最后一段（去掉首尾空白后）整段是
+# 状态词，才当状态；同一个 delta 里状态词独占最后一行的也算（2026-09-08 见过
+# `Verifying against published AWS documentation\nDone`）。
+# ⚠️ 只认"整段就是一个状态词"，**不猜词尾**：`Check alarm OrdersApiError` 这类以状态词
+#    结尾的标识符按词尾拆会变成 `OrdersApi · Error`，比原来的粘连还糟。
+# 词表与 `bff/web-chat/devops_chat.mjs::STEP_STATUS_WORDS` 逐项一致（小写，比较时忽略大小写），
+# tests/test_im_devops_chat_step_status.py 钉着两边一致。显示时**原样**保留 DevOps Agent
+# 给的那个词（不翻译、不改大小写 —— DevOps Agent 的内容原样呈现）。
+STEP_STATUS_WORDS: tuple[str, ...] = (
+    "done", "failed", "failure", "error", "errored", "completed", "complete",
+    "succeeded", "success", "successful", "cancelled", "canceled", "skipped",
+    "timed out", "timeout", "aborted", "stopped", "running", "in progress", "pending",
+)
+_STEP_STATUS_RE = re.compile(
+    r"(?:" + "|".join(r"\s+".join(map(re.escape, w.split())) for w in STEP_STATUS_WORDS)
+    + r")[.!]?",
+    re.IGNORECASE,
+)
+
+#: 带状态词时说明部分的长度上限。IM 卡片把单行截到 `platforms/common/live_card.py::MAX_STEP_LINE`
+#: （160）：说明照旧写满 180，被截掉的恰好是行尾的状态词 —— 而 "Failed" 正是这一行里最该被
+#: 看见的那个词。140 + "… · " + 最长的状态词（11）+ "↳ " 仍在 160 以内。
+#: 与 `devops_chat.mjs::STEP_TAIL_MAX_WITH_STATUS` 同值（同一条测试钉着）。
+STEP_TAIL_MAX_WITH_STATUS = 140
+
+
+def _is_step_status(s: str) -> bool:
+    return bool(_STEP_STATUS_RE.fullmatch(str(s or "").strip()))
+
+
+def split_step_status(parts) -> tuple[str, str]:
+    """过程块的文字分段（按到达顺序的 textDelta 列表）→ ``(说明, 状态词)``。
+
+    没有状态词时状态为空串、说明是原样拼接（与改动前 `b["buf"]` 完全相同）。
+    """
+    texts = [p for p in (parts or []) if isinstance(p, str)]
+    # ① 状态词自己一个 delta（现网主形状）：最后一个非空白段整段是状态词，且它前面有说明。
+    last = max((i for i, p in enumerate(texts) if p.strip()), default=-1)
+    if last > 0 and any(p.strip() for p in texts[:last]) and _is_step_status(texts[last]):
+        return "".join(texts[:last]).strip(), texts[last].strip()
+    joined = "".join(texts)
+    # ② 同一个 delta 里状态词独占最后一行。
+    head, nl, tail = joined.strip().rpartition("\n")
+    if nl and head.strip() and _is_step_status(tail):
+        return head.strip(), tail.strip()
+    return joined, ""
+
+
+def step_tail_line(parts, fallback: str = "") -> str:
+    """contentBlockStop 时的过程尾行：``  ↳ <说明> · <状态>``（没有状态词就是 ``  ↳ <说明>``）。
+
+    `fallback` = stop 事件的累积全文（实测恒为空串，只在一个 delta 都没收到时才用得上 ——
+    与改动前 `excerpt(b["buf"] or s_text)` 同一个兜底顺序）。什么文字都没有时返回空串
+    （调用方据此不发这一行）。
+    """
+    if not "".join(p for p in (parts or []) if isinstance(p, str)):
+        parts = [fallback or ""]
+    desc, status = split_step_status(parts)
+    if status:
+        tail = excerpt(desc, STEP_TAIL_MAX_WITH_STATUS)
+        return f"  ↳ {tail} · {status}" if tail else f"  ↳ {status}"
+    tail = excerpt(desc)
+    return f"  ↳ {tail}" if tail else ""
+
+
 # executionId 失效（会话过期/被清）时的错误名。只在**一个字都还没吐**时才重开新会话重试一次。
 _STALE_RE = re.compile(
     r"ResourceNotFound|NotFound|Validation|Conflict|Expired|Gone|InvalidRequest",
@@ -290,7 +360,10 @@ def _new_block() -> dict:
     # ⚠️ 文字与 JSON **分开存**：同一个块里两者都会来（实测 `tool_summary` = 一句人话
     # "Asking user: …?" + 一大坨 `{"type":"tool_call",…}` 入参）。混在一个 buf 里，过程行
     # 就会把裸 JSON 抖给用户看（线上已出现）。
-    return {"type": "", "kind": "answer", "buf": "", "json": "",
+    # `parts` = 同一批文字按 delta 边界分开存：过程块的状态词（"Done" / "Failed"）是单独
+    # 一个 delta，只有按边界才拆得开（见 `split_step_status`）。`buf` 仍是整块拼接，
+    # 反问解析 / 去重照旧读它。
+    return {"type": "", "kind": "answer", "buf": "", "json": "", "parts": [],
             "emitted_any": False, "dup": False}
 
 
@@ -407,6 +480,7 @@ def consume_events(events, sink: Sink, en: bool = False,
                 else:
                     # 过程 / 元数据 / 反问块的文字：先收着
                     b["buf"] += td
+                    b["parts"].append(td)
             elif isinstance(jd, str) and jd:
                 b["json"] += jd   # 工具入参 / 反问选项 JSON：单独存，绝不裸进正文或过程行
             continue
@@ -417,10 +491,11 @@ def consume_events(events, sink: Sink, en: bool = False,
             kind = (b or {}).get("kind") or "answer"
             s_text = s.get("text") if isinstance(s.get("text"), str) else ""
             if kind in ("step", "prompt"):
-                # 过程行尾巴：**只用文字**（b["buf"]），JSON 入参不外泄。
-                tail = excerpt((b or {}).get("buf") or s_text)
+                # 过程行尾巴：**只用文字**（b["parts"]），JSON 入参不外泄；状态词与说明分开
+                # （"↳ <说明> · Done"，见 `split_step_status`）。
+                tail = step_tail_line((b or {}).get("parts"), s_text)
                 if tail:
-                    sink.step(f"  ↳ {tail}")
+                    sink.step(tail)
                 # agent 的反问 → 提到正文里说人话，按问题正文去重避免说两遍。
                 ask = parse_ask((b or {}).get("json")) or parse_ask((b or {}).get("buf"))
                 if ask and _norm(ask["question"]) not in ask_shown:

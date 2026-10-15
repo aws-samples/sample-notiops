@@ -61,7 +61,8 @@ export interface StreamCallbacks {
   onToolCall?: (tool: string, args: unknown) => void;
   onToolResult?: (tool: string, summary: string) => void;
   onProgress?: (p: { text?: string; kind?: string; incident_id?: string; elapsed?: number; thinking?: string }) => void;
-  // 思考过程增量（模型 reasoning 明文）：随本轮语言，前端**只**并进右侧「思考过程」面板的思考段（thinking.ts::appendReasoning），气泡里不渲染
+  // 思考过程增量（模型 reasoning 明文）：语言由 agent 端在 prompt 里引导跟随本轮、**不保证**（偶尔仍是英文），
+  // 前端**只**并进右侧「思考过程」面板的思考段（thinking.ts::appendReasoning），气泡里不渲染
   // （2026-10-10 起；以前另有一份折叠灰字，与面板入口同名同内容，见 Message.tsx 入口规矩 3）。
   onReasoning?: (r: { text?: string }) => void;
   onSources?: (sources: SourceItem[]) => void;

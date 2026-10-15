@@ -1369,16 +1369,35 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
   // 缺这条时：keyStatus() 吞掉 AccessDenied 报「未配置」（即使已配置），而
   // apiPutBedrockKey 的 UpdateSecret 抛的不是 ResourceNotFoundException，
   // 于是穿透到 500 —— API Key 页面直接报错且无可操作信息。
+  // `TagResource`：BFF 建 secret 时带 `project` / `auto-delete` 标签（方式A 栈级 Tags 盖不到 BFF 建的
+  // secret，见 llm_config.mjs 的 OWN_SECRET_TAGS），带 Tags 的 CreateSecret 硬依赖它。下面网关那条同理。
   bff.addToRolePolicy(
     new iam.PolicyStatement({
       sid: "BedrockApiKeySecretAccess",
       actions: [
         "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue",
         "secretsmanager:UpdateSecret", "secretsmanager:DescribeSecret",
-        "secretsmanager:CreateSecret",
+        "secretsmanager:CreateSecret", "secretsmanager:TagResource",
       ],
       resources: [
         `arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:notiops/bedrock-api-key*`,
+      ],
+    }),
+  );
+  // OpenAI 兼容网关（LiteLLM / New API）的地址 + Key：Admin「模型来源 → 网关 → 设置」读状态
+  // （地址 + 后 4 位）、写入 / 清除，以及用它列模型、做连通性探测。方式B 由 NotiOpsBackendStack
+  // 预建（`LiteLlmConfigSecret`，名字是历史遗留），方式A 由这里 CreateSecret 按需建。
+  // 写法与上面 Bedrock Key 那条一致（字面名 + `*` 吃随机后缀）。
+  bff.addToRolePolicy(
+    new iam.PolicyStatement({
+      sid: "GatewayConfigSecretAccess",
+      actions: [
+        "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue",
+        "secretsmanager:UpdateSecret", "secretsmanager:DescribeSecret",
+        "secretsmanager:CreateSecret", "secretsmanager:TagResource",
+      ],
+      resources: [
+        `arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:notiops/litellm-config*`,
       ],
     }),
   );

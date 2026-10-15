@@ -394,12 +394,18 @@ def build_body(ctx: dict, severity: str, extra: str, operator_name: str,
     if operator_url:
         parts += ["=== Live investigation in DevOps Agent ===", operator_url,
                   "(requires AWS console login)", ""]
+    # 链接寿命按**形状**写（`shared.report_delivery.link_validity`）：ReportsCDN 链接约 7 天，
+    # 退回 presigned 时最长约 12 小时。写错的代价是 Support 工程师照着点、却打不开。
+    from shared.report_delivery.link_validity import is_presigned
+
+    def _how(url: str) -> str:
+        return ("presigned link, expires within about 12 hours" if is_presigned(url)
+                else "online link, valid for about 7 days")
+
     if report_url:
-        parts += ["=== Final report (HTML, presigned link, expires within about 12 hours) ===",
-                  report_url, ""]
+        parts += [f"=== Final report (HTML, {_how(report_url)}) ===", report_url, ""]
     if trace_url:
-        parts += ["=== Investigation trace (HTML, presigned link, expires within about 12 hours) ===",
-                  trace_url, ""]
+        parts += [f"=== Investigation trace (HTML, {_how(trace_url)}) ===", trace_url, ""]
     parts += ["=== Investigation summary ===", "", summary]
 
     body = "\n".join(parts)

@@ -178,6 +178,59 @@ function excerpt(s, max = 180) {
   return one.length > max ? one.slice(0, max) + "…" : one;
 }
 
+/* ── 过程行的状态词（2026-10-13 现网：`↳ Check EC2 instance status for i-…Done`）──
+ * `tool_summary` 块先流一句工具说明（一个 textDelta），工具跑完再补一个**状态词**（另一个
+ * textDelta："Done" / "Failed"），两段之间没有任何分隔 —— 按整块拼成一行，状态词就粘在说明末尾。
+ * 所以按 **delta 边界**拆：最后一段（去首尾空白后）整段是状态词才当状态；同一个 delta 里状态词
+ * 独占最后一行的也算（2026-09-08 见过 `Verifying against published AWS documentation\nDone`）。
+ * ⚠️ 只认"整段就是一个状态词"，**不猜词尾**：`Check alarm OrdersApiError` 按词尾拆会变成
+ *    `OrdersApi · Error`，比原来的粘连还糟。
+ * 词表 / 让位预算与 `core/devops_chat.py` 的 STEP_STATUS_WORDS / STEP_TAIL_MAX_WITH_STATUS
+ * 逐项一致（tests/test_im_devops_chat_step_status.py 钉着）。显示时**原样**保留 DevOps Agent
+ * 给的那个词（不翻译、不改大小写）。 */
+const STEP_STATUS_WORDS = ["done", "failed", "failure", "error", "errored", "completed", "complete", "succeeded", "success", "successful", "cancelled", "canceled", "skipped", "timed out", "timeout", "aborted", "stopped", "running", "in progress", "pending"];
+const STEP_STATUS_RE = new RegExp(
+  "^(?:" + STEP_STATUS_WORDS.map((w) => w.split(" ").map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s+")).join("|") + ")[.!]?$",
+  "i",
+);
+/** 带状态词时说明部分的长度上限：给行尾的状态词让位（IM 卡片按 160 截单行，"Failed" 正是这一行
+ *  最该被看见的词）。web 面板不截行，但两份实现必须产出同一行，故同值。 */
+const STEP_TAIL_MAX_WITH_STATUS = 140;
+const isStepStatus = (s) => STEP_STATUS_RE.test(String(s || "").trim());
+
+/** 过程块的文字分段（按到达顺序的 textDelta 数组）→ `[说明, 状态词]`；没有状态词时状态为 ""。 */
+export function splitStepStatus(parts) {
+  const texts = (parts || []).filter((p) => typeof p === "string");
+  // ① 状态词自己一个 delta（现网主形状）：最后一个非空白段整段是状态词，且它前面有说明。
+  let last = -1;
+  texts.forEach((p, i) => { if (p.trim()) last = i; });
+  if (last > 0 && texts.slice(0, last).some((p) => p.trim()) && isStepStatus(texts[last])) {
+    return [texts.slice(0, last).join("").trim(), texts[last].trim()];
+  }
+  const joined = texts.join("");
+  // ② 同一个 delta 里状态词独占最后一行。
+  const body = joined.trim();
+  const nl = body.lastIndexOf("\n");
+  if (nl > 0 && body.slice(0, nl).trim() && isStepStatus(body.slice(nl + 1))) {
+    return [body.slice(0, nl).trim(), body.slice(nl + 1).trim()];
+  }
+  return [joined, ""];
+}
+
+/** contentBlockStop 时的过程尾行：`  ↳ <说明> · <状态>`（没有状态词就是 `  ↳ <说明>`）。
+ *  `fallback` = stop 的累积全文（实测恒为空，只在一个 delta 都没收到时用得上 —— 与改动前
+ *  `excerpt(b.buf || s.text)` 同一个兜底顺序）。什么文字都没有时返回 ""。 */
+function stepTailLine(parts, fallback = "") {
+  const use = (parts || []).join("") ? parts : [fallback || ""];
+  const [desc, status] = splitStepStatus(use);
+  if (status) {
+    const tail = excerpt(desc, STEP_TAIL_MAX_WITH_STATUS);
+    return tail ? `  ↳ ${tail} · ${status}` : `  ↳ ${status}`;
+  }
+  const tail = excerpt(desc);
+  return tail ? `  ↳ ${tail}` : "";
+}
+
 /** executionId 失效（会话过期/被清）时的错误名。只在**一个字都还没吐**时才重开新会话重试一次。 */
 const STALE_RE = /ResourceNotFound|NotFound|Validation|Conflict|Expired|Gone|InvalidRequest/i;
 
@@ -214,11 +267,13 @@ export function makeSink({ emit }) {
  */
 export async function consumeEvents(events, sink, { en = false, maxWaitSec = MAX_WAIT_SEC, stallSec = STALL_SEC } = {}) {
   const dv = (zh, enStr) => (en ? enStr : zh);
-  const blocks = new Map();   // index -> { type, kind, buf, json, emittedAny, dup }
+  const blocks = new Map();   // index -> { type, kind, buf, json, parts, emittedAny, dup }
   // ⚠️ 文字与 JSON **分开存**：同一个块里两者都会来（实测 `tool_summary` = 一句人话
   // "Asking user: …?" + 一大坨 `{"type":"tool_call",…}` 入参）。混在一个 buf 里，面板那行
   // 就会把裸 JSON 抖给用户看（线上已出现）。
-  const nb = () => ({ type: "", kind: "answer", buf: "", json: "", emittedAny: false, dup: false });
+  // `parts` = 同一批文字按 delta 边界分开存：过程块的状态词（"Done" / "Failed"）是单独一个 delta，
+  // 只有按边界才拆得开（见 splitStepStatus）。`buf` 仍是整块拼接，反问解析 / 去重照旧读它。
+  const nb = () => ({ type: "", kind: "answer", buf: "", json: "", parts: [], emittedAny: false, dup: false });
   const blockFor = (i) => {
     let b = blocks.get(i);
     // 没见过 start 就来 delta：按正文处理（失败安全，见文件头）。
@@ -289,6 +344,7 @@ export async function consumeEvents(events, sink, { en = false, maxWaitSec = MAX
         } else {
           // 过程 / 元数据 / 反问块的文字：先收着（过程→面板、反问→stop 时渲染成人话、元数据→丢弃）
           b.buf += td;
+          b.parts.push(td);
         }
       } else if (typeof jd === "string" && jd) {
         b.json += jd;                   // 工具入参 / 反问选项 JSON：单独存，绝不裸进气泡或面板
@@ -300,9 +356,10 @@ export async function consumeEvents(events, sink, { en = false, maxWaitSec = MAX
       const b = blocks.get(s.index);
       const kind = b?.kind || "answer";
       if (kind === "step" || kind === "prompt") {
-        // 面板尾行：**只用文字**（b.buf），JSON 入参不外泄（线上曾把 ask_user 的整坨入参抖到面板）。
-        const tail = excerpt(b.buf || (typeof s.text === "string" ? s.text : ""));
-        if (tail) sink.step(`  ↳ ${tail}`);
+        // 面板尾行：**只用文字**（b.parts），JSON 入参不外泄（线上曾把 ask_user 的整坨入参抖到面板）；
+        // 状态词与说明分开（"↳ <说明> · Done"，见 splitStepStatus）。
+        const tail = stepTailLine(b.parts, typeof s.text === "string" ? s.text : "");
+        if (tail) sink.step(tail);
         // agent 的反问 → 提到主气泡里说人话。两种块形状都可能带它，用问题正文去重，避免说两遍。
         const ask = parseAsk(b.json) || parseAsk(b.buf);
         if (ask && !askShown.has(norm(ask.question))) {

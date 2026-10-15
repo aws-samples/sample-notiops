@@ -183,12 +183,13 @@ REPORTS_CDN_DOMAIN="$(aws cloudformation describe-stacks --region "$REGION" \
   --output text 2>/dev/null || echo '')"
 [ "$REPORTS_CDN_DOMAIN" = "None" ] && REPORTS_CDN_DOMAIN=""
 AGENTCORE_JSON="$AGENT_DIR/agentcore/agentcore.json"
-python3 - "$AGENTCORE_JSON" "$GATEWAY_URL" "$SKILLS_BUCKET" "$DEVOPS_AGENT_SPACE_ID" "$REPORTS_CDN_DOMAIN" "$ALLOW_CROSS_ACCOUNT" "$COST_AGENT_MCP_URL" <<'PY'
+python3 - "$AGENTCORE_JSON" "$GATEWAY_URL" "$SKILLS_BUCKET" "$DEVOPS_AGENT_SPACE_ID" "$REPORTS_CDN_DOMAIN" "$ALLOW_CROSS_ACCOUNT" "$COST_AGENT_MCP_URL" "$COST_AGENT_FN_ARN" <<'PY'
 import json, sys
 path, url, skills_bucket, da_space = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 reports_cdn = sys.argv[5] if len(sys.argv) > 5 else ""
 allow_cross = sys.argv[6] if len(sys.argv) > 6 else ""
 cost_mcp = sys.argv[7] if len(sys.argv) > 7 else ""
+cost_fn_arn = sys.argv[8] if len(sys.argv) > 8 else ""
 d = json.load(open(path))
 for rt in d.get("runtimes", []):
     for ev in rt.get("envVars", []):
@@ -207,20 +208,34 @@ for rt in d.get("runtimes", []):
 json.dump(d, open(path, "w"), indent=2, ensure_ascii=False)
 import os as _os
 _zh = _os.environ.get("UI_LANG") == "zh"
+# 「客户 CUR 数据源」按模式分开说（用户 2026-10-13 的建议 4）。三态在这里只看两个入参就分得清：
+#   · URL 有值                 → 外接 / 已接上，本次就生效；
+#   · URL 空、函数 ARN 有值    → 自建（setup.sh 先给 ARN 做授权，Function URL 要等 cdk deploy 之后回填）；
+#   · 两个都空                 → Off（默认）。
+# 🔴 原来后两种共用一句「(空，成本问题走 CE / aws-api)」：自建态读起来像终局结论（其实同一次运行
+#    随后就填上了），Off 态又不告诉人怎么打开 —— 那是用户找不到开关的唯一线索。
+if cost_mcp:
+    cur_zh, cur_en = "已配置", "configured"
+elif cost_fn_arn:
+    cur_zh = "(自建，Function URL 在 cdk deploy 之后回填)"
+    cur_en = "(self-hosted, Function URL backfilled after cdk deploy)"
+else:
+    cur_zh = "(未配置，成本问题走 CE / aws-api；要接 CUR 见 docs/DEPLOYMENT.md §14.2 的 COST_MCP_SELF_HOST)"
+    cur_en = "(not configured, cost questions use CE / aws-api -- see COST_MCP_SELF_HOST in docs/DEPLOYMENT.en.md §14.2)"
 if _zh:
     print(f"    agentcore.json 已写入 gateway URL: {url or '(空，本部署无联网搜索)'}; "
           f"SKILLS_BUCKET: {skills_bucket or '(空)'}; "
           f"DEVOPS_AGENT_SPACE_ID: {da_space or '(空，运行时自动发现)'}; "
           f"REPORTS_CDN_DOMAIN: {reports_cdn or '(空，回退 presigned)'}; "
           f"跨账号闸门: {'开启（多账号模式）' if allow_cross else '关闭（仅部署账号）'}; "
-          f"客户 CUR 数据源: {'已配置' if cost_mcp else '(空，成本问题走 CE / aws-api)'}")
+          f"客户 CUR 数据源: {cur_zh}")
 else:
     print(f"    agentcore.json written — gateway URL: {url or '(empty, no web search)'}; "
           f"SKILLS_BUCKET: {skills_bucket or '(empty)'}; "
           f"DEVOPS_AGENT_SPACE_ID: {da_space or '(empty, auto-discovered at runtime)'}; "
           f"REPORTS_CDN_DOMAIN: {reports_cdn or '(empty, presigned fallback)'}; "
           f"cross-account gate: {'ON (multi-account mode)' if allow_cross else 'OFF (deploy account only)'}; "
-          f"customer CUR source: {'configured' if cost_mcp else '(empty, cost questions fall back to CE / aws-api)'}")
+          f"customer CUR source: {cur_en}")
 PY
 
 # ── 2.9 部署前硬门禁：约束下装出来的组合必须真能 import ──────────────────────

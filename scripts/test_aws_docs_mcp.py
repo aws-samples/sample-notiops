@@ -225,6 +225,148 @@ def test_failure_paths(t: _CaseRunner) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 3b. read_documentation paging (start_index + the server's paging fields)
+# ---------------------------------------------------------------------------
+# 2026-10-14 现网：read 只发 url + max_length=4000、从不发 start_index，又把整个回包 JSON
+# 截在 4000 字 —— 截掉的正好是末尾的 end_index / truncated。模型看得到目录里的字符区间却没法
+# 翻页，同一个 URL 反复读（1/6 轮之后输出崩成乱码直到 max_tokens）。下面的回包形状照现网
+# 托管服务实测抄的（Lambda 运行时那一页，total_length 21326）。
+_LAMBDA_RUNTIMES = "https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html"
+
+
+def _read_envelope(body: str, *, start: int = 0, end: int = 10000, total: int = 21326,
+                   truncated: bool = True, status: str = "SUCCESS", error_code=None,
+                   redirected_url=None) -> dict:
+    item = {"status": status, "url": _LAMBDA_RUNTIMES, "content": body,
+            "total_length": total, "start_index": start, "end_index": end,
+            "truncated": truncated, "redirected_url": redirected_url, "error_code": error_code}
+    return {"content": [{"type": "text",
+                         "text": json.dumps({"content": {"result": [item]}})}]}
+
+
+def test_read_paging(t: _CaseRunner) -> None:
+    print("\n[3b] read_documentation paging (start_index / end_index / truncated)")
+    toc = ("Table of Contents:\n- Supported runtimes (char 2467-8354)\n"
+           "- Deprecated runtimes (char 17946-21325)\n\n")
+    page = toc + "x" * 10000            # 现网形状：每个被截断的段前面都带一份目录
+
+    calls: list[dict] = []
+
+    def _fake(tool, arguments):
+        calls.append({"tool": tool, "arguments": arguments})
+        return _read_envelope(page)
+
+    with mock.patch.object(aws_docs_mcp, "_mcp_call", side_effect=_fake):
+        r = aws_docs_mcp.read_documentation_ex(_LAMBDA_RUNTIMES)
+    t.expect("default read sends url + max_length 10000 and NO start_index (same request as a first read)",
+             calls[-1]["arguments"] == {"requests": [{"url": _LAMBDA_RUNTIMES, "max_length": 10000}]},
+             str(calls[-1]))
+    t.expect("the page chunk is unwrapped from the server envelope (not the raw JSON)",
+             r["content"] == page and r["error"] == "")
+    t.expect("TOC-prefixed chunk longer than max_chars is NOT cut (cutting ate the page end)",
+             len(r["content"]) == len(page) > 10000)
+    t.expect("paging fields are passed through",
+             (r["start_index"], r["end_index"], r["total_length"], r["truncated"])
+             == (0, 10000, 21326, True), str({k: v for k, v in r.items() if k != "content"}))
+
+    for raw, sent in ((17946, 17946), ("17946", 17946), (17946.0, 17946)):
+        with mock.patch.object(aws_docs_mcp, "_mcp_call", side_effect=_fake):
+            aws_docs_mcp.read_documentation_ex(_LAMBDA_RUNTIMES, start_index=raw)
+        t.expect(f"start_index={raw!r} is sent as {sent}",
+                 calls[-1]["arguments"]["requests"][0].get("start_index") == sent, str(calls[-1]))
+    # 服务端对负数 / 0 长度回的是一段参数校验报错，不是页面 —— 本地夹住，别让模型的手误白费一轮。
+    for raw in (-5, True, "abc", None):
+        with mock.patch.object(aws_docs_mcp, "_mcp_call", side_effect=_fake):
+            aws_docs_mcp.read_documentation_ex(_LAMBDA_RUNTIMES, start_index=raw)
+        t.expect(f"start_index={raw!r} is clamped to the page start (not sent)",
+                 "start_index" not in calls[-1]["arguments"]["requests"][0], str(calls[-1]))
+
+    with mock.patch.object(aws_docs_mcp, "_mcp_call", side_effect=_fake):
+        aws_docs_mcp.read_documentation_ex(_LAMBDA_RUNTIMES, max_chars=4000)
+    t.expect("explicit max_chars is still honoured (IM path passes 4000)",
+             calls[-1]["arguments"]["requests"][0]["max_length"] == 4000)
+
+    with mock.patch.object(aws_docs_mcp, "_mcp_call",
+                           return_value=_read_envelope("y" * 30000)):
+        r = aws_docs_mcp.read_documentation_ex(_LAMBDA_RUNTIMES)
+    t.expect("a body far beyond max_chars is capped (2x) and marked truncated",
+             len(r["content"]) == 20000 and r["truncated"] is True)
+
+    with mock.patch.object(aws_docs_mcp, "_mcp_call",
+                           return_value=_read_envelope("", start=999999, end=999999,
+                                                       truncated=False)):
+        r = aws_docs_mcp.read_documentation_ex(_LAMBDA_RUNTIMES, start_index=999999)
+    t.expect("start_index past the end is a normal answer, not docs_service_unavailable",
+             r["content"] == "" and r["error"] == "" and r["start_index"] >= r["total_length"])
+
+    err_env = _read_envelope("", status="ERROR", error_code="not_found")
+    with mock.patch.object(aws_docs_mcp, "_mcp_call", return_value=err_env):
+        r = aws_docs_mcp.read_documentation_ex(_LAMBDA_RUNTIMES)
+    t.expect("a per-request ERROR keeps the old behaviour: raw reply (with error_code) as content",
+             r == {"content": err_env["content"][0]["text"], "error": ""}, str(r)[:200])
+
+    validation = {"content": [{"type": "text", "text": json.dumps(
+        {"errorMessage": "Error executing tool read_documentation: 1 validation error"})}]}
+    with mock.patch.object(aws_docs_mcp, "_mcp_call", return_value=validation):
+        r = aws_docs_mcp.read_documentation_ex(_LAMBDA_RUNTIMES)
+    t.expect("a non-standard reply keeps the old behaviour (raw text, error '')",
+             r["error"] == "" and "validation error" in r["content"] and "start_index" not in r)
+
+    with mock.patch.object(aws_docs_mcp, "_mcp_call", return_value=_read_envelope(
+            "body", truncated=False, end=5583, total=5583,
+            redirected_url="https://docs.aws.amazon.com/lambda/latest/dg/welcome.html")):
+        r = aws_docs_mcp.read_documentation_ex(_LAMBDA_RUNTIMES)
+    t.expect("an allowed redirected_url is passed on",
+             r.get("redirected_url") == "https://docs.aws.amazon.com/lambda/latest/dg/welcome.html")
+    with mock.patch.object(aws_docs_mcp, "_mcp_call", return_value=_read_envelope(
+            "body", truncated=False, redirected_url="https://evil.example.com/x")):
+        r = aws_docs_mcp.read_documentation_ex(_LAMBDA_RUNTIMES)
+    t.expect("a redirected_url off the host allowlist is dropped", "redirected_url" not in r)
+
+    with mock.patch.object(aws_docs_mcp, "_mcp_call", side_effect=_fake):
+        text = aws_docs_mcp.read_documentation(_LAMBDA_RUNTIMES, start_index=10000)
+    t.expect("read_documentation() returns the unwrapped chunk and forwards start_index",
+             text == page and calls[-1]["arguments"]["requests"][0].get("start_index") == 10000)
+
+    # IM 侧（core/bedrock_chat.py，长连接路径）：schema 带 start_index、执行时透传、结果末尾有 [page …] 行。
+    read_spec = next(s for s in bedrock_chat._TIER1_TOOLS
+                     if s["name"] == bedrock_chat._TOOL_NAME_DOCS_READ)
+    t.expect("IM aws_docs_read schema exposes start_index (integer, optional)",
+             read_spec["input_schema"]["properties"].get("start_index", {}).get("type") == "integer"
+             and read_spec["input_schema"]["required"] == ["url"])
+    seen: dict = {}
+
+    def _fake_ex(url, **kw):
+        seen.update(kw)
+        return {"content": "chunk", "error": "", "start_index": 10000, "end_index": 14000,
+                "total_length": 21326, "truncated": True}
+
+    with mock.patch.object(bedrock_chat._aws_docs_mcp, "read_documentation_ex", side_effect=_fake_ex):
+        ok, text, cites = bedrock_chat._exec_tool(
+            bedrock_chat._TOOL_NAME_DOCS_READ, {"url": _LAMBDA_RUNTIMES, "start_index": 10000})
+    t.expect("IM _exec_tool forwards start_index and keeps max_chars=4000",
+             seen == {"max_chars": 4000, "start_index": 10000}, str(seen))
+    t.expect("IM result ends with the [page …] line naming the next start_index",
+             ok and text.endswith("[page: chars 10000-14000 of 21326; next start_index=14000]"), text)
+    t.expect("IM [page …] line: last chunk says end of page",
+             bedrock_chat._docs_page_line({"content": "c", "start_index": 20000, "end_index": 21326,
+                                           "total_length": 21326, "truncated": False})
+             .endswith("end of page]"))
+    t.expect("IM [page …] line: nothing for a one-chunk page / a reply without paging fields",
+             bedrock_chat._docs_page_line({"content": "c", "start_index": 0, "end_index": 900,
+                                           "total_length": 900, "truncated": False}) == ""
+             and bedrock_chat._docs_page_line({"content": "raw", "error": ""}) == "")
+    t.expect("IM [page …] line: past the end",
+             "past the end" in bedrock_chat._docs_page_line(
+                 {"content": "", "start_index": 999999, "end_index": 999999,
+                  "total_length": 21326, "truncated": False}))
+    t.expect("IM tool-call summary shows start_index when paging",
+             bedrock_chat._summarize_tool_args(
+                 bedrock_chat._TOOL_NAME_DOCS_READ,
+                 {"url": _LAMBDA_RUNTIMES, "start_index": 17946}).endswith("start_index=17946"))
+
+
+# ---------------------------------------------------------------------------
 # 4. Skip-MCP heuristic
 # ---------------------------------------------------------------------------
 def test_skip_heuristic(t: _CaseRunner) -> None:
@@ -1214,6 +1356,7 @@ def main() -> int:
     t.run_section(test_url_allowlist)
     t.run_section(test_search_parsing)
     t.run_section(test_failure_paths)
+    t.run_section(test_read_paging)
     t.run_section(test_skip_heuristic)
     t.run_section(test_citation_render)
     t.run_section(test_respond_e2e)

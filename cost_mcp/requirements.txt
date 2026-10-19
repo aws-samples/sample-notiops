@@ -23,13 +23,13 @@
 #   就以为错了（另外三个是实打实的 cp314）。
 #
 # 版本集来源：2026-09-20 用
-#   pip download mcp==2.0.0 mangum==0.21.0 boto3==1.43.77 \
+#   pip download mcp==2.2.0 mangum==0.21.0 boto3==1.43.77 \
 #     --platform manylinux2014_x86_64 --implementation cp --python-version 3.14 \
 #     --only-binary=:all:
 # 解出的 36 个 wheel，全部有 manylinux 轮子、无一退回源码构建。
 
 # ── 直接依赖 ────────────────────────────────────────────────────────────────
-mcp==2.0.0
+mcp==2.2.0
 mangum==0.21.0
 boto3==1.43.77
 

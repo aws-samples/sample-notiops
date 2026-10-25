@@ -820,15 +820,37 @@ def on_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         try:
             from platforms.feishu.app import case_flow
             # Resolve the conversation locale for handler-rendered text
-            # (toasts, result/pending cards). Priority: the original
-            # event row's locale (the same one set on intake), then a
-            # default of zh for legacy convos pre-dating multi-locale.
-            convo_locale = "zh"
+            # (toasts, result/pending cards). Priority (待办 #38 ③):
+            #   1. the locale stamped on the button itself (case_flow stamps
+            #      every case button since 2026-10-23 — before that the value
+            #      only carried `action` + the account stamp, the event_id
+            #      lookup below never found anything, and English users got
+            #      Chinese cards after every click);
+            #   2. the original event row's locale (legacy buttons that carry
+            #      an event_id);
+            #   3. the operator's language preference / lock
+            #      (`locale_resolver`, same chain as the worker's card path);
+            #   4. zh for legacy convos pre-dating multi-locale.
+            convo_locale = ""
+            stamped = (action_value.get("locale") or "") if isinstance(action_value, dict) else ""
+            if str(stamped).strip().lower() in {"zh", "en"}:
+                convo_locale = str(stamped).strip().lower()
             try:
-                if event_id:
+                if not convo_locale and event_id:
                     convo = ddb_state.get_by_event(event_id)
                     if convo and (convo.get("locale") or "").strip():
                         convo_locale = convo["locale"].strip().lower()
+                if not convo_locale:
+                    from core import locale_resolver
+                    op = getattr(event.event, "operator", None)
+                    loc, src = locale_resolver.resolve(
+                        user_id=getattr(op, "open_id", "") or "", platform="feishu",
+                        is_dm=True, thread_root_id="", text="")
+                    # Only a real preference / lock counts: the resolver's own
+                    # fallback is `en`, and legacy convos have always fallen
+                    # back to zh here — don't flip them.
+                    if src != "default":
+                        convo_locale = loc
             except Exception as e:
                 logger.warning("locale lookup for case action failed: %s", e)
             if convo_locale not in {"zh", "en"}:

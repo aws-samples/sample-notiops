@@ -130,17 +130,22 @@ ok("neverStarted 文案里不出现任何原始报文变量插值（不许把 SD
  * 没有能切回去的控件 —— 退路只能是开一个「新对话」。
  * 只看代码行：注释里为了讲清来龙去脉会出现这些旧说法。 */
 const codeOnly = (s) => s.split("\n").filter((l) => !/^\s*(\/\/|\*)/.test(l)).join("\n");
+// modelFailureText 2026-10-23 挪到了 turn_errors.mjs（待办 #30：分档里多了「会话忙」「超时」两档）。
+const te = readFileSync(join(HERE, "..", "turn_errors.mjs"), "utf8");
 const mft = (() => {
-  const i = idx.indexOf("function modelFailureText(");
-  const j = idx.indexOf("\nfunction ", i + 1);
-  return i >= 0 ? codeOnly(idx.slice(i, j > i ? j : idx.length)) : "";
+  const i = te.indexOf("export function modelFailureText(");
+  const j = te.indexOf("\nexport function ", i + 1);
+  return i >= 0 ? codeOnly(te.slice(i, j > i ? j : te.length)) : "";
 })();
-ok("读到了 modelFailureText（自检）", mft.includes("const badRequest ="));
+ok("读到了 modelFailureText（自检）", mft.includes('tier === "badRequest"'));
+ok("index.mjs 用的是 turn_errors.mjs 那一份（没有留一份本地副本）",
+  /^import \{ modelFailureText,[^}]*\} from "\.\/turn_errors\.mjs";$/m.test(idx)
+  && !idx.includes("function modelFailureText("));
 ok("modelFailureText 不再说「输入框上方」/ above the input box",
   !mft.includes("输入框上方") && !/above the input box/.test(mft));
-ok("modelFailureText 中英各两处都指到输入框右下角（transient + badRequest）",
-  (mft.match(/输入框右下角/g) || []).length === 2
-  && (mft.match(/at the bottom right of the input box/g) || []).length === 2);
+ok("modelFailureText 中英各三处都指到输入框右下角（transient + timeout + badRequest）",
+  (mft.match(/输入框右下角/g) || []).length === 3
+  && (mft.match(/at the bottom right of the input box/g) || []).length === 3);
 ok("modelFailureText 不点名具体模型（选择器里列的都是管理员启用的）",
   !/Claude|Sonnet|Opus|Kimi|Grok|GLM|GPT|DeepSeek|Nova/.test(mft));
 const idxCode = codeOnly(idx);

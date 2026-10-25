@@ -85,6 +85,32 @@ describe("the notification -> deep dive wiring", () => {
   // ④ 第一条消息是 startFromNotification 自动发的，此时新会话可能还没 flush 进 state；
   //    handleSend 必须从传入的 target 读开关，否则开关显示为开、实际仍走普通问答。
   it("handleSend reads the flag off the target conversation first", () => {
-    expect(chatAppSrc).toMatch(/devopsAgentDirect:\s*targetConv\?\.devopsAgentDirect\s*\?\?/);
+    // 2026-10-23 起本轮的值先取进 sendDeepDirect（finally 里也要用它），streamChat 发的就是它。
+    expect(chatAppSrc).toMatch(/const sendDeepDirect = targetConv\?\.devopsAgentDirect\s*\?\?/);
+    expect(chatAppSrc).toMatch(/devopsAgentDirect:\s*sendDeepDirect\b/);
+  });
+});
+
+// ⑤ 「深度调查」只管这一轮（待办 #34，用户 2026-10-23：「只管这一轮，跑完自动关」）。
+//    2026-10-21 现网实测：跑完一次调查后开关还开着，接着说「针对上面的问题开一个案例」又成了
+//    一次新的深度调查。落盘那一半由 convMode.test.ts 钉；这里钉 ChatApp 的两处接线 —— 都是手工
+//    同步的，类型系统管不到"忘了关"。
+describe("deep dive is per-turn", () => {
+  it("handleSend switches it off in finally, whatever way the turn ended", () => {
+    const start = chatAppSrc.indexOf("const handleSend = async");
+    expect(start, "找不到 handleSend").toBeGreaterThan(-1);
+    const fin = chatAppSrc.indexOf("} finally {", start);
+    expect(fin, "handleSend 里找不到 finally").toBeGreaterThan(-1);
+    const body = chatAppSrc.slice(fin, chatAppSrc.indexOf("\n  };\n", fin));
+    expect(body, "finally 里没有按本轮的开关去关「深度调查」").toContain("if (sendDeepDirect || sendDevopsAgent)");
+    expect(body).toContain("devopsAgentDirect: false, devopsAgent: false");
+    // 对话对象（DevOps 对话 / STAROps）不能跟着被关：那是"这段对话谁在答"，不是一轮的开关。
+    expect(body).not.toMatch(/devopsChat:\s*false|starops:\s*false/);
+  });
+
+  it("the topic landing page resets its draft after starting the conversation", () => {
+    expect(chatAppSrc).toMatch(
+      /startFromNotification\(text, topicKey, \{ \.\.\.lt\(topicKey\), accountId: dashAccountId \}, skillId\);[\s\S]{0,400}?setLt\(topicKey, \{ devopsAgent: false, devopsAgentDirect: false \}\)/,
+    );
   });
 });

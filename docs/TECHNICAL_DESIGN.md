@@ -2,7 +2,7 @@
 
 > 🌐 **Language**: [中文](TECHNICAL_DESIGN.md) · [English](TECHNICAL_DESIGN.en.md)
 >
-> **一句话定位**:一个 **只读的 Web Chat 运维控制台** 为主入口 —— 在浏览器里直接和 AWS 运维 agent(Strands / Bedrock **AgentCore Runtime**)对话,做调查 / FinOps / 案例 / Skills,对客户基础设施只读、绝不改环境(唯一的写操作是用户确认过的 AWS Support 工单);作为必要补充,同时把 **AWS DevOps Agent**(AWS 推出的 agentic 调查服务,`aidevops` API)接入企业 IM(飞书 / Slack / 钉钉),让用户在告警群里 `@bot 一句话` 也能调起调查、看实时进度、收到本地化报告 —— **不再需要登陆 AWS 控制台**。
+> **一句话定位**:**只读、可追溯的云上 Agentic AI 助手**,以 **Web Chat** 为主入口 —— 在浏览器里直接和 AWS 运维 agent(Strands / Bedrock **AgentCore Runtime**)对话,做调查 / FinOps / 案例 / Skills,对客户基础设施只读、绝不改环境(唯一的写操作是用户确认过的 AWS Support 工单);作为必要补充,同时把 **AWS DevOps Agent**(AWS 推出的 agentic 调查服务,`aidevops` API)接入企业 IM(飞书 / Slack / 钉钉),让用户在告警群里 `@bot 一句话` 也能调起调查、看实时进度、收到本地化报告 —— **不再需要登陆 AWS 控制台**。
 
 **版本**:v1.3 · 2026-06-10
 
@@ -249,7 +249,7 @@ L2 被两类调用方共用 —— IM worker Lambda / 后台 Lambda(CDK 打包�
 | **前端** | React / Vite(静态托管) | 主题导航、聊天 UI、右侧面板、模型 / 账号 / 联网开关;`config.json` 注入 `chatApiBase` + cognito + `identityPoolId` |
 | **BFF** | Node.js 24 Lambda + Function URL(`notiops-web-chat-bff`) | Function URL 响应流式返回 SSE;转发对话到 AgentCore Runtime;暴露确定性端点(建案执行 `/actions/execute`、服务目录 `/support/services`、通知收件箱读取) |
 | **Agent** | Bedrock AgentCore Runtime(Strands agent) | 单 agent + 工具 + 主题聚焦层;`investigate_live` 流式调查;`create_case_from_template` 确定性建案;严格只读 |
-| **通知 Handler** | Lambda(`notiops-web-notif-handler`) | 接 EventBridge 事件源,复用 `core/push_event` normalizer + 5min 去重,写 DDB `notif#` 段(持久化收件箱) |
+| **通知 Handler** | Lambda(`notiops-web-notif-handler`) | 接 EventBridge 事件源,复用 `core/push_event` normalizer + 去重(同一事件 5 分钟、Trusted Advisor 24 小时;同一次投递的重投 24 小时),写 DDB `notif#` 段(持久化收件箱) |
 | **存储 / 基建** | CDK `WebChatStack` | DynamoDB 单表 `notiops-web-chat`;BFF Lambda + Function URL(`AWS_IAM`) |
 
 #### 2.4.3 鉴权链路(Cognito + SigV4)
@@ -414,7 +414,8 @@ AWS 事件源(EventBridge)
         ▼ EventBridge 规则
 notiops-web-notif-handler(Lambda)
         │ 复用 core/push_event normalizer
-        │ 5 分钟去重
+        │ 去重:同一事件 5 分钟(Trusted Advisor 24 小时)
+        │       同一次投递的重投 24 小时
         ▼
 DynamoDB 单表 notiops-web-chat · notif# 段
   · 90 天 TTL
@@ -1785,7 +1786,7 @@ notiops/
 │   └── NotiOpsWebChat/                #   agentcore.json 的 codeLocation 指向 app/NotiOpsWebChat/,
 │                                      #   scripts/deploy_agent.sh 只 cd 到这里跑 `agentcore deploy`
 ├── bff/web-chat/                      # ★ Web Chat BFF(Node.js;Lambda Function URL,AWS_IAM + SSE)
-│   └── preset-skills/                 # ★ 11 个预置 skill 源码(author=notiops-system,随代码打包)
+│   └── preset-skills/                 # ★ 12 个预置 skill 源码(author=notiops-system,随代码打包)
 ├── frontend/chat-app/                 # ★ Web Chat 前端(React 19 + Vite,自写组件)
 ├── config/                            # 配置单一真源(capabilities / LLM 模型目录种子 / EOL 兜底表)
 ├── platforms/

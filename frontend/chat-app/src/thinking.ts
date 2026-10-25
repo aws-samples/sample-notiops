@@ -51,6 +51,24 @@ export function isWaitHint(kind?: string): boolean {
   return kind === "coldstart" || kind === "working";
 }
 
+/**
+ * 「镜像」进度行（kind=mirror，`bff/web-chat/devops_chat.mjs::makeSink().mirror`）：同一句话刚作为
+ * 过程行（investigation_step）进过时间线，这一条只用来刷新气泡里的等待行 → **不再记一次**。
+ * 以前 DevOps 对话的每个阶段名都在面板里出现两次（同文同类合成「×2」），摘要那条更是 400 字与
+ * 120 字截断各一行（#32 ②）。
+ */
+export const MIRROR_KIND = "mirror";
+
+/**
+ * 气泡等待行的文字：去掉进度文字末尾自带的省略号，没有进度时用 `fallback`。等待行后面紧跟一个会动的
+ * 「…」（`.tk-dots`），而 BFF / agent 发来的进度大多自带「…」（「DevOps Agent 正在思考…」
+ * 「Connecting to DevOps Agent…」），拼起来就是「……」（#32 ②）。
+ */
+export function waitingText(progress: string | undefined, fallback: string): string {
+  const s = (progress || "").replace(/(?:\s*(?:…|\.\.\.))+\s*$/u, "").trimEnd();
+  return s || fallback;
+}
+
 const cap = (arr: TimelineStep[]): TimelineStep[] =>
   arr.length > MAX_THINKING_STEPS ? arr.slice(arr.length - MAX_THINKING_STEPS) : arr;
 
@@ -65,7 +83,7 @@ export function appendStep(
 ): TimelineStep[] {
   const text = (step?.text || "").trim();
   if (!text) return steps as TimelineStep[];
-  if (isWaitHint(step?.kind)) return steps as TimelineStep[];
+  if (isWaitHint(step?.kind) || step?.kind === MIRROR_KIND) return steps as TimelineStep[];
 
   const kind = (step.kind === "tool" || step.kind === "result" || step.kind === "thought"
     ? step.kind

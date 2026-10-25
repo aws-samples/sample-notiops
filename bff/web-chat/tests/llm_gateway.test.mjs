@@ -142,7 +142,7 @@ const okChat = () => resp(200, { id: "x", object: "chat.completion", choices: [{
 
 function seedGateway() {
   state.secrets[GW_SECRET] = JSON.stringify({ base_url: BASE, api_key: KEY });
-  state.dns["gw.example.com"] = ["203.0.113.10"];
+  state.dns["gw.example.com"] = ["93.184.216.34"];
 }
 /** TO_GATEWAY() 把 IM 放到 Bedrock API Key 上：那几条要真有一把 Key —— 没有 Key 时服务端按 not_configured
  *  拦（不再回退部署角色去探，见 IM 那一节）。 */
@@ -190,6 +190,12 @@ const NORMALISE = [
   ["https://169.254.169.254/latest", ""],
   ["https://[::1]/v1", ""],
   ["https://foo.localhost/v1", ""],
+  // 三层同一份名单之后（待办 #3）以前至少一层放行的：*.internal / *.local、文档网段、换算后落到公网的数字写法
+  ["https://svc.internal/v1", ""],
+  ["https://printer.local/v1", ""],
+  ["https://203.0.113.10/v1", ""],
+  ["https://0x08.0x08.0x08.0x08/v1", ""],
+  ["https://93.184.216.34", "https://93.184.216.34/v1"],
 ];
 await t("normalizeGatewayBaseUrl follows the shared table", async () => {
   for (const [raw, want] of NORMALISE) {
@@ -247,11 +253,49 @@ await t("listing maps upstream failures to enums", async () => {
 
 await t("listing refuses a host that resolves to a private address", async () => {
   seedGateway();
-  state.dns["gw.example.com"] = ["203.0.113.10", "10.1.2.3"];
+  state.dns["gw.example.com"] = ["93.184.216.34", "10.1.2.3"];
   state.route = () => okModels(["gpt-4o-mini"]);
   const r = await mod.apiGetGatewayModels();
   assert.equal(r.status, 400, JSON.stringify(r));
   assert.equal(state.fetchCalls.length, 0, "must not even connect");
+});
+
+/* 响应体上限（待办 #3）：没有 Content-Length 时以前先整个读完再比长度 —— 一个一直往里灌的网关
+ * 能把 BFF 撑到超时 / 爆内存。现在边读边数，超了就掐断连接。 */
+function endless(chunkBytes, counter) {
+  return new ReadableStream({
+    pull(c) { counter.pulls += 1; c.enqueue(new Uint8Array(chunkBytes).fill(0x20)); },
+    cancel() { counter.cancelled = true; },
+  });
+}
+await t("an endless body without Content-Length is cut off at the cap, not read to the end", async () => {
+  const counter = { pulls: 0, cancelled: false };
+  const r = { status: 200, ok: true, headers: { get: () => null }, body: endless(4, counter),
+              async text() { throw new Error("must stream, not buffer"); } };
+  await assert.rejects(mod.readTextCapped(r, 10), (e) => e.name === "TooLarge");
+  assert.ok(counter.pulls <= 4, `read ${counter.pulls} chunks for a 10-byte cap`);
+  assert.equal(counter.cancelled, true, "the connection is cancelled, not left streaming");
+});
+await t("a streamed body under the cap is read whole (multi-byte text survives chunk splits)", async () => {
+  const bytes = new TextEncoder().encode(JSON.stringify({ data: [{ id: "模型-gpt-4o-mini" }] }));
+  const r = { status: 200, ok: true, headers: { get: () => null },
+              body: new ReadableStream({ start(c) { c.enqueue(bytes.slice(0, 13)); c.enqueue(bytes.slice(13)); c.close(); } }) };
+  assert.deepEqual(JSON.parse(await mod.readTextCapped(r, 1024)), { data: [{ id: "模型-gpt-4o-mini" }] });
+});
+await t("listing gives bad_response (not a hang) when the gateway streams past 5 MB", async () => {
+  seedGateway();
+  const counter = { pulls: 0, cancelled: false };
+  state.route = () => ({ status: 200, ok: true, headers: { get: () => null }, body: endless(1024 * 1024, counter) });
+  const r = await mod.apiGetGatewayModels();
+  assert.equal(r.result, "bad_response", JSON.stringify(r));
+  assert.ok(counter.pulls <= 7 && counter.cancelled, JSON.stringify(counter));
+});
+await t("a declared Content-Length over the cap is refused before reading", async () => {
+  const counter = { pulls: 0, cancelled: false };
+  const r = { status: 200, ok: true, headers: { get: (k) => (k === "content-length" ? String(6 * 1024 * 1024) : null) },
+              body: endless(4, counter) };
+  await assert.rejects(mod.readTextCapped(r), (e) => e.name === "TooLarge");
+  assert.equal(counter.pulls <= 1, true, `pulled ${counter.pulls}`);
 });
 
 await t("listing without saved settings is a 409, not a crash", async () => {
@@ -263,7 +307,7 @@ console.log("PUT /admin/llm-config/gateway");
 
 await t("saving validates with GET /models first and stores the normalised base", async () => {
   state.item = { PK: "llmcfg", SK: "meta", ...CFG(), generation: 1000, bedrock_key_set_by: "someone" };
-  state.dns["gw.example.com"] = ["203.0.113.10"];
+  state.dns["gw.example.com"] = ["93.184.216.34"];
   state.route = () => okModels(["gpt-4o-mini", "*"]);
   const r = await mod.apiPutGateway({ base_url: "https://gw.example.com/", api_key: ` ${KEY} ` }, ACTOR);
   assert.equal(r.error, undefined, JSON.stringify(r));
@@ -284,7 +328,7 @@ const tagsOf = (input) => Object.fromEntries((input.Tags || []).map((x) => [x.Ke
 
 await t("first gateway save without a pre-created secret creates it with the mandatory tags", async () => {
   state.item = { PK: "llmcfg", SK: "meta", ...CFG(), generation: 1000 };
-  state.dns["gw.example.com"] = ["203.0.113.10"];
+  state.dns["gw.example.com"] = ["93.184.216.34"];
   state.route = () => okModels(["gpt-4o-mini"]);
   const r = await mod.apiPutGateway({ base_url: BASE, api_key: KEY }, ACTOR);
   assert.equal(r.error, undefined, JSON.stringify(r));
@@ -303,7 +347,7 @@ await t("first Bedrock API key save without a pre-created secret creates it with
 });
 
 await t("a rejected key is not saved", async () => {
-  state.dns["gw.example.com"] = ["203.0.113.10"];
+  state.dns["gw.example.com"] = ["93.184.216.34"];
   state.route = () => resp(401, { error: { message: "Invalid proxy server token passed" } });
   const r = await mod.apiPutGateway({ base_url: BASE, api_key: KEY }, ACTOR);
   assert.equal(r.status, 400);
@@ -312,7 +356,7 @@ await t("a rejected key is not saved", async () => {
 });
 
 await t("bad inputs are rejected before any network call", async () => {
-  state.dns["gw.example.com"] = ["203.0.113.10"];
+  state.dns["gw.example.com"] = ["93.184.216.34"];
   state.route = () => okModels(["gpt-4o-mini"]);
   for (const body of [
     { base_url: "http://gw.example.com/v1", api_key: KEY },
@@ -347,7 +391,7 @@ await t("omitting api_key keeps the stored key only for the same host", async ()
 
 await t("a new host never receives the stored key (must re-enter it)", async () => {
   seedGateway();
-  state.dns["attacker.example.net"] = ["203.0.113.99"];
+  state.dns["attacker.example.net"] = ["93.184.216.99"];
   state.route = () => okModels(["gpt-4o-mini"]);
   const r = await mod.apiPutGateway({ base_url: "https://attacker.example.net/v1" }, ACTOR);
   assert.equal(r.status, 400, JSON.stringify(r));
@@ -359,7 +403,7 @@ await t("a new host never receives the stored key (must re-enter it)", async () 
 await t("re-pointing the active gateway must still serve its default model", async () => {
   seedGateway();
   state.item = { PK: "llmcfg", SK: "meta", ...TO_GATEWAY(), generation: 1000 };
-  state.dns["gw2.example.com"] = ["203.0.113.11"];
+  state.dns["gw2.example.com"] = ["93.184.216.35"];
   state.route = () => okModels(["claude-opus-4-7"]);         // New API 风格的名字，对不上
   const r = await mod.apiPutGateway({ base_url: "https://gw2.example.com/v1", api_key: KEY }, ACTOR);
   assert.equal(r.status, 409, JSON.stringify(r));
@@ -377,7 +421,7 @@ await t("re-pointing the active gateway must still serve its default model", asy
 await t("a gateway change whose generation bump fails is still audited and reported, not silently 'saved'", async () => {
   seedGateway();
   state.item = { PK: "llmcfg", SK: "meta", ...CFG(), generation: 1000 };
-  state.dns["gw2.example.com"] = ["203.0.113.11"];
+  state.dns["gw2.example.com"] = ["93.184.216.35"];
   state.route = () => okModels(["gpt-4o-mini"]);
   state.failCondition = 2;                        // 首次与重试都撞上并发写
   const r = await mod.apiPutGateway({ base_url: "https://gw2.example.com/v1", api_key: KEY }, ACTOR);
@@ -406,7 +450,7 @@ await t("an invalid stored base_url is reported as host only", async () => {
 });
 
 await t("a redirecting gateway is refused (no SSRF via 30x, key not forwarded)", async () => {
-  state.dns["gw.example.com"] = ["203.0.113.10"];
+  state.dns["gw.example.com"] = ["93.184.216.34"];
   state.route = () => resp(302, "");
   const r = await mod.apiPutGateway({ base_url: BASE, api_key: KEY }, ACTOR);
   assert.equal(r.status, 400);
@@ -415,7 +459,7 @@ await t("a redirecting gateway is refused (no SSRF via 30x, key not forwarded)",
 
 await t("the gateway_rev bump retries once on a concurrent save", async () => {
   state.item = { PK: "llmcfg", SK: "meta", ...CFG(), generation: 1000 };
-  state.dns["gw.example.com"] = ["203.0.113.10"];
+  state.dns["gw.example.com"] = ["93.184.216.34"];
   state.route = () => okModels(["gpt-4o-mini"]);
   state.failCondition = 1;
   const r = await mod.apiPutGateway({ base_url: BASE, api_key: KEY }, ACTOR);
@@ -878,6 +922,63 @@ await t("a Bedrock key secret read failure on the IM probe only warns", async ()
     assert.match(r.warning || "", /IM default moonshot-kimi-k3 could not be verified right now \(error\)/);
     assert.equal(state.item.credential_mode, "gateway");
   } finally { fakeSm.send = realSend; }
+});
+
+/* 待办 #8：没装 IM 的纯网页部署（典型是本账号压根没开 Bedrock）以前存不上网关 —— 保存永远被
+ * 「IM default … failed a live check」拦下。现在先看 IM 入口 HTTP API 在不在（与「集成 IM」抽屉找
+ * webhook 地址同一个判据）；查不清时照旧探。 */
+function fakeAgw(names, { fail = false } = {}) {
+  const calls = { n: 0 };
+  return { calls, async send() { calls.n += 1; if (fail) throw Object.assign(new Error("x"), { name: "AccessDeniedException" });
+                                  return { Items: names.map((Name) => ({ Name, ApiEndpoint: "https://x.execute-api" })) }; } };
+}
+async function withImPrefix(agw, fn) {
+  const prev = process.env.IM_INGRESS_API_NAME_PREFIX;
+  process.env.IM_INGRESS_API_NAME_PREFIX = "notiops-im-ingress-";
+  mod.__setClients({ agw });
+  try { await fn(); } finally {
+    if (prev === undefined) delete process.env.IM_INGRESS_API_NAME_PREFIX; else process.env.IM_INGRESS_API_NAME_PREFIX = prev;
+  }
+}
+
+await t("web-only deployment (no IM ingress API): moving the gateway on top skips the IM Bedrock probe", async () => {
+  seedGateway(); seedBedrockKey();
+  state.item = { PK: "llmcfg", SK: "meta", ...CFG(), generation: 1000 };
+  state.route = () => okChat();
+  state.converseError = "AccessDeniedException";              // 本账号没开 Bedrock：探到就会 400
+  const agw = fakeAgw(["some-other-api", "notiops-im-ingress-feishu-old"]);
+  await withImPrefix(agw, async () => {
+    const r = await mod.apiPutLlmConfig(TO_GATEWAY(), ACTOR);
+    assert.equal(r.error, undefined, JSON.stringify(r));
+    assert.equal(state.item.credential_mode, "gateway", "the gateway is saved on top");
+    assert.ok(!/IM default/.test(r.warning || ""), r.warning);
+    assert.equal(agw.calls.n, 1);
+  });
+});
+
+await t("IM deployed (an ingress API exists): the IM Bedrock probe still blocks a deterministic failure", async () => {
+  seedGateway(); seedBedrockKey();
+  state.item = { PK: "llmcfg", SK: "meta", ...CFG(), generation: 1000 };
+  state.route = () => okChat();
+  state.converseError = "AccessDeniedException";
+  await withImPrefix(fakeAgw(["notiops-im-ingress-slack"]), async () => {
+    const r = await mod.apiPutLlmConfig(TO_GATEWAY(), ACTOR);
+    assert.equal(r.status, 400, JSON.stringify(r));
+    assert.equal(r.probe?.source, "api_key");
+    assert.equal(state.item.credential_mode, "iam", "nothing changed");
+  });
+});
+
+await t("cannot tell whether IM is deployed (GetApis fails): probe as before — the safe direction", async () => {
+  seedGateway(); seedBedrockKey();
+  state.item = { PK: "llmcfg", SK: "meta", ...CFG(), generation: 1000 };
+  state.route = () => okChat();
+  state.converseError = "AccessDeniedException";
+  await withImPrefix(fakeAgw([], { fail: true }), async () => {
+    const r = await mod.apiPutLlmConfig(TO_GATEWAY(), ACTOR);
+    assert.equal(r.status, 400, JSON.stringify(r));
+    assert.equal(r.probe?.result, "forbidden");
+  });
 });
 
 await t("testing the api_key source without a key says so instead of using the role", async () => {

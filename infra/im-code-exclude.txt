@@ -1,7 +1,12 @@
 # IM Lambda 代码包（ingress / worker / progress）的**排除清单** —— 两条部署路径共用。
 #
-#   · 方式B（setup.sh / CDK）：infra/lib/im-stack.ts 读本文件，喂给
-#     `lambda.Code.fromAsset("../", { exclude })`。
+# ⚠️ 2026-10-23 起（待办 #36）两条路径都**先按允许清单取包**（infra/lambda-code-packages.json 的
+# assets.im.packages：core / platforms / shared / inspection / devops_agent_callback），本文件只负责
+# 剪掉包**里面**的杂项（*.md、Dockerfile、点文件……）。下面按顶层目录写的条目（frontend/**、dist/**…）
+# 在允许清单之下已经碰不到东西，留着是方式A 打包器的哨兵（build_im_zips.py 的 SENTINEL_PATTERNS）。
+#
+#   · 方式B（setup.sh / CDK）：infra/lib/im-stack.ts 读本文件，追加在允许清单的模式表之后
+#     （`repoRootCode("im", exclude)`，见 infra/lib/repo-root-code.ts）。
 #   · 方式A（一键 CloudFormation）：scripts/build_im_zips.py 读本文件，按同一套语义
 #     打出 im-code.zip 挂到 GitHub Release，由 StagerFn 搬进客户账号。
 #

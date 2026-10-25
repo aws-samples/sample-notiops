@@ -9,12 +9,13 @@
 
 ![NotiOps web console](docs/screenshot-web-en.png)
 
-**NotiOps** is AWS sample code for a **read-only cloud operations console** — a
-browser-based chat app where an engineer asks about their AWS environment in
-plain language and gets back a near real-time, cited answer: incident
-investigations with a root-cause narrative, cost/FinOps analysis, resource
-health inspection, and full AWS Support case management — all without leaving
-the web UI or touching the AWS Console.
+**NotiOps** is AWS sample code for a
+**read-only, traceable agentic AI assistant for your cloud**. Its primary
+surface is a browser-based chat app where an engineer asks about their AWS
+environment in plain language and gets back a near real-time, cited answer:
+incident investigations with a root-cause narrative, cost/FinOps analysis,
+resource health inspection, and full AWS Support case management — all without
+leaving the web UI or touching the AWS Console.
 
 The same assistant is also available **inside your team's chat tools (Slack /
 Feishu / DingTalk)**: `@mention` the bot in an alert channel to run an
@@ -264,7 +265,7 @@ mode comparison and how to switch — see
 | Bring your own CUR data source (4 dashboard sheets + ask about that bill in chat) | ✅ optional, off by default (pick `ProvisionCur=yes` or fill in `CurTable` when creating the stack), see note ⁵ | ✅ optional, off by default (turn it on explicitly: `COST_MCP_SELF_HOST=true ./setup.sh`), see note ⁵ |
 | **Cases and Skills** | | |
 | Full AWS Support case management (multi-account: pick the target account right on the case form) | ✅ | ✅ |
-| 11 bundled Skills + your own | ✅ | ✅ |
+| 12 bundled Skills + your own | ✅ | ✅ |
 | Publish a Skill to DevOps Agent | ✅ see note ¹ | ✅ |
 | **Models** | | |
 | Multi-LLM switching + model catalogue | ✅ | ✅ |
@@ -504,7 +505,8 @@ mode the `DataRetentionOnDelete` output names these too); see
   you to type `DELETE EVERYTHING`).
   ⚠️ On this path the data bucket `notiops-data-<account>-<region>` is destroyed with
   the stack (your Skills and saved reports live there), so the script **syncs it to a
-  local backup directory first** — pass `--no-backup` to skip that.
+  local backup directory first** (`~/notiops-teardown-backup-<timestamp>/` by default, outside the
+  repository; `--backup-dir` changes it) — pass `--no-backup` to skip that.
   If you have deployed **both** options into the same account and Region: they use the
   same resource names, so before emptying a bucket or deleting a table the script asks
   CloudFormation which stack owns it and **skips anything owned by the one-click stack**

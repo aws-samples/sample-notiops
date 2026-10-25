@@ -142,6 +142,8 @@ def _normalize(payload: dict) -> ImMessage | None:
     pre_locale, _ = locale_resolver.resolve(
         user_id=user_id, platform=PLATFORM, is_dm=is_dm,
         thread_root_id="", text="",
+        # 命令里带中文(`/调查 …`、「确认」)就认 zh —— 只朝这一个方向(待办 #32 ③,见 resolve 的说明)
+        zh_hint=raw_text,
     )
     return ImMessage(
         platform=PLATFORM,

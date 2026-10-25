@@ -95,6 +95,11 @@ export async function appendMessage(conversationId, msg) {
         // 必须逐轮落而不是读当前配置 —— 管理员换过员工之后,历史回复要仍显示**当时**那一个。
         // 不是凭据(`/features/starops` 本来就回给任何已登录用户)；workspace 才是敏感值,不落这里。
         starops_employee: msg.staropsEmployee || msg.starops_employee,
+        // 这一轮是哪个引擎答的（agent / deep-direct / devops-chat / starops），以及直连深度调查的编号
+        // `{ task_id, execution_id }`。用途：下一次轮到 agent 回答时，把它没见过的直连轮次带给它
+        // （direct_context.mjs，待办 #33）。`via` 只管署名、分不出「直连深度调查」和「agent」，所以另起一个字段。
+        path: msg.path,
+        investigation: msg.investigation,
         ttl: ttl(),
       },
     }),
@@ -179,9 +184,9 @@ const HISTORY_LIMIT = Number(process.env.WEB_CHAT_HISTORY_LIMIT || "400");
  * 有人改了 WEB_CHAT_HISTORY_LIMIT 之后界面就开始报一个假数字 —— 而报假数字正是这次
  * 要修的病本身。
  */
-export async function listMessages(conversationId, limit) {
-  const cap = Number(limit) > 0 ? Number(limit) : HISTORY_LIMIT;
-  const r = await ddb.send(
+/** 倒序取最近 cap 条消息（只发一次 Query）。`listMessages` 与 `listMessagesForContext` 共用。 */
+function queryLatestMessages(conversationId, cap) {
+  return ddb.send(
     new QueryCommand({
       TableName: TABLE,
       KeyConditionExpression: "PK = :pk AND begins_with(SK, :sk)",
@@ -190,6 +195,24 @@ export async function listMessages(conversationId, limit) {
       Limit: cap,
     }),
   );
+}
+
+/**
+ * 只给服务端自己用的读法（不回前端）：时间正序的最近 cap 条，带上 `path` / `investigation`。
+ * 用途是挑出 agent 没见过的直连轮次（direct_context.mjs，待办 #33）。
+ * 为什么不直接加进 `listMessages`：那份投影是回给前端的**允许清单**（store_history_pagination
+ * 测试钉着），前端用不着这两个字段，execution_id 也是 2026-09-03 起刻意不再给人看的编号。
+ */
+export async function listMessagesForContext(conversationId, cap = 20) {
+  const r = await queryLatestMessages(conversationId, Number(cap) > 0 ? Number(cap) : 20);
+  return (r.Items || [])
+    .map((i) => ({ role: i.role, text: i.text, via: i.via, path: i.path, investigation: i.investigation }))
+    .reverse();
+}
+
+export async function listMessages(conversationId, limit) {
+  const cap = Number(limit) > 0 ? Number(limit) : HISTORY_LIMIT;
+  const r = await queryLatestMessages(conversationId, cap);
   const messages = (r.Items || [])
     .map((i) => ({ role: i.role, text: i.text, ts: i.ts, model: i.model, sources: i.sources, usage: i.usage, account_id: i.account_id, via: i.via, starops_employee: i.starops_employee }))
     .reverse(); // 翻回时间正序，前端与 agent 的上下文都按正序消费
@@ -285,6 +308,98 @@ export async function clearStarOpsThread(conversationId) {
     TableName: TABLE,
     Key: { PK: `conv#${conversationId}`, SK: "sochat" },
   }));
+}
+
+/* ───────── 进行中的 agent 轮次（待办 #30 第 ③ 档）─────────
+ * 同一个会话同一时间只能跑一轮：runtime 里 agent 按会话缓存，strands 的 Agent 有一把调用锁，
+ * 上一轮没结束时下一句只会撞上 `ConcurrencyException`。BFF 在调 runtime **之前**先占这一行：
+ *   · 占不到 = 上一轮还在跑 → 直接走「会话忙」，不再去撞锁（runtime 换了 microVM、锁不在时
+ *     这是唯一能挡住同一会话两轮并发写同一份 Memory 的地方）；
+ *   · 前端刷新后靠它知道「上一轮还在生成」（`GET /conversations/{id}/turn`），轮询到它消失再拉消息；
+ *   · 「停止」靠它找到要停的那一轮，并在行上记一笔 `stopRequested`，让还活着的那个 BFF 调用
+ *     把落库的回答标成「已停止」，而不是「中途断了」。记了 stopRequested 的行**马上可以被下一轮接手**：
+ *     runtime 会话已经停了（StopRuntimeSession），用户点完停止紧接着发下一句不该撞「会话忙」。
+ * SK 固定 `turn`，放消息分区（同 dachat / sochat：不占 msg# 段、删会话时一起清）。
+ * 条件里自己比 `expiresAt`（毫秒），不靠 DDB 的 TTL：TTL 删除是尽力而为、没有时限保证 ——
+ * BFF 被 Lambda 超时杀掉时走不到 release，得靠它让这一行在持有者死后自动失效（同 IM 的 imlease#）。
+ */
+// BFF Lambda 超时 15 分钟（web-chat-core.ts）+ 30 秒余量：活着的持有者一定在这之前 release。
+export const TURN_MAX_MS = 15 * 60 * 1000 + 30 * 1000;
+// 「停止」之后给还活着的那个调用留的收尾时间（runtime 会话被停掉后它几秒内就会走到 finally）。
+export const TURN_STOP_GRACE_MS = 30 * 1000;
+const turnKey = (conversationId) => ({ PK: `conv#${conversationId}`, SK: "turn" });
+
+/** 占下「这个会话现在有一轮在跑」。返回 `{claimed:true}`，或 `{claimed:false, inflight}`（上一轮的
+ *  开始时间）。DDB 出错照常抛 —— 调用方 fail-open：并发跑两轮是可恢复的降级，因为 DDB 抖一下
+ *  就不回答用户不是。 */
+export async function claimTurn(conversationId, turnId, { now = Date.now(), maxMs = TURN_MAX_MS } = {}) {
+  try {
+    await ddb.send(new PutCommand({
+      TableName: TABLE,
+      Item: {
+        ...turnKey(conversationId), turnId, startedAt: now, expiresAt: now + maxMs,
+        // DDB TTL 只管最后的清扫（秒）；判据是上面的 expiresAt。
+        ttl: Math.floor((now + maxMs) / 1000) + 86400,
+      },
+      ConditionExpression: "attribute_not_exists(PK) OR expiresAt < :now OR stopRequested = :y",
+      ExpressionAttributeValues: { ":now": now, ":y": true },
+    }));
+    return { claimed: true };
+  } catch (e) {
+    if (e?.name !== "ConditionalCheckFailedException") throw e;
+    return { claimed: false, inflight: await getInflightTurn(conversationId, { now }).catch(() => null) };
+  }
+}
+
+/** 这一轮结束了（答完 / 失败 / 被停）。只删**自己**那一行：过期后被别的调用接手的行不归我删。 */
+export async function releaseTurn(conversationId, turnId) {
+  try {
+    await ddb.send(new DeleteCommand({
+      TableName: TABLE,
+      Key: turnKey(conversationId),
+      ConditionExpression: "turnId = :t",
+      ExpressionAttributeValues: { ":t": turnId },
+    }));
+  } catch (e) {
+    if (e?.name !== "ConditionalCheckFailedException") throw e;
+  }
+}
+
+/** 进行中的那一轮：`{startedAt, stopRequested}`；没有、或已过期 → null。强一致读：前端轮询的
+ *  「上一轮结束了」要和随后拉到的消息对得上（BFF 先落库、再 release）。 */
+export async function getInflightTurn(conversationId, { now = Date.now() } = {}) {
+  const r = await ddb.send(new GetCommand({ TableName: TABLE, Key: turnKey(conversationId), ConsistentRead: true }));
+  const i = r?.Item;
+  if (!i || !(Number(i.expiresAt) > now)) return null;
+  return { startedAt: Number(i.startedAt) || 0, stopRequested: Boolean(i.stopRequested) };
+}
+
+/** turn 那一行的原样内容（不看过期）：`{turnId, stopRequested, expiresAt}` 或 null。给持有者自己用 ——
+ *  这一轮结束时判断「我是不是被停掉的」：行上记了 stopRequested，或者行已经被下一轮接手（turnId 不是我的；
+ *  活着的持有者不可能被「过期接手」—— 过期时间长于 Lambda 超时 —— 所以只可能是停止之后被接手）。 */
+export async function getTurnRow(conversationId) {
+  const r = await ddb.send(new GetCommand({ TableName: TABLE, Key: turnKey(conversationId), ConsistentRead: true }));
+  const i = r?.Item;
+  return i ? { turnId: String(i.turnId || ""), stopRequested: Boolean(i.stopRequested), expiresAt: Number(i.expiresAt) || 0 } : null;
+}
+
+/** 用户要停掉进行中的那一轮：记一笔 stopRequested，并把过期时间收短到 `graceMs` 之后 ——
+ *  持有者还活着，它几秒内就会 release；持有者已经死了，这一行也不会再挡 15 分钟。
+ *  没有进行中的一轮 → false。 */
+export async function requestTurnStop(conversationId, { now = Date.now(), graceMs = TURN_STOP_GRACE_MS } = {}) {
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: TABLE,
+      Key: turnKey(conversationId),
+      UpdateExpression: "SET stopRequested = :y, expiresAt = :e",
+      ConditionExpression: "attribute_exists(PK) AND expiresAt > :now",
+      ExpressionAttributeValues: { ":y": true, ":e": now + graceMs, ":now": now },
+    }));
+    return true;
+  } catch (e) {
+    if (e?.name === "ConditionalCheckFailedException") return false;
+    throw e;
+  }
 }
 
 export async function renameConversation(sub, conversationId, title) {
@@ -473,10 +588,11 @@ export async function deleteConversation(sub, conversationId) {
     lastKey = r.LastEvaluatedKey;
   } while (lastKey);
   // 3) 删外部会话句柄（同分区、SK 固定，不在上面 msg# 的扫描范围里）：
-  //    `dachat` = DevOps Agent 的 executionId，`sochat` = 阿里云 STAROps 的 threadId。
+  //    `dachat` = DevOps Agent 的 executionId，`sochat` = 阿里云 STAROps 的 threadId，
+  //    `turn` = 进行中那一轮的标记（待办 #30）。
   //    留着不删的后果：同名 conversationId 极小概率复用时会接到一条陌生的外部对话上。
   //    ⚠️ 新增同类行时必须往这个数组里补一条 —— 分区扫描只覆盖 `msg#`，扫不到它们。
-  for (const sk of ["dachat", "sochat"]) {
+  for (const sk of ["dachat", "sochat", "turn"]) {
     await ddb.send(
       new DeleteCommand({ TableName: TABLE, Key: { PK: `conv#${conversationId}`, SK: sk } }),
     ).catch(() => {});

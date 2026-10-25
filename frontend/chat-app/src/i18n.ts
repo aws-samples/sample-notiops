@@ -2130,6 +2130,11 @@ export const STRINGS: Dict = {
     en: "The STAROps digital employee can make mistakes — verify important conclusions",
   },
   "composer.stop": { zh: "停止生成", en: "Stop generating" },
+  // 「上一轮还在进行」（待办 #30）：消息流末尾的等待提示，后面跟一个「新对话」按钮。{t} = 已等了多久（m:ss）。
+  "turnwait.text": {
+    zh: "⏳ 这个会话的上一轮还在进行中（已 {t}），它结束后回答会自动出现在这里。不想等可以点输入框右下角的停止按钮停掉它，或者换个",
+    en: "⏳ The previous turn in this conversation is still running ({t} so far); its answer will appear here when it finishes. To stop waiting, stop it with the button at the bottom right of the input box, or start a",
+  },
   // "/" 命令菜单
   "cmd.button.hint": { zh: "命令菜单（/）", en: "Command menu (/)" },
   "cmd.typeToFilter": { zh: "输入以筛选…", en: "Type to filter…" },

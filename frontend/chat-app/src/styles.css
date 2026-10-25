@@ -158,6 +158,10 @@ body { background: var(--page); color: var(--text); overflow: hidden; }
 .navitem .ni-caret { margin-left: auto; display: inline-flex; align-items: center; color: var(--sidebar-muted); transition: transform .15s ease; }
 .navitem .ni-caret.open { transform: rotate(90deg); }
 .navitem.expanded { color: var(--sidebar-strong); }
+/* 当前所在的主题 / 页（#32 ⑥）：Sidebar.tsx 一直在给按钮加 `active`，这里以前没有对应样式 ——
+   人站在「成本」页上，侧栏看不出自己在哪。与会话列表 `.conv-wrap.active`、`.lt-btn.active` 同一套底色。 */
+.navitem.active { background: var(--sidebar-hover); color: var(--sidebar-strong); font-weight: 600; }
+.navitem.active .ni-ic { opacity: 1; }
 /* 「更多」子菜单：缩进 + 左侧引导线，视觉从属于「更多」 */
 .sb-submenu { display: flex; flex-direction: column; gap: 1px; margin: 1px 0 2px 20px; padding-left: 9px; border-left: 1px solid var(--sidebar-border); }
 .sb-submenu .subitem { font-size: 13px; padding: 7px 10px; }
@@ -278,6 +282,13 @@ a.um-item:visited { color: var(--text); }
   background: color-mix(in srgb, var(--orange) 8%, transparent);
   border: 1px solid color-mix(in srgb, var(--orange) 32%, var(--line));
   border-radius: 9px; padding: 8px 12px; }
+/* 「上一轮还在进行」（待办 #30）：与 .thread-truncated 同一套提示条样式，后面跟一个「新对话」按钮。 */
+.thread-turnwait { font-size: 12.5px; line-height: 1.6; color: var(--muted);
+  background: color-mix(in srgb, var(--orange) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--orange) 32%, var(--line));
+  border-radius: 9px; padding: 8px 12px; }
+.thread-turnwait button { margin-left: 4px; padding: 0; border: 0; background: none; color: var(--orange);
+  font: inherit; text-decoration: underline; cursor: pointer; }
 .row { display: flex; flex-direction: column; }
 .row.user { align-items: flex-end; }
 .row.bot { align-items: stretch; }

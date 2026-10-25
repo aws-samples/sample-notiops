@@ -320,8 +320,8 @@ echo ""
 # 选择部署 Region
 echo "$(t "请选择部署 Region: " "Select the deployment Region:")"
 echo ""
-echo "  1) ap-northeast-1  $(t "(東京)" "(Tokyo)")"
-echo "  2) us-east-1       $(t "(弗吉尼亚)" "(N. Virginia)")"
+echo "  1) us-east-1       $(t "(弗吉尼亚)" "(N. Virginia)")"
+echo "  2) ap-northeast-1  $(t "(东京)" "(Tokyo)")"
 echo "  3) us-west-2       $(t "(俄勒冈)" "(Oregon)")"
 echo "  4) eu-west-1       $(t "(爱尔兰)" "(Ireland)")"
 echo "  5) ap-southeast-1  $(t "(新加坡)" "(Singapore)")"
@@ -330,14 +330,31 @@ echo ""
 read -p "$(t "请输入选项" "Enter choice") [1-6]($(t "默认" "default") 1): " REGION_CHOICE
 
 case "${REGION_CHOICE:-1}" in
-  1) DEPLOY_REGION="ap-northeast-1" ;;
-  2) DEPLOY_REGION="us-east-1" ;;
+  1) DEPLOY_REGION="us-east-1" ;;
+  2) DEPLOY_REGION="ap-northeast-1" ;;
   3) DEPLOY_REGION="us-west-2" ;;
   4) DEPLOY_REGION="eu-west-1" ;;
   5) DEPLOY_REGION="ap-southeast-1" ;;
   6) read -p "$(t "请输入 Region(如 eu-central-1): " "Enter Region (e.g. eu-central-1): ")" DEPLOY_REGION ;;
-  *) DEPLOY_REGION="ap-northeast-1" ;;
+  *) DEPLOY_REGION="us-east-1" ;;
 esac
+
+# 默认 region 2026-10-15 从 ap-northeast-1 改成 us-east-1(选项 1 / 2 对调)。以前装在东京、重跑 setup.sh
+# 升级时习惯性直接回车的人,会被带去 us-east-1 新装一套 —— 全局唯一的 IAM 角色名一撞,主栈回滚失败。
+# 只在「直接回车 + us-east-1 没有部署 + ap-northeast-1 有部署」这一种情况下问一次(默认 N);
+# 其它情况一个字都不多打。查不到(无权限 / 网络)就当没有,不拦人。
+if [ -z "$REGION_CHOICE" ] \
+   && ! aws cloudformation describe-stacks --region us-east-1 --stack-name NotiOpsBackendStack >/dev/null 2>&1 \
+   && aws cloudformation describe-stacks --region ap-northeast-1 --stack-name NotiOpsBackendStack >/dev/null 2>&1; then
+  echo ""
+  echo "  $(t "⚠️ 默认 region 已从 ap-northeast-1 改成 us-east-1,而 ap-northeast-1 里已经有一套 NotiOps(NotiOpsBackendStack)。" "⚠️ The default region changed from ap-northeast-1 to us-east-1, and ap-northeast-1 already has a NotiOps deployment (NotiOpsBackendStack).")"
+  echo "  $(t "   要升级那一套,请重跑 ./setup.sh 并选 2) ap-northeast-1。" "   To upgrade that deployment, re-run ./setup.sh and choose 2) ap-northeast-1.")"
+  read -p "  $(t "仍要在 us-east-1 新部署一套吗?[y/N]: " "Deploy a new copy in us-east-1 anyway? [y/N]: ")" NEW_DEFAULT_CONFIRM
+  case "${NEW_DEFAULT_CONFIRM:-N}" in
+    [yY]*) ;;
+    *) echo "$(t "  已取消部署" "  Deployment cancelled")"; exit 0 ;;
+  esac
+fi
 
 echo ""
 echo "$(t "部署 Region: " "Deploy Region: ")$DEPLOY_REGION"
@@ -1636,9 +1653,13 @@ PLAT_ARGS="--platform manylinux2014_x86_64 --implementation cp --only-binary=:al
 #      setup.sh（本行）
 #      scripts/build_im_layer.sh 的 BOTO_VERSION
 #      platforms/{feishu,slack,dingtalk}/requirements.txt
-pip install boto3==1.43.65 botocore==1.43.65 -t lambda_layer/python/ --quiet --upgrade $PLAT_ARGS
-pip install "aws-lambda-powertools[aws-sdk]>=3.0.0" -t lambda_layer/python/ --quiet --upgrade $PLAT_ARGS
-pip install "jinja2>=3.1.6" -t lambda_layer/python/ --quiet --upgrade $PLAT_ARGS
+#
+# 🔴 一条命令装完 + `-c scripts/layer-constraints-main.txt`（待办 #37，2026-10-23）。以前是三条分开的
+#    `pip install -t … --upgrade`：`-t` 目录不算「已安装」，每条都重新解析 —— 第二条 powertools 的
+#    aws-sdk extra（`boto3>=1.34.32`）会把第一条钉的 1.43.65 **换成当天最新**（2026-10-22 重建实测
+#    1.43.117），上面那段「不许往下调」的钉版本形同虚设；没钉的传递依赖也是哪天部署就哪天的最新版。
+#    约束文件里是现网这一层逐个读 dist-info 得到的版本，改版本见那个文件头。
+pip install -c "$PROJECT_ROOT/scripts/layer-constraints-main.txt" boto3==1.43.65 botocore==1.43.65 "aws-lambda-powertools[aws-sdk]>=3.0.0" "jinja2>=3.1.6" -t lambda_layer/python/ --quiet --upgrade $PLAT_ARGS
 deactivate
 echo "  $(t "✓ Lambda 依赖安装完成" "✓ Lambda dependencies installed")"
 

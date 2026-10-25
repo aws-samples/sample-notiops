@@ -47,10 +47,19 @@ if [ -z "$STAGED" ]; then
   exit 0
 fi
 
-# `python3`, not `python`: modern macOS has no bare `python`, and a dev
-# shell without the repo .venv activated would fail on it.
+# Interpreter: the repo's own `.venv` first, then `python3` (not bare
+# `python`: modern macOS has none). Why the venv first: on the Cloud
+# Desktop the shell's `python3` is the system 3.9 (other tooling needs it),
+# which cannot parse this repo's 3.12+ syntax — lint_i18n.py then reported
+# parse failures as two "NEW violations" and blocked every .py/.ts commit
+# (待办 #41, 2026-10-22). lint_i18n.py now also refuses to run on a too-old
+# Python with an explicit message instead of fake violations.
 PY=python3
-command -v "$PY" >/dev/null 2>&1 || PY=python
+if [ -x .venv/bin/python ]; then
+  PY=.venv/bin/python
+elif ! command -v "$PY" >/dev/null 2>&1; then
+  PY=python
+fi
 
 # Run the i18n lint on the whole repo (baseline-aware), but if it
 # fails we'll show the user only the new violations they introduced.

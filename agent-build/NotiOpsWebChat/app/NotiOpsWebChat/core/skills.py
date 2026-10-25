@@ -125,6 +125,10 @@ def list_skill_index() -> list[dict]:
                     "skill_id": meta.get("skill_id", sid),
                     "name": meta.get("name", sid),
                     "description": meta.get("description", ""),
+                    # 预置 skill 的中英展示文本 {zh:{name,description}, en:{...}}（BFF skills.mjs 的
+                    # _parseLocalized 落进 meta）。只给相关性闸门用：基础 name/description 是英文，
+                    # 中文提问光靠它们几乎匹配不上（待办 #38 ①）。客户自建的 skill 一般没有这一项。
+                    "i18n": meta.get("i18n") if isinstance(meta.get("i18n"), dict) else None,
                 })
     except Exception as e:  # noqa: BLE001
         logger.warning("skills: list index failed: %s", e)
@@ -275,6 +279,13 @@ def _keywords(text: str) -> set[str]:
     return out
 
 
+def _localized(s: dict, field: str) -> str:
+    """预置 skill 的中英展示文本（`i18n.zh/en.<field>`，见 list_skill_index）拼成一段；没有就是空串。"""
+    i18n = s.get("i18n") if isinstance(s.get("i18n"), dict) else {}
+    return " ".join(str((i18n.get(loc) or {}).get(field) or "") for loc in ("zh", "en")
+                    if isinstance(i18n.get(loc), dict))
+
+
 def relevant_skills(user_text: str, idx: list[dict] | None = None) -> list[dict]:
     """相关性闸门（防误触发的核心，代码层而非靠模型自觉）：只返回**与用户本轮问题
     有实质性关键词重叠**的 skill。无重叠 → 不注入 → 物理上不可能误触发，且省 token。
@@ -292,8 +303,8 @@ def relevant_skills(user_text: str, idx: list[dict] | None = None) -> list[dict]
         return []
     hits = []
     for s in idx:
-        strong = _keywords(f"{s.get('skill_id','')} {s.get('name','')}")  # 区分性信号
-        weak = _keywords(s.get("description", ""))                          # 描述（含通用词）
+        strong = _keywords(f"{s.get('skill_id','')} {s.get('name','')} {_localized(s, 'name')}")  # 区分性信号
+        weak = _keywords(f"{s.get('description', '')} {_localized(s, 'description')}")             # 描述（含通用词）
         if ukw & strong:
             hits.append(s)
         elif len(ukw & weak) >= 2:

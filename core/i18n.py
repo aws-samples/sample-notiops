@@ -1017,6 +1017,24 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "zh": "⏱️(已超过 {sec} 秒,上面是截断到此的部分答案)",
         "en": "⏱️ (cut off at {sec}s — the answer above is partial)",
     },
+    "agent.chat.interrupted": {
+        # 有正文、runtime 又报了错（待办 #30）—— 同上，追加在答案后面，不自带换行/标题。
+        "zh": "⚠️(回答在中途断了:{etype},上面的内容不完整。可以再问一次;"
+              "若反复断在同一处,发 `/model` 换一个模型。)",
+        "en": "⚠️ (The answer was cut off: {etype} — what is above is incomplete. "
+              "Ask again; if it keeps breaking at the same point, send `/model` "
+              "to switch models.)",
+    },
+    "agent.chat.busy": {
+        # 会话忙（待办 #30）：上一轮还在 runtime 里跑，这一句没进 agent。
+        "zh": "⏳ 上一个问题在 NotiOps Agent 那边还没跑完,这一条没有发出去 —— "
+              "同一个会话同一时间只能跑一轮。等几分钟再问;"
+              "急的话先用 `/agent devops` 走 DevOps Agent 直连。",
+        "en": "⏳ The previous question is still running on the NotiOps agent, so this "
+              "one was not sent — a conversation runs one turn at a time. Ask again in "
+              "a few minutes, or use `/agent devops` for the DevOps Agent direct path "
+              "if it's urgent.",
+    },
 
     "web.on": {"zh": "开", "en": "on"},
     "web.off": {"zh": "关", "en": "off"},

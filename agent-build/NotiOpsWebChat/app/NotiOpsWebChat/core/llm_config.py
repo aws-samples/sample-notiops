@@ -50,6 +50,11 @@ _KEY_TTL = int(os.environ.get("LLMCFG_KEY_CACHE_TTL", "300"))
 # 满 TTL —— 也就是强刷路径对**最坏情况**零改善。10s 保住抗放大的初衷，同时把
 # 「两次保存」这个最常见场景的延迟从 60s 降到 10s。
 _FORCED_REFRESH_MIN_INTERVAL = int(os.environ.get("LLMCFG_REFRESH_MIN_INTERVAL", "10"))
+# 读 DDB 连续失败时，上一份 DDB 配置最多再用多久（stale-while-error 的上限，待办 #3）。
+# 以前没有上限：每次失败都把时间戳重置，一个长期读不到配置的进程会一直用几小时前的目录，
+# Admin 这期间的改动（停用模型、把网关挪下来）在它身上永远不生效，也没人知道。超过上限后
+# 与「刚启动就读不到」同一个状态：内置目录 + FallbackBuiltin，外加一次 StaleConfigExpired。
+_STALE_MAX = max(int(os.environ.get("LLMCFG_STALE_MAX", "3600")), _CATALOG_TTL)
 
 _CONFIG_TABLE = os.environ.get("CONFIG_TABLE", "notiops-config")
 _BEDROCK_KEY_SECRET = os.environ.get("BEDROCK_API_KEY_SECRET", "notiops/bedrock-api-key")
@@ -236,6 +241,8 @@ _lock = threading.Lock()
 _cached_cfg: dict | None = None
 _cached_cfg_ts: float = 0.0
 _last_forced_refresh_ts: float = 0.0
+# 从哪一刻起一直在用旧的 DDB 配置（读成功就清零）。见 `_STALE_MAX`。
+_stale_since: float | None = None
 
 _cached_key: str | None = None
 _cached_key_ts: float = 0.0
@@ -539,7 +546,7 @@ def get_config(payload_generation=None) -> dict:
     payload_generation: BFF 在本条消息 payload 里带来的服务端 generation。与本地缓存
     不同 → 绕过 TTL 强制刷新（受 `_FORCED_REFRESH_MIN_INTERVAL` 限速）。非法值忽略。
     """
-    global _cached_cfg, _cached_cfg_ts, _last_forced_refresh_ts
+    global _cached_cfg, _cached_cfg_ts, _last_forced_refresh_ts, _stale_since
 
     if not _ENABLED:
         # 关闭态：不读 DDB、不读 Secret，直接给内置目录。复用 TTL 缓存把 metric 与日志
@@ -583,15 +590,29 @@ def get_config(payload_generation=None) -> dict:
             # **读失败时留着上一份 DDB 配置**（stale-while-error），不换成内置目录。
             # 内置目录只有 Bedrock 条目、来源是 iam：网关排第一的部署里，一次 GetItem 抖动就会
             # 让这一个 TTL 窗口的对话悄悄改走本账号 Bedrock —— 正是「第一来源坏了不自动换」
-            # 要杜绝的那种静默换来源（数据去向、计费主体一起换掉）。旧配置最多旧一个 TTL，
-            # 而内置目录可能整份都不对。只有**从没读到过**时才用内置目录。
-            _emit("StaleConfigServed")
-            logger.warning("llm_config: refresh failed; keeping the last DDB config (generation=%s)",
-                           cached.get("generation"))
+            # 要杜绝的那种静默换来源（数据去向、计费主体一起换掉）。
+            # **但只留 `_STALE_MAX`**（默认一小时）：连续读不到超过这么久，就不再假装手里的配置还
+            # 是 Admin 现在的意思 —— 与刚启动就读不到同一个状态（内置目录），而进程本来也会在
+            # 回收重启后落到这个状态，上限只是让它不取决于进程活了多久。
             with _lock:
-                _cached_cfg_ts = time.time()
-            return cached
+                if _stale_since is None:
+                    _stale_since = now
+                stale_for = now - _stale_since
+            if stale_for < _STALE_MAX:
+                _emit("StaleConfigServed")
+                logger.warning("llm_config: refresh failed; keeping the last DDB config (generation=%s, stale for %ds)",
+                               cached.get("generation"), int(stale_for))
+                with _lock:
+                    _cached_cfg_ts = time.time()
+                return cached
+            _emit("StaleConfigExpired")
+            logger.error("llm_config: DDB unreadable for %ds (> %ds); dropping the last DDB config "
+                         "(generation=%s) and using the builtin catalogue", int(stale_for), _STALE_MAX,
+                         cached.get("generation"))
         cfg = _builtin()
+    else:
+        with _lock:
+            _stale_since = None
 
     with _lock:
         _cached_cfg = cfg
@@ -644,6 +665,7 @@ def status(cfg: dict | None = None) -> dict:
         "active_source": str((cfg.get("source_order") or [cfg.get("credential_mode") or "iam"])[0]),
         "catalog_ttl_s": _CATALOG_TTL,
         "force_refresh_min_interval_s": _FORCED_REFRESH_MIN_INTERVAL,
+        "stale_max_s": _STALE_MAX,
         "output_target": _OUTPUT_TARGET,
     }
 
@@ -894,13 +916,14 @@ def normalise_gateway_base_url(url) -> str:
       · 路径为空补 `/v1`。LiteLLM 两种都认（`/models` 与 `/v1/models` 实测同为 200），
         New API 文档只给 `/v1/...`；补 `/v1` 两边都通。自定义前缀（如 `/openai/v1`、
         `/api/v1`）原样保留。
-      · 主机是字面量的非公网 IP（回环 / 私网 / 链路本地 / 元数据地址）或 `localhost` → ""。
-        一期只接公网网关；内网网关要走 VPC 模式，是二期。
+      · 主机过不了 `core/gateway_host.host_problem`（localhost / `*.internal` / `*.local`、
+        字面量的非公网 IP、`0x7f.1` 这类非标准数字写法）→ ""。名单与 BFF、后端任务是同一份
+        （待办 #3）。一期只接公网网关；内网网关要走 VPC 模式，是二期。
     调用时拼 `{base}/chat/completions`、`{base}/models`。
     """
-    import ipaddress
-    import re
     from urllib.parse import urlsplit
+
+    from core import gateway_host
 
     s = str(url or "").strip()
     if not s:
@@ -915,19 +938,7 @@ def normalise_gateway_base_url(url) -> str:
         return ""
     if p.query or p.fragment or p.username or p.password:
         return ""
-    # 末尾的点（`localhost.`、`127.0.0.1.`）是合法 FQDN 写法，解析结果与不带点相同 —— 先去掉再判。
-    bare = host.lower().rstrip(".")
-    if bare == "localhost" or bare.endswith(".localhost"):
-        return ""
-    try:
-        ip = ipaddress.ip_address(bare)
-    except ValueError:
-        ip = None
-    if ip is not None and not ip.is_global:
-        return ""
-    # `0x7f.1`、`2130706433`、`0177.0.0.1` 这类 inet_aton 写法 ipaddress 不认，getaddrinfo 却会
-    # 把它们解析成 127.0.0.1。正经网关的主机名不会长这样：全是数字 / 点 / 0x 的一律不收。
-    if ip is None and re.fullmatch(r"(0x[0-9a-f]+|[0-9]+)(\.(0x[0-9a-f]+|[0-9]+)){0,3}", bare):
+    if gateway_host.host_problem(host):
         return ""
     path = p.path.rstrip("/")
     for suffix in ("/chat/completions", "/models"):
@@ -939,10 +950,15 @@ def normalise_gateway_base_url(url) -> str:
 
 
 def _resolves_public(base_url: str) -> bool:
-    """主机名的全部 A / AAAA 记录都是公网地址。解析失败返回 True（连不上自然报错，不在这里猜）。"""
-    import ipaddress
+    """主机名的全部 A / AAAA 记录都不在 `core/gateway_host.BLOCKED_NETWORKS` 里。
+
+    解析失败返回 True（连不上自然报错，不在这里猜）—— 与 BFF 保存时「解析不了就拒」不同是有意的：
+    那边是一次性检查，这里在对话路径上，DNS 抖一下不该让每一轮都报「地址不合法」。
+    """
     import socket
     from urllib.parse import urlsplit
+
+    from core import gateway_host
 
     try:
         p = urlsplit(base_url)
@@ -950,12 +966,8 @@ def _resolves_public(base_url: str) -> bool:
     except (OSError, ValueError, UnicodeError):
         return True
     for info in infos:
-        try:
-            addr = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            continue
-        mapped = getattr(addr, "ipv4_mapped", None)
-        if not (mapped or addr).is_global:
+        addr = gateway_host.parse_ip(info[4][0])
+        if addr is not None and gateway_host.is_blocked_address(addr):
             return False
     return True
 
@@ -1152,11 +1164,12 @@ def reset_cache() -> None:
     """测试用：清空全部缓存。**不重置凭证纪元** —— 纪元是单调计数，重置它会让
     「纪元变了就该重建」这条不变式在测试里失真；要观察纪元就读 credential_epoch()。"""
     global _cached_cfg, _cached_cfg_ts, _last_forced_refresh_ts, _cached_key, _cached_key_ts
-    global _cached_gw, _cached_gw_ts, _cached_gw_rev
+    global _cached_gw, _cached_gw_ts, _cached_gw_rev, _stale_since
     with _lock:
         _cached_cfg = None
         _cached_cfg_ts = 0.0
         _last_forced_refresh_ts = 0.0
+        _stale_since = None
         _cached_key = None
         _cached_key_ts = 0.0
         _cached_gw = None

@@ -753,7 +753,14 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
     // 所以改这一处两边同时生效，不会出现方式 A / 方式 B 的 runtime 不一致。
     runtime: lambda.Runtime.NODEJS_24_X,
     handler: "index.handler",
-    code: lambda.Code.fromAsset(path.join(REPO_ROOT, "bff", "web-chat")),
+    // 点文件 / 点目录一律不进包（任意深度；待办 #36）。验证账号的 BFF 包里实测带着从 Mac 检出
+    // 带过来的 `.npmrc` 与 `.DS_Store`；干净 clone 里也有 `.gitignore` 和 npm 的
+    // `node_modules/.package-lock.json`。一键部署的 bff.zip 是从**这个**暂存目录打的
+    // （scripts/package_artifacts.sh），会挂到公开的 GitHub Release —— `.npmrc` 里要是有 token
+    // 就是一次外泄。BFF 只依赖 AWS SDK，运行时不读任何点文件（node_modules/.bin 也只是 CLI 垫片）。
+    code: lambda.Code.fromAsset(path.join(REPO_ROOT, "bff", "web-chat"), {
+      exclude: [".*", ".*/**", "**/.*", "**/.*/**"],
+    }),
     timeout: cdk.Duration.minutes(15), // 长任务（调查）需要长超时
     memorySize: 512,
     environment: {
@@ -1055,10 +1062,11 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
     }),
   );
 
-  // BFF 需要调 AgentCore Runtime
+  // BFF 需要调 AgentCore Runtime；StopRuntimeSession = 输入框「停止」真停掉 runtime 里那一轮
+  // （待办 #30 第 ③ 档：不停的话那一轮照样跑完、照样烧 token，用户紧接着发下一句就撞「会话忙」）。
   bff.addToRolePolicy(
     new iam.PolicyStatement({
-      actions: ["bedrock-agentcore:InvokeAgentRuntime"],
+      actions: ["bedrock-agentcore:InvokeAgentRuntime", "bedrock-agentcore:StopRuntimeSession"],
       // ARN 在部署后才有；用通配限定到本账户的 runtime（避免越权到别处）
       resources: [`arn:aws:bedrock-agentcore:${stack.region}:${stack.account}:runtime/*`],
     }),
@@ -1747,75 +1755,11 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
     }),
   );
 
-  // org 模式：Admin「账户」页一键接入 —— StackSets 下发成员账号资源 + Organizations 账号列表
-  if (orgMode) {
-    const onboardingStackSetName = "notiops-member-onboarding";
-    bff.addToRolePolicy(
-      new iam.PolicyStatement({
-        sid: "OrgOnboardStackSets",
-        actions: [
-          "cloudformation:CreateStackInstances",
-          "cloudformation:DeleteStackInstances",
-          "cloudformation:DescribeStackSet",
-          "cloudformation:DescribeStackSetOperation",
-          "cloudformation:ListStackInstances",
-        ],
-        resources: [
-          `arn:aws:cloudformation:${stack.region}:${stack.account}:stackset/${onboardingStackSetName}:*`,
-          `arn:aws:cloudformation:*:*:stackset-target/${onboardingStackSetName}:*`,
-          `arn:aws:cloudformation:${stack.region}:${stack.account}:stackset/notiops-member-devops-agent:*`,
-          `arn:aws:cloudformation:*:*:stackset-target/notiops-member-devops-agent:*`,
-          "arn:aws:cloudformation:*::type/resource/*",
-        ],
-      }),
-    );
-    bff.addToRolePolicy(
-      new iam.PolicyStatement({
-        sid: "OrgOnboardListAccounts",
-        actions: ["organizations:ListAccounts", "organizations:ListRoots", "organizations:DescribeOrganization", "organizations:ListParents", "organizations:DescribeOrganizationalUnit"],
-        resources: ["*"],
-      }),
-    );
-  }
-
-  // ④ SecOps 仪表盘（部署账号自身视角；成员账号经 AssumeRole 走成员角色权限）
-  bff.addToRolePolicy(
-    new iam.PolicyStatement({
-      sid: "SecOpsDashboardsReadOnly",
-      actions: [
-        "guardduty:ListDetectors", "guardduty:GetFindingsStatistics",
-        "guardduty:ListFindings", "guardduty:GetFindings",
-        "backup:ListBackupJobs", "backup:ListBackupVaults", "backup:ListProtectedResources",
-      ],
-      resources: ["*"],
-    }),
-  );
-
-  // 多账号：BFF 可 AssumeRole 进目标账号的 notiops 跨账号角色（执行写操作）
-  bff.addToRolePolicy(
-    new iam.PolicyStatement({
-      actions: ["sts:AssumeRole"],
-      // 只匹配两种合法形态，避免 role* 松散通配误匹配 ...roleFOO：
-      resources: [
-        "arn:aws:iam::*:role/notiops-idle-detection-role", // 无后缀=部署账号自身/遗留手动接入
-        "arn:aws:iam::*:role/notiops-idle-detection-role-*", // 带账号后缀=2026-10 之前接入的成员账号（旧名）
-        // 2026-10 起成员账号角色的新名。两代执行侧互为别名（role_guard.mjs::siblingRoleArn），两条都要留。
-        "arn:aws:iam::*:role/notiops-cross-account-role-*",
-        // 跨 payer DevOps Agent 接入：testDaConnection AssumeRole 进成员账号的触发角色
-        // （member-devops-agent.yaml 建的 notiops-agent-trigger-<acct>-m<sys>）。
-        "arn:aws:iam::*:role/notiops-agent-trigger-*",
-      ],
-    }),
-  );
-
-  // BFF 需要调 AgentCore Runtime
-  bff.addToRolePolicy(
-    new iam.PolicyStatement({
-      actions: ["bedrock-agentcore:InvokeAgentRuntime"],
-      // ARN 在部署后才有；用通配限定到本账户的 runtime（避免越权到别处）
-      resources: [`arn:aws:bedrock-agentcore:${stack.region}:${stack.account}:runtime/*`],
-    }),
-  );
+  // （org 模式的 OrgOnboardStackSets / OrgOnboardListAccounts、SecOpsDashboardsReadOnly、sts:AssumeRole 与
+  //   AgentCore Runtime 这几条在上面 `mayBeOrgMode` 那段 —— 这里原来是它们**逐字重复**的第二份（org 那条
+  //   用的是 `orgMode`，它是 `mayBeOrgMode` 的子集）。CDK 合成时把完全相同的语句去重了，所以部署出去的策略
+  //   一直只有一份；真正的风险是改一处忘一处：两份内容一旦不同，同一个 Sid 出现两次，IAM 直接拒收整份
+  //   策略（MalformedPolicyDocument）。2026-10-23 删掉（待办 #38 ⑧），infra/test/web-chat-policy-sids.test.ts 守着。）
 
   // （IM 机器人配置的 Secrets Manager 权限在上面 `imBotSecretArns` 那两条 ——
   //   这里原来有一份**逐字重复**的拷贝，同一个角色加了两遍同样的语句。2026-09-08 删掉：

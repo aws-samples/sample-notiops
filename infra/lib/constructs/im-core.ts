@@ -23,7 +23,8 @@ import * as logs from "aws-cdk-lib/aws-logs";
  * 的长期隐患。所以两条路径都从这里生成，差异**只允许**通过下面的 props 表达。
  *
  * ── 两条路径的真实差异（就这几条，别再加）───────────────────────────────────
- *   1. 代码来源：方式B `Code.fromAsset("../")`；方式A 从 staging 桶取 Release 产物。
+ *   1. 代码来源：方式B 是仓库根按允许清单打的资产（`repoRootCode("im", …)`，见 ../repo-root-code.ts）；
+ *      方式A 从 staging 桶取 Release 产物（im-code.zip，同一份允许清单）。
  *   2. 物理名：方式B 写死 `notiops-im-*`（客户文档里到处引用）；方式A 带 StackName 前缀
  *      —— 一键模板可能与 setup.sh 部署共存于同一账号，写死名字会 already-exists。
  *   3. 日志组名：方式B 显式同名（`/aws/lambda/<fn>`）；方式A **不给名字**（CFN 自己命名 +
@@ -485,8 +486,10 @@ export function createImCore(scope: Construct, props: ImCoreProps): ImCoreResult
   // 每一轮都收到 `AccessDeniedException`，而 web 端同一个 runtime 一切正常
   // （web 走 web-chat-core.ts 里那条同名授权）。与那边逐字一致，包括资源通配的理由：
   // runtime ARN 在部署后才有，收窄到本账号本区域的 `runtime/*` 已经是能给的最紧范围。
+  // StopRuntimeSession：worker 等超时以后停掉 runtime 里还在跑的那一轮（core/agent_chat.py，
+  // 待办 #30 第 ③ 档）—— 不停的话它照样烧 token，这个群的下一个问题会撞上「会话忙」。
   imRole.addToPrincipalPolicy(new iam.PolicyStatement({
-    actions: ["bedrock-agentcore:InvokeAgentRuntime"],
+    actions: ["bedrock-agentcore:InvokeAgentRuntime", "bedrock-agentcore:StopRuntimeSession"],
     resources: [`arn:aws:bedrock-agentcore:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:runtime/*`],
   }));
 

@@ -281,12 +281,18 @@ def split_step_status(parts) -> tuple[str, str]:
     return joined, ""
 
 
+#: 整块文字只是一个数（可带 `ms` / `s`）：DevOps Agent 2026-10 中起在「思考中…」块之后另发一个
+#: 只装着上一段思考毫秒数的块（现网 `↳ 11694`、`↳ 4119`，讲解 deck qa/grounding-2026-10-19.md）。
+#: 单独一个数字对用户没有意义，不出这一行。与 `devops_chat.mjs::BARE_NUMBER_RE` 同一条（同一条测试钉着）。
+_BARE_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:ms|s)?", re.IGNORECASE)
+
+
 def step_tail_line(parts, fallback: str = "") -> str:
     """contentBlockStop 时的过程尾行：``  ↳ <说明> · <状态>``（没有状态词就是 ``  ↳ <说明>``）。
 
     `fallback` = stop 事件的累积全文（实测恒为空串，只在一个 delta 都没收到时才用得上 ——
-    与改动前 `excerpt(b["buf"] or s_text)` 同一个兜底顺序）。什么文字都没有时返回空串
-    （调用方据此不发这一行）。
+    与改动前 `excerpt(b["buf"] or s_text)` 同一个兜底顺序）。什么文字都没有、或只是一个裸数字时
+    返回空串（调用方据此不发这一行）。
     """
     if not "".join(p for p in (parts or []) if isinstance(p, str)):
         parts = [fallback or ""]
@@ -295,6 +301,8 @@ def step_tail_line(parts, fallback: str = "") -> str:
         tail = excerpt(desc, STEP_TAIL_MAX_WITH_STATUS)
         return f"  ↳ {tail} · {status}" if tail else f"  ↳ {status}"
     tail = excerpt(desc)
+    if _BARE_NUMBER_RE.fullmatch(tail):
+        return ""
     return f"  ↳ {tail}" if tail else ""
 
 
@@ -602,7 +610,19 @@ def run_devops_chat(text: str, *, locale: str = "en", account_id: str | None = N
             "account is supported."))
         return done(False)
 
-    client, space = devops_agent._client_and_space(acct)
+    # 跨账号时这里会 AssumeRole 进成员账号的触发角色，失败抛 ValueError / ClientError（待办 #38 ④）。
+    # 以前没有 try：异常一路冒出去，worker 最后吞掉只记一行日志，卡片停在「思考中」再也不动。
+    # 同一个调用在 devops_agent.py 的其它调用处都包了 try。这里按「定位不到」处理，但把原因说对。
+    try:
+        client, space = devops_agent._client_and_space(acct)
+    except Exception as e:  # noqa: BLE001 — 任何解析失败都不能让卡片卡死
+        logger.warning("devops_chat: resolving the DevOps Agent client failed: %s", _safe_err(e))
+        sink.say(dv(
+            f"⚠️ 进不去该账号的 DevOps Agent(`{type(e).__name__}`)。请确认该账号已接入、"
+            "接入时建的触发角色还在，再试一次。",
+            f"⚠️ Could not reach this account's DevOps Agent (`{type(e).__name__}`). Please confirm "
+            "the account is onboarded and its trigger role still exists, then try again."))
+        return done(False)
     if not client or not space:
         sink.say(dv(
             "⚠️ 无法定位该账号的 DevOps Agent Agent Space。请确认该账号已接入 DevOps Agent。",

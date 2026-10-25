@@ -21,6 +21,7 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as fs from "fs";
 import * as path from "path";
 import { createWebChatCore, WebChatCoreProps } from "./constructs/web-chat-core";
+import { LAYER_ASSET_EXCLUDES } from "./repo-root-code";
 
 export interface WebChatStackProps extends cdk.StackProps, WebChatCoreProps {}
 
@@ -75,7 +76,7 @@ export class WebChatStack extends cdk.Stack {
         ],
       }),
       costMcpLayer: new lambda.LayerVersion(this, "CostMcpLayer", {
-        code: lambda.Code.fromAsset(layerDir),
+        code: lambda.Code.fromAsset(layerDir, { exclude: LAYER_ASSET_EXCLUDES }),
         compatibleRuntimes: [lambda.Runtime.PYTHON_3_14],
         description: "NotiOps: cost MCP server dependencies (mcp / mangum / boto3, pinned)",
         removalPolicy: cdk.RemovalPolicy.DESTROY,

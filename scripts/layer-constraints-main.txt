@@ -1,0 +1,34 @@
+# 后端主依赖层 lambda_layer/ 的**精确版本**(pip 约束文件)—— setup.sh 打层时实际装到的就是这里的版本。
+# Exact versions for the backend dependency layer (lambda_layer/). setup.sh installs exactly these.
+#
+# 谁读它:setup.sh「[2/4] 安装 Lambda 依赖」那一条 `pip install -c <本文件> … -t lambda_layer/python/`。
+# 只有方式 B(setup.sh)有这一层;一键部署(方式 A)没有后端那批函数。
+#
+# 为什么要钉(待办 #37,2026-10-23):setup.sh 以前分三条 `pip install -t … --upgrade` 装
+# boto3==1.43.65 / aws-lambda-powertools[aws-sdk]>=3.0.0 / jinja2>=3.1.6。`-t` 目录不算「已安装」,
+# 每一条都重新解析 —— 第二条的 `boto3>=1.34.32`(powertools 的 aws-sdk extra)会把第一条钉的 boto3
+# 换成当天最新(2026-10-22 在 CDD 上重建实测:1.43.65 → 1.43.117),第一条的钉版本形同虚设;
+# 没钉的传递依赖(s3transfer、urllib3……)也跟着「哪天部署就是哪天的最新版」。三条分开装还会留下
+# 失效的 dist-info(现网这一层里 s3transfer 有 0.16.1 和 0.19.2 两份元数据,实际文件是 0.19.2)。
+#
+# 当前这组版本 = 2026-10-23 只读下载现网 PythonDepsLayer(2026-09-05 建)逐个读 dist-info 得到的
+# (s3transfer 取包里实际的 0.19.2)。所以用这份文件重建,装出来的包与现网一致。
+#
+# 升级 = 改这里的版本(boto3 / botocore 改了要连同另外四处一起改,见 setup.sh 那段「一共五处」的注释),
+# 然后在干净目录里试装一次:
+#     pip install -c scripts/layer-constraints-main.txt boto3==<新> botocore==<新> \
+#       "aws-lambda-powertools[aws-sdk]>=3.0.0" "jinja2>=3.1.6" -t /tmp/layer-try --only-binary=:all: \
+#       --platform manylinux2014_x86_64 --implementation cp
+# 解析不出来就是两条约束冲突了 —— 别删约束了事。tests/test_layer_constraints.py 核这份文件的格式与
+# 与 setup.sh 里直接依赖的一致性。
+aws-lambda-powertools==3.31.1
+boto3==1.43.65
+botocore==1.43.65
+jinja2==3.1.6
+jmespath==1.1.0
+markupsafe==3.0.3
+python-dateutil==2.9.0.post0
+s3transfer==0.19.2
+six==1.17.0
+typing-extensions==4.16.0
+urllib3==2.7.0

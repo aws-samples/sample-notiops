@@ -118,8 +118,12 @@ def _role_arn_for(account_id: str) -> str | None:
 
     不再按角色名约定静默拼 ARN —— org 模式下成员角色带管理账号后缀，
     约定拼出的无后缀 ARN 是错的（会命中目标账号里独立部署的角色或不存在的角色）。
-    未接入/记录缺 role_arn → 返回 None（get_session 据此拒绝，工具层报
-    cross_account_unavailable，模型如实告知用户）。
+    未接入/记录缺 role_arn/在 Admin「账户」页停用了（`enabled` 不是 True）→ 返回 None（get_session 据此
+    拒绝，工具层报 cross_account_unavailable，模型如实告知用户）。
+
+    `enabled` 这一条 2026-10-23 补上（待办 #38 ⑤）：IM 那份 `core/aws_session.py::role_arn_for` 早就查它，
+    这一份漏了 —— 停用的成员账号从账号下拉里消失了，但在问题里点名它的 12 位账号号，agent 照样
+    AssumeRole 进去查。
     """
     try:
         # 直接读 config 表（自包含 —— 事故教训：shared.queries 从未随 agent 打包，
@@ -129,6 +133,9 @@ def _role_arn_for(account_id: str) -> str | None:
             TableName=table,
             Key={"PK": {"S": f"account#{account_id}"}, "SK": {"S": "meta"}},
         ).get("Item")
+        if item and item.get("enabled", {}).get("BOOL") is not True:
+            logger.info("account %s is not enabled in the registry — refusing cross-account access", account_id)
+            return None
         role_arn = item and item.get("role_arn", {}).get("S")
         if role_arn:
             return str(role_arn)

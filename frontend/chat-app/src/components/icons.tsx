@@ -260,6 +260,7 @@ export const IconLifebuoy = ({ size = 18 }: P) => (
 const SKILL_ICONS: Record<string, ComponentType<P>> = {
   "aws-health-events": IconHeartPulse,
   "cost-spike-triage": IconCostSpike,
+  "cost-usage-analysis": IconFinOps,
   "eks-operation-review": IconCluster,
   "idle-resource-scan": IconIdle,
   "rds-health-review": IconDatabase,

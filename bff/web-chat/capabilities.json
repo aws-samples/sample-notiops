@@ -7,7 +7,9 @@
       "routes": [{ "method": "POST", "pattern": "/stream$" },
                  { "method": "GET", "pattern": "/features/deep-investigation$" },
                  { "method": "GET", "pattern": "/features/starops$" },
-                 { "method": "POST", "pattern": "/warmup$" }] },
+                 { "method": "POST", "pattern": "/warmup$" },
+                 { "method": "GET", "pattern": "/conversations/[^/]+/turn$" },
+                 { "method": "POST", "pattern": "/conversations/[^/]+/stop$" }] },
 
     { "key": "nav:notifications", "level": "tab", "viewState": "notifications",
       "title_zh": "通知", "title_en": "Notifications",

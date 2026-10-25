@@ -42,6 +42,7 @@ import * as logs from "aws-cdk-lib/aws-logs";
 import * as ssm from "aws-cdk-lib/aws-ssm";
 import * as path from "path";
 import { WEB_CHAT_TABLE_NAME } from "./constructs/web-chat-core";
+import { LAYER_ASSET_EXCLUDES, repoRootCode } from "./repo-root-code";
 // 「通知」生产端的唯一真源 —— 一键部署（方式 A）的单栈 import 的是同一份。
 import {
   WEB_NOTIF_FUNCTION_DESCRIPTION,
@@ -613,7 +614,7 @@ export class NotiOpsBackendStack extends cdk.Stack {
 
     // ─── Python 依赖 Layer ───
     const depsLayer = new lambda.LayerVersion(this, "PythonDepsLayer", {
-      code: lambda.Code.fromAsset(path.join(__dirname, "..", "..", "lambda_layer")),
+      code: lambda.Code.fromAsset(path.join(__dirname, "..", "..", "lambda_layer"), { exclude: LAYER_ASSET_EXCLUDES }),
       compatibleRuntimes: [lambda.Runtime.PYTHON_3_14],
       description: "Python dependencies for Lambda functions",
     });
@@ -641,65 +642,13 @@ export class NotiOpsBackendStack extends cdk.Stack {
       layers: [depsLayer],
     };
 
-    // GLOB exclude with `/**` patterns. IMPORTANT: cdk synth/deploy MUST run
-    // with --output pointing OUTSIDE the repo root (setup.sh passes
-    // --output ../.cdk-out via a path outside ../). Reason: fromAsset("../")
-    // packages the repo root, and if the CDK output dir (infra/cdk.out) sits
-    // inside that source tree, the asset copy self-references recursively →
-    // ENAMETOOLONG. Excluding "infra/**" is not enough because the copy
-    // races with the output being written. Keeping output outside the source
-    // is the robust fix; the excludes below keep the package lean (~few MB).
-    // 🔴 **所有以点开头的路径都排掉**（`.*` 四条，2026-10-10）。fromAsset 走的是文件系统、不看
-    //    .gitignore，仓库根里的点目录是各种本地工具的地盘，而且会不断冒出新的：
-    //      · `.claude/worktrees/<名字>/` —— Claude Code 的 worktree 隔离放的**整份仓库检出**，一次
-    //        synth 里 11 个 Lambda 的代码包都带上了它（858 个文件；审 assembly 拦下，没上线）；
-    //      · 本机工具的配置与日志（`.claude/`、`.playwright-mcp/`）、CI 与扫描配置（`.gitlab-ci.yml` /
-    //        `.gitleaks.toml`）—— 都不该进代码包（一键部署的 im-code.zip 与这里共用排除口径）。
-    //    ⚠️ CDK 的 GLOB 里 `*` **不匹配**点开头的名字（成本 MCP 资产那条注释实测过），所以必须
-    //    显式写 `.*`；`**/.*` 两条管嵌套的（如 `scripts/.seams_baseline.json`）。`.claude/**` 留着
-    //    是为了让人一眼看出它为什么在。与 `dist/**` 一样四处都要有，tests/test_repo_root_asset_excludes.py 钉着。
-    const lambdaCode = lambda.Code.fromAsset("../", {
-      exclude: [
-        "frontend/**", "infra/**", ".venv*/**", "**/node_modules/**",
-        "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
-        ".git/**", "tests/**", "docs/**", ".kiro/**", ".claude/**", ".*", ".*/**", "**/.*", "**/.*/**",
-        "lambda_layer/**", "lambda_layer_im/**", "lambda_layer_cost/**", "lambda_layer_cost", "cost_mcp/**", "cost_mcp", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
-        // ⚠️ dist/** 是一键部署（方式A）的产物目录（dist/oneclick + dist/verify，
-        // 各 ~290MB 的 zip）。不排掉它，「代码资产 + 依赖层」解压后会超 Lambda 的
-        // 250MB 上限，部署到一半才报 `Unzipped size must be smaller than 262144000
-        // bytes`（2026-09-01 实测：ImStack 整栈回滚）。本地跑过一键构建的人才会中，
-        // 极易误判成"依赖层太大"。四处 fromAsset("../") 都要有这一条。
-        "dist/**",
-        "platforms/**", "*.md", "mcp_server/**",
-        ".hypothesis/**", ".pytest_cache/**",
-        "phd_event_forwarder/**", "devops_agent_callback/**",
-        // 🔴 **必须把判读 skill 放回来。** `"*.md"` 在 GLOB 模式下排除的是
-        //    **所有深度**的 `.md`，不只是仓库根那几个 —— 2026-08-31 从线上
-        //    Lambda 包里 unzip 出来实测：包内 `.md` 文件数 = **0**。
-        //
-        //    后果是 `inspection/adapters/skill_upload.py::ensure_skills()`
-        //    在 Lambda 里**找不到任何 skill**，而它的约定是「从不抛」——
-        //    返回一个 `skipped:` / `failed:` 字符串就过去了。于是：
-        //
-        //    ```
-        //    CreateBacklogTask 照样成功
-        //      → DA 那侧没有 inspection-cost-idle / inspection-high-load
-        //      → 用**通用提示词**自由发挥
-        //      → 报告照样出得来，格式大致像那么回事
-        //      → 而 finding_id 分节、severity 不得改写、四档 unavailable 语义
-        //        这些契约一条都没生效
-        //    ```
-        //
-        //    从外面完全看不出来（`task_builder.py` 的注释早就写过这个形态：
-        //    「两份都不加载…报告照样出，只是退化成 DA 的通用发挥」）。
-        //
-        // ⚠️ 放在 `"*.md"` **之后** —— GLOB 模式按顺序求值，后面的否定式胜出。
-        //    放前面无效。
-        // ⚠️ 只放回 `inspection/skills/`，不是所有 `.md`：仓库里那些
-        //    README / 设计文档进包只是白占空间（包越大冷启越慢）。
-        "!inspection/skills/**",
-      ],
-    });
+    // 代码包 = 仓库根的**允许清单**（待办 #36）：只收 infra/lambda-code-packages.json 里
+    // assets.backend.packages 那几个顶层包，包里的 .md 只留 inspection/skills（判读 skill 的正文 ——
+    // 缺了它巡检照样出报告、只是退化成 DA 的通用发挥，见 tests/test_inspection_skill_sync.py）。
+    // 模式怎么拼、为什么不再是排除清单，见 ./repo-root-code.ts 文件头。
+    // 以前的老坑「cdk 的 --output 落在仓库根里 → 资产自引用递归复制 → ENAMETOOLONG」对这几个资产已不成立：
+    // 输出目录不在允许清单里，复制和指纹都在第一层就把它整棵剪掉。setup.sh 照旧把 --output 放在仓库外。
+    const lambdaCode = repoRootCode("backend");
 
 
     // ─── 多账号一键接入（Web Chat「更多 → 管理 → 账户」，orgMode 专属）───
@@ -1268,6 +1217,16 @@ export class NotiOpsBackendStack extends cdk.Stack {
       ],
       description: "Primary role assumed by DevOps Agent service to investigate deploy account resources",
     });
+    // 待办 #14（2026-10-23 只读核过，结论：两组都**保留**）：现网 90 天的 CloudTrail 里，这个角色既没调过
+    // CreateServiceLinkedRole，也没跑过 Athena 查询。没用到 ≠ 用不到 —— 两组都是 **DevOps Agent 服务侧**
+    // 的需要，NotiOps 自己的代码一行都不调；删掉的代价只在特定账号 / 特定调查里出现，而且不报错：
+    //   · CreateServiceLinkedRole（只限 Resource Explorer 那一个 SLR）：现网没调过，是因为部署账号里这个 SLR
+    //     早就有了。控制台建的 agent space 角色就是这个形状，一键部署（notiops-webchat-standalone-stack.ts）
+    //     与成员账号模板（member-devops-agent.yaml）也都给；没有它的新账号里 DevOps Agent 的资源发现是残的。
+    //   · Athena + `*/athena-results/*` 的 PutObject（下面两条）：给深度调查查 CUR 做资源级归因（预置 skill
+    //     「成本突增排查」发布到 Agent Space 后会让它走这条路）。Athena 用**调用方自己的凭证**把结果写到
+    //     OutputLocation，PutObject 是查询能跑起来的前提，写的只是查询结果对象；DevOps Agent 用哪个工作组 /
+    //     输出位置不归我们定，所以按前缀而不是按桶收口。
     primaryRole.addToPolicy(new iam.PolicyStatement({
       actions: ["iam:CreateServiceLinkedRole"],
       resources: [`arn:aws:iam::${cdk.Aws.ACCOUNT_ID}:role/aws-service-role/resource-explorer-2.amazonaws.com/AWSServiceRoleForResourceExplorer`],
@@ -2295,24 +2254,8 @@ def handler(event, context):
     });
 
     // ─── Callback Lambda 独立代码包 ───
-    // GLOB exclude; requires --output outside repo root (see lambdaCode note).
-    const devopsCallbackCode = lambda.Code.fromAsset("../", {
-      exclude: [
-        "frontend/**", "infra/**", "tests/**", ".venv*/**",
-        "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
-        "**/node_modules/**", ".git/**", ".hypothesis/**",
-        "*.md", ".pytest_cache/**", ".kiro/**", ".claude/**", ".*", ".*/**", "**/.*", "**/.*/**",
-        "lambda_layer/**", "lambda_layer_im/**", "lambda_layer_cost/**", "lambda_layer_cost", "cost_mcp/**", "cost_mcp", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
-        "dist/**",   // 见上面 lambdaCode 处的长注释：漏了会撞 Lambda 250MB 解压上限
-        "platforms/**", "agent/**",
-        "api/**", "lambda1_collector/**", "lambda2_analyzer/**",
-        "lambda3_health_checker/**", "lambda4_notifier/**",
-        "lambda5_cost_analyzer/**",
-        "phd_event_forwarder/**",
-        "mcp_server/**", "scripts/**", "docs/**",
-        "generated-diagrams/**",
-      ],
-    });
+    // 允许清单 assets.devopsCallback（core / shared / inspection / devops_agent_callback），见 ./repo-root-code.ts。
+    const devopsCallbackCode = repoRootCode("devopsCallback");
 
     // ─── Callback Lambda ───
     const logGroupCallback = createLogGroup("LogGroupCallback", DEVOPS_CALLBACK_FUNCTION_NAME);
@@ -2560,17 +2503,8 @@ def handler(event, context):
     //    「Push disabled」就返回,IM 侧什么都收不到。要不要给它接推送目标是待定的产品决定;
     //    定下来之前,别把「enable 规则」写成「开启推送」。
     // 没有 CDK context 开关(那是下面 web 通知规则的 `-c webNotif<Id>`),老 Dashboard 的开关也已退役。
-    const pushLambdaCode = lambda.Code.fromAsset("../", {
-      exclude: [
-        "frontend/**", "infra/**", ".venv*/**", "**/node_modules/**",
-        "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
-        ".git/**", "tests/**", "docs/**", ".kiro/**", ".claude/**", ".*", ".*/**", "**/.*", "**/.*/**",
-        "lambda_layer/**", "lambda_layer_im/**", "lambda_layer_cost/**", "lambda_layer_cost", "cost_mcp/**", "cost_mcp", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
-        "dist/**",   // 见上面 lambdaCode 处的长注释：漏了会撞 Lambda 250MB 解压上限
-        "platforms/**", "*.md", "mcp_server/**",
-        ".hypothesis/**", ".pytest_cache/**",
-      ],
-    });
+    // 允许清单 assets.push（core / shared）：IM 推送与网页「通知」生产端两个函数共用，见 ./repo-root-code.ts。
+    const pushLambdaCode = repoRootCode("push");
 
     const pushLambda = new lambda.Function(this, "PushHandlerLambda", {
       ...commonLambdaProps,
@@ -2798,22 +2732,8 @@ def handler(event, context):
         targets: [new targets.SnsTopic(phdTopic)],
       });
 
-      // PHD Lambda 独立代码包
-      // GLOB exclude; requires --output outside repo root (see lambdaCode note).
-      const phdLambdaCode = lambda.Code.fromAsset("../", {
-        exclude: [
-          "frontend/**", "infra/**", "tests/**", ".venv*/**",
-          "agent-build/**", "promo/**", "agent/**", "bff/**", "**/.cache/**",
-          "**/node_modules/**", ".git/**", ".hypothesis/**",
-          "*.md", ".pytest_cache/**", ".kiro/**", ".claude/**", ".*", ".*/**", "**/.*", "**/.*/**",
-          "lambda_layer/**", "lambda_layer_im/**", "lambda_layer_cost/**", "lambda_layer_cost", "cost_mcp/**", "cost_mcp", "cdk.out/**", ".cdk-out", ".cdk-out/**", "**/__pycache__/**",
-        "dist/**",   // 见上面 lambdaCode 处的长注释：漏了会撞 Lambda 250MB 解压上限
-          "platforms/**", "agent/**",
-          "api/**", "lambda1_collector/**", "lambda2_analyzer/**",
-          "lambda3_health_checker/**", "lambda4_notifier/**",
-          "lambda5_cost_analyzer/**", "docs/**",
-        ],
-      });
+      // PHD Lambda 独立代码包：允许清单 assets.phd（core / shared / phd_event_forwarder），见 ./repo-root-code.ts。
+      const phdLambdaCode = repoRootCode("phd");
 
       // PHD Lambda
       const logGroupPhd = createLogGroup("LogGroupPhd", "notiops-phd-forwarder");

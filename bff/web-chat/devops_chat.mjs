@@ -217,10 +217,15 @@ export function splitStepStatus(parts) {
   return [joined, ""];
 }
 
+/** 整块文字只是一个数（可带 `ms` / `s`）：DevOps Agent 2026-10 中起在「思考中…」块之后另发一个只装着
+ *  上一段思考毫秒数的块（现网 `↳ 11694`、`↳ 4119`，讲解 deck qa/grounding-2026-10-19.md）—— 单独一个数字
+ *  对用户没有意义，不出这一行。与 `core/devops_chat.py::_BARE_NUMBER_RE` 同一条（同一条测试钉着）。 */
+const BARE_NUMBER_RE = /^\d+(?:\.\d+)?\s*(?:ms|s)?$/i;
+
 /** contentBlockStop 时的过程尾行：`  ↳ <说明> · <状态>`（没有状态词就是 `  ↳ <说明>`）。
  *  `fallback` = stop 的累积全文（实测恒为空，只在一个 delta 都没收到时用得上 —— 与改动前
- *  `excerpt(b.buf || s.text)` 同一个兜底顺序）。什么文字都没有时返回 ""。 */
-function stepTailLine(parts, fallback = "") {
+ *  `excerpt(b.buf || s.text)` 同一个兜底顺序）。什么文字都没有、或只是一个裸数字时返回 ""。 */
+export function stepTailLine(parts, fallback = "") {
   const use = (parts || []).join("") ? parts : [fallback || ""];
   const [desc, status] = splitStepStatus(use);
   if (status) {
@@ -228,6 +233,7 @@ function stepTailLine(parts, fallback = "") {
     return tail ? `  ↳ ${tail} · ${status}` : `  ↳ ${status}`;
   }
   const tail = excerpt(desc);
+  if (BARE_NUMBER_RE.test(tail)) return "";
   return tail ? `  ↳ ${tail}` : "";
 }
 
@@ -249,6 +255,10 @@ export function makeSink({ emit }) {
     step(t, extra) { emit("investigation_step", { step: { text: t, ...(extra || {}) } }); },
     /** 瞬态进度行：**只在正文还没开始时**发（前端收到正文即清空），避免盖住答案。 */
     progress(t) { if (!s.reply) emit("progress", { text: t }); },
+    /** 同一句话刚作为过程行（`step`）发过、这里只是让气泡里的等待行跟着变 —— 带 `kind: "mirror"`，
+     *  前端只拿它刷新等待行、**不再记进「思考过程」时间线**。不带的话面板里每个阶段名都出现两次
+     *  （appendStep 把同文同类的两条合成「×2」），摘要那条更糟：400 字与 120 字截断各一行（#32 ②）。 */
+    mirror(t) { if (!s.reply) emit("progress", { text: t, kind: "mirror" }); },
     /** 正文块之间插空行：工具调用穿插在段落之间时，不插会把两段粘成一段。 */
     gap() { if (s.reply && !/\n\n$/.test(s.reply)) s.say("\n\n"); },
   };
@@ -316,7 +326,7 @@ export async function consumeEvents(events, sink, { en = false, maxWaitSec = MAX
     }
     if (ev.summary) {
       const c = String(ev.summary.content || "").trim();
-      if (c) { sink.step(excerpt(c, 400)); sink.progress(excerpt(c, 120)); }
+      if (c) { sink.step(excerpt(c, 400)); sink.mirror(excerpt(c, 120)); }
       continue;
     }
     if (ev.contentBlockStart) {
@@ -324,7 +334,7 @@ export async function consumeEvents(events, sink, { en = false, maxWaitSec = MAX
       const kind = blockKind(b.type, b.parentId);
       const label = blockLabel(b, en);
       blocks.set(b.index, { ...nb(), type: b.type || "", kind });
-      if (kind === "step" || kind === "prompt") { sink.step(label); sink.progress(label); }
+      if (kind === "step" || kind === "prompt") { sink.step(label); sink.mirror(label); }
       continue;
     }
     if (ev.contentBlockDelta) {

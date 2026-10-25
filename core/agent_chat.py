@@ -270,14 +270,15 @@ _LOOKS_SERIALISED_RE = re.compile(r"^[{\[]|^b['\"]")
 
 def extract(evt) -> dict:
     """一个 SSE 帧 → `{"text","sources","actions","followups","investigation_step",
-    "thinking_step","progress","reasoning","usage","via","ready","error"}`。
+    "thinking_step","progress","reasoning","usage","via","ready","error","call_start","discard"}`。
 
     每一条判断都在 `agentcore.mjs::extract` 里有对应行，改动必须两边一起改。
     """
     empty = {"text": "", "sources": [], "actions": [], "followups": [],
              "investigation_step": None, "thinking_step": None,
              "progress": None, "reasoning": None, "usage": None,
-             "via": "", "ready": False, "error": None}
+             "via": "", "ready": False, "error": None,
+             "call_start": None, "discard": None}
     if isinstance(evt, str):
         s = evt.lstrip()
         return {**empty,
@@ -344,6 +345,11 @@ def extract(evt) -> dict:
         "via": evt["via"] if isinstance(evt.get("via"), str) else "",
         "ready": evt.get("ready") is True,
         "error": error,
+        # 输出崩坏守卫（agent degeneration.py）的两种帧：每次模型调用开头的书签（第几次调用），
+        # 和判死时的「丢掉这次调用显示过的部分」。`bool` 是 int 的子类，要单独排除。
+        "call_start": (evt["call_start"] if isinstance(evt.get("call_start"), int)
+                       and not isinstance(evt.get("call_start"), bool) else None),
+        "discard": evt["discard"] if isinstance(evt.get("discard"), dict) else None,
     }
 
 
@@ -380,6 +386,16 @@ class Sink:
         self.reply += text
         self._fire("text", {"delta": text})
 
+    def rewind(self, length: int) -> None:
+        """正文退回到前 `length` 个字（输出崩坏守卫判死一次模型调用时用，见 consume_stream）。
+
+        卡片收到 `reset` 就用这份正文整段重画 —— 飞书 / Slack 是原地改那张卡；钉钉发出去的追加消息
+        撤不回，只是后面的进度不再带着那段乱码。
+        """
+        if 0 <= length < len(self.reply):
+            self.reply = self.reply[:length]
+            self._fire("reset", {"text": self.reply})
+
     def step(self, text: str, detail: str = "") -> None:
         """加一条过程行。
 
@@ -410,6 +426,20 @@ class Sink:
             self.sources.append(s)
 
 
+def _is_quiet_result(obj) -> bool:
+    """「工具已返回 · success · 3 blocks」这种过程行 IM 里不单列(待办 #32 ④)。
+
+    agent 对每次工具调用发两条 `thinking_step`:调用那条(与 `progress` 同文、带入参,
+    `Sink.step` 会原地升级成一行)和返回那条(`kind == "result"`,文案恒为「工具已返回」)。
+    网页右侧的思考过程面板两条都要;IM 卡片的「过程」最多 8 行,每次工具调用占两行、其中
+    一行永远是同一句「已返回」—— 一半篇幅是噪音,工具一多真正的步骤反而被挤掉。
+    出错的返回(`detail` 以 error 开头)照常列出:那是用户该看到的信息。
+    """
+    if not isinstance(obj, dict) or obj.get("kind") != "result":
+        return False
+    return not str(obj.get("detail") or "").strip().lower().startswith("error")
+
+
 def _step_text_of(obj) -> tuple[str, str]:
     """`thinking_step` / `progress` / `investigation_step` → `(text, detail)`。"""
     if not isinstance(obj, dict):
@@ -438,6 +468,9 @@ def consume_stream(body, sink: Sink, *, max_wait_sec: int) -> dict:
     runtime_error: dict | None = None
     via = ""
     timed_out = False
+    # 输出崩坏守卫的书签：第几次模型调用 → 那时 `sink.reply` 有多长。判死那次调用时退回去
+    # （agent 侧只说「丢掉第 n 次调用」，长度由各端在自己的字符串上记，不跨语言数字符）。
+    marks: dict[int, int] = {}
 
     chunks = body.iter_chunks() if hasattr(body, "iter_chunks") else body
     for chunk in chunks:
@@ -466,9 +499,17 @@ def consume_stream(body, sink: Sink, *, max_wait_sec: int) -> dict:
                 got = extract(evt)
                 if got["error"] and runtime_error is None:
                     runtime_error = got["error"]
+                if got["call_start"] is not None:
+                    marks[got["call_start"]] = len(sink.reply)
+                if got["discard"]:
+                    at = marks.get(got["discard"].get("call"))
+                    if at is not None:
+                        sink.rewind(at)
                 sink.say(got["text"])
                 sink.add_sources(got["sources"])
                 for key in ("progress", "thinking_step", "investigation_step"):
+                    if key == "thinking_step" and _is_quiet_result(got[key]):
+                        continue
                     t, d = _step_text_of(got[key])
                     if t:
                         sink.step(t, d)
@@ -596,21 +637,54 @@ def run_agent_chat(text: str, *, locale: str = "en", session_id: str = "",
 
     reply = sink.reply.strip()
     status = out.get("status")
+    etype = (out.get("error") or {}).get("type") or ""
+    if status == "timed_out":
+        # 我们不等了，但 runtime 里那一轮还在跑 —— 停掉它（待办 #30 第 ③ 档）。不停的话它照样
+        # 烧 token，而且这个会话的下一个问题拿到租约后会撞上 strands 的 Agent 锁（「会话忙」）。
+        _stop_runtime_session(arn, sid)
     if status == "timed_out" and not reply:
         reply = i18n.t("agent.chat.timed_out", locale, sec=wait)
     elif status == "failed" and not reply:
-        etype = ((out.get("error") or {}).get("type")
-                 or "AgentRuntimeStreamError")
-        logger.error("agent_chat: runtime error type=%s", etype)
-        reply = i18n.t("agent.chat.failed", locale, etype=etype)
+        etype = etype or "AgentRuntimeStreamError"
+        if _is_busy(etype):
+            # 会话忙（待办 #30）：同一个会话的上一轮还在 runtime 里跑，这一句撞上了 strands 的
+            # Agent 锁，**没进** agent。IM 这边按会话排队（`platforms/common/chat_lease.py`），
+            # 所以只在上一个 worker 已经不等了（超时）、runtime 里那一轮还没跑完时才会撞上 ——
+            # 叫人「稍后再试」没错，但得说清楚为什么，别报成一次失败。
+            logger.warning("agent_chat: session busy — previous turn still running in the runtime")
+            reply = i18n.t("agent.chat.busy", locale)
+        else:
+            logger.error("agent_chat: runtime error type=%s", etype)
+            reply = i18n.t("agent.chat.failed", locale, etype=etype)
     elif status == "timed_out":
         # 有正文但被我们掐断了 —— **必须明说**，不许让用户以为答完了。
         reply += "\n\n" + i18n.t("agent.chat.partial", locale, sec=wait)
+    elif etype:
+        # 有正文、runtime 又报了错（错误帧来在正文之后，或流读到一半抛了）—— 同一条理由，必须明说
+        # 上面不完整（待办 #30）。以前这里什么都不补：卡片上停在半句话，看起来像答完了。
+        logger.error("agent_chat: runtime error after a partial answer type=%s", etype)
+        reply += "\n\n" + i18n.t("agent.chat.interrupted", locale, etype=etype)
 
     return {"reply": reply, "steps": list(sink.steps),
             "sources": list(sink.sources),
             "ok": status == "completed" and bool(reply),
             "usage": usage, "error": (out.get("error") or {}).get("type", "")}
+
+
+def _stop_runtime_session(arn: str, sid: str) -> None:
+    """StopRuntimeSession，尽力而为：停不掉（老部署的角色还没有这条权限、会话已经被回收）只记一行，
+    不影响这一轮已经给用户的回答。与 web 端 `bff/web-chat/agentcore.mjs::stopAgentSession` 同一用意。"""
+    try:
+        _client().stop_runtime_session(agentRuntimeArn=arn, runtimeSessionId=sid)
+        logger.info("agent_chat: stopped the runtime session after timing out")
+    except Exception as e:                        # noqa: BLE001
+        logger.warning("agent_chat: stop_runtime_session failed: %s", _safe_err(e))
+
+
+def _is_busy(etype: str) -> bool:
+    """runtime 报的是「这个会话正在跑另一轮」（strands 的 `ConcurrencyException`）。
+    与 BFF 的 `bff/web-chat/turn_errors.mjs::classifyTurnError` 同一判据。"""
+    return "ConcurrencyException" in (etype or "")
 
 
 __all__ = ["TOPIC", "Sink", "build_payload", "configured", "consume_stream",

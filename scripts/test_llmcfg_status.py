@@ -48,6 +48,8 @@ _ALLOWED_KEYS = {
     "force_refresh_min_interval_s", "output_target",
     # 2026-10：第一来源名（iam / api_key / gateway），不含任何凭证。
     "active_source",
+    # 2026-10-23（待办 #3）：读不到 DDB 时旧配置最多再用多少秒，一个数字。
+    "stale_max_s",
 }
 
 

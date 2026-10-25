@@ -206,7 +206,7 @@ export async function skillExists(skillId) {
 
 /** 新建或更新（按 skill_id upsert，写一个新版本 + 更新 meta）。返回保存后的精简对象。
  * mode='create' 时若 id 已存在则报错（防止覆盖别人的 skill）；mode='update' 才允许覆盖。 */
-export async function saveSkill({ skill_id, name, description, body, author = "web", mode = "", i18n, body_i18n, forceAuthor = false }) {
+export async function saveSkill({ skill_id, name, description, body, author = "web", mode = "", i18n, body_i18n, forceAuthor = false, reactivate = false }) {
   if (!BUCKET) throw userError("SKILLS_BUCKET not configured", "config_error");
   const id = (skill_id && ID_RE.test(skill_id)) ? skill_id : slugify(name);
   if (!ID_RE.test(id)) throw userError("invalid skill_id (need lowercase a-z, 0-9, -)");
@@ -247,6 +247,8 @@ export async function saveSkill({ skill_id, name, description, body, author = "w
   // 更新已有 skill 时默认保留原 author（尊重创建者）；仅当 forceAuthor=true 才改写——
   // 用于预置 seed 归一化：把历史 seed 误写的 author 纠正为 PRESET_AUTHOR。普通编辑不传此参。
   if (forceAuthor && author) meta.author = author;
+  // reactivate：仅预置 seed 用 —— 被 reconcile 归档（status=archived）的预置又回到 preset-skills/ 时恢复成 active。
+  if (reactivate) meta.status = "active";
   meta.name = (name || id).trim();
   meta.description = (description || "").trim();
   meta.format = SKILL_FORMAT;          // 标记为 Agent Skills 开放标准
@@ -559,7 +561,9 @@ const LEGACY_PRESET_AUTHORS = new Set(["NotiOps"]);
 // 没有源目录，seedPresetSkills 主循环永远遇不到它们，既无法归一化 author 也无法删除，
 // 于是在已部署环境里以 author="NotiOps" 长期显示为「客户自建」。reconcile 阶段将其归档（软删）。
 // 只归档 author 仍属 LEGACY_PRESET_AUTHORS 的记录——绝不动客户自建（author=Cognito sub / "web"）。
-const LEGACY_ORPHAN_PRESET_IDS = new Set(["cost-usage-analysis"]);
+// 2026-10-24：唯一的孤儿 cost-usage-analysis 按用户要求补回 preset-skills/，不再是孤儿；已部署环境里
+// 被归档的那条由主循环的 reactivate 恢复。机制留着，以后再有预置下线时把 id 加进来。
+const LEGACY_ORPHAN_PRESET_IDS = new Set([]);
 
 // SKILL.md 与本地化 SKILL.<loc>.md（如 SKILL.zh.md）都是「正文源」，不当作附属文件。
 const _isSkillMdName = (name) => /^SKILL(\.[a-z]{2})?\.md$/i.test(name);
@@ -627,6 +631,11 @@ export async function seedPresetSkills({ force = false } = {}) {
     // 反之（pristine 旧拷贝）：这不是客户自建，故不走 kept-customer，也不能被 unchanged 跳过
     // （下方 contentUnchanged 分支单独处理原地归一化）。
     const needsAuthorFix = !!(existing && LEGACY_PRESET_AUTHORS.has(existing.author) && !customerEdited);
+    // 曾被下面 reconcile 当孤儿归档、现在又回到 preset-skills/ 的预置（2026-10-24 补回 cost-usage-analysis）：
+    // 只有系统自己的记录（作者是 PRESET_AUTHOR 或历史 seed 值、客户从未编辑过）才恢复成 active。
+    // 客户在网页上删 skill 是整个删掉（deleteSkill），不会留下 archived 记录，所以这里不会把客户删掉的复活。
+    const reactivate = !!(existing && existing.status === "archived" && !customerEdited
+      && (existing.author === PRESET_AUTHOR || LEGACY_PRESET_AUTHORS.has(existing.author)));
     // 客户自建 / 客户已接管的同名 skill 不动（尊重客户内容），也不覆盖。这里涵盖两类：
     //   ① 真·客户自建（author=Cognito sub / "web"）；
     //   ② 历史 seed 拷贝但客户改过（author 仍是 legacy 值，但 customerEdited=true → needsAuthorFix=false）。
@@ -657,14 +666,15 @@ export async function seedPresetSkills({ force = false } = {}) {
     // 内容无变化：正文与版本一律不动。仅当 author 需归一化时【原地 patch】meta.author（不 bump 版本、
     // 不重写正文），从而保留客户对该 skill 的任何正文编辑；否则直接跳过。
     if (contentUnchanged) {
-      if (needsAuthorFix) {
-        existing.author = PRESET_AUTHOR;
+      if (needsAuthorFix || reactivate) {
+        if (needsAuthorFix) existing.author = PRESET_AUTHOR;
+        if (reactivate) existing.status = "active";
         existing.updated_at = _now();
         await s3.send(new PutObjectCommand({
           Bucket: BUCKET, Key: metaKey(id),
           Body: Buffer.from(JSON.stringify(existing), "utf-8"), ContentType: "application/json",
         }));
-        seeded++; details.push({ id, action: "author-normalized" });
+        seeded++; details.push({ id, action: reactivate ? "reactivated" : "author-normalized" });
       } else {
         skipped++; details.push({ id, action: "unchanged" });
       }
@@ -673,14 +683,14 @@ export async function seedPresetSkills({ force = false } = {}) {
     // 内容确有变化（预置正文随版本更新等）：写新版本 + 更新 meta。forceAuthor 顺带纠正历史误写的 author。
     // mode 用 ""（非 "create"）：并发冷启动下两个容器可能都看到 existing=null 并各自 create，
     // "create" 会让后到者抛「skill_id 已存在」；"" 则退化为 upsert，幂等且不抛。
-    await saveSkill({ skill_id: id, name, description: parsed.description, body: parsed.body, author: PRESET_AUTHOR, mode: existing ? "update" : "", i18n: parsed.i18n, body_i18n: bodyI18n, forceAuthor: true });
+    await saveSkill({ skill_id: id, name, description: parsed.description, body: parsed.body, author: PRESET_AUTHOR, mode: existing ? "update" : "", i18n: parsed.i18n, body_i18n: bodyI18n, forceAuthor: true, reactivate });
     // 附属文件（references/ 等）随之注入。
     const rels = _walk(join(PRESET_DIR, id));
     const assets = rels.filter((r) => !isScriptPath(r) && ASSET_EXT_RE.test(r))
       .map((r) => ({ path: r, buf: readFileSync(join(PRESET_DIR, id, r)) }));
     if (assets.length) await _replaceSkillFiles(id, assets);
     // 此处内容确有变化（author-normalized-only 的场景已在上面 contentUnchanged 分支提前返回）。
-    seeded++; details.push({ id, action: existing ? (needsAuthorFix ? "updated+author-normalized" : "updated") : "created", references: assets.length });
+    seeded++; details.push({ id, action: existing ? (reactivate ? "updated+reactivated" : needsAuthorFix ? "updated+author-normalized" : "updated") : "created", references: assets.length });
   }
   // ── reconcile：归档「孤儿」预置 skill（旧 seed 发布过、新 preset-skills/ 已移除的 id）──
   // 主循环只遍历 preset-skills/ 下现存目录，遇不到孤儿，故单独处理。仅软删（status=archived）

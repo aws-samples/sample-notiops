@@ -4,7 +4,8 @@ agent reply, with the priority chain:
     1. user explicit pref     (DDB row, set by /language)
     2. thread / investigation lock  (set on first message of a thread)
     3. DM lock                (set on first message of a 1:1 chat)
-    4. auto-detect this message    (heuristic, see core.i18n)
+    4. auto-detect this message    (heuristic, see core.i18n; for commands
+                                    only the "it is Chinese" direction)
     5. group default          (CFN parameter / env)
     6. fallback "en"
 
@@ -121,12 +122,22 @@ def resolve(*,
             thread_root_id: str = "",
             incident_id: str = "",
             text: str = "",
+            zh_hint: str = "",
             ) -> tuple[str, str]:
     """Run the priority chain and return ``(locale, source)``.
 
     `source` is one of: ``user`` / ``incident`` / ``thread`` / ``dm``
     / ``auto`` / ``default``. Used for logging and the `/language`
     response so users understand why a language is being applied.
+
+    `zh_hint` is for **commands** (the platform workers' `_pre_locale`):
+    commands don't auto-detect, because a pure-ASCII command word such as
+    `language en` / `agent notiops` would lock the chat to English. But a
+    command that carries Chinese (`/调查 …`, `@bot 回复案例 …`, `确认`) tells
+    us the user writes Chinese, so the hint only ever points to ``zh`` —
+    never to ``en``. Without it a fresh Chinese group (no `/language`, no
+    lock yet) got every command receipt in English (todo #32 ③). It sits
+    below the explicit pref and the locks, exactly where auto-detection does.
     """
     if user_id:
         v = _read_locale(_k_user(user_id))
@@ -150,6 +161,9 @@ def resolve(*,
 
     if text:
         return i18n.detect_locale(text), "auto"
+
+    if zh_hint and i18n.detect_locale(zh_hint) == "zh":
+        return "zh", "auto"
 
     return _env_default(), "default"
 

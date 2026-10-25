@@ -6,7 +6,7 @@
  * 累积逻辑本身，因为 bug 都藏在合并/去重/过滤这些边界上，而它们与 UI 无关、最该单测。
  */
 import { describe, it, expect } from "vitest";
-import { appendStep, appendReasoning, isWaitHint, hasThinking, MAX_THINKING_STEPS, THOUGHT_TRUNCATED_MARK, type TimelineStep } from "./thinking";
+import { appendStep, appendReasoning, isWaitHint, hasThinking, waitingText, MIRROR_KIND, MAX_THINKING_STEPS, THOUGHT_TRUNCATED_MARK, type TimelineStep } from "./thinking";
 
 const T = 1_700_000_000_000;
 
@@ -144,5 +144,32 @@ describe("hasThinking", () => {
     expect(hasThinking(undefined)).toBe(false);
     expect(hasThinking([])).toBe(false);
     expect(hasThinking([{ text: "x", kind: "tool" }])).toBe(true);
+  });
+});
+
+/* #32 ②：DevOps 对话的每个阶段名以前在面板里出现两次（investigation_step 一次、progress 一次，
+ * appendStep 合成「×2」），等待行还多一个省略号（文字自带「…」+ 样式再补一个）。 */
+describe("DevOps 对话的镜像进度行与等待行（#32 ②）", () => {
+  it("kind=mirror 的进度行不进时间线；同一句的过程行照常只记一次、不计 repeat", () => {
+    let s: TimelineStep[] = [];
+    s = appendStep(s, { text: "思考中…" }, T);                       // investigation_step（无 kind）
+    s = appendStep(s, { text: "思考中…", kind: MIRROR_KIND }, T);    // 同一句的 progress 镜像
+    expect(s).toHaveLength(1);
+    expect(s[0].repeat).toBeUndefined();
+    expect(MIRROR_KIND).toBe("mirror");                               // 与 bff/web-chat/devops_chat.mjs 的契约词一致
+  });
+
+  it("没带 kind 的普通进度行照旧进时间线（agent 那条路径不受影响）", () => {
+    const s = appendStep([], { text: "调用 get_cost_and_usage" }, T);
+    expect(s).toHaveLength(1);
+  });
+
+  it("等待行去掉进度文字末尾自带的省略号（后面紧跟会动的「…」），空了就用兜底", () => {
+    expect(waitingText("DevOps Agent 正在思考…", "思考中")).toBe("DevOps Agent 正在思考");
+    expect(waitingText("Connecting to DevOps Agent...", "Thinking")).toBe("Connecting to DevOps Agent");
+    expect(waitingText("检索中……", "思考中")).toBe("检索中");
+    expect(waitingText("…", "思考中")).toBe("思考中");
+    expect(waitingText(undefined, "思考中")).toBe("思考中");
+    expect(waitingText("调用 aws_docs_search（region=…）", "思考中")).toBe("调用 aws_docs_search（region=…）");
   });
 });

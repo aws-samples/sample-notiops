@@ -234,6 +234,19 @@ def text_card(text: str, locale: str, *, color: str = "grey",
     }
 
 
+def md_card(text: str, locale: str) -> dict:
+    """没有标题栏的一段 markdown —— 给带 `**` / 反引号的短回执用(待办 #32 ⑤)。
+
+    飞书的**纯文本**消息不渲染 markdown(`caps.help` 的 docstring 记过那次现网截图):
+    `/agent`、`/model`、`/account` 这些回执里的粗体和代码会把星号、反引号原样摆给用户看。
+    回执本身只有一两句,配一个标题栏反而喧宾夺主,所以这里不要 header。
+    """
+    return {
+        "config": card_config(wide_screen_mode=True),
+        "elements": [_md(text, locale)],
+    }
+
+
 def message_id_of(api_response: dict) -> str:
     """从 `feishu_utils.send_card` 的返回里取新消息的 message_id。
 

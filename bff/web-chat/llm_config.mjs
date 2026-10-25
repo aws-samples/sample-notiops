@@ -51,6 +51,8 @@ import {
 } from "@aws-sdk/client-secrets-manager";
 import net from "node:net";
 import dns from "node:dns/promises";
+import { hostProblem, isBlockedAddress, rawHostOf } from "./gateway_host.mjs";
+import { imIngressDeployed, __setImIngressClient } from "./im_ingress.mjs";
 
 const TABLE = process.env.CONFIG_TABLE || "notiops-config";
 const SECRET_ID = process.env.BEDROCK_API_KEY_SECRET || "notiops/bedrock-api-key";
@@ -128,6 +130,7 @@ export function __setClients(overrides = {}) {
   if (overrides.bedrockFactory) bedrockFactory = overrides.bedrockFactory;
   if (overrides.dnsLookup) dnsLookup = overrides.dnsLookup;
   if (overrides.gatewayFetch) gatewayFetch = overrides.gatewayFetch;
+  if (overrides.agw) __setImIngressClient(overrides.agw);
 }
 
 // 打网关用的 fetch，可注入（测试不触网）。**不跟随重定向**：公网网关 302 到内网地址
@@ -257,7 +260,9 @@ function defaultAliasFor(cfg, source) {
  *   · 只收 https；带 query / fragment / 用户名密码的不收
  *   · 去掉末尾 `/` 与误贴的 `/chat/completions`、`/models`
  *   · 路径为空补 `/v1`（LiteLLM 两种路径都认；New API 文档只给 /v1/...）
- *   · 主机是字面量的非公网 IP 或 localhost → ""（DNS 解析后的检查另见 assertPublicHost）
+ *   · 主机过不了 gateway_host.mjs 的 hostProblem（localhost / `*.internal` / `*.local`、字面量的
+ *     非公网 IP、`0x7f.1` 这类非标准数字写法）→ ""。名单与 Python 两层是同一份（待办 #3）；
+ *     DNS 解析后的检查另见 assertPublicHost
  */
 export function normalizeGatewayBaseUrl(url) {
   const s = String(url ?? "").trim();
@@ -268,9 +273,9 @@ export function normalizeGatewayBaseUrl(url) {
   if (u.search || u.hash || u.username || u.password) return "";
   // WHATWG URL 会把 `?` 后为空的 query 也吞掉；原串里出现过就拒，免得「看起来没 query」。
   if (/[?#]/.test(s)) return "";
-  const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (host === "localhost" || host.endsWith(".localhost")) return "";
-  if (isBlockedAddress(host)) return "";
+  // 两个都要看：WHATWG 会把 `0x7f.1` 先换算成 `127.0.0.1`（换算后的能抓非公网段），而「只收标准
+  // 点分写法」那条只能看原串里的主机（`0x08.0x08.0x08.0x08` 换算后是公网的 8.8.8.8，Python 两层拒）。
+  if (hostProblem(rawHostOf(s)) || hostProblem(u.hostname)) return "";
   let path = u.pathname.replace(/\/+$/, "");
   for (const suffix of ["/chat/completions", "/models"]) {
     if (path.toLowerCase().endsWith(suffix)) path = path.slice(0, -suffix.length).replace(/\/+$/, "");
@@ -279,29 +284,8 @@ export function normalizeGatewayBaseUrl(url) {
   return `https://${u.host}${path}`;
 }
 
-// 非公网地址段。网关一期只接公网（HTTPS + key）；内网网关要走 VPC，是二期。
-// 段落与 shared/llm_provider._is_blocked_ip 对齐（私网 / 回环 / 链路本地 / 保留 / 组播），
-// 另加 CGNAT 100.64/10 —— Python 的 ipaddress 把它算作非 global，那边 core 侧也会拒。
-const _blocked = (() => {
-  const bl = new net.BlockList();
-  for (const [a, p] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
-    ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.168.0.0", 16],
-    ["198.18.0.0", 15], ["224.0.0.0", 4], ["240.0.0.0", 4]]) bl.addSubnet(a, p, "ipv4");
-  for (const [a, p] of [["::", 128], ["::1", 128], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8],
-    ["64:ff9b::", 96], ["2001:db8::", 32]]) bl.addSubnet(a, p, "ipv6");
-  return bl;
-})();
-
-function isBlockedAddress(host) {
-  const v = net.isIP(host);
-  if (!v) return false;
-  if (v === 6) {
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(host);
-    if (mapped) return _blocked.check(mapped[1], "ipv4");
-    return _blocked.check(host, "ipv6");
-  }
-  return _blocked.check(host, "ipv4");
-}
+// 非公网地址段与主机名规则：gateway_host.mjs（与 Python 两层同一份名单，待办 #3）。
+// 网关一期只接公网（HTTPS + key）；内网网关要走 VPC，是二期。
 
 // DNS 解析可注入（测试不触网）。
 let dnsLookup = (host) => dns.lookup(host, { all: true, verbatim: true });
@@ -314,7 +298,9 @@ let dnsLookup = (host) => dns.lookup(host, { all: true, verbatim: true });
 async function assertPublicHost(baseUrl) {
   let host;
   try { host = new URL(baseUrl).hostname.replace(/^\[|\]$/g, ""); } catch { return "invalid base_url"; }
-  if (net.isIP(host)) return isBlockedAddress(host) ? "base_url points to a non-public address" : "";
+  // 正常进来的地址已经过 normalizeGatewayBaseUrl；这里再判一次，挡住绕过它直接写进 Secret 的值。
+  if (hostProblem(rawHostOf(baseUrl)) || hostProblem(host)) return "base_url points to a non-public address";
+  if (net.isIP(host)) return "";
   let addrs;
   try { addrs = await dnsLookup(host); } catch { return `base_url host ${host} does not resolve`; }
   for (const a of addrs || []) {
@@ -1886,7 +1872,12 @@ async function probeBeforeWrite(cfg, prev) {
     const changed = !prev || activeSource(prev) !== "gateway" || !was?.entry || !now.entry
       || was.source !== now.source || String(was.entry.alias) !== String(now.entry.alias)
       || String(was.entry.model_id) !== String(now.entry.model_id);
-    if (changed && now.entry) {
+    // 没装 IM 的部署（纯网页）：IM 那条 Bedrock 链路根本不存在，探它只会把本账号没开 Bedrock 的客户
+    // 挡在网关门外 —— 保存永远被「IM default … failed a live check」拦下（待办 #8）。查不清装没装
+    // （null）时照旧探，与改动前同一个安全方向；装上 IM 之后再保存一次就会探到。
+    if (changed && now.entry && (await imIngressDeployed()) === false) {
+      console.log("[llm-config] IM is not deployed here; skipping the IM default probe");
+    } else if (changed && now.entry) {
       const alias = String(now.entry.alias);
       // IM 落到 Bedrock API Key、Key 却没配：probeCredential 会回退部署角色去探 —— 那是假绿，而运行时
       // 同样会静默退回 IAM，正是「不自动降级」要杜绝的。直接按确定性失败拦（与 apiTestLlmModel 指名测
@@ -1955,12 +1946,50 @@ function gatewayHeaders(key, json = false) {
   };
 }
 
-async function readJsonCapped(r) {
+const _tooLarge = () => Object.assign(new Error("too large"), { name: "TooLarge" });
+
+/**
+ * 读网关响应体，**边读边数字节**，超过 `max` 立刻掐断（待办 #3）。
+ *
+ * 以前是先看 Content-Length、再 `await r.text()` 整个读完才比长度：网关不带 Content-Length（分块
+ * 传输很常见）时，一个坏掉 / 恶意的网关可以一直往 BFF 里灌，直到超时或把 Lambda 内存撑爆，
+ * 「5 MB 上限」只在读完之后才生效。现在按 `r.body` 的流一块块读，超了就 `cancel()` 断开连接。
+ * 测试替身与少数没有流的实现（没有 `body.getReader`）退回 `text()` 再判 —— 那条路上没有可掐的流。
+ */
+export async function readTextCapped(r, max = GATEWAY_MAX_BODY) {
   const declared = Number(r.headers?.get?.("content-length") || 0);
-  if (declared > GATEWAY_MAX_BODY) throw Object.assign(new Error("too large"), { name: "TooLarge" });
+  if (declared > max) {
+    try { await r.body?.cancel?.(); } catch { /* 已经断了 */ }
+    throw _tooLarge();
+  }
+  const body = r.body;
+  if (body && typeof body.getReader === "function") {
+    const reader = body.getReader();
+    const chunks = [];
+    let n = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        n += value?.byteLength || 0;
+        if (n > max) {
+          try { await reader.cancel(); } catch { /* 已经断了 */ }
+          throw _tooLarge();
+        }
+        if (value) chunks.push(value);
+      }
+    } finally {
+      try { reader.releaseLock(); } catch { /* cancel 之后可能已释放 */ }
+    }
+    return Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength))).toString("utf8");
+  }
   const txt = await r.text();
-  if (txt.length > GATEWAY_MAX_BODY) throw Object.assign(new Error("too large"), { name: "TooLarge" });
-  return JSON.parse(txt);
+  if (Buffer.byteLength(txt, "utf8") > max) throw _tooLarge();
+  return txt;
+}
+
+async function readJsonCapped(r) {
+  return JSON.parse(await readTextCapped(r));
 }
 
 function _netFailure(e) {

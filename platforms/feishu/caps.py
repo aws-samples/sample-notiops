@@ -57,6 +57,26 @@ class FeishuCaps(Caps):
         in_thread = not msg.is_direct
         feishu_utils.reply_text(msg.message_id, text, in_thread=in_thread)
 
+    def reply_markdown(self, msg: ImMessage, text: str) -> None:
+        """会话设置类命令(`/language` `/model` `/agent` `/web` `/account`)的回执 —— 走卡片。
+
+        这些回执的共享文案里有 `**粗体**` 和反引号,而飞书纯文本消息不渲染 markdown
+        (待办 #32 ⑤;同一个坑 `/help` 2026-09-03 踩过,见 `help` 的 docstring)。
+        卡片和 `reply_text` 落在同一个地方:群里回在用户那条消息的话题里,私聊直接发。
+        卡片发不出去(权限 / 限流)就退回纯文本 —— 格式会变回源码样,但看得见优先,**不许静默**。
+        """
+        root = None if msg.is_direct else (msg.message_id or None)
+        try:
+            resp = feishu_utils.send_card(msg.chat_id, im_cards.md_card(text, msg.locale),
+                                          root_id=root)
+            if im_cards.message_id_of(resp):
+                return
+            logger.error("caps.reply_markdown: send_card rejected code=%s",
+                         (resp or {}).get("code"))
+        except Exception as e:                        # noqa: BLE001
+            logger.error("caps.reply_markdown: send_card failed: %s", type(e).__name__)
+        self.reply_text(msg, text)
+
     # ---- 十个能力 ----
     def help(self, msg: ImMessage) -> None:
         """`/help` 命令菜单 —— 必须发**卡片**，不能发纯文本。
@@ -97,7 +117,7 @@ class FeishuCaps(Caps):
         # NL 分支直接给了 zh/en；命令分支的 arg 可能是空 / `zh` / `en` / `auto` / 别的
         target = i18n.normalize_locale(lang or arg)
         if not msg.user_id:
-            self.reply_text(msg, i18n.t("main.failed_user_id", msg.locale))
+            self.reply_markdown(msg, i18n.t("main.failed_user_id", msg.locale))
             return
         if not target or target not in ("zh", "en", "auto"):
             # 显示当前
@@ -105,17 +125,17 @@ class FeishuCaps(Caps):
                                                   platform=PLATFORM, text="")
             name = i18n.locale_name(cur, cur)
             key = "lang.current.user" if source == "user" else "lang.current.auto"
-            self.reply_text(msg, i18n.t(key, cur, name=name) + "\n"
+            self.reply_markdown(msg, i18n.t(key, cur, name=name) + "\n"
                             + i18n.t("lang.usage", cur))
             return
         if target == "auto":
             ok = locale_resolver.set_user_pref(msg.user_id, "auto", platform=PLATFORM)
-            self.reply_text(msg, i18n.t("lang.unset" if ok else "lang.unset_failed",
+            self.reply_markdown(msg, i18n.t("lang.unset" if ok else "lang.unset_failed",
                                         msg.locale))
             return
         ok = locale_resolver.set_user_pref(msg.user_id, target, platform=PLATFORM)
         name = i18n.locale_name(target, target)
-        self.reply_text(msg, i18n.t("lang.set.user" if ok else "lang.set_failed",
+        self.reply_markdown(msg, i18n.t("lang.set.user" if ok else "lang.set_failed",
                                     target if ok else msg.locale, name=name))
 
     def model(self, msg: ImMessage, model_arg: str) -> None:
@@ -127,14 +147,14 @@ class FeishuCaps(Caps):
             entry = model_catalog.get(alias)
             text = (i18n.t("model.current", msg.locale, label=entry.label, source=source)
                     + "\n" + i18n.t("model.usage", msg.locale))
-            self.reply_text(msg, text)
+            self.reply_markdown(msg, text)
             return
         if arg == "list":
             rows = "\n".join(
                 i18n.t("model.list_row", msg.locale, alias=e.alias, label=e.label)
                 for e in model_catalog.all_entries()
             )
-            self.reply_text(msg, i18n.t("model.list_header", msg.locale) + "\n"
+            self.reply_markdown(msg, i18n.t("model.list_header", msg.locale) + "\n"
                             + rows + "\n\n" + i18n.t("model.usage", msg.locale))
             return
         if arg == "default":
@@ -142,21 +162,21 @@ class FeishuCaps(Caps):
                 llm_pref_resolver.clear_dm_pref(PLATFORM, msg.user_id)
             else:
                 llm_pref_resolver.clear_chat_pref(PLATFORM, msg.chat_id)
-            self.reply_text(msg, i18n.t("model.cleared", msg.locale))
+            self.reply_markdown(msg, i18n.t("model.cleared", msg.locale))
             return
         if not model_catalog.is_known(arg):
-            self.reply_text(msg, i18n.t("model.unknown", msg.locale, alias=arg,
+            self.reply_markdown(msg, i18n.t("model.unknown", msg.locale, alias=arg,
                                         valid=", ".join(model_catalog.list_aliases())))
             return
         ok = (llm_pref_resolver.set_dm_pref(PLATFORM, msg.user_id, arg)
               if is_dm else
               llm_pref_resolver.set_chat_pref(PLATFORM, msg.chat_id, arg))
         if not ok:
-            self.reply_text(msg, i18n.t("model.set_failed", msg.locale))
+            self.reply_markdown(msg, i18n.t("model.set_failed", msg.locale))
             return
         entry = model_catalog.get(arg)
         key = "model.set_dm" if is_dm else "model.set_chat"
-        self.reply_text(msg, i18n.t(key, msg.locale, label=entry.label))
+        self.reply_markdown(msg, i18n.t(key, msg.locale, label=entry.label))
 
     def agent(self, msg: ImMessage, arg: str) -> None:
         """`/agent [notiops|devops|starops|default]` —— 这个会话的对话由谁答（0 token）。
@@ -164,11 +184,11 @@ class FeishuCaps(Caps):
         逻辑与文案全在 `platforms.common.pref_commands`：这两条命令没有任何平台差异，
         两边各写一遍必然漂移（见那个模块的文件头）。
         """
-        self.reply_text(msg, pref_commands.agent_reply(msg, arg, platform=PLATFORM))
+        self.reply_markdown(msg, pref_commands.agent_reply(msg, arg, platform=PLATFORM))
 
     def web(self, msg: ImMessage, arg: str) -> None:
         """`/web [on|off]` —— 联网搜索开关（0 token）。只对 NotiOps Agent 生效。"""
-        self.reply_text(msg, pref_commands.web_reply(msg, arg, platform=PLATFORM))
+        self.reply_markdown(msg, pref_commands.web_reply(msg, arg, platform=PLATFORM))
 
     def account(self, msg: ImMessage, arg: str) -> None:
         """`/account [<12 位账号 id>|list|default]` —— 这个会话在问哪个 AWS 账号。
@@ -176,7 +196,7 @@ class FeishuCaps(Caps):
         0 token（一次偏好读写 + 一次注册表 GSI1 Query）。**上车 / 启用 / 停用只在 Web
         做**，这里只选。
         """
-        self.reply_text(msg, pref_commands.account_reply(msg, arg, platform=PLATFORM))
+        self.reply_markdown(msg, pref_commands.account_reply(msg, arg, platform=PLATFORM))
 
     def investigate(self, msg: ImMessage, text: str) -> None:
         """发起一次深度调查 —— **0 token**：只 create_backlog_task，NotiOps 侧不总结、

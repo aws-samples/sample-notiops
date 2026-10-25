@@ -306,9 +306,14 @@ def is_bot_thread(platform: str, root_id: str) -> bool:
 
 
 def release_inflight(key: str) -> None:
-    """Best-effort early release of an inflight lock. Optional — the TTL
-    will reap stale rows automatically. Useful only when the worker
-    finishes very quickly and the user might want to retry sooner.
+    """Best-effort early release of an inflight lock.
+
+    Callers use it (via `support_logic.release_inflight`) after a
+    **definite** failure, so a retry with the same key isn't told
+    "already in progress" for the rest of the TTL (todo #4 ③). Unconditional
+    delete is safe here: the lock holder is the only one releasing, and the
+    protected work (≤ 900 s Lambda) always ends well inside the TTL, so no
+    one else can have taken the lock over in the meantime.
     """
     if not key:
         return
@@ -500,25 +505,40 @@ def get_im_task(incident_id: str) -> dict | None:
     return item
 
 
+#: list_im_tasks 最多翻几页（每页最多评估 1000 行）。表里总量是几千行的量级，正常 1–3 页就扫完；
+#: 封顶是为了别让一张异常大的表把每分钟一次的进度 Lambda 拖到超时。
+_IM_TASK_SCAN_MAX_PAGES = 20
+
+
 def list_im_tasks(limit: int = 50) -> list[dict]:
     """扫出所有在途调查（进度 Lambda 每分钟一次）。
 
     ⚠️ 用 Scan 而不是 GSI：在途调查同时最多几条（一个客户的 IM 并发调查量级），
     表里 99% 是别的前缀的行但总量也就几千 —— 加一个 GSI 的成本和运维面比 Scan 大。
     如果哪天真的多到需要索引，那时再加 GSI 并把这里换掉。
+
+    ⚠️ 必须翻页（待办 #38 ②，2026-10-22 通读发现）：`Limit` 限制的是**过滤之前**读到的行数，
+    不是返回的条数。原来只扫一页 —— 表一过 1000 行，排在后面的在途调查就永远扫不到，它的进度卡
+    不再刷新。中途某一页失败时返回已经扫到的（少刷几张卡好过一张都不刷）。
     """
     now = int(time.time())
+    kw = dict(
+        FilterExpression="begins_with(lookup_key, :p) AND #t > :now",
+        ExpressionAttributeNames={"#t": "ttl"},
+        ExpressionAttributeValues={":p": "imtask#", ":now": now},
+        Limit=1000,
+    )
+    items: list[dict] = []
     try:
-        resp = _table.scan(
-            FilterExpression="begins_with(lookup_key, :p) AND #t > :now",
-            ExpressionAttributeNames={"#t": "ttl"},
-            ExpressionAttributeValues={":p": "imtask#", ":now": now},
-            Limit=1000,
-        )
+        for _ in range(_IM_TASK_SCAN_MAX_PAGES):
+            resp = _table.scan(**kw)
+            items.extend(resp.get("Items") or [])
+            lek = resp.get("LastEvaluatedKey")
+            if len(items) >= limit or not lek:
+                break
+            kw["ExclusiveStartKey"] = lek
     except Exception as e:
-        logger.warning("list_im_tasks failed: %s", _safe_err(e))
-        return []
-    items = resp.get("Items") or []
+        logger.warning("list_im_tasks failed after %d item(s): %s", len(items), _safe_err(e))
     return items[:limit]
 
 

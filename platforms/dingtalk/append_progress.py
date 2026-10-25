@@ -142,6 +142,10 @@ class AppendProgress:
         try:
             if kind == "text":
                 self.reply += str((payload or {}).get("delta") or "")
+            elif kind == "reset":
+                # 输出崩坏守卫判死一次模型调用（`core.agent_chat.Sink.rewind`）：正文退回去。
+                # 已经发出去的追加消息撤不回 —— 只是之后发的不再带着那段乱码。
+                self.reply = str((payload or {}).get("text") or "")
             elif kind == "step":
                 line = str((payload or {}).get("text") or "").strip()
                 if line:

@@ -835,8 +835,8 @@ def _do_resolve(client, channel_id: str, thread_ts: str,
     # 去重键带上账号：不同账号可以有相同的 displayId（`caseId` 虽然嵌了账号号，
     # 但走 displayId 那条路时这里只有 displayId），不带账号会把 B 账号的同号工单
     # 误判成"正在处理中"而拒掉。
-    if not support_logic.claim_inflight(
-            f"slack_resolve:{account_id}:{internal_id or display_id}"):
+    inflight_key = f"slack_resolve:{account_id}:{internal_id or display_id}"
+    if not support_logic.claim_inflight(inflight_key):
         client.chat_postMessage(
             channel=channel_id, thread_ts=thread_ts or None,
             text=i18n.t("case.toast.processing_short", locale))
@@ -844,6 +844,10 @@ def _do_resolve(client, channel_id: str, thread_ts: str,
     final = case_management.resolve_case(display_id,
                                          internal_id=internal_id or None,
                                          account_id=account_id)
+    if not final:
+        # 键是固定的(同账号同工单):关案失败不放开,用户再点「关闭」会被「正在处理」
+        # 挡满一小时(待办 #4 ③)。关案是幂等的,放开没有重复副作用。
+        support_logic.release_inflight(inflight_key)
     if final:
         case_url = case_management._case_console_url(display_id)
         client.chat_postMessage(
@@ -905,8 +909,8 @@ def _dispatch_for_case(client, channel_id: str, thread_ts: str,
     #   的解析契约，加账号段会让报告卡丢掉「同步到案例」按钮。已知取舍：两个账号里
     #   撞到同一个 displayId 且都要起调查时，第二次会被判成"已派发过"。撞号概率极低，
     #   而弄坏报告回投是必然损失。
-    if not support_logic.claim_inflight(
-            f"slack_dispatch_for_case:{account_id}:{display_id}"):
+    inflight_key = f"slack_dispatch_for_case:{account_id}:{display_id}"
+    if not support_logic.claim_inflight(inflight_key):
         if user_id:
             client.chat_postEphemeral(
                 channel=channel_id, user=user_id,
@@ -944,6 +948,8 @@ def _dispatch_for_case(client, channel_id: str, thread_ts: str,
     if raw_result.get("error"):
         logger.error("Investigation dispatch for case %s failed: %s",
                      display_id, raw_result["error"])
+        # 派发明确失败:放开(待办 #4 ③),否则案例卡上那颗「起调查」再点会被挡一小时。
+        support_logic.release_inflight(inflight_key)
         if user_id:
             client.chat_postEphemeral(
                 channel=channel_id, user=user_id,

@@ -13,6 +13,8 @@ BucketDeployment / ChatConfig provider），因为一键模板里不能有任何
     所以它**依赖 BFF**；而 BFF 依赖 Artifacts。两件事塞进同一个自定义资源就会成环。
   · Phase=OrgSetup —— 只在客户选了多账号时才存在：打开 StackSets 的组织信任访问
     （没有对应的 CFN 资源）+ 建两个成员账号 StackSet。理由见下方该段注释。
+  · Phase=DataCleanup —— 只在删栈时干活：DeleteEverything 时删数据桶。单独成一个资源，是为了让
+    ReportsCDN 能依赖它 ⇒ 删栈时分发先删完、再删它的源站桶（见 `_teardown_data`）。
 
 铁律（改这个文件前先读）：
   1. **绝不打印凭证/密码**。管理员初始密码由 Cognito 生成并直接发邮件，本函数从不接触它。
@@ -717,9 +719,9 @@ def _teardown_site(props) -> dict:
 
       · 总是做 —— 清空网站桶与 staging 桶（DESTROY 的桶非空就删不掉，会卡住删栈）；
         删掉本次部署自己那几个日志组（它们是**计算资源的附属物**，不是客户数据）。
-      · TeardownMode=DeleteEverything 才做 —— 删数据桶与两张表（它们是
-        `DeletionPolicy: Retain`，CFN 不会碰，只有这里会）。默认 KeepData 就是靠
-        「这里不动它们」+ Retain 共同兑现的。
+      · TeardownMode=DeleteEverything 才做 —— 删两张表（它们是 `DeletionPolicy: Retain`，
+        CFN 不会碰，只有这里会）。默认 KeepData 就是靠「这里不动它们」+ Retain 共同兑现的。
+        数据桶同样是 Retain，但**不在这里删**，见 `_teardown_data`(Phase=DataCleanup)。
 
     两级的失败处理**故意不一样**：
       · 数据类（桶/表/secret）出错 → 栈进 DELETE_FAILED。客户明确要求"全删"，
@@ -779,17 +781,11 @@ def _teardown_site(props) -> dict:
             print(f"WARN could not delete log group {name}: {exc!r}")
 
     if mode != "DeleteEverything":
-        print("TeardownMode=KeepData — the config/session tables and the data bucket are kept")
+        print("TeardownMode=KeepData — the config/session tables are kept")
         if failures:
             raise _TeardownIncomplete(failures)
         return report
 
-    data_bucket = props.get("DataBucket") or ""
-    if data_bucket:
-        def _drop_data_bucket():
-            _empty_bucket(data_bucket)
-            _delete_bucket(data_bucket)
-        attempt(f"s3://{data_bucket}", _drop_data_bucket)
     ddb = boto3.client("dynamodb")
     for table in json.loads(props.get("TableNames") or "[]"):
         def _drop_table(table=table):
@@ -829,6 +825,57 @@ def _teardown_site(props) -> dict:
         raise _TeardownIncomplete(failures)
     report["DeletedEverything"] = "true"
     return report
+
+
+#: 只有这两种栈状态下，DataCleanup 收到的 Delete 才是「整个栈要没了」：删栈本身，以及首次创建失败后的
+#: 回滚（那时 StagerSite 也在删，旧版本就是在那里删数据桶的）。
+_STACK_GOING_AWAY = frozenset({"DELETE_IN_PROGRESS", "ROLLBACK_IN_PROGRESS"})
+
+
+def _stack_status(stack_id: str) -> str:
+    cfn = boto3.client("cloudformation")
+    return cfn.describe_stacks(StackName=stack_id)["Stacks"][0]["StackStatus"]
+
+
+def _teardown_data(props, stack_id: str) -> dict:
+    """Phase=DataCleanup 的删栈收尾：TeardownMode=DeleteEverything 时清空并删掉数据桶。
+
+    数据桶是 `DeletionPolicy: Retain`（KeepData 要留着它），所以 DeleteEverything 时只能由 stager 删。
+    它原来在 `_teardown_site` 里删，而 StagerSite 经 AgentRuntime（环境变量里有报告 CDN 的域名）间接依赖
+    ReportsCDN —— 删栈时 StagerSite 总是先于 ReportsCDN：数据桶一删，报告 CDN 还要再删 6 分钟左右，这段时间
+    分发指向一个已经不存在、名字又可预测（`notiops-data-<账号>-<区域>`）的桶。桶名是全局的，别人可以抢注它，
+    借这个分发发自己的内容（2026-10-25 发 v1.0.33 前，验证账号两次 RC 删栈都被内部的 dangling CloudFront
+    检测抓到、分发被自动禁用）。现在这一步单独成一个自定义资源，模板里 ReportsCDN 依赖它 ⇒ 删栈时 ReportsCDN
+    先删完，才轮到这里删桶。
+
+    🔴 **先确认是整个栈在删。** 这个资源是 v1.0.33 才加的：存量栈升级时它是**新建**的，那次升级要是失败
+    回滚，CFN 会把「本次新建的资源」删掉 —— 也会调到这里，而栈和数据桶都还要接着用。所以只在
+    `_STACK_GOING_AWAY` 里的状态下动桶；读不到栈状态时也留着桶（误删数据不可逆，桶留下来客户自己删得掉）。
+
+    失败语义与 `_teardown_site` 的数据类一致：删不掉就让删栈失败（客户要的是全删），消息里只放码；
+    桶本来就不存在（重试删栈）不算失败。
+    """
+    mode = props.get("TeardownMode", "KeepData")
+    bucket = props.get("DataBucket") or ""
+    if mode != "DeleteEverything" or not bucket:
+        print(f"TeardownMode={mode} — the data bucket is kept")
+        return {"Mode": mode, "DataBucket": "kept"}
+    try:
+        status = _stack_status(stack_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARN could not read the stack status ({exc!r}) — the data bucket is kept")
+        return {"Mode": mode, "DataBucket": f"kept (stack status unknown: {_err_code(exc)})"}
+    if status not in _STACK_GOING_AWAY:
+        print(f"stack is {status}, not being deleted — the data bucket is kept")
+        return {"Mode": mode, "DataBucket": f"kept ({status})"}
+    try:
+        deleted = _empty_bucket(bucket)
+        _delete_bucket(bucket)
+    except Exception as exc:  # noqa: BLE001
+        op = exc.operation_name if isinstance(exc, ClientError) else ""
+        print(f"ERROR teardown step failed — s3://{bucket}: {exc!r}")
+        raise _TeardownIncomplete([f"s3://{bucket}: {op + ' ' if op else ''}{_err_code(exc)}"]) from None
+    return {"Mode": mode, "DataObjectsDeleted": str(deleted), "DataBucket": "deleted"}
 
 
 # ── Phase=OrgSetup：多账号（Organizations）落地 ───────────────────────────────
@@ -1333,6 +1380,8 @@ def handler(event, context):
         if rt == "Delete":
             if phase == "Site":
                 data = _teardown_site(props)
+            elif phase == "DataCleanup":
+                data = _teardown_data(props, event.get("StackId") or "")
             elif phase == "WebSearch":
                 data = _teardown_websearch(props, prior_pid)
                 pid = prior_pid or pid
@@ -1358,6 +1407,9 @@ def handler(event, context):
                 # Artifacts 的那一次和还在收尾的上传赛跑（`_drain_bucket` 的注释里有实测
                 # 时间线），StagingCleanup 排在它之后，是最后一道闸。
                 data = {"StagingObjectsDeleted": str(_drain_bucket(props["StagingBucket"]))}
+        elif phase == "DataCleanup":
+            # Create/Update 什么都不做 —— 只为 Delete 而存在（见 `_teardown_data`）。
+            data = {"NoOp": "this resource only does work on stack delete"}
         elif phase == "StagingCleanup":
             # Create/Update 什么都不做 —— 这个自定义资源**只为 Delete 而存在**：
             # 它排在 Artifacts 与 staging 桶之间，于是删栈顺序是

@@ -493,8 +493,10 @@ def _handle_sync_report(body: dict, client) -> None:
 
     # 去重键带上账号：不同账号可以有相同的 displayId，不带账号会把 B 账号的同号
     # 工单误判成"正在同步中"而直接拒掉。
-    if not support_logic.claim_inflight(
-            f"sync:{account_id}:{incident_id}:{display_id}"):
+    # 键是固定的(同一张报告卡、同一个案例):失败时必须放开,否则用户再点一次会被
+    # 「正在同步」挡满一小时(待办 #4 ③,见 `support_logic.release_inflight`)。
+    inflight_key = f"sync:{account_id}:{incident_id}:{display_id}"
+    if not support_logic.claim_inflight(inflight_key):
         client.chat_postEphemeral(channel=channel_id, user=user_id,
                                   text=i18n.t("case.toast.syncing_in_progress",
                                               locale))
@@ -502,6 +504,7 @@ def _handle_sync_report(body: dict, client) -> None:
 
     ctx = support_logic.load_support_context(incident_id)
     if not ctx:
+        support_logic.release_inflight(inflight_key)   # 什么都没做
         client.chat_postEphemeral(channel=channel_id, user=user_id,
                                   text=i18n.t("case.toast.report_expired",
                                               locale))
@@ -515,6 +518,7 @@ def _handle_sync_report(body: dict, client) -> None:
         target=_sync_report_worker,
         args=(client, channel_id, thread_ts, display_id, ctx, locale,
               account_id),
+        kwargs={"inflight_key": inflight_key},
         daemon=True,
     ).start()
     client.chat_postEphemeral(channel=channel_id, user=user_id,
@@ -524,7 +528,8 @@ def _handle_sync_report(body: dict, client) -> None:
 
 def _sync_report_worker(client, channel_id: str, thread_ts: str,
                         display_id: str, ctx: dict,
-                        locale: str = "en", account_id: str = "") -> None:
+                        locale: str = "en", account_id: str = "",
+                        inflight_key: str = "") -> None:
     locale = _normalize_locale(locale)
     from core import case_management
     try:
@@ -534,6 +539,10 @@ def _sync_report_worker(client, channel_id: str, thread_ts: str,
         #   照实报失败 —— 绝不回落到部署账号里找同号工单写（那是另一个客户的工单）。
         ok = case_management.add_communication(display_id, body_text,
                                                account_id=account_id)
+        if not ok:
+            # AWS 明确拒了 / 拿不到凭证 / 找不到工单 —— 没写进去,放开让用户能重试。
+            # 抛异常那条(下面的 except)不放:请求可能已经到了 AWS。
+            support_logic.release_inflight(inflight_key)
         if ok:
             case_url = case_management._case_console_url(display_id)
             blocks_out = [

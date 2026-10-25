@@ -80,6 +80,14 @@ export interface StreamCallbacks {
   // 服务端把本轮模型换掉了（客户端点的那个已不在管理员启用集内）。
   // 静默替换会让用户以为自己还在用原来的模型，所以必须回传并纠正选择器。
   onModelSubstituted?: (info: { requested?: string; effective?: string; reason?: string }) => void;
+  // 会话忙（待办 #30）：这个会话的上一轮还在服务端跑，这一句没有发出去。`since` = 上一轮开始的时间（ms，
+  // BFF 从 turn 那一行读来；撞的是 runtime 里的锁时没有）。界面据此进入「上一轮还在进行」状态。
+  onBusy?: (info: { reason?: string; since?: number }) => void;
+  // 输出崩坏守卫（agent degeneration.py，待办 #2）：每次模型调用开头一个书签（第几次调用）；
+  // 某次调用的输出被判成乱码时 discard —— 把正文与「思考过程」退回那次调用开头的样子（见 streamRewind.ts）。
+  // retry=true 表示 agent 马上用同样的上下文重试一次。
+  onCallStart?: (call: number) => void;
+  onDiscard?: (info: { call?: number; retry?: boolean }) => void;
   onDone?: (info: { message_id?: string }) => void;
   onError?: (message: string) => void;
 }
@@ -298,6 +306,36 @@ export async function getMessages(conversationId: string): Promise<{ messages: S
   } catch {
     return { messages: [], truncated: false, limit: 0 };
   }
+}
+
+/** 这个会话有没有一轮还在服务端跑（待办 #30 第 ②③ 档）。刷新页面后靠它知道「上一轮还在生成」，
+ *  轮询到它结束再重新拉消息。任何失败都回 `inflight: null` —— 拿不准就别把用户锁在一个会话外面。 */
+export async function getTurnStatus(conversationId: string): Promise<{ inflight: { startedAt: number; stopRequested: boolean } | null }> {
+  const s = await signedClient();
+  if (!s) return { inflight: null };
+  try {
+    const r = await s.aws.fetch(`${s.base}/conversations/${encodeURIComponent(conversationId)}/turn`, { headers: { "x-notiops-id-token": s.idToken } });
+    if (!r.ok) return { inflight: null };
+    const j = await r.json();
+    const f = j?.inflight;
+    return { inflight: f ? { startedAt: Number(f.startedAt) || 0, stopRequested: Boolean(f.stopRequested) } : null };
+  } catch {
+    return { inflight: null };
+  }
+}
+
+/** 让服务端真停掉这个会话正在跑的那一轮（StopRuntimeSession）。输入框的「停止」原来只断开浏览器这一端，
+ *  runtime 里那一轮照样跑完、照样烧 token，紧接着发下一句就撞「会话忙」。尽力而为，失败不提示。 */
+export async function stopTurn(conversationId: string): Promise<void> {
+  const s = await signedClient();
+  if (!s) return;
+  try {
+    await s.aws.fetch(`${s.base}/conversations/${encodeURIComponent(conversationId)}/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-notiops-id-token": s.idToken },
+      body: "{}",
+    });
+  } catch { /* ignore */ }
 }
 
 /** 删除会话（含全部消息）。 */
@@ -555,6 +593,15 @@ function routeEvent(event: string, data: any, cb: StreamCallbacks) {
       break;
     case "followups":
       cb.onFollowups?.(data?.followups ?? []);
+      break;
+    case "busy":
+      cb.onBusy?.(data ?? {});
+      break;
+    case "call_start":
+      if (Number.isInteger(data?.call)) cb.onCallStart?.(data.call);
+      break;
+    case "discard":
+      cb.onDiscard?.(data ?? {});
       break;
     case "done":
       cb.onDone?.(data ?? {});

@@ -1057,7 +1057,8 @@ export async function devopsAgentAssocStatus(operationId, accountId) {
   }));
   const stackId = inst.Summaries?.[0]?.StackId;
   if (!stackId) return { operationId, status, accountId: id, note: "instance_not_found" };
-  const creds = await credsFor(id);
+  // allowDisabled：接入流程读成员账号里的栈输出，与「账户」页的启用开关无关（待办 #38 ⑤）。
+  const creds = await credsFor(id, { allowDisabled: true });
   const cfMember = new CloudFormationClient({ region: process.env.AWS_REGION || "us-east-1", credentials: creds || undefined });
   const st = await cfMember.send(new DescribeStacksCommand({ StackName: stackId }));
   const outs = Object.fromEntries((st.Stacks?.[0]?.Outputs || []).map((o) => [o.OutputKey, o.OutputValue]));

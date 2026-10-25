@@ -295,6 +295,10 @@ else
   [ -f "$AGENT_ZIP" ] || die "agentcore package produced no $AGENT_ZIP"
 fi
 cp "$AGENT_ZIP" "$OUT_DIR/agent-code.zip"
+# agent 依赖里 console-script 包装器(bin/*)的第一行由 uv 按构建机写:macOS 交叉打包时是
+# `#!/usr/bin/env python3`,Linux 构建机上却是本机 venv 的绝对路径(2026-10-25 在 Linux 上打 v1.0.33-rc1
+# 时被末尾的「无本地路径」判据拦下)。统一改写成 env 写法,产物不随构建机变化,在 runtime 里也能直接执行。
+python3 scripts/relocatable_shebangs.py "$OUT_DIR/agent-code.zip"
 
 # ── 4. 逐个产物验形状 ─────────────────────────────────────────────────────────
 # 这些 zip 都是"内容错了也照样能上传、要等客户开栈甚至打开页面才暴露"的类型。

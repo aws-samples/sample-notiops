@@ -15,11 +15,12 @@
  * 运行时：Node.js 20。零第三方依赖（crypto/https 内置 + 预装 AWS SDK v3）。
  */
 import { verifyToken, bearerFrom } from "./jwt.mjs";
-import { ensureConversation, touchConversation, appendMessage, listConversations, listMessages, renameConversation, setConversationPinned, deleteConversation, conversationOwnedBy, conversationPartitionUsed, convAccessAllowed, listNotifications, unreadNotifications, markNotificationsRead } from "./store.mjs";
+import { ensureConversation, touchConversation, appendMessage, listConversations, listMessages, listMessagesForContext, renameConversation, setConversationPinned, deleteConversation, conversationOwnedBy, conversationPartitionUsed, convAccessAllowed, listNotifications, unreadNotifications, markNotificationsRead, claimTurn, releaseTurn, getInflightTurn, getTurnRow, requestTurnStop } from "./store.mjs";
 import { safeErr, errBody } from "./safe_err.mjs";
-import { agentRuntimeConfigured, invokeAgent, warmupAgent } from "./agentcore.mjs";
+import { agentRuntimeConfigured, invokeAgent, warmupAgent, stopAgentSession } from "./agentcore.mjs";
 import { normalizeTopic } from "./topic.mjs";
 import { createWaitHint } from "./wait_hint.mjs";
+import { modelFailureText, interruptedNote, isBusyError, busyText, stoppedNote } from "./turn_errors.mjs";
 import { executeAction, casesSummary, casesDashboard, describeServices, getCasesTrends, casesOrgSummary } from "./support.mjs";
 import { listAccounts, deploymentInfo } from "./accounts.mjs";
 import { listSkills, getSkill, saveSkill, deleteSkill, skillExists, listVersions, rollbackSkill, importSkillZip, seedPresetSkills } from "./skills.mjs";
@@ -59,56 +60,7 @@ const enc = new TextEncoder();
 const sse = (event, data) => enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** 本轮一个字都没产出、且**不是**冷启动 → 说清失败原因 + 给下一步（别再只给「（无响应）」）。
- *
- * 事故背景（2026-08-25 现网）：Grok 4.6 那轮 Bedrock ConverseStream 连续
- * InternalServerException，agent runtime 按约定发了 `{error, error_type}` 帧，但 BFF 当时
- * 不认识那帧、也就没有 lastErr → 用户只看到「（无响应）」，无从判断是该重试还是换模型。
- * 现在 agentcore.mjs 会把那帧变成异常，这里负责把它翻成人话。
- *
- * 只回显**错误类型**（如 InternalServerException），不回显原始报文
- * （docs/LOGGING_STANDARD.md：日志与用户可见文案都不带模型/服务的原始 message）。
- */
-function modelFailureText(locale, err) {
-  const kind = String(err?.runtimeErrorType || err?.name || "").trim() || "UnknownError";
-  // 错误必须分档，且与 agent 侧（main.py 的 _MODEL_TIMEOUT_ERRORS / AccessDenied /
-  // ValidationException 三档）**同一口径** —— 否则同一次失败，agent 说"权限没配"、BFF 说
-  // "请再发一次"，用户按后者一直重试到放弃。判据：
-  //   transient  → 重发大概率就好（服务端抖动/限流/超时）
-  //   permission → 重发一万次也不会好，得管理员去开权限（Bedrock 模型访问 / IAM）
-  //   badRequest → 重发同样内容不会好：模型在本区不可用、或这轮请求本身不合法/过长
-  //   其它       → 多为本端 bug，只说失败 + 反馈管理员，不误导成"模型的问题"
-  const transient = /InternalServer|ServiceUnavailable|Throttl|Timeout|ModelError|ModelNotReady/i.test(kind);
-  const permission = /AccessDenied|UnrecognizedClient|InvalidSignature|ExpiredToken|Unauthorized|Forbidden/i.test(kind);
-  const badRequest = /Validation|ResourceNotFound|ModelNotFound|Serialization/i.test(kind);
-  // 「去哪儿换模型」与「不点名模型」必须与 agent 侧 main.py 那几条模型失败提示的 web 分支一致：
-  //   · 模型选择器在输入框工具栏**最右**（输入框右下角，Composer.tsx 的 .cbar-right），**不在**
-  //     输入框上方（上方那一行是看板胶囊）；
-  //   · 不点名具体模型：这里写死过「Claude Sonnet 5」，它 2026-10-10 起在模型目录里停用，客户照着
-  //     去选择器里找会找不到。选择器里列的都是管理员启用的，「换一个」就够了。
-  if (locale === "en") {
-    if (transient) {
-      return `⚠️ The model service returned \`${kind}\` and this turn produced no answer (already retried automatically).\n\n**Next steps:**\n1. Send the message again — this class of error is usually transient;\n2. If it keeps failing, switch to a different model at the bottom right of the input box and retry.`;
-    }
-    if (permission) {
-      return `🔒 This turn was **denied by permissions** (\`${kind}\`) — resending will not help.\n\n**Next step:** ask your administrator to grant this deployment access to the selected model in **Amazon Bedrock → Model access**, and to check the IAM permissions of the NotiOps agent role. Once that is done, retry.`;
-    }
-    if (badRequest) {
-      return `⚠️ The model rejected this request (\`${kind}\`) — resending the same message will not help.\n\n**Next steps:**\n1. Switch to a different model at the bottom right of the input box (the selected one may not be available in this Region);\n2. If your message or the conversation is very long, start a new conversation and shorten the question.`;
-    }
-    return `⚠️ This turn failed (\`${kind}\`) and produced no answer.\n\n**Next step:** send the message again. If it keeps failing, report it to your administrator with the time of this message.`;
-  }
-  if (transient) {
-    return `⚠️ 模型服务返回 \`${kind}\`，本轮未能生成回答（已自动重试）。\n\n**下一步：**\n1. 直接再发一次 —— 这类错误多为模型服务端的临时故障；\n2. 若连续失败，在输入框右下角切换到**另一个模型**后重试。`;
-  }
-  if (permission) {
-    return `🔒 本轮被**权限拒绝**（\`${kind}\`），再发一次也不会好。\n\n**下一步：** 请管理员在 **Amazon Bedrock → 模型访问（Model access）** 里为本部署开通所选模型，并检查 NotiOps agent 角色的 IAM 权限；开通后再重试。`;
-  }
-  if (badRequest) {
-    return `⚠️ 模型拒绝了这次请求（\`${kind}\`），原样重发不会好。\n\n**下一步：**\n1. 在输入框右下角**换一个模型**（当前所选可能在本区域不可用）；\n2. 若这条消息或整段对话很长，请新建会话并把问题写短一些。`;
-  }
-  return `⚠️ 本轮处理失败（\`${kind}\`），未能生成回答。\n\n**下一步：** 请再发送一次。若持续失败，请把这条消息的时间点反馈给管理员。`;
-}
+// agent 这一轮失败时给用户的话（分档、会话忙、中途断了）在 turn_errors.mjs（待办 #30）。
 
 function pathOf(event) {
   return event.rawPath || event.requestContext?.http?.path || "/";
@@ -722,6 +674,24 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
       const vis = await visibleAccountSet(sub, groups, eff);
       const filtered = vis === "*" ? convs : convs.filter((c) => !c.accountId || vis.has(String(c.accountId)));
       return json(200, { conversations: filtered });
+    }
+    // ── 进行中的那一轮 / 停止它 ── /conversations/{id}/turn、/conversations/{id}/stop（待办 #30 第 ②③ 档）
+    // 前端刷新后靠 turn 知道「上一轮还在生成」并轮询到它结束；「停止」与会话忙提示里的「停止上一轮」
+    // 走 stop：在 turn 行上记一笔 stopRequested，再 StopRuntimeSession 真停掉 runtime 里那一轮。
+    // 对象级门禁与下面的会话接口同一道（不是自己的会话一律 404）。
+    const turnMatch = /\/conversations\/([^/]+)\/(turn|stop)$/.exec(path);
+    if (turnMatch && ((method === "GET" && turnMatch[2] === "turn") || (method === "POST" && turnMatch[2] === "stop"))) {
+      if (!(await conversationOwnedBy(sub, turnMatch[1]))) return json(404, { error: "not_found" });
+      if (turnMatch[2] === "turn") {
+        const t = await getInflightTurn(turnMatch[1]).catch((e) => { console.warn(`[BFF] getInflightTurn failed — ${safeErr(e)}`); return null; });
+        return json(200, { inflight: t ? { startedAt: t.startedAt, stopRequested: t.stopRequested } : null });
+      }
+      const marked = await requestTurnStop(turnMatch[1]).catch((e) => { console.warn(`[BFF] requestTurnStop failed — ${safeErr(e)}`); return false; });
+      // 没有 turn 行也照样停 runtime 会话：前端只在 NotiOps agent 那条路的轮次上调 stop，而 turn 行
+      // 可能因为 DDB 抖动 fail-open 没写上 —— 那一轮仍在 runtime 里跑。
+      const rt = await stopAgentSession(turnMatch[1]);
+      console.log(`[BFF] /stop conversation turn — marked=${marked} runtime=${rt.ok ? (rt.code || "ok") : rt.code}`);
+      return json(200, { stopped: marked, runtime: rt.ok ? (rt.code || "ok") : rt.code });
     }
     // ── 会话历史 ── /conversations/{id}
     const convMatch = /\/conversations\/([^/]+)$/.exec(path);
@@ -1392,6 +1362,28 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
   // 答案来源标记（agent 发来的 {"via":"builtin"}）：这一轮不是模型答的（内置确定性
   // 回答，0 token）。落库时用它把署名行钉成 NotiOps，刷新后历史仍不会被错误署名。
   let agentVia;
+  // 这一轮是哪个引擎答的（agent / deep-direct / devops-chat / starops / echo），以及直连深度调查落在哪一场
+  // 调查上（`{ taskId, executionId }`）。都随助手消息落库：下次轮到 agent 回答时，`direct_context.mjs`
+  // 靠它们挑出 agent 没见过的直连轮次带过去（待办 #33）。在各分支的**第一行**赋值，别靠事后推断。
+  let turnPath = "";
+  let directRef = null;
+  // 同一会话同一时间只能跑一轮（待办 #30 第 ③ 档）：走 NotiOps agent 之前先占 `turn` 那一行。
+  // 占不到 = 上一轮还在跑 → 下面直接走「会话忙」，不去撞 runtime 里 strands 的锁；DDB 出错 fail-open
+  // （并发跑两轮是可恢复的降级，因为 DDB 抖一下就不回答用户不是）。占到的那一行在 finally 里放掉。
+  let heldTurnId = "";
+  let busySince = 0;
+  const claimAgentTurn = async () => {
+    const turnId = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      const c = await claimTurn(conversationId, turnId);
+      if (!c.claimed) { busySince = Number(c.inflight?.startedAt) || 0; return false; }
+    } catch (e) {
+      console.warn(`[BFF] /stream claimTurn failed (fail-open) — ${safeErr(e)}`);
+      return true;
+    }
+    heldTurnId = turnId;
+    return true;
+  };
   // 本轮回答的阿里云数字员工 ID（只有 STAROps 那条路径会填）。落库后页脚跨刷新仍能显示
   // 「这条是哪个数字员工答的」—— 不落的话，历史回复的页脚会在管理员换过员工之后说错。
   let staropsEmployee = "";
@@ -1456,6 +1448,7 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
       .catch((e) => console.error(`[BFF] /stream appendMessage(user) failed — ${safeErr(e)}`));
 
     if (staropsDirect) {
+      turnPath = "starops";
       // ── STAROps 对话：0 token 路径（由**客户自己的阿里云 STAROps 数字员工**回答）──
       // 不经 agent runtime / Bedrock，BFF 直接调阿里云 `CreateChat`（SSE）并把事件流逐 delta
       // 转成同形 SSE（token/progress/investigation_step/usage）→ 前端渲染与右侧「思考过程」
@@ -1514,6 +1507,7 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
         }
       }
     } else if (chatDirect) {
+      turnPath = "devops-chat";
       // ── DevOps 对话：0 token 路径（由**客户自己的 DevOps Agent** 回答）──
       // 不经 agent runtime / Bedrock，BFF 直接调 DevOps Agent 控制面 CreateChat + SendMessage，
       // 把事件流逐 delta 转成 SSE（token/progress/investigation_step），体验对齐"直接开 DevOps
@@ -1544,6 +1538,7 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
         }
       }
     } else if (directInvestigate) {
+      turnPath = "deep-direct";
       // ── 深度调查（直连）：0 token 路径 ──
       // 不经 agent runtime / Bedrock，BFF 直接调 DevOps Agent API（发起 + 轮询 journal + 读摘要
       // + 落 HTML 报告）。SSE 事件与老路径同形，故前端渲染/右侧「思考过程」面板零改动复用。
@@ -1552,6 +1547,7 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
         const { runDirectInvestigation } = await import("./devops_investigate.mjs");
         reply = await runDirectInvestigation({
           text, locale, accountId, skillId, skillVersion,
+          onRef: (r) => { directRef = r; },
           emit: (evt, data) => {
             // sources 与老路径一致地累积，供落库复用（历史回显时报告链接不丢）。
             if (evt === "sources") {
@@ -1582,7 +1578,16 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
           stream.write(sse("token", { delta: reply }));
         }
       }
+    } else if (agentRuntimeConfigured() && !(await claimAgentTurn())) {
+      // 会话忙（服务端记录，待办 #30 第 ③ 档）：这一句**不进** runtime。前端据 busy 事件进入
+      // 「上一轮还在进行」状态，轮询 /turn 到它结束。路径记 busy（direct_context 不当它是 agent 答过的一轮）。
+      turnPath = "busy";
+      console.warn(`[BFF] /stream conversation busy — turn marker held since=${busySince || "?"}`);
+      stream.write(sse("busy", { reason: "turn_in_progress", since: busySince || undefined }));
+      reply = busyText(locale);
+      stream.write(sse("token", { delta: reply }));
     } else if (agentRuntimeConfigured()) {
+      turnPath = "agent";
       // ── Phase 1：调 AgentCore Runtime（Strands agent），透传流式 ──
       // 冷启动兜底：AgentCore runtime 空闲回收后下次请求会冷启动，若容器初始化 >30s
       // 会被 kill 并抛 "Runtime initialization time exceeded"（RuntimeClientError）——
@@ -1623,8 +1628,12 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
       const stopHeartbeat = () => waitHint.stop();
       const gotOutput = () => { sawAgentOutput = true; stopHeartbeat(); };
 
+      // 已经推给浏览器的正文（跨重试累计；只有冷启动才会重试，而冷启动一个字都没吐）和本轮 runtime
+      // 报来的错误帧。两者同时存在 = 「答到一半断了」，下面要在正文后面明说，而不是静默吞掉（待办 #30）。
+      let streamedText = "";
+      let midStreamErr = null;
       const callbacks = {
-        onToken: (delta) => { streamedAny = true; gotOutput(); stream.write(sse("token", { delta })); },
+        onToken: (delta) => { streamedAny = true; streamedText += delta; gotOutput(); stream.write(sse("token", { delta })); },
         onSources: (sources) => {
           for (const s of sources) collectedSources.push(s);
           stream.write(sse("sources", { sources: collectedSources }));
@@ -1644,6 +1653,15 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
         onProgress: (p) => { gotOutput(); stream.write(sse("progress", p || {})); },
         // 思考过程增量 → 前端右侧「思考过程」面板的思考段（thinking.ts::appendReasoning）。同样不置 streamedAny。
         onReasoning: (r) => { gotOutput(); stream.write(sse("reasoning", r || {})); },
+        // 输出崩坏守卫（agent degeneration.py，待办 #2）：每次模型调用开头一个书签；某次调用被判成乱码时，
+        // invokeAgent 已把落库用的全文退回书签处（d.text），这里让 streamedText 跟上，并让浏览器也退回去
+        // （前端按同一个书签恢复正文与「思考过程」）。都不是答案内容：不置 streamedAny、不算产出。
+        onCallStart: (call) => { stream.write(sse("call_start", { call })); },
+        onDiscard: (d) => {
+          if (typeof d?.text === "string") streamedText = d.text;
+          console.warn(`[BFF] /stream agent discarded a collapsed model call — call=${d?.call} retry=${d?.retry === true} model=${model || "-"}`);
+          stream.write(sse("discard", { call: d?.call, retry: d?.retry === true }));
+        },
         // 本轮 token 用量 → 前端在消息末尾显示「· N tokens」
         onUsage: (u) => { usage = u; stream.write(sse("usage", { usage: u })); },
         // 答案来源标记（"builtin" = agent 的内置确定性回答，未调模型）→ 前端把署名行
@@ -1653,7 +1671,8 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
         // runtime 流内异常帧（模型 5xx/限流等）。只记**类型**，不记原始报文
         // （docs/LOGGING_STANDARD.md）。文案由下面的 fallback 统一给，这里只保证可观测。
         onRuntimeError: (err) => {
-          console.error(`[BFF] /stream agent runtime error frame — type=${err?.type || "?"} model=${model || "-"}`);
+          midStreamErr = { runtimeErrorType: err?.type || "" };
+          console.error(`[BFF] /stream agent runtime error frame — type=${err?.type || "?"} model=${model || "-"} afterText=${streamedText.length > 0}`);
         },
         // ↓ 这两个只切等待期提示的阶段 + 记一个跨重试的标记，不产生任何前端事件、不置 streamedAny。
         // onOpen  = InvokeAgentRuntime 的响应头到了（平台侧不再是"拉容器"阶段）。
@@ -1666,12 +1685,23 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
         const m = String(e?.name || "") + " " + String(e?.message || e || "");
         return /Runtime initialization time exceeded|RuntimeClientError|not ready|initialization|ServiceUnavailable|throttl/i.test(m);
       };
+      // 本会话里 agent 没见过的直连轮次（深度调查 / DevOps 对话由客户自己的 DevOps Agent 直接答，
+      // 没经过 agent，它的记忆里没有）—— 2026-10-21 现网实测「调查完说开个案例」拿到空白建案卡
+      // 就是因为这个（待办 #33）。在重试循环**外**算一次；读不到只是少带上文，不影响这一轮。
+      let directTurns;
+      try {
+        const { pickUnseenDirectTurns } = await import("./direct_context.mjs");
+        directTurns = pickUnseenDirectTurns(await listMessagesForContext(conversationId, 20));
+      } catch (e) {
+        console.warn(`[BFF] /stream direct-turn context skipped — ${safeErr(e)}`);
+      }
       const MAX_ATTEMPTS = 3;
       let lastErr;
       let attemptsMade = 0;   // 实际打出去的次数（下面区分"没醒" vs "起不来"要用，循环变量出不了作用域）
       startHeartbeat(); // 冷启动阻塞期间的过程提示（5s 后起，每 10s 一条；见 first token 即停）
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         attemptsMade = attempt;
+        midStreamErr = null; // 只认这一次尝试的错误帧（上一次冷启动失败的那帧不该挂到这次的正文后面）
         try {
           reply = await invokeAgent(
             // allowedAccounts：可见性 RBAC 下发给 agent，防 prompt 点名账号绕过门禁
@@ -1683,7 +1713,7 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
                 const v = await visibleAccountSet(sub, groups || [], effLocal);
                 return v === "*" ? "*" : [...v].join(",");
               })(),
-              skillId, skillVersion },
+              skillId, skillVersion, directTurns },
             callbacks,
           );
           lastErr = undefined;
@@ -1692,8 +1722,9 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
           lastErr = e;
           // 观测缺口教训：此前吞错不打日志 → "(no response)" 无迹可查。必须落 CloudWatch。
           console.error(`[BFF] /stream invokeAgent attempt ${attempt} failed — ${e?.name || ""}: ${e?.message || e}`, e?.stack || "");
-          // 已经吐过内容 → 绝不重试（避免重复）；非冷启动错误 → 不重试；到达上限 → 停。
-          if (streamedAny || !isColdStart(e) || attempt >= MAX_ATTEMPTS) break;
+          // 已经吐过内容 → 绝不重试（避免重复）；会话忙 → 不重试（上一轮可能还要跑几分钟，
+          // 2 秒、4 秒后重发只会再撞两次锁）；非冷启动错误 → 不重试；到达上限 → 停。
+          if (streamedAny || isBusyError(e) || !isColdStart(e) || attempt >= MAX_ATTEMPTS) break;
           // 冷启动重试：过渡提示走**瞬态 progress**（不污染答案正文，收到正文即清空），
           // 而非当作 token 写进 reply。退避后重试（心跳仍在跑，不重复起）。
           stream.write(sse("progress", {
@@ -1704,6 +1735,34 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
         }
       }
       stopHeartbeat(); // 循环结束（成功/失败/放弃）——务必停掉心跳，避免定时器泄漏到响应之后
+      // 用户点了「停止」（POST /stop 在 turn 行上记了 stopRequested、并停掉了 runtime 会话，待办 #30）：
+      // 落库的回答 = 已推给浏览器的正文 +「已停止」，与前端本地显示的一致 —— 不是「中途断了」，
+      // 也不是一句失败文案。行已经被下一轮接手（turnId 不是我的）同样说明我是被停掉的（见 getTurnRow）。
+      // 读不到就按没停处理。
+      const turnRow = heldTurnId ? await getTurnRow(conversationId).catch(() => null) : null;
+      if (turnRow && (turnRow.turnId !== heldTurnId || turnRow.stopRequested)) {
+        const body = streamedText || reply || "";
+        const note = stoppedNote(locale, Boolean(body));
+        reply = body + note;
+        try { stream.write(sse("token", { delta: note })); } catch { /* 浏览器那端多半已经断开 */ }
+        lastErr = undefined;
+        midStreamErr = null;
+      }
+      // 答到一半断了 → 正文后面补一段「断了 + 下一步」，并且落库的回答与用户看到的一致（待办 #30）：
+      //   · runtime 发来错误帧、但前面已经有正文：invokeAgent 照常返回（不抛 —— 抛了调用方会重试、
+      //     重复输出），错误只经 onRuntimeError 交回来。以前到这里就没了下文：2026-10-17 验证账号，
+      //     模型说完「我先查一下 AWS 官方文档…」、调完工具后 300 秒零字节，会话里只剩那 76 个字；
+      //   · invokeAgent 在吐过正文之后才抛（BFF 与 runtime 之间的流读到一半断了）：reply 还是空的，
+      //     而浏览器早已收到那些 token —— 以前落库的只有下面那句失败文案，刷新后正文凭空消失。
+      if (reply && midStreamErr) {
+        const note = interruptedNote(locale, midStreamErr);
+        reply += note;
+        stream.write(sse("token", { delta: note }));
+      } else if (!reply && lastErr && streamedText) {
+        const note = interruptedNote(locale, lastErr);
+        reply = streamedText + note;
+        stream.write(sse("token", { delta: note }));
+      }
       // 注意：**不**再往前端发 sse("error", {message: 原始报文})。
       // 一是违反日志/展示纪律（docs/LOGGING_STANDARD.md）——Bedrock 的原始报文里带
       // region / model id / 内部提示（Strands 还会追加 `└ Model id: …` 两行），不该进用户界面；
@@ -1730,6 +1789,16 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
         // 不会回来，所以加上这一条在真故障上不丢判据，只挡掉误判。
         const neverStarted = !!lastErr && isColdStart(lastErr)
           && attemptsMade >= MAX_ATTEMPTS && !everReady && !everOpened;
+        // 会话忙（待办 #30）：同一会话的上一轮还在 runtime 里跑，这一句撞上了 strands 的 Agent 锁 ——
+        // 它**没进** agent。2026-10-15 验证账号：第一轮等模型 300 秒，期间用户刷新页面、两次重发同一句，
+        // 两次都被说成「本轮处理失败，请再发送一次」，于是又发了一次。
+        //   · 路径记成 busy：direct_context 据此不把它当成「agent 答过的一轮」；
+        //   · 发一个结构化的 busy 事件，前端可以据此把这条显示成提示、而不是一次失败的回答。
+        if (lastErr && isBusyError(lastErr)) {
+          turnPath = "busy";
+          console.warn(`[BFF] /stream conversation busy — previous turn still running (attempts=${attemptsMade})`);
+          stream.write(sse("busy", { reason: "turn_in_progress" }));
+        }
         if (neverStarted) {
           // 可观测性：这条与普通冷启动必须能在 CloudWatch 里分开数（它意味着"该发版了"，
           // 不是"该等一等"）。只记类型/次数，不记原始报文（docs/LOGGING_STANDARD.md）。
@@ -1745,11 +1814,13 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
                 ? "⏳ The service is still starting up and didn't respond in time (cold start after idle).\n\n**Next step:** send your message again — the second request usually lands on an already-warmed instance and responds immediately."
                 : "⏳ 服务仍在启动中，本次未能及时响应（空闲后的冷启动）。\n\n**下一步：** 请再发送一次消息 —— 第二次请求通常会落到已预热的实例，会立即响应。")
             : lastErr
-              ? modelFailureText(locale, lastErr)
+              // retried：BFF 真的替用户重发过（只有冷启动类错误会重发）才说「已自动重试」
+              ? modelFailureText(locale, lastErr, { retried: attemptsMade > 1 })
               : (locale === "en" ? "(no response)" : "（无响应）");
         stream.write(sse("token", { delta: reply }));
       }
     } else {
+      turnPath = "echo";
       // ── 回退：AGENT_RUNTIME_ARN 未配置时仍走 echo（Phase 0 部署兼容）──
       await sleep(300);
       reply =
@@ -1765,6 +1836,10 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
     ts = Date.now();
     await appendMessage(conversationId, {
       role: "assistant", text: reply, ts, model,
+      path: turnPath || undefined,
+      investigation: directRef && (directRef.taskId || directRef.executionId)
+        ? { task_id: directRef.taskId || undefined, execution_id: directRef.executionId || undefined }
+        : undefined,
       sources: collectedSources.length ? collectedSources : undefined,
       usage: usage || undefined, // 持久化本轮用量，刷新后仍显示
       // 本轮针对账号(历史回复账号徽标用)。STAROps 那一轮**不落**：这一轮一个 AWS API 都没调，
@@ -1811,6 +1886,11 @@ async function streamChat(event, responseStream, { sub, groups, onSseStart }) {
       stream.end();
     } catch (e) {
       console.error(`[BFF] /stream finalize failed — ${safeErr(e)}`);
+    }
+    // 这一轮结束（答完 / 失败 / 被停）→ 放掉 turn 那一行（待办 #30 第 ③ 档）。在落库之后：前端轮询
+    // 看到「上一轮结束了」时，它的回答已经拉得到。只删自己那一行（条件写），放不掉就等它过期。
+    if (heldTurnId) {
+      await releaseTurn(conversationId, heldTurnId).catch((e) => console.warn(`[BFF] /stream releaseTurn failed — ${safeErr(e)}`));
     }
   }
 }

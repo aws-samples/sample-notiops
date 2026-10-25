@@ -45,6 +45,12 @@ BOTO_VERSION="1.43.65"
 
 PLAT_ARGS="--platform manylinux2014_x86_64 --implementation cp --only-binary=:all:"
 
+# 传递依赖也钉死（待办 #37，2026-10-23）：上面只钉了三个直接依赖，其余每次重建都取当天最新 ——
+# 2026-10-22 重建一次，对比现网 IM 层漂了 7 个包，pycryptodome 3.23.0 → 4.1.0 跨了大版本
+# （飞书事件解密在用）。约束文件里是现网这一层逐个读 dist-info 得到的版本；三条 pip 都带 -c。
+CONSTRAINTS="$PROJECT_ROOT/scripts/layer-constraints-im.txt"
+[ -f "$CONSTRAINTS" ] || { echo "[im-layer] ❌ 找不到约束文件 $CONSTRAINTS" >&2; exit 1; }
+
 echo "[im-layer] 清理 $DEST"
 rm -rf "$DEST"
 mkdir -p "$DEST"
@@ -90,18 +96,18 @@ fi
 
 echo "[im-layer] 安装 lark-oapi==$LARK_VERSION"
 # shellcheck disable=SC2086
-pip install "lark-oapi==$LARK_VERSION" -t "$DEST" --quiet --upgrade $PLAT_ARGS
+pip install -c "$CONSTRAINTS" "lark-oapi==$LARK_VERSION" -t "$DEST" --quiet --upgrade $PLAT_ARGS
 
 echo "[im-layer] 安装 slack-sdk==$SLACK_SDK_VERSION"
 # ⚠️ 这里**故意不带** $PLAT_ARGS：slack-sdk 是纯 Python（py3-none-any wheel），
 # 没有任何 .so。带上 `--only-binary=:all: --platform manylinux2014_x86_64` 时
 # pip 对 none-any wheel 的处理在各版本间有过反复，为了不让层构建卡在一个纯 Python
 # 包上，这里直接常规安装 —— 平台校验由下面的 *-darwin.so / *.dylib 扫描兜底。
-pip install "slack-sdk==$SLACK_SDK_VERSION" -t "$DEST" --quiet --upgrade
+pip install -c "$CONSTRAINTS" "slack-sdk==$SLACK_SDK_VERSION" -t "$DEST" --quiet --upgrade
 
 echo "[im-layer] 安装 boto3/botocore==$BOTO_VERSION"
 # shellcheck disable=SC2086
-pip install "boto3==$BOTO_VERSION" "botocore==$BOTO_VERSION" -t "$DEST" --quiet --upgrade $PLAT_ARGS
+pip install -c "$CONSTRAINTS" "boto3==$BOTO_VERSION" "botocore==$BOTO_VERSION" -t "$DEST" --quiet --upgrade $PLAT_ARGS
 
 deactivate
 

@@ -11,6 +11,7 @@ import { getSupportServices, type SupportService, type AccountInfo } from "../ap
 import { modelDisplayName } from "../models";
 import { SHOW_TOKEN_USAGE } from "../featureFlags";
 import { formatMessageTime } from "../messageTime";
+import { waitingText } from "../thinking";
 
 // 署名文案："AWS Bedrock (DeepSeek V3.2) · 1,234 tokens"
 // 所有模型均经 Amazon Bedrock 提供（GPT-5.6 经 Bedrock Mantle），故 provider 统一。
@@ -702,7 +703,7 @@ export default function Message({ m, onOpenSources, onOpenThinking, onConfirmAct
             <PulseWave />
             {/* 处理中：有进度行(工具调用等)就显示"正在做什么"，否则显示"思考中"。
                 文案已由后端按本轮语言给好（中问中答、英问英答）。 */}
-            <span>{m.progress || t("thinking")}<span className="tk-dots" /></span>
+            <span>{waitingText(m.progress, t("thinking"))}<span className="tk-dots" /></span>
             <span className="tk-sep">·</span>
             <span className="tk-time">{m.thinkElapsed ?? 0}s</span>
           </div>

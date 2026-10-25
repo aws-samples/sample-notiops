@@ -312,7 +312,7 @@ Credential flow: `setup.sh` **does not collect IM credentials** — it only sets
 | **Bedrock** | Same as the deploy region | There is no separate Bedrock region parameter: model calls are made from the deploy region (except GPT-5.6 Terra / Luna, which always go to `us-east-2`). The default model, Kimi K3, is a `global.` cross-Region inference profile; for model access see §2.2 |
 | **DDB / S3** | Same as the deploy region | Created in the same region as the stack |
 
-**Simplest deploy**: the `setup.sh` region menu defaults to `1) ap-northeast-1` (Tokyo); just press Enter to use it — it is on the DevOps Agent list above. Check that list before choosing "Custom input".
+**Simplest deploy**: the `setup.sh` region menu defaults to `1) us-east-1` (N. Virginia); just press Enter to use it — it is on the DevOps Agent list above, and it is the only region where web search is available. A deployment installed earlier in Tokyo (`ap-northeast-1`) must choose `2)` when re-running to upgrade; if you just press Enter and us-east-1 has no deployment yet, setup.sh asks before going on. Check that list before choosing "Custom input".
 
 ### 2.4 IAM deployment permissions
 
@@ -542,7 +542,7 @@ CDK deployment doesn't need `bootstrap.env` — `./setup.sh` walks you through t
 |---|---|---|
 | **AWS Profile** | Deploy profile | Pick from your local `~/.aws` profile list, or keep the current one |
 | **AWS** | Account ID | Auto-detected from `aws sts get-caller-identity`; just confirm |
-| | Region | 6 options (`ap-northeast-1` [default] / `us-east-1` / `us-west-2` / `eu-west-1` / `ap-southeast-1` / custom input). Every stack goes into this one region, and it must support AWS DevOps Agent (see §2.3) |
+| | Region | 6 options (`us-east-1` [default] / `ap-northeast-1` / `us-west-2` / `eu-west-1` / `ap-southeast-1` / custom input). Every stack goes into this one region, and it must support AWS DevOps Agent (see §2.3) |
 | **Push (PHD)** | Deploy PHD event forwarding | Defaults to `Y`; the `--phd` flag handles linked-account-side forwarding |
 | **Multi-account** | Business account allowlist | Triggered separately via `--multi-account`; single-account by default |
 | **IM platforms** (optional) | Choice | `1` Feishu / `2` Slack / `3` DingTalk (multi-select, e.g. `1,3`) / `0` skip (default on a **first install only**, web UI only). On a **re-run** the default is to keep the live platforms as-is (`keep`); if the live state cannot be read and there is no TTY, it **exits with an error** rather than continuing on a default. **Only sets the `enabledPlatforms` flag — no credential prompt** |
@@ -656,7 +656,7 @@ After §2 prerequisites (and §3 IM-app registration only if you want IM), this 
 1. Dependency check: `node` ≥ 22 / `npm` / `npx cdk` / `aws` / `jq` / `python3` / `uv` (**exits immediately if uv is missing** — otherwise a failed agent deployment silently degrades Web Chat to echo mode; not checked when `SKIP_AGENT=true`). **No container build tool is required at all** since 2026-09-03 (IM refactor M2) — see §2.1
 2. Lets you pick a deploy Profile from your local `~/.aws` profile list (or keep the current one)
 3. `aws sts get-caller-identity` to detect the account, prompts you to confirm
-4. Lets you pick a deploy region from 6 options (default `ap-northeast-1`; includes a "custom input" choice)
+4. Lets you pick a deploy region from 6 options (default `us-east-1`; includes a "custom input" choice)
 5. (Optional) asks whether to deploy PHD event forwarding (default `Y`)
 6. Asks which IM platforms to deploy (`1` Feishu / `2` Slack / `3` DingTalk, multi-select such as `1,3`; `0` skips it — the default on a **first install only**). On a **re-run** the default is to keep the live platforms as-is, so pressing Enter cannot freeze a running bot on old code. **Only sets the `enabledPlatforms` flag — does not collect credentials**
 7. **`[1/4]` Build the frontend** — builds only the Web Chat frontend (`frontend/chat-app`). The old admin console (`frontend/frontend-app`) and the old REST API behind it were retired on 2026-09-04 in this release; the directory no longer exists in the repo and `setup.sh` no longer builds it. This step also copies `config/capabilities.json` / `config/eol-dates.json` into `bff/web-chat/` (the capability manifest's single source of truth lives in `config/`, but the Lambda only packages `bff/web-chat/`) and installs the BFF dependencies (`npm ci --omit=dev`)
@@ -720,7 +720,7 @@ Walk through the list based on what your existing space has:
 
 #### 5.3.3 The web app (operator app) is enabled automatically — nothing to click
 
-The console step "Agent Space → Access → Operator access → **Configure web app**" (the API is `aidevops:EnableOperatorApp`) is **done by CDK at the same time it creates the space**; you don't click it. That adds one role, `notiops-agent-webapp-<account_id>` (trusts `aidevops.amazonaws.com`, carries the AWS managed policy `AIDevOpsOperatorAppAccessPolicy`), disabled and deleted together with the space when you delete the stack. In multi-account mode the member-account StackSet (`infra/member-devops-agent.yaml`) enables it too — otherwise onboarding N accounts would mean signing into N member-account consoles and clicking once in each.
+The console step "Agent Space → Access → Operator access → **Configure web app**" (the API is `aidevops:EnableOperatorApp`) is **done by CDK at the same time it creates the space**; you don't click it. That adds one role, `notiops-agent-webapp-<account_id>` (trusts `aidevops.amazonaws.com`, carries the AWS managed policy `AIDevOpsOperatorAppAccessPolicy`), disabled and deleted together with the space when you delete the stack. In multi-account mode the member-account StackSet (`infra/member-devops-agent.yaml`) enables it too — otherwise onboarding N accounts would mean signing into N member-account consoles and clicking once in each. ⚠️ Member instances onboarded before 2026-08 whose web app was enabled by hand in the member console: updating them to the new template fails with `Operator App … is already enabled` and the instance rolls back (so the inspection space is never created and the Accounts page shows "Stack update needed"). Override the parameter for that instance only and update again: `aws cloudformation update-stack-instances --stack-set-name notiops-member-devops-agent --accounts <member account> --regions <region> --parameter-overrides ParameterKey=OperatorAppAlreadyEnabled,ParameterValue=yes`. The override is stored on the instance, so later `./setup.sh --multi-account` runs keep it. Do not change the StackSet-level value — newly onboarded accounts rely on the template to enable the web app.
 
 **Symptom when it hasn't been enabled**: starting an investigation, connecting to one, DevOps Chat and publishing a skill all fail with `Invalid or unregistered domain` (an error that points nowhere near "you missed a button"). The only spaces that can still hit this are **spaces created before this version** and **spaces you created by hand** — for those, click Configure web app once in the console.
 
@@ -1103,7 +1103,8 @@ aws dynamodb delete-item --table-name <conv-table> \
 > Start with `./teardown.sh --dry-run`; the default keeps the four RETAIN'd tables, and
 > `--delete-everything` deletes them together with the leftover log groups; the data bucket goes
 > with the main stack in both modes, so by default it first backs the bucket up locally
-> (`--no-backup` skips that). Everything
+> (to `~/notiops-teardown-backup-<timestamp>/`, outside the repository; `--backup-dir` changes it;
+> `--no-backup` skips that). Everything
 > CUR-related (the `notiops-cur-report` report definition, its delivery bucket, the Athena
 > integration stack, the saved queries) is **kept in both modes** -- that is your billing
 > history, and AWS does not backfill it; on reinstall `setup.sh` recognises the kept
@@ -1234,7 +1235,7 @@ The frontend build artifact needs a `config.json` (injected at deploy time, not 
 
 ### 12.5 Notification event sources (persistent inbox)
 
-The **persistent inbox** of Web Chat's "Notifications" topic is fed by EventBridge → `notiops-web-notif-handler` (reuses the `core/push_event` normalizer, 5-minute dedup) → writes to the `notif#` segment of the `notiops-web-chat` table. Source toggles:
+The **persistent inbox** of Web Chat's "Notifications" topic is fed by EventBridge → `notiops-web-notif-handler` (reuses the `core/push_event` normalizer; dedup: the same event once per 5 minutes, Trusted Advisor once per 24 hours) → writes to the `notif#` segment of the `notiops-web-chat` table. Source toggles:
 
 - **On by default** (5 — highest operational value, manageable noise): AWS Health / CloudWatch Alarm / Cost Anomaly / Trusted Advisor / GuardDuty
 - **Off by default** (5 — turn one on by adding `"webNotif<Id>": "on"` to the `context` block of `infra/cdk.json` and re-running `./setup.sh`, see §8.1): Backup / EC2 Spot / Auto Scaling / RDS / Config (their `<Id>`s are `BackupJob` / `Ec2Spot` / `AutoScalingFail` / `Rds` / `Config`)

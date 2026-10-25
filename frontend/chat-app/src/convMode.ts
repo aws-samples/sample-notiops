@@ -19,9 +19,16 @@
  *
  * 换机器 / 换浏览器 / 清了站点数据 → 回落到 `via` 那条路径，最差也只是回到今天的行为。
  * 存储读写全程 try/catch：Safari 隐私模式下 localStorage 会直接抛，绝不能让它把聊天页带崩。
+ *
+ * 🔴 2026-10-23 起（待办 #34，用户定的口径「深度调查只管这一轮，跑完自动关；跨刷新保持的只有
+ * 对话对象」）：**只有「对话对象」落盘** —— DevOps 对话（`chat`）和阿里云 STAROps（`starops`）。
+ * 「深度调查」（`direct`，以及界面上已没有入口的 `agent`）是**这一轮的修饰**，一轮结束就由
+ * ChatApp `handleSend` 的 finally 关掉，所以这里既不写、也不恢复（见 `saveConvMode` /
+ * `restorableMode`）。原来它也落盘，后果是 2026-10-21 现网实测的那次：跑完一次深度调查后接着
+ * 说「针对上面的问题开一个案例」，又被当成一次新的深度调查发给了 DevOps Agent（白占一次额度）。
  */
 
-import { topicHasDevopsAgent, topicHasDevopsChat, topicHasStarops } from "./types";
+import { topicHasDevopsChat, topicHasStarops } from "./types";
 
 /** 三个 DevOps 开关 + STAROps 是单选，用一个枚举表达；`off` = 都没开（= 不落盘）。
  *
@@ -65,11 +72,20 @@ export function loadConvMode(convId: string): DevopsMode {
 }
 
 /**
+ * 只管一轮的模式：一轮结束就被 ChatApp 关掉，所以**绝不落盘**（见文件头 2026-10-23 那段）。
+ * 放在写入口这一处兜住，而不是指望每个调用方先过滤 —— 模式的写入口不止一个（会话内开关、
+ * 落地页草稿带进新会话、仪表盘「深入调查」），逐个去拦必然漏一个。
+ */
+const PER_TURN: ReadonlySet<DevopsMode> = new Set<DevopsMode>(["direct", "agent"]);
+
+/**
  * 记下某会话的模式。`off` = 删掉这一条（不留"我选择了都不开"这种条目）——
  * 否则每建一个空会话都会写一条，表很快被没意义的记录填满。
+ * 只管一轮的模式（`PER_TURN`）按 `off` 处理：不写，并删掉这个会话的旧条目。
  */
 export function saveConvMode(convId: string, mode: DevopsMode): void {
   if (!convId) return;
+  if (PER_TURN.has(mode)) mode = "off";
   try {
     const all = readAll();
     if (mode === "off") {
@@ -135,7 +151,11 @@ export function fieldsOf(mode: DevopsMode): { devopsAgent: boolean; devopsAgentD
 export function restorableMode(topic: string | undefined, mode: DevopsMode): DevopsMode {
   if (mode === "chat") return topicHasDevopsChat(topic) ? "chat" : "off";
   if (mode === "starops") return topicHasStarops(topic) ? "starops" : "off";
-  if (mode === "direct") return topicHasDevopsAgent(topic) ? "direct" : "off";
+  // 🔴 「深度调查」（`direct`）**一律恢复成 off**，哪怕主题还提供它 —— 2026-10-23 起它只管
+  //    这一轮（见文件头）。`saveConvMode` 已经不再写它；这里挡的是 2026-10-23 之前落过盘的老条目：
+  //    恢复回来就等于刷新以后开关还开着，下一句追问又被当成一次新的深度调查发出去。
+  //    恢复成 off 以后，ChatApp 的落盘 effect 会顺手把这条老记录删掉。
+  if (mode === "direct") return "off";
   // 🔴 `"agent"`（经我们的 agent 转交那条深度调查）**一律恢复成 off**，哪怕主题还提供
   //    深度调查 —— 2026-09-13 起它在界面上**没有任何开关**（见 ModePicker 文件头 ①）。
   //    字段和 BFF 侧那条链路都还活着，所以"恢复"是能成的；恰恰因此才必须在这里挡：

@@ -128,16 +128,19 @@ ok("finops denied when module disabled even for admin", finopsClosed.allow === f
  * （给自己改成 `*`，完整提权）。权限选择器本就特意过滤掉 adminOnly 节点，说明
  * 「admin 不作为可授予的 nav 权限」是设计意图，通配绕过的正是这个意图。
  * ─────────────────────────────────────────────────────────────────────────── */
-const LLM_ADMIN_ROUTES = [
-  ["GET", "/admin/llm-config"],
-  ["PUT", "/admin/llm-config"],
-  ["PUT", "/admin/llm-config/api-key"],
-  ["PUT", "/admin/llm-config/gateway"],
-  ["GET", "/admin/llm-config/gateway/models"],
-  ["POST", "/admin/llm-config/rollback"],
-  ["PUT", "/admin/llm-config/backend-tasks"],
-  ["GET", "/admin/llm-config/audit"],
-];
+// 路由表**从 index.mjs 源码里取**，不再手抄（待办 #3）：手抄的那份漏了 `POST /admin/llm-config/test`
+// （拿管理员的凭证去调模型）与 `GET /admin/llm-config/status`，还留着一条早已不存在的
+// `PUT /admin/llm-config/api-key`（真名是 bedrock-key）—— 新加的 llm-config 路由默认就在这张表里。
+const INDEX_SRC = (await import("node:fs")).readFileSync(new URL("../index.mjs", import.meta.url), "utf8");
+const LLM_ADMIN_ROUTES = [...INDEX_SRC.matchAll(
+  /method === "(GET|PUT|POST|DELETE|PATCH)" && path\.endsWith\("(\/admin\/llm-config[^"]*)"\)/g,
+)].map((m) => [m[1], m[2]]);
+ok("llm-config route table is derived from index.mjs (≥ 12 routes)", LLM_ADMIN_ROUTES.length >= 12);
+for (const want of [["POST", "/admin/llm-config/test"], ["GET", "/admin/llm-config/status"],
+  ["GET", "/admin/llm-config/candidates"], ["PUT", "/admin/llm-config/bedrock-key"],
+  ["GET", "/admin/llm-config/backend-tasks"]]) {
+  ok(`route table includes ${want.join(" ")}`, LLM_ADMIN_ROUTES.some(([m, p]) => m === want[0] && p === want[1]));
+}
 
 async function allowsAll(eff) {
   for (const [method, path] of LLM_ADMIN_ROUTES) {

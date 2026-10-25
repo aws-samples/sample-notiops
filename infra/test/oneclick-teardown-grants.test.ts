@@ -97,7 +97,8 @@ describe("one-click teardown: every object StagerSite hands to the stager is act
   });
 
   // `_teardown_site` 用 list_object_versions + delete_objects(带 VersionId) 清桶。
-  const EMPTIED = ["SiteBucket", "StagingBucket", "CostResultsBucket", "DataBucket"];
+  // 数据桶不在这里：它归 DataCleanup（见下一组）。
+  const EMPTIED = ["SiteBucket", "StagingBucket", "CostResultsBucket"];
   for (const prop of EMPTIED) {
     it(`${prop}: stager can list versions and delete object versions`, () => {
       const ids = bucketsOf(site[prop]);
@@ -109,11 +110,6 @@ describe("one-click teardown: every object StagerSite hands to the stager is act
         .toBe(true);
     });
   }
-
-  it("DataBucket: stager can delete the bucket itself (it is Retain, CFN will not)", () => {
-    const [id] = bucketsOf(site.DataBucket);
-    expect(granted("s3:DeleteBucket", (r) => arnShape(r)?.id === id && !arnShape(r)!.objects)).toBe(true);
-  });
 
   it("TableNames: stager can delete every listed table", () => {
     const ids = [...new Set(refsIn(site.TableNames))];
@@ -150,6 +146,85 @@ describe("one-click teardown: every object StagerSite hands to the stager is act
       const allMayVanish = asList(st.Resource).every(mayVanish);
       expect(`${st.Sid}: ${allMayVanish ? "every Resource can collapse to NoValue" : "ok"}`).toBe(`${st.Sid}: ok`);
     }
+  });
+});
+
+describe("one-click teardown: the data bucket goes only after the reports CDN that serves it", () => {
+  // 2026-10-25（发 v1.0.33 前）：数据桶原来由 StagerSite 的 Delete 删，而 StagerSite 经 AgentRuntime
+  // （环境变量带 REPORTS_CDN_DOMAIN）间接依赖 ReportsCDN ⇒ 删栈时桶先没，分发还要再删 6 分钟左右，这段时间
+  // 它指向一个不存在、名字可预测的桶（全局命名空间，可被抢注）。验证账号两次 RC 删栈都被内部的 dangling
+  // CloudFront 检测抓到。CFN 的删除顺序 = 依赖的反向 ⇒ 让分发依赖删桶的那个资源，分发就先删完。
+  const dc = R.DataCleanup;
+  const dataBucketId = logicalIdOfType("AWS::S3::Bucket").find((k) => R[k].DeletionPolicy === "Retain"
+    && JSON.stringify(R[k].Properties?.BucketName ?? "").includes("notiops-data-"))!;
+  const servedBy = logicalIdOfType("AWS::CloudFront::Distribution").filter((k) =>
+    (R[k].Properties.DistributionConfig.Origins as Json[]).some((o) => refsIn(o.DomainName).includes(dataBucketId)));
+
+  it("sanity: the data bucket and the distribution serving it are found", () => {
+    expect(dataBucketId).toBeDefined();
+    expect(servedBy.length).toBe(1);
+  });
+
+  it("StagerSite no longer hands the data bucket to the stager", () => {
+    expect(site.DataBucket).toBeUndefined();
+    expect(bucketsOf(site)).not.toContain(dataBucketId);
+  });
+
+  it("DataCleanup is a stager custom resource for exactly the data bucket, driven by TeardownMode", () => {
+    expect(dc?.Type).toBe("Custom::NotiOpsDataCleanup");
+    expect(dc.Properties.Phase).toBe("DataCleanup");
+    expect(dc.Properties.ServiceToken).toEqual(R.StagerSite.Properties.ServiceToken);
+    expect(dc.Properties.TeardownMode).toEqual(site.TeardownMode);
+    expect(bucketsOf(dc.Properties.DataBucket)).toEqual([dataBucketId]);
+    expect(dc.Condition).toBeUndefined();
+  });
+
+  it("every distribution whose origin is the data bucket DependsOn DataCleanup (deleted before the bucket is)", () => {
+    for (const k of servedBy) expect(asList(R[k].DependsOn ?? [])).toContain("DataCleanup");
+  });
+
+  it("DataCleanup does not itself (transitively) depend on such a distribution — that would be a cycle CFN rejects", () => {
+    // 这正是数据桶不能留在 StagerSite 上的原因（StagerSite 经 AgentRuntime 依赖 ReportsCDN）。环在合成时不报，
+    // 要到 CFN 校验模板时才炸，所以在这里算一遍：Ref / GetAtt / Fn::Sub 里的 ${X} / DependsOn。
+    const direct = (id: string): string[] => {
+      const r = R[id];
+      const subs = JSON.stringify(r.Properties ?? {}).match(/\$\{([A-Za-z0-9]+)(\.[A-Za-z0-9.]+)?\}/g) ?? [];
+      return [...refsIn(r.Properties ?? {}), ...asList(r.DependsOn ?? []),
+              ...subs.map((m) => m.slice(2, -1).split(".")[0])].filter((x) => x in R);
+    };
+    const seen = new Set<string>();
+    const stack = ["DataCleanup"];
+    while (stack.length) {
+      const id = stack.pop()!;
+      for (const d of direct(id)) if (!seen.has(d)) { seen.add(d); stack.push(d); }
+    }
+    expect(servedBy.filter((k) => seen.has(k))).toEqual([]);
+  });
+
+  it("stager can empty and delete the data bucket (it is Retain, CFN will not)", () => {
+    const id = dataBucketId;
+    expect(granted("s3:ListBucketVersions", (r) => arnShape(r)?.id === id && !arnShape(r)!.objects)).toBe(true);
+    expect(granted("s3:DeleteObjectVersion", (r) => arnShape(r)?.id === id && arnShape(r)!.objects)).toBe(true);
+    expect(granted("s3:DeleteBucket", (r) => arnShape(r)?.id === id && !arnShape(r)!.objects)).toBe(true);
+  });
+
+  it("StagerFn waits for no CloudFront distribution (else ReportsCDN, via DataCleanup, is created only after the chat CDN)", () => {
+    // CFN 让依赖方等被依赖方（连同它的传递依赖）完全建好。DefaultPolicy 里曾有一条引用聊天 CDN 的 CreateInvalidation
+    // ⇒ StagerFn 等聊天 CDN 建完 ⇒ ReportsCDN 也只能在那之后才开始建：v1.0.33-rc2 实测建栈 393s → 664s。
+    const seen = new Set<string>();
+    const stack = ["StagerFn"];
+    while (stack.length) {
+      const id = stack.pop()!;
+      const r = R[id];
+      for (const d of [...refsIn(r.Properties ?? {}), ...asList(r.DependsOn ?? [])].filter((x) => x in R)) {
+        if (!seen.has(d)) { seen.add(d); stack.push(d); }
+      }
+    }
+    expect([...seen].filter((k) => R[k].Type === "AWS::CloudFront::Distribution")).toEqual([]);
+  });
+
+  it("stager can read its own stack's status (it deletes the bucket only while the whole stack is going away)", () => {
+    expect(granted("cloudformation:DescribeStacks", (r) => r?.Ref === "AWS::StackId")).toBe(true);
   });
 });
 

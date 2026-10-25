@@ -35,6 +35,8 @@ export interface MinimalBase {
   groups: cognito.CfnUserPoolGroup[];
   /** 报告分发 CDN 的域名（`REPORTS_CDN_DOMAIN`）。与后端栈的 `reportsCdnDomain` 同义。 */
   reportsCdnDomain: string;
+  /** 报告分发 CDN 本身 —— 一键栈要让它依赖 DataCleanup（删栈时分发先删、源站桶后删）。 */
+  reportsCdn: cloudfront.Distribution;
 }
 
 export function createMinimalBase(scope: Construct): MinimalBase {
@@ -163,7 +165,7 @@ export function createMinimalBase(scope: Construct): MinimalBase {
   });
 
   return {
-    userPool, userPoolClient, configTable, dataBucket, groups,
+    userPool, userPoolClient, configTable, dataBucket, groups, reportsCdn,
     reportsCdnDomain: reportsCdn.distributionDomainName,
   };
 }

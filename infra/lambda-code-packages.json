@@ -1,0 +1,78 @@
+{
+  "_comment": [
+    "以「仓库根」为资产的 Python Lambda 代码包的**允许清单**:每个资产只收 packages 里这几个顶层包(待办 #36,2026-10-23)。",
+    "",
+    "为什么是允许清单:fromAsset 打的是文件系统里的仓库根、不看 .gitignore;按名字列的排除清单永远追不上仓库根又多了什么。",
+    "改成允许清单之前,16 个函数包里实测混进过:teardown.sh 默认写在仓库根的数据备份(配置表 / 网页会话表的导出)、",
+    "internal/ 发布工具、publish/、scripts/、setup.sh、CODEOWNERS 和一次 synth 里另一份 worktree 检出。",
+    "",
+    "谁读它:",
+    "  · infra/lib/repo-root-code.ts —— 方式 B(setup.sh / CDK)的五个仓库根资产都从这里取允许清单;",
+    "  · scripts/build_im_zips.py   —— 方式 A(一键部署)的 im-code.zip 用 assets.im.packages,两条路径同一份清单;",
+    "  · tests/test_repo_root_code_allowlist.py —— 每个 handler 的 import 闭包必须落在它那个资产的 packages 里(否则方式 B 冷启动 ImportModuleError);",
+    "  · infra/test/repo-root-code.test.ts —— 真 synth 一遍:每个函数的代码包只含允许的包、带着自己的 handler、没有点文件 / 字节码缓存 / 文档。",
+    "",
+    "字段:packages = 收哪些顶层包;keepMarkdown = 哪些目录里的 .md 要留(其余 .md 一律不进包);",
+    "handlers = 这个资产服务的 Lambda handler(jest 拿 synth 结果反核:每个用仓库根资产的函数,handler 都必须列在它实际用的那个资产下)。",
+    "加一个顶层包 / 一个 handler = 改这里;别回到在栈里手写 exclude 数组。"
+  ],
+  "assets": {
+    "backend": {
+      "_comment": "notiops-backend-stack.ts 的 lambdaCode:通知 / 成本 / CUR 收尾 + 巡检四件套。inspection/skills 的 SKILL.md 是判读 skill 的正文(ensure_skills 上传给 DevOps Agent),缺了它巡检照样出报告、只是退化成通用提示词 —— 所以 keepMarkdown。",
+      "packages": [
+        "core",
+        "shared",
+        "inspection",
+        "lambda4_notifier",
+        "lambda5_cost_analyzer",
+        "lambda6_cur_finalizer",
+        "lambda_inspection_scheduler",
+        "lambda_inspection_executor",
+        "lambda_inspection_reconciler",
+        "lambda_inspection_push"
+      ],
+      "keepMarkdown": ["inspection/skills"],
+      "handlers": [
+        "lambda4_notifier.handler.handler",
+        "lambda5_cost_analyzer.handler.handler",
+        "lambda6_cur_finalizer.handler.handler",
+        "lambda_inspection_scheduler.handler.handler",
+        "lambda_inspection_executor.handler.handler",
+        "lambda_inspection_reconciler.handler.handler",
+        "lambda_inspection_push.handler.handler"
+      ]
+    },
+    "devopsCallback": {
+      "_comment": "notiops-backend-stack.ts 的 devopsCallbackCode(DevOps Agent 调查完成回调)。方式 A 的回调与 IM 共用 im-code.zip,所以 assets.im 里也列了它的 handler。",
+      "packages": ["core", "shared", "inspection", "devops_agent_callback"],
+      "handlers": ["devops_agent_callback.handler.handler"]
+    },
+    "push": {
+      "_comment": "notiops-backend-stack.ts 的 pushLambdaCode:IM 主动推送 + 网页「通知」收件箱的生产端(两个函数共用)。",
+      "packages": ["core", "shared"],
+      "handlers": [
+        "shared.report_delivery.push_handler.lambda_handler",
+        "shared.report_delivery.web_push_handler.lambda_handler"
+      ]
+    },
+    "phd": {
+      "_comment": "notiops-backend-stack.ts 的 phdLambdaCode(组织模式的 AWS Health 事件转发)。",
+      "packages": ["core", "shared", "phd_event_forwarder"],
+      "handlers": ["phd_event_forwarder.handler.handler"]
+    },
+    "im": {
+      "_comment": "im-stack.ts 的 imCode(方式 B)与 scripts/build_im_zips.py 的 im-code.zip(方式 A)。包里的杂项(*.md、Dockerfile、点文件…)再按 infra/im-code-exclude.txt 剪 —— 两条路径读同一份。",
+      "packages": ["core", "platforms", "shared", "inspection", "devops_agent_callback"],
+      "handlers": [
+        "platforms.feishu.lambda_ingress.handler",
+        "platforms.feishu.lambda_worker.handler",
+        "platforms.slack.lambda_ingress.handler",
+        "platforms.slack.lambda_worker.handler",
+        "platforms.dingtalk.lambda_ingress.handler",
+        "platforms.dingtalk.lambda_worker.handler",
+        "platforms.common.lambda_progress.handler",
+        "devops_agent_callback.handler.handler"
+      ]
+    }
+  }
+}

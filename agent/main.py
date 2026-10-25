@@ -411,8 +411,10 @@ async def invoke(payload):
     #   · 工具开始调用 → {progress}：一句"正在做什么"（双语随本轮语言）。
     #   · reasoning 增量 → {reasoning}：模型思考过程（前端只并进右侧「思考过程」面板的思考段）。
     _joiner = ParagraphJoiner()  # 工具调用前后的两段正文之间补空行（见 paragraphs.py）
-    # 输出崩坏守卫（影子模式）：只读事件、判定时打一行 warning，不改任何行为（见 degeneration.py）。
-    _degen = DegenerationGuard(user_message, log=app.logger,
+    # 输出崩坏守卫（影子模式，`enforce=False`）：只读事件、判定时打一行 warning，不改任何行为（见 degeneration.py）。
+    # 部署版（agent-build/…/main.py）是强制拦截：它靠模型流的检查点、AfterModelCallEvent 重试和模型失败那一支
+    # 收尾 —— 这份手写副本没有那一支，所以只留影子模式，不半套接线。
+    _degen = DegenerationGuard(user_message, log=app.logger, enforce=False,
                                model=model_id.get("model_id") if isinstance(model_id, dict) else model_id)
     async for event in agent.stream_async(prompt):
         _degen.observe(event)

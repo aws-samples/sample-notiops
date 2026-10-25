@@ -1081,6 +1081,15 @@ def test_operator_app_enabled_everywhere() -> None:
     _check("成员账号 StackSet 建 space 时开了 Operator App",
            re.search(r"OperatorApp:\s*\n\s*Iam:\s*\n\s*OperatorAppRoleArn:", member) is not None,
            "多账号客户要为每个成员账号登进它自己的控制台点一次 —— 这是三条路径里漏掉代价最大的一条。")
+    # 排障 space 的 web app 允许按实例跳过（存量实例在栈外开过，再 Enable 会被服务端拒、整个
+    # 实例回滚，2026-10-23 现网实测）—— 但**默认必须是由本栈开**，否则新接入的账号又回到
+    # 「登控制台手点」。上面那条正则匹配的是巡检 space 那份（它不许带条件）。
+    _check("排障 space 的 Operator App 只在 OperatorAppAlreadyEnabled=yes 时跳过,默认照开",
+           re.search(r"OperatorApp: !If\s*\n\s*- ManageOperatorApp\s*\n\s*- Iam:\s*\n\s*OperatorAppRoleArn:", member)
+           is not None
+           and re.search(r'OperatorAppAlreadyEnabled:\s*\n\s*Type: String\s*\n\s*Default: "no"', member) is not None
+           and 'ManageOperatorApp: !Equals [!Ref OperatorAppAlreadyEnabled, "no"]' in member,
+           "默认值改成 yes 或条件写反,新成员账号的排障 space 就没有 web app。")
     for must in _OPERATOR_ROLE_MUSTS_CFN:
         _check(f"member-devops-agent.yaml 的 Operator App 角色带 {must}", must in member)
     # 成员账号里可能同时存在一套**独立 NotiOps 部署**（无 -m 后缀的同名角色）。

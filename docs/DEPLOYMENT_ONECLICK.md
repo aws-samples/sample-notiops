@@ -75,7 +75,7 @@
 
 #### ② 开栈 —— 栈里的资源是用**你自己的身份**建的
 
-这个模板**不带** CloudFormation 服务角色（stack service role）。CloudFormation 不会切换身份：模板里声明了 154 个资源（按参数选装的那些也算在内；默认参数下实际建 74 个，见 [§3](#3-这个栈建了什么)），建出来的每一个都是拿**你当前这个 IAM 身份**去创建的 —— 你的权限就是这个栈能建出来的上限。涉及的服务范围（这就是「服务范围」这个问题的答案；「个数」按模板里声明的算）：
+这个模板**不带** CloudFormation 服务角色（stack service role）。CloudFormation 不会切换身份：模板里声明了 156 个资源（按参数选装的那些也算在内；默认参数下实际建 76 个，见 [§3](#3-这个栈建了什么)），建出来的每一个都是拿**你当前这个 IAM 身份**去创建的 —— 你的权限就是这个栈能建出来的上限。涉及的服务范围（这就是「服务范围」这个问题的答案；「个数」按模板里声明的算）：
 
 | 服务前缀 | 这个栈要建什么 | 个数 |
 |---|---|---|
@@ -362,7 +362,7 @@ service-managed StackSet 要求 CloudFormation 与 Organizations 之间的**信�
 
 ### 2.9 「通知」收件箱
 
-**没有参数，栈自动建好。** 左侧导航第一项「通知」里那个收件箱，内容由 **10 条 EventBridge 规则** → 一个 Lambda（`notiops-web-notif-handler`，归一化 + 5 分钟去重）→ 写进 `notiops-web-chat` 表来的。前端 **60s 轮询**一次，所以最长约 1 分钟延迟；左侧红点只统计**未读**。
+**没有参数，栈自动建好。** 左侧导航第一项「通知」里那个收件箱，内容由 **10 条 EventBridge 规则** → 一个 Lambda（`notiops-web-notif-handler`，归一化 + 去重：同一事件 5 分钟内只记一次，Trusted Advisor 24 小时）→ 写进 `notiops-web-chat` 表来的。前端 **60s 轮询**一次，所以最长约 1 分钟延迟；左侧红点只统计**未读**。
 
 - **默认开 5 类**（运维价值最高、噪音可控）：AWS Health / CloudWatch 告警 / 成本异常 / Trusted Advisor / GuardDuty
 - **默认关 5 类**（量大容易刷屏，或需先开通付费服务）：Backup 作业 / EC2 Spot 中断 / Auto Scaling 失败 / RDS / Config
@@ -486,7 +486,7 @@ service-managed StackSet 要求 CloudFormation 与 Organizations 之间的**信�
 
 ## 3. 这个栈建了什么
 
-默认参数下 **74 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 6 个；选上多账号多 8 个；**选带 IM 的安装选项多 26 个**；填了 `CurTable` 或选了 `ProvisionCur=yes` 多 10 个 —— 成本 MCP 那套，选的是 `ProvisionCur=yes` 的话再多 11 个）：
+默认参数下 **76 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 6 个；选上多账号多 8 个；**选带 IM 的安装选项多 26 个**；填了 `CurTable` 或选了 `ProvisionCur=yes` 多 10 个 —— 成本 MCP 那套，选的是 `ProvisionCur=yes` 的话再多 11 个）：
 
 | 类别 | 资源 |
 |---|---|
@@ -495,8 +495,8 @@ service-managed StackSet 要求 CloudFormation 与 Organizations 之间的**信�
 | Agent | 1 个 Bedrock AgentCore Runtime + 1 个 AgentCore Memory（会话记忆，见 [§2.10](#210-会话记忆agentcore-memory)） |
 | 登录 | Cognito User Pool + Client + Identity Pool + 8 个用户组（角色） |
 | 数据 | DynamoDB `notiops-config`、`notiops-web-chat`；1 个数据桶（报告等） |
-| 部署辅助 | 1 个 staging 桶（放搬进来的产物）+ 1 个内联的部署 Lambda + 3 个自定义资源（搬产物 / 写前端配置 / **删栈时把 staging 桶清到真的空**） |
-| 权限 | 6 个 IAM 角色 + 5 个内联策略（其中 AgentCore Memory 的执行角色**一条策略都没有** —— 它只是给服务用来信任的壳）+ 1 个托管策略（BFF 角色的授权超出内联策略的长度上限，多出来的那部分放在这里） |
+| 部署辅助 | 1 个 staging 桶（放搬进来的产物）+ 1 个内联的部署 Lambda + 4 个自定义资源（搬产物 / 写前端配置 / **删栈时把 staging 桶清到真的空** / 删栈时等报告 CloudFront 分发删完再删数据桶，只在 `DeleteEverything` 时干活） |
+| 权限 | 6 个 IAM 角色 + 6 个内联策略（其中 AgentCore Memory 的执行角色**一条策略都没有** —— 它只是给服务用来信任的壳）+ 1 个托管策略（BFF 角色的授权超出内联策略的长度上限，多出来的那部分放在这里） |
 | 「通知」收件箱（见 [§2.9](#29-通知收件箱)） | **10 条 EventBridge 规则**（5 条 ENABLED / 5 条 DISABLED）+ 1 个 Lambda + 它的日志组 + 1 个角色（+ 策略）+ 1 条 Lambda 调用许可 = 15 个 |
 | 深度调查（默认开） | 1 个 DevOps Agent Agent Space（**含自动开好的 Operator App**）+ 1 个只读关联 + 1 个被 DevOps Agent 假设的角色（+ 它的策略）+ 1 个 Operator App 角色 + 1 个自定义资源（把部署账号写进深度调查的账号登记）= 6 个 |
 | 联网搜索（仅 us-east-1） | 1 个自定义资源（去建 AgentCore Gateway）+ 1 个 Gateway 服务角色 + 1 个内联策略 |
@@ -702,7 +702,7 @@ CloudFormation 在删栈时交给自定义资源的是**上一次成功部署时
 
 CloudFormation → 选中栈 → **Delete**。**实测**：`KeepData` ~**3 分 10 秒**；`DeleteEverything` ~**6 分 47 秒**（多出来的是清空并删掉两个桶 + 两张表那一段）。别照着 3 分钟的预期去等 `DeleteEverything`。
 
-删栈过程中，栈里的部署 Lambda 会先把网站桶、staging 桶和（装了成本 MCP 时的）Athena 查询结果桶**清空**（非空的桶删不掉，会把整个删栈卡住），然后按 `TeardownMode` 决定要不要删那两张表和数据桶。2026-08 实测两种模式都是**零 `DELETE_FAILED`**。⚠️ 这句话在 v1.0.30 的预发布版上**一度不成立**：装了成本 MCP 的栈，部署 Lambda 缺查询结果桶的权限，删栈停在 `DELETE_FAILED`（2026-10-10 实测，已修；修复后同日重测 `DeleteEverything`：4 分 12 秒删完、零 `DELETE_FAILED`，查询结果桶里放了对象也照样清掉）。卡住了怎么收拾见 [§6.5](#65-删栈停在-delete_failedstagersite怎么办)。
+删栈过程中，栈里的部署 Lambda 会先把网站桶、staging 桶和（装了成本 MCP 时的）Athena 查询结果桶**清空**（非空的桶删不掉，会把整个删栈卡住），然后按 `TeardownMode` 决定要不要删那两张表和数据桶。数据桶由单独一步 `DataCleanup` 删，排在报告 CloudFront 分发**删完之后** —— 这个桶就是分发的源站（v1.0.32 及更早先删桶，分发还要再删几分钟，这段时间它指向一个已经不存在的桶名，桶名又是全局的、别人可以抢注）。2026-08 实测两种模式都是**零 `DELETE_FAILED`**。⚠️ 这句话在 v1.0.30 的预发布版上**一度不成立**：装了成本 MCP 的栈，部署 Lambda 缺查询结果桶的权限，删栈停在 `DELETE_FAILED`（2026-10-10 实测，已修；修复后同日重测 `DeleteEverything`：4 分 12 秒删完、零 `DELETE_FAILED`，查询结果桶里放了对象也照样清掉）。卡住了怎么收拾见 [§6.5](#65-删栈停在-delete_failedstagersite怎么办)。
 
 ### 6.4 会留下的东西（孤儿），要不要管
 
@@ -719,7 +719,7 @@ CloudFormation → 选中栈 → **Delete**。**实测**：`KeepData` ~**3 分 1
 
 ### 6.5 删栈停在 `DELETE_FAILED`（StagerSite）怎么办
 
-`StagerSite` 就是上面那个「先清空、再按 `TeardownMode` 收尾」的步骤。它失败时，**失败原因里会逐条列出没做成的每一步**（哪个桶 / 表 / secret、哪个 API、什么错误码）—— 先看这一行，再按下面做。`DELETE_FAILED` 的栈**不能再 update**，所以只能把没做完的事手工补上，然后让 CloudFormation 跳过这一步：
+`StagerSite` 就是上面那个「先清空、再按 `TeardownMode` 收尾」的步骤。它失败时，**失败原因里会逐条列出没做成的每一步**（哪个桶 / 表 / secret、哪个 API、什么错误码）—— 先看这一行，再按下面做。`DELETE_FAILED` 的栈**不能再 update**，所以只能把没做完的事手工补上，然后让 CloudFormation 跳过这一步。删数据桶那一步（`DataCleanup`，只在 `DeleteEverything` 时干活）失败时同理：失败原因里同样列出那个桶，第 2 步改成 `--retain-resources DataCleanup`（两步都失败就两个都写上），再按第 3 步把那个桶删掉：
 
 ```bash
 # 1. 把失败原因里列出的桶清空（只清列出来的那几个）
@@ -729,13 +729,14 @@ aws s3 rm s3://<失败原因里列出的桶> --recursive
 aws cloudformation delete-stack --stack-name <栈名> --retain-resources StagerSite
 ```
 
-⚠️ **跳过 StagerSite 就等于跳过了它的收尾** —— 如果你选的是 `DeleteEverything`，下面这些不会再有人替你删，栈删完之后要自己删：两张表（`notiops-config` / `notiops-web-chat`）、数据桶 `notiops-data-<账号>-<区域>`（先清空；**里面有 Skill 与导出的报告，要留就先导出**）、§6.4 表里那几个 `notiops/*` secret（存在的话）、`/aws/bedrock-agentcore/runtimes/` 下这个栈的 agent 日志组。选的是 `KeepData` 的话，那两张表和数据桶本来就是留下的，不用管。CUR 相关（报告、交付桶、`notiops-cur-athena-<账号>` 栈）任何模式都**保留**，这是有意的。
+⚠️ **跳过 StagerSite 就等于跳过了它的收尾** —— 如果你选的是 `DeleteEverything`，下面这些不会再有人替你删，栈删完之后要自己删：两张表（`notiops-config` / `notiops-web-chat`）、§6.4 表里那几个 `notiops/*` secret（存在的话）、`/aws/bedrock-agentcore/runtimes/` 下这个栈的 agent 日志组。数据桶 `notiops-data-<账号>-<区域>` 不在其中（它归 `DataCleanup`）—— 只有跳过了 `DataCleanup`，或者栈还是 v1.0.32 及更早的版本（那时数据桶也在 StagerSite 里删）时，才要自己删它（先清空；**里面有 Skill 与导出的报告，要留就先导出**）。选的是 `KeepData` 的话，那两张表和数据桶本来就是留下的，不用管。CUR 相关（报告、交付桶、`notiops-cur-athena-<账号>` 栈）任何模式都**保留**，这是有意的。
 
 ```bash
 # 3. 只在选了 DeleteEverything 时需要：补上被跳过的收尾。不补的话，同账号同区重装会因为同名的表 / 桶
 #    在第一步预检就整栈失败（约 9 秒，见 §6.1 的第二条警告）
 aws dynamodb delete-table --table-name notiops-config
 aws dynamodb delete-table --table-name notiops-web-chat
+# 数据桶：只在跳过了 DataCleanup、或栈是 v1.0.32 及更早时需要
 aws s3 rb s3://notiops-data-<账号>-<区域> --force   # --force = 先清空再删；要留 Skill / 报告就先导出
 aws logs delete-log-group --log-group-name /aws/bedrock-agentcore/runtimes/<runtime id>-DEFAULT
 # §6.4 表里那几个 notiops/* secret，存在的才删：

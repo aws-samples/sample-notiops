@@ -828,10 +828,16 @@ export async function deepInvestigationAvailability(accountId, { useCache = true
  * @param {function} p.emit      (event, data) => void，写一条 SSE（形状与老路径完全一致）
  * @returns {Promise<string>}    落库用的 assistant 正文
  */
-export async function runDirectInvestigation({ text, locale, accountId, skillId, skillVersion, emit }) {
+export async function runDirectInvestigation({ text, locale, accountId, skillId, skillVersion, emit, onRef }) {
   const en = locale === "en";
   const dv = (zh, enStr) => (en ? enStr : zh);
   let reply = "";
+  /** 告诉调用方这一轮落在哪一场调查上（index.mjs 把它随消息落库，下次轮到 agent 时带给它 ——
+   *  agent 的 `escalate_to_support` 要的是 execution_id，正文里只贴了 taskId，待办 #33）。
+   *  回调出错不影响调查本身。 */
+  const reportRef = (taskId, executionId) => {
+    try { onRef?.({ taskId: taskId || "", executionId: executionId || "" }); } catch { /* 只是少记一个编号 */ }
+  };
   /** 写正文：既流给前端，也累积进 reply 供落库。 */
   const say = (s) => { reply += s; emit("token", { delta: s }); };
 
@@ -871,6 +877,7 @@ export async function runDirectInvestigation({ text, locale, accountId, skillId,
         say(dv(`_（本轮是查看上一场调查的结果，\`/${skillId}\` 未参与。）_\n`,
                `_(This turn just fetches the previous investigation's result, so \`/${skillId}\` was not applied.)_\n`));
       }
+      reportRef(resolved.taskId, resolved.executionId);
       await resumeInvestigation({ client, space, executionId: resolved.executionId,
                                  taskId: resolved.taskId, locale, emit, say });
       finishUsage();
@@ -928,6 +935,7 @@ export async function runDirectInvestigation({ text, locale, accountId, skillId,
     return reply;
   }
   const { taskId, executionId, consoleUrl } = started;
+  reportRef(taskId, executionId);
 
   // 开场横幅：主聊天只放**结论线**（发起了什么 + 后台链接 + 一句"过程在右侧栏看"）；
   // 分析过程走 investigation_step → 右侧「思考过程」面板（与老路径一致）。

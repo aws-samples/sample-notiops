@@ -1,0 +1,40 @@
+# IM 依赖层 lambda_layer_im/ 的**精确版本**(pip 约束文件)—— scripts/build_im_layer.sh 实际装到的就是这里的版本。
+# Exact versions for the IM dependency layer (lambda_layer_im/). build_im_layer.sh installs exactly these.
+#
+# 谁读它:scripts/build_im_layer.sh 的三条 `pip install -c <本文件> …`。两条部署路径都用这个脚本打层
+# (方式 B:setup.sh 选了 IM 平台时;方式 A:发版前 package_artifacts.sh 用 lambda_layer_im/ 打 im-layer.zip),
+# 所以两边的层同一组版本。
+#
+# 为什么要钉(待办 #37,2026-10-23):build_im_layer.sh 只钉了三个直接依赖(lark-oapi / slack-sdk /
+# boto3+botocore),传递依赖每次重建都取当天最新。2026-10-22 在 CDD 上重建一次,对比现网 IM 层
+# (2026-09-02 建)漂了 7 个包、多出 1 个,其中 pycryptodome 3.23.0 → 4.1.0 跨了大版本 ——
+# 飞书事件解密(lark-oapi 的 AES)就在用它,而这类漂移在构建、synth、部署时都不报错。
+#
+# 当前这组版本 = 2026-10-23 只读下载现网 ImDepsLayer 逐个读 dist-info 得到的。用这份文件重建,
+# 装出来的包与现网一致。
+#
+# 升级 = 改这里的版本(lark-oapi / slack-sdk / boto3 / botocore 同时改 build_im_layer.sh 里的
+# *_VERSION 与 im-stack.ts 的层描述;boto3 / botocore 另见 setup.sh「一共五处」),然后重跑
+#     bash scripts/build_im_layer.sh
+# 解析不出来就是两条约束冲突了 —— 别删约束了事。tests/test_layer_constraints.py 核这份文件的格式、
+# 与 build_im_layer.sh 里直接依赖的一致性。
+anyio==4.14.2
+boto3==1.43.65
+botocore==1.43.65
+certifi==2026.7.22
+charset-normalizer==3.5.1
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.19
+jmespath==1.1.0
+lark-oapi==1.6.5
+pycryptodome==3.23.0
+python-dateutil==2.9.0.post0
+requests==2.34.2
+requests-toolbelt==1.0.0
+s3transfer==0.19.2
+six==1.17.0
+slack-sdk==3.33.5
+urllib3==2.7.0
+websockets==15.0.1

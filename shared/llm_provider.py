@@ -21,9 +21,9 @@
 """
 
 from __future__ import annotations
+from shared import gateway_host
 from shared.net import safe_urlopen
 
-import ipaddress
 import json
 import logging
 import os
@@ -48,43 +48,42 @@ class LiteLLMHTTPError(RuntimeError):
 
 
 def _is_blocked_ip(addr) -> bool:
-    """True if the IP is in a range base_url must never reach."""
-    mapped = getattr(addr, "ipv4_mapped", None)
-    if mapped is not None:
-        addr = mapped  # treat ::ffff:169.254.x.x as the embedded IPv4
-    # `not is_global` 覆盖了私网 / 回环 / 链路本地 / 保留 / 未指定，外加 CGNAT 100.64/10 ——
-    # 与 core/llm_config、BFF 的 BlockList 同一个口径。组播另判（is_global 对部分组播为真）。
-    return (not addr.is_global) or addr.is_multicast
+    """True if the IP is in a range base_url must never reach.
+
+    名单在 `shared/gateway_host.py`（与 core/llm_config、BFF 是同一份，待办 #3）；IPv4 映射的 IPv6
+    按里面那个 IPv4 判。
+    """
+    return gateway_host.is_blocked_address(addr)
+
+
+# host_problem 的枚举词 → 报错文案（沿用改名单之前的说法，日志与告警里搜的是这些词）。
+_HOST_PROBLEM_TEXT = {
+    "empty": "base_url has no hostname",
+    "localhost": "base_url must not point to localhost",
+    "internal_name": "base_url must not point to internal hostname",
+    "non_public_ip": "base_url must not point to localhost or a private/link-local address",
+    "numeric_host": "base_url host must be a DNS name or a dotted-quad IPv4 address",
+}
 
 
 def _validate_base_url(url: str) -> None:
     """校验 base_url 不指向内网地址，防止 SSRF。
 
-    层次：localhost/IP 字面量黑名单 → .internal/.local 域名 → **DNS 解析**后
-    校验所有 A/AAAA 记录都不是私网/环回/链路本地/保留地址（堵"公网域名解析
-    到内网 IP"的绕过）。DNS 解析失败时不硬拦（best-effort，避免离线/解析抖动
-    误伤；真正不可达时实际 HTTP 请求自然失败）。
+    层次：主机名 / 字面量 IP 先过 `gateway_host.host_problem`（localhost、`*.internal` /
+    `*.local`、非公网 IP、非标准数字写法）→ **DNS 解析**后校验所有 A/AAAA 记录都不在
+    `gateway_host.BLOCKED_NETWORKS` 里（堵"公网域名解析到内网 IP"的绕过）。DNS 解析失败时
+    不硬拦（best-effort，避免离线/解析抖动误伤；真正不可达时实际 HTTP 请求自然失败）。
     """
     parsed = urllib.parse.urlparse(url)
     hostname = parsed.hostname or ""
     if not hostname:
         raise LiteLLMConfigError("base_url has no hostname")
-    if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):  # nosec B104 - membership check to REJECT these hosts, not a socket bind to all interfaces
-        raise LiteLLMConfigError(f"base_url must not point to localhost: {hostname}")
-    try:
-        addr = ipaddress.ip_address(hostname)
-        if _is_blocked_ip(addr):
-            raise LiteLLMConfigError(
-                f"base_url must not point to private/link-local address: {hostname}"
-            )
-        return
-    except ValueError:
-        # hostname 是域名，不是 IP
-        pass
-    if hostname.endswith(".internal") or hostname.endswith(".local"):
-        raise LiteLLMConfigError(
-            f"base_url must not point to internal hostname: {hostname}"
-        )
+    problem = gateway_host.host_problem(hostname)
+    if problem:
+        raise LiteLLMConfigError(f"{_HOST_PROBLEM_TEXT.get(problem, 'base_url host is not allowed')} "
+                                 f"({problem}): {hostname}")
+    if gateway_host.parse_ip(hostname) is not None:
+        return   # 公网字面量 IP：没有 DNS 可查
     # 解析 DNS，逐一校验解析出的地址（防公网域名→内网 IP 绕过）
     try:
         infos = socket.getaddrinfo(hostname, parsed.port or 443,
@@ -92,9 +91,8 @@ def _validate_base_url(url: str) -> None:
     except OSError:
         return  # 解析失败：best-effort 放行，实际请求会自然失败
     for info in infos:
-        try:
-            addr = ipaddress.ip_address(info[4][0])
-        except ValueError:
+        addr = gateway_host.parse_ip(info[4][0])
+        if addr is None:
             continue
         if _is_blocked_ip(addr):
             raise LiteLLMConfigError(
@@ -112,9 +110,11 @@ def reset_cache() -> None:
     """
     global _cached_litellm, _cached_litellm_ts
     global _cached_cred_mode, _cached_cred_mode_ts, _cached_active_source, _cached_gateway_rev
-    global _cached_bedrock_key, _cached_bedrock_key_ts
+    global _cached_bedrock_key, _cached_bedrock_key_ts, _cached_source_known, _meta_stale_since
     _cached_active_source = ""
     _cached_gateway_rev = None
+    _cached_source_known = False
+    _meta_stale_since = None
     _cached_litellm = None
     _cached_litellm_ts = 0.0
     _cached_cred_mode = None
@@ -157,16 +157,9 @@ def _normalise_gateway_base_url(url) -> str:
         return ""
     if p.query or p.fragment or p.username or p.password:
         return ""
-    # 与 core/llm_config 同：去掉末尾的点再判；inet_aton 写法（`0x7f.1`、`2130706433`）不收。
-    bare = host.lower().rstrip(".")
-    if bare == "localhost" or bare.endswith(".localhost"):
+    # 与 core/llm_config 同一个判据（同一份名单，见 shared/gateway_host.py）。
+    if gateway_host.host_problem(host):
         return ""
-    if re.fullmatch(r"(0x[0-9a-f]+|[0-9]+)(\.(0x[0-9a-f]+|[0-9]+)){0,3}", bare):
-        try:
-            if not ipaddress.ip_address(bare).is_global:
-                return ""
-        except ValueError:
-            return ""
     path = p.path.rstrip("/")
     for suffix in ("/chat/completions", "/models"):
         if path.lower().endswith(suffix):
@@ -261,9 +254,18 @@ _cached_cred_mode_ts: float = 0.0
 # 同一次 GetItem 顺带读出的第一来源与网关版本号（见 _credential_mode）。
 _cached_active_source: str = ""
 _cached_gateway_rev: int | None = None
+# 第一来源是不是**读到过的**（而不是读失败时的默认值）。后端任务的来源护栏只认读到过的值：
+# 冷启动第一次 GetItem 就失败时 `_cached_active_source` 是空串 —— 以前这被当成「不是网关」，
+# 于是网关排第一的部署恰好在冷启动抖动时放行了 Bedrock 兜底（待办 #3）。
+_cached_source_known: bool = False
+# 读失败时从哪一刻起一直在用上一次读到的值（读成功就清零），上限与对话侧同一个开关。
+_meta_stale_since: float | None = None
 # 来源配置的缓存窗口。与对话侧 core/llm_config 的目录 TTL 同一个数：Admin 换了网关 / 次序，
 # 后端任务最迟一分钟跟上（gateway_rev 一变，网关连接信息的缓存也立刻作废）。
 _META_TTL = 60
+# 读不到配置时，上一次读到的第一来源最多再信多久（stale-while-error 的上限，与
+# core/llm_config 的 `_STALE_MAX` 同一个环境变量）。超过就当「不知道」—— 后端任务护栏一律拒绝。
+_META_STALE_MAX = max(int(os.environ.get("LLMCFG_STALE_MAX", "3600")), _META_TTL)
 
 
 def _credential_mode() -> str:
@@ -280,6 +282,7 @@ def _credential_mode() -> str:
     也不要在管理员以为已停用 Key 的情况下继续拿它计费与鉴权）。
     """
     global _cached_cred_mode, _cached_cred_mode_ts, _cached_active_source, _cached_gateway_rev
+    global _cached_source_known, _meta_stale_since
     now = time.time()
     if _cached_cred_mode is not None and (now - _cached_cred_mode_ts) < _META_TTL:
         return _cached_cred_mode
@@ -287,8 +290,9 @@ def _credential_mode() -> str:
     table = os.environ.get(_CONFIG_TABLE_ENV, "")
     if not table:
         # 没有配置表的部署（老栈 / 单测）：保持历史行为，不因为读不到开关而砍掉 Key，
-        # 否则升级过程中后端任务会突然从 Key 静默切回 IAM。
+        # 否则升级过程中后端任务会突然从 Key 静默切回 IAM。这种部署没有网关、也没有投影行。
         _cached_cred_mode, _cached_cred_mode_ts = "api_key", now
+        _cached_source_known = True
         return "api_key"
     try:
         import boto3 as _b
@@ -304,14 +308,28 @@ def _credential_mode() -> str:
         logger.warning("read credential_mode failed, assuming iam: %s", type(e).__name__)
         # 读失败：上一次读到的第一来源与网关版本号**原样留着**（stale-while-error）。清空的话，
         # 网关排第一的部署会在一次 GetItem 抖动后放行 Bedrock 兜底（见 invoke_llm 的 backend_task）。
-        if _cached_cred_mode is not None:
-            _cached_cred_mode_ts = now
+        # 但最多留 `_META_STALE_MAX`：之后当「不知道第一来源」，后端任务护栏一律拒绝。
+        if _cached_source_known and _cached_cred_mode is not None:
+            if _meta_stale_since is None:
+                _meta_stale_since = now
+            if now - _meta_stale_since < _META_STALE_MAX:
+                _cached_cred_mode_ts = now
+                return _cached_cred_mode
+            logger.error("model source config unreadable for %ds (> %ds); treating the active source as unknown",
+                         int(now - _meta_stale_since), _META_STALE_MAX)
+        elif _cached_cred_mode is not None:
+            _cached_cred_mode_ts = now          # 从没读到过：照旧当 iam，来源仍是「不知道」
             return _cached_cred_mode
-        mode, active, rev = "iam", "", None
+        _cached_cred_mode, _cached_cred_mode_ts = "iam", now
+        _cached_active_source = ""
+        _cached_source_known = False
+        return "iam"
     if rev is not None and _cached_gateway_rev is not None and rev != _cached_gateway_rev:
         _invalidate_gateway_config()     # Admin 刚改过网关：别再用缓存的旧地址 / 旧 Key
     _cached_cred_mode, _cached_cred_mode_ts = mode, now
     _cached_active_source = active
+    _cached_source_known = True
+    _meta_stale_since = None
     if rev is not None:
         _cached_gateway_rev = rev
     return mode
@@ -887,7 +905,9 @@ def invoke_llm(
                 来源时，**拒绝**走 Bedrock：BFF 在网关排第一时把后端任务全部投影成网关模型，此时
                 还拿到 Bedrock 模型只可能是投影行读失败后落到了 env / 硬编码兜底 —— 那是静默换来源
                 （数据去向、计费主体一起换），用户决策是不许发生。抛 LiteLLMConfigError，调用方走
-                自己的非 LLM 降级（PHD 推原始事件）。
+                自己的非 LLM 降级（PHD 推原始事件）。反方向同样拒绝：Bedrock 排第一却拿到网关模型
+                （投影行没跟上）；读不到第一来源（冷启动第一次就失败，或连续读不到超过
+                `LLMCFG_STALE_MAX`）时不知道哪边才对，也拒绝（待办 #3）。
 
     Returns:
         {"content": str, "stop_reason": str, "usage": dict}
@@ -914,15 +934,27 @@ def invoke_llm(
         len(system_prompt), len(user_prompt), max_tokens,
     )
     _warn_legacy_provider_param()
-    if kind == _GATEWAY_KIND:
+    if backend_task:
+        # 后端任务只用第一来源（BFF 按第一来源投影），两个方向都不许静默换来源（待办 #3）：
         _credential_mode()   # 顺带刷新 gateway_rev：Admin 改了网关就别用缓存的旧连接信息
-    elif backend_task:
-        _credential_mode()
-        if _cached_active_source == "gateway":
+        if not _cached_source_known:
+            # 冷启动就读不到 / 读不到超过 _META_STALE_MAX：不知道第一来源，拿什么都可能是换来源。
+            raise LiteLLMConfigError(
+                "the model source configuration could not be read, so the active source is unknown; "
+                "refusing to call a model for this backend task")
+        if kind == _GATEWAY_KIND and _cached_active_source != "gateway":
+            # Bedrock 排第一，却拿到网关模型 = 投影行还是网关排第一时写的（投影失败 / 还没跟上）。
+            # 这是数据出 AWS 的那个方向，更不能放。
+            raise LiteLLMConfigError(
+                "a Bedrock source is the active model source, but this backend task resolved to a "
+                "gateway model (its projected config is stale); refusing to send it to the gateway")
+        if kind != _GATEWAY_KIND and _cached_active_source == "gateway":
             raise LiteLLMConfigError(
                 "the OpenAI-compatible gateway is the active model source, but this backend task "
                 "resolved to a Bedrock model (its projected config could not be read); refusing to "
                 "fall back to Bedrock")
+    elif kind == _GATEWAY_KIND:
+        _credential_mode()   # 顺带刷新 gateway_rev：Admin 改了网关就别用缓存的旧连接信息
     if kind == _GATEWAY_KIND:
         return _invoke_gateway(model_id, system_prompt, user_prompt, max_tokens)
     if kind == _MANTLE_KIND:

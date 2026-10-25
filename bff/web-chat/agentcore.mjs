@@ -8,7 +8,7 @@
  * Strands 的 stream_async 事件形态多样（文本增量、tool 使用、最终消息）。
  * 这里做**宽容解析**：能提取到文本增量就当 token 推；带 sources 的结构提取出来。
  */
-import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } from "@aws-sdk/client-bedrock-agentcore";
+import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand, StopRuntimeSessionCommand } from "@aws-sdk/client-bedrock-agentcore";
 
 const RUNTIME_ARN = process.env.AGENT_RUNTIME_ARN || "";
 const client = new BedrockAgentCoreClient({});
@@ -34,7 +34,7 @@ export function toSessionId(conversationId) {
  * 而不是传 0：runtime 侧 0 是合法值（未 seed 的目录就是 0），传 0 会让"与本地不同"恒真、
  * 每条消息都触发一次强制 ConsistentRead。省掉 → runtime 收到 None → 纯走 TTL 兜底。
  */
-export function buildRuntimePayload({ prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, now, topic, accountId, allowedAccounts, skillId, skillVersion, warmup }) {
+export function buildRuntimePayload({ prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, now, topic, accountId, allowedAccounts, skillId, skillVersion, warmup, directTurns }) {
   const gen = Number(generation);
   return {
     prompt, model, locale,
@@ -52,6 +52,9 @@ export function buildRuntimePayload({ prompt, model, generation, locale, webSear
     // runtime 侧判据是 `payload.get("warmup") is True`，传 false 也不会误触发，
     // 但省掉能让"真实那一轮的 payload 一个字节都没变"这件事一眼可验。
     warmup: warmup ? true : undefined,
+    // 本会话里 agent 没见过的直连轮次（direct_context.mjs，待办 #33）。没有就省掉 —— 与 warmup
+    // 同理：没有直连轮次的会话，payload 一个字节都不变。
+    direct_turns: Array.isArray(directTurns) && directTurns.length ? directTurns : undefined,
   };
 }
 
@@ -99,10 +102,37 @@ export async function warmupAgent({ conversationId, model, generation, topic, ac
 }
 
 /**
+ * 停掉这个会话在 runtime 里正在跑的那一轮（待办 #30 第 ③ 档）：StopRuntimeSession。
+ *
+ * 为什么要真停：输入框的「停止」原来只断开浏览器这一端，runtime 里那一轮照样跑完、照样烧 token；
+ * 用户紧接着发下一句就撞上 strands 的 Agent 锁（`ConcurrencyException`）—— 那正是「会话忙」的
+ * 另一条来路。代价：被停的会话下一句会冷启动一次（约 10 秒），历史从 AgentCore Memory 恢复
+ * （停在 user 上的那一条由 agent 侧的 repair_role_alternation 补平）。
+ *
+ * 尽力而为：失败只回 `{ok:false, code}`，不抛（「停止」本身不该变成一个报错）。会话在 runtime 里
+ * 已经不存在（空闲回收了）时平台回 ResourceNotFound —— 对「停止」来说就是已经停了。
+ */
+export async function stopAgentSession(conversationId) {
+  if (!RUNTIME_ARN) return { ok: false, code: "not_configured" };
+  try {
+    await client.send(new StopRuntimeSessionCommand({
+      agentRuntimeArn: RUNTIME_ARN,
+      runtimeSessionId: toSessionId(conversationId),
+    }));
+    return { ok: true };
+  } catch (e) {
+    if (e?.name === "ResourceNotFoundException") return { ok: true, code: "not_running" };
+    // 只记类型（docs/LOGGING_STANDARD.md）。AccessDenied = 老部署的 BFF 角色还没有这条权限。
+    console.error(`[BFF] StopRuntimeSession failed — ${e?.name || "Error"}`);
+    return { ok: false, code: e?.name || "Error" };
+  }
+}
+
+/**
  * 调用 runtime，回调 onToken(text) / onSources(arr)。返回拼好的全文。
  * 解析失败不抛，尽量把能拿到的文本推出去。
  */
-export async function invokeAgent({ conversationId, prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, topic, accountId, allowedAccounts, skillId, skillVersion }, { onToken, onSources, onActions, onUsage, onFollowups, onInvestigationStep, onThinkingStep, onProgress, onReasoning, onRuntimeError, onVia, onOpen, onReady }) {
+export async function invokeAgent({ conversationId, prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, topic, accountId, allowedAccounts, skillId, skillVersion, directTurns }, { onToken, onSources, onActions, onUsage, onFollowups, onInvestigationStep, onThinkingStep, onProgress, onReasoning, onRuntimeError, onVia, onOpen, onReady, onCallStart, onDiscard }) {
   // 把"今天"传给 agent：用于联网搜索时给 query 补当前年份（让结果偏向最新），
   // 也让模型知道当前日期、不把训练截止当“现在”。
   const now = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
@@ -113,7 +143,7 @@ export async function invokeAgent({ conversationId, prompt, model, generation, l
     accept: "text/event-stream",
     payload: new TextEncoder().encode(JSON.stringify(buildRuntimePayload({
       prompt, model, generation, locale, webSearch, finopsAgent, devopsAgent, now,
-      topic, accountId, allowedAccounts, skillId, skillVersion,
+      topic, accountId, allowedAccounts, skillId, skillVersion, directTurns,
     }))),
   });
 
@@ -133,6 +163,9 @@ export async function invokeAgent({ conversationId, prompt, model, generation, l
   // runtime 侧异常帧（见下 extract 的 error 分支）。**先记下、流读完再处理** ——
   // 在 chunk 回调里抛会把 SDK 的迭代器撕开、丢掉后面已经在缓冲里的帧。
   let runtimeError = null;
+  // 输出崩坏守卫（agent degeneration.py）的书签：第几次模型调用 → 那时 `full` 有多长。
+  // agent 判死一次调用时只说「丢掉第 n 次调用」，长度由这一侧在自己的字符串上记（不跨语言数字符）。
+  const callMarks = new Map();
 
   const handleChunk = (chunk) => {
     buf += decoder.decode(chunk, { stream: true });
@@ -146,8 +179,19 @@ export async function invokeAgent({ conversationId, prompt, model, generation, l
         if (!m) continue;
         let evt;
         try { evt = JSON.parse(m[1]); } catch { evt = m[1]; }
-        const { text, sources, actions, usage, followups, investigationStep, thinkingStep, progress, reasoning, error, via, ready } = extract(evt);
+        const { text, sources, actions, usage, followups, investigationStep, thinkingStep, progress, reasoning, error, via, ready, callStart, discard } = extract(evt);
         if (error) runtimeError = error;
+        // 模型调用的书签 / 判死：`full`（落库的回答）退回书签处，再交给调用方（它把同一件事告诉浏览器）。
+        // 判死时这次调用剩下的事件 agent 一个都不会再发，所以退回之后接着拼的就是重试那次的输出。
+        if (callStart !== undefined) {
+          callMarks.set(callStart, full.length);
+          onCallStart?.(callStart);
+        }
+        if (discard) {
+          const at = callMarks.get(discard.call);
+          if (at !== undefined && at <= full.length) full = full.slice(0, at);
+          onDiscard?.({ call: discard.call, retry: discard.retry === true, text: full });
+        }
         // 容器里的 entrypoint 真的跑起来了（agent 的第一帧）。纯信号、不发给浏览器：
         // 只用来把等待期提示切到"模型在干活"那一组。比 onOpen 更硬（那只说明响应头回来了）。
         if (ready) { try { onReady?.(); } catch { /* 提示用，忽略 */ } }
@@ -185,7 +229,8 @@ export async function invokeAgent({ conversationId, prompt, model, generation, l
   // 无声丢弃 → invokeAgent 正常返回空串 → 调用方既没拿到文本也没拿到异常，前端只剩
   // 「（无响应）」（2026-08-25 现网事故：Grok 4.6 连续 InternalServerException）。
   // 现在：一个字都没吐 → 抛出带 name=错误类型的异常，让 /stream 走它的错误分支；
-  // 已经吐过部分正文 → 不抛（避免调用方重试造成重复输出），只把错误交给回调。
+  // 已经吐过部分正文 → 不抛（避免调用方重试造成重复输出），只把错误交给回调 —— 调用方据此在
+  // 正文后面补一段「回答在中途断了」（index.mjs + turn_errors.mjs 的 interruptedNote，待办 #30）。
   if (runtimeError) {
     onRuntimeError?.(runtimeError);
     if (!full) throw new AgentRuntimeStreamError(runtimeError.type, runtimeError.message);
@@ -294,5 +339,11 @@ export function extract(evt) {
     error = { type: evt.error_type, message: typeof evt.error === "string" ? evt.error : "" };
   }
 
-  return { text: typeof text === "string" ? text : "", sources, actions, usage, followups, investigationStep, thinkingStep, progress, reasoning, error, via, ready };
+  // 输出崩坏守卫（agent degeneration.py）的两种帧：每次模型调用开头的书签 {"call_start": n}，
+  // 判死时的 {"discard": {call, retry, signal}} —— 丢掉第 n 次调用已经显示过的部分（core/agent_chat.py 同口径）。
+  const callStart = Number.isInteger(evt.call_start) ? evt.call_start : undefined;
+  const discard = (evt.discard && typeof evt.discard === "object" && Number.isInteger(evt.discard.call))
+    ? evt.discard : null;
+
+  return { text: typeof text === "string" ? text : "", sources, actions, usage, followups, investigationStep, thinkingStep, progress, reasoning, error, via, ready, callStart, discard };
 }

@@ -30,7 +30,7 @@
 #   --profile <p>               AWS CLI profile(默认取 AWS_PROFILE / default)
 #   --dry-run                   只盘点并打印将要执行的删除,不改任何东西
 #   --delete-everything         连数据一起删(表 / 残留日志组;**CUR 相关一律保留**)
-#   --backup-dir <dir>          备份目录(默认 ./notiops-teardown-backup-<时间戳>)
+#   --backup-dir <dir>          备份目录(默认 $HOME/notiops-teardown-backup-<时间戳>,在仓库目录之外)
 #   --no-backup                 不做任何备份(数据桶随栈消失,不可恢复)
 #   --delete-member-stacksets   删两个成员账号 StackSet 及其实例(跨账号,默认跳过)
 #   --yes                       跳过交互确认(自动化用;极其危险,请配合 --dry-run 先验)
@@ -357,7 +357,12 @@ fi
 if [ "$DO_BACKUP" = true ]; then
   step "$(t "备份" "Backup")"
   if [ -z "$BACKUP_DIR" ]; then
-    BACKUP_DIR="./notiops-teardown-backup-$(date -u +%Y%m%dT%H%M%SZ)"
+    # 默认放在**仓库目录之外**(待办 #36,2026-10-23)。以前默认是当前目录(也就是仓库根),而
+    # setup.sh 把仓库根打成 Lambda 代码包 —— 跑过 teardown 再在同一个目录重跑 setup.sh,这份备份
+    # (--delete-everything 时含配置表 / 网页会话表的导出)就进了 Lambda 代码包(验证账号实测
+    # 45 个文件)。代码包现在已改成允许清单、不会再带上它;默认位置也挪出仓库,备份不再出现在
+    # 待提交列表里,也就不会被误提交。
+    BACKUP_DIR="${HOME:-.}/notiops-teardown-backup-$(date -u +%Y%m%dT%H%M%SZ)"
   fi
   mkdir -p "$BACKUP_DIR"
   info "$(t "备份目录: " "Backup directory: ")$BACKUP_DIR"

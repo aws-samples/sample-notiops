@@ -123,6 +123,16 @@ class SlackCaps(Caps):
     def reply_text(self, msg: ImMessage, text: str) -> None:
         self._post(msg, text=text)
 
+    def reply_markdown(self, msg: ImMessage, text: str) -> None:
+        """会话设置类命令(`/language` `/model` `/agent` `/web` `/account`)的回执。
+
+        共享文案的粗体是 `**x**`(飞书 / 钉钉口径),Slack mrkdwn 只认单星号,原样发过去
+        星号会摆给用户看(待办 #32 ⑤ 的 Slack 那一半;`/help` 2026-09-03 修过同一件事)。
+        反引号两边一致,不用转。
+        """
+        from platforms.slack.app import blocks
+        self._post(msg, text=blocks.to_mrkdwn(text))
+
     def _post(self, msg: ImMessage, *, text: str = "",
               blocks_out: list[dict] | None = None):
         """`chat.postMessage` 收口。返回 SlackResponse（调用方取 ts）。
@@ -185,24 +195,24 @@ class SlackCaps(Caps):
         """
         target = i18n.normalize_locale(lang or arg)
         if not msg.user_id:
-            self.reply_text(msg, i18n.t("main.failed_user_id", msg.locale))
+            self.reply_markdown(msg, i18n.t("main.failed_user_id", msg.locale))
             return
         if not target or target not in ("zh", "en", "auto"):
             cur, source = locale_resolver.resolve(user_id=msg.user_id,
                                                   platform=PLATFORM, text="")
             name = i18n.locale_name(cur, cur)
             key = "lang.current.user" if source == "user" else "lang.current.auto"
-            self.reply_text(msg, i18n.t(key, cur, name=name) + "\n"
+            self.reply_markdown(msg, i18n.t(key, cur, name=name) + "\n"
                             + i18n.t("lang.usage", cur))
             return
         if target == "auto":
             ok = locale_resolver.set_user_pref(msg.user_id, "auto", platform=PLATFORM)
-            self.reply_text(msg, i18n.t("lang.unset" if ok else "lang.unset_failed",
+            self.reply_markdown(msg, i18n.t("lang.unset" if ok else "lang.unset_failed",
                                         msg.locale))
             return
         ok = locale_resolver.set_user_pref(msg.user_id, target, platform=PLATFORM)
         name = i18n.locale_name(target, target)
-        self.reply_text(msg, i18n.t("lang.set.user" if ok else "lang.set_failed",
+        self.reply_markdown(msg, i18n.t("lang.set.user" if ok else "lang.set_failed",
                                     target if ok else msg.locale, name=name))
 
     def model(self, msg: ImMessage, model_arg: str) -> None:
@@ -214,14 +224,14 @@ class SlackCaps(Caps):
             entry = model_catalog.get(alias)
             text = (i18n.t("model.current", msg.locale, label=entry.label, source=source)
                     + "\n" + i18n.t("model.usage", msg.locale))
-            self.reply_text(msg, text)
+            self.reply_markdown(msg, text)
             return
         if arg == "list":
             rows = "\n".join(
                 i18n.t("model.list_row", msg.locale, alias=e.alias, label=e.label)
                 for e in model_catalog.all_entries()
             )
-            self.reply_text(msg, i18n.t("model.list_header", msg.locale) + "\n"
+            self.reply_markdown(msg, i18n.t("model.list_header", msg.locale) + "\n"
                             + rows + "\n\n" + i18n.t("model.usage", msg.locale))
             return
         if arg == "default":
@@ -229,21 +239,21 @@ class SlackCaps(Caps):
                 llm_pref_resolver.clear_dm_pref(PLATFORM, msg.user_id)
             else:
                 llm_pref_resolver.clear_chat_pref(PLATFORM, msg.chat_id)
-            self.reply_text(msg, i18n.t("model.cleared", msg.locale))
+            self.reply_markdown(msg, i18n.t("model.cleared", msg.locale))
             return
         if not model_catalog.is_known(arg):
-            self.reply_text(msg, i18n.t("model.unknown", msg.locale, alias=arg,
+            self.reply_markdown(msg, i18n.t("model.unknown", msg.locale, alias=arg,
                                         valid=", ".join(model_catalog.list_aliases())))
             return
         ok = (llm_pref_resolver.set_dm_pref(PLATFORM, msg.user_id, arg)
               if is_dm else
               llm_pref_resolver.set_chat_pref(PLATFORM, msg.chat_id, arg))
         if not ok:
-            self.reply_text(msg, i18n.t("model.set_failed", msg.locale))
+            self.reply_markdown(msg, i18n.t("model.set_failed", msg.locale))
             return
         entry = model_catalog.get(arg)
         key = "model.set_dm" if is_dm else "model.set_chat"
-        self.reply_text(msg, i18n.t(key, msg.locale, label=entry.label))
+        self.reply_markdown(msg, i18n.t(key, msg.locale, label=entry.label))
 
     def agent(self, msg: ImMessage, arg: str) -> None:
         """`/agent [notiops|devops|starops|default]` —— 这个会话的对话由谁答（0 token）。
@@ -251,18 +261,18 @@ class SlackCaps(Caps):
         与飞书**同一份**逻辑和文案（`platforms.common.pref_commands`）；两边各写一遍
         必然漂移，见那个模块的文件头。
         """
-        self.reply_text(msg, pref_commands.agent_reply(msg, arg, platform=PLATFORM))
+        self.reply_markdown(msg, pref_commands.agent_reply(msg, arg, platform=PLATFORM))
 
     def web(self, msg: ImMessage, arg: str) -> None:
         """`/web [on|off]` —— 联网搜索开关（0 token）。只对 NotiOps Agent 生效。"""
-        self.reply_text(msg, pref_commands.web_reply(msg, arg, platform=PLATFORM))
+        self.reply_markdown(msg, pref_commands.web_reply(msg, arg, platform=PLATFORM))
 
     def account(self, msg: ImMessage, arg: str) -> None:
         """`/account [<12 位账号 id>|list|default]` —— 这个会话在问哪个 AWS 账号。
 
         与飞书同一份逻辑和文案。0 token；**上车 / 启用 / 停用只在 Web 做**，这里只选。
         """
-        self.reply_text(msg, pref_commands.account_reply(msg, arg, platform=PLATFORM))
+        self.reply_markdown(msg, pref_commands.account_reply(msg, arg, platform=PLATFORM))
 
     def investigate(self, msg: ImMessage, text: str) -> None:
         """发起一次深度调查 —— **0 token**：只 create_backlog_task，NotiOps 侧不总结、

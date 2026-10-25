@@ -220,7 +220,7 @@ Two buttons with the same name, on **completely different cost models**:
 > 1. Both buttons **send on click** — they do not prefill the prompt for you to edit first.
 > 2. **Only "Investigate deeply" carries the account you selected on the Notifications page; "Ask about this" does not** — on a multi-account deployment "Ask about this" may end up asking about whatever account the chat side is currently on.
 >
-> The inbox **never starts an investigation on its own** — something only happens when you click. The inbox is **account-level** (everyone with access to that account sees the same list), duplicate events inside 5 minutes are collapsed, entries expire after roughly 90 days, and a list **shows only the newest 200**; when truncated the group footer says so honestly — "Showing the latest {n} of {total}" (or "Showing the latest {n}; older notifications are not shown" when even the total is unavailable).
+> The inbox **never starts an investigation on its own** — something only happens when you click. The inbox is **account-level** (everyone with access to that account sees the same list), duplicate events inside 5 minutes are collapsed (repeated Trusted Advisor check refreshes: 24 hours), entries expire after roughly 90 days, and a list **shows only the newest 200**; when truncated the group footer says so honestly — "Showing the latest {n} of {total}" (or "Showing the latest {n}; older notifications are not shown" when even the total is unavailable).
 
 **Five event sources are on out of the box** — but **each one also has a hard filter**, which is the most common reason for "it's on but nothing arrives":
 
@@ -531,6 +531,8 @@ Hover a toggle and the tooltip says, in one sentence, "who answers + how long + 
 
 > ⚠️ **There is now exactly one Deep Dive toggle, and it is the 0-token one.** Before 2026-09-13 there were two with the same name: one spent tokens having the NotiOps model hand the work over, the other was labelled "(Direct)" and had the BFF call the API itself. One capability behind two entry points, differing only in whether you burn a round of tokens first — nobody had a basis for choosing, so only the direct one stayed and the "(Direct)" qualifier went with it. **If an older conversation still remembers the hand-over one, it falls back to off when you open it** — there is no switch for it in the UI any more, and leaving it on would mean running something you can neither see nor turn off.
 
+- **Deep Dive applies to one turn only**: when the turn ends (answered, stopped, or failed), the toggle switches itself off, and it won't be back on after a page refresh; turn it on again for the next deep dive. The same goes for **Investigate** from a notification or a dashboard: only the first, automatically sent message is a deep dive, and follow-ups go back to normal Q&A. The conversation's counterpart (for example the DevOps Agent you picked in a general chat) is unaffected and stays with the conversation.
+- **Follow up on an investigation directly**: once a deep dive has answered and the toggle has switched off, just say something like "open a support case about the issue above" — no need to paste the report again. NotiOps picks up excerpts of the conclusions from those turns, and the case card's problem and background are drafted from this investigation. Only the turns since NotiOps last answered are carried over (at most 3, length-capped), and no new investigation is started just to answer a follow-up.
 - Before you pick, the composer probes deep-investigation availability for this account. When unavailable, the DevOps-Agent-dependent toggles are **greyed with an N/A badge**, and the tooltip states the exact reason (no Agent Space in the deployment account, or the selected account isn't onboarded); anything already enabled is turned off automatically. The probe itself **fails open** (toggles stay clickable) rather than hiding the feature.
 - If **deep dive is off but the model tries a deep-dive tool anyway**, you get: "DevOps Agent deep investigation is off. Turn on the Deep investigation toggle under the composer and try again; for now you can use this topic's read-only tools (alarms/metrics/logs/events/resource state) for immediate triage."
 - Know the **cost of the 0-token path**: your wording is **passed through verbatim** to the DevOps Agent (a fixed function derives the title from your first sentence, and the description is your own text), and it won't answer conceptual questions for you first.
@@ -597,7 +599,8 @@ The same report also shows up in Sources as "Full report (downloadable)".
 While an answer is streaming, **the Send button becomes a square stop button** (tooltip "Stop generating"). Pressing it:
 
 - **aborts only that conversation** — other conversations keep running;
-- **keeps whatever text already arrived**, appending `_(stopped)_`.
+- **keeps whatever text already arrived**, appending `_(stopped)_`;
+- for a turn NotiOps is answering, it **really stops on the server** (no more model calls, no more tokens), and after a refresh you still see "stopped". The cost: the next message in that conversation is a little slower (about 10 seconds while the service starts again). For DevOps Agent / Deep Dive turns it only disconnects the page.
 
 ### 4.10 The answer footer: who answered, and how many tokens
 
@@ -638,11 +641,11 @@ A Skill is how you write down the process in your head — "when we check RDS we
 
 > ⚠️ **Skills are permission-gated.** You need `nav:skills` to see the entry at all; create/edit, import, rollback and publish-to-DevOps-Agent each additionally need `action:skills:edit` / `:import` / `:rollback` / `:devops-agent`. Of the six preset roles **only Administrator and Developer** get `nav:skills` — `role:viewer` (the default mapping for the Cognito `member` / `read-only` groups), `role:finops`, `role:support` and `role:service-manager` do not. **Granting `action:skills:*` without `nav:skills` does not work** (you can't even list them). If Skills isn't under "More" in your sidebar, ask an administrator to add it under More → Admin → Access control.
 
-### 5.2 Eleven presets, out of the box
+### 5.2 Twelve presets, out of the box
 
-The first time any container lists Skills on a fresh deployment, **11 official Skills are seeded automatically** (marked with author `notiops-system`) — no admin action required:
+The first time any container lists Skills on a fresh deployment, **12 official Skills are seeded automatically** (marked with author `notiops-system`) — no admin action required:
 
-`aws-health-events`, `aws-well-architected-review-devops`, `cost-spike-triage`, `eks-operation-review`, `idle-resource-scan`, `rds-health-review`, `security-posture-review`, `service-quota-check`, `sp-ri-coverage-analysis`, `support-case-history-rca`, `whats-new-report`
+`aws-health-events`, `aws-well-architected-review-devops`, `cost-spike-triage`, `cost-usage-analysis`, `eks-operation-review`, `idle-resource-scan`, `rds-health-review`, `security-posture-review`, `service-quota-check`, `sp-ri-coverage-analysis`, `support-case-history-rca`, `whats-new-report`
 
 The list separates **Preset skills** from **My skills**, tags each card **Preset** or **Custom**, and offers search over name / ID / description plus sorting by "Recently updated" or "By name".
 
@@ -656,7 +659,9 @@ The list separates **Preset skills** from **My skills**, tags each card **Preset
 
 **① Pick it explicitly** — type `/` and choose from the menu (§4.4). The full Skill body is then injected in the language you asked in. If the Skill ships `references/` files, they are offered as an **on-demand list** the agent can pull with `read_skill_reference` — and that read is restricted to **that Skill's declared file allowlist**, **document extensions only**, ≤256 KB per file, with **path traversal, scripts and cross-skill reads all blocked**.
 
-**② Natural-language matching** — this route is protected by a **code-level keyword gate, not a prompt instruction**: a hit on the `skill_id` or the name counts as relevant; a hit only in the description needs **≥2 distinct overlapping terms** after bilingual stopword removal (English words ≥3 characters plus CJK 2-grams). **When nothing is relevant the Skill catalog is not injected at all** — so mis-triggering is *impossible*, not merely discouraged.
+**② Natural-language matching** — this route is protected by a **code-level keyword gate, not a prompt instruction**: a hit on the `skill_id` or the name counts as relevant; a hit only in the description needs **≥2 distinct overlapping terms** after bilingual stopword removal (English words ≥3 characters plus CJK 2-grams). The gate compares **your message as you typed it**, and the Chinese names and descriptions of the preset Skills take part too, so asking in Chinese matches as well. **When nothing is relevant the Skill catalog is not injected at all** — so mis-triggering is *impossible*, not merely discouraged.
+
+> Fixed 2026-10-23: the gate used to compare the whole prompt after the system had added its language and date instructions, and their common words let almost every question through (asking "What is Amazon S3?" injected 10 of the 11 preset Skills). It now compares your own words, and unrelated questions inject nothing.
 
 ### 5.4 Writing one, or importing a zip
 
@@ -725,6 +730,8 @@ The Modules page switches features on / off **by tab** (showing Enabled / Disabl
 ### 6.4 Accounts: where cross-account comes from
 
 Which accounts a user can pick in the topbar depends on which member accounts are onboarded and enabled on this page. "Member account onboarding" has two routes. On a multi-account deployment (method B's `./setup.sh --multi-account`, or method A with `DeployMode=MultiAccount`), click **Onboard** for an account in the organization (deployed through StackSets); step 2, the DevOps Agent association, then starts by itself — if it has not completed or has failed, click **Associate** on that row to retry. Everything else uses **Manual onboarding** on the same page: enter the account ID → Generate link → have that account's administrator sign in **as that account** and deploy → paste the stack Outputs back → Test connection → Save & activate. The collection role in the member account is created by the template — **don't create it by hand**. It carries the AWS managed `ReadOnlyAccess` policy **plus, by default, permission to open / reply to / resolve Support cases** (set the template parameter `EnableSupportCaseWrite=false` to keep it strictly read-only). Full steps: [DEPLOYMENT.en.md §0.1.1](DEPLOYMENT.en.md).
+
+When you **disable** a member account on this page, NotiOps stops going into it: it disappears from the topbar, and the dashboard endpoints, the chat (even if the question spells out its 12-digit account ID) and Support cases all refuse to access it. Before 2026-10-23 the dashboard endpoints and the chat still went in (only the Support-case path refused); now they refuse as well.
 
 > ⚠️ **One-click (method A) multi-account stacks not yet updated to v1.0.30**: step 2 fails there. Step 1 already created the collection role in the member account, step 2 tries to create a role with the same name → `EntityAlreadyExists` → rollback. Update the stack to the current version first (every update re-runs the step that rolls out the StackSets, which sets `CreateCollectionRole` to `no` on the member DevOps Agent StackSet), then click **Associate**; accounts whose step 2 failed before just need one more click after the update. How to update the stack (and what to know before you do) is in [DEPLOYMENT_ONECLICK.en.md §5](DEPLOYMENT_ONECLICK.en.md).
 
@@ -895,7 +902,7 @@ The caption under the composer ("NotiOps can make mistakes. Verify important fin
 | Cases org overview | **15-minute** cache (stated on the page) |
 | Case service catalog | Cached **6 hours** per language |
 | Case entitlement probe | **15-minute** cache |
-| Notification inbox | 5-minute duplicate suppression; entries expire after ~**90 days**; a list returns the newest **200** |
+| Notification inbox | 5-minute duplicate suppression (Trusted Advisor: 24 hours); entries expire after ~**90 days**; a list returns the newest **200** |
 | The three AWS Health blocks on Notifications | **50** entries per block maximum — no paging beyond that, just truncation |
 | Report links | Online ~**7 days**; Markdown download ~**12 hours** |
 | Conversations | Server-expired after **30 days** by default |
@@ -920,7 +927,7 @@ Method A is a minimal footprint that installs only Web Chat. Compared with the f
 - **The notification inbox does not filter out NotiOps' own alarms** — method A's CloudWatch alarm subscription rules don't exclude self-created alarms like `notiops-inspection-*`, so NotiOps' own alarms land in your inbox too.
 - **The "DevOps Agent — Credit Usage" card on the cost dashboard says "not configured" by default** — it reads the CUR that NotiOps creates, which method A only has with `ProvisionCur=yes`: until the first delivery is ready it shows "Initializing data", then real numbers.
 - The 5 default-off notification event sources have to be enabled by hand in the **EventBridge console** under method A (method B takes a `setup.sh` flag).
-- **Skills are identical on both paths** — method A is missing nothing here: all 11 presets, authoring, zip import and version rollback are present.
+- **Skills are identical on both paths** — method A is missing nothing here: all 12 presets, authoring, zip import and version rollback are present.
 
 > **`EnableDeepInvestigation` (default Yes) is a main switch on method A** that governs three things at once: **Deep Dive** (0 tokens, direct), **DevOps Chat**, and **publishing a Skill to DevOps Agent**. Set it to No and all three go away. Separately, in **regions where AWS DevOps Agent is not yet available** it is **silently skipped** even when set to Yes — to tell "I turned it off myself" from "the region doesn't support it", check `DeepInvestigationStatus` in the stack Outputs.
 
@@ -934,6 +941,13 @@ Method A is a minimal footprint that installs only Web Chat. Compared with the f
 - **Notifications has no "mark all read" button and no read/unread filter** — opening the page marks everything read.
 - **The sign-in page is English-only**, and its failure message is a hardcoded Chinese string.
 - A missing UI translation renders **as its raw key** (e.g. `conv.rename`) rather than falling back to the other language. If you hit one, please file an issue.
+
+### 8.8 When an answer stalls or breaks off
+
+- **"The previous turn in this conversation hasn't finished yet"**: a conversation runs one turn at a time. If you send another message while the previous turn is still waiting on the model (for example after refreshing the page mid-answer), you get this notice — that message was **not sent**, and it is not resent automatically. A waiting notice then appears at the end of the conversation showing how long it has been running; when the previous turn finishes, its answer **appears on its own** — no need to refresh. Opening a conversation that is still answering (for example after a refresh) shows the same notice. To stop waiting, stop the previous turn with the stop button at the bottom right of the input box, or **start a new conversation** — new conversations are not affected.
+- **"The answer was cut off"**: the answer failed partway (for example the model stopped returning content, or the connection dropped), so what is above it is **incomplete**. Follow the next step in the notice: usually just send the message again; if the model stopped returning content, narrow the question or switch models at the bottom right of the input box.
+- **A burst of garbled text appears and then disappears**: occasionally a model's output collapses into garbage (fragments glued together with hyphens, or an endless run of repeated symbols). The system stops that call as soon as it notices, discards the garbled text (it is not saved to the conversation), leaves a line in the thinking panel — "discarded it, retrying once" — and retries with the same context; the retried answer then appears. If the retry collapses too, you are asked to **switch models** at the bottom right of the input box and ask again.
+- When a failure notice says "already retried automatically", the system really did resend for you (only errors such as the service still starting up are resent); if it doesn't say so, nothing was resent.
 
 ---
 
@@ -1661,6 +1675,9 @@ Everything except the investigation reports is cleaned up automatically by DDB T
 Follow the §20 process and ask an admin to investigate. Common causes:
 - IM credentials expired or changed (the admin re-enters them under Web Chat More → Admin → IM Integration, or edits that secret in Secrets Manager directly)
 - Bedrock throttling (occasional during peak hours; it only affects the places that use a model — `/agent notiops` answers and smart case analysis)
+- The reply says "The previous question is still running on the NotiOps agent": under `/agent notiops` the previous question is still being worked on by the agent, so this one was not sent. Ask again in a few minutes, or use `/agent devops` for the DevOps Agent direct path if it's urgent.
+- An answer ends with "The answer was cut off": what is above is incomplete — ask again; if it keeps breaking at the same point, send `/model` to switch models.
+- The reply says "The model's output turned into garbled text twice in a row": under `/agent notiops` the model's output collapsed into garbage, the system already retried once and it collapsed again (the garbled text is not left on the card). Send `/model` to switch models and ask again.
 
 ### Q5: Can I add the bot to non-production channels?
 

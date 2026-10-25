@@ -4,6 +4,7 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as fs from "fs";
 import * as path from "path";
 import { createImCore } from "./constructs/im-core";
+import { LAYER_ASSET_EXCLUDES, repoRootCode } from "./repo-root-code";
 
 export interface ImStackProps extends cdk.StackProps {
   metricsTableName: string;
@@ -134,7 +135,7 @@ export class ImStack extends cdk.Stack {
       );
     }
     const imLayer = new lambda.LayerVersion(this, "ImDepsLayer", {
-      code: lambda.Code.fromAsset(imLayerDir),
+      code: lambda.Code.fromAsset(imLayerDir, { exclude: LAYER_ASSET_EXCLUDES }),
       compatibleRuntimes: [lambda.Runtime.PYTHON_3_14],
       // 与 scripts/build_im_layer.sh 里三个 *_VERSION 保持一致（改那边记得改这句 ——
       // 这是运维在控制台唯一能看到层里装了什么的地方）。
@@ -142,20 +143,18 @@ export class ImStack extends cdk.Stack {
     });
 
     // ─── 代码资产 ─────────────────────────────────────────────────────────
-    // 排除清单在 [../im-code-exclude.txt](../im-code-exclude.txt) —— **方式A 的
-    // scripts/build_im_zips.py 读的是同一个文件**。曾经两边各写一份，但漏一条/多一条
-    // 只在方式A 暴露（客户账号里 ImportModuleError 或 250MB 解压上限），必然漂，
-    // 所以合成了一处。每条模式为什么在那里，注释都在那个文件里（含 `.cdk-out` 兜底
-    // 与 `dist/**` 两个实测踩过的坑）。
-    //
-    // ⚠️ 与 notiops-backend-stack.ts 里的 `lambdaCode` **只差一条**：这里**不能**
-    // exclude `platforms/**` —— IM 的三个 handler 全在 platforms/ 下。抄那份 exclude
-    // 列表时把 platforms/** 一起抄进来，症状是 handler not found（不是构建报错）。
-    //
-    // 老坑复述一遍（清单里的 `.cdk-out` 只是兜底）：cdk synth/deploy 必须带 --output
-    // 指到仓库根**之外**（setup.sh:1095 用 `${TMPDIR:-/tmp}/notiops-cdk-out` —— 注意
-    // **不是** `../.cdk-out`：那个路径就在仓库根里）。fromAsset("../") 打包仓库根，
-    // 输出目录若落在被打包的树里 → 自引用递归复制 → ENAMETOOLONG。
+    // 两层，两条部署路径完全同一份口径（待办 #36，2026-10-23 起）：
+    //   ① **允许清单**：只收 infra/lambda-code-packages.json 的 assets.im.packages
+    //      （core / platforms / shared / inspection / devops_agent_callback）—— 方式A 的
+    //      scripts/build_im_zips.py 读的是同一项（它的 IM_PACKAGES）。以前方式B 是「整个仓库根
+    //      减排除清单」，现网 5 个 IM 函数的包里因此带着 scripts/、publish/、internal/、setup.sh
+    //      之类 89+ 个运行时用不到的文件；而方式A 早在 v1.0.30 就改成了允许清单。
+    //   ② 包里的杂项（*.md、Dockerfile、点文件……）再按 [../im-code-exclude.txt](../im-code-exclude.txt)
+    //      剪 —— 同样是两边读同一个文件。曾经两边各写一份，漏一条/多一条只在方式A 暴露
+    //      （客户账号里 ImportModuleError 或 250MB 解压上限），必然漂，所以合成了一处。
+    //      那份文件里按顶层目录写的条目（frontend/**、dist/**…）在允许清单之下已经碰不到东西，
+    //      留着是方式A 打包器的哨兵（见 build_im_zips.py 的 SENTINEL_PATTERNS）。
+    // 模式怎么拼见 ./repo-root-code.ts 文件头。
     const excludeFile = path.join(__dirname, "..", "im-code-exclude.txt");
     const exclude = fs.readFileSync(excludeFile, "utf-8")
       .split("\n")
@@ -173,7 +172,7 @@ export class ImStack extends cdk.Stack {
         "。IM 代码资产的排除清单必须完整 —— 否则会把 .venv/dist 一起打进 Lambda 包。"
       );
     }
-    const imCode = lambda.Code.fromAsset("../", { exclude });
+    const imCode = repoRootCode("im", exclude);
 
     const im = createImCore(this, {
       metricsTableName: props.metricsTableName,

@@ -154,8 +154,26 @@ def excluded(rel_posix: str, patterns: list[str]) -> bool:
 #: 而排除清单是按名字列的，永远追不上「仓库里又多了什么」—— v1.0.20–v1.0.29 的 im-code.zip
 #: 就因此带出了不该发布的本机与内部文件（已撤下）。允许清单只认「运行时要什么」。
 #: 五个包都在 `publish/include.txt` 里 ⇒ im-code.zip 是公开仓库快照的子集。
-#: 方式 B（`infra/lib/im-stack.ts` 的 `fromAsset`）不走这里，资产只进客户自己的账号。
-IM_PACKAGES = ("core", "platforms", "shared", "inspection", "devops_agent_callback")
+#:
+#: 包名单不写在这里：读 `infra/lambda-code-packages.json` 的 `assets.im.packages` —— 方式 B
+#: （`infra/lib/im-stack.ts` → `repoRootCode("im", …)`）读的是同一项（2026-10-23 起，待办 #36；
+#: 在那之前方式 B 还是「仓库根减排除清单」，现网 IM 函数包里因此带着 scripts/、publish/ 之类）。
+PACKAGES_FILE = PROJECT_ROOT / "infra" / "lambda-code-packages.json"
+
+
+def _load_im_packages() -> tuple[str, ...]:
+    import json
+    try:
+        pkgs = json.loads(PACKAGES_FILE.read_text(encoding="utf-8"))["assets"]["im"]["packages"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        sys.exit(f"cannot read assets.im.packages from {PACKAGES_FILE} ({type(exc).__name__}) —— "
+                 "im-code.zip 只按这份允许清单取文件，读不到就不打")
+    if not pkgs or not all(isinstance(p, str) and p and "/" not in p for p in pkgs):
+        sys.exit(f"{PACKAGES_FILE}: assets.im.packages 必须是非空的顶层包名列表，现在是 {pkgs!r}")
+    return tuple(pkgs)
+
+
+IM_PACKAGES = _load_im_packages()
 
 
 def _tracked_files() -> set[str]:

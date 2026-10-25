@@ -2086,16 +2086,26 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     // 合成一个资源就是环。
     webchat.siteBucket.grantReadWrite(stagerRole);
     webchat.siteBucket.grantDelete(stagerRole);
-    stagerRole.addToPolicy(new iam.PolicyStatement({
-      sid: "InvalidateChatCdn",
-      actions: ["cloudfront:CreateInvalidation"],
-      resources: [`arn:${this.partition}:cloudfront::${this.account}:distribution/${webchat.distribution.distributionId}`],
-    }));
-    stagerRole.addToPolicy(new iam.PolicyStatement({
-      sid: "CreateFirstAdmin",
-      actions: ["cognito-idp:AdminCreateUser", "cognito-idp:AdminAddUserToGroup"],
-      resources: [base.userPool.userPoolArn],
-    }));
+    // 刷新聊天 CDN、建第一个管理员：只在 StagerSite 的 Create/Update 里用，删栈收尾用不到 ⇒ 单独一份策略、只让
+    // StagerSite 依赖它，**不进** DefaultPolicy。这两条引用的聊天 CDN、用户池（回调地址里有聊天 CDN 的域名）都要等
+    // 聊天 CDN 建完（CloudFront 要 5 分钟左右）；放在 DefaultPolicy 里，StagerFn（DependsOn DefaultPolicy）就跟着等，
+    // 而 ReportsCDN 依赖 DataCleanup → StagerFn ⇒ 两个分发成了先后建：v1.0.33-rc2 实测建栈从 393s 涨到 664s。
+    // 判据：oneclick-teardown-grants.test.ts 里「StagerFn 不等任何分发」。
+    const stagerSitePolicy = new iam.Policy(this, "StagerSitePolicy", {
+      roles: [stagerRole],
+      statements: [
+        new iam.PolicyStatement({
+          sid: "InvalidateChatCdn",
+          actions: ["cloudfront:CreateInvalidation"],
+          resources: [`arn:${this.partition}:cloudfront::${this.account}:distribution/${webchat.distribution.distributionId}`],
+        }),
+        new iam.PolicyStatement({
+          sid: "CreateFirstAdmin",
+          actions: ["cognito-idp:AdminCreateUser", "cognito-idp:AdminAddUserToGroup"],
+          resources: [base.userPool.userPoolArn],
+        }),
+      ],
+    });
     // 删栈收尾用的权限。都是**精确资源**，不给通配 —— 这个角色在客户生产账号里，
     // 一个 `logs:DeleteLogGroup` on `*` 就意味着「部署工具能删光你所有日志」。
     stagerRole.addToPolicy(new iam.PolicyStatement({
@@ -2117,6 +2127,13 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       sid: "TeardownDeleteDataBucket",
       actions: ["s3:ListBucket", "s3:ListBucketVersions", "s3:DeleteBucket"],
       resources: [base.dataBucket.bucketArn],
+    }));
+    // DataCleanup 删数据桶之前先读本栈的状态：只有整个栈在删时才动桶（升级失败回滚时，CFN 也会删掉
+    // 那次升级才新建的 DataCleanup —— 见 stager 的 `_teardown_data`）。只读、只限本栈。
+    stagerRole.addToPolicy(new iam.PolicyStatement({
+      sid: "TeardownReadOwnStackStatus",
+      actions: ["cloudformation:DescribeStacks"],
+      resources: [this.stackId],
     }));
     // Athena 查询结果桶（只在装了成本 MCP 时存在）。`_teardown_site` 删栈时**无条件**清它 ——
     // KeepData / DeleteEverything 两种模式都清（它是缓存、不是客户数据），所以「交给 stager
@@ -2207,7 +2224,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         // 自定义资源的 Delete 事件带的是**上一次成功部署**时的属性，所以要删什么必须
         // 在部署期就写死在这里，删栈时才有得读。
         TeardownMode: teardownMode.valueAsString,
-        DataBucket: base.dataBucket.bucketName,
+        // 数据桶**不在这里**交给 stager —— DeleteEverything 时由下面的 DataCleanup 删（理由见那里）。
         // Athena 查询结果桶。⚠️ 必须交给 stager 清空 —— 它是 DESTROY，而一键路径不能用
         // autoDeleteObjects（会引入 cr.Provider = 隐式资产，本文件头禁止）。里面有对象时
         // CFN 删不掉桶，**整个删栈会失败**，客户只能手工去清。
@@ -2262,10 +2279,31 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
       },
     });
     stagerSite.addDependency(stagerArtifacts);
+
+    // ── Phase=DataCleanup：DeleteEverything 时删数据桶 —— 必须排在 ReportsCDN **之后** ──
+    // ReportsCDN 的源站就是数据桶（reports/ 前缀）。数据桶是 Retain，DeleteEverything 时只能由 stager 删；这一步原来
+    // 在 StagerSite 的 Delete 里，而 StagerSite 经 AgentRuntime（环境变量里有 REPORTS_CDN_DOMAIN）间接依赖 ReportsCDN
+    // ⇒ 删栈时 StagerSite 先跑：桶一删，分发还要再删 6 分钟左右，这段时间它指向一个不存在、名字又可预测的桶
+    // （全局命名空间，别人可以抢注，借我们的分发发他们的内容）。2026-10-25 发 v1.0.33 前，验证账号两次 RC 删栈都被
+    // 内部的 dangling CloudFront 检测抓到、分发被自动禁用。直接让 ReportsCDN 依赖 StagerSite 会成环，所以单拆一个
+    // 只在 Delete 时干活的资源：它只依赖 StagerFn（StagerFn 不依赖 ReportsCDN）+ 数据桶，ReportsCDN 依赖它
+    // ⇒ 反向依赖 = 正向删除顺序：ReportsCDN 删完，才轮到它删桶。权限仍是上面那条 TeardownDeleteDataBucket
+    // （StagerFn DependsOn 那份策略，所以删栈时策略一定在它之后才删）。
+    const dataCleanup = new cdk.CfnResource(this, "DataCleanup", {
+      type: "Custom::NotiOpsDataCleanup",
+      properties: {
+        ServiceToken: stagerFn.attrArn,
+        Phase: "DataCleanup",
+        TeardownMode: teardownMode.valueAsString,
+        DataBucket: base.dataBucket.bucketName,
+      },
+    });
+    base.reportsCdn.node.addDependency(dataCleanup);
     // 管理员要放进 `admin` 组 → 组必须先建好。CfnUserPoolGroup 与用户池之间只有
     // `Ref userPoolId` 的隐式依赖，与本资源之间没有，必须显式声明。
     base.groups.forEach((g) => stagerSite.addDependency(g));
     if (stagerPolicy) stagerSite.addDependency(stagerPolicy as cdk.CfnResource);
+    stagerSite.addDependency(stagerSitePolicy.node.defaultChild as cdk.CfnResource);
 
     // ══ 「通知」生产端 ═════════════════════════════════════════════════════════
     // 读端（`notif#` 段、BFF 的 `/notifications*`、侧栏红点）本来就在 createWebChatCore

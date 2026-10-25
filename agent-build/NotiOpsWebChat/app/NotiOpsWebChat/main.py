@@ -2,6 +2,7 @@
 from typing import Any
 from strands import Agent, tool
 import asyncio
+import copy as _copy
 from strands.agent.conversation_manager.sliding_window_conversation_manager import (
     SlidingWindowConversationManager,
 )
@@ -40,11 +41,27 @@ except ImportError:  # pragma: no cover — 未装 openai（不启用 GPT 系时
         """占位：未安装 openai 时永不匹配。"""
     class _OpenAIConnectionError(Exception):  # type: ignore[no-redef]
         """占位：未安装 openai 时永不匹配。"""
+# 流**读到一半**出的错不经过 botocore 的包装：ConverseStream 的 EventStream 直接迭代
+# urllib3 的 `HTTPResponse.stream()`（botocore/eventstream.py 的 _create_raw_event_generator），
+# 于是抛出来的是 urllib3 **自己的** ReadTimeoutError / ProtocolError。botocore 的同名类继承的是
+# botocore 自带的 vendored 桩（`botocore.vendored.requests.packages.urllib3`），和真 urllib3 的类
+# 没有任何继承关系 —— 只列 botocore 的就接不住。
+# 2026-10-15 / 10-17 验证账号实测两次（待办 #5 / #30）：Bedrock 300 秒零字节 → urllib3 读超时
+# → 一路冒到 AgentCore 变成错误帧，用户看到 BFF 的通用文案；会话历史还停在 user 上，
+# 下一轮直接 ValidationException。守卫导入：urllib3 是 botocore 的依赖，缺了也不该起不来。
+try:
+    from urllib3.exceptions import ProtocolError as _Urllib3ProtocolError
+    from urllib3.exceptions import ReadTimeoutError as _Urllib3ReadTimeoutError
+except ImportError:  # pragma: no cover
+    class _Urllib3ReadTimeoutError(Exception):  # type: ignore[no-redef]
+        """占位：未安装 urllib3 时永不匹配。"""
+    class _Urllib3ProtocolError(Exception):  # type: ignore[no-redef]
+        """占位：未安装 urllib3 时永不匹配。"""
 # 「模型没在约定时间内给出下一段内容」这一类。单独成组是因为**给用户的话不一样**：
 # 5xx / 限流 该说「再发一次通常就好」，超时该说「问题太重或模型在长推理，拆小或换模型」。
 _MODEL_TIMEOUT_ERRORS = (
     ReadTimeoutError, ConnectionClosedError, EndpointConnectionError,
-    _OpenAITimeoutError, _OpenAIConnectionError,
+    _OpenAITimeoutError, _OpenAIConnectionError, _Urllib3ReadTimeoutError,
 )
 # HTTP 层的 4xx / 5xx（openai-python 的 APIStatusError 族）。OpenAI 兼容网关与 Mantle 都走
 # openai-python；限流与上下文溢出已被 Strands 改写成自己的异常，其余原样冒上来。
@@ -61,9 +78,11 @@ except ImportError:  # pragma: no cover
     class _OpenAIAPIError(Exception):  # type: ignore[no-redef]
         """占位：未安装 openai 时永不匹配。"""
 from core.llm_config import GatewayNotConfigured as _GatewayNotConfigured  # noqa: E402
+# urllib3 的 ProtocolError（流读到一半连接被断开，`Connection broken: …`）归「模型调用失败」那一档
+# 而不是超时档：它不是「模型想太久」，重发一次通常就好。
 _MODEL_CALL_ERRORS = (
     ClientError, EventStreamError, ModelThrottledException,
-    _OpenAIStatusError, _OpenAIAPIError, _GatewayNotConfigured,
+    _OpenAIStatusError, _OpenAIAPIError, _GatewayNotConfigured, _Urllib3ProtocolError,
 ) + _MODEL_TIMEOUT_ERRORS
 try:
     from strands.types.exceptions import EventLoopException as _EventLoopException
@@ -88,7 +107,7 @@ async def _unwrap_model_errors(agen):
         orig = e
         while isinstance(orig, _EventLoopException) and getattr(orig, "original_exception", None):
             orig = orig.original_exception
-        if isinstance(orig, _MODEL_CALL_ERRORS + (MaxTokensReachedException,)):
+        if isinstance(orig, _MODEL_CALL_ERRORS + (MaxTokensReachedException, OutputCollapsed)):
             raise orig from e
         raise
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
@@ -104,9 +123,12 @@ from paragraphs import ParagraphJoiner
 # 同一轮里同工具、同参数、同结果的第二份 → 换成一句提示（判据与现网事故见 repeat_calls.py）。零依赖；
 # 挂的是 Strands 公开的两个 hook 事件（由这里传进去），不碰 Strands 内部。
 from repeat_calls import RepeatCallGuard
-from strands.hooks import AfterToolCallEvent, BeforeInvocationEvent
-# 输出崩坏守卫（影子模式）：模型一次调用中途崩成乱码时只打一行日志、不改任何行为（判据见 degeneration.py）。零依赖。
-from degeneration import DegenerationGuard
+from strands.hooks import AfterModelCallEvent, AfterToolCallEvent, BeforeInvocationEvent
+# 输出崩坏守卫（强制拦截，待办 #2）：模型一次调用中途崩成乱码时停掉它、丢掉它的输出、自动重试一次
+# （判据与做法见 degeneration.py 文件头）。零依赖；挂的是 Strands 公开的 AfterModelCallEvent.retry。
+from degeneration import CollapseRetry, DegenerationGuard, OutputCollapsed, install_stream_stop
+# 直连那几轮的上文（待办 #33）：BFF 带来的 payload.direct_turns → 本轮 prompt 前面的数据块。
+from direct_turns import format_direct_turns
 
 app = BedrockAgentCoreApp()
 log = app.logger
@@ -1074,6 +1096,12 @@ _ui_locale: "_ctxvars.ContextVar[str]" = _ctxvars.ContextVar(
 _question_lang_cv: "_ctxvars.ContextVar[str]" = _ctxvars.ContextVar(
     "notiops_question_lang", default=""
 )
+# 本轮的输出崩坏守卫（见 degeneration.py）。模型流的检查点（每个 Agent 装一次的 install_stream_stop）
+# 从这里取「这一轮的那个」—— Agent 按会话缓存、跨轮复用，守卫却是每轮一个。主循环结束就清掉，
+# 免得同一个 Agent 下一次被别的路径调用时还拿着上一轮的守卫。
+_degen_cv: "_ctxvars.ContextVar[object]" = _ctxvars.ContextVar(
+    "notiops_degeneration_guard", default=None
+)
 
 
 def _dv(zh: str, en: str) -> str:
@@ -1935,15 +1963,21 @@ def agent_factory():
                 # 静默少工具是最坏的失败:模型只是"看不到工具",于是凭自己的知识编一个像真
                 # 的答案(指标/金额/告警),用户完全没有"这次没查到"的信号。所以必须告诉它。
                 log.error("mounting agent with degraded MCP capability for session %s", session_id)
+            _model = load_model(model_key)
+            # 输出崩坏的检查点（见 degeneration.py）：判定之后停掉这次模型调用。装不上 → 这个 Agent 的
+            # 守卫退回影子模式（invoke 里按 `_notiops_stream_stop` 判），别判了却停不下。
+            install_stream_stop(_model, _degen_cv.get, log=log)
             _agent = Agent(
-                model=load_model(model_key),
+                model=_model,
                 session_manager=get_memory_session_manager(session_id, _actor_id) if restore else None,
                 conversation_manager=_make_conversation_manager(),
                 system_prompt=(DEFAULT_SYSTEM_PROMPT + "\n\n## Degraded capability (this session)\n"
                                + _degraded) if _degraded else DEFAULT_SYSTEM_PROMPT,
                 tools=_tool_set,
                 # 每个 Agent 实例一份（状态按轮清零），见 repeat_calls.py。
-                hooks=[RepeatCallGuard(BeforeInvocationEvent, AfterToolCallEvent, log=log)],
+                # CollapseRetry：崩坏那次调用让 Strands 用同样的上下文再调一次（一轮最多一次，见 degeneration.py）。
+                hooks=[RepeatCallGuard(BeforeInvocationEvent, AfterToolCallEvent, log=log),
+                       CollapseRetry(AfterModelCallEvent)],
             )
             # 历史已经在 Agent.__init__ 末尾被 session manager 恢复进 _agent.messages
             # （Strands 在那里 invoke AgentInitializedEvent）。这里趁它还没进任何一次
@@ -2462,6 +2496,40 @@ def _gateway_failure_text(e, zh: bool, what: str, model_id: str, im: bool,
     if zh:
         return head_zh + steps_zh("直接再发一次 —— 网关或其后端的临时故障，重试通常就好；")
     return head_en + steps_en("Send the message again — usually a transient gateway or backend fault;")
+
+
+def _collapse_progress_text(retry: bool) -> str:
+    """输出崩坏守卫判死一次模型调用时的那行进度（进「思考过程」面板；还没有正文时气泡里也显示）。
+
+    按本轮提问语言（`_dv`）。只说发生了什么、接下来做什么；不点名模型、不带任何乱码原文。
+    """
+    if retry:
+        return _dv("⚠️ 模型这次的输出崩成了乱码，已丢弃，正在自动重试一次…",
+                   "⚠️ The model's output turned into garbled text — discarded it, retrying once…")
+    return _dv("⚠️ 模型的输出又一次崩成了乱码，已丢弃。",
+               "⚠️ The model's output turned into garbled text again — discarded it.")
+
+
+def _collapse_failure_text(zh: bool, im: bool) -> str:
+    """守卫一轮里第二次判死（自动重试那次也崩了）之后给用户的话。
+
+    与模型失败那几档同一个结构（分隔线 + 一句发生了什么 + 下一步）。下一步是**换一个模型**：
+    崩坏是模型自己的偶发问题，同一个模型连着两次，再发一次多半还是它。去哪儿换按入口说
+    （IM 是 `/model`，网页是输入框右下角 —— 与模型失败那支同一套说法）。IM 没有「新建对话」，
+    所以 IM 那份没有第 2 步。
+    """
+    if zh:
+        return ("\n\n---\n⚠️ 模型的输出连续两次崩成了乱码，本轮已停止（乱码已丢弃，没有写进对话记录）。\n\n"
+                "这是模型偶发的问题，和你的问题本身无关。**下一步：**\n"
+                + ("1. 发送 `/model` **换一个模型**后再问一次；\n2. 或把问题拆小一点再发。\n" if im else
+                   "1. 在输入框右下角**换一个模型**后再问一次；\n"
+                   "2. 或新建一个对话，把问题拆小一点再问。\n"))
+    return ("\n\n---\n⚠️ The model's output turned into garbled text twice in a row, so this turn stopped "
+            "(the garbled text was discarded and not saved to the conversation).\n\n"
+            "This is an intermittent model problem, not something about your question. **Next steps:**\n"
+            + ("1. Send `/model` to **switch models**, then ask again;\n2. Or ask a narrower question.\n" if im else
+               "1. **Switch models** at the bottom right of the input box, then ask again;\n"
+               "2. Or start a new conversation and ask a narrower question.\n"))
 
 
 def _extract_prompt(payload: dict):
@@ -3230,6 +3298,16 @@ async def invoke(payload, context):
         "**不要臆断具体档位**（不要说 Basic / Developer 之类——工具没返回确切档位就不要编）。]\n"
         + prompt
     )
+    # 直连那几轮的上文（待办 #33）：深度调查 / DevOps 对话由客户自己的 DevOps Agent 直接答，没经过这里，
+    # 记忆里没有。BFF 挑出没见过的那几轮带来（payload.direct_turns），排成数据块放在问题前面。
+    # 2026-10-21 现网实测：调查完说「针对上面的问题开一个案例」，没有这一段就只能回一张空白建案卡。
+    try:
+        _dt_block = format_direct_turns(payload.get("direct_turns"))
+    except Exception as e:  # noqa: BLE001 — 上文拼不出来只是少一段背景，不能拖垮这一轮
+        _dt_block = ""
+        log.warning("direct_turns format failed: %s", _safe_err(e))
+    if _dt_block:
+        prompt = _dt_block + prompt
     # 主题聚焦（cases 等）：仍单独注入（它是真正改变行为的指令，且只在主题会话出现）
     focus = _topic_directive(payload.get("topic"))
     if focus:
@@ -3295,9 +3373,13 @@ async def invoke(payload, context):
                         f"=== Skill: {sk['name']} ===\n{sk['body']}\n=== Skill 结束 ==={_ref_note}]\n\n"
                     ) + prompt
         else:
-            # 相关性闸门：把用户本轮原文传进去，只注入有关键词重叠的 skill。
+            # 相关性闸门：把用户本轮**原话**传进去，只注入有关键词重叠的 skill。
             # 无关问题（如"上下文工程 vs KV cache"）→ 空串 → 物理上不会误触发，且零 token。
-            _dir = _skills.skills_directive(user_text=_extract_prompt(payload))
+            # ⚠️ 必须是 `_raw_q`，不能是 `_extract_prompt(payload)`：后者已经拼上了语言指令、日期指令和
+            # `[Web search: …]`，里面的 user / cost / time / period / last / month / days 这类脚手架词
+            # 会让无关问题也过闸 —— 2026-10-22 通读时模拟:「What is Amazon S3?」11 个预置 skill 过了 10 个，
+            # 用原话一个都不过（待办 #38 ①）。
+            _dir = _skills.skills_directive(user_text=_raw_q)
             if _dir:
                 prompt = _dir + prompt
     except Exception as e:  # noqa: BLE001 — skill 读取失败不阻断对话
@@ -3405,10 +3487,16 @@ async def invoke(payload, context):
     _mvia = _via_for_model(payload.get("model"))
     if _mvia:
         yield {"via": _mvia}
-    # 输出崩坏守卫（影子模式，见 degeneration.py）：每次模型调用按到达顺序看思考 + 正文增量，
-    # 判定「崩成乱码了」时只打一行 warning（trace id 由 OTEL 日志处理器带上），不停流、不改事件、
-    # 不多花 token；自己出错就本轮关掉。必须在 _stream_events **之前**看 —— 那里的清洗器会就地改正文增量。
-    _degen = DegenerationGuard(_raw_q, model=_model_id, log=log)
+    # 输出崩坏守卫（强制拦截，见 degeneration.py 文件头）：每次模型调用按到达顺序看思考 + 正文增量。
+    # 判定「崩成乱码了」→ 这次调用剩下的事件一律不发，告诉下游丢掉它已经显示的部分；模型流的检查点
+    # 停掉这次调用（它不进历史），Strands 用同样的上下文再调一次；一轮里再崩就走下面 `except
+    # OutputCollapsed` 的说明。自己出错就本轮关掉。必须在 _stream_events **之前**看 —— 那里的清洗器会
+    # 就地改正文增量。这个 Agent 的模型没装上检查点就只打日志：停不下模型的话，判了也只能让乱码进历史。
+    _degen = DegenerationGuard(_raw_q, model=_model_id, log=log,
+                               enforce=bool(getattr(getattr(agent, "model", None), "_notiops_stream_stop", False)))
+    _degen_cv.set(_degen)
+    _degen_call = 0            # 已经发给下游的最后一个 call_start
+    _joiner_at_call = None     # 那次模型调用开始时 _joiner 的样子：丢弃这次调用时退回去
     try:
         # `_unwrap_model_errors`：第二轮起的模型失败被 Strands 包成 EventLoopException，拆开才
         # 进得了下面的 `except _MODEL_CALL_ERRORS`（见该函数说明）。
@@ -3418,6 +3506,23 @@ async def invoke(payload, context):
             if not isinstance(event, dict):
                 continue
             _degen.observe(event)
+            if _degen.enforcing and _degen.calls != _degen_call:
+                # 新的一次模型调用开始了：给 BFF / IM 一个标记 —— 这次调用要是被判死，它们退回到这里。
+                _degen_call = _degen.calls
+                _joiner_at_call = _copy.copy(_joiner)
+                yield {"call_start": _degen_call}
+            if _degen.discarding:
+                _notice = _degen.pop_discard()
+                if _notice is not None:
+                    # 刚判死：段落拼接器退回这次调用开始时的样子；清洗器里 hold 着的尾巴是乱码，换个新的。
+                    if _joiner_at_call is not None:
+                        _joiner, _joiner_at_call = _joiner_at_call, None
+                    _scrubber = _MarkerScrubber()
+                    yield {"discard": _notice}
+                    # 不静默：思考过程面板里留一行、还没有正文时气泡里也显示（progress 收到正文即清空）。
+                    yield {"progress": {"text": _collapse_progress_text(bool(_notice.get("retry"))),
+                                        "kind": "status"}}
+                continue
             # 流式工具（如 investigate_live）的中间 yield → ToolStreamEvent（见 _tool_stream_events）。
             if event.get("type") == "tool_stream":
                 for _out in _tool_stream_events(event, _joiner):
@@ -3433,6 +3538,25 @@ async def invoke(payload, context):
             #   · 工具调用之后的第一段正文 → 前面先补一个空行事件（_joiner）。
             for _out in _stream_events(event, _scrubber, _joiner):
                 yield _out
+    except OutputCollapsed as e:  # 守卫一轮里判了第二次（重试那次也崩了），见 degeneration.py
+        # 崩坏那两次调用的输出都没进历史（异常发生在 Strands 写入 agent.messages 之前），下游也已按
+        # discard 丢掉了它们显示过的部分。这里回一段说明，与上面那几档模型失败同一口径；**不**说
+        # 「回复"继续"」—— 继续的话模型接着的是我们这段说明，不是一段有用的半截回答。
+        # 日志纪律（docs/LOGGING_STANDARD.md）：只记信号与第几次调用。
+        log.error("model output collapsed again, giving up this turn: signal=%s call=%s model=%s",
+                  e.signal, e.call, _model_id)
+        _msg = _collapse_failure_text(not _is_probably_english(_raw_q), _is_im_topic(payload.get("topic")))
+        yield _text_event(_msg)
+        # 与模型失败那支同一个理由补平 user / assistant 交替（见那里的长注释）：本轮失败 = 历史停在
+        # user（或工具结果）上，不补的话下一轮直接 ValidationException。
+        try:
+            _msgs = getattr(agent, "messages", None)
+            if (isinstance(_msgs, list) and _msgs and isinstance(_msgs[-1], dict)
+                    and _msgs[-1].get("role") == "user"):
+                _msgs.append({"role": "assistant", "content": [{"text": _msg.strip()}]})
+        except Exception as _tail_e:  # 补历史失败绝不能盖掉上面已经发出去的说明
+            log.warning("failed to repair message tail after output collapse: type=%s",
+                        type(_tail_e).__name__)
     except MaxTokensReachedException as e:  # 见顶部 import（撞输出上限，非故障）
         # 撞输出上限：不是故障，是回答太长。保留已生成内容，收尾照常走（下方补提示 + sources）。
         log.warning("stream hit max_tokens, finishing gracefully with partial answer: %s",
@@ -3621,6 +3745,9 @@ async def invoke(payload, context):
         except Exception as _tail_e:  # 补历史失败绝不能盖掉上面已经发出去的降级答案
             log.warning("failed to repair message tail after model failure: type=%s",
                         type(_tail_e).__name__)
+    finally:
+        # 本轮的守卫只管本轮的模型调用（见 _degen_cv 的说明）。
+        _degen_cv.set(None)
     # 流结束：把清洗器里暂存的尾巴（确认非标记的部分）补发出去
     _tail = _scrubber.flush()
     if _tail:

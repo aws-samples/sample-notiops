@@ -1768,7 +1768,10 @@
               ]
             },
             {
-              "Action": "bedrock-agentcore:InvokeAgentRuntime",
+              "Action": [
+                "bedrock-agentcore:InvokeAgentRuntime",
+                "bedrock-agentcore:StopRuntimeSession"
+              ],
               "Effect": "Allow",
               "Resource": "arn:aws:bedrock-agentcore:us-east-1:444455556666:runtime/*"
             },

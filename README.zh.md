@@ -8,7 +8,7 @@
 
 ![NotiOps 网页控制台](docs/screenshot-web-zh.png)
 
-**NotiOps** 是一套 AWS 示例代码,提供一个**只读的云运维控制台** —— 一个网页版聊天
+**NotiOps** 是一套 AWS 示例代码,提供一个**只读、可追溯的云上 Agentic AI 助手**。主入口是网页版聊天
 应用:工程师用大白话询问自己的 AWS 环境,就能拿到近实时、带来源引用的回答:含根因
 分析的事件调查、成本 / FinOps 分析、资源健康巡检,以及完整的 AWS Support 工单管理
 —— 全程在网页里完成,无需切到 AWS 控制台。
@@ -203,7 +203,7 @@ bash scripts/preflight.sh
 | 接自己的 CUR 数据源(4 个仪表盘 sheet + 聊天里问那份账单) | ✅ 可选,默认关(开栈时选 `ProvisionCur=yes` 或填 `CurTable`),见下方注 ⁵ | ✅ 可选,默认关(要显式开:`COST_MCP_SELF_HOST=true ./setup.sh`),见下方注 ⁵ |
 | **工单与 Skills** | | |
 | AWS Support 工单全生命周期(多账号:开案例卡上直接选开到哪个账号) | ✅ | ✅ |
-| 11 个预置 Skill + 客户自建 | ✅ | ✅ |
+| 12 个预置 Skill + 客户自建 | ✅ | ✅ |
 | 把 Skill 发布到 DevOps Agent | ✅ 见下方注 ¹ | ✅ |
 | **模型** | | |
 | 多模型切换 + 模型目录管理 | ✅ | ✅ |
@@ -388,7 +388,8 @@ StackSet 里的实例、再删 StackSet 本身(多账号模式下 `DataRetention
 
   删除需要输入 12 位账号号码确认(`--delete-everything` 还要再输一次 `DELETE EVERYTHING`)。
   ⚠️ 数据桶 `notiops-data-<账号>-<区域>` 在这条路径上是随栈删除的(Skill 与长报告都在里面),
-  所以脚本**默认先把它同步到本地备份目录**,不想备份加 `--no-backup`。
+  所以脚本**默认先把它同步到本地备份目录**(默认 `~/notiops-teardown-backup-<时间戳>/`,在仓库目录之外;
+  `--backup-dir` 可改),不想备份加 `--no-backup`。
   如果同一个账号+区域里**两种方式都装过**:两边用的是同一套资源名,所以脚本在清空桶 /
   删表前会先问 CloudFormation "这资源属于哪个栈",属于一键部署那个栈的会**自动跳过**
   (要删它请去删那个栈)。

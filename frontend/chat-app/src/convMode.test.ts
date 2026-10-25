@@ -34,13 +34,26 @@ describe("落盘与读回", () => {
   it("off 不落盘 —— 否则每建一个空会话都写一条，表很快被无意义记录填满", () => {
     saveConvMode("c1", "off");
     expect(raw()).toEqual({});
-    saveConvMode("c1", "agent");
+    saveConvMode("c1", "chat");
     saveConvMode("c1", "off");   // 关掉 → 这一条被删掉，不是留一个 "off"
     expect(raw()).toEqual({});
   });
 
-  it("forgetConvMode 清掉某会话（会话被删时用，避免留孤儿条目）", () => {
+  it("「深度调查」只管这一轮：direct / agent 绝不落盘，并删掉这个会话的旧条目（待办 #34）", () => {
+    // 🔴 2026-10-21 现网实测的就是它落盘的后果：跑完一次深度调查，接着说「开一个案例」，
+    //    又被当成一次新的深度调查发出去。
     saveConvMode("c1", "direct");
+    saveConvMode("c2", "agent");
+    expect(raw()).toEqual({});
+    // 2026-10-23 之前落过盘的老条目：再写一次 per-turn 模式（= 落盘 effect 对恢复成 off 的会话
+    // 做的事）就会被清掉，不会一直留在表里。
+    localStorage.setItem(KEY, JSON.stringify({ c3: "direct", c4: "chat" }));
+    saveConvMode("c3", "direct");
+    expect(raw()).toEqual({ c4: "chat" });
+  });
+
+  it("forgetConvMode 清掉某会话（会话被删时用，避免留孤儿条目）", () => {
+    saveConvMode("c1", "starops");
     saveConvMode("c2", "chat");
     forgetConvMode("c1");
     expect(loadConvMode("c1")).toBe("off");
@@ -58,11 +71,11 @@ describe("落盘与读回", () => {
 
   it("上限 200：超了丢最久没动过的，且被动过的那条不会被误丢", () => {
     for (let i = 0; i < 200; i++) saveConvMode(`c${i}`, "chat");
-    saveConvMode("c0", "agent");        // 重新动一下最老的那条 → 它挪到末尾
-    saveConvMode("c200", "direct");     // 第 201 条 → 淘汰一条
+    saveConvMode("c0", "starops");      // 重新动一下最老的那条 → 它挪到末尾
+    saveConvMode("c200", "chat");       // 第 201 条 → 淘汰一条
     expect(Object.keys(raw()).length).toBe(200);
-    expect(loadConvMode("c0")).toBe("agent");   // 刚动过的还在
-    expect(loadConvMode("c200")).toBe("direct");
+    expect(loadConvMode("c0")).toBe("starops");   // 刚动过的还在
+    expect(loadConvMode("c200")).toBe("chat");
     expect(loadConvMode("c1")).toBe("off");     // 现在最老的那条被丢了
   });
 });
@@ -123,11 +136,11 @@ describe("恢复前的主题闸门", () => {
     expect(restorableMode("cost", "chat")).toBe("off");
   });
 
-  it("「深度调查」（直连）按 topicHasDevopsAgent 的口径（general/cases/whats-new 除外）", () => {
-    expect(restorableMode("investigate", "direct")).toBe("direct");
-    expect(restorableMode("cost", "direct")).toBe("direct");
-    for (const bad of ["general", "cases", "whats-new"]) {
-      expect(restorableMode(bad, "direct")).toBe("off");
+  it("「深度调查」（直连）一律恢复成 off —— 2026-10-23 起只管这一轮，刷新后不再开着（待办 #34）", () => {
+    // 原来按 topicHasDevopsAgent 的口径恢复（investigate / cost 恢复成 direct）。现在挡的是
+    // 2026-10-23 之前落过盘的老条目：恢复回来 = 刷新以后开关还开着，下一句追问又成了一次新调查。
+    for (const topic of ["investigate", "cost", "general", "cases", "whats-new"]) {
+      expect(restorableMode(topic, "direct")).toBe("off");
     }
   });
 

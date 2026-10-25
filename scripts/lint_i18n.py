@@ -775,7 +775,20 @@ def check_frontend_orphans() -> list[str]:
     return out
 
 
+#: 能解析本仓库全部源码的最低 Python。pyproject 要求 ≥3.14，但 3.12 就能 parse（CI 的 pytest 镜像
+#: 就是这么跑的）；再旧就会把语法当成「解析失败」，报成 i18n 违规（待办 #41）。
+MIN_PYTHON = (3, 12)
+
+
 def main(argv: list[str]) -> int:
+    if sys.version_info < MIN_PYTHON:
+        # 环境问题，不是 i18n 违规 —— 明说是哪个解释器、该换哪个（待办 #41：CDD 上 shell 里的 python3
+        # 是系统 3.9，以前在这里报出两条假的「NEW violation」挡住提交）。
+        print(f"i18n lint: needs Python >= {MIN_PYTHON[0]}.{MIN_PYTHON[1]} to parse this repo, "
+              f"but is running {sys.version_info.major}.{sys.version_info.minor} ({sys.executable}). "
+              "This is an environment problem, not an i18n violation — use the repo .venv "
+              "(.venv/bin/python scripts/lint_i18n.py) or a newer python3 on PATH.", file=sys.stderr)
+        return 2
     update_baseline = "--update-baseline" in argv[1:]
     explicit_files = [a for a in argv[1:] if not a.startswith("--")]
     files = collect_files(explicit_files)

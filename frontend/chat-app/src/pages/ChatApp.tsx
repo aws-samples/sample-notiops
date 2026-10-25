@@ -6,6 +6,7 @@ import Composer from "../components/Composer";
 import SourcesPanel from "../components/SourcesPanel";
 import ThinkingPanel from "../components/ThinkingPanel";
 import { appendStep, appendReasoning, type TimelineStep } from "../thinking";
+import { createStreamRewind } from "../streamRewind";
 import CustomizePanel from "../components/CustomizePanel";
 import NotificationsPanel from "../components/NotificationsPanel";
 import AdminPanel from "../components/AdminPanel";
@@ -23,7 +24,8 @@ import ErrorBoundary from "../components/ErrorBoundary";
 import ChatObjectPicker from "../components/ChatObjectPicker";
 import Logo from "../components/Logo";
 import { unreadCount } from "../api/notifications";
-import { streamChat, warmupChat, listConversations, getMessages, deleteConversationApi, renameConversationApi, setPinnedApi, executeActionApi, getAccountsFull, type SourceItem, type AccountInfo } from "../api/chat";
+import { streamChat, warmupChat, listConversations, getMessages, deleteConversationApi, renameConversationApi, setPinnedApi, executeActionApi, getAccountsFull, getTurnStatus, stopTurn, type SourceItem, type AccountInfo, type StoredMessage } from "../api/chat";
+import { fmtElapsed, isAgentPathTurn } from "../turnWait";
 import { useLocale, useT } from "../i18n";
 import { topicDef, deepDiveTogglesFor, normalizeTopic, type ChatMessage, type Conversation, type TopicKey } from "../types";
 import { loadConvMode, saveConvMode, forgetConvMode, modeOf, fieldsOf, restorableMode, relockFromHistory } from "../convMode";
@@ -272,7 +274,16 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   const [deployment, setDeployment] = useState<{ accountId: string; accountName: string }>({ accountId: "", accountName: "Management account" });
   // 每会话独立的"生成中"状态：A 在流式输出时，切到 B 仍可正常提问，互不锁定。
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
-  const busy = busyIds.has(activeId); // 仅当前会话在生成时，禁用当前会话的发送
+  // 「上一轮还在进行」（待办 #30 第 ②③ 档）：会话 id → 那一轮开始的时间（ms）。两个来源：本轮收到 busy 事件
+  // （这一句没发出去），或者打开一个会话时服务端说它有一轮还在跑（刷新页面后最常见）。有这条记录的会话：
+  // 输入框按「生成中」处理（停止按钮会真停掉服务端那一轮）、消息流末尾显示等待提示、每 5 秒问一次服务端，
+  // 那一轮结束就重新拉这段会话的消息、解锁。见 turnWait.ts。
+  const [turnWait, setTurnWait] = useState<Record<string, number>>({});
+  const turnWaitRef = useRef(turnWait);
+  turnWaitRef.current = turnWait;
+  // 正在本 tab 里流式的那一轮走不走 NotiOps agent（只有这条路在 runtime 里有会话可停）：会话 id → bool。
+  const agentTurnRef = useRef<Map<string, boolean>>(new Map());
+  const busy = busyIds.has(activeId) || activeId in turnWait; // 仅当前会话在生成（或上一轮还在服务端跑）时，禁用当前会话的发送
   // 「未读」会话集合：某后台(非当前打开)会话的 agent 输出完成时标记，侧栏列表显红点提示，
   // 切进该会话即清除。让客户跳到别的 session 后，仍知道上一个 session 已出完结果。
   const [unreadIds, setUnreadIds] = useState<Set<string>>(new Set());
@@ -511,11 +522,12 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   // FinOps Agent 深度模式：同样**每会话**独立（默认关）；仅 FinOps 主题会显示该开关。
   const finopsAgent = active.finopsAgent ?? false;
   const toggleFinopsAgent = () => setConversations((prev) => prev.map((c) => (c.id === activeId ? { ...c, finopsAgent: !(c.finopsAgent ?? false) } : c)));
-  // DevOps Agent 深度调查：每会话独立（默认关）；哪些主题显示该开关见 types.ts
-  // `topicHasDevopsAgent`（默认全部提供，只排除 general/cases/whats-new）。
+  // DevOps Agent 深度调查：**只管这一轮**（默认关）—— 一轮结束由 handleSend 的 finally 自动关掉，
+  // 也不跨刷新恢复（待办 #34，用户 2026-10-23 定；见 convMode.ts 文件头）。哪些主题显示该开关见
+  // types.ts `topicHasDevopsAgent`（默认全部提供，只排除 general/cases/whats-new）。
   const devopsAgent = active.devopsAgent ?? false;
   // 「深度调查（直连）」：同一能力的 0-token 版本。两个开关**互斥** —— 点亮一个自动灭另一个
-  // （同时开会同时走两条路：一条烧 token 的 + 一条直连的）。
+  // （同时开会同时走两条路：一条烧 token 的 + 一条直连的）。同样只管这一轮。
   const devopsAgentDirect = active.devopsAgentDirect ?? false;
   // 「DevOps 对话」：直连 DevOps Agent 控制面对话 API，由**客户自己的 DevOps Agent** 回答
   // （NotiOps 侧 0 token）。仅故障调查主题显示。
@@ -560,6 +572,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   // 挂在 effect 上而不是塞进 setDevopsMode：模式还有别的写入口（落地页草稿随
   // startFromNotification 带进新会话、水合时按历史 via 回锁），逐个去 hook 必然漏一个。
   // 只看 active 是够的 —— 非当前会话的模式没有任何入口能改。
+  // 「深度调查」只管这一轮，`saveConvMode` 会把它当 off（不落盘）—— 落盘的只有对话对象。
   useEffect(() => {
     if (!active) return;
     saveConvMode(active.id, modeOf(active));
@@ -666,6 +679,20 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 服务端存的消息 → 界面消息（打开会话时水合、以及「上一轮结束后重新拉」共用一份映射）。
+  const toChatMessages = (convId: string, msgs: StoredMessage[]): ChatMessage[] => msgs.map((m, i) => ({
+    id: `${convId}-h${i}`,
+    role: m.role,
+    text: m.text,
+    ts: m.ts,
+    model: m.model,
+    sources: m.sources,
+    usage: m.usage,
+    accountId: m.account_id,  // 历史回复的账号徽标(刷新后仍显示)
+    via: m.via,               // 答案来源(devops-agent → 署名行显示 "AWS DevOps Agent")
+    staropsEmployee: m.starops_employee, // 阿里云那条：页脚显示当时那个数字员工 ID
+  }));
+
   // 选中某会话且尚未加载过消息 → 从后端拉取该会话历史。
   useEffect(() => {
     const conv = conversations.find((c) => c.id === activeId);
@@ -685,21 +712,18 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
         return n;
       });
     };
+    // 刷新页面后打开的会话可能还有一轮在服务端跑（它的回答还没落库）—— 问一次，有就进入等待状态，
+    // 而不是等用户再发一句、撞上「会话忙」才知道（待办 #30 第 ②③ 档）。
+    if (willHydrate) {
+      const convId = activeId;
+      void getTurnStatus(convId).then(({ inflight }) => {
+        if (inflight) setTurnWait((p) => ({ ...p, [convId]: inflight.startedAt || Date.now() }));
+      });
+    }
     getMessages(activeId)
       .then(({ messages: msgs, truncated, limit }) => {
         if (!msgs.length) return;
-        const mapped: ChatMessage[] = msgs.map((m, i) => ({
-          id: `${activeId}-h${i}`,
-          role: m.role,
-          text: m.text,
-          ts: m.ts,
-          model: m.model,
-          sources: m.sources,
-          usage: m.usage,
-          accountId: m.account_id,  // 历史回复的账号徽标(刷新后仍显示)
-          via: m.via,               // 答案来源(devops-agent → 署名行显示 "AWS DevOps Agent")
-          staropsEmployee: m.starops_employee, // 阿里云那条：页脚显示当时那个数字员工 ID
-        }));
+        const mapped = toChatMessages(activeId, msgs);
         // 「对话对象」的锁要**跨刷新**成立：devopsChat / starops 只活在前端内存里，刷新后回落
         // false —— 那样一个由客户自己的 DevOps Agent 答过的会话，接着问会**静默换成 NotiOps
         // 来答**（客户看不出来，只会觉得答案风格突然变了）。历史消息里的 via 是持久化的事实
@@ -724,6 +748,37 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
       // 拉到空数组 / 请求失败时同样要摘，否则骨架屏卡死。
       .finally(settleHydration);
   }, [activeId, conversations]);
+
+  // 「上一轮还在进行」的轮询：每 5 秒问一次服务端；那一轮结束（turn 那一行没了）→ 重新拉这段会话的消息
+  // （它的回答这时已经落库：BFF 先落库、再放掉 turn 那一行）→ 解锁。只在有等待中的会话时才转。
+  const hasTurnWait = Object.keys(turnWait).length > 0;
+  useEffect(() => {
+    if (!hasTurnWait) return;
+    let dead = false;
+    const iv = setInterval(async () => {
+      for (const id of Object.keys(turnWaitRef.current)) {
+        const { inflight } = await getTurnStatus(id);
+        if (dead || inflight) continue;
+        const { messages: msgs, truncated, limit } = await getMessages(id);
+        if (dead) return;
+        if (msgs.length) {
+          setConversations((prev) => prev.map((c) => (c.id === id
+            ? { ...c, messages: toChatMessages(id, msgs), historyTruncated: truncated, historyLimit: limit }
+            : c)));
+        }
+        setTurnWait((p) => { const n = { ...p }; delete n[id]; return n; });
+      }
+    }, 5000);
+    return () => { dead = true; clearInterval(iv); };
+  }, [hasTurnWait]);
+  // 等待提示里的「已 m:ss」每秒走一格（只在正看着的那个会话在等时才转）。
+  const [, setWaitTick] = useState(0);
+  const activeWaiting = activeId in turnWait;
+  useEffect(() => {
+    if (!activeWaiting) return;
+    const iv = setInterval(() => setWaitTick((x) => x + 1), 1000);
+    return () => clearInterval(iv);
+  }, [activeWaiting]);
 
   // 已预热过的会话（每个 tab 生命周期内每会话最多一次）。
   const warmedRef = useRef<Set<string>>(new Set());
@@ -842,6 +897,10 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     // 同理的第四个对象：阿里云 STAROps 数字员工。第一帧就要署名成它 —— 这条链路一个字都不经
     // Bedrock，先挂上本地模型名等于在流式那几秒里对客户撒谎（还是"答案来自哪朵云"这种谎）。
     const sendStarops = targetConv?.starops ?? (conversations.find(findConv)?.starops) ?? false;
+    // 本轮是不是深度调查（两个开关都只管这一轮，finally 里据此关掉）。与下面 streamChat 的入参同源。
+    const sendDevopsAgent = targetConv?.devopsAgent ?? (conversations.find(findConv)?.devopsAgent) ?? false;
+    const sendDeepDirect = targetConv?.devopsAgentDirect ?? (conversations.find(findConv)?.devopsAgentDirect) ?? false;
+    agentTurnRef.current.set(convId, isAgentPathTurn({ devopsChat: sendDevopsChat, starops: sendStarops, deepDirect: sendDeepDirect }));
     const botMsg: ChatMessage = { id: botId, role: "assistant", text: "", ts: Date.now(), thinking: true, thinkElapsed: 0, streaming: true, model: modelDisplayName(sendModel), accountId: sendAccountId, via: sendStarops ? "starops" : sendDevopsChat ? "devops-agent" : undefined };
 
     // upsert:通常会话已在列表里(map 命中);但从通知卡发起时,新会话可能还没被
@@ -882,6 +941,8 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     const invSteps: import("../api/chat").InvestigationStep[] = []; // 调查过程累积（走右侧面板）
     // 「思考过程」时间线累积（走右侧面板；合并连续思考、去重重复行、滤掉 BFF 等待期提示）。
     let thinkTimeline: TimelineStep[] = [];
+    // 输出崩坏守卫的书签（见 streamRewind.ts）：每次模型调用开头记下正文与时间线，判成乱码时退回去。
+    const rewind = createStreamRewind<TimelineStep[]>();
     // 收到第一步时：若用户没关过自动弹，且面板没在看别的消息 → 自动把面板打开到本条。只做一次。
     let thinkAutoDone = false;
     const pushThinking = (next: TimelineStep[]) => {
@@ -898,7 +959,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
 
     try {
       await streamChat(
-        { conversationId: convId, text, model: sendModel, locale, webSearch: (conversations.find(findConv)?.webSearch) ?? false, finopsAgent: (conversations.find(findConv)?.finopsAgent) ?? false, devopsAgent: targetConv?.devopsAgent ?? (conversations.find(findConv)?.devopsAgent) ?? false, devopsAgentDirect: targetConv?.devopsAgentDirect ?? (conversations.find(findConv)?.devopsAgentDirect) ?? false, devopsChat: sendDevopsChat, starops: sendStarops, topic: convTopic, accountId: targetConv?.accountId ?? (conversations.find(findConv)?.accountId) ?? "", skillId },
+        { conversationId: convId, text, model: sendModel, locale, webSearch: (conversations.find(findConv)?.webSearch) ?? false, finopsAgent: (conversations.find(findConv)?.finopsAgent) ?? false, devopsAgent: sendDevopsAgent, devopsAgentDirect: sendDeepDirect, devopsChat: sendDevopsChat, starops: sendStarops, topic: convTopic, accountId: targetConv?.accountId ?? (conversations.find(findConv)?.accountId) ?? "", skillId },
         {
           onToken: (delta) => {
             if (firstToken) { firstToken = false; clearInterval(tk); }
@@ -954,6 +1015,18 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
             patchMsgIn(convId, botId, { model: modelDisplayName(eff) });
             void refreshModelCatalog();
           },
+          // 会话忙（待办 #30）：这一句没发出去，上一轮还在服务端跑 → 进入等待状态（轮询到它结束、自动拉回答）。
+          onBusy: (info) => setTurnWait((p) => ({ ...p, [convId]: Number(info?.since) || Date.now() })),
+          // 输出崩坏守卫（待办 #2）：模型调用开头记书签；某次调用被判成乱码 → 正文与「思考过程」退回书签处。
+          // 紧跟着 agent 会发一行 progress（「已丢弃，正在重试…」），还没有正文时气泡里显示它。
+          onCallStart: (call) => rewind.mark(call, acc, thinkTimeline),
+          onDiscard: (info) => {
+            const m = rewind.rewind(info?.call);
+            if (!m) return;
+            acc = m.text;
+            thinkTimeline = m.timeline;
+            patchMsgIn(convId, botId, { text: acc, thinkingSteps: thinkTimeline });
+          },
           onDone: () => { clearInterval(tk); patchMsgIn(convId, botId, { streaming: false, thinking: false, progress: "" }); },
           onError: (msg) => { clearInterval(tk); patchMsgIn(convId, botId, { text: acc || `⚠️ ${msg}`, streaming: false, thinking: false, progress: "" }); },
         },
@@ -973,6 +1046,14 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
       patchMsgIn(convId, botId, { streaming: false, thinking: false, progress: "" });
       setBusyFor(convId, false);
       abortRef.current.delete(convId);
+      agentTurnRef.current.delete(convId);
+      // 🔴 「深度调查」只管这一轮（待办 #34，用户 2026-10-23：「只管这一轮，跑完自动关」）：
+      // 这一轮结束（答完 / 点了停止 / 出错都算）就把它关掉；对话对象（devopsChat / starops）不动。
+      // 不关的后果（2026-10-21 现网实测）：跑完一次调查，接着说「针对上面的问题开一个案例」，
+      // 又被当成一次**新的**深度调查发给 DevOps Agent，白占一次调查额度。
+      if (sendDeepDirect || sendDevopsAgent) {
+        setConversations((prev) => prev.map((c) => (c.id === convId ? { ...c, devopsAgentDirect: false, devopsAgent: false } : c)));
+      }
       // 生成结束（正常/停止/出错皆然）时，若用户已不在看这个会话 → 标「未读」，侧栏红点提示；
       // 若仍停在该会话（且视图就是聊天）则不标（用户正看着，无需提示）。切进该会话时清除（见 switchTo）。
       // "不在看" = 切到了别的会话，或虽是同一会话但视图切到了仪表盘/Skills 等非 chat 视图。
@@ -984,6 +1065,10 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   // 停止当前会话正在进行的生成
   const stopGen = () => {
     const ac = abortRef.current.get(activeId);
+    // 走 NotiOps agent 的那一轮（本 tab 正在流式的，或上一轮还在服务端跑的）：除了断开浏览器这一端，
+    // 还要让服务端真停（待办 #30 第 ③ 档）—— 否则 runtime 里那一轮照样跑完、照样烧 token，
+    // 紧接着发下一句就撞「会话忙」。等待中的会话没有本地流可断，停完继续靠轮询解锁。
+    if (agentTurnRef.current.get(activeId) || activeId in turnWaitRef.current) void stopTurn(activeId);
     if (ac) ac.abort();
   };
 
@@ -1320,7 +1405,12 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
         {/* 三个 DevOps 开关在 landing 也是**单选**（与会话内 setDevopsMode 同口径）：
             点亮一个必须显式把另两个置 false，否则草稿会带着两个开关进新会话、后端同时收到两个 flag。 */}
         <Composer model={lm(topicKey)} onModelChange={(id) => setLm(topicKey, id)}
-          onSend={(text, skillId) => startFromNotification(text, topicKey, { ...lt(topicKey), accountId: dashAccountId }, skillId)}
+          onSend={(text, skillId) => {
+            startFromNotification(text, topicKey, { ...lt(topicKey), accountId: dashAccountId }, skillId);
+            // 「深度调查」只管这一轮（待办 #34）：草稿已经带进新会话了，落地页这个主题的开关随即复位，
+            // 不然回到落地页它还勾着，下一个新会话的第一句又会被当成深度调查发出去。
+            setLt(topicKey, { devopsAgent: false, devopsAgentDirect: false });
+          }}
           busy={false} /* landing 是发起新会话入口,永远可发送 */ showSuggestions={false} prefill={themePrefill[topicKey]}
           webSearch={lt(topicKey).webSearch ?? false} onToggleWebSearch={() => setLt(topicKey, { webSearch: !(lt(topicKey).webSearch ?? false) })}
           finopsAgent={lt(topicKey).finopsAgent ?? false} onToggleFinopsAgent={() => setLt(topicKey, { finopsAgent: !(lt(topicKey).finopsAgent ?? false) })}
@@ -1701,6 +1791,13 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
                       : undefined}
                     accountIsMember={!!m.accountId} />
                 ))}
+                {/* 上一轮还在服务端跑（待办 #30 第 ②③ 档）。本 tab 正在流式时不显示 —— 那时气泡自己在动。 */}
+                {active.id in turnWait && !busyIds.has(active.id) && (
+                  <div className="thread-turnwait" role="status">
+                    <span>{t("turnwait.text").replace("{t}", fmtElapsed(Date.now() - turnWait[active.id]))}</span>
+                    <button type="button" onClick={() => newConv(active.topic ?? "general")}>{t("app.newChat")}</button>
+                  </div>
+                )}
               </div>
             </div>
             <Composer model={model} onModelChange={setModel} onSend={handleSend} busy={busy} showSuggestions={false} webSearch={webSearch} onToggleWebSearch={toggleWebSearch} finopsAgent={finopsAgent} onToggleFinopsAgent={toggleFinopsAgent} devopsAgent={devopsAgent} onToggleDevopsAgent={toggleDevopsAgent} devopsAgentDirect={devopsAgentDirect} onToggleDevopsAgentDirect={toggleDevopsAgentDirect} devopsChat={devopsChat} onToggleDevopsChat={toggleDevopsChat} starops={starops} onStop={stopGen} topic={active.topic ?? "general"} convKey={active.id} accountId={accountId} dashPills={dashPillsFor(active.topic ?? "general")}

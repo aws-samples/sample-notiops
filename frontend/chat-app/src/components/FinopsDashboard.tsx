@@ -391,7 +391,9 @@ export default function FinopsDashboard({ dashboardId, onOpenDashboard, data: da
       </div>
       </>)}
       {canCard.top5 && (
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 14 }}>
+      // marginTop：上面的 Marketplace 卡（或没有它时的支出概览）在另一个 grid 里，grid 的 gap 管不到
+      // 两个容器之间 —— 以前两张卡直接贴在一起（#32 ⑦）。
+      <div data-testid="finops-top5-grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 14, marginTop: 14 }}>
         <Card>
           <Label>{zh ? "Top 5 服务 · 本月" : "Top 5 Services · MTD"}</Label>
           {topServices?.available && (topServices.top || []).length > 0 ? (

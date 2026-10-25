@@ -12,6 +12,7 @@ Public surface:
   - apply_case_overrides(classification, service_text=, issue_type=)
   - load_support_context(incident_id) -> dict | None
   - claim_inflight(idempotency_key)   -> bool
+  - release_inflight(idempotency_key)  -> None   (definite failures only)
   - create_case(...)                  -> CaseResult dataclass
 
 Idempotency: callers should call `claim_inflight(key)` before kicking off
@@ -340,6 +341,22 @@ def claim_inflight(key: str) -> bool:
     the rationale.
     """
     return ddb_state.claim_inflight(key)
+
+
+def release_inflight(key: str) -> None:
+    """失败后放开 `claim_inflight` 那把一次性锁,让用户马上能再点一次(待办 #4 ③)。
+
+    锁默认挂 1 小时(`ddb_state.INFLIGHT_TTL_SECONDS`)。成功之后要它挂着 —— 挡住平台的
+    回调重投和手快的重复点击;**失败**之后还挂着,键固定的入口(「同步到案例」、Slack 的
+    关闭工单、案例卡上的「起调查」……)就会对用户说一小时「正在处理中」。
+
+    只在**确定没生效**的失败上调:AWS 明确返回了错误(`add_communication` 回 False、
+    `resolve_case` 回空串、派发回 error),或者根本没开始做(报告上下文过期)。抛了异常的
+    那种(网络中断,请求可能已经到了 AWS)别放 —— 宁可让用户多等,也不要重复写进客户的工单。
+    空键 = 当初就没认领,什么都不做。
+    """
+    if key:
+        ddb_state.release_inflight(key)
 
 
 def load_support_context(incident_id: str) -> dict | None:

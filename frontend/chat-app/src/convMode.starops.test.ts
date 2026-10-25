@@ -41,7 +41,8 @@ describe("恢复前的主题闸门：多云翻开时的 STAROps", () => {
     // 它们的口径在 flag=true / flag=false 两种世界里必须完全一样。
     expect(restorableMode("investigate", "chat")).toBe("chat");
     expect(restorableMode("general", "chat")).toBe("off");
-    expect(restorableMode("investigate", "direct")).toBe("direct");
+    // 「深度调查」2026-10-23 起只管这一轮，任何主题都恢复成 off（待办 #34，见 convMode.ts 文件头）。
+    expect(restorableMode("investigate", "direct")).toBe("off");
     expect(restorableMode("general", "direct")).toBe("off");
     expect(restorableMode("investigate", "agent")).toBe("off");
   });

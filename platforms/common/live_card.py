@@ -238,10 +238,13 @@ class LiveCard:
 
     # ---- 事件入口 ----
     def emit(self, kind: str, payload: dict) -> None:
-        """`run_devops_chat(emit=...)` 的回调。三种 kind 与 Web 端同形。"""
+        """`run_devops_chat(emit=...)` 的回调。三种 kind 与 Web 端同形；`reset` 是正文整段换掉
+        （输出崩坏守卫判死一次模型调用时，`core.agent_chat.Sink.rewind` 发来退回后的正文）。"""
         try:
             if kind == "text":
                 self.reply += str((payload or {}).get("delta") or "")
+            elif kind == "reset":
+                self.reply = str((payload or {}).get("text") or "")
             elif kind == "step":
                 line = str((payload or {}).get("text") or "").strip()
                 if line:

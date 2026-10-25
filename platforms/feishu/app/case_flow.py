@@ -284,8 +284,7 @@ def _filter_quick_row(current: str, locale: str,
         buttons.append(_callback_button(
             label,
             {"action": "case_list_filter", "case_filter": slug,
-             "case_account_id": account_id},
-        ))
+             "case_account_id": account_id}, locale=locale))
     return _action_row(buttons)
 
 
@@ -756,14 +755,17 @@ def _handle_sync_report(chat_id: str, display_id: str, incident_id: str,
         return _toast(i18n.t("case.toast.missing_id_or_incident", locale))
 
     # Idempotency: prevent double-add when Feishu retries the trigger.
-    if not support_logic.claim_inflight(
-            f"sync:{incident_id}:{display_id}"):
+    # 键是固定的(同一张报告卡、同一个案例):失败时必须放开,否则用户再点一次会被
+    # 「正在同步」挡满一小时(待办 #4 ③,见 `support_logic.release_inflight`)。
+    inflight_key = f"sync:{incident_id}:{display_id}"
+    if not support_logic.claim_inflight(inflight_key):
         return _toast(i18n.t("case.toast.syncing_in_progress", locale))
 
     # Pull the agent's summary + report URLs from the support context
     # row that report-handler wrote (under support#<incident_id>).
     ctx = support_logic.load_support_context(incident_id)
     if not ctx:
+        support_logic.release_inflight(inflight_key)   # 什么都没做
         return _toast(i18n.t("case.toast.report_expired", locale))
 
     # 账号来源有两个，卡片上的「章」优先：
@@ -780,6 +782,7 @@ def _handle_sync_report(chat_id: str, display_id: str, incident_id: str,
         threading.Thread(
             target=_sync_report_worker,
             args=(chat_id, display_id, ctx, locale, account_id),
+            kwargs={"inflight_key": inflight_key},
             daemon=True,
         ).start()
         return _toast(i18n.t("case.pending.sync", locale,
@@ -790,6 +793,8 @@ def _handle_sync_report(chat_id: str, display_id: str, incident_id: str,
     body = _build_sync_body(ctx)
     ok = case_management.add_communication(display_id, body,
                                            account_id=account_id)
+    if not ok:
+        support_logic.release_inflight(inflight_key)
     return _build_card_response(
         i18n.t("case.toast.synced", locale) if ok
         else i18n.t("case.toast.sync_failed", locale),
@@ -799,12 +804,17 @@ def _handle_sync_report(chat_id: str, display_id: str, incident_id: str,
 
 
 def _sync_report_worker(chat_id: str, display_id: str, ctx: dict,
-                        locale: str = "zh", account_id: str = "") -> None:
+                        locale: str = "zh", account_id: str = "",
+                        inflight_key: str = "") -> None:
     locale = _normalize_locale(locale)
     try:
         body = _build_sync_body(ctx)
         ok = case_management.add_communication(display_id, body,
                                                account_id=account_id)
+        if not ok:
+            # AWS 明确拒了(或拿不到凭证 / 找不到工单)—— 没写进去,放开让用户能重试。
+            # 抛异常那条(下面的 except)不放:请求可能已经到了 AWS。
+            support_logic.release_inflight(inflight_key)
         new_card = _sync_result_card(display_id, ok, locale=locale,
                                      account_id=account_id)
         fallback = i18n.t("case.sync.success_title" if ok
@@ -910,7 +920,7 @@ def _sync_result_card(display_id: str, ok: bool, locale: str = "zh",
                 _callback_button(i18n.t("case.sync.btn.detail", locale),
                                  {"action": "case_view",
                                   "case_display_id": display_id,
-                                  "case_account_id": account_id}),
+                                  "case_account_id": account_id}, locale=locale),
             ]),
         ]},
     }
@@ -947,14 +957,17 @@ def _dispatch_investigation_for_case(chat_id: str, display_id: str,
     locale = _normalize_locale(locale)
     if not chat_id or not display_id:
         return _toast(i18n.t("case.toast.missing_chat_or_case", locale))
-    if not support_logic.claim_inflight(
-            card_message_id or f"dispatch_for_case:{display_id}"):
+    inflight_key = card_message_id or f"dispatch_for_case:{display_id}"
+    if not support_logic.claim_inflight(inflight_key):
         return _toast(i18n.t("case.toast.processing", locale))
 
     result = _dispatch_for_case(chat_id, display_id, subject, body,
                                 locale=locale, account_id=account_id)
     if result.get("ok"):
         return _toast(i18n.t("case.toast.dispatch_started", locale))
+    # 派发明确失败(DevOps Agent 回了 error):成功卡上那颗按钮还在,放开让用户能再点
+    # (待办 #4 ③)。`_dispatch_for_case` 自己抛异常的那种不走到这里。
+    support_logic.release_inflight(inflight_key)
     return _toast(i18n.t("case.toast.dispatch_failed", locale,
                          detail=result.get("body", "")[:60]))
 
@@ -1116,6 +1129,7 @@ def _handle_reply_submit(display_id: str, body: str,
             target=_reply_worker,
             args=(card_message_id, display_id, body, internal_id, locale,
                   account_id),
+            kwargs={"inflight_key": key},
             daemon=True,
         ).start()
         return _build_card_response(
@@ -1126,6 +1140,8 @@ def _handle_reply_submit(display_id: str, body: str,
     ok = case_management.add_communication(display_id, body,
                                            internal_id=internal_id or None,
                                            account_id=account_id)
+    if not ok:
+        support_logic.release_inflight(key)
     return _build_card_response(
         i18n.t("case.toast.sent", locale) if ok
         else i18n.t("case.toast.send_failed", locale),
@@ -1151,12 +1167,15 @@ def _send_reply(chat_id: str, display_id: str, body: str,
 
 def _reply_worker(card_message_id: str, display_id: str, body: str,
                   internal_id: str, locale: str = "zh",
-                  account_id: str = "") -> None:
+                  account_id: str = "", inflight_key: str = "") -> None:
     locale = _normalize_locale(locale)
     try:
         ok = case_management.add_communication(display_id, body,
                                                internal_id=internal_id or None,
                                                account_id=account_id)
+        if not ok:
+            # 明确没写进去 → 放开(待办 #4 ③);抛异常那条不放,理由同 `_sync_report_worker`。
+            support_logic.release_inflight(inflight_key)
         new_card = _reply_result_card(display_id, body, ok, locale=locale,
                                       account_id=account_id)
     except Exception as e:
@@ -1190,6 +1209,7 @@ def _handle_resolve(display_id: str,
             target=_resolve_worker,
             args=(card_message_id, display_id, internal_id, locale,
                   account_id),
+            kwargs={"inflight_key": key},
             daemon=True,
         ).start()
         return _build_card_response(
@@ -1200,6 +1220,8 @@ def _handle_resolve(display_id: str,
     final = case_management.resolve_case(display_id,
                                          internal_id=internal_id or None,
                                          account_id=account_id)
+    if not final:
+        support_logic.release_inflight(key)
     return _build_card_response(
         i18n.t("case.toast.closed", locale) if final
         else i18n.t("case.toast.close_failed", locale),
@@ -1209,16 +1231,21 @@ def _handle_resolve(display_id: str,
 
 def _resolve_worker(card_message_id: str, display_id: str,
                     internal_id: str, locale: str = "zh",
-                    account_id: str = "") -> None:
+                    account_id: str = "", inflight_key: str = "") -> None:
     locale = _normalize_locale(locale)
     try:
         final = case_management.resolve_case(display_id,
                                              internal_id=internal_id or None,
                                              account_id=account_id)
+        if not final:
+            # 关案失败 → 放开(待办 #4 ③)。关案是幂等的(对已关闭的工单再关一次无害),
+            # 所以下面抛异常那条也放。
+            support_logic.release_inflight(inflight_key)
         new_card = _resolve_result_card(display_id, final, locale=locale,
                                         account_id=account_id)
     except Exception as e:
         logger.exception("resolve worker crashed")
+        support_logic.release_inflight(inflight_key)
         new_card = _info_card(
             i18n.t("case.resolve.error_title", locale),
             i18n.t("case.create.internal_error", locale,
@@ -1397,7 +1424,7 @@ def _create_form_card(subject: str = "", locale: str = "zh",
     opts = account_options or []
     # 每一颗按钮都要带的账号章。用 `**_stamp` 展开而不是逐个手写，正是为了让
     # "漏一颗"这件事在 code review 里看得见。
-    _stamp = {"case_account_id": account_id}
+    _stamp = {"case_account_id": account_id, "locale": locale}
     account_elements: list[dict] = []
     if opts:
         account_elements = [
@@ -1672,7 +1699,7 @@ def _create_result_card(result: support_logic.CaseResult, severity: str,
                              result.case_url, primary=True),
             _callback_button(i18n.t("case.create.btn.my_cases", locale),
                              {"action": "case_list_open",
-                              "case_account_id": account_id}),
+                              "case_account_id": account_id}, locale=locale),
         ]))
         return {
             "schema": "2.0",
@@ -1760,9 +1787,9 @@ def _list_card(cases: list[CaseSummary], status_filter: str = "recent",
         # the API side, but it's noisy in the UI).
         actions = [
             _callback_button(i18n.t("case.list.btn.detail", locale),
-                             {"action": "case_view", **action_val}),
+                             {"action": "case_view", **action_val}, locale=locale),
             _callback_button(i18n.t("case.list.btn.reply", locale),
-                             {"action": "case_reply_form", **action_val}),
+                             {"action": "case_reply_form", **action_val}, locale=locale),
             _open_url_button(i18n.t("case.list.btn.open_case", locale),
                              c.case_url),
         ]
@@ -1770,8 +1797,7 @@ def _list_card(cases: list[CaseSummary], status_filter: str = "recent",
             actions.append(_callback_button(
                 i18n.t("case.list.btn.close", locale),
                 {"action": "case_resolve_confirm", **action_val},
-                danger=True,
-            ))
+                danger=True, locale=locale))
         elements.append(_action_row(actions))
     # Footer: quick filter shortcuts + link to the full Support console
     # list so users can dig into older / filtered cases beyond the 5-row
@@ -1847,7 +1873,7 @@ def _view_card(c: CaseSummary, comms: list[Communication],
     actions = [
         _callback_button(i18n.t("case.view.btn.add_reply", locale),
                          {"action": "case_reply_form", **action_val},
-                         primary=True),
+                         primary=True, locale=locale),
         _open_url_button(i18n.t("case.view.btn.open_console", locale),
                          c.case_url),
     ]
@@ -1855,8 +1881,7 @@ def _view_card(c: CaseSummary, comms: list[Communication],
         actions.append(_callback_button(
             i18n.t("case.view.btn.close", locale),
             {"action": "case_resolve_confirm", **action_val},
-            danger=True,
-        ))
+            danger=True, locale=locale))
     elements.append(_action_row(actions))
     return {
         "schema": "2.0",
@@ -1878,7 +1903,8 @@ def _reply_form_card(display_id: str, internal_id: str = "",
     submit_value = {"action": "case_reply_submit",
                     "case_display_id": display_id,
                     "case_internal_id": internal_id,
-                    "case_account_id": account_id}
+                    "case_account_id": account_id,
+                    "locale": locale}
     return {
         "schema": "2.0",
         "config": card_config(streaming_mode=False),
@@ -1965,7 +1991,7 @@ def _reply_result_card(display_id: str, body: str, ok: bool,
                 _callback_button(i18n.t("case.reply.btn.detail", locale),
                                  {"action": "case_view",
                                   "case_display_id": display_id,
-                                  "case_account_id": account_id}),
+                                  "case_account_id": account_id}, locale=locale),
             ]),
         ]},
     }
@@ -1992,9 +2018,9 @@ def _resolve_confirm_card(display_id: str, internal_id: str = "",
             _action_row([
                 _callback_button(i18n.t("case.resolve.btn.confirm", locale),
                                  {"action": "case_resolve_yes", **action_val},
-                                 danger=True),
+                                 danger=True, locale=locale),
                 _callback_button(i18n.t("case.resolve.btn.cancel", locale),
-                                 {"action": "case_resolve_no", **action_val}),
+                                 {"action": "case_resolve_no", **action_val}, locale=locale),
             ]),
         ]},
     }
@@ -2131,7 +2157,7 @@ def _analyze_card(result: case_analyze.AnalyzeResult,
     actions = [
         _callback_button(i18n.t("case.analyze.btn.reply", locale),
                          {"action": "case_reply_form", **action_val},
-                         primary=True),
+                         primary=True, locale=locale),
         _open_url_button(i18n.t("case.analyze.btn.view_full", locale),
                          c.case_url),
     ]
@@ -2173,7 +2199,12 @@ def _action_row(buttons: list[dict]) -> dict:
 
 
 def _callback_button(label: str, value: dict,
-                     primary: bool = False, danger: bool = False) -> dict:
+                     primary: bool = False, danger: bool = False, *, locale: str = "") -> dict:
+    """回调按钮。`locale` 会盖进按钮的 value（待办 #38 ③）：点按钮时 `main.on_card_action` 先认这个章 ——
+    以前按钮上只有 `action` 和账号章，那边按 `event_id` 查会话语言又总是查不到，于是英文用户点完
+    按钮，换出来的卡片 / 提示一律是中文。"""
+    if locale and isinstance(value, dict) and "locale" not in value:
+        value = {**value, "locale": locale}
     btn_type = "default"
     if danger:
         btn_type = "danger"

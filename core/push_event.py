@@ -272,9 +272,14 @@ def from_guardduty(event: dict, min_severity: float = 7.0) -> PushEvent | None:
         region=region,
         account=account,
         description=body,
-        dedupe_key=_hash_key("gd", account, region, finding_type,
-                             resource.get("instanceDetails", {}).get("instanceId", "")
-                             or resource.get("accessKeyDetails", {}).get("userName", "")),
+        # 键以 finding id 为准(待办 #4 ②):同一条发现的重投 / 更新 id 不变,该合并;
+        # 不同的发现 id 不同,不该合并。以前只用「类型 + 实例 / 用户名」,S3 / EKS / RDS /
+        # Lambda 这类没有实例和用户名的发现,同类型的不同发现会在窗口里被压成一条。
+        # 没有 id 的(手工构造的测试事件)才退回旧键。
+        dedupe_key=(_hash_key("gd", account, region, finding_id) if finding_id
+                    else _hash_key("gd", account, region, finding_type,
+                                   resource.get("instanceDetails", {}).get("instanceId", "")
+                                   or resource.get("accessKeyDetails", {}).get("userName", ""))),
         dispatch_query=(
             f"GuardDuty reported {finding_type} (severity {severity_score}). "
             f"{description_field[:200]}. Assess the actual risk level "

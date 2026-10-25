@@ -516,11 +516,8 @@ export async function getDeepDive(scenario) {
       }
     } catch { /* 缓存读失败 → 照常跑 */ }
     // 2) 未命中 → 跑 Named Query + AI
-    const listed = await athena.send(new ListNamedQueriesCommand({ WorkGroup: "primary", MaxResults: 50 }));
-    const ids = listed.NamedQueryIds || [];
-    if (ids.length === 0) return { available: false, reason: "no_named_queries" };
-    const batch = await athena.send(new BatchGetNamedQueryCommand({ NamedQueryIds: ids }));
-    const nq = (batch.NamedQueries || []).find((q) => q.Name === nqName);
+    const { nq, any } = await findNamedQuery(nqName);
+    if (!any) return { available: false, reason: "no_named_queries" };
     if (!nq) return { available: false, reason: "named_query_not_found", message: nqName };
     const { rows, queryExecutionId } = await _runQueryFull(nq.QueryString, nq.Database);
     const ai = await _deepDiveInsight(scenario, rows, period);
@@ -535,6 +532,30 @@ export async function getDeepDive(scenario) {
   } catch (e) {
     return { available: false, reason: "error", message: _clientErr(e, "deep-dive") };
   }
+}
+
+/**
+ * 按名字找 primary 工作组里的保存查询（Deep Dive 那几个场景的 SQL 由 Python 端建好存在这里）。
+ * ListNamedQueries 一页最多 50 条、BatchGetNamedQuery 一次最多 50 个 id —— 原来只看第一页，工作组里
+ * 保存查询超过 50 个时就可能报 named_query_not_found（待办 #38 ⑦；建这些查询的 Python 端是翻页的）。
+ * 最多翻 20 页（1000 个）。`any` = 工作组里有没有任何保存查询（区分「一个都没有」和「有，但没这个」）。
+ */
+export async function findNamedQuery(name) {
+  let token;
+  let pages = 0;
+  let any = false;
+  do {
+    const listed = await athena.send(new ListNamedQueriesCommand({ WorkGroup: "primary", MaxResults: 50, NextToken: token }));
+    const ids = listed.NamedQueryIds || [];
+    if (ids.length) {
+      any = true;
+      const batch = await athena.send(new BatchGetNamedQueryCommand({ NamedQueryIds: ids }));
+      const hit = (batch.NamedQueries || []).find((q) => q.Name === name);
+      if (hit) return { nq: hit, any };
+    }
+    token = listed.NextToken;
+  } while (token && ++pages < 20);
+  return { nq: null, any };
 }
 
 /* ───────────────── 成本分配标签浏览器（封装层）─────────────────

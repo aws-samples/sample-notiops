@@ -2,7 +2,7 @@
 
 > 🌐 **Language**: [中文](TECHNICAL_DESIGN.md) · [English](TECHNICAL_DESIGN.en.md)
 >
-> **One-liner**: a **read-only Web Chat ops console** as the primary surface — talk to the AWS ops agent (Strands / Bedrock **AgentCore Runtime**) right in the browser to run investigations / FinOps / cases / Skills, read-only on the customer's infrastructure and never mutating the environment (the only write: AWS Support cases the user confirms); as a necessary supplement, it also brings **AWS DevOps Agent** (the agentic investigation service exposed by the `aidevops` API) into enterprise IM (Feishu / Slack / DingTalk), so users can `@bot 一句话` in alert channels to launch investigations, watch real-time progress, and receive localized reports — **without ever logging into the AWS console**.
+> **One-liner**: a **read-only, traceable agentic AI assistant for your cloud**, with **Web Chat** as the primary surface — talk to the AWS ops agent (Strands / Bedrock **AgentCore Runtime**) right in the browser to run investigations / FinOps / cases / Skills, read-only on the customer's infrastructure and never mutating the environment (the only write: AWS Support cases the user confirms); as a necessary supplement, it also brings **AWS DevOps Agent** (the agentic investigation service exposed by the `aidevops` API) into enterprise IM (Feishu / Slack / DingTalk), so users can `@bot 一句话` in alert channels to launch investigations, watch real-time progress, and receive localized reports — **without ever logging into the AWS console**.
 
 **Version**: v1.3 · 2026-06-10
 
@@ -257,7 +257,7 @@ Side path: EventBridge sources → notiops-web-notif-handler (Lambda)
 | **Frontend** | React / Vite (static hosting) | theme nav, chat UI, right dock, model / account / web-search toggles; `config.json` injects `chatApiBase` + cognito + `identityPoolId` |
 | **BFF** | Node.js 24 Lambda + Function URL (`notiops-web-chat-bff`) | Function URL response-streams SSE; forwards chat to AgentCore Runtime; exposes deterministic endpoints (case execution `/actions/execute`, service catalog `/support/services`, inbox reads) |
 | **Agent** | Bedrock AgentCore Runtime (Strands agent) | single agent + tools + per-theme focus layer; `investigate_live` streaming investigation; `create_case_from_template` deterministic case creation; strictly read-only |
-| **Notification handler** | Lambda (`notiops-web-notif-handler`) | consumes EventBridge sources, reuses the `core/push_event` normalizer + 5-min dedup, writes the DDB `notif#` segment (persistent inbox) |
+| **Notification handler** | Lambda (`notiops-web-notif-handler`) | consumes EventBridge sources, reuses the `core/push_event` normalizer + dedup (same event 5 min, Trusted Advisor 24 h; redeliveries of one event 24 h), writes the DDB `notif#` segment (persistent inbox) |
 | **Storage / infra** | CDK `WebChatStack` | DynamoDB single table `notiops-web-chat`; BFF Lambda + Function URL (`AWS_IAM`) |
 
 #### 2.4.3 Auth chain (Cognito + SigV4)
@@ -427,7 +427,8 @@ AWS event sources (EventBridge)
         ▼ EventBridge rule
 notiops-web-notif-handler (Lambda)
         │ reuses the core/push_event normalizer
-        │ 5-minute dedup
+        │ dedup: same event 5 min (Trusted Advisor 24 h)
+        │        redeliveries of one event 24 h
         ▼
 DynamoDB single table notiops-web-chat · notif# segment
   · 90-day TTL
@@ -1837,7 +1838,7 @@ notiops/
 │                                      #   points at app/NotiOpsWebChat/, and scripts/deploy_agent.sh
 │                                      #   only ever cd's here to run `agentcore deploy`
 ├── bff/web-chat/                      # ★ Web Chat BFF (Node.js; Lambda Function URL, AWS_IAM + SSE)
-│   └── preset-skills/                 # ★ 11 bundled preset skills (author = notiops-system)
+│   └── preset-skills/                 # ★ 12 bundled preset skills (author = notiops-system)
 ├── frontend/chat-app/                 # ★ Web Chat frontend (React 19 + Vite, hand-written components)
 ├── config/                            # single source of truth for config (capabilities / LLM model catalog seed / EOL fallback table)
 ├── platforms/

@@ -158,6 +158,34 @@ Parameters:
       already onboarded through one-click (StackSets), which creates the
       forwarding rule from the other template.
 
+  OperatorAppAlreadyEnabled:
+    Type: String
+    Default: "no"
+    AllowedValues: ["yes", "no"]
+    # 中文：本账号排障 space 的 Operator App（Web App）是不是**在本栈之外**已经开好了。
+    #
+    # 🔴 只给 2026-08 之前接入的存量实例用（2026-10-23 现网实测）：那一代模板的
+    #    AgentSpace 不带 `OperatorApp`，web app 是后来在成员账号控制台手点开的。
+    #    更新到本模板时 CFN 会对那个 space 再 Enable 一次，服务端报
+    #    `Operator App with IAM configuration … is already enabled. Disable it first`，
+    #    整个实例回滚 —— 巡检 space 也就永远建不出来（da# 行缺
+    #    `inspect_agent_space_id`，对账每小时报一次错）。
+    #    部署账号那边同一个坑由 CDK 的 `operatorAppAlreadyEnabled` context 处理。
+    #
+    # ⚠️ 用法是**按实例覆盖**，别改 StackSet 级的值（新接入的账号要靠 CFN 开 web app）：
+    #      aws cloudformation update-stack-instances --stack-set-name notiops-member-devops-agent \
+    #        --accounts <成员账号> --regions <区> \
+    #        --parameter-overrides ParameterKey=OperatorAppAlreadyEnabled,ParameterValue=yes
+    #    覆盖值记在实例上，之后 setup.sh 重跑 update-stack-set 也不会丢。
+    # ⚠️ 选 yes 只是不再由本栈管理排障 space 的 web app（也不会去 Disable 它）；
+    #    巡检 space 照常由本栈开 web app。
+    Description: >
+      Set to "yes" only for a stack instance created by an older template whose
+      troubleshooting agent space already had its Operator App (web app) enabled
+      outside this stack. CloudFormation then leaves that web app as it is instead
+      of enabling it again, which the service rejects as "already enabled".
+      Keep "no" for new accounts.
+
 Conditions:
   HasOrgId: !Not [!Equals [!Ref OrganizationId, ""]]
   EnableCollectionRole: !Equals [!Ref CreateCollectionRole, "yes"]
@@ -166,6 +194,7 @@ Conditions:
   HasSupportCaseWrite: !Equals [!Ref EnableSupportCaseWrite, "true"]
   EnableInspectionMonitor: !Not [!Equals [!Ref InspectionAgentSpaceArn, ""]]
   EnableEventForwarding: !Not [!Equals [!Ref DevOpsEventBusArn, ""]]
+  ManageOperatorApp: !Equals [!Ref OperatorAppAlreadyEnabled, "no"]
 
 Resources:
   AgentSpace:
@@ -196,9 +225,13 @@ Resources:
       # ⚠️ 用 `Iam` 而不是 `Idc`：`IdcAuthConfiguration` 必填 `IdcInstanceArn`，
       #    而成员账号大多没有 Identity Center 实例。IAM 模式下客户用自己的
       #    AWS 凭证/控制台会话登录那个 web app。
-      OperatorApp:
-        Iam:
-          OperatorAppRoleArn: !GetAtt OperatorAppRole.Arn
+      # ⚠️ 存量实例的 web app 若在栈外开过，按实例把 OperatorAppAlreadyEnabled 覆盖成 yes
+      #    （见参数说明），这里就不再碰它。
+      OperatorApp: !If
+        - ManageOperatorApp
+        - Iam:
+            OperatorAppRoleArn: !GetAtt OperatorAppRole.Arn
+        - !Ref "AWS::NoValue"
 
   # ─── 巡检判读专用的第二个 space（per-account agent space 设计，改动①）───
   #

@@ -11,7 +11,7 @@
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { makeSink, consumeEvents, parseAsk, renderUserPrompt, createChatFailText } from "../devops_chat.mjs";
+import { makeSink, consumeEvents, parseAsk, renderUserPrompt, createChatFailText, stepTailLine } from "../devops_chat.mjs";
 
 let fails = 0;
 let ok = 0;
@@ -528,6 +528,62 @@ await t("长说明给状态词让位：状态词总在行尾、说明留省略�
   const line = tailOf(r);
   assert.ok(line.endsWith(" · Failed"), line);
   assert.ok(line.includes("…"), "截断要留省略号");
+});
+
+/* ── #32 ①：「↳ 11694」这类纯数字过程行（2026-10-19 讲解 deck 现网实测）──
+ * DevOps Agent 后来在「思考中…」块之后另发一个只装着上一段思考毫秒数的块。单独一个数字对用户没有意义。 */
+console.log("\ndevops_chat: 纯数字过程行与镜像进度（#32 ① ②）");
+
+const thinkingThenMs = [
+  { responseCreated: {} },
+  { contentBlockStart: { index: 0, type: "thinking" } },
+  textDelta(0, "Let me check the alarms first."),
+  { contentBlockStop: { index: 0, type: "thinking", text: "" } },
+  { contentBlockStart: { index: 1, type: "thinking" } },
+  textDelta(1, "11694"),
+  { contentBlockStop: { index: 1, type: "thinking", text: "" } },
+  { contentBlockStart: { index: 2, type: "text" } },
+  textDelta(2, "All clear."),
+  { contentBlockStop: { index: 2, type: "text", text: "" } },
+  { responseCompleted: { usage: {} } },
+];
+
+await t("① 只装着一个数字的过程块不出「↳ 11694」，真正的思考行照出", async () => {
+  const r = recorder();
+  await consumeEvents(stream(thinkingThenMs), r.sink, { en: true });
+  const tails = r.steps().filter((s) => s.trimStart().startsWith("↳"));
+  assert.deepEqual(tails, ["  ↳ Let me check the alarms first."]);
+  assert.equal(r.tokens().join(""), "All clear.");
+});
+
+await t("① 判据：裸数字（可带 ms / s）才丢；数字开头的说明、带状态词的照旧", async () => {
+  for (const n of ["11694", "4119", " 3725 ", "12.5", "11694ms", "12 s"]) assert.equal(stepTailLine([n]), "", n);
+  assert.equal(stepTailLine(["3 alarms in ALARM state"]), "  ↳ 3 alarms in ALARM state");
+  assert.equal(stepTailLine(["Check EC2", "Done"]), "  ↳ Check EC2 · Done");
+  assert.equal(stepTailLine(["404", "Failed"]), "  ↳ 404 · Failed", "有状态词时那个数就是说明本身");
+});
+
+await t("② 阶段名只作为过程行进面板一次；同一句的进度行带 kind=mirror（前端不再记进时间线）", async () => {
+  const r = recorder();
+  await consumeEvents(stream(thinkingThenMs), r.sink, { en: true });
+  const stepLabels = r.steps().filter((s) => !s.trimStart().startsWith("↳"));
+  const progress = r.events.filter((e) => e.event === "progress");
+  assert.ok(stepLabels.length >= 1, JSON.stringify(r.steps()));
+  for (const label of stepLabels) {
+    const mirrored = progress.filter((p) => p.data.text === label);
+    assert.ok(mirrored.every((p) => p.data.kind === "mirror"), `「${label}」的镜像进度行没有带 kind=mirror`);
+  }
+  // 「DevOps Agent 正在思考…」不是任何过程行的镜像：不带 mirror，照旧进时间线
+  assert.ok(progress.some((p) => p.data.text === "DevOps Agent is thinking…" && p.data.kind === undefined));
+});
+
+await t("② summary 事件：过程行 400 字、等待行 120 字截断那一条是镜像，不在面板里再出一行", async () => {
+  const r = recorder();
+  const long = "Investigating the orders-api latency regression across CloudWatch, logs and recent deployments. ".repeat(4);
+  await consumeEvents(stream([{ summary: { content: long } }, { responseCompleted: {} }]), r.sink, { en: true });
+  const mirrors = r.events.filter((e) => e.event === "progress" && e.data.kind === "mirror");
+  assert.equal(mirrors.length, 1);
+  assert.equal(r.steps().length, 1);
 });
 
 console.log(fails ? `\nFAILED: ${fails}` : `\nPASSED: ${ok} ok, 0 failed`);

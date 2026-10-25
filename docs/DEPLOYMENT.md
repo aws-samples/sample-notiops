@@ -287,7 +287,7 @@ CDK 部署三个栈(选了 IM 平台时是四个,多一个 `ImStack`),`./setup.s
 | **Bedrock** | 同部署 region | 没有单独的 Bedrock region 参数:模型调用从部署 region 发起(GPT-5.6 Terra / Luna 例外,固定走 `us-east-2`)。默认模型 Kimi K3 用的是 `global.` 跨区推理配置文件,模型访问的要求见 §2.2 |
 | **DDB / S3** | 同部署 region | CFN 自动落到 stack 所在 region |
 
-**最简单的部署**:`setup.sh` 的 region 菜单默认选 `1) ap-northeast-1`(东京),直接回车即用该 region,它在上面那份 DevOps Agent 清单里。选「自定义输入」之前先对一下这份清单。
+**最简单的部署**:`setup.sh` 的 region 菜单默认选 `1) us-east-1`(弗吉尼亚),直接回车即用该 region,它在上面那份 DevOps Agent 清单里,联网搜索也只有这个 region 可用。以前装在东京(`ap-northeast-1`)的部署,重跑升级时要选 `2)` —— 直接回车而 us-east-1 里还没有部署时,setup.sh 会先问一句再继续。选「自定义输入」之前先对一下这份清单。
 
 ### 2.4 IAM 部署权限
 
@@ -520,7 +520,7 @@ CDK 部署不需要 `bootstrap.env` —— `./setup.sh` 第一次跑会**交互�
 |---|---|---|
 | **AWS Profile** | 部署用 Profile | 从本地 `~/.aws` 的 profile 列表里选,或保持当前 |
 | **AWS** | Account ID | `aws sts get-caller-identity` 自动检测,确认即可 |
-| | Region | 6 个选项(`ap-northeast-1`【默认】/ `us-east-1` / `us-west-2` / `eu-west-1` / `ap-southeast-1` / 自定义输入)。所有栈都部到这一个 region,它必须支持 AWS DevOps Agent(见 §2.3) |
+| | Region | 6 个选项(`us-east-1`【默认】/ `ap-northeast-1` / `us-west-2` / `eu-west-1` / `ap-southeast-1` / 自定义输入)。所有栈都部到这一个 region,它必须支持 AWS DevOps Agent(见 §2.3) |
 | **Push (PHD)** | 是否部署 PHD 事件转发 | 默认 `Y` 部署;`--phd` 标志走 linked account 侧转发 |
 | **Multi-account** | 业务账号允许清单 | `--multi-account` 标志单独走;默认单账号 |
 | **IM 平台**(可选) | 选项 | `1` 飞书 / `2` Slack / `3` 钉钉(可多选,如 `1,3`)/ `0` 暂不部署(**仅首装**默认,只上 web 端)。**重跑**时默认 = 原样保留现网已启用的平台(`keep`);读不到现网状态又没有 TTY 时**直接报错退出**,不会按默认值继续。**只设 `enabledPlatforms` 开关,不问凭据** |
@@ -623,7 +623,7 @@ IM 侧的 `enabledPlatforms` / `imAllowedChatIds` 见 §11.1 的 `ImStack` conte
 1. 依赖检查:`node` ≥ 22 / `npm` / `npx cdk` / `aws` / `jq` / `python3` / `uv`(**缺 uv 直接退出** —— 否则 agent 部署失败会让 Web Chat 静默退化成回显;`SKIP_AGENT=true` 时不检查)。**已经完全不需要容器构建工具** —— 2026-09-03(IM 重构 M2)起 `finch` / `docker` 都不再是前置条件,见 §2.1
 2. 让你从本地 `~/.aws` profile 列表选部署 Profile(或保持当前)
 3. 调 `aws sts get-caller-identity` 检测账号,要你确认
-4. 让你从 6 个选项里选 deploy region(默认 `ap-northeast-1`;含"自定义输入")
+4. 让你从 6 个选项里选 deploy region(默认 `us-east-1`;含"自定义输入")
 5. (可选)问是否部署 PHD 事件转发功能(默认 `Y`)
 6. 让你选要部署哪些 IM 平台(`1` 飞书 / `2` Slack / `3` 钉钉,可多选如 `1,3`;`0` 暂不部署 —— **仅首装**时是默认值)。**重跑**时默认 = 原样保留现网已启用的平台,回车不会让正在跑的 bot 停更在旧代码上。**只设 `enabledPlatforms` 开关,不采集凭据**
 7. **`[1/4]` 构建前端** —— 只构建 Web Chat 前端(`frontend/chat-app`)。老 admin 控制台(`frontend/frontend-app`)连同它背后的老 REST API 已于 2026-09-04 随本版退役,目录在仓库里已不存在,`setup.sh` 不再构建它。这一步还会把 `config/capabilities.json` / `config/eol-dates.json` 复制进 `bff/web-chat/`(能力清单单一真源在 `config/`,而 Lambda 只打包 `bff/web-chat/`)并装 BFF 依赖(`npm ci --omit=dev`)
@@ -687,7 +687,7 @@ npx cdk diff --all
 
 #### 5.3.3 Web 应用(Operator App)已自动开好 — 不需要手点
 
-控制台上那一步「Agent Space → Access → Operator access → **Configure web app**」(API 是 `aidevops:EnableOperatorApp`)**由 CDK 在建 space 的同时完成**,你不需要去点。为此栈里多了一个角色 `notiops-agent-webapp-<account_id>`(信任 `aidevops.amazonaws.com`、挂 AWS 托管策略 `AIDevOpsOperatorAppAccessPolicy`),删栈时随 space 一起关闭并删除。多账号模式下,成员账号那份 StackSet(`infra/member-devops-agent.yaml`)同样自动开 —— 否则接 N 个账号就要登进 N 个成员账号的控制台各点一次。
+控制台上那一步「Agent Space → Access → Operator access → **Configure web app**」(API 是 `aidevops:EnableOperatorApp`)**由 CDK 在建 space 的同时完成**,你不需要去点。为此栈里多了一个角色 `notiops-agent-webapp-<account_id>`(信任 `aidevops.amazonaws.com`、挂 AWS 托管策略 `AIDevOpsOperatorAppAccessPolicy`),删栈时随 space 一起关闭并删除。多账号模式下,成员账号那份 StackSet(`infra/member-devops-agent.yaml`)同样自动开 —— 否则接 N 个账号就要登进 N 个成员账号的控制台各点一次。⚠️ 2026-08 之前接入、当时在成员账号控制台里手动开过 web app 的存量实例:更新到新模板时服务端会报 `Operator App … is already enabled`、实例回滚(巡检 space 也就建不出来,管理页那一行显示「待更新栈」)。对这类实例按实例覆盖参数 `OperatorAppAlreadyEnabled=yes` 再更新:`aws cloudformation update-stack-instances --stack-set-name notiops-member-devops-agent --accounts <成员账号> --regions <区> --parameter-overrides ParameterKey=OperatorAppAlreadyEnabled,ParameterValue=yes`;覆盖值记在实例上,之后重跑 `./setup.sh --multi-account` 也不会丢。别改 StackSet 级的值 —— 新接入的账号要靠模板开 web app。
 
 **没开过它的症状**:发起调查 / 连接调查 / DevOps 对话 / 发布 Skill 一律报 `Invalid or unregistered domain`(错误信息完全不指向"少点了一个按钮")。现在还能撞上这个报错的只有两种 space:**本版本之前建的老 space**,和你**自己手工建的 space** —— 这两种进控制台点一次 Configure web app 即可。
 
@@ -1039,7 +1039,7 @@ aws dynamodb delete-item --table-name <conv-table> \
 > 要**删掉整个环境**(而不是回滚单个栈),别逐个 `cdk destroy` —— 用仓库根目录的
 > `./teardown.sh`:它按依赖倒序删栈,并收掉 CDK 之外的尾巴(一次性 EventBridge schedule、
 > WebSearch Gateway、secret 的 30 天恢复期)。先 `./teardown.sh --dry-run` 看清单;默认保留
-> 四张 RETAIN 表,`--delete-everything` 连这四张表和残留日志组一起删;数据桶两种模式下都会随主栈删掉,所以它默认先把数据桶备份到本地(`--no-backup` 跳过)。CUR 相关的(报告定义
+> 四张 RETAIN 表,`--delete-everything` 连这四张表和残留日志组一起删;数据桶两种模式下都会随主栈删掉,所以它默认先把数据桶备份到本地(默认 `~/notiops-teardown-backup-<时间戳>/`,在仓库目录之外,`--backup-dir` 可改;`--no-backup` 跳过)。CUR 相关的(报告定义
 > `notiops-cur-report`、交付桶、Athena 集成栈、保存查询)**两种模式下都保留** —— 那是账单历史,
 > AWS 不补发;重装时 `setup.sh` 认出留下的 `notiops-cur-report`、不问也不重建,几分钟内接上
 > 原来的 Athena 表(见 §13.2)。
@@ -1164,7 +1164,7 @@ setup.sh 的 cdk deploy --all    # 2) 与它管的其余 -c 同一条命令,建 
 
 ### 12.5 通知事件源(持久化收件箱)
 
-Web Chat「通知」主题的**持久化收件箱**由 EventBridge → `notiops-web-notif-handler`(复用 `core/push_event` 归一化,5 分钟去重)→ 写 `notiops-web-chat` 表 `notif#` 段。事件源开关:
+Web Chat「通知」主题的**持久化收件箱**由 EventBridge → `notiops-web-notif-handler`(复用 `core/push_event` 归一化,去重:同一事件 5 分钟内只记一次,Trusted Advisor 24 小时)→ 写 `notiops-web-chat` 表 `notif#` 段。事件源开关:
 
 > 📌 **这一整套两条部署路径都有,清单同源。** 事件源定义(10 类、默认开关、规则名、规则描述、Lambda 环境变量)在
 > [`infra/lib/constructs/web-notif-sources.ts`](../infra/lib/constructs/web-notif-sources.ts),`setup.sh` 的

@@ -22,8 +22,12 @@ import { safeErr } from "./safe_err.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const AGENT_SPACE_ID = process.env.DEVOPS_AGENT_SPACE_ID || "";
-// BFF 部署账号 ID（约定角色名的后缀）。web-chat-stack.ts 注入 LOCKED_ACCOUNT_ID=部署账号。
-const SELF_ACCOUNT_ID = process.env.LOCKED_ACCOUNT_ID || "";
+// BFF 部署账号 ID（约定角色名的后缀）。先读 DEPLOY_ACCOUNT_ID（web-chat-core.ts 恒注入 = stack.account），
+// 再退 LOCKED_ACCOUNT_ID。⚠️ 只读 LOCKED_ACCOUNT_ID 是错的（待办 #38 ⑥）：org 模式下它被**故意置空**
+// （= 不锁单账号），于是下面 findPayerAccount 的 organizations 主路径整段被跳过 —— 部署在成员账号里的
+// org 模式部署拿不到 payer 的成本角色，成本看板只剩本账号视角。别的模块早就改读 DEPLOY_ACCOUNT_ID 了
+// （member_accounts.mjs 的 SELF_ACCOUNT、devops_agent_skills.mjs）。
+const SELF_ACCOUNT_ID = (process.env.DEPLOY_ACCOUNT_ID || process.env.LOCKED_ACCOUNT_ID || "").trim();
 // payer 侧可被 BFF 假设的成本只读角色名前缀。DevOps Agent onboarding 在 payer 里按
 // 部署账号命名（DevOpsAgentRole-AgentSpace-notiOps-<部署账号>），该角色挂
 // AIDevOpsAgentAccessPolicy（含 ce:*/budgets:*/cur:* 只读）。可用 env 覆盖以适配改名。

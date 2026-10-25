@@ -1,4 +1,6 @@
-"""输出崩坏守卫（影子模式）：模型一次调用中途崩成乱码时，在日志里记一行「本来会在第几个字停下」。
+"""输出崩坏守卫：模型一次调用中途崩成乱码时，停掉这次调用、丢掉它的输出、自动重试一次。
+
+2026-10-14 → 10-23 是影子模式（只打日志）；10-23 起强制拦截（待办 #2）。
 
 ## 现象（2026-10，默认模型 Kimi K3）
 
@@ -33,20 +35,34 @@
 （São Paulo、法语 / 越南语）、希腊字母（Δ、λ、μ）一律当正常字母；日文假名、韩文、西里尔……
 只在提问里出现过时才算正常。
 
-## 影子模式：只记日志，不改任何行为
+## 判定之后（强制拦截，`enforce=True`，部署版 agent 的默认）
 
-触发时打**一行**结构化日志（每次模型调用最多一行），不停流、不改事件、不多花 token：
+  1. **停**：`install_stream_stop` 包在模型实例的 `stream` 外面，是一个检查点：判定之后，下一个 chunk
+     交出去之前就抛 `OutputCollapsed`，同时把传给模型的取消信号置位 —— Bedrock 的读流线程在下一个
+     chunk 边界关掉 HTTP 流。只关我们这边的 async generator 停不下它：那个线程会在后台把几万 token 的
+     乱码读完、照样计费。
+  2. **不进历史**：异常发生在 Strands 把这条 assistant 消息写进 `agent.messages` 之前，所以它既不进
+     会话历史，也不进 AgentCore Memory（Strands 的模型重试本来就丢弃那次的消息）。
+  3. **让下游丢掉已经显示的部分**：main.py 在每次模型调用开头发 `{"call_start": n}`，判定时发
+     `{"discard": {"call": n, "retry": …, "signal": …}}`。BFF、浏览器、IM 各自退回到那个标记处
+     —— 各自在自己的字符串上记偏移，不跨语言数字符。
+  4. **重试一次**：`CollapseRetry`（挂 `AfterModelCallEvent`，Strands 公开的 hook）把 `retry` 置真，
+     Strands 用同样的上下文再调一次模型（本轮的工具结果都还在）。一轮最多 `max_retries` 次。
+  5. **还崩**：异常照常冒出去，main.py 回一段「换一个模型」的说明（与其它模型失败同一口径）；
+     这种情况下不会出现「回复"继续"」—— 那句只跟着撞输出上限走，而崩坏的调用撞不到上限。
 
-    degeneration guard (shadow, no action taken): signal=glue model=global.moonshotai.kimi-k3 call=2 phase=reasoning at=143 …
+每次判定打**一行**结构化日志（每次模型调用最多一行）：
 
-字段：`signal`（glue / repeat）、`call`（本轮第几次模型调用）、`phase`（触发时在思考还是正文）、
-`at`（本次调用的第几个字，思考 + 正文按到达顺序）、`reasoning_chars` / `text_chars`、`elapsed_s`、
-窗口里的各类标记数（`glue` 得分、`han_latin` / `han_han` / `double` / `foreign`、`foreign_scripts`）、
-最近一次算出的压缩率 `zlib`。**不记任何正文**（docs/LOGGING_STANDARD.md）—— trace / span id 由
-runtime 的 OTEL 日志处理器自动带上，要看原文按 trace 去查。
-攒够现网基线之后，才考虑真的停流（停流、这次输出不进历史、告诉用户、可重试一次）—— 那是另一个改动。
+    degeneration guard (enforced, model call stopped): signal=glue action=retry model=global.moonshotai.kimi-k3 call=2 phase=reasoning at=143 …
 
-守卫自己出错时**本轮关掉自己**（打一行只带异常类型的 warning），不影响回答。
+`action` = retry / give_up；`enforce=False`（影子模式，手写权威副本 `agent/main.py` 用它）时前缀是
+`degeneration guard (shadow, no action taken):`、没有 `action`，也不改任何行为。其余字段：`signal`
+（glue / repeat）、`call`（本轮第几次模型调用）、`phase`（触发时在思考还是正文）、`at`（本次调用的第几个字，
+思考 + 正文按到达顺序）、`reasoning_chars` / `text_chars`、`elapsed_s`、窗口里的各类标记数（`glue` 得分、
+`han_latin` / `han_han` / `double` / `foreign`、`foreign_scripts`）、最近一次算出的压缩率 `zlib`。
+**不记任何正文**（docs/LOGGING_STANDARD.md）—— trace / span id 由 runtime 的 OTEL 日志处理器自动带上。
+
+守卫自己出错时**本轮关掉自己**（打一行只带异常类型的 warning），回答照常 —— 那一轮就等于没有守卫。
 
 ## 已知的误报风险（影子期要看的）
 
@@ -64,13 +80,15 @@ runtime 的 OTEL 日志处理器自动带上，要看原文按 trace 去查。
 ## 零依赖
 
 同 paragraphs.py / repeat_calls.py：不 import strands，事件按 Strands 的原始形状读
-（`{"event": {"messageStart" | "contentBlockDelta": …}}`）。tests/test_agent_degeneration.py 按文件路径
-直接加载本模块。`agent/degeneration.py` 是逐字节相同的副本，同一个测试钉着两份一致。
+（`{"event": {"messageStart" | "contentBlockDelta": …}}`）；要挂的 hook 事件类由 main.py 传进来
+（`CollapseRetry(AfterModelCallEvent)`）。tests/test_agent_degeneration.py 按文件路径直接加载本模块。
+`agent/degeneration.py` 是逐字节相同的副本，同一个测试钉着两份一致。
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import unicodedata
 import zlib
@@ -460,37 +478,111 @@ class CollapseDetector:
         self._prev, self._prev_script = kind, script
 
 
+class OutputCollapsed(Exception):
+    """模型这一次调用的输出崩成了乱码 —— 守卫判定之后，由模型流的检查点（`install_stream_stop`）抛出。
+
+    Strands 在模型调用的重试循环里接住它（`AfterModelCallEvent.exception`）：`retry` 为真时
+    `CollapseRetry` 让它再调一次模型；为假时它照常冒出去，由 main.py 回一段说明。
+    消息只有元数据（信号、第几次调用），不带任何正文。
+    """
+
+    def __init__(self, signal: str = "", call: int = 0, retry: bool = False) -> None:
+        super().__init__(f"model output collapsed (signal={signal}, call={call})")
+        self.signal = signal
+        self.call = call
+        self.retry = retry
+
+
 class DegenerationGuard:
     """一轮（一次 invoke）一个实例，挂在 `agent.stream_async` 的循环里：每个原始事件先给它看一眼。
 
     `observe(event)` 只读事件、从不改它，也从不抛异常：自己出错就本轮关掉（打一行只带异常类型的
     warning）。每次模型调用（`messageStart`）重新计数；一次调用里第一次判定时打一行 warning，
     同一次调用里不再计算（省 CPU，也不刷屏）。
+
+    强制拦截（`enforce=True`）时，判定还会留下三样东西，各给一个下游取一次：
+      · `discarding`    —— 这次调用剩下的事件一律不发给前端（main.py 的主循环看它）；
+      · `pop_discard()` —— 那条 `{"call", "signal", "retry"}`：告诉 BFF / IM 丢掉这次调用已经显示的部分；
+      · `take_abort()`  —— 那个 `OutputCollapsed`：模型流的检查点拿去抛（`install_stream_stop`）。
+    一轮最多重试 `max_retries` 次；再判就 `retry=False`，交给 main.py 收尾。
     """
 
-    def __init__(self, question: str = "", model: str = "", log=None, clock=time.monotonic) -> None:
+    def __init__(self, question: str = "", model: str = "", log=None, clock=time.monotonic,
+                 enforce: bool = True, max_retries: int = 1) -> None:
         self._log = log or logging.getLogger(__name__)
         self._clock = clock
         self._model = "_".join(str(model or "").split()) or "-"   # 日志是 key=value，值里不能有空格
+        self._enforce = bool(enforce)
+        self._max_retries = max(0, int(max_retries))
         self._calls = 0
         self._detector = None
         self._started = 0.0
         self._done = False                    # 本次调用已判定过
         self._off = False
+        self.collapses = 0                    # 本轮判定了几次（强制拦截时才数）
+        self._discarding = False
+        self._notice = None
+        self._abort = None
         try:
             self._allowed = _BASE_SCRIPTS | scripts_in(str(question or ""))
         except Exception as e:  # noqa: BLE001 — 同 observe：出错只关掉自己
             self._off = True
             self._log.warning("degeneration guard disabled for this turn: %s", type(e).__name__)
 
+    # ── 给 main.py / 模型流检查点 / hook 的 ─────────────────────────────────────
+    @property
+    def enforcing(self) -> bool:
+        """这一轮还在强制拦截（没设成影子模式、自己也没出错关掉）。"""
+        return self._enforce and not self._off
+
+    @property
+    def calls(self) -> int:
+        """本轮已经开始了几次模型调用（main.py 据此发 `call_start` 标记）。"""
+        return self._calls
+
+    @property
+    def discarding(self) -> bool:
+        """当前这次模型调用已判定崩坏：它剩下的事件一律不发。下一次调用开始时复位。"""
+        return self._discarding
+
+    def pop_discard(self):
+        """刚判定、还没告诉下游的那条 discard（只给一次）；没有就 None。"""
+        notice, self._notice = self._notice, None
+        return notice
+
+    def take_abort(self):
+        """刚判定、还没抛出去的那个 `OutputCollapsed`（只给一次）；没有就 None。"""
+        exc, self._abort = self._abort, None
+        return exc
+
+    def model_call_started(self) -> None:
+        """模型流检查点在每次 `model.stream(...)` 开头调：接下来的 messageStart（或第一个增量）一定是
+        新的一次调用。重试那一次前面没有上一次的 messageStop —— 不复位的话，它会被当成被判死的
+        那次调用的延续，正文全被丢掉。"""
+        if self._off:
+            return
+        self._detector = None
+        self._discarding = False
+        self._notice = None
+        self._abort = None
+
+    # ── 看事件 ────────────────────────────────────────────────────────────────
     def observe(self, event) -> None:
         if self._off:
             return
         try:
             self._observe(event)
-        except Exception as e:  # noqa: BLE001 — 影子模式：守卫失败只关掉自己，不影响回答
-            self._off = True
-            self._log.warning("degeneration guard disabled for this turn: %s", type(e).__name__)
+        except Exception as e:  # noqa: BLE001 — 守卫失败只关掉自己，不影响回答
+            self._turn_off(e)
+
+    def _turn_off(self, e: Exception) -> None:
+        """本轮关掉：之后的调用原样放行；判到一半的状态一并清掉 —— 这一轮就等于没有守卫。
+        （留着半套状态最糟：主循环还在丢事件、检查点却已不再停，重试那次的回答会被整段丢掉。）"""
+        self._off = True
+        self._discarding = False
+        self._notice = None
+        self._abort = None
+        self._log.warning("degeneration guard disabled for this turn: %s", type(e).__name__)
 
     def _observe(self, event) -> None:
         ev = event.get("event") if isinstance(event, dict) else None
@@ -526,12 +618,122 @@ class DegenerationGuard:
         self._detector = CollapseDetector(allowed=self._allowed)
         self._started = self._clock()
         self._done = False
+        self._discarding = False
 
     def _report(self, v: Verdict) -> None:
-        self._log.warning(
-            "degeneration guard (shadow, no action taken): signal=%s model=%s call=%d phase=%s at=%d "
-            "reasoning_chars=%d text_chars=%d elapsed_s=%.1f glue=%d han_latin=%d han_han=%d "
-            "double=%d foreign=%d foreign_scripts=%s zlib=%s",
-            v.signal, self._model, self._calls, v.phase, v.at, v.reasoning_chars, v.text_chars,
-            self._clock() - self._started, v.glue, v.han_latin, v.han_han, v.double, v.foreign,
-            v.foreign_scripts, "-" if v.zlib_ratio is None else "%.3f" % v.zlib_ratio)
+        fields = (self._model, self._calls, v.phase, v.at, v.reasoning_chars, v.text_chars,
+                  self._clock() - self._started, v.glue, v.han_latin, v.han_han, v.double, v.foreign,
+                  v.foreign_scripts, "-" if v.zlib_ratio is None else "%.3f" % v.zlib_ratio)
+        tail = ("model=%s call=%d phase=%s at=%d reasoning_chars=%d text_chars=%d elapsed_s=%.1f "
+                "glue=%d han_latin=%d han_han=%d double=%d foreign=%d foreign_scripts=%s zlib=%s")
+        if not self._enforce:
+            self._log.warning("degeneration guard (shadow, no action taken): signal=%s " + tail,
+                              v.signal, *fields)
+            return
+        retry = self.collapses + 1 <= self._max_retries
+        # 先打日志、再记状态：日志出错 → observe 把守卫关掉，这一轮等于没有守卫（见 _turn_off）。
+        self._log.warning("degeneration guard (enforced, model call stopped): signal=%s action=%s " + tail,
+                          v.signal, "retry" if retry else "give_up", *fields)
+        self.collapses += 1
+        self._discarding = True
+        self._notice = {"call": self._calls, "signal": v.signal, "retry": retry}
+        self._abort = OutputCollapsed(v.signal, self._calls, retry)
+
+
+class _StopSignal(threading.Event):
+    """传给模型的取消信号：我们自己置位（判定崩坏），或调用方原来那个置位（比如用户停止），都算。
+
+    Bedrock 的读流线程每个 chunk 看一次 `is_set()`，置位就关掉 HTTP 流（strands models/bedrock.py 的
+    `_stream`）—— 这是让模型**真的停下**的唯一办法。不把调用方那个接进来，用户停止就失灵了。
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__()
+        self._parent = parent
+
+    def is_set(self) -> bool:  # type: ignore[override]
+        if super().is_set():
+            return True
+        try:
+            return bool(self._parent is not None and self._parent.is_set())
+        except Exception:  # noqa: BLE001 — 认不出的对象就当没置位：检查点不能反过来把正常调用弄坏
+            return False
+
+
+def install_stream_stop(model, current_guard, log=None) -> bool:
+    """给模型实例的 `stream` 套一个检查点（每个 Agent 装一次，幂等）。返回装没装上。
+
+    `current_guard`：无参函数，返回本轮的 `DegenerationGuard`（main.py 放在 ContextVar 里）或 None。
+    没有守卫 / 守卫不在强制拦截 → 原样转发，一个 chunk 都不碰。在强制拦截时：
+      · 每次 `stream(...)` 开头告诉守卫「新的一次调用开始了」；
+      · 把传给模型的取消信号换成 `_StopSignal`（调用方原来那个照样生效）；
+      · 每交出一个 chunk，问守卫要不要停：要停就置位取消信号、关掉上游、抛 `OutputCollapsed`。
+    装不上（模型对象不让设属性）时返回 False —— main.py 就让这个 Agent 的守卫退回影子模式：
+    停不下模型的话，判了也只能让乱码照样写进历史。
+    """
+    log = log or logging.getLogger(__name__)
+    if getattr(model, "_notiops_stream_stop", False):
+        return True
+    try:
+        orig = model.stream
+    except Exception as e:  # noqa: BLE001
+        log.warning("degeneration stream stop not installed: %s", type(e).__name__)
+        return False
+
+    async def stream(*args, **kwargs):
+        try:
+            guard = current_guard()
+            if guard is not None and not guard.enforcing:
+                guard = None
+        except Exception:  # noqa: BLE001 — 拿不到守卫就当没有
+            guard = None
+        if guard is None:
+            async for chunk in orig(*args, **kwargs):
+                yield chunk
+            return
+        guard.model_call_started()
+        stop = _StopSignal(kwargs.get("cancel_signal"))
+        kwargs["cancel_signal"] = stop
+        upstream = orig(*args, **kwargs)
+        try:
+            async for chunk in upstream:
+                yield chunk
+                exc = guard.take_abort()
+                if exc is not None:
+                    stop.set()
+                    raise exc
+            exc = guard.take_abort()
+            if exc is not None:
+                raise exc
+        finally:
+            closer = getattr(upstream, "aclose", None)
+            if closer is not None:
+                await closer()
+
+    try:
+        model.stream = stream
+        model._notiops_stream_stop = True
+    except Exception as e:  # noqa: BLE001
+        log.warning("degeneration stream stop not installed: %s", type(e).__name__)
+        return False
+    return True
+
+
+class CollapseRetry:
+    """挂到 Strands Agent 上的 hook（`Agent(hooks=[CollapseRetry(AfterModelCallEvent)])`）。
+
+    模型调用以 `OutputCollapsed(retry=True)` 失败时把 `event.retry` 置真：Strands 丢掉那次的输出
+    （它本来就没进 `agent.messages`），用同样的上下文再调一次模型。别的异常一概不碰 —— 限流的退避
+    重试归 Strands 自己的 `ModelRetryStrategy`。
+    """
+
+    def __init__(self, after_model_call_event) -> None:
+        self._event = after_model_call_event
+
+    def register_hooks(self, registry, **kwargs) -> None:
+        registry.add_callback(self._event, self._on_after_model_call)
+
+    def _on_after_model_call(self, event) -> None:
+        exc = getattr(event, "exception", None)
+        if isinstance(exc, OutputCollapsed) and exc.retry:
+            event.retry = True

@@ -79,7 +79,7 @@ The console stores the template you upload in a bucket named `cf-templates-<rand
 
 #### (2) Creating the stack — the resources are created **as you**
 
-This template ships **no** CloudFormation service role (stack service role). CloudFormation does not switch identity: the template declares 154 resources (counting the ones that only get created for certain parameter values; the default parameters create 74 — see [§3](#3-what-the-stack-creates)), and every one that does get created is created using **your current IAM identity**, so your permissions are the ceiling on what this stack can build. The service scope (the counts are what the template declares):
+This template ships **no** CloudFormation service role (stack service role). CloudFormation does not switch identity: the template declares 156 resources (counting the ones that only get created for certain parameter values; the default parameters create 76 — see [§3](#3-what-the-stack-creates)), and every one that does get created is created using **your current IAM identity**, so your permissions are the ceiling on what this stack can build. The service scope (the counts are what the template declares):
 
 | Service prefix | What the stack creates | Count |
 |---|---|---|
@@ -366,7 +366,7 @@ Four capabilities depend on this one agent space (without it, the matching toggl
 
 ### 2.9 Notifications inbox
 
-**No parameters, the stack sets it up.** The inbox behind the first left-nav item is fed by **10 EventBridge rules** → one Lambda (`notiops-web-notif-handler`, normalizes + dedups within 5 minutes) → the `notiops-web-chat` table. The frontend polls every **60s**, so latency is up to about a minute; the red dot counts **unread only**.
+**No parameters, the stack sets it up.** The inbox behind the first left-nav item is fed by **10 EventBridge rules** → one Lambda (`notiops-web-notif-handler`, normalizes + dedups: the same event is recorded once per 5 minutes, Trusted Advisor once per 24 hours) → the `notiops-web-chat` table. The frontend polls every **60s**, so latency is up to about a minute; the red dot counts **unread only**.
 
 - **On by default (5)** — highest operational value, manageable noise: AWS Health / CloudWatch Alarm / Cost Anomaly / Trusted Advisor / GuardDuty
 - **Off by default (5)** — high volume, or need a paid service turned on first: Backup jobs / EC2 Spot interruptions / Auto Scaling failures / RDS / Config
@@ -482,7 +482,7 @@ All three add the same things: 4 CUR sheets on the FinOps page (cost trend / cre
 
 ## 3. What the stack creates
 
-**74 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 6 fewer with deep investigation off; 8 more if you pick multi-account; **26 more if you pick an install option with IM**; 10 more — the cost MCP set — with `CurTable` set or `ProvisionCur=yes`, and another 11 on top of that if you chose `ProvisionCur=yes`):
+**76 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 6 fewer with deep investigation off; 8 more if you pick multi-account; **26 more if you pick an install option with IM**; 10 more — the cost MCP set — with `CurTable` set or `ProvisionCur=yes`, and another 11 on top of that if you chose `ProvisionCur=yes`):
 
 | Category | Resources |
 |---|---|
@@ -491,8 +491,8 @@ All three add the same things: 4 CUR sheets on the FinOps page (cost trend / cre
 | Agent | 1 Bedrock AgentCore Runtime + 1 AgentCore Memory (session memory, see [§2.10](#210-session-memory-agentcore-memory)) |
 | Sign-in | Cognito User Pool + Client + Identity Pool + 8 groups (roles) |
 | Data | DynamoDB `notiops-config`, `notiops-web-chat`; 1 data bucket (reports etc.) |
-| Deployment helper | 1 staging bucket (for the staged artifacts) + 1 inline Lambda + 3 custom resources (stage the artifacts / write the frontend config / **on delete, drain the staging bucket until it really is empty**) |
-| Permissions | 6 IAM roles + 5 inline policies (the AgentCore Memory execution role has **no policy at all** — it is just a shell for the service to trust) + 1 managed policy (the BFF role's grants exceed the inline-policy size limit, and the overflow lands here) |
+| Deployment helper | 1 staging bucket (for the staged artifacts) + 1 inline Lambda + 4 custom resources (stage the artifacts / write the frontend config / **on delete, drain the staging bucket until it really is empty** / on delete, delete the data bucket once the reports CloudFront distribution is gone, only under `DeleteEverything`) |
+| Permissions | 6 IAM roles + 6 inline policies (the AgentCore Memory execution role has **no policy at all** — it is just a shell for the service to trust) + 1 managed policy (the BFF role's grants exceed the inline-policy size limit, and the overflow lands here) |
 | Notifications inbox (see [§2.9](#29-notifications-inbox)) | **10 EventBridge rules** (5 ENABLED / 5 DISABLED) + 1 Lambda + its log group + 1 role (plus its policy) + 1 Lambda invoke permission = 15 |
 | Deep investigation (on by default) | 1 DevOps Agent agent space (**with its operator app enabled automatically**) + 1 read-only association + 1 role assumed by DevOps Agent (plus its policy) + 1 operator app role + 1 custom resource (registers the deployment account for deep investigation) = 6 |
 | Web search (us-east-1 only) | 1 custom resource (creates the AgentCore gateway) + 1 gateway service role + 1 inline policy |
@@ -699,7 +699,7 @@ Getting the order wrong fails silently: the stack goes away, the tables and buck
 
 CloudFormation → select the stack → **Delete**. **Measured**: `KeepData` ~**3m10s**; `DeleteEverything` ~**6m47s** (the extra time is emptying and deleting the two buckets and two tables). Don't expect `DeleteEverything` to finish in three minutes.
 
-During deletion the stack's deployment Lambda first **empties** the website bucket, the staging bucket and (when the cost MCP is installed) the Athena query-results bucket (a non-empty bucket can't be deleted and would stall the whole delete), then honours `TeardownMode` for the two tables and the data bucket. Measured in 2026-08: **zero `DELETE_FAILED`** in both modes. Note: this did **not** hold on a v1.0.30 pre-release -- with the cost MCP installed, the deployment Lambda lacked permissions on the query-results bucket and the delete stopped in `DELETE_FAILED` (measured 2026-10-10, fixed; re-measured the same day after the fix: `DeleteEverything` finished in 4m12s with zero `DELETE_FAILED`, with an object left in the query-results bucket on purpose). If yours is stuck, see [§6.5](#65-delete-stopped-in-delete_failed-stagersite).
+During deletion the stack's deployment Lambda first **empties** the website bucket, the staging bucket and (when the cost MCP is installed) the Athena query-results bucket (a non-empty bucket can't be deleted and would stall the whole delete), then honours `TeardownMode` for the two tables and the data bucket. The data bucket is deleted by a separate step, `DataCleanup`, only **after** the reports CloudFront distribution is gone -- that bucket is the distribution's origin (v1.0.32 and earlier deleted the bucket first, so for several minutes the distribution pointed at a bucket name that no longer existed, and bucket names are global: anyone could have claimed it). Measured in 2026-08: **zero `DELETE_FAILED`** in both modes. Note: this did **not** hold on a v1.0.30 pre-release -- with the cost MCP installed, the deployment Lambda lacked permissions on the query-results bucket and the delete stopped in `DELETE_FAILED` (measured 2026-10-10, fixed; re-measured the same day after the fix: `DeleteEverything` finished in 4m12s with zero `DELETE_FAILED`, with an object left in the query-results bucket on purpose). If yours is stuck, see [§6.5](#65-delete-stopped-in-delete_failed-stagersite).
 
 ### 6.4 What's left behind (orphans), and whether to care
 
@@ -716,7 +716,7 @@ During deletion the stack's deployment Lambda first **empties** the website buck
 
 ### 6.5 Delete stopped in `DELETE_FAILED` (StagerSite)
 
-`StagerSite` is the "empty first, then honour `TeardownMode`" step above. When it fails, **its failure reason lists every step that did not complete** (which bucket / table / secret, which API, which error code) -- read that line first. A stack in `DELETE_FAILED` **cannot be updated**, so the way out is to finish the remaining work by hand and let CloudFormation skip this step:
+`StagerSite` is the "empty first, then honour `TeardownMode`" step above. When it fails, **its failure reason lists every step that did not complete** (which bucket / table / secret, which API, which error code) -- read that line first. A stack in `DELETE_FAILED` **cannot be updated**, so the way out is to finish the remaining work by hand and let CloudFormation skip this step. The same goes for the step that deletes the data bucket (`DataCleanup`, which only acts under `DeleteEverything`): its failure reason names that bucket too; use `--retain-resources DataCleanup` in step 2 (both names if both failed), then delete that bucket as in step 3:
 
 ```bash
 # 1. Empty the buckets named in the failure reason (only those)
@@ -726,13 +726,14 @@ aws s3 rm s3://<bucket named in the failure reason> --recursive
 aws cloudformation delete-stack --stack-name <stack> --retain-resources StagerSite
 ```
 
-Skipping StagerSite **also skips its clean-up**. If you chose `DeleteEverything`, nothing will delete the following for you any more -- remove them yourself after the stack is gone: the two tables (`notiops-config` / `notiops-web-chat`), the data bucket `notiops-data-<account>-<region>` (empty it first; **it holds your Skills and exported reports -- export them first if you want to keep them**), any of the `notiops/*` secrets from the §6.4 table that exist, and this stack's agent log group under `/aws/bedrock-agentcore/runtimes/`. With `KeepData` the two tables and the data bucket are kept on purpose anyway. Everything CUR-related (the report, its delivery bucket, the `notiops-cur-athena-<account>` stack) is **kept** in every mode, by design.
+Skipping StagerSite **also skips its clean-up**. If you chose `DeleteEverything`, nothing will delete the following for you any more -- remove them yourself after the stack is gone: the two tables (`notiops-config` / `notiops-web-chat`), any of the `notiops/*` secrets from the §6.4 table that exist, and this stack's agent log group under `/aws/bedrock-agentcore/runtimes/`. The data bucket `notiops-data-<account>-<region>` is not on that list (it belongs to `DataCleanup`) -- delete it yourself only if you also skipped `DataCleanup`, or if the stack still runs v1.0.32 or earlier (where StagerSite deleted the data bucket too); empty it first, and **it holds your Skills and exported reports -- export them first if you want to keep them**. With `KeepData` the two tables and the data bucket are kept on purpose anyway. Everything CUR-related (the report, its delivery bucket, the `notiops-cur-athena-<account>` stack) is **kept** in every mode, by design.
 
 ```bash
 # 3. Only if you chose DeleteEverything: finish the clean-up that was skipped. Otherwise a re-install in the
 #    same account and Region fails its pre-check on the same-named tables / bucket (~9 s, see §6.1)
 aws dynamodb delete-table --table-name notiops-config
 aws dynamodb delete-table --table-name notiops-web-chat
+# the data bucket: only if you skipped DataCleanup, or the stack runs v1.0.32 or earlier
 aws s3 rb s3://notiops-data-<account>-<region> --force   # --force empties it first; export Skills / reports before if you want them
 aws logs delete-log-group --log-group-name /aws/bedrock-agentcore/runtimes/<runtime id>-DEFAULT
 # any of the notiops/* secrets from the §6.4 table that exist:

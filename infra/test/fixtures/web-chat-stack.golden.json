@@ -1497,6 +1497,7 @@
     "WebChatBffF9213199": {
       "DependsOn": [
         "WebChatBffServiceRoleDefaultPolicyF068D5C2",
+        "WebChatBffServiceRoleOverflowPolicy1B86B9DDC",
         "WebChatBffServiceRole61946212"
       ],
       "Metadata": {
@@ -1724,7 +1725,11 @@
                 "cognito-idp:DeleteGroup",
                 "cognito-idp:ListUsersInGroup",
                 "cognito-idp:AdminAddUserToGroup",
-                "cognito-idp:AdminRemoveUserFromGroup"
+                "cognito-idp:AdminRemoveUserFromGroup",
+                "cognito-idp:GetUserPoolMfaConfig",
+                "cognito-idp:AdminGetUser",
+                "cognito-idp:AdminDeleteSoftwareToken",
+                "cognito-idp:AdminUserGlobalSignOut"
               ],
               "Effect": "Allow",
               "Resource": "arn:aws:cognito-idp:us-east-1:444455556666:userpool/us-east-1_FIXTUREPOOL"
@@ -2145,7 +2150,28 @@
               ],
               "Effect": "Allow",
               "Resource": "arn:aws:aidevops:us-east-1:444455556666:agentspace/*"
-            },
+            }
+          ],
+          "Version": "2012-10-17"
+        },
+        "PolicyName": "WebChatBffServiceRoleDefaultPolicyF068D5C2",
+        "Roles": [
+          {
+            "Ref": "WebChatBffServiceRole61946212"
+          }
+        ]
+      },
+      "Type": "AWS::IAM::Policy"
+    },
+    "WebChatBffServiceRoleOverflowPolicy1B86B9DDC": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/WebChatBff/ServiceRole/OverflowPolicy1/Resource"
+      },
+      "Properties": {
+        "Description": "Part of the policies for WebChatStack/WebChatBff/ServiceRole",
+        "Path": "/",
+        "PolicyDocument": {
+          "Statement": [
             {
               "Action": "iam:PassRole",
               "Condition": {
@@ -2159,14 +2185,13 @@
           ],
           "Version": "2012-10-17"
         },
-        "PolicyName": "WebChatBffServiceRoleDefaultPolicyF068D5C2",
         "Roles": [
           {
             "Ref": "WebChatBffServiceRole61946212"
           }
         ]
       },
-      "Type": "AWS::IAM::Policy"
+      "Type": "AWS::IAM::ManagedPolicy"
     },
     "WebChatTable02103F86": {
       "DeletionPolicy": "Retain",

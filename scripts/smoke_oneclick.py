@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import secrets
 import string
 import sys
@@ -54,6 +55,8 @@ import urllib.request
 import boto3
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
+
+import cognito_totp  # 同目录；rc-tools 的脚本把 scripts/ 放进 sys.path 后 import 本文件，同样找得到
 
 # 一键部署建的管理员用户名（见 infra/lambda/stager/index.py 的 _ADMIN_USERNAME）。
 ADMIN_USERNAME = "admin"
@@ -171,8 +174,13 @@ def _bff_function_url(cfn, lam, stack: str) -> str:
         return ""
 
 
-def login(idp, pool_id: str, client_id: str, password: str) -> str:
-    """USER_PASSWORD_AUTH 拿 idToken；碰到首登改密挑战就当场改掉。"""
+#: 本进程里 admin 的验证器密钥（两步验证；只在内存里）。`--reset-password` 会连两步验证一起重置，
+#: 之后「强制」档的登录当场绑一把新的，「可选」档的登录不要码。SMOKE_TOTP_SECRET 可以传入一把已有的。
+MFA = cognito_totp.MfaState(os.environ.get("SMOKE_TOTP_SECRET") or None)
+
+
+def login_tokens(idp, pool_id: str, client_id: str, password: str) -> dict:
+    """USER_PASSWORD_AUTH 拿全套令牌；首登改密、两步验证（绑定 / 输码）的挑战都当场答掉。"""
     resp = idp.initiate_auth(
         ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
         AuthParameters={"USERNAME": ADMIN_USERNAME, "PASSWORD": password},
@@ -184,9 +192,23 @@ def login(idp, pool_id: str, client_id: str, password: str) -> str:
             Session=resp["Session"],
             ChallengeResponses={"USERNAME": ADMIN_USERNAME, "NEW_PASSWORD": password},
         )
-    if resp.get("ChallengeName"):
-        raise SmokeError(f"unexpected auth challenge: {resp['ChallengeName']}")
-    return resp["AuthenticationResult"]["IdToken"]
+    if resp.get("ChallengeName") in ("MFA_SETUP", "SOFTWARE_TOKEN_MFA"):
+        _say(f"      two-step verification: answering {resp['ChallengeName']} (key and code not printed)")
+    try:
+        return cognito_totp.answer_mfa(idp, resp, client_id=client_id, username=ADMIN_USERNAME, state=MFA)
+    except RuntimeError as e:
+        raise SmokeError(str(e)) from None
+
+
+def login(idp, pool_id: str, client_id: str, password: str) -> str:
+    """只要 idToken 的那几处用这个（与 login_tokens 同一条路）。"""
+    return login_tokens(idp, pool_id, client_id, password)["IdToken"]
+
+
+def ensure_admin_mfa(idp, pool_id: str, access_token: str) -> None:
+    """要调 /admin/* 的脚本（如 RC 的 rc_tag_check.py）先调这个：用户池不是「关闭」档时「管理」页要求已绑定。"""
+    if cognito_totp.ensure_enrolled(idp, pool_id, ADMIN_USERNAME, access_token, MFA):
+        _say("      two-step verification: enrolled the admin for the Admin API (key not printed)")
 
 
 def identity_pool_creds(region: str, identity_pool_id: str, pool_id: str, id_token: str) -> dict:
@@ -340,6 +362,9 @@ def main(argv: list[str] | None = None) -> int:
                                         Username=ADMIN_USERNAME, Password=password,
                                         Permanent=True)
             _say("      reset the admin password (value not printed)")
+            # 连两步验证一起重置：否则一个在别处绑过验证器的 admin，这里登录要一把脚本不知道的码。
+            cognito_totp.reset(idp, cfg["cognitoUserPoolId"], ADMIN_USERNAME)
+            MFA.secret = None
         if not password:
             raise SmokeError("no password: pass --reset-password or set SMOKE_ADMIN_PASSWORD")
         id_token = login(idp, cfg["cognitoUserPoolId"], cfg["cognitoClientId"], password)

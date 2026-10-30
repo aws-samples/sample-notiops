@@ -323,7 +323,7 @@ t("★★ every endsWith route in index.mjs resolves to a capability node", () =
   // LOGIN_ONLY 白名单里的路由不需要能力节点（会话/账号/me-capabilities）。
   const LOGIN_ONLY_OK = [
     /\/conversations$/, /\/conversations\/[^/]+$/, /\/accounts$/,
-    /\/me\/capabilities$/, /\/models$/,
+    /\/me\/capabilities$/, /\/me\/mfa$/, /\/models$/,
   ];
   const src = readFileSync(join(HERE, "..", "index.mjs"), "utf8");
   const paths = new Set(

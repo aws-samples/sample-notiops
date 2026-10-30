@@ -3,6 +3,7 @@
  * 所有请求经 signedClient（SigV4 + idToken）；后端 authz 要求 nav:admin。
  */
 import { signedClient } from "./chat";
+import { MFA_REQUIRED_EVENT } from "./mfa";
 
 export interface FullCapabilityNode {
   key: string;
@@ -15,7 +16,11 @@ export interface FullCapabilityNode {
   responseKey?: string | string[];
 }
 export interface RoleRec { name: string; permissions: string[]; preset?: boolean }
-export interface UserRec { username: string; sub: string; enabled?: boolean; status?: string; roles: string[]; denies: string[] }
+export interface UserRec {
+  username: string; sub: string; enabled?: boolean; status?: string; roles: string[]; denies: string[];
+  /** 是否已绑定验证器：true / false / null（服务端读不到）。用户池「关闭」两步验证时没有意义，界面不显示。 */
+  mfa?: boolean | null;
+}
 export interface ModuleToggle { key: string; title_zh?: string; title_en?: string; disabled: boolean }
 
 async function req<T>(method: string, pathSuffix: string, body?: unknown): Promise<T> {
@@ -34,6 +39,11 @@ async function req<T>(method: string, pathSuffix: string, body?: unknown): Promi
     // 两个都读，另外带上服务端可能给出的结构化细节（如非法权限键列表）。
     const rec = (j && typeof j === "object" ? j : {}) as Record<string, unknown>;
     const reason = (rec.error as string) || (rec.message as string) || "";
+    // 管理页要求先开两步验证（bff/web-chat/mfa.mjs::adminMfaGate）：广播出去，ChatApp 弹出设置框。
+    // 照常抛错 —— 调用方的错误显示不变，只是多了一个能直接去开的入口。
+    if (r.status === 403 && reason === "mfa_required" && typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent(MFA_REQUIRED_EVENT));
+    }
     const keys = Array.isArray(rec.keys) ? ` (${(rec.keys as string[]).join(", ")})` : "";
     const hint = rec.hint ? ` — ${String(rec.hint)}` : "";
     // `result`：服务端给的枚举态（如网关保存被拒时的 unauthorized / redirect），界面据此给出
@@ -75,6 +85,10 @@ export async function createUser(username: string, email?: string): Promise<{ us
 }
 export async function deleteUser(username: string, sub: string): Promise<{ ok: boolean }> {
   return req("DELETE", `/admin/users/${encodeURIComponent(username)}?sub=${encodeURIComponent(sub)}`);
+}
+/** 替丢了手机的人重置两步验证：关掉他的验证器、作废他的会话（下次登录重新绑定）。不能对自己做。 */
+export async function resetUserMfa(username: string): Promise<{ ok: boolean; signedOut?: boolean }> {
+  return req("DELETE", `/admin/users/${encodeURIComponent(username)}/mfa`);
 }
 export async function putUser(sub: string, roles: string[], denies: string[]): Promise<UserRec> {
   return req<UserRec>("PUT", `/admin/users/${encodeURIComponent(sub)}`, { roles, denies });

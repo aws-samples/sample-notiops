@@ -47,6 +47,7 @@ const INSPECTION_KIND_NAV = Object.freeze({
   idle: "nav:inspection:idle",
   structural: "nav:inspection:structural",
 });
+import { adminMfaGate, apiMyMfa, apiResetUserMfa } from "./mfa.mjs";
 import { apiListRoles, apiSaveRole, apiDeleteRole, apiListUsers, apiPutUser, apiGetModules, apiPutModules, apiAllCapabilities, apiCreateUser, apiDeleteUser, apiListGroups, apiPutGroupMap, apiCreateGroup, apiDeleteGroup, apiListGroupMembers, apiAddUserToGroup, apiRemoveUserFromGroup, apiGetEol, apiPutEol } from "./admin.mjs";
 import { isAccountVisible, filterVisibleAccounts, visibleAccountSet, listVisibility, getVisibility, putVisibility, deleteVisibility } from "./account_visibility.mjs";
 import { listMemberAccounts, onboardAccount, onboardStatus, setAccountEnabled, offboardAccount, associateDevopsAgent, devopsAgentAssocStatus, generateLaunchStackUrl, manualPayloadSave, testDaConnection, inspectionCrossAccountStatus, verifyAndRegisterCollectionRole, generateCollectionStackUrl, oneClickOnboardAvailable, associateInspectionSource } from "./member_accounts.mjs";
@@ -172,6 +173,11 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
     const eff = await effective(sub, groups);
     const gate = await authorize({ method, path, query: q, body: authBody }, eff);
     if (!gate.allow) return json(gate.status || 403, { error: "forbidden", required: gate.required });
+    // 「管理」页（nav:admin = 全部 /admin/*）要求调用者已绑定验证器 —— 用户池不是「关闭」档时。见 mfa.mjs 文件头。
+    if (gate.adminOnly) {
+      const mfaGate = await adminMfaGate(claims["cognito:username"] || claims.username || "");
+      if (!mfaGate.allow) return json(mfaGate.status, { error: mfaGate.error });
+    }
 
     // ── 成员账号数据可见性（账号级 RBAC；Admin「账户」页配置）──
     // 任何带账号参数的请求（FinOps ?account= / 会话 body.account_id）在此统一校验；
@@ -286,10 +292,16 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
     if (method === "GET" && path.endsWith("/me/capabilities")) {
       return json(200, { capabilities: await visibleTree(eff) });
     }
+    // ── 两步验证：档位 + 自己是否已绑定（菜单入口用；绑定本身在浏览器里直连 Cognito）──
+    if (method === "GET" && path.endsWith("/me/mfa")) {
+      const r = await apiMyMfa(claims["cognito:username"] || claims.username || "");
+      return json(r.status, r.body);
+    }
 
     // ── Admin API（角色/用户/模块；均已由门禁要求 nav:admin）──
     const adminRoleMatch = /\/admin\/roles\/([^/]+)$/.exec(path);
     const adminUserMatch = /\/admin\/users\/([^/]+)$/.exec(path);
+    const adminUserMfaMatch = /\/admin\/users\/([^/]+)\/mfa$/.exec(path);
     const adminGroupMatch = /\/admin\/groups\/([^/]+)$/.exec(path);
     if (method === "GET" && path.endsWith("/admin/capabilities")) {
       return json(200, { nodes: apiAllCapabilities() });
@@ -310,6 +322,12 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
     }
     if (method === "POST" && path.endsWith("/admin/users")) {
       const r = await apiCreateUser({ username: authBody.username, email: authBody.email });
+      return json(r.status, r.body);
+    }
+    // 替丢了手机的人重置两步验证（关掉 TOTP + 作废会话）。必须排在下面那条 DELETE 之前 —— 那条的
+    // 正则带 `$`、匹配不到 `/mfa` 结尾，但别让以后的人把顺序当成无所谓。
+    if (method === "DELETE" && adminUserMfaMatch) {
+      const r = await apiResetUserMfa(decodeURIComponent(adminUserMfaMatch[1]), actorOf());
       return json(r.status, r.body);
     }
     if (method === "DELETE" && adminUserMatch) {

@@ -894,6 +894,12 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
 .login-card .lc-btn:hover { background: #ffad33; }
 .login-card .lc-btn:disabled { opacity: .5; cursor: default; }
 .login-card .lc-err { color: #c00; font-size: 12.5px; margin-top: 12px; }
+/* 登录页：两步验证（强制档的首次绑定 / 每次登录输验证码） */
+.login-card .lc-note { font-size: 13px; color: #33414f; line-height: 1.55; margin: 0 0 10px; }
+.login-card .lc-qr { display: flex; justify-content: center; margin: 6px 0 4px; }
+.login-card .lc-secret { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; letter-spacing: .04em; color: #0a1622; background: #f3f5f7; border: 1px solid #e1e5ea; border-radius: 8px; padding: 8px 10px; word-break: break-all; user-select: all; }
+.login-card .lc-link { display: block; width: 100%; margin-top: 10px; background: transparent; border: none; color: var(--muted); font-size: 12.5px; cursor: pointer; }
+.login-card .lc-link:hover { color: #0a1622; text-decoration: underline; }
 
 /* ============================================================
    响应式：平板 (≤1024px) 收窄留白；手机 (≤768px) 侧栏改覆盖式抽屉
@@ -1775,3 +1781,28 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
   .mdl[data-lang="en"] .mdl-grid-task { grid-template-columns: 200px minmax(0,1fr); }
   .mdl-grid-task > .mdl-col-note { display: none; }
 }
+
+/* ── 两步验证设置框（TwoFactorDialog，复用 .cz-overlay / .cz-dialog 外壳）+ 「管理」页门禁提示 + 状态胶囊 ── */
+.mfa-dialog { width: 440px; max-width: 100%; padding: 22px 24px 22px; }
+.mfa-body { margin-top: 14px; }
+.mfa-text { font-size: 13.5px; color: var(--text); line-height: 1.6; margin: 0 0 10px; }
+.mfa-text.muted { color: var(--muted); }
+.mfa-reason { font-size: 13.5px; color: var(--text); line-height: 1.6; margin: 0 0 12px; padding: 10px 12px; border-radius: 10px; background: var(--sidebar-hover, rgba(255,255,255,.05)); border-left: 3px solid var(--orange); }
+.mfa-qr { display: flex; justify-content: center; margin: 8px 0 12px; }
+.mfa-label { font-size: 12.5px; color: var(--muted); margin: 10px 0 5px; }
+.mfa-secret { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; letter-spacing: .04em; color: var(--text); background: var(--page, rgba(0,0,0,.15)); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; word-break: break-all; user-select: all; }
+.mfa-code { width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: transparent; color: var(--text); font-size: 18px; letter-spacing: .3em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mfa-code:focus { outline: none; border-color: var(--orange); }
+.mfa-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.mfa-btn { border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 8px; padding: 7px 14px; font-size: 13px; cursor: pointer; }
+.mfa-btn:hover:not(:disabled) { background: var(--sidebar-hover); }
+.mfa-btn:disabled { opacity: .5; cursor: default; }
+.mfa-btn.primary { background: var(--orange); border-color: var(--orange); color: #000; font-weight: 650; }
+.mfa-btn.primary:hover:not(:disabled) { background: #ffad33; }
+.mfa-btn.danger { color: #e5484d; border-color: rgba(229,72,77,.5); }
+.mfa-err { color: #e5484d; font-size: 13px; margin-top: 12px; }
+.mfa-pill { font-size: 11px; font-weight: 600; border-radius: 100px; padding: 1px 8px; border: 1px solid var(--line); }
+.mfa-pill.on { color: var(--green); }
+.mfa-pill.off { color: var(--muted); }
+.mfa-gate { max-width: 520px; margin: 48px auto; padding: 24px 26px; border: 1px solid var(--line); border-radius: 14px; }
+.mfa-gate-title { font-size: 17px; font-weight: 650; margin-bottom: 10px; }

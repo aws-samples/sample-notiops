@@ -39,7 +39,15 @@ export interface MinimalBase {
   reportsCdn: cloudfront.Distribution;
 }
 
-export function createMinimalBase(scope: Construct): MinimalBase {
+export interface MinimalBaseOptions {
+  /**
+   * 两步验证三档（OFF / OPTIONAL / REQUIRED，见 web-mfa.ts）—— 一键模板里是参数 `MfaMode` 的 Ref。
+   * 是 token，所以不能交给 L2 的 `mfa`（那个只收枚举字面量），下面走 L1 + Fn::If。
+   */
+  mfaMode: string;
+}
+
+export function createMinimalBase(scope: Construct, opts: MinimalBaseOptions): MinimalBase {
   const stack = cdk.Stack.of(scope);
 
   // ─── notiops-config：全局配置真源（RBAC / 模型目录 / 纳管账号 / 通知配置）───
@@ -83,6 +91,20 @@ export function createMinimalBase(scope: Construct): MinimalBase {
     },
     removalPolicy: cdk.RemovalPolicy.DESTROY,
   });
+
+  // 两步验证：REQUIRED → Cognito 的 "ON"，OFF / OPTIONAL 原样；OFF 时 EnabledMfas 必须不给
+  // （Cognito：「MFAs can only be all disabled if MfaConfiguration is OFF」）。与方式 B 的
+  // userPoolMfaProps() 输出同一组值，判据见 infra/test/web-mfa.test.ts。
+  const cfnUserPool = userPool.node.defaultChild as cognito.CfnUserPool;
+  const mfaOff = new cdk.CfnCondition(scope, "WebMfaOff", {
+    expression: cdk.Fn.conditionEquals(opts.mfaMode, "OFF"),
+  });
+  const mfaRequired = new cdk.CfnCondition(scope, "WebMfaRequired", {
+    expression: cdk.Fn.conditionEquals(opts.mfaMode, "REQUIRED"),
+  });
+  cfnUserPool.mfaConfiguration = cdk.Fn.conditionIf(mfaRequired.logicalId, "ON", opts.mfaMode).toString();
+  cfnUserPool.enabledMfas = cdk.Token.asList(
+    cdk.Fn.conditionIf(mfaOff.logicalId, cdk.Aws.NO_VALUE, ["SOFTWARE_TOKEN_MFA"]));
 
   const userPoolClient = userPool.addClient("IdleDetectorWebClient", {
     userPoolClientName: "notiops-web",

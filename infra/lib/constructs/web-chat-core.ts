@@ -976,6 +976,11 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
         "cognito-idp:ListUsers", "cognito-idp:AdminCreateUser", "cognito-idp:AdminDeleteUser",
         "cognito-idp:ListGroups", "cognito-idp:CreateGroup", "cognito-idp:DeleteGroup",
         "cognito-idp:ListUsersInGroup", "cognito-idp:AdminAddUserToGroup", "cognito-idp:AdminRemoveUserFromGroup",
+        // 两步验证（bff/web-chat/mfa.mjs）：读用户池的模式、读某人是否已绑定（「管理」页门禁 + 用户列表），
+        // 管理员替丢了手机的人重置（删掉他登记的验证器 + 让他所有会话失效）。重置用 AdminDeleteSoftwareToken，
+        // 不是 AdminSetUserMFAPreference：「强制」档下后者只关偏好、验证器还登记着，下次登录照样要旧码。
+        "cognito-idp:GetUserPoolMfaConfig", "cognito-idp:AdminGetUser",
+        "cognito-idp:AdminDeleteSoftwareToken", "cognito-idp:AdminUserGlobalSignOut",
       ],
       resources: [`arn:aws:cognito-idp:${stack.region}:${stack.account}:userpool/${props.userPoolId}`],
     }),

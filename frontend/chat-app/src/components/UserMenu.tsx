@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { useT, useLocale, useTheme, type Locale, type ThemePref } from "../i18n";
 import {
-  IconLanguage, IconSignout, IconChevronRight, IconCheck, IconAppearance, IconGitHub,
+  IconLanguage, IconSignout, IconChevronRight, IconCheck, IconAppearance, IconGitHub, IconSecurity,
 } from "./icons";
+import type { MfaMode } from "../api/mfa";
 
 /**
  * 唯一一个外链的目标 —— 公开仓库 aws-samples/sample-notiops 主页。
@@ -28,7 +29,13 @@ const LINKS = {
 } as const;
 
 /** 左下角用户区 → 向上弹出的设置菜单（参考 Bedrock/Claude）。 */
-export default function UserMenu({ username, onSignOut }: { username: string; onSignOut: () => void }) {
+export default function UserMenu({ username, onSignOut, mfaMode = null, onTwoFactor }: {
+  username: string;
+  onSignOut: () => void;
+  /** 用户池的两步验证档位（/me/mfa）。OFF 或读不到（null）时不显示「两步验证」这一项。 */
+  mfaMode?: MfaMode | null;
+  onTwoFactor?: () => void;
+}) {
   const t = useT();
   const { locale, setLocale } = useLocale();
   const { pref, setPref } = useTheme();
@@ -101,6 +108,12 @@ export default function UserMenu({ username, onSignOut }: { username: string; on
               </div>
             )}
           </div>
+
+          {(mfaMode === "OPTIONAL" || mfaMode === "REQUIRED") && onTwoFactor && (
+            <button className="um-item" onClick={() => { setOpen(false); onTwoFactor(); }}>
+              <IconSecurity size={16} /> <span>{t("mfa.title")}</span>
+            </button>
+          )}
 
           <div className="um-sep" />
           <button className="um-item" onClick={() => { setOpen(false); onSignOut(); }}>

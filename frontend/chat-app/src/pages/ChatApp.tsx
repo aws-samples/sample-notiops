@@ -10,6 +10,8 @@ import { createStreamRewind } from "../streamRewind";
 import CustomizePanel from "../components/CustomizePanel";
 import NotificationsPanel from "../components/NotificationsPanel";
 import AdminPanel from "../components/AdminPanel";
+import TwoFactorDialog from "../components/TwoFactorDialog";
+import { getMyMfa, MFA_REQUIRED_EVENT, type MyMfa } from "../api/mfa";
 import { getMyCapabilities } from "../api/capabilities";
 import FinopsDashboardBrowser from "../components/FinopsDashboardBrowser";
 import { getFinopsDashboard, type FinopsDashboard as FinopsData } from "../api/finops";
@@ -611,6 +613,23 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
       .then((u) => setUsername(u.username || "U"))
       .catch(() => setUsername("dev")); // 跳过登录预览时无真实用户
   }, []);
+
+  // ── 两步验证（验证器 App）：档位 + 自己绑没绑（GET /me/mfa）。菜单项、设置框与「管理」页门禁都看它。
+  //    读不到（null）时菜单里不显示入口、管理页也不拦（BFF 那道门禁照样在，前端只是不提前提示）。
+  const [mfa, setMfa] = useState<MyMfa | null>(null);
+  // 第一次 /me/mfa 回来之前，「管理」页先不发请求（见 AdminPanel 的 mfaPending）：否则刚登录就点进去，
+  // 管理请求先撞上 403 mfa_required、再由下面那个事件弹框 —— 结果对，但先闪一排错（验证账号 UI 实测）。
+  const [mfaLoaded, setMfaLoaded] = useState(false);
+  const [mfaDialog, setMfaDialog] = useState<null | "menu" | "admin">(null);
+  const refreshMfa = useCallback(async () => { setMfa(await getMyMfa()); setMfaLoaded(true); }, []);
+  useEffect(() => { void refreshMfa(); }, [refreshMfa]);
+  // BFF 以「先开两步验证」拒绝了某个管理请求（api/admin.ts 广播）：先刷新状态，再弹出设置框。
+  useEffect(() => {
+    const onRequired = () => { void refreshMfa(); setMfaDialog("admin"); };
+    window.addEventListener(MFA_REQUIRED_EVENT, onRequired);
+    return () => window.removeEventListener(MFA_REQUIRED_EVENT, onRequired);
+  }, [refreshMfa]);
+  const adminMfaBlocked = mfa?.adminRequiresMfa === true && mfa?.enrolled === false;
 
   // 多账号：启动加载已注册账号列表（供账号选择器）。失败 → 空（仅默认账号）。
   // 账号列表随视图切换刷新（offboard/onboard 后无需整页刷新即同步；请求走 15s 内去重）
@@ -1439,6 +1458,8 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
         collapsed={collapsed}
         onToggle={() => setCollapsed((v) => !v)}
         username={username}
+        mfaMode={mfa?.mode ?? null}
+        onTwoFactor={() => setMfaDialog("menu")}
         onSignOut={doSignOut}
         width={sidebarWidth}
         onSkills={() => { setView("skills"); setSkillsHome((n) => n + 1); collapseIfMobile(); }}
@@ -1674,7 +1695,8 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               )}
               <div className="title">{t("nav.admin")}</div>
             </div>
-            <AdminPanel />
+            <AdminPanel mfaMode={mfa?.mode ?? null} mfaBlocked={adminMfaBlocked} mfaPending={!mfaLoaded}
+                        onSetupMfa={() => setMfaDialog("admin")} currentUsername={username} />
           </>
         ) : (
         <>
@@ -1936,6 +1958,10 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
       <ThinkingPanel open={thinkOpen} steps={thinkSteps} live={thinkLive} consoleUrl={thinkConsoleUrl}
                      width={srcWidth} onClose={closeThinking} />
       {/* FinOps / Cases 仪表盘均改为主区两栏浏览器(见 view==="finops"/"cases" && *Dash 分支),不再用右停靠面板 */}
+      {mfaDialog && (
+        <TwoFactorDialog mode={mfa?.mode ?? null} enrolled={mfa?.enrolled ?? null} username={username}
+                         reason={mfaDialog} onClose={() => setMfaDialog(null)} onChanged={refreshMfa} />
+      )}
     </div>
   );
 }

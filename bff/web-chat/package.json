@@ -6,7 +6,7 @@
   "private": true,
   "main": "index.mjs",
   "scripts": {
-    "test": "for f in role_guard cross_account_role_alias authz capabilities_env_gate cur_dashboard_failsoft admin_role_perms agentcore wait_hint warmup llm_config llm_gateway gateway_host llmcfg_disabled inspection inspection_readside cross_account_identity support_cross_account manual_onboard_flow alias_and_batch_run judge_finding deep_investigation_availability investigation_ref direct_context turn_errors turn_inflight collapse_discard account_gates trace_html topic_normalize dashboard_insight_requests devops_chat aliyun_signer starops_sse starops_chat starops_report devops_skill preset_seed feishu_config dingtalk_config aliyun_config daily_anomaly conversation_ownership stream_error_contract store_history_pagination error_response_hygiene jwt_jwks action_idempotency; do node tests/$f.test.mjs | tee /dev/stderr | grep -q ', 0 failed' || { echo \"GUARD FAIL: tests/$f.test.mjs \u6ca1\u6253\u5370\u6210\u529f\u884c\" >&2; exit 1; }; done"
+    "test": "for f in role_guard cross_account_role_alias authz capabilities_env_gate cur_dashboard_failsoft admin_role_perms agentcore wait_hint warmup llm_config llm_gateway gateway_host llmcfg_disabled inspection inspection_readside cross_account_identity support_cross_account manual_onboard_flow alias_and_batch_run judge_finding deep_investigation_availability investigation_ref direct_context turn_errors turn_inflight collapse_discard account_gates trace_html topic_normalize dashboard_insight_requests devops_chat aliyun_signer starops_sse starops_chat starops_report devops_skill preset_seed feishu_config dingtalk_config aliyun_config daily_anomaly conversation_ownership stream_error_contract store_history_pagination error_response_hygiene jwt_jwks action_idempotency mfa; do node tests/$f.test.mjs | tee /dev/stderr | grep -q ', 0 failed' || { echo \"GUARD FAIL: tests/$f.test.mjs \u6ca1\u6253\u5370\u6210\u529f\u884c\" >&2; exit 1; }; done"
   },
   "dependencies": {
     "@aws-crypto/sha256-js": "^5.2.0",
@@ -19,7 +19,7 @@
     "@aws-sdk/client-budgets": "^3.700.0",
     "@aws-sdk/client-cloudformation": "^3.700.0",
     "@aws-sdk/client-cloudwatch": "^3.1083.0",
-    "@aws-sdk/client-cognito-identity-provider": "^3.1083.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.1120.0",
     "@aws-sdk/client-cost-and-usage-report-service": "^3.1080.0",
     "@aws-sdk/client-cost-explorer": "^3.700.0",
     "@aws-sdk/client-cost-optimization-hub": "^3.1081.0",

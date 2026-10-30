@@ -163,6 +163,7 @@ notiops-webchat.template.json
 |---|---|---|
 | **What to install** | `web` | 下拉四选一：`web`（只装浏览器里的聊天界面）/ `web+feishu`（再加一个飞书/Lark 机器人）/ `web+slack`（再加一个 Slack 机器人）/ `web+dingtalk`（再加一个钉钉机器人）。**四个选项都装 web** —— IM 是加装项，不是替代项。选了带 IM 的还要在 IM 平台侧配几步，见 [§2.11](#211-加装-im-机器人飞书larkslack-或钉钉)。**部署完也能改**（update 栈换个值即可，见 §2.11）。 |
 | **Give the agent account-wide read-only access?** | `Yes` | 选 `Yes` 会给 agent 挂上 AWS 托管的 `ReadOnlyAccess`，于是它能回答这个账号里任何资源的问题。选 `No` 则只保留精选的只读授权（成本、日志、指标、RDS/EC2 describe），有些问题会答不了并明确告诉你缺哪条 action。**两种选择都不给任何写权限。** |
+| **Two-step verification at web sign-in** | `OPTIONAL` | 网页登录的两步验证（验证器 App）：`OPTIONAL` 每个人自己在菜单里开、「管理」页要求先开；`REQUIRED` 所有人下次登录时必须绑定；`OFF` 只用密码。部署完也能改（update 栈换个值），IM 机器人不受影响。见 [§8](#8-安全说明值得知道的几条) 第 7 条。 |
 | **CORS allowed origins** | `*` | 接口本身已经是 `AWS_IAM`（SigV4）鉴权，`*` 不构成越权。想再收一层，可以在第一次部署完之后 update 栈、把它设成 `ChatUrl` 那个地址。 |
 | **IM chat/channel allow list (optional)** | 空 | 只有装了 IM 才有意义（[§2.11](#211-加装-im-机器人飞书larkslack-或钉钉)），只装 web 可以完全不管。填逗号分隔的飞书 chat id（`oc_...`）、Slack channel id（`C...`）或钉钉 `conversationId`（在群里 @ 一句后从 worker 日志里拿），**不能有空格**；留空 = 不限制，机器人被拉进的任何群都答。三个平台共用这一个参数。它是 IM 入口的一道纵深防御（[§8](#8-安全说明值得知道的几条) 里的第 ③ 道）：清单外会话的消息会在**任何模型调用之前**被丢弃 —— 飞书/Slack 在入口函数就拦（即使验签被绕过也拦得住），钉钉的 `conversationId` 要**验签之后**才解得出来，所以它落在 worker 那一层拦。**正常节奏是先留空部署 → 建群拿到 chat id → 再 update 栈填进去**，所以它归在 `Security` 组、不在必填项里。与 `setup.sh` 路径的 `imAllowedChatIds` 等价（那边写进 `infra/cdk.json` 的 `context`，见 [IM_WEBHOOK_SETUP.md §4](IM_WEBHOOK_SETUP.md#4-群允许清单allowlist可选三个平台都支持)）。 |
 | **On stack delete** | `KeepData` | 决定删栈时你的数据怎么办。见 [§6 删除](#6-删除这个栈)——**改这个值有个坑，删栈前先读那一节**。 |
@@ -227,6 +228,8 @@ notiops-webchat.template.json
 > 真的丢了：Cognito 控制台 → 该 user pool → Users → `admin` → 重设密码。
 
 登录后建议先问一句 `列出这个账号里的 EC2 实例` 之类的，确认 agent 真的能答（顺便验证 §1.2 的模型访问）。
+
+> 🔐 **两步验证**：参数保持默认 `OPTIONAL` 时，第一次点「更多 → 管理」会先要求你开启两步验证（用验证器 App 扫一个二维码、输入 6 位验证码，一分钟的事）。选了 `REQUIRED` 的话，改完初始密码紧接着就要绑定。见 [§8](#8-安全说明值得知道的几条) 第 7 条。
 
 ### 2.6 （可选）多账号：组织内跨账号
 
@@ -704,6 +707,8 @@ CloudFormation → 选中栈 → **Delete**。**实测**：`KeepData` ~**3 分 1
 
 删栈过程中，栈里的部署 Lambda 会先把网站桶、staging 桶和（装了成本 MCP 时的）Athena 查询结果桶**清空**（非空的桶删不掉，会把整个删栈卡住），然后按 `TeardownMode` 决定要不要删那两张表和数据桶。数据桶由单独一步 `DataCleanup` 删，排在报告 CloudFront 分发**删完之后** —— 这个桶就是分发的源站（v1.0.32 及更早先删桶，分发还要再删几分钟，这段时间它指向一个已经不存在的桶名，桶名又是全局的、别人可以抢注）。2026-08 实测两种模式都是**零 `DELETE_FAILED`**。⚠️ 这句话在 v1.0.30 的预发布版上**一度不成立**：装了成本 MCP 的栈，部署 Lambda 缺查询结果桶的权限，删栈停在 `DELETE_FAILED`（2026-10-10 实测，已修；修复后同日重测 `DeleteEverything`：4 分 12 秒删完、零 `DELETE_FAILED`，查询结果桶里放了对象也照样清掉）。卡住了怎么收拾见 [§6.5](#65-删栈停在-delete_failedstagersite怎么办)。
 
+> **聊天界面的 CloudFront 分发偶尔删不掉**：删栈停在 `DELETE_FAILED`，失败的是 `ChatCDN…`，原因是 `The distribution you are trying to delete has not been disabled`（CloudFront 409）。CloudFormation 已经把它禁用了，只是 CloudFront 那边还没同步过来。**再点一次 Delete 就行**（2026-10-25 实测碰到一次，重删 31 秒完成）。这时它的源站桶还在，不会出现分发指向不存在的桶。
+
 ### 6.4 会留下的东西（孤儿），要不要管
 
 | 留下的 | 为什么 | 建议 |
@@ -789,6 +794,13 @@ done
 4. **管理员密码我们碰不到**：临时密码由 Cognito 生成并直接发给你。部署流程不传、不读、不打印、不放进 Outputs。
 5. **你自己的凭证做的所有动作**：整条链路上没有我们的账号、我们的桶、我们的角色。
 6. **装了 IM 就多一个公网入口**（[§2.11](#211-加装-im-机器人飞书larkslack-或钉钉)）——那个 **API Gateway HTTP API** 必须是**未鉴权**的，因为飞书/Slack/钉钉都不会给你签 SigV4（2026-09-01 之前这里是 Lambda Function URL，为什么换、以及被否掉的两个替代方案，见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §5.1）。五道边界：① **验签**（飞书用 Encrypt Key + Verification Token，Slack 用 signing secret，钉钉用 AppSecret 校验请求头里的 `sign`（带 1 小时时间窗），缺钥匙就冷启动失败，不存在"没配好也能进"）；② **两层限流** —— HTTP API 阶段级 50 req/s、突发 100（超出的请求由 API Gateway 直接 429，**不进 Lambda**），入口函数上再叠**并发上限 10**，这是公网未鉴权入口的花费天花板；③ 可选的**群允许清单**（只让指定群里的消息生效，见 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §4；钉钉这一层落在 worker、在验签之后，因为 `conversationId` 要验签才解得出来）；④ **幂等去重**（同一个事件重复投递只处理一次）；⑤ 到了后端仍然是**同一个只读 agent**，没有任何写权限 —— 即使有人伪造了一条消息，最坏结果也是读到只读信息。凭证一律放 Secrets Manager，不进环境变量、不打印在日志里。还剩下的风险如实列在 [IM_WEBHOOK_SETUP.md](IM_WEBHOOK_SETUP.md) §5.3。
+7. **登录两步验证（验证器 App）**：参数 **Two-step verification at web sign-in**（`MfaMode`），三档：`OPTIONAL`（默认：每个人在左下角菜单自己开，「管理」页要求先开）/ `REQUIRED`（所有人下次登录时绑定，之后每次都要 6 位验证码）/ `OFF`（只用密码）。只开验证器 App（TOTP），不开短信 / 邮件验证码（前者要配 SNS、新账号在沙箱里发不出去；后者要把用户池升到付费档并自己配 SES）。二维码在浏览器里生成；绑定和验证码都在浏览器与 Cognito 之间完成，BFF 不经手。IM 机器人不受影响。用户手机丢了：管理员在 **管理 → 用户** 里点 **重置两步验证**（会同时退出他所有会话）。**唯一的管理员自己丢了手机**：有这个账号权限的人用 AWS CLI 删掉他登记的验证器（CLI 要 2.36.33 及以上，`aws --version` 看版本），他再重新绑定：`REQUIRED` 档是下次登录时，`OPTIONAL` 档是打开「管理」页时（`setup.sh` 部署同样适用；用户池 id 在 Cognito 控制台里找名为 `notiops-users` 的那个，或者看 `ChatUrl` 下 `config.json` 里的 `cognitoUserPoolId`）：
+
+   ```bash
+   aws cognito-idp admin-delete-software-token --region <区域> --user-pool-id <用户池 id> --username admin
+   ```
+
+   只用 `admin-set-user-mfa-preference` 关掉偏好不够：`REQUIRED` 档下 Cognito 照样要丢了的那个验证器的码。
 
 ---
 

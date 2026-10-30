@@ -205,6 +205,19 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
         "set this to the ChatUrl output for defense in depth.",
     });
 
+    // 两步验证（验证器 App）。三档的语义与方式 B 的 MFA_MODE 一致，见 constructs/web-mfa.ts。
+    // 默认 OPTIONAL：升级时没人被强制，但「管理」页要先开（BFF 判）。描述是对客文案，只许 ASCII。
+    const mfaMode = new cdk.CfnParameter(this, "MfaMode", {
+      type: "String",
+      default: "OPTIONAL",
+      allowedValues: ["OFF", "OPTIONAL", "REQUIRED"],
+      description:
+        "Two-step verification (an authenticator app code) at web sign-in. OPTIONAL: each user can " +
+        "turn it on from the account menu, and the Admin pages require it. REQUIRED: every user sets " +
+        "it up at their next sign-in and enters a code every time after that. OFF: password only. " +
+        "You can change this on a later stack update; IM bots are not affected.",
+    });
+
     const teardownMode = new cdk.CfnParameter(this, "TeardownMode", {
       type: "String",
       default: "KeepData",
@@ -541,7 +554,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           },
           {
             Label: { default: "Security (safe defaults -- change only if you know why)" },
-            Parameters: [agentReadOnlyAccess.logicalId, allowedOrigins.logicalId, imAllowedChatIds.logicalId],
+            Parameters: [mfaMode.logicalId, agentReadOnlyAccess.logicalId, allowedOrigins.logicalId, imAllowedChatIds.logicalId],
           },
           {
             Label: { default: "Optional: your own CUR data source" },
@@ -570,6 +583,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
           [enableDeepInvestigation.logicalId]: {
             default: "Enable AWS DevOps Agent features (deep investigation, DevOps Chat)?",
           },
+          [mfaMode.logicalId]: { default: "Two-step verification at web sign-in" },
           [agentReadOnlyAccess.logicalId]: { default: "Give the agent account-wide read-only access?" },
           [allowedOrigins.logicalId]: { default: "CORS allowed origins" },
           [imAllowedChatIds.logicalId]: { default: "IM chat/channel allow list (optional)" },
@@ -823,7 +837,7 @@ export class NotiOpsWebChatStandaloneStack extends cdk.Stack {
     });
 
     // ══ 最小底座 ══════════════════════════════════════════════════════════════
-    const base = createMinimalBase(this);
+    const base = createMinimalBase(this, { mfaMode: mfaMode.valueAsString });
 
     // ══ StagerFn：单栈里唯一的搬运工 ═══════════════════════════════════════════
     // 代码**内联**（`Code.ZipFile`，官方上限 4MB）—— 它自己不能依赖任何桶，否则就是

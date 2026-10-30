@@ -11,6 +11,7 @@ import {
 } from "./icons";
 import ConvItem from "./ConvItem";
 import UserMenu from "./UserMenu";
+import type { MfaMode } from "../api/mfa";
 
 interface Props {
   conversations: Conversation[];
@@ -26,6 +27,9 @@ interface Props {
   onToggle: () => void;
   username: string;
   onSignOut: () => void;
+  /** 两步验证档位与「打开设置框」—— 透传给左下角 UserMenu。 */
+  mfaMode?: MfaMode | null;
+  onTwoFactor?: () => void;
   width?: number;
   onSkills?: () => void;        // 打开独立 Skills 页（收进「更多」，中文标签「技能」）
   skillsActive?: boolean;       // Skills 页当前是否激活（高亮）
@@ -97,7 +101,7 @@ const SHOW_CUSTOMIZE_ITEM = false;
 /** 「更多」展开态的记忆（"1" / "0"）。与会话分组的 notiops.collapsedGroups 同一套做法。 */
 const MORE_OPEN_KEY = "notiops.moreOpen";
 
-export default function Sidebar({ conversations, activeId, busyIds, unreadIds, onSelect, onNew, onRename, onTogglePin, onDelete, collapsed, onToggle, username, onSignOut, width = 264, onSkills, skillsActive, onCustomize, customizeActive, onWhatsNew, onNotifications, notificationsActive, notifUnread = 0, onFinops, finopsActive, onCases, casesActive, onAdmin, adminActive, showFinops = true, showCases = true, showAdmin = false, showNotifications = true, showInvestigation = true, showSkills = true, showCustomize = true, onInvestigate, investigateActive, onInspection, inspectionActive, showInspection = false }: Props) {
+export default function Sidebar({ conversations, activeId, busyIds, unreadIds, onSelect, onNew, onRename, onTogglePin, onDelete, collapsed, onToggle, username, onSignOut, mfaMode = null, onTwoFactor, width = 264, onSkills, skillsActive, onCustomize, customizeActive, onWhatsNew, onNotifications, notificationsActive, notifUnread = 0, onFinops, finopsActive, onCases, casesActive, onAdmin, adminActive, showFinops = true, showCases = true, showAdmin = false, showNotifications = true, showInvestigation = true, showSkills = true, showCustomize = true, onInvestigate, investigateActive, onInspection, inspectionActive, showInspection = false }: Props) {
   const t = useT();
   const { locale } = useLocale();
   // 「更多」子菜单的展开态：用户上次的选择（默认收起）。
@@ -314,7 +318,7 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
         <span className="wn-arrow"><IconChevronRight size={18} /></span>
       </button>
 
-      <UserMenu username={username} onSignOut={onSignOut} />
+      <UserMenu username={username} onSignOut={onSignOut} mfaMode={mfaMode} onTwoFactor={onTwoFactor} />
     </aside>
   );
 }

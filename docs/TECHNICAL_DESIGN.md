@@ -270,6 +270,7 @@ BFF Function URL(AUTH_TYPE = AWS_IAM)验签放行
 - **user pool 复用** notiops 侧,不新建身份体系
 - **Function URL 用 `AWS_IAM`**,靠 SigV4 挡未授权请求,不额外自建 token 校验
 - 前端 `config.json` 注入 `chatApiBase`(BFF Function URL)+ cognito 配置 + `identityPoolId`
+- **两步验证(验证器 App,TOTP;v1.0.34 起)**:用户池三档 `OFF` / `OPTIONAL`(默认)/ `REQUIRED`,两条部署路径各配一处(一键模板参数 `MfaMode`,`setup.sh` 的 `MFA_MODE` → `-c mfaMode=`),落到同一组 `MfaConfiguration` / `EnabledMfas`(判据 `infra/test/web-mfa.test.ts`)。绑定与输码都在浏览器里经 Amplify 直连 Cognito,BFF 不经手密钥和验证码;BFF 只做两件事:「管理」页(`nav:admin` 覆盖的全部 `/admin/*`)要求调用者已绑定 —— 判据是 Cognito 里此刻的状态(`AdminGetUser`),因为 ID token 里没有「这次登录用了 MFA」的声明;以及管理员替丢了手机的人重置(`AdminDeleteSoftwareToken` 删掉他登记的验证器 + 全局登出;只关偏好不够 ——「强制」档下验证器还登记着,Cognito 照样要旧码)。登录时绑定(Cognito 的 `MFA_SETUP`)只登记验证器、不启用,`AdminGetUser` 里看不出来,所以登录页拿到令牌后补一句「启用 + 首选」(`updateMFAPreference`),否则「强制」档的管理员进「管理」页还得再绑一次。档位由 BFF 从用户池现读(`GetUserPoolMfaConfig`),不走环境变量,不会与用户池漂移。见 `bff/web-chat/mfa.mjs`
 
 #### 2.4.4 SSE 事件类型(BFF → 前端)
 

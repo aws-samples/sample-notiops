@@ -101,6 +101,9 @@ const LOGIN_ONLY = [
   /\/conversations\/[^/]+$/,
   /\/accounts$/,
   /\/me\/capabilities$/,
+  // 两步验证的档位与自己是否已绑定（mfa.mjs::apiMyMfa）：只回 {mode, enrolled, adminRequiresMfa}，
+  // 任何登录用户都要用它决定菜单里显不显示「两步验证」。
+  /\/me\/mfa$/,
   // 可选模型清单：只返回 admin 已启用的模型（无 provider / 凭证 / 候选全集字段），
   // 任何登录用户都要用它渲染模型下拉（spec R6.2）。
   /\/models$/,
@@ -252,8 +255,9 @@ export async function authorize({ method, path, query, body }, eff, { disabledMo
   // adminOnly 节点单独判：通配派生的匹配不算，必须显式点名（见 satisfiesAdmin）。
   // 放在这里而不是塞进 satisfies()：只收紧 adminOnly 节点，不动其余通配语义。
   // 也不能落到下面的 subtab 兜底 —— nav:admin 没有子节点，落下去等于把判定绕开。
+  // `adminOnly: true` 回给调用方：index.mjs 据此再过一道两步验证门禁（mfa.mjs::adminMfaGate）。
   if (node.adminOnly) {
-    if (satisfiesAdmin(eff)) return { allow: true };
+    if (satisfiesAdmin(eff)) return { allow: true, adminOnly: true };
     return { allow: false, status: 403, required: node.key };
   }
   if (satisfies(eff, node.key)) return { allow: true };

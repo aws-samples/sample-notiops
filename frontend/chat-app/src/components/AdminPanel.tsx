@@ -19,7 +19,7 @@ import {
 } from "./icons";
 import {
   fetchAllCapabilities, fetchRoles, saveRole, deleteRole,
-  fetchUsers, putUser, createUser, deleteUser, fetchModules, putModules,
+  fetchUsers, putUser, createUser, deleteUser, resetUserMfa, fetchModules, putModules,
   fetchGroups, putGroupMap, createGroup, deleteGroup, fetchGroupMembers, addUserToGroup, removeUserFromGroup,
   fetchEol, putEol,
   fetchMemberAccounts, onboardMemberAccount, memberOnboardStatus, setMemberAccountEnabled,
@@ -38,6 +38,7 @@ import {
   type FullCapabilityNode, type RoleRec, type UserRec, type ModuleToggle, type GroupRec, type EolMap,
   type MemberAccountRec, type AccountVisibilityRec,
 } from "../api/admin";
+import type { MfaMode } from "../api/mfa";
 import ModelsView from "./models/ModelsView";
 
 type Tab = "roles" | "users" | "groups" | "modules" | "accounts" | "lifecycle" | "notifications" | "models" | "aliyun";
@@ -157,13 +158,40 @@ void _navCoversAllTabs;
 // `featureFlags.ts` 的 `MULTICLOUD_UI` 翻成 `true`，入口原样回来。
 const NAV_VISIBLE = NAV_ITEMS.filter((it) => it.key !== "aliyun" || MULTICLOUD_UI);
 
-export default function AdminPanel() {
+export default function AdminPanel({ mfaMode = null, mfaBlocked = false, mfaPending = false, onSetupMfa, currentUsername = "" }: {
+  /** 用户池的两步验证档位（/me/mfa）；用户列表据此决定显不显示「两步验证」一列。 */
+  mfaMode?: MfaMode | null;
+  /** 「管理」页要求先开两步验证、而当前用户还没开（BFF 也会以 403 mfa_required 拒绝全部 /admin/*）。 */
+  mfaBlocked?: boolean;
+  /** 两步验证状态（/me/mfa）还没回来：先什么都不发、不画，等它回来再决定是门禁提示还是正常页面。 */
+  mfaPending?: boolean;
+  onSetupMfa?: () => void;
+  currentUsername?: string;
+} = {}) {
   const t = useT();
   const [tab, setTab] = useState<Tab>("roles");
   const [caps, setCaps] = useState<FullCapabilityNode[]>([]);
   const [err, setErr] = useState("");
 
-  useEffect(() => { fetchAllCapabilities().then(setCaps).catch((e) => setErr(String(e?.message || e))); }, []);
+  // 被两步验证门禁拦着时不发请求（发了也是一排 403），开启之后 mfaBlocked 变 false 再拉。
+  useEffect(() => {
+    if (mfaBlocked || mfaPending) return;
+    fetchAllCapabilities().then(setCaps).catch((e) => setErr(String(e?.message || e)));
+  }, [mfaBlocked, mfaPending]);
+
+  if (mfaPending) return <div className="admin-panel" aria-busy="true" />;
+  if (mfaBlocked) {
+    return (
+      <div className="admin-panel" style={{ color: "var(--text)" }}>
+        <div className="mfa-gate" role="status">
+          <div className="mfa-gate-title">{t("mfa.gate.title")}</div>
+          <p className="mfa-text">{t("mfa.adminReason")}</p>
+          <p className="mfa-text muted">{t("mfa.gate.body")}</p>
+          {onSetupMfa && <button className="mfa-btn primary" onClick={onSetupMfa}>{t("mfa.gate.button")}</button>}
+        </div>
+      </div>
+    );
+  }
 
   return (
     // 复用 NotificationsPanel 的 .notif2 / .notif-side / .notif-content 样式（团队一致，
@@ -196,7 +224,7 @@ export default function AdminPanel() {
         <div className="admin-pane">
           {err && <div style={{ ...errText, marginBottom: 12 }}>{t("admin.error")}: {err}</div>}
           {tab === "roles" && <RolesView caps={caps} />}
-          {tab === "users" && <UsersView />}
+          {tab === "users" && <UsersView mfaMode={mfaMode} currentUsername={currentUsername} />}
           {tab === "groups" && <GroupsView />}
           {tab === "modules" && <ModulesView />}
           {tab === "accounts" && <AccountsView />}
@@ -1214,13 +1242,14 @@ function RolesView({ caps }: { caps: FullCapabilityNode[] }) {
 
 /* ───────────────── 用户 ───────────────── */
 
-function UsersView() {
+function UsersView({ mfaMode = null, currentUsername = "" }: { mfaMode?: MfaMode | null; currentUsername?: string }) {
   const t = useT();
   const [users, setUsers] = useState<UserRec[]>([]);
   const [roles, setRoles] = useState<RoleRec[]>([]);
   const [draft, setDraft] = useState<Record<string, { roles: string[]; denies: string }>>({});
   const [msg, setMsg] = useState<Record<string, string>>({});
   const [err, setErr] = useState("");
+  const [notice, setNotice] = useState("");
   const [query, setQuery] = useState("");
   const [expUser, setExpUser] = useState("");
   const [roleQ, setRoleQ] = useState("");
@@ -1274,6 +1303,18 @@ function UsersView() {
     setErr("");
     try { await deleteUser(u.username, u.sub); await reload(); }
     catch (e) { setErr(String((e as Error)?.message || e)); }
+  };
+
+  // 两步验证：用户池不是「关闭」档时显示每人绑没绑；替丢了手机的人重置（不能对自己 —— 自己用左下角菜单）。
+  const showMfa = mfaMode === "OPTIONAL" || mfaMode === "REQUIRED";
+  const doResetMfa = async (u: UserRec) => {
+    if (!window.confirm(t("admin.users.mfaResetConfirm").replace("{name}", u.username))) return;
+    setErr("");
+    try {
+      await resetUserMfa(u.username);
+      setNotice(t("admin.users.mfaResetDone").replace("{name}", u.username));
+      await reload();
+    } catch (e) { setErr(String((e as Error)?.message || e)); }
   };
 
   const filtered = users.filter((u) => u.username.toLowerCase().includes(query.trim().toLowerCase()));
@@ -1349,6 +1390,7 @@ function UsersView() {
       </div>
 
       {err && <div style={{ ...errText, marginBottom: 12 }}>{err}</div>}
+      {notice && <div style={{ ...okText, marginBottom: 12 }} role="status">{notice}</div>}
 
       {/* 用户卡片列表（折叠式：摘要行可点开编辑） */}
       {filtered.map((u) => {
@@ -1364,6 +1406,9 @@ function UsersView() {
               <div onClick={() => setExpUser(open ? "" : u.sub)} style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, cursor: "pointer", minWidth: 0, flexWrap: "wrap" }}>
                 <span style={{ fontWeight: 700, fontSize: 14 }} title={u.sub}>{u.username}</span>
                 {st && <span style={{ fontSize: 11, fontWeight: 600, color: u.status === "CONFIRMED" ? "var(--green)" : "var(--muted)", border: "1px solid var(--line)", borderRadius: 100, padding: "1px 8px" }}>{st}</span>}
+                {showMfa && typeof u.mfa === "boolean" && (
+                  <span className={`mfa-pill ${u.mfa ? "on" : "off"}`}>{t(u.mfa ? "admin.users.mfaOn" : "admin.users.mfaOff")}</span>
+                )}
                 <span style={{ display: "inline-flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
                   {d.roles.length === 0
                     ? <span style={{ color: "var(--muted)", fontSize: 12 }}>—</span>
@@ -1371,6 +1416,9 @@ function UsersView() {
                   {d.roles.length > 5 && <span style={{ color: "var(--muted)", fontSize: 11.5 }}>+{d.roles.length - 5}</span>}
                 </span>
               </div>
+              {showMfa && u.mfa === true && u.username !== currentUsername && (
+                <button style={btnGhost} title={t("admin.users.mfaReset")} onClick={() => doResetMfa(u)}>{t("admin.users.mfaReset")}</button>
+              )}
               <button style={iconBtn} title={t("admin.users.delete")} onClick={() => doDelete(u)}>✕</button>
               <button style={{ ...iconBtn, border: "none" }} onClick={() => setExpUser(open ? "" : u.sub)}>{open ? "▲" : "▼"}</button>
             </div>

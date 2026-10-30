@@ -71,7 +71,8 @@ Your administrator gives you a URL and an initial account.
 
 1. Open the URL. You get a single card titled **Sign in to NotiOps**, with Username / Password fields and a **Sign in** button. Nothing else renders until you are signed in.
 2. **Your first sign-in always forces a password change**: the same card then asks you to **Set a new password**, and you go straight in.
-3. The sign-in page is deliberately **English-only** — there is no language switch here. You switch to Chinese after signing in. Note that a failed sign-in shows a hardcoded Chinese string (`登录失败`), and an unsupported extra verification step shows `需要额外验证步骤: <step>`.
+3. **When the deployment requires two-step verification** (the REQUIRED mode, see [§1.6](#16-two-step-verification-authenticator-app)), right after the new password you set up an authenticator: scan the QR code on the card with an authenticator app and enter the 6-digit code it shows. From then on, every sign-in has one more step after the password, **Two-step verification**: enter the 6-digit code.
+4. The sign-in page is deliberately **English-only** — there is no language switch here. You switch to Chinese after signing in. A failed sign-in shows the reason Cognito gives; a verification step this page does not support shows `This sign-in step is not supported here: <step>`.
 
 **The initial username is `admin` on both deployment paths**; where the temporary password comes from differs:
 
@@ -82,12 +83,13 @@ Your administrator gives you a URL and an initial account.
 
 ### 1.2 Set language and appearance first
 
-**Click your own name at the bottom-left** to open the user menu. It has exactly three items, and the first two are worth setting on day one:
+**Click your own name at the bottom-left** to open the user menu. It has three items (four when the deployment has two-step verification on: **Two-step verification**, see [§1.6](#16-two-step-verification-authenticator-app)), and the first two are worth setting on day one:
 
 | Menu item | What it does |
 |---|---|
 | **Appearance** | Only **Dark** (the default) and **Light** — there is no "follow system" option |
 | **Language** | Exactly two options: `English (United States)` and `中文（简体）`. **A fresh browser defaults to English**; your choice is remembered per browser |
+| **Two-step verification** | Only when the deployment has two-step verification on: turn it on / use a different authenticator / turn it off, see [§1.6](#16-two-step-verification-authenticator-app) |
 | **Sign out** | Returns you to the sign-in card |
 
 The GitHub icon to the right of your name (its hover text reads "Star NotiOps on GitHub") opens the public repository home in a new tab — the changelog (Releases) and issue reporting (Issues) are reached from there. The menu's three former external links (View changelog / Learn more / Report an issue) were removed on 2026-09-12.
@@ -130,6 +132,22 @@ Enter sends, `Shift + Enter` inserts a newline. A caption under the composer alw
 1. **It is read-only on your infrastructure.** It can read your CloudWatch, CloudTrail, EC2, RDS, cost, security findings and Support cases, and it **changes nothing**. The single exception is AWS Support cases (create / reply / close), and even those only execute after you click a confirm button — see §8.
 2. **Every question targets one specific AWS account.** The account picker in the topbar decides which account this turn is about, and every answer's footer prints the 12-digit account it actually answered for, so you can't mistake an old answer for the current account.
 3. **Conversations are kept for 30 days by default.** The server expires them (touching a conversation refreshes the clock). Anything you need long-term, export via **long-report download** (§4.8).
+
+### 1.6 Two-step verification (authenticator app)
+
+With two-step verification on, signing in needs, besides your password, the 6-digit code from an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password and so on). Whoever operates this NotiOps deployment picks one of three modes (the one-click parameter **Two-step verification at web sign-in**, or `MFA_MODE` for `setup.sh`):
+
+| Mode | What you see |
+|---|---|
+| **OPTIONAL** (default) | Turn it on yourself in the bottom-left menu under **Two-step verification**: **Turn on** → scan → enter the 6-digit code. After that every sign-in asks for a code, and you can turn it off again. **The Admin pages require it**: an admin who has not turned it on only sees **Turn on two-step verification first** and a **Turn it on now** button there |
+| **REQUIRED** | Your next sign-in (for a new user, right after the initial password change) asks you to set it up, and every sign-in after that asks for a code; the menu only offers **Use a different authenticator**, not turning it off |
+| **OFF** | Password only; the menu has no such item |
+
+- The QR code is generated in your browser and goes through no third party; if your phone cannot scan it, type the key shown under it.
+- **New phone**: while you still have the old one, choose **Use a different authenticator** in the menu and scan with the new phone; once that is verified, codes from the old phone stop working.
+- **Lost your phone and cannot sign in**: ask an admin to click **Reset two-step verification** on your row under **Admin → Users**. All your signed-in sessions are signed out and you set it up again at your next sign-in (in OPTIONAL mode, signing in only needs your password until you turn it on again).
+- If an admin lost their own phone and no other admin can reset it, someone with access to the AWS account can reset it with the AWS CLI; the command is in [DEPLOYMENT_ONECLICK.en.md §8](DEPLOYMENT_ONECLICK.en.md#8-security-notes-worth-knowing) (it works for both deployment methods).
+- IM bots are not affected: they do not use the web sign-in.
 
 ---
 
@@ -706,7 +724,7 @@ This section is for administrators. Ordinary users don't see the Admin entry.
 | Section | Page | Purpose |
 |---|---|---|
 | **Access control** | **Roles** | Define roles and tick what they can see / do |
-| | **Users** | Manage users |
+| | **Users** | Manage users; with two-step verification on, shows who has turned it on and lets you **Reset two-step verification** for someone who lost their phone (not for yourself; use the bottom-left menu) |
 | | **Group mapping** | Map Cognito groups to roles |
 | **Cloud environment** | **Accounts** | Onboard / enable member accounts (the source of cross-account capability), and DevOps Agent onboarding |
 | | **Lifecycle** | EOS / lifecycle |

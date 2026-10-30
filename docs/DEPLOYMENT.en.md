@@ -598,6 +598,7 @@ normally passes (see §8.1).
 | `costAgentMcpUrl` / `costAgentFunctionArn` | (empty) | "External" mode: a cost-agent MCP **you already run** (the two must come as a pair), used as the data source behind the four CUR sheets under FinOps. To have NotiOps deploy that server for you (recommended), use `COST_MCP_SELF_HOST=true ./setup.sh` instead of these two — see §14.2. With neither, those four entries do not appear at all (see `requiresEnv`) |
 | `agentRuntimeArn` | (empty) | ARN of an already-deployed Web Chat AgentCore Runtime. `setup.sh` passes it once the agent is deployed |
 | `operatorAppAlreadyEnabled` | `false` | ⚠️ **Never pass this by hand** — passing `true` makes the stack assume the Operator App is already enabled and skip enabling it |
+| `mfaMode` | `OPTIONAL` | Two-step verification (authenticator app) for the web sign-in: `OFF` / `OPTIONAL` / `REQUIRED` (`OPTIONAL` lets each user turn it on from the menu and the Admin pages require it; `REQUIRED` makes everyone set it up at their next sign-in). `setup.sh` derives it from `$MFA_MODE`: **without `MFA_MODE` it keeps the previous choice** (read from the `WebMfaMode` output of `NotiOpsBackendStack`), and a first install or an upgrade from v1.0.33 or earlier gets `OPTIONAL`. Example: `MFA_MODE=REQUIRED ./setup.sh`. To reset an admin who lost their phone, see item 7 of [DEPLOYMENT_ONECLICK.en.md §8](DEPLOYMENT_ONECLICK.en.md#8-security-notes-worth-knowing) (the same on both paths) |
 
 For the IM side (`enabledPlatforms` / `imAllowedChatIds`) see the `ImStack` context
 table in §11.1. `infra/cdk.json`'s `context` block contains **no** entries for any of
@@ -1157,7 +1158,7 @@ Below are the context keys each stack **actually reads**. `setup.sh` passes some
 
 The context keys `NotiOpsBackendStack` reads are exactly its rows in the §4.3 table — `organizationId` /
 `inspectionReportLocale` / `monthlyLimitSeconds` / `opsAlertEmail` / `webBaseUrl` / `skipPhd` /
-`phdLinkedAccounts` / `oamSinkArn` / `operatorAppAlreadyEnabled` — plus the `webNotif<Id>` keys from §12.5.
+`phdLinkedAccounts` / `oamSinkArn` / `operatorAppAlreadyEnabled` / `mfaMode` — plus the `webNotif<Id>` keys from §12.5.
 
 > ⚠️ The three keys this table used to list, `agentSpaceId` / `devOpsAgentRegion` /
 > `reportUrlExpirationSeconds`, are **not read anywhere** in the code, so passing them has no effect: the

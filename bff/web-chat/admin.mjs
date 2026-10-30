@@ -19,6 +19,7 @@ import {
   getEolOverrides, putEolOverrides,
 } from "./rbac_store.mjs";
 import { getEolTable } from "./eos.mjs";
+import { enrolledMap } from "./mfa.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || "";
@@ -141,6 +142,9 @@ export async function apiListUsers() {
     }
     token = r.PaginationToken;
   } while (token);
+  // 「两步验证」一列：true / false / null（读不到）。ListUsers 不带这项，见 mfa.mjs::enrolledMap。
+  const mfa = await enrolledMap(users.map((u) => u.username));
+  for (const u of users) u.mfa = mfa.has(u.username) ? mfa.get(u.username) : null;
   return users;
 }
 

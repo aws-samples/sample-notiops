@@ -18,6 +18,7 @@
  */
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
+import { parseMfaMode, userPoolMfaProps } from "./constructs/web-mfa";
 import { curFinalizerPolicyStatements } from "./constructs/cur-finalizer-policy";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as apigateway from "aws-cdk-lib/aws-apigateway";
@@ -246,6 +247,9 @@ export class NotiOpsBackendStack extends cdk.Stack {
     });
 
     // ─── Cognito User Pool ───
+    // 两步验证（TOTP）三档由 `-c mfaMode=` 给（setup.sh 的 MFA_MODE；没给 = OPTIONAL），取值与映射
+    // 见 constructs/web-mfa.ts。一键部署那边是模板参数 MfaMode，两边同一套语义。
+    const mfaMode = parseMfaMode(this.node.tryGetContext("mfaMode"));
     const userPool = new cognito.UserPool(this, "IdleDetectorUserPool", {
       userPoolName: "notiops-users",
       selfSignUpEnabled: false,
@@ -258,7 +262,14 @@ export class NotiOpsBackendStack extends cdk.Stack {
         requireDigits: true,
         requireSymbols: false,
       },
+      ...userPoolMfaProps(mfaMode),
       removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    // setup.sh 重跑时据此保留上次选的档位（没设 MFA_MODE 时）。不从用户池读：v1.0.33 及更早建的池都是「关闭」，
+    // 从池读会让升级上来的部署永远停在 OFF（见 setup.sh 的 MFA_MODE 那段）。
+    new cdk.CfnOutput(this, "WebMfaMode", {
+      value: mfaMode,
+      description: "Web sign-in two-step verification mode (OFF / OPTIONAL / REQUIRED). setup.sh keeps it on re-runs unless MFA_MODE is set.",
     });
 
     const userPoolClient = userPool.addClient("IdleDetectorWebClient", {

@@ -2090,8 +2090,35 @@ _cdk_out_cleanup() {
   fi
   exit "$rc"                      # 原样传出，不改 set -e 的 fail-fast 语义
 }
+# ─── Web 登录两步验证（验证器 App，TOTP）三档：MFA_MODE=OFF | OPTIONAL | REQUIRED ───
+#   OFF      只用密码（v1.0.33 及更早的样子）
+#   OPTIONAL 默认。每个人可以在左下角菜单里自己开；「管理」页要求先开
+#   REQUIRED 所有人下次登录时必须绑定
+# 取值优先级：环境变量 MFA_MODE > 现网 NotiOpsBackendStack 的 WebMfaMode 输出（上次部署选的）> OPTIONAL。
+# ⚠️ 不从用户池本身读「现网是哪一档」：v1.0.33 及更早建的用户池都是「关闭」，从它读会让所有升级上来的
+#    部署永远停在 OFF、拿不到新默认值；WebMfaMode 输出只有选过的部署才有。
+# 只有后端栈（用户池所在）吃这个值；BFF 从用户池现读，不需要它。
+MFA_MODE="${MFA_MODE:-}"
+if [ -z "$MFA_MODE" ]; then
+  _live_mfa="$(aws cloudformation describe-stacks --stack-name NotiOpsBackendStack --region "$DEPLOY_REGION" \
+    --query "Stacks[0].Outputs[?OutputKey=='WebMfaMode'].OutputValue | [0]" --output text 2>/dev/null || true)"
+  case "$_live_mfa" in
+    OFF|OPTIONAL|REQUIRED) MFA_MODE="$_live_mfa" ;;
+    *) MFA_MODE="OPTIONAL" ;;
+  esac
+fi
+MFA_MODE="$(printf '%s' "$MFA_MODE" | tr '[:lower:]' '[:upper:]')"
+case "$MFA_MODE" in
+  OFF|OPTIONAL|REQUIRED) ;;
+  *)
+    echo "  $(t "❌ MFA_MODE 只能是 OFF / OPTIONAL / REQUIRED，收到: " "❌ MFA_MODE must be OFF / OPTIONAL / REQUIRED, got: ")$MFA_MODE"
+    exit 1 ;;
+esac
+MFA_FLAG="-c mfaMode=$MFA_MODE"
+echo "  $(t "Web 登录两步验证: " "Web sign-in two-step verification: ")$MFA_MODE  $(t "（改用 MFA_MODE=OFF|OPTIONAL|REQUIRED ./setup.sh）" "(change with MFA_MODE=OFF|OPTIONAL|REQUIRED ./setup.sh)")"
+
 trap _cdk_out_cleanup EXIT INT TERM
-npx cdk synth --quiet --all --output "$CDK_OUT_DIR" $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG $PLATFORM_FLAG $AGENT_ARN_FLAG $ORG_FLAG $INSPECTION_FLAGS $COST_AGENT_FLAG 2>cdk-synth-stderr.log || SYNTH_OK=false
+npx cdk synth --quiet --all --output "$CDK_OUT_DIR" $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG $PLATFORM_FLAG $AGENT_ARN_FLAG $ORG_FLAG $INSPECTION_FLAGS $COST_AGENT_FLAG $MFA_FLAG 2>cdk-synth-stderr.log || SYNTH_OK=false
 
 if [ "$SYNTH_OK" = false ]; then
   echo ""
@@ -2200,7 +2227,7 @@ case "${RETIRE_PLAN%% *}" in
       npx cdk deploy "$_retire_stack" --exclusively --require-approval never \
         --output "$CDK_OUT_DIR" \
         $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG \
-        $PLATFORM_FLAG $AGENT_ARN_FLAG $ORG_FLAG $INSPECTION_FLAGS $COST_AGENT_FLAG
+        $PLATFORM_FLAG $AGENT_ARN_FLAG $ORG_FLAG $INSPECTION_FLAGS $COST_AGENT_FLAG $MFA_FLAG
     done
     ;;
   FALLTHROUGH)
@@ -2231,7 +2258,7 @@ echo "  $(t "执行完整部署..." "Running full deployment...")"
 # 调真 agent；为空则 BFF 回退 echo。
 # $COST_AGENT_FLAG（可选）= "-c costAgentMcpUrl=<url> -c costAgentFunctionArn=<arn>"：BFF 的
 # 环境变量 + lambda:InvokeFunctionUrl + 缓存前缀授权 + 每日预热规则都由它决定（web-chat-core.ts）。
-npx cdk deploy --all --require-approval never --output "$CDK_OUT_DIR" --outputs-file cdk-outputs.json $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG $PLATFORM_FLAG $AGENT_ARN_FLAG $ORG_FLAG $INSPECTION_FLAGS $COST_AGENT_FLAG
+npx cdk deploy --all --require-approval never --output "$CDK_OUT_DIR" --outputs-file cdk-outputs.json $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG $PLATFORM_FLAG $AGENT_ARN_FLAG $ORG_FLAG $INSPECTION_FLAGS $COST_AGENT_FLAG $MFA_FLAG
 # 部署成功 → 收尾时可以删 assembly（见上面的 _cdk_out_cleanup）。
 # 放在 deploy 之后：set -e 保证 deploy 非零就到不了这里。
 CDK_DEPLOY_DONE=1
@@ -2786,7 +2813,7 @@ if [ "$AGENT_STATUS" != "deployed" ]; then
   #    少 $ORG_FLAG → org 模式失效（跨账号查询报 org_mode_disabled）；
   #    少 $INSPECTION_FLAGS → 推送深链变空、巡检预算护栏关掉。
   #    CDK 的 context 不是"合并进已部署的栈"，而是每次 synth 从零重算。
-  echo "      cd infra && npx cdk deploy WebChatStack --exclusively --require-approval never -c agentRuntimeArn=<ARN> $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG $PLATFORM_FLAG $ORG_FLAG $INSPECTION_FLAGS $COST_AGENT_FLAG"
+  echo "      cd infra && npx cdk deploy WebChatStack --exclusively --require-approval never -c agentRuntimeArn=<ARN> $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG $PLATFORM_FLAG $ORG_FLAG $INSPECTION_FLAGS $COST_AGENT_FLAG $MFA_FLAG"
   echo "  $(t "   （上面这条已带本次部署用的全套 -c；少任何一个都会静默关掉对应功能。）" "   (The command above already carries the full -c set used by this deployment; dropping any one silently disables that feature.)")"
   echo ""
 fi

@@ -573,6 +573,7 @@ CDK 栈始终通过 ARN 引用这些 secret,**本地不落任何凭据文件**�
 | `costAgentMcpUrl` / `costAgentFunctionArn` | (空) | 「外接」模式:指向你**自己在跑**的 cost-agent MCP(两个必须成对),作 FinOps 里四张 CUR 报表的数据源。想让 NotiOps 替你部这个 server(推荐),用 `COST_MCP_SELF_HOST=true ./setup.sh`,不用这两个 —— 见 §14.2。两种都不配时这四个入口整个不出现(见 `requiresEnv`) |
 | `agentRuntimeArn` | (空) | 已部署好的 Web Chat AgentCore Runtime ARN。`setup.sh` 部署完 agent 后自动传 |
 | `operatorAppAlreadyEnabled` | `false` | ⚠️ **不要手工传** —— 传 `true` 会让栈以为 Operator App 已启用而跳过启用步骤 |
+| `mfaMode` | `OPTIONAL` | Web 登录两步验证(验证器 App):`OFF` / `OPTIONAL` / `REQUIRED`(`OPTIONAL` 时每个人在菜单里自己开、「管理」页要求先开;`REQUIRED` 时所有人下次登录必须绑定)。由 `setup.sh` 从 `$MFA_MODE` 转成它:**没设 `MFA_MODE` 时保留上次的选择**(读 `NotiOpsBackendStack` 的 `WebMfaMode` 输出),第一次装、或从 v1.0.33 及更早升级上来时是 `OPTIONAL`。例:`MFA_MODE=REQUIRED ./setup.sh`。管理员丢了手机的重置办法见 [DEPLOYMENT_ONECLICK.md §8](DEPLOYMENT_ONECLICK.md#8-安全说明值得知道的几条) 第 7 条(两条路径一样) |
 
 IM 侧的 `enabledPlatforms` / `imAllowedChatIds` 见 §11.1 的 `ImStack` context 表。
 `infra/cdk.json` 的 `context` 段里默认**没有**这些 key 的条目,要用就自己加进去,再重跑 `./setup.sh`
@@ -1089,7 +1090,7 @@ aws dynamodb delete-item --table-name <conv-table> \
 
 `NotiOpsBackendStack` 读的 context 就是 §4.3 那张表里属于它的那几个 —— `organizationId` /
 `inspectionReportLocale` / `monthlyLimitSeconds` / `opsAlertEmail` / `webBaseUrl` / `skipPhd` /
-`phdLinkedAccounts` / `oamSinkArn` / `operatorAppAlreadyEnabled` —— 外加 §12.5 的 `webNotif<Id>`。
+`phdLinkedAccounts` / `oamSinkArn` / `operatorAppAlreadyEnabled` / `mfaMode` —— 外加 §12.5 的 `webNotif<Id>`。
 
 > ⚠️ 这里以前列的 `agentSpaceId` / `devOpsAgentRegion` / `reportUrlExpirationSeconds` 三个 key,代码里
 > **一个都不读**,传了也不生效:两个 Agent Space 由栈自己新建(见 §5.3.5),DevOps Agent 用的就是部署

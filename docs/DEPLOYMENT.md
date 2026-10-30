@@ -1023,6 +1023,38 @@ aws dynamodb delete-item --table-name <conv-table> \
   --key '{"lookup_key":{"S":"locale#dm#feishu:<user_id>"}}'
 ```
 
+### 8.6 定时任务的总开关
+
+「更多 → 定时任务」由 WebChatStack 里一条每 5 分钟一次的 EventBridge 规则 `notiops-routines-tick` 触发 BFF 派发（使用说明见 [USER_GUIDE.md](USER_GUIDE.md) §5.8）。深度调查按秒计费，出事时可以一条命令停掉所有派发（进行中的照样收结果），不用重新部署：
+
+```bash
+aws dynamodb put-item --region <区域> --table-name notiops-config \
+  --item '{"PK":{"S":"appconfig#routines"},"SK":{"S":"enabled"},"config_value":{"S":"0"}}'
+```
+
+恢复：把 `config_value` 改成 `"1"`，或者删掉这一行。定时任务的报告在数据桶的 `routine-reports/` 前缀，保留 30 天（报告 CDN 放行这个前缀）。规则和报告前缀都由栈管理，`teardown.sh` 不需要额外处理。
+
+### 8.7 忘记密码与管理员救急
+
+2026-10-30 起(使用说明见 [USER_GUIDE.md](USER_GUIDE.md) §1.7):
+
+- **用户自己**:登录页 **Forgot password?**,验证码发到账号上**已验证**的邮箱(1 小时有效)。没有邮箱的人由管理员在 **管理 → 用户** 点 **重置密码**(一次性临时密码,7 天有效,同时退出他所有设备上的登录;两步验证不变)。
+- **新建用户邮箱必填**(「管理 → 用户」)。`setup.sh` 第一次部署时会问 admin 的邮箱(非交互运行用 `ADMIN_EMAIL=you@example.com ./setup.sh`);老部署的 admin 多半没有邮箱,升级时带上 `ADMIN_EMAIL=...` 就替它补上(不动密码和两步验证),或者登录后在左下角菜单 **账户与密码** 自己绑。
+- 发信用 Cognito 默认发件人(`no-reply@verificationemail.com`):**每个 AWS 账号每天最多 50 封**,09:00 UTC(北京时间 17:00)重置,不可调。超了当天的验证码发不出去,管理员重置不受影响。
+- 用户池只改了三项原地更新的属性(找回只走已验证邮箱、验证邮件文案、换邮箱验证前保留旧邮箱),升级**不替换**用户池、不丢用户。⚠️ 如果在 Cognito 控制台手工改过 `notiops-users` 用户池(比如自己接了 SES、加了 Lambda 触发器),CloudFormation 更新用户池时模板里没有的设置会回到默认值 —— 升级前先记下来。
+- **唯一的管理员也忘了密码**:有这个账号权限的人(本机或 CloudShell)跑下面几条。登录后会要求马上设新密码;`read -s` 是为了不让临时密码留在 shell 历史里。手机也丢了,再加一条 `admin-delete-software-token`(见 [DEPLOYMENT_ONECLICK.md §8](DEPLOYMENT_ONECLICK.md#8-安全说明值得知道的几条) 第 7 条)。
+
+```bash
+REGION=<区域>
+POOL=$(aws cognito-idp list-user-pools --region "$REGION" --max-results 60 \
+  --query "UserPools[?Name=='notiops-users'].Id | [0]" --output text)
+read -rs -p "临时密码（至少 8 位，含大小写字母和数字）: " PW; echo
+aws cognito-idp admin-set-user-password --region "$REGION" --user-pool-id "$POOL" \
+  --username admin --password "$PW" --no-permanent
+unset PW
+aws cognito-idp admin-user-global-sign-out --region "$REGION" --user-pool-id "$POOL" --username admin
+```
+
 ---
 
 ## 9. 回滚策略

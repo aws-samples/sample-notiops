@@ -251,7 +251,7 @@ function HealthEventCard({
  * 「显示完整通知」就地展开完整描述,无需再拉后台。深入调查/就此提问带上完整描述。
  */
 function InboxEventCard({
-  n, isNew, locale, t, onInvestigate, onAsk,
+  n, isNew, locale, t, onInvestigate, onAsk, onOpenConversation, currentUsername,
 }: {
   n: NotificationItem;
   isNew: boolean;
@@ -261,15 +261,20 @@ function InboxEventCard({
   // 接收方应把新会话的「深度调查（直连）」开关一起打开。见 types.ts:deepDiveTogglesFor。
   onInvestigate: (query: string, title: string, opts?: { deep?: boolean }) => void;
   onAsk: (query: string) => void;
+  /** 定时任务的通知：负责人本人可以直接打开那次运行的会话（会话按人存，别人打不开）。 */
+  onOpenConversation?: (id: string) => void;
+  currentUsername?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const routine = n.kind === "routine";
+  const canOpenChat = routine && !!n.convId && !!onOpenConversation && !!n.owner && n.owner === currentUsername;
   const hasDetail = !!(n.description && n.description.trim());
   return (
     <div className={"notif-card sev-" + n.severity + (isNew ? " is-new" : "")}>
       <span className="notif-sevbar" />
       <div className="notif-card-body">
         <div className="notif-card-top">
-          <span className="notif-src">{n.source}</span>
+          <span className="notif-src">{routine ? t("rt.source") : n.source}</span>
           <span className={"notif-sevtag sev-" + n.severity}>{t(`notif.sev.${n.severity}`)}</span>
           {isNew && <span className="notif-newtag">{t("notif.new")}</span>}
           <span className="notif-time">{fmtTime(n.ts, locale)}</span>
@@ -287,10 +292,24 @@ function InboxEventCard({
           </div>
         )}
         <div className="notif-card-actions">
-          <button className="notif-act primary"
-                  onClick={() => onInvestigate(n.dispatchQuery || n.title, n.title, { deep: true })}>
-            <IconInvestigate size={14} /> {t("notif.investigate")}
-          </button>
+          {routine ? (
+            // 定时任务的结果已经是一次跑完的调查：给报告 / 会话，**不给**「深入调查」（那会再发起一次收费的调查）。
+            <>
+              {n.reportUrl && (
+                <a className="notif-act primary" href={n.reportUrl} target="_blank" rel="noreferrer">
+                  {t("rt.notif.report")} <IconExternal size={12} />
+                </a>
+              )}
+              {canOpenChat && (
+                <button className="notif-act" onClick={() => onOpenConversation!(n.convId!)}>{t("rt.act.openChat")}</button>
+              )}
+            </>
+          ) : (
+            <button className="notif-act primary"
+                    onClick={() => onInvestigate(n.dispatchQuery || n.title, n.title, { deep: true })}>
+              <IconInvestigate size={14} /> {t("notif.investigate")}
+            </button>
+          )}
           <button className="notif-act" onClick={() => onAsk(`${n.title}\n\n${n.description || ""}`)}>
             <IconWhatsNew size={14} /> {t("notif.ask")}
           </button>
@@ -313,6 +332,7 @@ function InboxEventCard({
 
 export default function NotificationsPanel({
   onInvestigate, onAsk, onLoaded, can = () => true, accountId = "", accounts = [], onAccountChange,
+  onOpenConversation, currentUsername = "",
 }: {
   // 第三个参数见 InboxEventCard：deep=true → 新会话要开「深度调查（直连）」。
   onInvestigate: (query: string, title: string, opts?: { deep?: boolean }) => void;
@@ -323,6 +343,9 @@ export default function NotificationsPanel({
   accountId?: string;
   accounts?: { accountId: string; accountName?: string; ou?: string }[];
   onAccountChange?: (id: string) => void;
+  /** 定时任务的通知：负责人本人「打开会话」。 */
+  onOpenConversation?: (id: string) => void;
+  currentUsername?: string;
 }) {
   const t = useT();
   const { locale } = useLocale();
@@ -886,7 +909,8 @@ export default function NotificationsPanel({
             )}
             {group.map((n) => (
               <InboxEventCard key={n.id} n={n} isNew={n.ts > lastReadTs} locale={locale} t={t}
-                onInvestigate={onInvestigate} onAsk={onAsk} />
+                onInvestigate={onInvestigate} onAsk={onAsk}
+                onOpenConversation={onOpenConversation} currentUsername={currentUsername} />
             ))}
           </div>
         )}

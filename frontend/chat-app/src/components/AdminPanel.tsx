@@ -19,7 +19,7 @@ import {
 } from "./icons";
 import {
   fetchAllCapabilities, fetchRoles, saveRole, deleteRole,
-  fetchUsers, putUser, createUser, deleteUser, resetUserMfa, fetchModules, putModules,
+  fetchUsers, putUser, createUser, deleteUser, resetUserMfa, resetUserPassword, setUserEmail, fetchModules, putModules,
   fetchGroups, putGroupMap, createGroup, deleteGroup, fetchGroupMembers, addUserToGroup, removeUserFromGroup,
   fetchEol, putEol,
   fetchMemberAccounts, onboardMemberAccount, memberOnboardStatus, setMemberAccountEnabled,
@@ -1256,7 +1256,10 @@ function UsersView({ mfaMode = null, currentUsername = "" }: { mfaMode?: MfaMode
   // 创建用户表单
   const [newUser, setNewUser] = useState("");
   const [newEmail, setNewEmail] = useState("");
-  const [tempPw, setTempPw] = useState<{ username: string; password: string } | null>(null);
+  // 临时密码框：新建用户（显示在新建框里）/ 重置密码（显示在那个用户的卡片里）都只显示这一次
+  const [tempPw, setTempPw] = useState<{ username: string; password: string; kind: "created" | "reset" } | null>(null);
+  // 展开编辑里的「邮箱」输入（按 sub 存草稿）
+  const [emailDraft, setEmailDraft] = useState<Record<string, string>>({});
 
   const reload = () =>
     Promise.all([fetchUsers(), fetchRoles()])
@@ -1286,16 +1289,50 @@ function UsersView({ mfaMode = null, currentUsername = "" }: { mfaMode?: MfaMode
     catch (e) { setErr(String((e as Error)?.message || e)); }
   };
 
+  // 后端短码 → 人话（键直接写在 t(`…${}`) 里：i18n 检查按这个形状认动态键的前缀）；不认识的照原文
+  const userErr = (e: unknown) => {
+    const code = String((e as Error)?.message || e);
+    const msg = t(`admin.users.err.${code}`);
+    return msg === `admin.users.err.${code}` ? code : msg;
+  };
+
+  // 邮箱必填（2026-10-30 起）：新用户一定有邮箱，忘记密码时能在登录页自助找回。服务端同样校验。
+  const emailOk = (v: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim());
   const doCreate = async () => {
     const u = newUser.trim();
     if (!u) return;
+    if (!newEmail.trim()) { setErr(userErr(new Error("email_required"))); return; }
+    if (!emailOk(newEmail)) { setErr(userErr(new Error("invalid_email"))); return; }
     setErr(""); setTempPw(null);
     try {
-      const r = await createUser(u, newEmail.trim() || undefined);
-      setTempPw({ username: r.username, password: r.tempPassword });
+      const r = await createUser(u, newEmail.trim());
+      setTempPw({ username: r.username, password: r.tempPassword, kind: "created" });
       setNewUser(""); setNewEmail("");
       await reload();
-    } catch (e) { setErr(String((e as Error)?.message || e)); }
+    } catch (e) { setErr(userErr(e)); }
+  };
+
+  // 替忘了密码的人重置：一次性临时密码（下次登录必须改）+ 作废他所有会话。不能对自己（自己用「账户与密码」）。
+  const doResetPassword = async (u: UserRec) => {
+    if (!window.confirm(t("admin.users.pwResetConfirm").replace("{name}", u.username))) return;
+    setErr(""); setNotice(""); setTempPw(null);
+    try {
+      const r = await resetUserPassword(u.username);
+      setTempPw({ username: r.username, password: r.tempPassword, kind: "reset" });
+      setNotice(t("admin.users.pwResetDone").replace("{name}", u.username));
+      await reload();
+    } catch (e) { setErr(userErr(e)); }
+  };
+
+  const doSetEmail = async (u: UserRec) => {
+    const v = (emailDraft[u.sub] ?? u.email ?? "").trim();
+    if (!emailOk(v)) { setErr(userErr(new Error(v ? "invalid_email" : "email_required"))); return; }
+    setErr(""); setMsg((m) => ({ ...m, [u.sub]: "" }));
+    try {
+      await setUserEmail(u.username, v);
+      setMsg((m) => ({ ...m, [u.sub]: t("admin.users.emailSaved") }));
+      await reload();
+    } catch (e) { setErr(userErr(e)); }
   };
 
   const doDelete = async (u: UserRec) => {
@@ -1373,10 +1410,11 @@ function UsersView({ mfaMode = null, currentUsername = "" }: { mfaMode?: MfaMode
         <FieldLabel>{t("admin.users.createTitle")}</FieldLabel>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
           <input value={newUser} onChange={(e) => setNewUser(e.target.value)} placeholder={t("admin.users.username")} style={inputStyle} />
-          <input value={newEmail} onChange={(e) => setNewEmail(e.target.value)} placeholder={t("admin.users.email")} style={{ ...inputStyle, flex: "0 1 240px" }} />
-          <button style={btnPrimary} onClick={doCreate}>{t("admin.users.new")}</button>
+          <input type="email" required value={newEmail} onChange={(e) => setNewEmail(e.target.value)} placeholder={t("admin.users.email")}
+                 aria-label={t("admin.users.email")} style={{ ...inputStyle, flex: "0 1 240px" }} />
+          <button style={btnPrimary} disabled={!newUser.trim() || !newEmail.trim()} onClick={doCreate}>{t("admin.users.new")}</button>
         </div>
-        {tempPw && (
+        {tempPw?.kind === "created" && (
           <div style={{ border: "1px solid var(--green)", borderRadius: 8, padding: "10px 14px", marginTop: 12, background: "rgba(0,128,47,.06)" }}>
             <div style={{ marginBottom: 6, fontWeight: 600 }}>{t("admin.users.created").replace("{name}", tempPw.username)}</div>
             <div style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 6 }}>{t("admin.users.tempPwNote")}</div>
@@ -1406,6 +1444,10 @@ function UsersView({ mfaMode = null, currentUsername = "" }: { mfaMode?: MfaMode
               <div onClick={() => setExpUser(open ? "" : u.sub)} style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, cursor: "pointer", minWidth: 0, flexWrap: "wrap" }}>
                 <span style={{ fontWeight: 700, fontSize: 14 }} title={u.sub}>{u.username}</span>
                 {st && <span style={{ fontSize: 11, fontWeight: 600, color: u.status === "CONFIRMED" ? "var(--green)" : "var(--muted)", border: "1px solid var(--line)", borderRadius: 100, padding: "1px 8px" }}>{st}</span>}
+                {u.email && u.emailVerified
+                  ? <span style={{ fontSize: 12, color: "var(--muted)" }} title={t("admin.users.emailLabel")}>{u.email}</span>
+                  : <span style={{ fontSize: 11, fontWeight: 600, color: "var(--orange)", border: "1px solid rgba(255,153,0,.5)", borderRadius: 100, padding: "1px 8px" }}
+                          title={t("admin.users.emailNoneHint")}>{t("admin.users.emailNone")}</span>}
                 {showMfa && typeof u.mfa === "boolean" && (
                   <span className={`mfa-pill ${u.mfa ? "on" : "off"}`}>{t(u.mfa ? "admin.users.mfaOn" : "admin.users.mfaOff")}</span>
                 )}
@@ -1416,15 +1458,35 @@ function UsersView({ mfaMode = null, currentUsername = "" }: { mfaMode?: MfaMode
                   {d.roles.length > 5 && <span style={{ color: "var(--muted)", fontSize: 11.5 }}>+{d.roles.length - 5}</span>}
                 </span>
               </div>
+              {u.username !== currentUsername && (
+                <button style={btnGhost} title={t("admin.users.pwReset")} onClick={() => doResetPassword(u)}>{t("admin.users.pwReset")}</button>
+              )}
               {showMfa && u.mfa === true && u.username !== currentUsername && (
                 <button style={btnGhost} title={t("admin.users.mfaReset")} onClick={() => doResetMfa(u)}>{t("admin.users.mfaReset")}</button>
               )}
               <button style={iconBtn} title={t("admin.users.delete")} onClick={() => doDelete(u)}>✕</button>
               <button style={{ ...iconBtn, border: "none" }} onClick={() => setExpUser(open ? "" : u.sub)}>{open ? "▲" : "▼"}</button>
             </div>
+            {/* 刚重置的临时密码：就显示在这个用户的卡片里（只这一次） */}
+            {tempPw?.kind === "reset" && tempPw.username === u.username && (
+              <div style={{ border: "1px solid var(--green)", borderRadius: 8, padding: "10px 14px", margin: "0 14px 12px", background: "rgba(0,128,47,.06)" }}>
+                <div style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 6 }}>{t("admin.users.pwResetNote")}</div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <code style={{ fontSize: 14, padding: "4px 10px", background: "var(--code-bg)", borderRadius: 6 }}>{tempPw.password}</code>
+                  <button style={iconBtn} onClick={() => navigator.clipboard?.writeText(tempPw.password)}>{t("admin.users.copy")}</button>
+                  <button style={{ ...iconBtn, marginLeft: "auto" }} onClick={() => setTempPw(null)}>✕</button>
+                </div>
+              </div>
+            )}
             {/* 展开编辑 */}
             {open && (
               <div style={{ padding: "12px 14px", borderTop: "1px solid var(--line)" }}>
+                <FieldLabel>{t("admin.users.emailLabel")}</FieldLabel>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
+                  <input type="email" value={emailDraft[u.sub] ?? u.email ?? ""} onChange={(e) => setEmailDraft((m) => ({ ...m, [u.sub]: e.target.value }))}
+                         placeholder="name@example.com" aria-label={t("admin.users.emailLabel")} style={{ ...inputStyle, flex: "1 1 240px" }} />
+                  <button style={btnGhost} onClick={() => doSetEmail(u)}>{t("admin.users.emailSave")}</button>
+                </div>
                 <FieldLabel>{t("admin.users.roles")}</FieldLabel>
                 {roles.length > 8 && (
                   <input value={roleQ} onChange={(e) => setRoleQ(e.target.value)} placeholder={t("admin.users.roleFilter")} style={{ ...inputStyle, width: "100%", boxSizing: "border-box", marginBottom: 8 }} />

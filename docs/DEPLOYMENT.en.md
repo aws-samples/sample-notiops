@@ -1083,6 +1083,38 @@ aws dynamodb delete-item --table-name <conv-table> \
   --key '{"lookup_key":{"S":"locale#dm#feishu:<user_id>"}}'
 ```
 
+### 8.6 Scheduled-task kill switch
+
+More → Scheduled tasks is driven by an EventBridge rule in WebChatStack, `notiops-routines-tick`, that triggers the BFF every 5 minutes (usage in [USER_GUIDE.en.md](USER_GUIDE.en.md) §5.8). Deep investigations are billed per second, so one command stops all dispatching (runs in progress still finish), without a redeploy:
+
+```bash
+aws dynamodb put-item --region <region> --table-name notiops-config \
+  --item '{"PK":{"S":"appconfig#routines"},"SK":{"S":"enabled"},"config_value":{"S":"0"}}'
+```
+
+To turn it back on, set `config_value` to `"1"` or delete the item. Scheduled-task reports live under the data bucket's `routine-reports/` prefix and are kept for 30 days (the reports CDN serves that prefix). The rule and the prefix are managed by the stacks, so `teardown.sh` needs no extra step.
+
+### 8.7 Forgotten passwords and admin recovery
+
+From 2026-10-30 (usage in [USER_GUIDE.en.md](USER_GUIDE.en.md) §1.7):
+
+- **Users themselves**: **Forgot password?** on the sign-in page sends a code to the **verified** email address on the account (valid for 1 hour). For someone without an email address, an admin clicks **Reset password** under **Admin → Users** (a one-time temporary password valid for 7 days; they are signed out on every device; two-step verification is not changed).
+- **New users need an email address** (Admin → Users). On a first deployment `setup.sh` asks for the admin's email (non-interactive runs: `ADMIN_EMAIL=you@example.com ./setup.sh`). The admin of an older deployment usually has none: re-run with `ADMIN_EMAIL=...` to add it (password and two-step verification untouched), or add it after signing in under **Account & password** in the bottom-left menu.
+- Mail goes through Cognito's default sender (`no-reply@verificationemail.com`): **at most 50 emails per AWS account per day**, reset at 09:00 UTC, not adjustable. Past that, codes do not go out that day; admin resets are not affected.
+- Only three in-place user-pool settings change (recovery through a verified email only, the verification email text, keep the old email active until a new one is verified), so upgrading **does not replace** the user pool or lose users. ⚠️ If you changed the `notiops-users` pool by hand in the Cognito console (your own SES set-up, Lambda triggers, …), a CloudFormation update of the pool resets anything the template does not set — note those settings before upgrading.
+- **The only admin forgot the password**: someone with access to the account runs the commands below (locally or in CloudShell). The next sign-in asks for a new password straight away; `read -s` keeps the temporary password out of the shell history. If the phone is lost too, add `admin-delete-software-token` (see [DEPLOYMENT_ONECLICK.en.md §8](DEPLOYMENT_ONECLICK.en.md#8-security-notes-worth-knowing) item 7).
+
+```bash
+REGION=<region>
+POOL=$(aws cognito-idp list-user-pools --region "$REGION" --max-results 60 \
+  --query "UserPools[?Name=='notiops-users'].Id | [0]" --output text)
+read -rs -p "Temporary password (8+ characters, upper/lower-case letters and a digit): " PW; echo
+aws cognito-idp admin-set-user-password --region "$REGION" --user-pool-id "$POOL" \
+  --username admin --password "$PW" --no-permanent
+unset PW
+aws cognito-idp admin-user-global-sign-out --region "$REGION" --user-pool-id "$POOL" --username admin
+```
+
 ---
 
 ## 9. Rollback Strategy

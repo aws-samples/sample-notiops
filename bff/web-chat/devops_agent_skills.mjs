@@ -17,7 +17,8 @@
  */
 import { deflateRawSync } from "node:zlib";
 import * as zlib from "node:zlib";
-import { getSkillWithFiles, buildSkillMd, setSkillDevopsStatus } from "./skills.mjs";
+import { getSkill, getSkillWithFiles, buildSkillMd, setSkillDevopsStatus } from "./skills.mjs";
+import { withSkillMarker } from "./devops_skill.mjs";
 // userError：这些 message 都是手写的短码（skill_not_found / too_many_files …），
 // 显式标记成可外显，errBody 才不会把它们压成 "bad_request" 一句空话。
 import { userError } from "./safe_err.mjs";
@@ -197,6 +198,16 @@ function uploadKeyFor(target) {
   return target.scope === "self" ? "self" : (target.accountId || "self");
 }
 
+/** 这个 skill 在某个目标 Agent Space 里的上传记录（没有 → null）。规范键优先；否则按 Agent Space id
+ *  兜底命中历史键（早期 self 目标曾以真实账号 id 记账，见 upload 里的清洗）。
+ *  深度调查（直连）和定时任务据此判断「能不能引用已安装的那份」。 */
+export function uploadRecordFor(skill, target) {
+  const uploads = skill?.devops_agent?.uploads || {};
+  const rec = uploads[uploadKeyFor(target)];
+  if (rec) return rec;
+  return Object.values(uploads).find((r) => r?.agent_space_id && r.agent_space_id === target?.agentSpaceId) || null;
+}
+
 // ─────────── 本部署账号的 Agent Space：env 优先，缺了就自动发现 ───────────
 // 为什么需要自动发现：DEVOPS_AGENT_SPACE_ID 只在「主栈 + WebChatStack 一起部署」时被
 // 跨栈引用注入。单独部署 WebChatStack（--exclusively）、一键部署的早期版本、或用脚本
@@ -331,7 +342,11 @@ export async function uploadSkillToDevopsAgent(skillId, { accountId = "", agentT
   if (!skill) throw userError("skill_not_found");
 
   // 1) 组装 zip：根 SKILL.md（规范 frontmatter）+ references/assets 附属文档。
-  const md = buildSkillMd(skill);
+  //    描述里追加触发标记（NOTIOPS_SKILL:<id>）：深度调查引用已安装的 skill、定时任务运行时，任务描述里
+  //    带同一个标记，DevOps Agent 才能稳定地选中这一份（它按描述语义匹配，没有「指定 skill」的参数）。
+  //    只改发出去的这一份，S3 里客户写的描述原样不动。
+  const daDescription = withSkillMarker(skill.description || "", skillId);
+  const md = buildSkillMd({ ...skill, description: daDescription });
   const entries = [{ name: "SKILL.md", data: Buffer.from(md, "utf-8") }];
   for (const f of skill.fileBuffers || []) {
     const safe = f.path.replace(/^\/+/, "").replace(/\.\.(\/|\\)/g, "");
@@ -357,7 +372,7 @@ export async function uploadSkillToDevopsAgent(skillId, { accountId = "", agentT
   // metadata 是 DocumentSchema（自由 JSON）→ 直接传真数组，不要 stringify。
   const finalAgentTypes = normalizeAgentTypes(agentTypes ?? skill.devops_agent?.agent_types);
   const metadata = {
-    name: skillId, skill_id: skillId, description: skill.description || "",
+    name: skillId, skill_id: skillId, description: daDescription,
     source: "notiops", agent_types: finalAgentTypes,
   };
   const content = { zip: { zipFile: zip } };
@@ -398,10 +413,64 @@ export async function uploadSkillToDevopsAgent(skillId, { accountId = "", agentT
     scope: target.scope, account_id: target.accountId || await selfAccount(),
     uploaded_version: skill.latest_version || "", uploaded_at: new Date().toISOString(),
     agent_types: finalAgentTypes,
+    // 这次发出去的那份描述里带着触发标记（老版本发布的没有 —— 界面据此提示「重新发布一次」）。
+    marker: true,
   };
   await setSkillDevopsStatus(skillId, { uploads, last_action: action, agent_types: finalAgentTypes });
 
   return { ok: true, assetId, action, agentSpaceId: target.agentSpaceId, accountId: target.accountId, scope: target.scope, agentTypes: finalAgentTypes };
+}
+
+/**
+ * 回查这个 skill 在每个已发布目标里**是否真的还在**（GetAsset），而不是只信 S3 里的记账。
+ *
+ * 为什么需要：记账只在我们自己发布 / 撤下时更新。有人在 DevOps Agent 控制台里删掉了这个 skill，
+ * Skills 页照样显示「已发布」—— 深度调查会去引用一份不存在的 skill，定时任务会一直跑空。
+ * 查到已经没有的（ResourceNotFoundException）就把那条记账清掉，让界面和事实一致；
+ * 其它错误（限流、跨账号 AssumeRole 失败）**不清**，只报 check_failed —— 查不到 ≠ 不存在。
+ *
+ * @returns {{ latest_version, statuses: Record<key, {published, uploaded_version?, asset_version?,
+ *            updated_at?, marker?, stale?, reason?}> }}
+ */
+export async function checkSkillDevopsStatus(skillId) {
+  const skill = await getSkill(skillId);
+  if (!skill) throw userError("skill_not_found");
+  const uploads = { ...(skill.devops_agent?.uploads || {}) };
+  const latest = skill.latest_version || "";
+  const statuses = {};
+  const missing = [];
+  const { DevOpsAgentClient, GetAssetCommand } = await import("@aws-sdk/client-devops-agent");
+  for (const [key, rec] of Object.entries(uploads)) {
+    if (!rec?.asset_id) { statuses[key] = { published: false, reason: "not_uploaded" }; continue; }
+    try {
+      const target = await resolveTarget(key === "self" ? "" : (rec.account_id || key));
+      const client = new DevOpsAgentClient({ region: target.region || REGION, credentials: target.credentials });
+      const r = await client.send(new GetAssetCommand({
+        agentSpaceId: rec.agent_space_id || target.agentSpaceId, assetId: rec.asset_id,
+      }));
+      statuses[key] = {
+        published: true,
+        uploaded_version: rec.uploaded_version || "",
+        asset_version: r?.asset?.version,
+        updated_at: r?.asset?.updatedAt ? new Date(r.asset.updatedAt).toISOString() : undefined,
+        marker: !!rec.marker,
+        stale: Boolean(latest && rec.uploaded_version && rec.uploaded_version !== latest),
+      };
+    } catch (e) {
+      if (e?.name === "ResourceNotFoundException") {
+        statuses[key] = { published: false, reason: "asset_missing" };
+        missing.push(key);
+      } else {
+        console.warn(`[devops-agent] check skill status failed: ${e?.name || "Error"}`);
+        statuses[key] = { published: null, reason: "check_failed", error: e?.name || "Error" };
+      }
+    }
+  }
+  if (missing.length) {
+    for (const k of missing) delete uploads[k];
+    await setSkillDevopsStatus(skillId, { uploads, last_action: "reconciled" });
+  }
+  return { latest_version: latest, statuses };
 }
 
 /** 从 DevOps Agent 撤下一个已上传的 skill（DeleteAsset），并清账。目标同 upload。 */

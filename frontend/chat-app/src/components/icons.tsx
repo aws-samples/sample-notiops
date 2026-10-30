@@ -44,6 +44,11 @@ export const IconSecurity = ({ size = 18 }: P) => (
   <svg {...base(size)}><path d="M12 3 5 6v5c0 4.2 2.9 7.5 7 9 4.1-1.5 7-4.8 7-9V6Z" /><path d="m9.5 12 1.8 1.8 3.2-3.6" /></svg>
 );
 
+// 账户与密码 — 钥匙（左下角菜单「账户与密码」）
+export const IconKey = ({ size = 16 }: P) => (
+  <svg {...base(size)}><circle cx="8" cy="15" r="4" /><path d="m10.9 12.1 8.6-8.6" /><path d="m16 6.5 2.5 2.5" /><path d="m18.6 3.9 1.9 1.9" /></svg>
+);
+
 // 巡检&报告 — 折线图/报告
 // ⚠️ 这个是**旧的外链入口**（外链到 idle 控制台）在用，由 Sidebar 的
 //    SHOW_INSPECTIONS 关着。站内的资源巡检看板用下面的 IconInspection ——
@@ -155,6 +160,9 @@ export const IconGlobe = ({ size = 16 }: P) => (
 );
 export const IconCustomize = ({ size = 16 }: P) => (
   <svg {...base(size)}><path d="M4 6h10M18 6h2M4 12h2M10 12h10M4 18h12M20 18h0" /><circle cx="16" cy="6" r="2" /><circle cx="8" cy="12" r="2" /><circle cx="18" cy="18" r="2" /></svg>
+);
+export const IconClock = ({ size = 16 }: P) => (
+  <svg {...base(size)}><circle cx="12" cy="12" r="8.5" /><path d="M12 7.5V12l3 2" /></svg>
 );
 export const IconSkill = ({ size = 16 }: P) => (
   <svg {...base(size)}><path d="M5 4h11a2 2 0 0 1 2 2v13a1 1 0 0 1-1 1H7a2 2 0 0 1-2-2V4Z" /><path d="M5 4a2 2 0 0 0-2 2v0a2 2 0 0 0 2 2" /><path d="M9 9h6M9 13h6" /></svg>

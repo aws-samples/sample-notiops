@@ -981,6 +981,9 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
         // 不是 AdminSetUserMFAPreference：「强制」档下后者只关偏好、验证器还登记着，下次登录照样要旧码。
         "cognito-idp:GetUserPoolMfaConfig", "cognito-idp:AdminGetUser",
         "cognito-idp:AdminDeleteSoftwareToken", "cognito-idp:AdminUserGlobalSignOut",
+        // 忘记密码（bff/web-chat/passwords.mjs）：管理员替人重置 = 设一次性临时密码（下次登录必须改）+ 上面那条
+        // 全局登出；管理员给用户设邮箱（直接标已验证，与建用户时填邮箱同一口径）。
+        "cognito-idp:AdminSetUserPassword", "cognito-idp:AdminUpdateUserAttributes",
       ],
       resources: [`arn:aws:cognito-idp:${stack.region}:${stack.account}:userpool/${props.userPoolId}`],
     }),
@@ -1253,10 +1256,12 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       // 由客户自己的 DevOps Agent 回答（NotiOps 侧 0 token）—— CreateChat 建会话、SendMessage
       // 发一轮并接事件流、ListPendingMessages 探"是否在等人工确认"（只提示、绝不代批准）。
       // 缺 ListPendingMessages 的后果：答案照出，但需要确认的动作会静默卡住、用户不知道要去后台点。
+      // GetAsset：发布对话框回查 skill 是否真的还在 Agent Space 里（devops_agent_skills.mjs 的
+      // checkSkillDevopsStatus）—— 只信 S3 里的记账的话，控制台里删掉的 skill 会一直显示「已发布」。
       actions: [
         "aidevops:ListAssociations",
         "aidevops:CreateAsset", "aidevops:UpdateAsset",
-        "aidevops:DeleteAsset", "aidevops:ListAssets",
+        "aidevops:DeleteAsset", "aidevops:ListAssets", "aidevops:GetAsset",
         "aidevops:CreateBacklogTask", "aidevops:GetBacklogTask",
         "aidevops:ListJournalRecords", "aidevops:ListRecommendations",
         "aidevops:CreateChat", "aidevops:SendMessage", "aidevops:ListPendingMessages",
@@ -1480,6 +1485,15 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
         resources: [`arn:aws:s3:::${props.skillsBucketName}/reports/*`],
       }),
     );
+    // 定时任务的报告（routines_run.mjs）写 routine-reports/：保留 30 天，所以不能放在 reports/ 下面
+    // （那里的生命周期规则是 7 天）。ReportsPathGuard 同样放行这个前缀。
+    bff.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "RoutineReports",
+        actions: ["s3:PutObject"],
+        resources: [`arn:aws:s3:::${props.skillsBucketName}/routine-reports/*`],
+      }),
+    );
     // 跨 payer 接入：generateLaunchStackUrl 读模板源(onboarding-templates/member-devops-agent.yaml)
     // 并把带账号后缀的副本 Put 回同前缀，再 presign 出 Launch Stack 深链。
     bff.addToRolePolicy(
@@ -1561,6 +1575,24 @@ export function createWebChatCore(scope: Construct, props: WebChatCoreProps): We
       ],
     });
   }
+
+  // ─── 定时任务：每 5 分钟一次 tick（派发到期的、回收跑完的；bff/web-chat/routines_run.mjs）───
+  // 两条部署路径都建（共用这个 construct）。一条固定规则 + DynamoDB 里的任务行，而不是每个任务一个
+  // EventBridge Scheduler schedule：规则由 CloudFormation 管、删栈就没了，运行时不建任何资源，
+  // BFF 也不需要 scheduler:* / iam:PassRole（与巡检的 lambda_inspection_scheduler 同一个取舍）。
+  // 事件体里的 source 是 BFF 在鉴权**之前**分流的固定字面量（index.mjs），外部 HTTP 请求带不进来。
+  // 没有定时任务时每次 tick 只是一次 Query + 一次租约写，成本可以忽略。
+  new events.Rule(scope, "RoutinesTick", {
+    // 方式 A 不给物理名：同账号里可能已有 setup.sh 部署的同名规则，撞名 = 整栈回滚（同 CurDashWarmup）。
+    ruleName: props.staticTemplate ? undefined : "notiops-routines-tick",
+    description: "NotiOps: dispatch due scheduled tasks and collect finished ones (every 5 minutes)",
+    schedule: events.Schedule.rate(cdk.Duration.minutes(5)),
+    targets: [
+      new targets.LambdaFunction(bff, {
+        event: events.RuleTargetInput.fromObject({ source: "notiops.routines.tick" }),
+      }),
+    ],
+  });
 
   // BFF 执行用户已确认的 Support 写操作（创建/回复/关闭 case）。Support API 是
   // 全局服务，resource 只能用 *。写操作仅在用户 UI 确认后由 /actions/execute 触发。

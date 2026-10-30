@@ -79,7 +79,7 @@ The console stores the template you upload in a bucket named `cf-templates-<rand
 
 #### (2) Creating the stack — the resources are created **as you**
 
-This template ships **no** CloudFormation service role (stack service role). CloudFormation does not switch identity: the template declares 156 resources (counting the ones that only get created for certain parameter values; the default parameters create 76 — see [§3](#3-what-the-stack-creates)), and every one that does get created is created using **your current IAM identity**, so your permissions are the ceiling on what this stack can build. The service scope (the counts are what the template declares):
+This template ships **no** CloudFormation service role (stack service role). CloudFormation does not switch identity: the template declares 158 resources (counting the ones that only get created for certain parameter values; the default parameters create 78 — see [§3](#3-what-the-stack-creates)), and every one that does get created is created using **your current IAM identity**, so your permissions are the ceiling on what this stack can build. The service scope (the counts are what the template declares):
 
 | Service prefix | What the stack creates | Count |
 |---|---|---|
@@ -485,12 +485,12 @@ All three add the same things: 4 CUR sheets on the FinOps page (cost trend / cre
 
 ## 3. What the stack creates
 
-**76 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 6 fewer with deep investigation off; 8 more if you pick multi-account; **26 more if you pick an install option with IM**; 10 more — the cost MCP set — with `CurTable` set or `ProvisionCur=yes`, and another 11 on top of that if you chose `ProvisionCur=yes`):
+**78 resources** with the default parameters, all in your own account (3 more in us-east-1 — the web-search set; 6 fewer with deep investigation off; 8 more if you pick multi-account; **26 more if you pick an install option with IM**; 10 more — the cost MCP set — with `CurTable` set or `ProvisionCur=yes`, and another 11 on top of that if you chose `ProvisionCur=yes`):
 
 | Category | Resources |
 |---|---|
 | Frontend | S3 website bucket + CloudFront distribution + CloudWatch RUM; report downloads go through a second CloudFront distribution (with a CloudFront Function that only lets report paths through) |
-| API | 1 Lambda (BFF) + Function URL (`AWS_IAM` auth, streaming) + 1 EventBridge rule (warms the CUR dashboard cache once a day; with no CUR connected the BFF returns immediately) + its invoke permission |
+| API | 1 Lambda (BFF) + Function URL (`AWS_IAM` auth, streaming) + 2 EventBridge rules (① warms the CUR dashboard cache once a day, and with no CUR connected the BFF returns immediately; ② every 5 minutes, dispatches due scheduled tasks, see [§8](#8-security-notes-worth-knowing) item 8) + their invoke permissions |
 | Agent | 1 Bedrock AgentCore Runtime + 1 AgentCore Memory (session memory, see [§2.10](#210-session-memory-agentcore-memory)) |
 | Sign-in | Cognito User Pool + Client + Identity Pool + 8 groups (roles) |
 | Data | DynamoDB `notiops-config`, `notiops-web-chat`; 1 data bucket (reports etc.) |
@@ -797,6 +797,32 @@ Integrity still holds: every artifact's SHA256 in the template was computed over
    ```
 
    Turning the preference off with `admin-set-user-mfa-preference` is not enough: with `REQUIRED`, Cognito keeps asking for codes from the lost authenticator.
+
+8. **Scheduled tasks (More → Scheduled tasks) start DevOps Agent deep investigations unattended, on a schedule**: the investigations are read-only but **billed for the agent's actual working time**, so the more often a task runs, the more it costs. So viewing needs `nav:routines` and managing needs `action:routines:manage`, both administrator-only by default; only Skills published to DevOps Agent can be used; at most 2 run at once, runs are at least 1 hour apart, and a task pauses itself after 3 failed runs in a row (details in [USER_GUIDE.en.md](USER_GUIDE.en.md) §5.8). The stack adds only one EventBridge rule that triggers the BFF every 5 minutes; **nothing is created at runtime**, so deleting the stack needs no extra step. Scheduled-task reports go under the data bucket's `routine-reports/` prefix and are kept for 30 days (the reports CDN serves that prefix). If something goes wrong, one command stops all dispatching (runs in progress still finish), without a redeploy:
+
+   ```bash
+   aws dynamodb put-item --region <region> --table-name notiops-config \
+     --item '{"PK":{"S":"appconfig#routines"},"SK":{"S":"enabled"},"config_value":{"S":"0"}}'
+   ```
+
+   To turn it back on, set `config_value` to `"1"` or delete the item.
+
+9. **Forgotten passwords** (from 2026-10-30, usage in [USER_GUIDE.en.md](USER_GUIDE.en.md) §1.7): **Forgot password?** on the sign-in page sends a code to the **verified** email address on the account (valid for 1 hour); for someone without an email address, an admin clicks **Reset password** under **Admin → Users** (a one-time temporary password valid for 7 days; they are signed out on every device; two-step verification is not changed). New users need an email address; the first admin uses the `AdminEmail` you gave the stack, so they can already reset their own password. The browser talks to Cognito directly (as it does to sign in), the BFF only gains two admin routes and no unauthenticated entry point, and only three in-place user-pool settings change — upgrading does not replace the pool or lose users.
+
+   - Mail goes through Cognito's default sender (`no-reply@verificationemail.com`): **at most 50 emails per AWS account per day** (invitations included), reset at 09:00 UTC, not adjustable. Past that, codes do not go out that day; admin resets are not affected.
+   - ⚠️ If you changed the `notiops-users` pool by hand in the Cognito console (your own SES set-up, Lambda triggers, …), a stack update resets anything the template does not set — note those settings before upgrading.
+   - **The only admin forgot the password**: someone with access to the account runs the commands below in CloudShell (works for `setup.sh` deployments too). The next sign-in asks for a new password straight away; `read -s` keeps the temporary password out of the shell history. If the phone is lost too, add the command from item 7 above.
+
+   ```bash
+   REGION=<region>
+   POOL=$(aws cognito-idp list-user-pools --region "$REGION" --max-results 60 \
+     --query "UserPools[?Name=='notiops-users'].Id | [0]" --output text)
+   read -rs -p "Temporary password (8+ characters, upper/lower-case letters and a digit): " PW; echo
+   aws cognito-idp admin-set-user-password --region "$REGION" --user-pool-id "$POOL" \
+     --username admin --password "$PW" --no-permanent
+   unset PW
+   aws cognito-idp admin-user-global-sign-out --region "$REGION" --user-pool-id "$POOL" --username admin
+   ```
 
 ---
 

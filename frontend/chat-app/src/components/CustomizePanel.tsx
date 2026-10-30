@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useT, useLocale } from "../i18n";
-import { IconSkill, IconConnector, IconPlugin, IconPlus, IconRename, IconTrash, IconFileText, IconUpload, IconClose, IconChevronRight, IconCheck, IconPublish } from "./icons";
+import { IconSkill, IconConnector, IconPlugin, IconPlus, IconRename, IconTrash, IconFileText, IconUpload, IconClose, IconChevronRight, IconCheck, IconPublish, IconClock } from "./icons";
 import {
   listSkills, getSkill, saveSkill, deleteSkill, skillExists, slugify,
   listVersions, rollbackSkill, importSkillZip, skillDisplay,
-  listDevopsTargets, uploadSkillToDevops, removeSkillFromDevops,
-  type Skill, type SkillVersion, type DevopsTarget, type DevopsUpload,
+  listDevopsTargets, uploadSkillToDevops, removeSkillFromDevops, getSkillDevopsStatus,
+  type Skill, type SkillVersion, type DevopsTarget, type DevopsUpload, type DevopsTargetStatus,
 } from "../api/skills";
 
 // Customize 页：连接器 / 插件（均占位"即将上线"）。
@@ -23,7 +23,11 @@ const SearchIcon = () => (
 //        侧栏入口目前由 Sidebar 的 SHOW_CUSTOMIZE_ITEM 关着）。
 // homeSignal：左侧「Skills」入口每次点击自增。已在 Skills 视图时（可能停在某 skill 详情/编辑器），
 // 据此回到列表首页——无未保存修改直接回，有则先确认。
-export default function CustomizePanel({ only, homeSignal }: { only?: "skills"; homeSignal?: number } = {}) {
+export default function CustomizePanel({ only, homeSignal, canSchedule = false, onScheduleSkill }: {
+  only?: "skills"; homeSignal?: number;
+  /** 有 action:routines:manage 时，已发布的 skill 卡片上多一个「定时运行」。 */
+  canSchedule?: boolean; onScheduleSkill?: (skillId: string) => void;
+} = {}) {
   const t = useT();
   const [tab, setTab] = useState<Tab>("connectors");
 
@@ -31,7 +35,7 @@ export default function CustomizePanel({ only, homeSignal }: { only?: "skills"; 
   if (only === "skills") {
     return (
       <div className="cz cz-standalone">
-        <div className="cz-main"><SkillsTab homeSignal={homeSignal} /></div>
+        <div className="cz-main"><SkillsTab homeSignal={homeSignal} canSchedule={canSchedule} onScheduleSkill={onScheduleSkill} /></div>
       </div>
     );
   }
@@ -76,8 +80,13 @@ type SortKey = "recent" | "name";
 const _isPreset = (s: Skill) => (s.author || "") === "notiops-system";
 // 该 skill 已上传到几个 Agent Space（世界 B）。0 = 未发布。
 const _uploadCount = (s: Skill) => Object.keys(s.devops_agent?.uploads || {}).length;
+// 有没有哪个 Agent Space 里装的不是最新版（只看记账，不发请求；发布对话框打开时才回查 Agent Space）。
+const _hasStale = (s: Skill) => Object.values(s.devops_agent?.uploads || {})
+  .some((u) => !!s.latest_version && !!u?.uploaded_version && u.uploaded_version !== s.latest_version);
 
-function SkillsTab({ homeSignal }: { homeSignal?: number }) {
+function SkillsTab({ homeSignal, canSchedule = false, onScheduleSkill }: {
+  homeSignal?: number; canSchedule?: boolean; onScheduleSkill?: (skillId: string) => void;
+}) {
   const t = useT();
   const { locale } = useLocale();
   const [skills, setSkills] = useState<Skill[]>([]);
@@ -144,6 +153,7 @@ function SkillsTab({ homeSignal }: { homeSignal?: number }) {
   const renderCard = (s: Skill) => {
     const preset = _isPreset(s);
     const published = _uploadCount(s);
+    const stale = published > 0 && _hasStale(s);
     const disp = skillDisplay(s, locale);
     return (
       <div key={s.skill_id}
@@ -162,14 +172,21 @@ function SkillsTab({ homeSignal }: { homeSignal?: number }) {
             <div className="cz-skill-cfoot-meta">
               {s.latest_version && <span className="cz-skill-ver">v{s.latest_version}</span>}
               {published > 0 && (
-                <span className="cz-skill-pub" title={t("cz.da.publishedTip")}>
+                <span className={"cz-skill-pub" + (stale ? " stale" : "")}
+                      title={stale ? t("cz.da.staleTip") : t("cz.da.publishedTip")}>
                   <IconCheck size={12} /> {published > 1 ? t("cz.da.publishedN").replace("{n}", String(published)) : t("cz.da.published")}
+                  {stale && <span className="cz-skill-pub-dot" aria-label={t("cz.da.staleTip")}>•</span>}
                 </span>
               )}
             </div>
             <div className="cz-skill-cactions" onClick={(e) => e.stopPropagation()}>
               <button className={"cz-icon-btn cz-da-btn" + (published > 0 ? " on" : "")}
                 title={t("cz.da.publish")} onClick={() => setPublishing(s)}><IconPublish size={15} /></button>
+              {/* 定时运行：只对**已发布**的给（运行时用 Agent Space 里安装的那份），且要 action:routines:manage。 */}
+              {canSchedule && published > 0 && onScheduleSkill && (
+                <button className="cz-icon-btn cz-rt-btn" title={t("rt.skillCard.schedule")}
+                  onClick={() => onScheduleSkill(s.skill_id)}><IconClock size={15} /></button>
+              )}
               <button className="cz-icon-btn" title={t("cz.skill.edit")} onClick={() => setEditing(s)}><IconRename size={15} /></button>
               <button className="cz-icon-btn" title={t("cz.skill.delete")} onClick={() => del(s)}><IconTrash size={15} /></button>
             </div>
@@ -379,9 +396,26 @@ function PublishDialog({ skill, onChanged, onClose }: { skill: Skill; onChanged:
   const [err, setErr] = useState("");
   // 本地镜像上传状态（乐观更新，避免每次操作都全量刷新列表）
   const [uploads, setUploads] = useState<Record<string, DevopsUpload>>(skill.devops_agent?.uploads || {});
+  // 回查 Agent Space（GetAsset）的结果。记账只在我们自己发布 / 撤下时更新，控制台里删掉的 skill
+  // 只信记账会一直显示「已发布」—— 所以对话框一打开就核一遍；不在了的记账后端已经清掉，这里同步。
+  const [statuses, setStatuses] = useState<Record<string, DevopsTargetStatus>>({});
+  const [latest, setLatest] = useState(skill.latest_version || "");
 
   useEffect(() => {
     listDevopsTargets().then((ts) => { setTargets(ts); setLoading(false); }).catch(() => setLoading(false));
+    if (Object.keys(skill.devops_agent?.uploads || {}).length) {
+      getSkillDevopsStatus(skill.skill_id).then((r) => {
+        if (!r) return;
+        setStatuses(r.statuses || {});
+        if (r.latest_version) setLatest(r.latest_version);
+        const gone = Object.entries(r.statuses || {}).filter(([, st]) => st.published === false).map(([k]) => k);
+        if (gone.length) {
+          setUploads((u) => { const n = { ...u }; for (const k of gone) delete n[k]; return n; });
+          onChanged();
+        }
+      }).catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const keyOf = (tg: DevopsTarget) => (tg.scope === "self" ? "self" : tg.account_id);
@@ -402,11 +436,13 @@ function PublishDialog({ skill, onChanged, onClose }: { skill: Skill; onChanged:
         for (const kk of Object.keys(n)) if (kk !== k && n[kk]?.agent_space_id === spaceId) delete n[kk];
         n[k] = {
           asset_id: r.assetId || "", agent_space_id: spaceId,
-          scope: tg.scope, account_id: tg.account_id, uploaded_version: skill.latest_version || "",
-          uploaded_at: new Date().toISOString(),
+          scope: tg.scope, account_id: tg.account_id, uploaded_version: latest || skill.latest_version || "",
+          uploaded_at: new Date().toISOString(), marker: true,
         };
         return n;
       });
+      // 刚发布的这一份就是最新版、带标记 —— 清掉这个目标上次回查的结论（陈旧 / 缺标记 / 不在了）。
+      setStatuses((st) => { const n = { ...st }; delete n[k]; return n; });
       onChanged();
     } catch (e) { setErr((e as Error)?.message || String(e)); }
     finally { setBusy(""); }
@@ -452,6 +488,17 @@ function PublishDialog({ skill, onChanged, onClose }: { skill: Skill; onChanged:
                 const k = keyOf(tg);
                 const rec = recFor(uploads, tg);
                 const isBusy = busy === k;
+                const st = statuses[k];
+                const gone = st?.published === false && st.reason === "asset_missing";
+                const isStale = !!rec && !!latest && !!rec.uploaded_version && rec.uploaded_version !== latest;
+                // 老版本发布的记账没有 marker 字段：等回查确认它确实还在，再提示「重新发布一次带上标记」。
+                const noMarker = !!rec && !isStale && (rec.marker === false || (rec.marker === undefined && st?.published === true));
+                const note = gone ? t("cz.da.state.missing")
+                  : !rec ? ""
+                  : isStale ? t("cz.da.state.stale").replace("{have}", rec.uploaded_version || "?").replace("{latest}", latest)
+                  : noMarker ? t("cz.da.state.noMarker")
+                  : st?.published === null ? t("cz.da.state.checkFailed")
+                  : "";
                 return (
                   <div key={k} className={"cz-pub-row" + (rec ? " done" : "")}>
                     <div className="cz-pub-tgt">
@@ -459,12 +506,14 @@ function PublishDialog({ skill, onChanged, onClose }: { skill: Skill; onChanged:
                       <div className="cz-pub-tgt-tx">
                         <div className="cz-pub-tgt-name">{tg.label}</div>
                         <div className="cz-pub-tgt-sub">{tg.agent_space_id}</div>
+                        {note && <div className={"cz-pub-note" + (gone || isStale ? " warn" : "")}>{note}</div>}
                       </div>
                     </div>
                     {rec ? (
                       <div className="cz-pub-actions">
                         <span className="cz-pub-state"><IconCheck size={13} /> {t("cz.da.state.published")}{rec.uploaded_version ? ` · v${rec.uploaded_version}` : ""}</span>
-                        <button className="cz-btn-ghost sm" disabled={isBusy} onClick={() => publish(tg)}>{isBusy ? "…" : t("cz.da.reupload")}</button>
+                        <button className={(isStale || noMarker ? "cz-btn-primary" : "cz-btn-ghost") + " sm"}
+                                disabled={isBusy} onClick={() => publish(tg)}>{isBusy ? "…" : t("cz.da.reupload")}</button>
                         <button className="cz-btn-danger sm" disabled={isBusy} onClick={() => unpublish(tg)}>{t("cz.da.remove")}</button>
                       </div>
                     ) : (

@@ -27,6 +27,12 @@ export interface NotificationItem {
   consoleUrl?: string;     // 深链到 AWS 控制台
   dispatchQuery?: string;  // 「深入调查」时发给 DevOps Agent 的文本
   read: boolean;
+  /** 定时任务写的通知（bff/web-chat/routines_run.mjs）：卡片上给「查看报告 / 打开会话」，不给「深入调查」。 */
+  kind?: "routine";
+  reportUrl?: string;
+  convId?: string;
+  owner?: string;
+  routineId?: string;
 }
 
 export interface NotificationsResponse {

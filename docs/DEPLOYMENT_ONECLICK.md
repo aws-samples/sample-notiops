@@ -75,7 +75,7 @@
 
 #### ② 开栈 —— 栈里的资源是用**你自己的身份**建的
 
-这个模板**不带** CloudFormation 服务角色（stack service role）。CloudFormation 不会切换身份：模板里声明了 156 个资源（按参数选装的那些也算在内；默认参数下实际建 76 个，见 [§3](#3-这个栈建了什么)），建出来的每一个都是拿**你当前这个 IAM 身份**去创建的 —— 你的权限就是这个栈能建出来的上限。涉及的服务范围（这就是「服务范围」这个问题的答案；「个数」按模板里声明的算）：
+这个模板**不带** CloudFormation 服务角色（stack service role）。CloudFormation 不会切换身份：模板里声明了 158 个资源（按参数选装的那些也算在内；默认参数下实际建 78 个，见 [§3](#3-这个栈建了什么)），建出来的每一个都是拿**你当前这个 IAM 身份**去创建的 —— 你的权限就是这个栈能建出来的上限。涉及的服务范围（这就是「服务范围」这个问题的答案；「个数」按模板里声明的算）：
 
 | 服务前缀 | 这个栈要建什么 | 个数 |
 |---|---|---|
@@ -489,12 +489,12 @@ service-managed StackSet 要求 CloudFormation 与 Organizations 之间的**信�
 
 ## 3. 这个栈建了什么
 
-默认参数下 **76 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 6 个；选上多账号多 8 个；**选带 IM 的安装选项多 26 个**；填了 `CurTable` 或选了 `ProvisionCur=yes` 多 10 个 —— 成本 MCP 那套，选的是 `ProvisionCur=yes` 的话再多 11 个）：
+默认参数下 **78 个**资源，都在你自己的账号里（部署在 us-east-1 会再多 3 个 —— 联网搜索那套；关掉深度调查少 6 个；选上多账号多 8 个；**选带 IM 的安装选项多 26 个**；填了 `CurTable` 或选了 `ProvisionCur=yes` 多 10 个 —— 成本 MCP 那套，选的是 `ProvisionCur=yes` 的话再多 11 个）：
 
 | 类别 | 资源 |
 |---|---|
 | 前端 | S3 网站桶 + CloudFront distribution + CloudWatch RUM；报告下载走另一个 CloudFront distribution（带一个只放行报告路径的 CloudFront Function） |
-| 接口 | 1 个 Lambda（BFF）+ Function URL（`AWS_IAM` 鉴权，流式返回）+ 1 条 EventBridge 规则（每天预热一次 CUR 仪表盘的缓存；没接 CUR 时 BFF 收到就直接返回）+ 它的调用许可 |
+| 接口 | 1 个 Lambda（BFF）+ Function URL（`AWS_IAM` 鉴权，流式返回）+ 2 条 EventBridge 规则（① 每天预热一次 CUR 仪表盘的缓存，没接 CUR 时 BFF 收到就直接返回；② 每 5 分钟一次，派发到期的定时任务，见 [§8](#8-安全说明值得知道的几条) 第 8 条）+ 它们的调用许可 |
 | Agent | 1 个 Bedrock AgentCore Runtime + 1 个 AgentCore Memory（会话记忆，见 [§2.10](#210-会话记忆agentcore-memory)） |
 | 登录 | Cognito User Pool + Client + Identity Pool + 8 个用户组（角色） |
 | 数据 | DynamoDB `notiops-config`、`notiops-web-chat`；1 个数据桶（报告等） |
@@ -801,6 +801,32 @@ done
    ```
 
    只用 `admin-set-user-mfa-preference` 关掉偏好不够：`REQUIRED` 档下 Cognito 照样要丢了的那个验证器的码。
+
+8. **定时任务（「更多 → 定时任务」）按计划无人值守地发起 DevOps Agent 深度调查**：调查只读，但**按 agent 实际用时计费**，频率越高花费越多。所以看要 `nav:routines`、管要 `action:routines:manage`，默认都只有管理员有；只能用已发布到 DevOps Agent 的 Skill；同一时刻最多 2 个、两次之间至少 1 小时、连续失败 3 次自动暂停（详见 [USER_GUIDE.md](USER_GUIDE.md) §5.8）。栈里只多一条每 5 分钟一次的 EventBridge 规则（触发 BFF），**运行时不建任何资源**，删栈不用多做什么；定时任务的报告放数据桶的 `routine-reports/` 前缀，保留 30 天（报告 CDN 放行这个前缀）。出事时可以一条命令停掉所有派发（进行中的照样收结果），不用重新部署：
+
+   ```bash
+   aws dynamodb put-item --region <区域> --table-name notiops-config \
+     --item '{"PK":{"S":"appconfig#routines"},"SK":{"S":"enabled"},"config_value":{"S":"0"}}'
+   ```
+
+   恢复：把 `config_value` 改成 `"1"`，或者删掉这一行。
+
+9. **忘记密码**（2026-10-30 起，使用说明见 [USER_GUIDE.md](USER_GUIDE.md) §1.7）：登录页 **Forgot password?** 把验证码发到账号上**已验证**的邮箱（1 小时有效）；没有邮箱的人由管理员在 **管理 → 用户** 点 **重置密码**（一次性临时密码，7 天有效，同时退出他所有设备上的登录；两步验证不变）。新建用户邮箱必填；第一个管理员用的是建栈时填的 `AdminEmail`，本来就能自助找回。浏览器直连 Cognito（和登录一样），BFF 只多两个管理员接口，没有免登录的新入口；用户池只改三项原地更新的属性，升级不替换用户池、不丢用户。
+
+   - 发信用 Cognito 默认发件人（`no-reply@verificationemail.com`）：**每个 AWS 账号每天最多 50 封**（含邀请邮件），09:00 UTC（北京时间 17:00）重置，不可调。超了当天的验证码发不出去，管理员重置不受影响。
+   - ⚠️ 在 Cognito 控制台手工改过 `notiops-users` 用户池的（自己接了 SES、加了 Lambda 触发器等），更新栈时模板里没有的设置会回到默认值 —— 升级前先记下来。
+   - **唯一的管理员也忘了密码**：有这个账号权限的人在 CloudShell 里跑下面几条（`setup.sh` 部署同样适用）。登录后会要求马上设新密码；`read -s` 是为了不让临时密码留在 shell 历史里。手机也丢了，再加上面第 7 条那条命令。
+
+   ```bash
+   REGION=<区域>
+   POOL=$(aws cognito-idp list-user-pools --region "$REGION" --max-results 60 \
+     --query "UserPools[?Name=='notiops-users'].Id | [0]" --output text)
+   read -rs -p "临时密码（至少 8 位，含大小写字母和数字）: " PW; echo
+   aws cognito-idp admin-set-user-password --region "$REGION" --user-pool-id "$POOL" \
+     --username admin --password "$PW" --no-permanent
+   unset PW
+   aws cognito-idp admin-user-global-sign-out --region "$REGION" --user-pool-id "$POOL" --username admin
+   ```
 
 ---
 

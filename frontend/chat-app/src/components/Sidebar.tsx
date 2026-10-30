@@ -6,7 +6,7 @@ import { TOPICS } from "../types";
 import {
   // IconSecurity 不在这里了 —— 侧栏没有「安全」这一项（见下方 nav 里那段注释）。
   IconNewChat, IconInvestigate, IconFinOps, IconCases,
-  IconInspection, IconMore, IconSkill, IconCustomize, IconWhatsNew, IconChevronRight, IconBell,
+  IconInspection, IconMore, IconSkill, IconClock, IconCustomize, IconWhatsNew, IconChevronRight, IconBell,
   IconCollapseAll, IconExpandAll,
 } from "./icons";
 import ConvItem from "./ConvItem";
@@ -30,9 +30,15 @@ interface Props {
   /** 两步验证档位与「打开设置框」—— 透传给左下角 UserMenu。 */
   mfaMode?: MfaMode | null;
   onTwoFactor?: () => void;
+  /** 「账户与密码」框 + 没绑邮箱时的提示点 —— 透传给左下角 UserMenu。 */
+  onAccount?: () => void;
+  accountNudge?: boolean;
   width?: number;
   onSkills?: () => void;        // 打开独立 Skills 页（收进「更多」，中文标签「技能」）
   skillsActive?: boolean;       // Skills 页当前是否激活（高亮）
+  onRoutines?: () => void;      // 打开「定时任务」页（「更多」里、跟在「技能」后面）
+  routinesActive?: boolean;
+  showRoutines?: boolean;       // 能力门禁：nav:routines（默认 false：只有被授权的人才看得到）
   onCustomize?: () => void;     // 打开 Customize（定制）页（收进「更多」）
   customizeActive?: boolean;    // Customize 页当前是否激活（高亮）
   onWhatsNew?: () => void;      // 打开 What's New（AWS 新发布学习空间）
@@ -101,7 +107,7 @@ const SHOW_CUSTOMIZE_ITEM = false;
 /** 「更多」展开态的记忆（"1" / "0"）。与会话分组的 notiops.collapsedGroups 同一套做法。 */
 const MORE_OPEN_KEY = "notiops.moreOpen";
 
-export default function Sidebar({ conversations, activeId, busyIds, unreadIds, onSelect, onNew, onRename, onTogglePin, onDelete, collapsed, onToggle, username, onSignOut, mfaMode = null, onTwoFactor, width = 264, onSkills, skillsActive, onCustomize, customizeActive, onWhatsNew, onNotifications, notificationsActive, notifUnread = 0, onFinops, finopsActive, onCases, casesActive, onAdmin, adminActive, showFinops = true, showCases = true, showAdmin = false, showNotifications = true, showInvestigation = true, showSkills = true, showCustomize = true, onInvestigate, investigateActive, onInspection, inspectionActive, showInspection = false }: Props) {
+export default function Sidebar({ conversations, activeId, busyIds, unreadIds, onSelect, onNew, onRename, onTogglePin, onDelete, collapsed, onToggle, username, onSignOut, mfaMode = null, onTwoFactor, onAccount, accountNudge = false, width = 264, onSkills, skillsActive, onRoutines, routinesActive, showRoutines = false, onCustomize, customizeActive, onWhatsNew, onNotifications, notificationsActive, notifUnread = 0, onFinops, finopsActive, onCases, casesActive, onAdmin, adminActive, showFinops = true, showCases = true, showAdmin = false, showNotifications = true, showInvestigation = true, showSkills = true, showCustomize = true, onInvestigate, investigateActive, onInspection, inspectionActive, showInspection = false }: Props) {
   const t = useT();
   const { locale } = useLocale();
   // 「更多」子菜单的展开态：用户上次的选择（默认收起）。
@@ -119,10 +125,11 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
   // 置 skillsActive、再在同一轮 effect 里把他弹回聊天页 —— 只看 active 的话，「更多」会被凭空展开，
   // 而且展开的是一个他看不见那一项的菜单（2026-10-10 独立审查发现）。
   const moreChildActive = Boolean((showInspection && inspectionActive) || (showSkills && skillsActive)
+    || (showRoutines && routinesActive)
     || (showAdmin && adminActive) || (SHOW_CUSTOMIZE_ITEM && showCustomize && customizeActive));
   useEffect(() => { if (moreChildActive) setMoreOpen(true); }, [moreChildActive]);
   // 子菜单里到底有没有东西：一项都没有就连「更多」按钮一起藏，别让用户点开一个空菜单。
-  const hasMoreItems = showInspection || showSkills || showAdmin || (SHOW_CUSTOMIZE_ITEM && showCustomize);
+  const hasMoreItems = showInspection || showSkills || showRoutines || showAdmin || (SHOW_CUSTOMIZE_ITEM && showCustomize);
 
   // 主题会话分组的收起态：记录**已收起**的组 key（默认全部展开）。持久化到 localStorage，跨刷新保留。
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
@@ -234,6 +241,12 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
                 <span className="ni-ic"><IconSkill /></span>{t("cz.nav.skills")}
               </button>
             )}
+            {/* 定时任务：按计划发起 DevOps Agent 深度调查（需 nav:routines；默认只有管理员）。 */}
+            {showRoutines && (
+              <button className={"navitem subitem" + (routinesActive ? " active" : "")} onClick={() => onRoutines?.()}>
+                <span className="ni-ic"><IconClock /></span>{t("rt.nav")}
+              </button>
+            )}
             {/* 管理：仅 admin 可见（后端 nav:admin 门禁 + 前端能力过滤）。角色 / 用户 / 模块。 */}
             {showAdmin && (
               <button className={"navitem subitem" + (adminActive ? " active" : "")} onClick={() => onAdmin?.()}>
@@ -318,7 +331,8 @@ export default function Sidebar({ conversations, activeId, busyIds, unreadIds, o
         <span className="wn-arrow"><IconChevronRight size={18} /></span>
       </button>
 
-      <UserMenu username={username} onSignOut={onSignOut} mfaMode={mfaMode} onTwoFactor={onTwoFactor} />
+      <UserMenu username={username} onSignOut={onSignOut} mfaMode={mfaMode} onTwoFactor={onTwoFactor}
+                onAccount={onAccount} accountNudge={accountNudge} />
     </aside>
   );
 }

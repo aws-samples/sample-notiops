@@ -19,6 +19,7 @@
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import { parseMfaMode, userPoolMfaProps } from "./constructs/web-mfa";
+import { userPoolRecoveryProps } from "./constructs/web-password";
 import { curFinalizerPolicyStatements } from "./constructs/cur-finalizer-policy";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as apigateway from "aws-cdk-lib/aws-apigateway";
@@ -263,6 +264,8 @@ export class NotiOpsBackendStack extends cdk.Stack {
         requireSymbols: false,
       },
       ...userPoolMfaProps(mfaMode),
+      // 忘记密码 / 改邮箱（与一键模板的用户池同一份，见 constructs/web-password.ts）
+      ...userPoolRecoveryProps(),
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
     // setup.sh 重跑时据此保留上次选的档位（没设 MFA_MODE 时）。不从用户池读：v1.0.33 及更早建的池都是「关闭」，
@@ -2439,6 +2442,12 @@ def handler(event, context):
         prefix: "reports/",
         expiration: cdk.Duration.days(7),
       }, {
+        // 定时任务的报告保留 30 天（用户 2026-10-30 定的）。必须在 reports/ 之外：生命周期规则按前缀匹配、
+        // 没有排除，放进 reports/ 会被上面那条 7 天规则一起删。与方式 A 的 minimal-base-core.ts 同一条。
+        id: "expire-routine-reports-30d",
+        prefix: "routine-reports/",
+        expiration: cdk.Duration.days(30),
+      }, {
         // 客户 CUR 仪表盘的当天缓存（cube/es/sp 超 DDB 400KB 单条上限，只能落 S3）。
         // key 带日期、次日自然失效，但对象不会自己消失 —— 每天 4 个 panel × ~数 MB，
         // 不清理就是一年几 GB 的纯垃圾。3 天而不是 1 天：给"翻看前两天缓存"留余量。
@@ -2456,12 +2465,12 @@ def handler(event, context):
     // ─── 报告分发 CDN（CloudFront + OAC，只暴露 reports/*）───────────────────
     // 目的：报告链接真·长期有效、任地点浏览器打开，不受 runtime 临时凭证 presign 的 12h 限制。
     // 安全模型：URL 即凭证（与旧 presigned 一致，只是不过期），key 用不可猜的 UUID；
-    // 用 CloudFront Function 把非 /reports/ 前缀的请求一律 403，避免暴露桶内其它内容
+    // 用 CloudFront Function 把 /reports/ 与 /routine-reports/（定时任务的报告）以外的请求一律 403，避免暴露桶内其它内容
     // （skills/、cost 缓存、onboarding 等），OAC 只读私有桶（不放开桶的公共访问）。
     const reportsPathGuard = new cloudfront.Function(this, "ReportsPathGuard", {
       code: cloudfront.FunctionCode.fromInline(
         "function handler(event){var u=event.request.uri;" +
-        "if(u.indexOf('/reports/')!==0){return {statusCode:403,statusDescription:'Forbidden'};}" +
+        "if(u.indexOf('/reports/')!==0&&u.indexOf('/routine-reports/')!==0){return {statusCode:403,statusDescription:'Forbidden'};}" +
         "return event.request;}"
       ),
     });

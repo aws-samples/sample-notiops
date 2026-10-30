@@ -184,6 +184,9 @@ CloudFront Function 把其它前缀一律 403）。
 | DELETE | `/admin/roles/{name}` |
 | GET / POST | `/admin/users` |
 | PUT / DELETE | `/admin/users/{username}` |
+| DELETE | `/admin/users/{username}/mfa`（重置两步验证）|
+| POST | `/admin/users/{username}/password`（重置密码：一次性临时密码 + 全局登出）|
+| PUT | `/admin/users/{username}/email`（设邮箱，直接标已验证）|
 | GET / POST | `/admin/groups` |
 | PUT / DELETE | `/admin/groups/{name}` |
 | GET / POST | `/admin/groups/{name}/members` |

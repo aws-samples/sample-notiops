@@ -20,6 +20,9 @@ export interface UserRec {
   username: string; sub: string; enabled?: boolean; status?: string; roles: string[]; denies: string[];
   /** 是否已绑定验证器：true / false / null（服务端读不到）。用户池「关闭」两步验证时没有意义，界面不显示。 */
   mfa?: boolean | null;
+  /** 邮箱与是否已验证：没有已验证邮箱的人，忘了密码只能由管理员重置（登录页的自助找回只发给已验证邮箱）。 */
+  email?: string | null;
+  emailVerified?: boolean;
 }
 export interface ModuleToggle { key: string; title_zh?: string; title_en?: string; disabled: boolean }
 
@@ -80,8 +83,17 @@ export async function deleteRole(name: string): Promise<{ ok: boolean }> {
 export async function fetchUsers(): Promise<UserRec[]> {
   return (await req<{ users: UserRec[] }>("GET", "/admin/users")).users || [];
 }
-export async function createUser(username: string, email?: string): Promise<{ username: string; email: string; tempPassword: string }> {
-  return req("POST", "/admin/users", { username, email: email || "" });
+/** 新建用户：用户名和邮箱都必填（2026-10-30 起；邮箱直接标已验证，忘记密码时能自助找回）。 */
+export async function createUser(username: string, email: string): Promise<{ username: string; email: string; tempPassword: string }> {
+  return req("POST", "/admin/users", { username, email });
+}
+/** 替忘了密码的人设一次性临时密码（下次登录必须改）并让他所有设备上的登录失效。不能对自己做。 */
+export async function resetUserPassword(username: string): Promise<{ username: string; tempPassword: string; signedOut?: boolean }> {
+  return req("POST", `/admin/users/${encodeURIComponent(username)}/password`);
+}
+/** 给用户设（或换）邮箱，直接标已验证。 */
+export async function setUserEmail(username: string, email: string): Promise<{ username: string; email: string; emailVerified: boolean }> {
+  return req("PUT", `/admin/users/${encodeURIComponent(username)}/email`, { email });
 }
 export async function deleteUser(username: string, sub: string): Promise<{ ok: boolean }> {
   return req("DELETE", `/admin/users/${encodeURIComponent(username)}?sub=${encodeURIComponent(sub)}`);

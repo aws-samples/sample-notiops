@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getCurrentUser, signOut, fetchAuthSession } from "aws-amplify/auth";
+import { getCurrentUser, signOut, fetchAuthSession, fetchUserAttributes } from "aws-amplify/auth";
 import Sidebar from "../components/Sidebar";
 import Message from "../components/Message";
 import Composer from "../components/Composer";
@@ -8,9 +8,11 @@ import ThinkingPanel from "../components/ThinkingPanel";
 import { appendStep, appendReasoning, type TimelineStep } from "../thinking";
 import { createStreamRewind } from "../streamRewind";
 import CustomizePanel from "../components/CustomizePanel";
+import RoutinesPanel from "../components/RoutinesPanel";
 import NotificationsPanel from "../components/NotificationsPanel";
 import AdminPanel from "../components/AdminPanel";
 import TwoFactorDialog from "../components/TwoFactorDialog";
+import AccountDialog from "../components/AccountDialog";
 import { getMyMfa, MFA_REQUIRED_EVENT, type MyMfa } from "../api/mfa";
 import { getMyCapabilities } from "../api/capabilities";
 import FinopsDashboardBrowser from "../components/FinopsDashboardBrowser";
@@ -137,7 +139,7 @@ const ExpandIcon = () => (
 
 // 主区视图 key。抽成命名类型，是为了让「记住从哪个视图进的看板」那个 state
 // （dashReturn）能复用同一个联合，而不是把这一长串再抄一遍。
-type ViewKey = "chat" | "skills" | "customize" | "notifications" | "finops" | "cases" | "admin" | "security" | "investigate" | "inspection";
+type ViewKey = "chat" | "skills" | "routines" | "customize" | "notifications" | "finops" | "cases" | "admin" | "security" | "investigate" | "inspection";
 
 let idSeq = 0;
 const newId = (p: string) => `${p}-${Date.now()}-${idSeq++}`;
@@ -247,7 +249,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
     if (!capsLoaded) return;
     // ⚠️ **view union 加了新值就必须在这里加一条**，否则那个视图不受权限保护：
     //    降权或直链进来的用户会停在页面上，靠后端 403 才被挡（白屏 + 报错）。
-    const gate: Record<string, string> = { finops: "nav:finops", cases: "nav:cases", admin: "nav:admin", notifications: "nav:notifications", skills: "nav:skills", customize: "nav:customize", security: "nav:security", investigate: "nav:investigate", inspection: "nav:inspection" };
+    const gate: Record<string, string> = { finops: "nav:finops", cases: "nav:cases", admin: "nav:admin", notifications: "nav:notifications", skills: "nav:skills", routines: "nav:routines", customize: "nav:customize", security: "nav:security", investigate: "nav:investigate", inspection: "nav:inspection" };
     const need = gate[view];
     if (need && !can(need)) setView("chat");
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -297,6 +299,8 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   const viewRef = useRef(view);
   viewRef.current = view;
   const [username, setUsername] = useState("U");
+  // Skills 页「定时运行」→ 定时任务页的新建框预选这个 skill（n 变了就再打开一次）。
+  const [routinePrefill, setRoutinePrefill] = useState<{ skillId: string; n: number } | null>(null);
   const [srcOpen, setSrcOpen] = useState(false);
   const [srcItems, setSrcItems] = useState<SourceItem[]>([]);
   // 通用/whats-new 主页启动卡片 → Composer 预填（点卡片=把 prompt 填进输入框，停留在该会话）。
@@ -631,6 +635,16 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   }, [refreshMfa]);
   const adminMfaBlocked = mfa?.adminRequiresMfa === true && mfa?.enrolled === false;
 
+  // ── 账户与密码（邮箱 / 修改密码 / 退出所有设备）：没有已验证邮箱的人，忘了密码只能找管理员重置 ——
+  //    菜单和头像上给一个提示点，让老用户慢慢补上（不弹窗、不强制）。直连 Cognito 读，读不到就不提示。
+  const [accountOpen, setAccountOpen] = useState(false);
+  const [emailMissing, setEmailMissing] = useState(false);
+  useEffect(() => {
+    Promise.resolve().then(() => fetchUserAttributes())
+      .then((a) => setEmailMissing(!(a.email && a.email_verified === "true")))
+      .catch(() => setEmailMissing(false));
+  }, []);
+
   // 多账号：启动加载已注册账号列表（供账号选择器）。失败 → 空（仅默认账号）。
   // 账号列表随视图切换刷新（offboard/onboard 后无需整页刷新即同步；请求走 15s 内去重）
   const accountsFetchedAt = useRef(0);
@@ -817,7 +831,7 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
   //   · model/topic/accountId/devopsAgent 与 handleSend 同源。预热后用户又改了模型 →
   //     真正那一轮会另建一个 agent（多花约 1s 建 agent），但容器/import/MCP 的预热仍然有效。
   useEffect(() => {
-    if (view === "skills" || view === "customize" || view === "admin" || view === "notifications") return;
+    if (view === "skills" || view === "routines" || view === "customize" || view === "admin" || view === "notifications") return;
     if (!active || active.messages.length > 0) return;
     if (warmedRef.current.has(active.id)) return;
     warmedRef.current.add(active.id);
@@ -1460,9 +1474,14 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
         username={username}
         mfaMode={mfa?.mode ?? null}
         onTwoFactor={() => setMfaDialog("menu")}
+        onAccount={() => setAccountOpen(true)}
+        accountNudge={emailMissing}
         onSignOut={doSignOut}
         width={sidebarWidth}
         onSkills={() => { setView("skills"); setSkillsHome((n) => n + 1); collapseIfMobile(); }}
+        onRoutines={() => { setView("routines"); collapseIfMobile(); }}
+        routinesActive={view === "routines"}
+        showRoutines={capsLoaded && can("nav:routines")}
         onCustomize={() => { setView("customize"); collapseIfMobile(); }}
         onWhatsNew={openWhatsNew}
         onNotifications={() => { setView("notifications"); collapseIfMobile(); }}
@@ -1519,6 +1538,8 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               onAsk={(query) => startFromNotification(query, "general")}
               onLoaded={() => setNotifUnread(0)}
               can={can}
+              onOpenConversation={switchTo}
+              currentUsername={username}
               accountId={dashAccountId}
               accounts={accounts}
               onAccountChange={setDashAccountId}
@@ -1685,7 +1706,20 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
               )}
               <div className="title">{view === "skills" ? t("cz.nav.skills") : t("nav.customize")}</div>
             </div>
-            <CustomizePanel only={view === "skills" ? "skills" : undefined} homeSignal={skillsHome} />
+            <CustomizePanel only={view === "skills" ? "skills" : undefined} homeSignal={skillsHome}
+              canSchedule={capsLoaded && can("action:routines:manage")}
+              onScheduleSkill={(skillId) => { setRoutinePrefill({ skillId, n: Date.now() }); setView("routines"); }} />
+          </>
+        ) : view === "routines" ? (
+          <>
+            <div className="topbar">
+              {collapsed && (
+                <button className="panel-btn topbar-expand" onClick={() => setCollapsed(false)}><ExpandIcon /></button>
+              )}
+              <div className="title">{t("rt.title")}</div>
+            </div>
+            <RoutinesPanel prefill={routinePrefill} onOpenConversation={switchTo}
+              currentUsername={username} canManage={capsLoaded && can("action:routines:manage")} />
           </>
         ) : view === "admin" ? (
           <>
@@ -1958,6 +1992,11 @@ export default function ChatApp({ onSignOut }: { onSignOut: () => void }) {
       <ThinkingPanel open={thinkOpen} steps={thinkSteps} live={thinkLive} consoleUrl={thinkConsoleUrl}
                      width={srcWidth} onClose={closeThinking} />
       {/* FinOps / Cases 仪表盘均改为主区两栏浏览器(见 view==="finops"/"cases" && *Dash 分支),不再用右停靠面板 */}
+      {accountOpen && (
+        <AccountDialog onClose={() => setAccountOpen(false)}
+                       onEmailChanged={(verified) => setEmailMissing(!verified)}
+                       onSignedOut={() => { setAccountOpen(false); onSignOut(); }} />
+      )}
       {mfaDialog && (
         <TwoFactorDialog mode={mfa?.mode ?? null} enrolled={mfa?.enrolled ?? null} username={username}
                          reason={mfaDialog} onClose={() => setMfaDialog(null)} onChanged={refreshMfa} />

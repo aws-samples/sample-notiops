@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useT, useLocale, useTheme, type Locale, type ThemePref } from "../i18n";
 import {
-  IconLanguage, IconSignout, IconChevronRight, IconCheck, IconAppearance, IconGitHub, IconSecurity,
+  IconLanguage, IconSignout, IconChevronRight, IconCheck, IconAppearance, IconGitHub, IconSecurity, IconKey,
 } from "./icons";
 import type { MfaMode } from "../api/mfa";
 
@@ -29,12 +29,16 @@ const LINKS = {
 } as const;
 
 /** 左下角用户区 → 向上弹出的设置菜单（参考 Bedrock/Claude）。 */
-export default function UserMenu({ username, onSignOut, mfaMode = null, onTwoFactor }: {
+export default function UserMenu({ username, onSignOut, mfaMode = null, onTwoFactor, onAccount, accountNudge = false }: {
   username: string;
   onSignOut: () => void;
   /** 用户池的两步验证档位（/me/mfa）。OFF 或读不到（null）时不显示「两步验证」这一项。 */
   mfaMode?: MfaMode | null;
   onTwoFactor?: () => void;
+  /** 「账户与密码」框（邮箱 / 修改密码 / 退出所有设备）。 */
+  onAccount?: () => void;
+  /** 没有已验证邮箱：头像和菜单项上一个提示点 + 一句说明。不弹窗、不强制（老用户慢慢补上）。 */
+  accountNudge?: boolean;
 }) {
   const t = useT();
   const { locale, setLocale } = useLocale();
@@ -109,6 +113,16 @@ export default function UserMenu({ username, onSignOut, mfaMode = null, onTwoFac
             )}
           </div>
 
+          {onAccount && (
+            <>
+              <button className="um-item" onClick={() => { setOpen(false); onAccount(); }}>
+                <IconKey size={16} /> <span>{t("menu.account")}</span>
+                {accountNudge && <i className="um-dot" aria-hidden="true" />}
+              </button>
+              {accountNudge && <span className="um-hint">{t("menu.account.nudge")}</span>}
+            </>
+          )}
+
           {(mfaMode === "OPTIONAL" || mfaMode === "REQUIRED") && onTwoFactor && (
             <button className="um-item" onClick={() => { setOpen(false); onTwoFactor(); }}>
               <IconSecurity size={16} /> <span>{t("mfa.title")}</span>
@@ -131,7 +145,10 @@ export default function UserMenu({ username, onSignOut, mfaMode = null, onTwoFac
              拦截器拦掉，用户只看到「点了没反应」。rel="noopener noreferrer" 的理由见文件头。 */}
       <div className="sb-footrow">
         <button className="sb-foot" onClick={() => setOpen((o) => !o)}>
-          <span className="avatar">{username.slice(0, 1).toUpperCase()}</span>
+          <span className="avatar" title={accountNudge ? t("menu.account.nudge") : undefined}>
+            {username.slice(0, 1).toUpperCase()}
+            {accountNudge && <i className="avatar-dot" aria-hidden="true" />}
+          </span>
           <span className="um-name">{username}</span>
           <span className="um-caret">▾</span>
         </button>

@@ -167,6 +167,7 @@
       "routes": [
         { "method": "GET", "pattern": "/skills$" },
         { "method": "GET", "pattern": "/skills/devops-agent/targets$" },
+        { "method": "GET", "pattern": "/skills/[^/]+/devops-agent/status$" },
         { "method": "GET", "pattern": "/skills/[^/]+$" },
         { "method": "GET", "pattern": "/skills/[^/]+/exists$" },
         { "method": "GET", "pattern": "/skills/[^/]+/versions$" }
@@ -190,6 +191,26 @@
       "routes": [
         { "method": "POST",   "pattern": "/skills/[^/]+/devops-agent$" },
         { "method": "DELETE", "pattern": "/skills/[^/]+/devops-agent$" }
+      ] },
+
+    { "key": "nav:routines", "level": "tab", "viewState": "routines",
+      "title_zh": "定时任务", "title_en": "Scheduled tasks",
+      "_note": "看定时任务列表与运行历史（routines_api.mjs）。路径刻意不在 /skills/ 下：路由与权限按后缀匹配，/skills/schedules 会撞上 nav:skills 的 /skills/[^/]+$。",
+      "routes": [
+        { "method": "GET", "pattern": "/routines$" },
+        { "method": "GET", "pattern": "/routines/[^/]+/runs$" }
+      ] },
+    { "key": "nav:routines:actions", "level": "group", "parent": "nav:routines",
+      "title_zh": "操作", "title_en": "Actions" },
+    { "key": "action:routines:manage", "level": "action", "parent": "nav:routines:actions",
+      "title_zh": "管理定时任务", "title_en": "Manage scheduled tasks",
+      "_note": "🔴 新前缀、不挂在 action:skills:* 下：定时任务按计划**无人值守**地用部署自己的权限发起 DevOps Agent 调查（按秒计费），挂在 skills 下会让 dev-team（role:developer = action:skills:*）自动拿到。默认只有管理员（*）有，要开放给别人在「管理 → 角色」里单独授予。",
+      "routes": [
+        { "method": "POST",   "pattern": "/routines$" },
+        { "method": "PUT",    "pattern": "/routines/[^/]+$" },
+        { "method": "DELETE", "pattern": "/routines/[^/]+$" },
+        { "method": "POST",   "pattern": "/routines/[^/]+/run$" },
+        { "method": "POST",   "pattern": "/routines/[^/]+/toggle$" }
       ] },
 
     { "key": "nav:inspection", "level": "tab", "viewState": "inspection",

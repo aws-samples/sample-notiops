@@ -18,6 +18,20 @@ export interface DevopsUpload {
   account_id: string;
   uploaded_version?: string;
   uploaded_at?: string;
+  /** 这次发布的描述里带了触发标记（NOTIOPS_SKILL:<id>）。老版本发布的没有。 */
+  marker?: boolean;
+}
+
+/** GET /skills/{id}/devops-agent/status 的一条（key 同 uploads）。 */
+export interface DevopsTargetStatus {
+  /** true = GetAsset 查到了；false = 不在了（记账已被后端清掉）；null = 这次没核实成。 */
+  published: boolean | null;
+  uploaded_version?: string;
+  asset_version?: number;
+  updated_at?: string;
+  marker?: boolean;
+  stale?: boolean;
+  reason?: "not_uploaded" | "asset_missing" | "check_failed";
 }
 export interface DevopsAgentStatus {
   uploads?: Record<string, DevopsUpload>;   // key = account_id 或 "self"
@@ -202,6 +216,17 @@ export async function listDevopsTargets(): Promise<DevopsTarget[]> {
 export interface DevopsUploadResult {
   ok: boolean; assetId?: string; action?: "created" | "updated";
   agentSpaceId?: string; accountId?: string; scope?: string;
+}
+
+/** 回查这个 skill 在各个已发布目标里是否真的还在（后端 GetAsset；不在的记账会被清掉）。失败 → null。 */
+export async function getSkillDevopsStatus(skillId: string): Promise<{ latest_version: string; statuses: Record<string, DevopsTargetStatus> } | null> {
+  const s = await signedClient();
+  if (!s) return null;
+  const r = await s.aws.fetch(`${s.base}/skills/${encodeURIComponent(skillId)}/devops-agent/status`, {
+    headers: { "x-notiops-id-token": s.idToken },
+  });
+  if (!r.ok) return null;
+  return r.json();
 }
 
 /** 把 skill 发布到 DevOps Agent（accountId 空=本账号；否则跨 payer 成员账号）。 */

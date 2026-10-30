@@ -560,8 +560,12 @@ def check_webchat(out_dir: str) -> int:
     # The statement must exist AND must not grant writes. Writes would mean
     # "anyone who can see the dashboard can drop a production DB out of the
     # inspection scope" -- an action with no runtime signal at all.
+    # ⚠️ AWS::IAM::Policy **和** AWS::IAM::ManagedPolicy 都要看：BFF 角色的语句多到一份策略装不下时，CDK 会把一部分挪进
+    #    溢出的 ManagedPolicy（OverflowPolicyN）—— 挪哪几条由总长度决定，别处加一个动作就可能把这里的语句挤过去
+    #    （2026-10-30 忘记密码给 BFF 加两个 cognito 动作时，InspectionScopeAndScheduleWrite 就被挤进了溢出策略）。
+    bff_policies = list(by_type(res, "AWS::IAM::Policy").values()) + list(by_type(res, "AWS::IAM::ManagedPolicy").values())
     stmts = []
-    for pol in by_type(res, "AWS::IAM::Policy").values():
+    for pol in bff_policies:
         doc = pol.get("Properties", {}).get("PolicyDocument", {})
         for st in doc.get("Statement", []) or []:
             if st.get("Sid") == "InspectionDashboardReadOnly":
@@ -598,7 +602,7 @@ def check_webchat(out_dir: str) -> int:
     #    的 golden(infra-tests)与 `frontend/chat-app/src/inspection.test.ts`
     #    都要求 DeleteItem 在 —— 把产品侧改回去会让那两个 job 红。
     wstmts = []
-    for pol in by_type(res, "AWS::IAM::Policy").values():
+    for pol in bff_policies:
         doc = pol.get("Properties", {}).get("PolicyDocument", {})
         for st in doc.get("Statement", []) or []:
             if st.get("Sid") == "InspectionScopeAndScheduleWrite":

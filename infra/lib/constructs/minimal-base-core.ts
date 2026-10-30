@@ -25,6 +25,7 @@ import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
+import { userPoolRecoveryProps } from "./web-password";
 
 export interface MinimalBase {
   userPool: cognito.UserPool;
@@ -89,6 +90,8 @@ export function createMinimalBase(scope: Construct, opts: MinimalBaseOptions): M
       requireDigits: true,
       requireSymbols: false,
     },
+    // 忘记密码 / 改邮箱：找回只走已验证邮箱、验证邮件文案、换邮箱验证前保留旧邮箱（与后端栈同一份，见 web-password.ts）
+    ...userPoolRecoveryProps(),
     removalPolicy: cdk.RemovalPolicy.DESTROY,
   });
 
@@ -146,6 +149,10 @@ export function createMinimalBase(scope: Construct, opts: MinimalBaseOptions): M
       { id: "expire-onboarding-templates-7d", prefix: "onboarding/", expiration: cdk.Duration.days(7) },
       // 报告 7 天生命周期：兑现「报告链接 7 天内有效」的承诺，也避免报告长期堆积。
       { id: "expire-reports-7d", prefix: "reports/", expiration: cdk.Duration.days(7) },
+      // 定时任务的报告保留 30 天（用户 2026-10-30 定的；与会话的 30 天一致）。必须是 reports/ **之外**的前缀：
+      // S3 生命周期规则按前缀匹配、没有排除，放在 reports/ 下面会被上面那条 7 天规则一起删掉。
+      // 与方式 B 的 notiops-backend-stack.ts 同一条规则。
+      { id: "expire-routine-reports-30d", prefix: "routine-reports/", expiration: cdk.Duration.days(30) },
       // 客户 CUR 仪表盘的当天缓存（与方式 B 的 notiops-backend-stack.ts 同一条规则）。
       // 缓存 key 带日期，次日失效但对象不会自己消失；不清理就是纯垃圾常年堆着。
       { id: "expire-cur-dash-cache-3d", prefix: "cur-dash-cache/", expiration: cdk.Duration.days(3) },
@@ -161,7 +168,7 @@ export function createMinimalBase(scope: Construct, opts: MinimalBaseOptions): M
   // 域名为空时直接不产出报告链接。
   //
   // 安全模型：URL 即凭证（与 presigned 一致，只是不过期），key 用不可猜的 UUID；
-  // CloudFront Function 把非 /reports/ 前缀一律 403，避免暴露桶内其它前缀
+  // CloudFront Function 把 /reports/ 与 /routine-reports/（定时任务的报告）以外的前缀一律 403，避免暴露桶内其它前缀
   // （skills/、onboarding/ 等）；OAC 只读私有桶，不放开桶的公共访问。
   //
   // 一键模板的「不能有 CDK 资产」约束在这里是满足的：`FunctionCode.fromInline` 不产生
@@ -169,7 +176,7 @@ export function createMinimalBase(scope: Construct, opts: MinimalBaseOptions): M
   const reportsPathGuard = new cloudfront.Function(scope, "ReportsPathGuard", {
     code: cloudfront.FunctionCode.fromInline(
       "function handler(event){var u=event.request.uri;" +
-      "if(u.indexOf('/reports/')!==0){return {statusCode:403,statusDescription:'Forbidden'};}" +
+      "if(u.indexOf('/reports/')!==0&&u.indexOf('/routine-reports/')!==0){return {statusCode:403,statusDescription:'Forbidden'};}" +
       "return event.request;}"
     ),
   });

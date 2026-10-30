@@ -477,6 +477,10 @@ export async function listNotifications(limit = 200, withTotal = true) {
     resource: i.resource, region: i.region, account: i.account,
     description: i.description, consoleUrl: i.console_url,
     dispatchQuery: i.dispatch_query, read: i.ts <= lastReadTs,
+    // 定时任务写的通知（routines_run.mjs）：卡片上换成「查看报告 / 打开会话」，不给「深入调查」
+    // （那会再发起一次收费的调查）。其它来源没有这几个字段。
+    ...(i.kind === "routine" ? { kind: "routine", reportUrl: i.report_url || "", convId: i.conv_id || "",
+                                 owner: i.owner || "", routineId: i.routine_id || "" } : {}),
   }));
   // 判据用 LastEvaluatedKey 而非 items.length === limit：后者在"恰好 limit 条"时会误报截断。
   const truncated = !!evts.LastEvaluatedKey;

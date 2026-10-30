@@ -1391,6 +1391,62 @@
       },
       "Type": "AWS::IAM::Policy"
     },
+    "RoutinesTick4FA89E85": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/RoutinesTick/Resource"
+      },
+      "Properties": {
+        "Description": "NotiOps: dispatch due scheduled tasks and collect finished ones (every 5 minutes)",
+        "Name": "notiops-routines-tick",
+        "ScheduleExpression": "rate(5 minutes)",
+        "State": "ENABLED",
+        "Tags": [
+          {
+            "Key": "auto-delete",
+            "Value": "no"
+          },
+          {
+            "Key": "project",
+            "Value": "notiops"
+          }
+        ],
+        "Targets": [
+          {
+            "Arn": {
+              "Fn::GetAtt": [
+                "WebChatBffF9213199",
+                "Arn"
+              ]
+            },
+            "Id": "Target0",
+            "Input": "{\"source\":\"notiops.routines.tick\"}"
+          }
+        ]
+      },
+      "Type": "AWS::Events::Rule"
+    },
+    "RoutinesTickAllowEventRuleWebChatStackWebChatBffABEA683755C5440D": {
+      "Metadata": {
+        "aws:cdk:path": "WebChatStack/RoutinesTick/AllowEventRuleWebChatStackWebChatBffABEA6837"
+      },
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "WebChatBffF9213199",
+            "Arn"
+          ]
+        },
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "RoutinesTick4FA89E85",
+            "Arn"
+          ]
+        }
+      },
+      "Type": "AWS::Lambda::Permission"
+    },
     "RumGuestRoleDefaultPolicyBF05A973": {
       "Metadata": {
         "aws:cdk:path": "WebChatStack/RumGuestRole/DefaultPolicy/Resource"
@@ -1729,7 +1785,9 @@
                 "cognito-idp:GetUserPoolMfaConfig",
                 "cognito-idp:AdminGetUser",
                 "cognito-idp:AdminDeleteSoftwareToken",
-                "cognito-idp:AdminUserGlobalSignOut"
+                "cognito-idp:AdminUserGlobalSignOut",
+                "cognito-idp:AdminSetUserPassword",
+                "cognito-idp:AdminUpdateUserAttributes"
               ],
               "Effect": "Allow",
               "Resource": "arn:aws:cognito-idp:us-east-1:444455556666:userpool/us-east-1_FIXTUREPOOL"
@@ -1879,6 +1937,7 @@
                 "aidevops:UpdateAsset",
                 "aidevops:DeleteAsset",
                 "aidevops:ListAssets",
+                "aidevops:GetAsset",
                 "aidevops:CreateBacklogTask",
                 "aidevops:GetBacklogTask",
                 "aidevops:ListJournalRecords",
@@ -2035,6 +2094,12 @@
               "Resource": "arn:aws:s3:::notiops-data-444455556666-us-east-1/reports/*"
             },
             {
+              "Action": "s3:PutObject",
+              "Effect": "Allow",
+              "Resource": "arn:aws:s3:::notiops-data-444455556666-us-east-1/routine-reports/*",
+              "Sid": "RoutineReports"
+            },
+            {
               "Action": [
                 "s3:GetObject",
                 "s3:PutObject"
@@ -2135,21 +2200,14 @@
               "Sid": "InspectionResourceInventoryReadOnly"
             },
             {
-              "Action": [
-                "aidevops:ListAssociations",
-                "aidevops:AssociateService",
-                "aidevops:ValidateAwsAssociations",
-                "aidevops:CreateAsset",
-                "aidevops:UpdateAsset",
-                "aidevops:DeleteAsset",
-                "aidevops:ListAssets",
-                "aidevops:CreateBacklogTask",
-                "aidevops:GetBacklogTask",
-                "aidevops:ListJournalRecords",
-                "aidevops:ListRecommendations"
-              ],
+              "Action": "iam:PassRole",
+              "Condition": {
+                "StringEquals": {
+                  "iam:PassedToService": "aidevops.amazonaws.com"
+                }
+              },
               "Effect": "Allow",
-              "Resource": "arn:aws:aidevops:us-east-1:444455556666:agentspace/*"
+              "Resource": "arn:aws:iam::444455556666:role/*"
             }
           ],
           "Version": "2012-10-17"
@@ -2173,14 +2231,21 @@
         "PolicyDocument": {
           "Statement": [
             {
-              "Action": "iam:PassRole",
-              "Condition": {
-                "StringEquals": {
-                  "iam:PassedToService": "aidevops.amazonaws.com"
-                }
-              },
+              "Action": [
+                "aidevops:ListAssociations",
+                "aidevops:AssociateService",
+                "aidevops:ValidateAwsAssociations",
+                "aidevops:CreateAsset",
+                "aidevops:UpdateAsset",
+                "aidevops:DeleteAsset",
+                "aidevops:ListAssets",
+                "aidevops:CreateBacklogTask",
+                "aidevops:GetBacklogTask",
+                "aidevops:ListJournalRecords",
+                "aidevops:ListRecommendations"
+              ],
               "Effect": "Allow",
-              "Resource": "arn:aws:iam::444455556666:role/*"
+              "Resource": "arn:aws:aidevops:us-east-1:444455556666:agentspace/*"
             }
           ],
           "Version": "2012-10-17"

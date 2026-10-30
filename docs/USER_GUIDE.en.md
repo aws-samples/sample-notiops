@@ -73,22 +73,24 @@ Your administrator gives you a URL and an initial account.
 2. **Your first sign-in always forces a password change**: the same card then asks you to **Set a new password**, and you go straight in.
 3. **When the deployment requires two-step verification** (the REQUIRED mode, see [§1.6](#16-two-step-verification-authenticator-app)), right after the new password you set up an authenticator: scan the QR code on the card with an authenticator app and enter the 6-digit code it shows. From then on, every sign-in has one more step after the password, **Two-step verification**: enter the 6-digit code.
 4. The sign-in page is deliberately **English-only** — there is no language switch here. You switch to Chinese after signing in. A failed sign-in shows the reason Cognito gives; a verification step this page does not support shows `This sign-in step is not supported here: <step>`.
+5. **Forgot your password?** Click **Forgot password?** on the sign-in card; the code goes to the verified email address on your account. Without an email address, ask an admin to reset it. See [§1.7](#17-forgotten-passwords-and-account-settings).
 
 **The initial username is `admin` on both deployment paths**; where the temporary password comes from differs:
 
 - **One-click deployment (method A)**: follow the instructions in the CloudFormation Outputs — it is emailed to the address you supplied.
 - **Full deployment (method B, `setup.sh`)**: the temporary password is printed in the deployment terminal.
 
-> Sign-in uses the NotiOps Cognito user pool (the same deployment that sends your proactive notifications). **There is no self-registration and no self-service password recovery** — a forgotten password or a new account both go through whoever operates this NotiOps deployment.
+> Sign-in uses the NotiOps Cognito user pool (the same deployment that sends your proactive notifications). **There is no self-registration** — new accounts come from an admin. **A forgotten password you can reset yourself** if your account has a verified email address; otherwise an admin resets it, see [§1.7](#17-forgotten-passwords-and-account-settings).
 
 ### 1.2 Set language and appearance first
 
-**Click your own name at the bottom-left** to open the user menu. It has three items (four when the deployment has two-step verification on: **Two-step verification**, see [§1.6](#16-two-step-verification-authenticator-app)), and the first two are worth setting on day one:
+**Click your own name at the bottom-left** to open the user menu. It has four items (five when the deployment has two-step verification on: **Two-step verification**, see [§1.6](#16-two-step-verification-authenticator-app)), and the first two are worth setting on day one:
 
 | Menu item | What it does |
 |---|---|
 | **Appearance** | Only **Dark** (the default) and **Light** — there is no "follow system" option |
 | **Language** | Exactly two options: `English (United States)` and `中文（简体）`. **A fresh browser defaults to English**; your choice is remembered per browser |
+| **Account & password** | Your email address (where password-reset codes go), change password, sign out everywhere, see [§1.7](#17-forgotten-passwords-and-account-settings). Without a verified email, your avatar and this item show a small orange dot |
 | **Two-step verification** | Only when the deployment has two-step verification on: turn it on / use a different authenticator / turn it off, see [§1.6](#16-two-step-verification-authenticator-app) |
 | **Sign out** | Returns you to the sign-in card |
 
@@ -100,7 +102,7 @@ The GitHub icon to the right of your name (its hover text reads "Star NotiOps on
 
 ### 1.3 The three regions of the screen
 
-- **Left nav**: **New chat** at the top, then 4 top-level entries (Notifications / Investigation / Cost / Cases) and an expandable **More** (Inspection / Skills / Admin — whether each one shows still depends on your role, the deployment and the Modules switches; it expands by itself when the current page is one of them, and remembers whether you left it open; if none of the three is shown, "More" is not shown at all — see §2.10 for why), then your **conversation list** grouped by topic, and at the bottom a **What's New** card plus your user menu. The whole sidebar collapses ("Collapse sidebar" / "Expand sidebar").
+- **Left nav**: **New chat** at the top, then 4 top-level entries (Notifications / Investigation / Cost / Cases) and an expandable **More** (Inspection / Skills / Scheduled tasks / Admin — whether each one shows still depends on your role, the deployment and the Modules switches; it expands by itself when the current page is one of them, and remembers whether you left it open; if none of the three is shown, "More" is not shown at all — see §2.10 for why), then your **conversation list** grouped by topic, and at the bottom a **What's New** card plus your user menu. The whole sidebar collapses ("Collapse sidebar" / "Expand sidebar").
 - **Middle**: the conversation. The topbar shows the title, a topic tag and the **account picker**; messages in the middle; the composer and its toolbar at the bottom.
 - **Right-hand dock**: takes no space until needed, then slides out as either **Sources** (what this answer was based on) or **Thinking** (what it did, step by step). Both share one rail, so only one shows at a time.
 
@@ -149,6 +151,28 @@ With two-step verification on, signing in needs, besides your password, the 6-di
 - If an admin lost their own phone and no other admin can reset it, someone with access to the AWS account can reset it with the AWS CLI; the command is in [DEPLOYMENT_ONECLICK.en.md §8](DEPLOYMENT_ONECLICK.en.md#8-security-notes-worth-knowing) (it works for both deployment methods).
 - IM bots are not affected: they do not use the web sign-in.
 
+### 1.7 Forgotten passwords and account settings
+
+**If you forget your password**, it depends on whether your account has a **verified** email address:
+
+| Situation | What to do |
+|---|---|
+| A verified email address | On the sign-in card click **Forgot password?** → enter your username or email → **Send code** → get the 6-digit code from your inbox (valid for 1 hour) → enter it and your new password twice → **Reset password** → sign in with the new password |
+| No email address (or not verified) | No code can reach you. Ask an admin to click **Reset password** on your row under **Admin → Users**: they get a temporary password to pass on to you (valid for 7 days); sign in with it and choose your own new password straight away |
+| You are the only admin | Someone with access to the AWS account resets it with the CLI; the command is in [DEPLOYMENT.en.md](DEPLOYMENT.en.md) / [DEPLOYMENT_ONECLICK.en.md §8](DEPLOYMENT_ONECLICK.en.md#8-security-notes-worth-knowing) (it works for both deployment methods) |
+
+- For an account without a verified email address, **Send code** says straight away to ask an admin; in every other case you see the same message ("if this account has a verified email address, a code is on its way"), without the address. If no code arrives, check your spam folder, then ask an admin.
+- The code comes from `no-reply@verificationemail.com` with the subject `Your NotiOps verification code`. If you did not ask for it, ignore it and tell an admin.
+- An account can request or enter codes only a limited number of times per hour (Cognito decides, 5–20 depending on risk); past that, you are asked to try again later.
+- Two-step verification is not affected: after a reset, signing in still asks for the 6-digit code. If you also lost your phone, ask an admin to **Reset two-step verification** too (see [§1.6](#16-two-step-verification-authenticator-app)).
+- An account whose password an admin reset in the Cognito console goes straight to the code step at sign-in; **Send a new code** sends another one.
+
+**Account & password** (bottom-left menu):
+
+- **Email**: add, change or verify it. The code goes to the new address (valid for 24 hours); until you confirm it, your current address keeps working for sign-in and codes. **Everyone should add one** — then a forgotten password is something you can fix yourself. Without one, your avatar shows a small orange dot.
+- **Change password**: your current password and the new one twice (at least 8 characters, with upper-case and lower-case letters and a digit).
+- **Sign out everywhere**: signs you out on every device, including this one; other devices lose access within an hour. Use it if you think someone else knows your password, or after resetting a forgotten password.
+
 ---
 
 ## 2. The left nav: what each entry is for
@@ -163,6 +187,7 @@ Start with the whole picture — the key distinction is which entries are **chat
 | **Cases** | Chat topic **+** 4 dashboards | The whole AWS Support case lifecycle: read, analyse, create, reply, close |
 | **Inspection** | **Dashboards only — not a chat topic** | Reviewing what the automated inspection found (hot / idle resources) and dispatching an AI judgement |
 | **Skills** | Management page | Turn your team's process and standards into Skills so it works your way |
+| **Scheduled tasks** | Management page | Runs a DevOps Agent deep investigation with a Skill on a schedule; each result becomes a chat plus a notification (only administrators see it by default, see §5.8) |
 | **Admin** | Management pages | Under "More" (since 2026-10-10): models, role permissions, account onboarding and other console settings. **Administrators only.** |
 | **What's New** card | Chat topic | Track AWS launches, filtered against the services your account actually uses |
 
@@ -424,7 +449,8 @@ Asking "**what's relevant to my account?**" is genuinely personalised: it takes 
 
 ### 2.9 Admin and Customize
 
-- **Admin** — an 8-page admin console, see §6. It sits under the sidebar's **More** group, after Inspection and Skills (it was promoted to top level on 2026-09-11 and moved back into "More" on 2026-10-10 at the user's request), and only administrators see it.
+- **Scheduled tasks** — under the sidebar's **More** group, after Skills. It runs a deep investigation with a Skill published to DevOps Agent on a schedule, see §5.8. Only administrators see it by default.
+- **Admin** — an 8-page admin console, see §6. It sits under the sidebar's **More** group, after Inspection, Skills and Scheduled tasks (it was promoted to top level on 2026-09-11 and moved back into "More" on 2026-10-10 at the user's request), and only administrators see it.
 - **Customize** — ⚠️ **currently not rendered at all.** The "More" group now holds Inspection / Skills / Admin, but Customize is still left out of it (`SHOW_CUSTOMIZE_ITEM = false` in `Sidebar.tsx`). Its Connectors and Plugins pages are still "Coming soon" placeholders; it will come back when there is something behind them.
 
 ### 2.10 An entry is missing? That's permissions or deployment method
@@ -698,12 +724,19 @@ Every Skill has a **version history** with **Run with this version** and **Make 
 
 **Publish to DevOps Agent** installs the Skill into a DevOps Agent Agent Space (this account or a member account). Once published the card shows a "Published ×N" badge, and supports **Re-publish** and **Remove**. It **uploads documents only, never scripts**, so the read-only boundary is unaffected. With no onboarded Agent Space it tells you to onboard one first under More → Admin → Accounts.
 
+- Publishing appends one line to the Skill's description: a trigger marker (`NOTIOPS_SKILL:<Skill ID>`). DevOps Agent picks Skills by matching the task description, so a task that carries the same marker reliably selects this one. Only the published copy changes; your own description stays as written.
+- When the publish dialog opens it **checks** each Agent Space and says what it finds:
+  - **An older version is installed**: it shows "the Agent Space has vX; the latest is vY". Editing a Skill does not re-publish it, so click Re-publish. The card's "Published" badge also gets a dot.
+  - **It is no longer there**: for example, it was deleted in the DevOps Agent console. It stops showing "Published"; publish it again.
+  - **It was published by an older version without the trigger marker**: publish it once more.
+
 **When a Skill meets a DevOps Agent path, the composer tells you which of two things will happen:**
 
 | Path | Behaviour |
 |---|---|
 | **Deep Dive** (handed to DevOps Agent) | The Skill **must already be published**, or it won't activate this turn |
 | **Either direct path** | The Skill body is **inlined** into what's sent this turn (**no publishing needed**), but its `references/` files are **unreachable** on this path |
+| **Deep Dive with a very long Skill** | A deep investigation's description is limited to 10,000 characters. When the body doesn't fit, a published Skill is **referred to by its installed copy** (the version you published); an unpublished one **does not start an investigation** this turn and asks you to publish it first |
 
 > ⚠️ Skills published here **do not affect the AI judgement used by resource inspection** — inspection uses a separate, dedicated Agent Space whose judgement skills ship with the code, deliberately isolated so the two can't cross-activate.
 
@@ -715,6 +748,46 @@ Every Skill has a **version history** with **Run with this version** and **Make 
 
 ---
 
+### 5.8 Scheduled tasks
+
+**Scheduled tasks** sit under the sidebar's **More** group, after Skills. A scheduled task runs a DevOps Agent **deep investigation** with a Skill on the schedule you set, then turns the result into a chat and posts a notification. The design follows Claude Code's scheduled tasks (formerly Routines).
+
+**Who can use it**: the list needs `nav:routines`; creating, editing, deleting, pausing and Run now need `action:routines:manage`. **Only administrators have them by default**, because scheduled tasks start investigations **unattended** with this deployment's own permissions, and deep investigations are billed per second. To open it up, grant them under More → Admin → Access control (they are not part of `action:skills:*`, so the Developer role does not get them automatically).
+
+**Create one**: click **New scheduled task**, or click the clock icon (**Schedule**) on a published Skill's card on the Skills page; the dialog opens with that Skill selected.
+
+| Field | Notes |
+|---|---|
+| Name | Up to 80 characters |
+| Skill | **Only Skills published to DevOps Agent** (see §5.6). Each run uses the copy **installed in the Agent Space**, not your latest edit. When they differ, the dialog says "the Agent Space has vX; the latest is vY"; re-publish to use the latest |
+| Target account | Only the accounts this Skill is published to |
+| Extra context | Up to 2,000 characters, for example which resources to focus on, what time range, which language to answer in. Sent with every run |
+| How often | Once / Hourly / Daily / Weekdays / Weekly (pick the days) / Monthly (pick the day; months without that day run on their last day) / Custom cron (5 numeric fields: minute hour day month weekday, Sunday = 0 or 7; names such as JAN / MON are not accepted) |
+| Time zone | Your browser's time zone by default; daylight saving time is handled |
+| Start and end dates | Optional |
+
+**Limits** (following Claude Code, plus cost control):
+
+- Runs must be **at least 1 hour apart**; each starts **within 5 minutes** of the set time (checked every 5 minutes).
+- **At most 20** tasks can be on at once.
+- **At most 2** scheduled investigations run at the same time: DevOps Agent runs 3 investigations at a time per Agent Space by default, so one slot stays free for the deep investigations you start by hand. When the slots are full a run queues; if none frees up within 30 minutes, that run is skipped.
+- If the **previous run of the same task is still going**, the new one is skipped, not queued.
+- If dispatching stopped for a while and runs were missed, only the latest one (if within 6 hours) runs; earlier ones are recorded as missed.
+- **Run now** is limited to **3 times an hour** per task and does not move the next scheduled time.
+- **After 3 failed runs in a row a task pauses itself** and posts a notification. It pauses on the **first** run when the Skill was deleted or removed from DevOps Agent, the target account was disabled, or the owner's user was deleted. Fix the cause, then click **Turn on**; it checks the Skill again first.
+- Failed investigations are not retried automatically (every run costs money).
+
+**Where results go**:
+
+- **A chat**: each run creates a chat for the task's **owner** (Investigation topic, titled "⏰ task name · date") with the full description that was sent and the investigation's conclusion; you can follow up in it. Chats belong to a person: others can see the run in the run history but cannot open that chat.
+- **A notification**: one per run, "Scheduled task finished / did not succeed". The inbox is **shared across the deployment**, so everyone who can see Notifications sees it. These cards have no **Investigate** button (the result already is an investigation); they have **View report**, and the owner also gets **Open chat**.
+- **Run history**: each task's **Runs** list shows every run (including skipped ones and why), how long it took, and **whether the Skill was loaded**. DevOps Agent picks Skills from the description by itself: we include a trigger marker in the description and check its execution records afterwards. When loading is not confirmed, the run says so, and that conclusion may be DevOps Agent's general analysis.
+- **Reports**: the HTML report and the investigation trace page are **kept for 30 days** (regular deep-investigation reports are kept for 7), after which the links stop working.
+
+**Cost**: every run is one DevOps Agent deep investigation, billed for the agent's actual working time (see the official AWS pricing for the rate); the more often it runs, the more it costs. The app does not show a cost estimate.
+
+**Kill switch**: operators can stop all scheduled-task dispatching with one command (runs in progress still finish); the command is in both deployment guides.
+
 ## 6. Administration and customisation (admin view)
 
 This section is for administrators. Ordinary users don't see the Admin entry.
@@ -724,7 +797,7 @@ This section is for administrators. Ordinary users don't see the Admin entry.
 | Section | Page | Purpose |
 |---|---|---|
 | **Access control** | **Roles** | Define roles and tick what they can see / do |
-| | **Users** | Manage users; with two-step verification on, shows who has turned it on and lets you **Reset two-step verification** for someone who lost their phone (not for yourself; use the bottom-left menu) |
+| | **Users** | Manage users. **Creating a user needs a username and an email address** (both required; the email counts as verified, so that person can reset a forgotten password themselves). The list shows everyone's email address, with **No email** for those without one — add it with **Save email** in the expanded editor. **Reset password** gives someone who forgot theirs a one-time temporary password (valid for 7 days) and signs them out on every device; two-step verification is not changed; not for yourself — use **Account & password** in the bottom-left menu. With two-step verification on, it also shows who has turned it on and lets you **Reset two-step verification** for someone who lost their phone |
 | | **Group mapping** | Map Cognito groups to roles |
 | **Cloud environment** | **Accounts** | Onboard / enable member accounts (the source of cross-account capability), and DevOps Agent onboarding |
 | | **Lifecycle** | EOS / lifecycle |

@@ -522,7 +522,8 @@ export default function Composer({ model, onModelChange, onSend, busy, showSugge
               · 转交路径（`devopsAgent`）：我们的 agent 只是转交一个任务描述，正文不过去 →
                 这个 skill 真的不会被激活，必须先发布；
               · 两条**直连**路径：BFF 把正文内联进发给 DevOps Agent 的那段话（devops_skill.mjs）→ 无需发布也生效，
-                唯一缺口是 references/ 附属文件取不到。
+                缺口是 references/ 附属文件取不到；以及深度调查的描述上限 10,000 字 —— 放不下的长 Skill
+                要先发布、改为引用安装的那份（文案里写明）。
               这里以前只有第一句、且只在 devopsAgent 时出现：直连路径既没提示（客户不知道谁在执行），
               而把第一句套上去更糟 —— 那是在说一件不成立的事（"不会被激活"）。
               ⚠️ 2026-09-13 起 `devopsAgent` 已经没有界面入口（见 ModePicker 文件头）⇒ 实际走到

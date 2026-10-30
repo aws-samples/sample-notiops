@@ -77,8 +77,10 @@ export async function clientFor(accountId) {
 
 // ───────────────────────── 发起 / 轮询 / 结果（移植 core/devops_agent.py）─────────────────────────
 
-/** 发起 INVESTIGATION 任务。返回 { ok, taskId, executionId, agentSpaceId, consoleUrl, consoleHome }。 */
-async function startInvestigation({ client, agentSpaceId, title, description, priority = "MEDIUM" }) {
+/** 发起 INVESTIGATION 任务。返回 { ok, taskId, executionId, agentSpaceId, consoleUrl, consoleHome }。
+ *  export 给定时任务（routines_run.mjs）用：它换一个来源前缀，并带 clientToken（同一次计划运行重试不会建出第二场调查）。 */
+export async function startInvestigation({ client, agentSpaceId, title, description, priority = "MEDIUM",
+                                           prefix = "[notiops-web-chat] ", clientToken }) {
   const { CreateBacklogTaskCommand } = await import("@aws-sdk/client-devops-agent");
   const resp = await client.send(new CreateBacklogTaskCommand({
     agentSpaceId,
@@ -86,7 +88,8 @@ async function startInvestigation({ client, agentSpaceId, title, description, pr
     title,
     priority,
     // 前缀标明来源，便于客户在后台区分 NotiOps 发起的任务。
-    description: `[notiops-web-chat] ${description}`,
+    description: `${prefix}${description}`,
+    ...(clientToken ? { clientToken } : {}),
   }));
   // ⚠️ 返回体是 WRAPPED：r.task.taskId（r.taskId 不存在）——已探针确认。
   const task = resp?.task || {};
@@ -604,9 +607,9 @@ async function saveHtmlReport({ markdown, title, meta, status, keyBase }) {
  * 🔴 完整 UUID（原来只取前 8 位 = 32 比特）：ReportsCDN 的链接不带签名、URL 即凭证，
  *    minimal-base-core.ts 写的安全模型就是「key 用不可猜的 UUID」。
  */
-function reportKeyBase(title) {
+function reportKeyBase(title, prefix = `${REPORTS_PREFIX}/investigation`) {
   const today = new Date().toISOString().slice(0, 10);
-  return `${REPORTS_PREFIX}/investigation/${today}-${slug(title)}-${randomUUID()}`;
+  return `${prefix}/${today}-${slug(title)}-${randomUUID()}`;
 }
 
 /** HTML 落 S3，返回可直接点开的 CDN 链接；未配置 / 失败 → null（原因进日志）。`what` = report / trace。 */
@@ -904,18 +907,46 @@ export async function runDirectInvestigation({ text, locale, accountId, skillId,
   let description = userText;
   let skillLine = "";
   if (skillId) {
+    let skill = null;
     try {
-      const { loadSkillForDirect, buildSkillContent, skillLabel } = await import("./devops_skill.mjs");
-      const skill = await loadSkillForDirect({ skillId, skillVersion, locale });
-      description = buildSkillContent({ text: userText, skill, en, mode: "investigate" });
-      const label = skillLabel(skill) || skillId;
-      const ver = skill.version ? ` v${skill.version}` : "";
-      skillLine = dv(`\n\n_按 Skill「${label}」${ver} 执行。_`,
-                     `\n\n_Running with the skill “${label}”${ver}._`);
+      const { loadSkillForDirect } = await import("./devops_skill.mjs");
+      skill = await loadSkillForDirect({ skillId, skillVersion, locale });
     } catch (e) {
       console.warn("[direct-investigate] skill_load_failed", skillId, safeErr(e));
       say(dv(`⚠️ 没能读到 Skill \`${skillId}\`（${safeErr(e)}），本轮按普通调查处理。\n`,
              `⚠️ Could not load the skill \`${skillId}\` (${safeErr(e)}); running a plain investigation this turn.\n`));
+    }
+    if (skill) {
+      const { buildInvestigationDescription, skillLabel, DESCRIPTION_LIMIT } = await import("./devops_skill.mjs");
+      const { uploadRecordFor } = await import("./devops_agent_skills.mjs");
+      const label = skillLabel(skill) || skillId;
+      const upload = uploadRecordFor(skill, target);
+      let built;
+      try {
+        // 前缀 "[notiops-web-chat] " 由 startInvestigation 加，预留出来。
+        built = buildInvestigationDescription({ text: userText, skill, en, upload, reserve: 32 });
+      } catch (e) {
+        if (e?.name !== "SkillTooLong") throw e;
+        // 放不下就**不发起**：截断后硬发等于按半份指导调查，而 API 那边只会回一句 413。
+        console.warn("[direct-investigate] skill_too_long", skillId, e.size, e.published ? "published" : "unpublished");
+        say(e.published
+          ? dv(`\n⚠️ 问题描述太长（约 ${e.size} 字），超过 DevOps Agent 调查描述的上限（${DESCRIPTION_LIMIT} 字），这次没有发起调查。请精简后再发一次。\n`,
+               `\n⚠️ The request is too long (about ${e.size} characters) for a DevOps Agent investigation description (limit ${DESCRIPTION_LIMIT}), so no investigation was started. Please shorten it and send again.\n`)
+          : dv(`\n⚠️ Skill「${label}」正文较长（约 ${e.size} 字），带进深度调查会超过 DevOps Agent 调查描述的上限（${DESCRIPTION_LIMIT} 字），这次没有发起调查。\n\n请先在「Skills」页把它**发布到 DevOps Agent**（发布后深度调查会改为引用 Agent Space 里安装的那份，不再整段附上），再发一次。\n`,
+               `\n⚠️ The skill “${label}” is long (about ${e.size} characters): with it attached, the DevOps Agent investigation description would exceed its limit (${DESCRIPTION_LIMIT}), so no investigation was started.\n\nPublish it to DevOps Agent on the Skills page first (the investigation then refers to the copy installed in the Agent Space instead of attaching it), and send again.\n`));
+        finishUsage();
+        return reply;
+      }
+      description = built.description;
+      if (built.mode === "reference") {
+        const iv = upload?.uploaded_version ? ` v${upload.uploaded_version}` : "";
+        skillLine = dv(`\n\n_按 Skill「${label}」执行（正文较长，使用 Agent Space 里安装的${iv || "那份"}）。_`,
+                       `\n\n_Running with the skill “${label}” (it is long, so the copy installed in the Agent Space${iv} is used)._`);
+      } else {
+        const ver = skill.version ? ` v${skill.version}` : "";
+        skillLine = dv(`\n\n_按 Skill「${label}」${ver} 执行。_`,
+                       `\n\n_Running with the skill “${label}”${ver}._`);
+      }
     }
   }
   let started;
@@ -1069,6 +1100,63 @@ async function resumeInvestigation({ client, space, executionId, taskId: taskIdH
     origTitle: "",
     consoleUrl, locale, emit, say, preloaded: summary,
   });
+}
+
+/** 只查一次任务状态（定时任务的回收环节用；网页路径在 pollInvestigation 里查）。 */
+export async function getTaskStatus({ client, agentSpaceId, taskId }) {
+  const { GetBacklogTaskCommand } = await import("@aws-sdk/client-devops-agent");
+  const t = await client.send(new GetBacklogTaskCommand({ agentSpaceId, taskId }));
+  const status = t?.task?.status || "IN_PROGRESS";
+  return { status, terminal: TERMINAL.has(status), executionId: t?.task?.executionId || "" };
+}
+
+/** journal 里实际加载了哪些 skill（`utilization` 记录的 data.skills.bundles[].name）。
+ *  移植 inspection/domain/journal_gate.py::extract_bundles —— content 是 JSON **字符串**、外面还有 data 信封，
+ *  任一处弄错都会恒判「没加载」。 */
+export function loadedSkillBundles(records) {
+  const out = [];
+  for (const rec of records || []) {
+    if (rec?.recordType !== "utilization") continue;
+    let ct = rec.content;
+    if (typeof ct === "string") { try { ct = JSON.parse(ct); } catch { continue; } }
+    const data = ct && typeof ct === "object" ? (ct.data && typeof ct.data === "object" ? ct.data : ct) : {};
+    for (const b of data?.skills?.bundles || []) {
+      const name = typeof b === "string" ? b : (b?.name || b?.skill_id || b?.id);
+      if (name && !out.includes(String(name))) out.push(String(name));
+    }
+  }
+  return out;
+}
+
+/**
+ * 不经 SSE 的终态收尾（定时任务用）：读摘要 → 拼聊天正文 → HTML 报告与「调查过程」页落 S3。
+ * 与 finishAndReport 用同一组函数，只是把结果**返回**而不是流给前端。
+ * @param {string} p.keyPrefix  报告 key 前缀（定时任务用 `routine-reports/<任务 id>`，30 天生命周期）
+ * @returns {{ markdown, chatMd, report, trace, hasMitigation, records, taskId }}
+ */
+export async function collectInvestigation({ client, space, executionId, taskId, status, title, locale = "zh", keyPrefix }) {
+  const en = locale === "en";
+  const summary = await getInvestigationSummary({ client, agentSpaceId: space, executionId, locale });
+  const md = summary.markdown || "";
+  const chatMd = md
+    ? (summary.sections ? buildFullReportMd(summary.sections, locale, { summary: 4000, rootCause: 6000, mitigation: 4000 })
+                        : md.slice(0, 8000))
+    : "";
+  let report = null, trace = null;
+  if (md) {
+    const repTitle = en ? `DevOps Agent Deep Investigation Report - ${String(title).slice(0, 40)}`
+                        : `DevOps Agent 深度调查报告 - ${String(title).slice(0, 40)}`;
+    const keyBase = reportKeyBase(repTitle, keyPrefix);
+    const tid = taskId || summary.taskId || "";
+    report = await saveHtmlReport({ markdown: md, title: repTitle,
+      meta: { execution_id: executionId, task_id: tid, agent_space_id: space }, status, keyBase });
+    if (report?.url) {
+      trace = await saveTraceHtml({ records: summary.records || [], title, status, taskId: tid,
+                                    executionId, agentSpaceId: space, keyBase, locale });
+    }
+  }
+  return { markdown: md, chatMd, report, trace, hasMitigation: Boolean(summary.hasMitigation),
+           records: summary.records || [], taskId: taskId || summary.taskId || "" };
 }
 
 /** 终态收尾：摘要写进聊天 + HTML 报告落 S3 + sources/followups。

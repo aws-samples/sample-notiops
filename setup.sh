@@ -2117,6 +2117,39 @@ esac
 MFA_FLAG="-c mfaMode=$MFA_MODE"
 echo "  $(t "Web 登录两步验证: " "Web sign-in two-step verification: ")$MFA_MODE  $(t "（改用 MFA_MODE=OFF|OPTIONAL|REQUIRED ./setup.sh）" "(change with MFA_MODE=OFF|OPTIONAL|REQUIRED ./setup.sh)")"
 
+# ─── 管理员 admin 的邮箱（2026-10-30 起，待办 #45）───
+# 忘记密码时，登录页把验证码发到**已验证**邮箱；没有邮箱的 admin 只能用部署指南里的 CLI 命令重置。
+# 所以新部署一定要给 admin 一个邮箱（「管理 → 用户」新建用户也是邮箱必填）：
+#   · 环境变量 ADMIN_EMAIL 优先（非交互运行就用它）；
+#   · 第一次部署（还没有 NotiOpsBackendStack）而且是在终端里跑：在这里问，直到给出像邮箱的地址；
+#   · 升级（栈已存在）不问。已有的 admin 没有邮箱时，给了 ADMIN_EMAIL 就替它补上（不动密码），没给就在最后提示。
+# 只在部署前问一次 —— 建 admin 是在 CDK 部署完之后，那时再问，人可能早走开了。
+ADMIN_EMAIL="$(printf '%s' "${ADMIN_EMAIL:-}" | tr -d '[:space:]')"
+_email_ok() { printf '%s' "$1" | grep -Eq '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'; }
+if [ -n "$ADMIN_EMAIL" ] && ! _email_ok "$ADMIN_EMAIL"; then
+  echo "  $(t "❌ ADMIN_EMAIL 不像一个邮箱地址: " "❌ ADMIN_EMAIL does not look like an email address: ")$ADMIN_EMAIL"
+  exit 1
+fi
+if [ -z "$ADMIN_EMAIL" ]; then
+  _backend_exists="$(aws cloudformation describe-stacks --stack-name NotiOpsBackendStack --region "$DEPLOY_REGION" \
+    --query "Stacks[0].StackName" --output text 2>/dev/null || true)"
+  if [ -z "$_backend_exists" ] || [ "$_backend_exists" = "None" ]; then
+    if [ -t 0 ]; then
+      echo ""
+      echo "  $(t "管理员 admin 需要一个邮箱：忘记密码时，登录页把验证码发到这里。" "The admin user needs an email address: if the password is forgotten, the sign-in page sends a code there.")"
+      while :; do
+        read -p "  $(t "管理员 admin 的邮箱: " "Email for the admin user: ")" ADMIN_EMAIL || true
+        ADMIN_EMAIL="$(printf '%s' "$ADMIN_EMAIL" | tr -d '[:space:]')"
+        _email_ok "$ADMIN_EMAIL" && break
+        echo "  $(t "  这不像一个邮箱地址，请重新输入。" "  That does not look like an email address, please try again.")"
+      done
+    else
+      echo "  $(t "⚠ 没有给 ADMIN_EMAIL（非交互运行不提问）：admin 将没有邮箱，忘记密码只能用 CLI 重置。建议 ADMIN_EMAIL=you@example.com ./setup.sh" "⚠ ADMIN_EMAIL not set (no prompt in non-interactive runs): the admin user will have no email and a forgotten password can only be reset with the CLI. Prefer ADMIN_EMAIL=you@example.com ./setup.sh")"
+    fi
+  fi
+fi
+[ -n "$ADMIN_EMAIL" ] && echo "  $(t "管理员邮箱: " "Admin email: ")$ADMIN_EMAIL"
+
 trap _cdk_out_cleanup EXIT INT TERM
 npx cdk synth --quiet --all --output "$CDK_OUT_DIR" $SKIP_PHD_FLAG $PHD_ACCOUNTS_FLAG $DEVOPS_AGENT_ACCOUNTS_FLAG $PLATFORM_FLAG $AGENT_ARN_FLAG $ORG_FLAG $INSPECTION_FLAGS $COST_AGENT_FLAG $MFA_FLAG 2>cdk-synth-stderr.log || SYNTH_OK=false
 
@@ -2687,17 +2720,45 @@ ADMIN_USER_EXISTS=$(aws cognito-idp list-users \
   --query "Users[0].Username" --output text 2>/dev/null || echo "None")
 
 ADMIN_PASSWORD_MSG=""
+ADMIN_EMAIL_NOTE=""
 if [ "$ADMIN_USER_EXISTS" = "None" ] || [ -z "$ADMIN_USER_EXISTS" ]; then
   INIT_PASSWORD="Aa1$(openssl rand -hex 5)!"
-  aws cognito-idp admin-create-user \
-    --user-pool-id "$USER_POOL_ID" \
-    --username admin \
-    --temporary-password "$INIT_PASSWORD" \
-    --message-action SUPPRESS \
-    --region "$DEPLOY_REGION" >/dev/null
+  # 邮箱直接标已验证（与「管理 → 用户」新建用户同一口径）；SUPPRESS = 不发邀请邮件，临时密码印在下面的总结里
+  if [ -n "$ADMIN_EMAIL" ]; then
+    aws cognito-idp admin-create-user \
+      --user-pool-id "$USER_POOL_ID" \
+      --username admin \
+      --temporary-password "$INIT_PASSWORD" \
+      --user-attributes "Name=email,Value=$ADMIN_EMAIL" "Name=email_verified,Value=true" \
+      --message-action SUPPRESS \
+      --region "$DEPLOY_REGION" >/dev/null
+  else
+    aws cognito-idp admin-create-user \
+      --user-pool-id "$USER_POOL_ID" \
+      --username admin \
+      --temporary-password "$INIT_PASSWORD" \
+      --message-action SUPPRESS \
+      --region "$DEPLOY_REGION" >/dev/null
+    ADMIN_EMAIL_NOTE="missing"
+  fi
   ADMIN_PASSWORD_MSG="$INIT_PASSWORD  (临时密码, 首次登录需修改)"
 else
   ADMIN_PASSWORD_MSG="(用户已存在, 密码未变更)"
+  # 老部署的 admin 多半没有邮箱（2026-10-30 之前 setup.sh 不收）：给了 ADMIN_EMAIL 就补上，不动密码和两步验证
+  _admin_email="$(aws cognito-idp admin-get-user --user-pool-id "$USER_POOL_ID" --username admin --region "$DEPLOY_REGION" \
+    --query "UserAttributes[?Name=='email'].Value | [0]" --output text 2>/dev/null || true)"
+  if [ -z "$_admin_email" ] || [ "$_admin_email" = "None" ]; then
+    if [ -n "$ADMIN_EMAIL" ]; then
+      if aws cognito-idp admin-update-user-attributes --user-pool-id "$USER_POOL_ID" --username admin --region "$DEPLOY_REGION" \
+           --user-attributes "Name=email,Value=$ADMIN_EMAIL" "Name=email_verified,Value=true" >/dev/null 2>&1; then
+        ADMIN_EMAIL_NOTE="added"
+      else
+        ADMIN_EMAIL_NOTE="failed"   # 多半是这个邮箱已经是别的用户的登录别名
+      fi
+    else
+      ADMIN_EMAIL_NOTE="missing"
+    fi
+  fi
 fi
 
 # 把 admin 用户加入 admin group（幂等）。Web Chat 授权体系据此给予全部权限：
@@ -2726,6 +2787,11 @@ if [ "$CHAT_URL" = "N/A" ]; then
 fi
 echo ""
 echo "  $(t "👤 登录:  admin / " "👤 Login:  admin / ")$ADMIN_PASSWORD_MSG"
+case "$ADMIN_EMAIL_NOTE" in
+  added)   echo "  $(t "📧 已给 admin 绑定邮箱 " "📧 Added this email to the admin user: ")$ADMIN_EMAIL$(t "（忘记密码时可在登录页自助找回）" " (a forgotten password can now be reset on the sign-in page)")" ;;
+  failed)  echo "  $(t "⚠ 没能给 admin 绑定邮箱 " "⚠ Could not add this email to the admin user: ")$ADMIN_EMAIL$(t "（可能已被别的用户使用）。登录后在左下角菜单「账户与密码」里绑定。" " (it may already belong to another user). Add one under Account & password in the menu at the bottom left.")" ;;
+  missing) echo "  $(t "⚠ admin 还没有邮箱：忘记密码只能用部署指南里的 CLI 命令重置。登录后在左下角菜单「账户与密码」绑定，或重跑时加 ADMIN_EMAIL=you@example.com。" "⚠ The admin user has no email: a forgotten password can only be reset with the CLI command in the deployment guide. Add one under Account & password in the menu at the bottom left, or re-run with ADMIN_EMAIL=you@example.com.")" ;;
+esac
 echo ""
 echo "  $(t "Web Chat 就是你和终端用户的全部入口 —— 聊天 / 故障调查 / FinOps 成本 /" "Web Chat is the single entry for you and your end users — chat / investigation / cost /")"
 echo "  $(t "Support 案例 / 通知 / 巡检看板 / 管理配置(阈值·账号·Skills)，都在站内。" "Support cases / notifications / inspection dashboards / admin config (thresholds, accounts, skills) — all in-app.")"

@@ -15,7 +15,10 @@
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { buildSkillContent, skillLabel, isPublishedToDevopsAgent, MAX_SKILL_BODY } from "../devops_skill.mjs";
+import { buildSkillContent, skillLabel, isPublishedToDevopsAgent, MAX_SKILL_BODY,
+         DESCRIPTION_LIMIT, skillMarker, withSkillMarker, buildSkillReference,
+         buildInvestigationDescription } from "../devops_skill.mjs";
+import { uploadRecordFor } from "../devops_agent_skills.mjs";
 
 let fails = 0;
 let ok = 0;
@@ -116,8 +119,9 @@ await t("两条路径都把 skill 内联进真正发出去的那段文字", () =
   assert.ok(/content = buildSkillContent\(/.test(CHAT));
   assert.ok(/content,?\s*$|content\s*\}/m.test(CHAT.match(/new SendMessageCommand\(\{[\s\S]{0,300}?\}\)/)?.[0] || ""),
     "SendMessage 没有发加工后的 content");
-  // 调查：CreateBacklogTask 的 description 必须是加工后的 description。
-  assert.ok(/description = buildSkillContent\(/.test(INV));
+  // 调查：CreateBacklogTask 的 description 必须是加工后的 description（内联或引用，见下面那组用例）。
+  assert.ok(/built = buildInvestigationDescription\(/.test(INV));
+  assert.ok(/description = built\.description/.test(INV));
 });
 
 await t("读 skill 失败必须让用户看见（不是只写一条 step）", () => {
@@ -130,6 +134,99 @@ await t("读 skill 失败必须让用户看见（不是只写一条 step）", ()
 await t("调查气泡回显用户原话，而不是把整份 skill 正文倒进去", () => {
   assert.ok(/\$\{userText\}\$\{skillLine\}/.test(INV),
     "banner 又用回了 description —— 整份 skill 正文会出现在聊天气泡里");
+});
+
+/* ── 深度调查的描述上限（CreateBacklogTask.description ≤ 10,000 字）──
+ * 原来深度调查照 MAX_SKILL_BODY（24,000）内联，预置的 aws-well-architected-review-devops（约 19,000 字）
+ * 一选就 413。现在：放得下照旧内联；放不下而已发布 → 引用 Agent Space 里安装的那份；都不行 → 不发起。 */
+const big = (n) => skill({ body: "x".repeat(n) });
+const UP = { asset_id: "a-1", agent_space_id: "sp-1", uploaded_version: "1.1.0", marker: true };
+
+await t("触发标记：追加一次、压成单行、已有就不重复", () => {
+  assert.equal(skillMarker("rds-health-check"), "NOTIOPS_SKILL:rds-health-check");
+  const d = withSkillMarker("查 RDS\n连接数", "rds-health-check");
+  assert.ok(!d.includes("\n"), "描述必须是单行（SKILL.md frontmatter）");
+  assert.ok(d.startsWith("查 RDS 连接数 "));
+  assert.ok(d.endsWith("NOTIOPS_SKILL:rds-health-check."));
+  assert.equal(withSkillMarker(d, "rds-health-check"), d);
+  assert.equal(withSkillMarker("", "x1"), "Use this skill when the task description contains NOTIOPS_SKILL:x1.");
+});
+
+await t("放得下 → 照旧内联（用的是最新版正文）", () => {
+  const r = buildInvestigationDescription({ text: "看下 RDS", skill: skill(), upload: UP });
+  assert.equal(r.mode, "inline");
+  assert.ok(r.description.includes("先看连接数") && r.description.endsWith("看下 RDS"));
+});
+
+await t("放不下、已发布 → 引用安装的那份：标记 + 名称 + 已安装版本 + 原话，不带正文", () => {
+  const r = buildInvestigationDescription({ text: "看下 RDS", skill: big(12000), upload: UP });
+  assert.equal(r.mode, "reference");
+  assert.ok(r.description.startsWith("NOTIOPS_SKILL:rds-health-check\n"));
+  assert.ok(r.description.includes("RDS 巡检") && r.description.includes("v1.1.0"));
+  assert.ok(!r.description.includes("xxxxxxxxxx"), "引用模式不该再带正文");
+  assert.ok(r.description.endsWith("看下 RDS"));
+  assert.ok(r.description.length <= DESCRIPTION_LIMIT);
+  assert.ok(buildInvestigationDescription({ text: "q", skill: big(12000), upload: UP, en: true })
+    .description.includes("installed in this Agent Space"));
+});
+
+await t("放不下、没发布 → SkillTooLong（published:false），不截断硬发", () => {
+  assert.throws(() => buildInvestigationDescription({ text: "看下 RDS", skill: big(12000), upload: null }),
+    (e) => e.name === "SkillTooLong" && e.published === false && e.size > DESCRIPTION_LIMIT);
+});
+
+await t("已发布但原话本身太长 → SkillTooLong（published:true）", () => {
+  assert.throws(() => buildInvestigationDescription({ text: "y".repeat(DESCRIPTION_LIMIT), skill: big(12000), upload: UP }),
+    (e) => e.name === "SkillTooLong" && e.published === true);
+});
+
+await t("真实的预置 skill：aws-well-architected-review-devops 超过上限 → 必须先发布", () => {
+  const body = readFileSync(new URL("../preset-skills/aws-well-architected-review-devops/SKILL.md", import.meta.url), "utf8");
+  const s = skill({ skill_id: "aws-well-architected-review-devops", name: "WAR", body });
+  assert.ok(body.length > DESCRIPTION_LIMIT, "这份预置 skill 变短了 —— 用例的前提不成立，换一个更长的样本");
+  assert.throws(() => buildInvestigationDescription({ text: "做一次 WAR", skill: s, upload: null }), (e) => e.name === "SkillTooLong");
+  assert.equal(buildInvestigationDescription({ text: "做一次 WAR", skill: s, upload: UP }).mode, "reference");
+});
+
+await t("超长时不发起调查：SkillTooLong 分支在 startInvestigation 之前 return", () => {
+  const seg = INV.split("skill_too_long")[1] || "";
+  assert.ok(/finishUsage\(\);\s*return reply;/.test(seg.slice(0, 2600)), "SkillTooLong 之后没有直接返回");
+  assert.ok(INV.indexOf("skill_too_long") < INV.indexOf("started = await startInvestigation("),
+    "SkillTooLong 的判断必须在发起调查之前");
+});
+
+await t("buildSkillReference 的 lead 放在标记之后、说明之前（定时任务写第几次运行用）", () => {
+  const s = buildSkillReference({ text: "q", skill: skill(), upload: UP, lead: "[定时任务 X · 第 3 次]\n" });
+  assert.ok(s.startsWith("NOTIOPS_SKILL:rds-health-check\n[定时任务 X · 第 3 次]\n["));
+});
+
+/* ── 上传记录查找 / 发布时带标记 / 回查状态 ── */
+const SKILLS_SRC = readFileSync(new URL("../devops_agent_skills.mjs", import.meta.url), "utf8");
+
+await t("uploadRecordFor：规范键优先，否则按 Agent Space id 命中历史键，都没有 → null", () => {
+  const sk = { devops_agent: { uploads: { self: { agent_space_id: "sp-self", uploaded_version: "1.0.0" },
+                                          "111122223333": { agent_space_id: "sp-m", uploaded_version: "2.0.0" } } } };
+  assert.equal(uploadRecordFor(sk, { scope: "self", agentSpaceId: "sp-self" }).uploaded_version, "1.0.0");
+  assert.equal(uploadRecordFor(sk, { scope: "cross-payer", accountId: "111122223333", agentSpaceId: "sp-m" }).uploaded_version, "2.0.0");
+  const legacy = { devops_agent: { uploads: { "444455556666": { agent_space_id: "sp-self", uploaded_version: "0.9.0" } } } };
+  assert.equal(uploadRecordFor(legacy, { scope: "self", agentSpaceId: "sp-self" }).uploaded_version, "0.9.0");
+  assert.equal(uploadRecordFor(sk, { scope: "cross-payer", accountId: "999", agentSpaceId: "sp-x" }), null);
+  assert.equal(uploadRecordFor({}, { scope: "self", agentSpaceId: "sp-self" }), null);
+});
+
+await t("发布：发出去的 SKILL.md 与 metadata 都用带标记的描述，记账写 marker:true", () => {
+  assert.ok(/const daDescription = withSkillMarker\(/.test(SKILLS_SRC));
+  assert.ok(/buildSkillMd\(\{ \.\.\.skill, description: daDescription \}\)/.test(SKILLS_SRC));
+  assert.ok(/description: daDescription,/.test(SKILLS_SRC));
+  assert.ok(/marker: true,/.test(SKILLS_SRC));
+});
+
+await t("回查状态：只有 ResourceNotFoundException 才清记账，其它错误只报 check_failed", () => {
+  const fn = SKILLS_SRC.split("export async function checkSkillDevopsStatus")[1].split("\nexport ")[0];
+  assert.ok(/GetAssetCommand/.test(fn));
+  assert.ok(/e\?\.name === "ResourceNotFoundException"[\s\S]{0,200}missing\.push\(key\)/.test(fn));
+  assert.ok(/check_failed/.test(fn));
+  assert.ok(/if \(missing\.length\)[\s\S]{0,160}setSkillDevopsStatus/.test(fn));
 });
 
 console.log(fails ? `\n${fails} failed` : `\n${ok} ok, 0 failed`);

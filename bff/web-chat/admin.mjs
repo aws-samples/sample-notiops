@@ -8,7 +8,7 @@ import {
   CreateGroupCommand, DeleteGroupCommand, ListUsersInGroupCommand,
   AdminAddUserToGroupCommand, AdminRemoveUserFromGroupCommand,
 } from "@aws-sdk/client-cognito-identity-provider";
-import { randomBytes } from "node:crypto";
+import { genTempPassword, validEmail, emailUsedBy } from "./passwords.mjs";
 import { allNodes, toggleableTabs } from "./capabilities.mjs";
 import { PRESET_ROLES, DEFAULT_GROUP_ROLE_MAP, matchesAny } from "./authz.mjs";
 import {
@@ -131,6 +131,7 @@ export async function apiListUsers() {
     for (const u of r.Users || []) {
       const sub = (u.Attributes || []).find((a) => a.Name === "sub")?.Value || u.Username;
       const p = bySub.get(sub) || { roles: [], denies: [] };
+      const attr = (n) => (u.Attributes || []).find((a) => a.Name === n)?.Value;
       users.push({
         username: u.Username,
         sub,
@@ -138,6 +139,9 @@ export async function apiListUsers() {
         status: u.UserStatus,
         roles: p.roles || [],
         denies: p.denies || [],
+        // 「邮箱」一列：没有邮箱 / 没验证的人忘了密码只能由管理员重置（登录页的自助找回只发给已验证邮箱）
+        email: attr("email") || null,
+        emailVerified: attr("email_verified") === "true",
       });
     }
     token = r.PaginationToken;
@@ -148,39 +152,40 @@ export async function apiListUsers() {
   return users;
 }
 
-/** 生成满足密码策略（min8/大写/小写/数字，无需符号）的临时密码。 */
-function genTempPassword() {
-  return "Aa1" + randomBytes(6).toString("hex"); // 含大写A/小写a/数字1 + 12位hex，长度15
-}
-
 /**
- * 创建 Cognito 用户（AdminCreateUser）。username 必填、email 选填。
+ * 创建 Cognito 用户（AdminCreateUser）。username、email **都必填**（2026-10-30 起，用户要求：新用户一定有邮箱，
+ * 忘记密码时能在登录页自助找回；原来邮箱选填，现网 7 个用户里 4 个没有邮箱）。
+ * 管理员填的邮箱直接标已验证（与「设置邮箱」同一口径，见 passwords.mjs）。
  * 自动生成临时密码，MessageAction=SUPPRESS 不发邮件；用户首次登录强制改密。
- * @returns {status, body:{username, email?, tempPassword}}
+ * @returns {status, body:{username, email, tempPassword}}
  */
-export async function apiCreateUser({ username, email } = {}) {
+export async function apiCreateUser({ username, email } = {}, { client = cognito } = {}) {
   const u = (username || "").trim();
   if (!u || !/^[A-Za-z0-9._@+-]{1,128}$/.test(u)) {
     return { status: 400, body: { error: "invalid_username" } };
   }
+  const e = String(email || "").trim();
+  if (!e) return { status: 400, body: { error: "email_required" } };
+  if (!validEmail(e)) return { status: 400, body: { error: "invalid_email" } };
   const tempPassword = genTempPassword();
-  const attrs = [];
-  if (email && email.trim()) {
-    attrs.push({ Name: "email", Value: email.trim() });
-    attrs.push({ Name: "email_verified", Value: "true" }); // 免二次验证（autoVerify email 已开）
-  }
   try {
-    await cognito.send(new AdminCreateUserCommand({
+    // 先查邮箱有没有人在用：Cognito 对「别人的已验证邮箱」回的是 UsernameExistsException，和用户名重了同一句话
+    if ((await emailUsedBy(e, u, { client })).length) return { status: 409, body: { error: "email_in_use" } };
+    await client.send(new AdminCreateUserCommand({
       UserPoolId: USER_POOL_ID,
       Username: u,
       TemporaryPassword: tempPassword,
       MessageAction: "SUPPRESS",
-      ...(attrs.length ? { UserAttributes: attrs } : {}),
+      UserAttributes: [
+        { Name: "email", Value: e },
+        { Name: "email_verified", Value: "true" }, // 免二次验证（autoVerify email 已开）
+      ],
     }));
-    return { status: 200, body: { username: u, email: email || "", tempPassword } };
-  } catch (e) {
-    const name = e?.name || "error";
+    return { status: 200, body: { username: u, email: e, tempPassword } };
+  } catch (err) {
+    const name = err?.name || "error";
     if (name === "UsernameExistsException") return { status: 409, body: { error: "user_exists" } };
+    if (name === "AliasExistsException") return { status: 409, body: { error: "email_in_use" } };
     return { status: 400, body: { error: name } };
   }
 }

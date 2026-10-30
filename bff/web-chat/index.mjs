@@ -24,7 +24,7 @@ import { modelFailureText, interruptedNote, isBusyError, busyText, stoppedNote }
 import { executeAction, casesSummary, casesDashboard, describeServices, getCasesTrends, casesOrgSummary } from "./support.mjs";
 import { listAccounts, deploymentInfo } from "./accounts.mjs";
 import { listSkills, getSkill, saveSkill, deleteSkill, skillExists, listVersions, rollbackSkill, importSkillZip, seedPresetSkills } from "./skills.mjs";
-import { uploadSkillToDevopsAgent, removeSkillFromDevopsAgent, listDevopsAgentTargets } from "./devops_agent_skills.mjs";
+import { uploadSkillToDevopsAgent, removeSkillFromDevopsAgent, listDevopsAgentTargets, checkSkillDevopsStatus } from "./devops_agent_skills.mjs";
 import { getHealthDashboard, getHealthOpenIssueCount, getHealthEventDetail } from "./health.mjs";
 import { getFinopsDashboard, getDeepDive, getTagKeys, getTagValues, getTagCost } from "./finops.mjs";
 import { curCube, curCredit, curExtendedSupport, curSavingsPlans } from "./cur_dashboard.mjs";
@@ -48,6 +48,7 @@ const INSPECTION_KIND_NAV = Object.freeze({
   structural: "nav:inspection:structural",
 });
 import { adminMfaGate, apiMyMfa, apiResetUserMfa } from "./mfa.mjs";
+import { apiResetUserPassword, apiSetUserEmail } from "./passwords.mjs";
 import { apiListRoles, apiSaveRole, apiDeleteRole, apiListUsers, apiPutUser, apiGetModules, apiPutModules, apiAllCapabilities, apiCreateUser, apiDeleteUser, apiListGroups, apiPutGroupMap, apiCreateGroup, apiDeleteGroup, apiListGroupMembers, apiAddUserToGroup, apiRemoveUserFromGroup, apiGetEol, apiPutEol } from "./admin.mjs";
 import { isAccountVisible, filterVisibleAccounts, visibleAccountSet, listVisibility, getVisibility, putVisibility, deleteVisibility } from "./account_visibility.mjs";
 import { listMemberAccounts, onboardAccount, onboardStatus, setAccountEnabled, offboardAccount, associateDevopsAgent, devopsAgentAssocStatus, generateLaunchStackUrl, manualPayloadSave, testDaConnection, inspectionCrossAccountStatus, verifyAndRegisterCollectionRole, generateCollectionStackUrl, oneClickOnboardAvailable, associateInspectionSource } from "./member_accounts.mjs";
@@ -114,6 +115,21 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
       if (x.status === "rejected") console.error(`warmup ${["cube", "credit", "es", "sp"][i]} reason:`, x.reason?.message || x.reason);
     }
     return json(200, { warmed: status });
+  }
+
+  // EventBridge 每 5 分钟一次：派发到期的定时任务、回收跑完的（routines_run.mjs）。
+  // 与上面的 CUR 预热同一个模式：事件不带 HTTP 上下文，鉴权前按固定 source 分流；
+  // Function URL 的事件里没有顶层 source 字段，外部 HTTP 请求伪造不了这一支。
+  if (event.source === "notiops.routines.tick") {
+    try {
+      const { engine } = await import("./routines_run.mjs");
+      const stats = await engine().tick();
+      console.log("[routines] tick", JSON.stringify(stats));
+      return json(200, stats);
+    } catch (e) {
+      console.error(`[routines] tick failed — ${e?.name || "Error"}`);
+      return json(500, { error: "tick_failed" });
+    }
   }
 
   let claims;
@@ -302,6 +318,8 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
     const adminRoleMatch = /\/admin\/roles\/([^/]+)$/.exec(path);
     const adminUserMatch = /\/admin\/users\/([^/]+)$/.exec(path);
     const adminUserMfaMatch = /\/admin\/users\/([^/]+)\/mfa$/.exec(path);
+    const adminUserPasswordMatch = /\/admin\/users\/([^/]+)\/password$/.exec(path);
+    const adminUserEmailMatch = /\/admin\/users\/([^/]+)\/email$/.exec(path);
     const adminGroupMatch = /\/admin\/groups\/([^/]+)$/.exec(path);
     if (method === "GET" && path.endsWith("/admin/capabilities")) {
       return json(200, { nodes: apiAllCapabilities() });
@@ -328,6 +346,15 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
     // 正则带 `$`、匹配不到 `/mfa` 结尾，但别让以后的人把顺序当成无所谓。
     if (method === "DELETE" && adminUserMfaMatch) {
       const r = await apiResetUserMfa(decodeURIComponent(adminUserMfaMatch[1]), actorOf());
+      return json(r.status, r.body);
+    }
+    // 替忘了密码的人设一次性临时密码（下次登录必须改）+ 作废他的会话；给用户设邮箱（直接标已验证）。见 passwords.mjs。
+    if (method === "POST" && adminUserPasswordMatch) {
+      const r = await apiResetUserPassword(decodeURIComponent(adminUserPasswordMatch[1]), actorOf());
+      return json(r.status, r.body);
+    }
+    if (method === "PUT" && adminUserEmailMatch) {
+      const r = await apiSetUserEmail(decodeURIComponent(adminUserEmailMatch[1]), authBody.email, actorOf());
       return json(r.status, r.body);
     }
     if (method === "DELETE" && adminUserMatch) {
@@ -771,6 +798,7 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
     const skillVersionsMatch = /\/skills\/([^/]+)\/versions$/.exec(path);
     const skillRollbackMatch = /\/skills\/([^/]+)\/rollback$/.exec(path);
     const skillDevopsMatch = /\/skills\/([^/]+)\/devops-agent$/.exec(path);
+    const skillDevopsStatusMatch = /\/skills\/([^/]+)\/devops-agent\/status$/.exec(path);
     const skillMatch = /\/skills\/([^/]+)$/.exec(path);
     if (method === "POST" && path.endsWith("/skills/import")) {
       const b = parseBody();
@@ -783,6 +811,12 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
     // DELETE /skills/{id}/devops-agent     从 DevOps Agent 撤下(query.account_id 指定目标)
     if (method === "GET" && path.endsWith("/skills/devops-agent/targets")) {
       return json(200, { targets: await listDevopsAgentTargets() });
+    }
+    // GET /skills/{id}/devops-agent/status  回查每个已发布目标里这份 skill 是否真的还在（GetAsset），
+    //    顺带清掉已经不存在的记账（见 checkSkillDevopsStatus）。发布对话框打开时调。
+    if (method === "GET" && skillDevopsStatusMatch) {
+      try { return json(200, await checkSkillDevopsStatus(decodeURIComponent(skillDevopsStatusMatch[1]))); }
+      catch (e) { return json(e?.code === "bad_request" ? 400 : 500, errBody(e)); }
     }
     if (method === "POST" && skillDevopsMatch) {
       const b = parseBody();
@@ -827,6 +861,35 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
     if (method === "DELETE" && skillMatch) {
       await deleteSkill(decodeURIComponent(skillMatch[1]));
       return json(200, { ok: true });
+    }
+    // ── 定时任务（更多 → 定时任务；权限 nav:routines / action:routines:manage）──
+    // 路径刻意不放在 /skills/ 下面：路由与权限都按路径**后缀**匹配，/skills/schedules 会被当成
+    // 「读取一个叫 schedules 的 skill」（authz.mjs 里 /models 那次撞名同理）。
+    {
+      const rtRun = /\/routines\/([^/]+)\/run$/.exec(path);
+      const rtRuns = /\/routines\/([^/]+)\/runs$/.exec(path);
+      const rtToggle = /\/routines\/([^/]+)\/toggle$/.exec(path);
+      const rtOne = /\/routines\/([^/]+)$/.exec(path);
+      const rtList = path.endsWith("/routines");
+      if (rtList || rtRun || rtRuns || rtToggle || rtOne) {
+        const api = await import("./routines_api.mjs");
+        const actor = actorOf();
+        const id = (m) => decodeURIComponent(m[1]);
+        let res = null;
+        try {
+          if (rtList && method === "GET") res = await api.apiListRoutines();
+          else if (rtList && method === "POST") res = await api.apiCreateRoutine(parseBody(), actor);
+          else if (rtRuns && method === "GET") res = await api.apiListRoutineRuns(id(rtRuns));
+          else if (rtRun && method === "POST") res = await api.apiRunRoutineNow(id(rtRun), actor);
+          else if (rtToggle && method === "POST") res = await api.apiToggleRoutine(id(rtToggle), parseBody(), actor);
+          else if (rtOne && method === "PUT") res = await api.apiUpdateRoutine(id(rtOne), parseBody(), actor);
+          else if (rtOne && method === "DELETE") res = await api.apiDeleteRoutine(id(rtOne), actor);
+        } catch (e) {
+          console.error(`[routines] api failed — ${e?.name || "Error"}`);
+          return json(500, errBody(e));
+        }
+        if (res) return json(res.status, res.body);
+      }
     }
     // ── 通知收件箱（主动观察 push 的 web 端）──
     // GET  /notifications          列出通知（倒序）+ 已读游标

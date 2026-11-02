@@ -920,6 +920,18 @@ export async function runDirectInvestigation({ text, locale, accountId, skillId,
       const { buildInvestigationDescription, skillLabel, DESCRIPTION_LIMIT } = await import("./devops_skill.mjs");
       const { uploadRecordFor } = await import("./devops_agent_skills.mjs");
       const label = skillLabel(skill) || skillId;
+      // 要用 NotiOps 自带 agent 工具的 Skill（如 whats-new-report 的 aws_whats_new）：DevOps Agent 里没有这些工具，
+      // 发过去注定做不了那几步、还要花调查时间 → **不发起**，说清楚去哪里用（见 skill_tools.mjs，2026-11-02）。
+      const { skillNotiopsTools } = await import("./skill_tools.mjs");
+      const needs = await skillNotiopsTools(skill).catch(() => []);
+      if (needs.length) {
+        const list = needs.map((x) => `\`${x}\``).join(dv("、", ", "));
+        console.warn("[direct-investigate] skill_needs_notiops_tools", skillId, needs.join(","));
+        say(dv(`\n⚠️ Skill「${label}」要用 NotiOps 自带的工具（${list}），而深度调查（直连）是交给 AWS DevOps Agent 执行的，那边没有这些工具，所以这次没有发起调查。\n\n请在对话对象为「NotiOps」的会话里用这个 Skill。\n`,
+               `\n⚠️ The skill “${label}” needs NotiOps's own tools (${list}). Direct deep investigations run in AWS DevOps Agent, which does not have them, so no investigation was started.\n\nUse this skill in a conversation whose responder is “NotiOps”.\n`));
+        finishUsage();
+        return reply;
+      }
       const upload = uploadRecordFor(skill, target);
       let built;
       try {

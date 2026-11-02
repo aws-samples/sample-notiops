@@ -21,12 +21,13 @@ import { IconClock, IconPlus, IconClose, IconRename, IconTrash, IconExternal } f
 type T = (k: string) => string;
 
 /** 后端短码 → 一句人话（带上限数字）。 */
-export function routineErrorText(t: T, code: string, limits?: RoutinesList["limits"]): string {
+export function routineErrorText(t: T, code: string, limits?: RoutinesList["limits"], tools?: string[]): string {
   // 键直接写在 t(`…${}`) 里：i18n 检查按这个形状认动态键的前缀（scripts/lint_i18n.py）。
   const msg = t(`rt.err.${code}`);
   if (msg === `rt.err.${code}`) return t("rt.err.generic").replace("{code}", code);
   const n = code === "too_many_routines" ? limits?.max_enabled : code === "run_now_rate_limited" ? limits?.run_now_per_hour : undefined;
-  return msg.replace("{n}", String(n ?? ""));
+  // {tools}：Skill 依赖、DevOps Agent 替代不了的 NotiOps 工具（skill_needs_notiops_tools）。没回工具名时留空。
+  return msg.replace("{n}", String(n ?? "")).replace("{tools}", tools?.length ? tools.join(", ") : "");
 }
 
 function reasonText(t: T, reason?: string): string {
@@ -84,11 +85,11 @@ export default function RoutinesPanel({ prefill, onOpenConversation, currentUser
   const refresh = () => setReload((n) => n + 1);
   const show = (ok: boolean, text: string) => { setFlash({ ok, text }); window.setTimeout(() => setFlash(null), 6000); };
 
-  const act = async (id: string, fn: () => Promise<{ ok: boolean; error?: string; data?: unknown }>, okText = "") => {
+  const act = async (id: string, fn: () => Promise<{ ok: boolean; error?: string; data?: unknown; tools?: string[] }>, okText = "") => {
     setBusy(id);
     const r = await fn();
     setBusy("");
-    if (!r.ok) show(false, routineErrorText(t, r.error || "generic", data?.limits));
+    if (!r.ok) show(false, routineErrorText(t, r.error || "generic", data?.limits, r.tools));
     else if (okText) show(true, okText);
     refresh();
     return r;
@@ -326,7 +327,7 @@ export function RoutineEditor({ initial, prefillSkill, skills, limits, onClose, 
     const input = { name: name.trim(), skill_id: skillId, account_id: accountId, context: context.trim(), schedule, locale: en ? "en" as const : "zh" as const };
     const r = initial ? await updateRoutine(initial.id, input) : await createRoutine(input);
     setSaving(false);
-    if (!r.ok) { setErr(routineErrorText(t, r.error, limits)); return; }
+    if (!r.ok) { setErr(routineErrorText(t, r.error, limits, r.tools)); return; }
     onSaved();
   };
 
@@ -353,10 +354,18 @@ export function RoutineEditor({ initial, prefillSkill, skills, limits, onClose, 
             ) : (
               <select value={skillId} onChange={(e) => setSkillId(e.target.value)} aria-label={t("rt.ed.skill")}>
                 <option value="">{t("rt.ed.skillPick")}</option>
-                {(skills || []).map((s) => <option key={s.skill_id} value={s.skill_id}>{s.name}</option>)}
+                {/* 依赖 DevOps Agent 替代不了的 NotiOps 工具的 Skill（如 AWS 新功能报告）：列出来但不让选，写明为什么 */}
+                {(skills || []).map((s) => (
+                  <option key={s.skill_id} value={s.skill_id} disabled={!!s.notiops_tools?.length}>
+                    {s.notiops_tools?.length ? `${s.name} ${t("rt.ed.skillNeedsNotiopsTag")}` : s.name}
+                  </option>
+                ))}
               </select>
             )}
             <div className="rt-hint">{t("rt.ed.skillHint")}</div>
+            {!!skill?.notiops_tools?.length && (
+              <div className="rt-hint warn" role="alert">{t("rt.ed.skillNeedsNotiops").replace("{tools}", skill.notiops_tools.join(", "))}</div>
+            )}
             {stale && <div className="rt-hint warn">{t("rt.ed.staleSkill").split("{have}").join(target!.uploaded_version).replace("{latest}", skill!.latest_version)}</div>}
           </label>
 
@@ -447,7 +456,7 @@ export function RoutineEditor({ initial, prefillSkill, skills, limits, onClose, 
         </div>
         <div className="cz-dialog-foot">
           <button className="cz-btn-ghost" disabled={saving} onClick={onClose}>{t("rt.ed.cancel")}</button>
-          <button className="cz-btn-primary" disabled={saving || !name.trim() || !skillId} onClick={save}>
+          <button className="cz-btn-primary" disabled={saving || !name.trim() || !skillId || !!skill?.notiops_tools?.length} onClick={save}>
             {saving ? t("rt.ed.saving") : initial ? t("rt.ed.save") : t("rt.ed.create")}
           </button>
         </div>

@@ -94,6 +94,8 @@ export interface PublishableSkill {
   name: string;
   latest_version: string;
   targets: Array<{ key: string; account_id: string; uploaded_version: string; marker: boolean }>;
+  /** 这个 Skill 依赖、而 DevOps Agent 替代不了的 NotiOps 工具（如 aws_whats_new）。非空 = 不能定时（编辑框里不让选）。 */
+  notiops_tools?: string[];
 }
 
 export interface RoutinesList {
@@ -109,7 +111,7 @@ export type RoutineInput = Pick<Routine, "name" | "skill_id" | "account_id" | "c
   enabled?: boolean;
 };
 
-type Res<T> = { ok: true; data: T } | { ok: false; error: string; status?: number };
+type Res<T> = { ok: true; data: T } | { ok: false; error: string; status?: number; tools?: string[] };
 
 async function call<T>(method: string, path: string, body?: unknown): Promise<Res<T>> {
   const s = await signedClient();
@@ -121,7 +123,8 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<Re
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
     const data = await r.json().catch(() => ({}));
-    if (!r.ok) return { ok: false, error: String(data?.error || `http_${r.status}`), status: r.status };
+    if (!r.ok) return { ok: false, error: String(data?.error || `http_${r.status}`), status: r.status,
+                        ...(Array.isArray(data?.tools) ? { tools: data.tools as string[] } : {}) };
     return { ok: true, data: data as T };
   } catch {
     return { ok: false, error: "network" };

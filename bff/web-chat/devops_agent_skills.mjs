@@ -429,7 +429,10 @@ export async function uploadSkillToDevopsAgent(skillId, { accountId = "", agentT
  * 查到已经没有的（ResourceNotFoundException）就把那条记账清掉，让界面和事实一致；
  * 其它错误（限流、跨账号 AssumeRole 失败）**不清**，只报 check_failed —— 查不到 ≠ 不存在。
  *
- * @returns {{ latest_version, statuses: Record<key, {published, uploaded_version?, asset_version?,
+ * 另外回 `notiops_tools`：这个 Skill 用到的 NotiOps 自带 agent 工具（DevOps Agent 里没有，见 skill_tools.mjs）——
+ * 发布对话框据此警告「发布后在深度调查 / DevOps 对话 / 定时任务里这些步骤做不了」。没发布过也照样回。
+ *
+ * @returns {{ latest_version, notiops_tools: string[], statuses: Record<key, {published, uploaded_version?, asset_version?,
  *            updated_at?, marker?, stale?, reason?}> }}
  */
 export async function checkSkillDevopsStatus(skillId) {
@@ -470,7 +473,9 @@ export async function checkSkillDevopsStatus(skillId) {
     for (const k of missing) delete uploads[k];
     await setSkillDevopsStatus(skillId, { uploads, last_action: "reconciled" });
   }
-  return { latest_version: latest, statuses };
+  const { skillNotiopsTools } = await import("./skill_tools.mjs");
+  const notiops_tools = await skillNotiopsTools(skill).catch(() => []);
+  return { latest_version: latest, notiops_tools, statuses };
 }
 
 /** 从 DevOps Agent 撤下一个已上传的 skill（DeleteAsset），并清账。目标同 upload。 */

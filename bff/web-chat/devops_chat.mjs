@@ -470,8 +470,20 @@ export async function runDevopsChat({ text, locale, accountId, conversationId, s
     try {
       const { loadSkillForDirect, buildSkillContent, skillLabel } = await import("./devops_skill.mjs");
       const skill = await loadSkillForDirect({ skillId, skillVersion, locale });
-      content = buildSkillContent({ text, skill, en, mode: "chat" });
       const label = skillLabel(skill) || skillId;
+      // 要用 NotiOps 自带 agent 工具的 Skill：DevOps Agent 里没有这些工具 → 这一轮不发出去，说清楚去哪里用
+      // （见 skill_tools.mjs，2026-11-02 定时任务跑 whats-new-report 时撞上的同一类问题）。
+      const { skillNotiopsTools } = await import("./skill_tools.mjs");
+      const needs = await skillNotiopsTools(skill).catch(() => []);
+      if (needs.length) {
+        const list = needs.map((x) => `\`${x}\``).join(dv("、", ", "));
+        console.warn("[devops-chat] skill_needs_notiops_tools", skillId, needs.join(","));
+        say(dv(`⚠️ Skill「${label}」要用 NotiOps 自带的工具（${list}），而 DevOps 对话是直接发给 AWS DevOps Agent 的，那边没有这些工具，所以这一轮没有发出去。\n\n请在对话对象为「NotiOps」的会话里用这个 Skill。\n`,
+               `⚠️ The skill “${label}” needs NotiOps's own tools (${list}). DevOps conversations go straight to AWS DevOps Agent, which does not have them, so this message was not sent.\n\nUse this skill in a conversation whose responder is “NotiOps”.\n`));
+        finishUsage();
+        return sink.reply;
+      }
+      content = buildSkillContent({ text, skill, en, mode: "chat" });
       step(dv(`本轮按 Skill「${label}」${skill.version ? ` v${skill.version}` : ""} 执行`,
               `Running this turn with the skill "${label}"${skill.version ? ` v${skill.version}` : ""}`));
     } catch (e) {

@@ -404,5 +404,30 @@ await t("接线：tick 分支在鉴权之前、只认固定 source；权限节�
   }
 });
 
+await t("要用 NotiOps 自带工具的 Skill（2026-11-02 whats-new-report）：建任务 400 并列出工具；到点不发起、第一次就暂停并通知；下拉里标出来", async () => {
+  const h = harness();
+  h.env.skill.body = "Step 2: first use the `aws_whats_new` tool; with more than 20 items switch to `aws_whats_new_report`.";
+  const base = { name: "每周 What's New", skill_id: "rds-check", account_id: "", context: "",
+                 schedule: { kind: "weekly", tz: "Asia/Shanghai", time: "09:00", days: [1] } };
+  const r = await api.apiCreateRoutine(base, {});
+  assert.equal(r.status, 400);
+  assert.equal(r.body.error, "skill_needs_notiops_tools");
+  assert.deepEqual(r.body.tools, ["aws_whats_new", "aws_whats_new_report"]);
+  // 这次之前就建好的任务：到点不发起调查（不花调查时间）、第一次就暂停、发暂停通知并写明是哪些工具
+  const id = h.add();
+  await h.eng.tick();
+  assert.equal(h.calls.start.length, 0, "不发起调查");
+  const after = await h.store.getRoutine(id);
+  assert.equal(after.enabled, false);
+  assert.equal(after.paused_reason, "skill_needs_notiops_tools");
+  assert.equal(after.last_run.detail, "aws_whats_new, aws_whats_new_report");
+  const n = h.calls.notif.find((x) => String(x.title).includes("已暂停"));
+  assert.ok(n && n.description.includes("aws_whats_new"), "暂停通知里写明是哪些工具");
+  // 新建框的下拉：这个 Skill 标出要用的 NotiOps 工具（前端据此不让选）
+  api._inject({ listSkills: async () => [structuredClone(h.env.skill)], skillTools: async () => ["aws_whats_new", "aws_whats_new_report"] });
+  const list = await api.apiListRoutines({});
+  assert.deepEqual(list.body.skills.find((x) => x.skill_id === "rds-check").notiops_tools, ["aws_whats_new", "aws_whats_new_report"]);
+});
+
 console.log(fails ? `\n${fails} failed` : `\n${ok} ok, 0 failed`);
 process.exit(fails ? 1 : 0);

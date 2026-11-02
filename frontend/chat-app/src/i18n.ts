@@ -1974,6 +1974,7 @@ export const STRINGS: Dict = {
     zh: "发布后，DevOps Agent 在做**深度调查**时会按 skill 的描述自动决定是否使用它。仅上传文档（不含脚本），只读边界不受影响。\n\n⚠️ 这里发布的 skill **不影响资源巡检的 AI 判读** —— 巡检用的是另一个专属 Agent Space，它的判读 skill 随代码发布（`inspection/skills/`），刻意与调查隔离，避免互相误激活。",
     en: "Once published, DevOps Agent decides whether to use this skill during DEEP INVESTIGATIONS, based on its description. Documents only (no scripts); the read-only boundary is unaffected.\n\n⚠️ Skills published here do NOT affect resource-inspection AI analysis — inspection uses a separate dedicated Agent Space whose judgement skills ship with the code (`inspection/skills/`), deliberately isolated to avoid cross-activation.",
   },
+  "cz.da.notiopsTools": { zh: "⚠️ 这个 Skill 要用 NotiOps 自带的工具：{tools}。AWS DevOps Agent 里没有这些工具 —— 发布后，在深度调查、DevOps 对话和定时任务里，这些步骤都做不了（定时任务不能选它）。在对话对象为「NotiOps」的会话里用它不受影响。", en: "⚠️ This skill needs NotiOps's own tools: {tools}. AWS DevOps Agent does not have them: once published, these steps cannot run in deep investigations, DevOps conversations or scheduled tasks (it cannot be picked for a scheduled task). Using it in a conversation whose responder is “NotiOps” is not affected." },
   // 路径从「更多」写起：2026-10-10 起「管理」收进侧栏「更多」（默认收起），一级导航里看不到它。
   "cz.da.noTargets": {
     zh: "暂无可用的 Agent Space。请先在「更多 → 管理 → 账户」里接入 DevOps Agent。",
@@ -2058,6 +2059,7 @@ export const STRINGS: Dict = {
   "rt.reason.kill_switch": { zh: "总开关关着", en: "The kill switch was off" },
   "rt.reason.skill_deleted": { zh: "Skill 已被删除", en: "The skill was deleted" },
   "rt.reason.skill_not_published": { zh: "Skill 不在 DevOps Agent 里了，请重新发布", en: "The skill is no longer published to DevOps Agent; publish it again" },
+  "rt.reason.skill_needs_notiops_tools": { zh: "Skill 要用 NotiOps 自带的工具，DevOps Agent 里没有，不能定时", en: "The skill needs NotiOps's own tools, which DevOps Agent does not have, so it cannot be scheduled" },
   "rt.reason.account_inactive": { zh: "目标账号已停用或已移除接入", en: "The target account was disabled or removed" },
   "rt.reason.owner_deleted": { zh: "负责人的账号已被删除", en: "The owner's user was deleted" },
   "rt.reason.start_failed": { zh: "发起调查失败", en: "Starting the investigation failed" },
@@ -2077,6 +2079,8 @@ export const STRINGS: Dict = {
   "rt.ed.skill": { zh: "Skill", en: "Skill" },
   "rt.ed.skillPick": { zh: "选一个 Skill", en: "Pick a skill" },
   "rt.ed.skillHint": { zh: "只能选已发布到 DevOps Agent 的 Skill：运行时 DevOps Agent 用它 Agent Space 里安装的那一份。", en: "Only skills published to DevOps Agent can be used: each run uses the copy installed in the Agent Space." },
+  "rt.ed.skillNeedsNotiopsTag": { zh: "（不能定时：要用 NotiOps 自带工具）", en: "(cannot be scheduled: needs NotiOps tools)" },
+  "rt.ed.skillNeedsNotiops": { zh: "这个 Skill 要用 NotiOps 自带的工具（{tools}），而定时任务交给 AWS DevOps Agent 执行，那边没有这些工具，所以不能定时。请在对话对象为「NotiOps」的会话里用它。", en: "This skill needs NotiOps's own tools ({tools}). Scheduled tasks run in AWS DevOps Agent, which does not have them, so it cannot be scheduled. Use it in a conversation whose responder is “NotiOps”." },
   "rt.ed.noPublished": { zh: "还没有发布到 DevOps Agent 的 Skill。先去「更多 → 技能」里发布一个。", en: "No skill is published to DevOps Agent yet. Publish one under More → Skills first." },
   "rt.ed.staleSkill": { zh: "Agent Space 里装的是 v{have}，最新是 v{latest}；运行时用的是 v{have}。想用最新版就先重新发布。", en: "The Agent Space has v{have}; the latest is v{latest}. Runs use v{have}. Re-publish to use the latest." },
   "rt.ed.account": { zh: "目标账号", en: "Target account" },
@@ -2124,6 +2128,7 @@ export const STRINGS: Dict = {
   "rt.err.too_frequent": { zh: "太频繁了：两次运行之间至少间隔 1 小时", en: "Too frequent: runs must be at least 1 hour apart" },
   "rt.err.no_future_run": { zh: "按这个设置以后不会再运行（时间已过或日期不存在）", en: "With these settings it would never run again (the time has passed or the date does not exist)" },
   "rt.err.skill_not_published": { zh: "这个 Skill 没有发布到目标账号的 DevOps Agent（或已被撤下）。先在「更多 → 技能」里发布。", en: "This skill is not published to the target account's DevOps Agent (or was removed). Publish it under More → Skills first." },
+  "rt.err.skill_needs_notiops_tools": { zh: "这个 Skill 要用 NotiOps 自带的工具（{tools}），而定时任务交给 AWS DevOps Agent 执行，那边没有这些工具，不能定时。请在对话对象为「NotiOps」的会话里用它。", en: "This skill needs NotiOps's own tools ({tools}). Scheduled tasks run in AWS DevOps Agent, which does not have them, so it cannot be scheduled. Use it in a conversation whose responder is “NotiOps”." },
   "rt.err.skill_not_found": { zh: "Skill 不存在", en: "The skill does not exist" },
   "rt.err.account_inactive": { zh: "目标账号已停用或已移除接入", en: "The target account was disabled or removed" },
   "rt.err.target_unavailable": { zh: "找不到目标账号的 Agent Space", en: "The target account's Agent Space could not be resolved" },

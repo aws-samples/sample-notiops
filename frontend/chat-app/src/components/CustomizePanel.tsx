@@ -400,21 +400,24 @@ function PublishDialog({ skill, onChanged, onClose }: { skill: Skill; onChanged:
   // 只信记账会一直显示「已发布」—— 所以对话框一打开就核一遍；不在了的记账后端已经清掉，这里同步。
   const [statuses, setStatuses] = useState<Record<string, DevopsTargetStatus>>({});
   const [latest, setLatest] = useState(skill.latest_version || "");
+  // 这个 Skill 依赖、而 DevOps Agent 替代不了的 NotiOps 工具（如 whats-new-report 的 aws_whats_new）。
+  // 发布照样允许（在 NotiOps 对话里用不受影响），但要先说清楚：发布后在 DevOps Agent 那边这些步骤做不了。
+  const [notiopsTools, setNotiopsTools] = useState<string[]>([]);
 
   useEffect(() => {
     listDevopsTargets().then((ts) => { setTargets(ts); setLoading(false); }).catch(() => setLoading(false));
-    if (Object.keys(skill.devops_agent?.uploads || {}).length) {
-      getSkillDevopsStatus(skill.skill_id).then((r) => {
-        if (!r) return;
-        setStatuses(r.statuses || {});
-        if (r.latest_version) setLatest(r.latest_version);
-        const gone = Object.entries(r.statuses || {}).filter(([, st]) => st.published === false).map(([k]) => k);
-        if (gone.length) {
-          setUploads((u) => { const n = { ...u }; for (const k of gone) delete n[k]; return n; });
-          onChanged();
-        }
-      }).catch(() => {});
-    }
+    // 没发布过也要回查一次：要拿 notiops_tools（警告得在第一次发布之前就看到）
+    getSkillDevopsStatus(skill.skill_id).then((r) => {
+      if (!r) return;
+      setNotiopsTools(r.notiops_tools || []);
+      setStatuses(r.statuses || {});
+      if (r.latest_version) setLatest(r.latest_version);
+      const gone = Object.entries(r.statuses || {}).filter(([, st]) => st.published === false).map(([k]) => k);
+      if (gone.length) {
+        setUploads((u) => { const n = { ...u }; for (const k of gone) delete n[k]; return n; });
+        onChanged();
+      }
+    }).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -478,6 +481,9 @@ function PublishDialog({ skill, onChanged, onClose }: { skill: Skill; onChanged:
 
         <div className="cz-pub-body">
           <p className="cz-pub-intro">{t("cz.da.intro")}</p>
+          {notiopsTools.length > 0 && (
+            <div className="cz-pub-warn" role="alert">{t("cz.da.notiopsTools").replace("{tools}", notiopsTools.join(", "))}</div>
+          )}
           {loading ? (
             <div className="cz-pub-loading">…</div>
           ) : targets.length === 0 ? (

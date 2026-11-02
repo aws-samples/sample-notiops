@@ -22,20 +22,21 @@ import { engine as defaultEngine, LIMITS } from "./routines_run.mjs";
 const SKILL_ID_RE = /^[a-z0-9][a-z0-9-]{1,63}$/;
 const ACCOUNT_RE = /^\d{12}$/;
 
-let _store = defaultStore, _engine = null, _now = () => Date.now(), _listSkills = null;
+let _store = defaultStore, _engine = null, _now = () => Date.now(), _listSkills = null, _skillTools = null;
 /** 仅供测试：注入假的存储 / 引擎 / 时钟 / Skill 列表。 */
-export function _inject({ store, engine, now, listSkills } = {}) {
+export function _inject({ store, engine, now, listSkills, skillTools } = {}) {
   if (store) _store = store;
   if (engine) _engine = engine;
   if (now) _now = now;
   if (listSkills) _listSkills = listSkills;
+  if (skillTools) _skillTools = skillTools;
 }
 
 /** 已发布到 DevOps Agent 的 Skill（新建框的下拉用）。由这里给而不是让前端调 /skills：那条要 nav:skills，
  *  只被授了定时任务权限的人会拿不到。只回展示要的几个字段；是否真的还在由保存时的 GetAsset 判。 */
 async function publishableSkills() {
   const list = _listSkills ? await _listSkills() : await (await import("./skills.mjs")).listSkills();
-  return (list || [])
+  const out = (list || [])
     .filter((s) => Object.keys(s?.devops_agent?.uploads || {}).length)
     .map((s) => ({
       skill_id: s.skill_id, name: s.name || s.skill_id, latest_version: s.latest_version || "",
@@ -43,7 +44,19 @@ async function publishableSkills() {
         key, account_id: key === "self" ? "" : (u?.account_id || key),
         uploaded_version: u?.uploaded_version || "", marker: !!u?.marker,
       })),
+      notiops_tools: [],
     }));
+  // 要用 NotiOps 自带工具的 Skill（DevOps Agent 里没有这些工具）：编辑框里列出来但不让选，并写明原因（见 skill_tools.mjs）。
+  // 列表项不带正文，要逐个读；只读已发布的那几个。读失败当成没有 —— 保存时 verifyPublished 还会再查一次。
+  await Promise.all(out.map(async (x) => {
+    try { x.notiops_tools = await (_skillTools || defaultSkillTools)(x.skill_id); } catch { /* 见上 */ }
+  }));
+  return out;
+}
+async function defaultSkillTools(skillId) {
+  const { getSkill } = await import("./skills.mjs");
+  const { skillNotiopsTools } = await import("./skill_tools.mjs");
+  return skillNotiopsTools(await getSkill(skillId));
 }
 const eng = () => _engine || defaultEngine();
 
@@ -125,7 +138,7 @@ export async function apiCreateRoutine(body, actor = {}) {
     return { status: 409, body: { error: "too_many_routines", limit: LIMITS.maxEnabled } };
   }
   const v = await eng().verifyPublished(fields.skill_id, fields.account_id);
-  if (!v.ok) return bad(v.reason);
+  if (!v.ok) return bad(v.reason, v.tools ? { tools: v.tools } : {});
   const routine = {
     id: `rt-${now.toString(36)}-${randomUUID().slice(0, 6)}`,
     ...fields,
@@ -154,7 +167,7 @@ export async function apiUpdateRoutine(id, body, actor = {}) {
   let skillName = cur.skill_name;
   if (skillId !== cur.skill_id || accountId !== (cur.account_id || "")) {
     const v = await eng().verifyPublished(skillId, accountId);
-    if (!v.ok) return bad(v.reason);
+    if (!v.ok) return bad(v.reason, v.tools ? { tools: v.tools } : {});
     skillName = v.skill?.name || skillId;
   }
   const saved = await _store.updateRoutine(id, (r) => {
@@ -189,7 +202,7 @@ export async function apiToggleRoutine(id, body, actor = {}) {
     if (next === null) return { status: 409, body: { error: "no_future_run" } };
     // 暂停的原因可能正是 Skill 被撤下 / 账号停用 —— 恢复之前再核一遍，别恢复成一个注定失败的任务。
     const v = await eng().verifyPublished(cur.skill_id, cur.account_id || "");
-    if (!v.ok) return bad(v.reason);
+    if (!v.ok) return bad(v.reason, v.tools ? { tools: v.tools } : {});
   }
   const saved = await _store.updateRoutine(id, (r) => {
     r.enabled = enable;

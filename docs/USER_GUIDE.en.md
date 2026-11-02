@@ -729,6 +729,7 @@ Every Skill has a **version history** with **Run with this version** and **Make 
   - **An older version is installed**: it shows "the Agent Space has vX; the latest is vY". Editing a Skill does not re-publish it, so click Re-publish. The card's "Published" badge also gets a dot.
   - **It is no longer there**: for example, it was deleted in the DevOps Agent console. It stops showing "Published"; publish it again.
   - **It was published by an older version without the trigger marker**: publish it once more.
+- **Skills that need NotiOps's own tools**: a few tools exist only in NotiOps's own agent; DevOps Agent has neither them nor a substitute: `aws_whats_new` / `aws_whats_new_report` (AWS What's New, used by the preset "AWS What's New Report") and `web_search` (public web search). For a Skill that uses them, the dialog **warns** at the top that, once published, those steps cannot run in deep investigations, DevOps conversations or scheduled tasks. Publishing is still allowed, and using it in a conversation whose responder is "NotiOps" is not affected. When such a Skill is picked for a deep investigation or a DevOps conversation, that turn is **not sent**, and you are told to use it in a "NotiOps" conversation instead.
 
 **When a Skill meets a DevOps Agent path, the composer tells you which of two things will happen:**
 
@@ -759,7 +760,7 @@ Every Skill has a **version history** with **Run with this version** and **Make 
 | Field | Notes |
 |---|---|
 | Name | Up to 80 characters |
-| Skill | **Only Skills published to DevOps Agent** (see §5.6). Each run uses the copy **installed in the Agent Space**, not your latest edit. When they differ, the dialog says "the Agent Space has vX; the latest is vY"; re-publish to use the latest |
+| Skill | **Only Skills published to DevOps Agent** (see §5.6). Each run uses the copy **installed in the Agent Space**, not your latest edit. When they differ, the dialog says "the Agent Space has vX; the latest is vY"; re-publish to use the latest **Skills that need NotiOps's own tools** (such as the preset "AWS What's New Report") are listed but **cannot be picked**: scheduled tasks run in DevOps Agent, which does not have those tools (see §5.6); use such a Skill directly in a "NotiOps" conversation |
 | Target account | Only the accounts this Skill is published to |
 | Extra context | Up to 2,000 characters, for example which resources to focus on, what time range, which language to answer in. Sent with every run |
 | How often | Once / Hourly / Daily / Weekdays / Weekly (pick the days) / Monthly (pick the day; months without that day run on their last day) / Custom cron (5 numeric fields: minute hour day month weekday, Sunday = 0 or 7; names such as JAN / MON are not accepted) |
@@ -774,7 +775,7 @@ Every Skill has a **version history** with **Run with this version** and **Make 
 - If the **previous run of the same task is still going**, the new one is skipped, not queued.
 - If dispatching stopped for a while and runs were missed, only the latest one (if within 6 hours) runs; earlier ones are recorded as missed.
 - **Run now** is limited to **3 times an hour** per task and does not move the next scheduled time.
-- **After 3 failed runs in a row a task pauses itself** and posts a notification. It pauses on the **first** run when the Skill was deleted or removed from DevOps Agent, the target account was disabled, or the owner's user was deleted. Fix the cause, then click **Turn on**; it checks the Skill again first.
+- **After 3 failed runs in a row a task pauses itself** and posts a notification. It pauses on the **first** run, without starting an investigation, when the Skill was deleted or removed from DevOps Agent, needs NotiOps's own tools (see §5.6), the target account was disabled, or the owner's user was deleted. Fix the cause, then click **Turn on**; it checks the Skill again first.
 - Failed investigations are not retried automatically (every run costs money).
 
 **Where results go**:

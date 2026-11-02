@@ -24,6 +24,7 @@ import * as defaultStore from "./routines_store.mjs";
 import { nextRun, latestDue } from "./routines_schedule.mjs";
 import { buildSkillReference, DESCRIPTION_LIMIT } from "./devops_skill.mjs";
 import { safeErr } from "./safe_err.mjs";
+import { skillNotiopsTools } from "./skill_tools.mjs";
 
 /** 能给前端看的失败细节：我们自己写的 userError 短码原样给，上游异常只给异常名（不外泄原始 message）。 */
 function clientDetail(e) {
@@ -47,7 +48,9 @@ export const ROUTINE_PREFIX = "[notiops-routine] ";
 export const REPORT_PREFIX = "routine-reports";
 export const NOTIF_SOURCE = "NotiOps Scheduled task";
 /** 这些原因不会自己好：直接暂停，别让它每小时失败一次。 */
-const PAUSE_NOW = new Set(["skill_deleted", "skill_not_published", "account_inactive", "owner_deleted"]);
+// skill_needs_notiops_tools：Skill 要用 NotiOps 自带 agent 的工具（如 whats-new-report 的 aws_whats_new），
+// DevOps Agent 里没有 —— 再跑多少次都一样，第一次就暂停，不再花调查时间（见 skill_tools.mjs）。
+const PAUSE_NOW = new Set(["skill_deleted", "skill_not_published", "account_inactive", "owner_deleted", "skill_needs_notiops_tools"]);
 /** 晚于计划时间多久算「补跑」而不是「准点」（tick 间隔 5 分钟 + 余量）。 */
 const ON_TIME_MS = 10 * 60 * 1000;
 
@@ -177,6 +180,9 @@ export function makeEngine(depsOverride = null) {
     try { skill = await d.getSkill(routine.skill_id); }
     catch (e) { return fail("skill_read_failed", e?.name || "Error"); }
     if (!skill) return fail("skill_deleted");
+    // 在发起调查**之前**拦：这类 Skill 交给 DevOps Agent 注定跑不出东西（2026-11-02 whats-new-report 实测）
+    const needs = await (d.skillTools || skillNotiopsTools)(skill);
+    if (needs.length) return fail("skill_needs_notiops_tools", needs.join(", "));
     let client, target;
     try { ({ client, target } = await d.clientFor(routine.account_id || "")); }
     catch (e) { return fail("target_unavailable", clientDetail(e)); }
@@ -209,7 +215,7 @@ export function makeEngine(depsOverride = null) {
     const failed = status === "failed";
     let paused = false;
     const updated = await d.store.updateRoutine(routine.id, (r) => {
-      r.last_run = { sk: d.store.runSk(scheduledAt), scheduled_at: scheduledAt, status, reason, finished_at: now };
+      r.last_run = { sk: d.store.runSk(scheduledAt), scheduled_at: scheduledAt, status, reason, detail, finished_at: now };
       if (failed) {
         r.consecutive_failures = (r.consecutive_failures || 0) + 1;
         if (PAUSE_NOW.has(reason) || r.consecutive_failures >= LIMITS.maxFailures) {
@@ -231,6 +237,8 @@ export function makeEngine(depsOverride = null) {
       consecutive_failures: dv(r, `连续 ${LIMITS.maxFailures} 次没有成功`, `${LIMITS.maxFailures} runs in a row did not succeed`),
       skill_deleted: dv(r, "用到的 Skill 已被删除", "its skill was deleted"),
       skill_not_published: dv(r, "用到的 Skill 不在 DevOps Agent 里了（被撤下或没发布）", "its skill is no longer published to DevOps Agent"),
+      skill_needs_notiops_tools: dv(r, `用到的 Skill 要用 NotiOps 自带的工具（${r.last_run?.detail || ""}），定时任务交给 AWS DevOps Agent 执行，那边没有这些工具`,
+        `its skill needs NotiOps's own tools (${r.last_run?.detail || ""}), which AWS DevOps Agent, where scheduled tasks run, does not have`),
       account_inactive: dv(r, "目标账号已停用或已移除接入", "the target account was disabled or removed"),
       owner_deleted: dv(r, "任务负责人的账号已被删除", "the task owner's user was deleted"),
     }[r.paused_reason] || r.paused_reason;
@@ -526,6 +534,8 @@ export function makeEngine(depsOverride = null) {
     const d = await deps();
     const skill = await d.getSkill(skillId);
     if (!skill) return { ok: false, reason: "skill_not_found" };
+    const needs = await (d.skillTools || skillNotiopsTools)(skill);
+    if (needs.length) return { ok: false, reason: "skill_needs_notiops_tools", tools: needs };
     if ((await d.accountActive(accountId || "")) === false) return { ok: false, reason: "account_inactive" };
     let client, target;
     try { ({ client, target } = await d.clientFor(accountId || "")); }

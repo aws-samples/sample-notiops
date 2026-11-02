@@ -219,7 +219,7 @@ export interface DevopsUploadResult {
 }
 
 /** 回查这个 skill 在各个已发布目标里是否真的还在（后端 GetAsset；不在的记账会被清掉）。失败 → null。 */
-export async function getSkillDevopsStatus(skillId: string): Promise<{ latest_version: string; statuses: Record<string, DevopsTargetStatus> } | null> {
+export async function getSkillDevopsStatus(skillId: string): Promise<{ latest_version: string; statuses: Record<string, DevopsTargetStatus>; notiops_tools?: string[] } | null> {
   const s = await signedClient();
   if (!s) return null;
   const r = await s.aws.fetch(`${s.base}/skills/${encodeURIComponent(skillId)}/devops-agent/status`, {

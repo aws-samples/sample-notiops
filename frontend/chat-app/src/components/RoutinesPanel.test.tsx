@@ -148,3 +148,36 @@ describe("定时任务页", () => {
     expect(await screen.findByText(/总开关已关闭/)).toBeTruthy();
   });
 });
+
+describe("要用 NotiOps 自带工具的 Skill 不能定时（2026-11-02 whats-new-report）", () => {
+  const WN = { skill_id: "whats-new-report", name: "AWS 新功能报告", latest_version: "1.0.0",
+               targets: [{ key: "self", account_id: "", uploaded_version: "1.0.0", marker: true }],
+               notiops_tools: ["aws_whats_new", "aws_whats_new_report"] };
+
+  it("下拉里列出来但不让选，并标明原因", async () => {
+    api.listRoutines.mockResolvedValue({ ok: true, data: { routines: [], switch_on: true, limits: LIMITS, skills: [...SKILLS, WN] } });
+    render(<RoutinesPanel onOpenConversation={vi.fn()} currentUsername="alice" canManage />);
+    fireEvent.click(await screen.findByRole("button", { name: /新建定时任务/ }));
+    const sel = await screen.findByLabelText("Skill") as HTMLSelectElement;
+    const opt = [...sel.options].find((o) => o.value === "whats-new-report")!;
+    expect(opt.disabled).toBe(true);
+    expect(opt.textContent).toContain("不能定时");
+    expect([...sel.options].find((o) => o.value === "rds-check")!.disabled).toBe(false);
+  });
+
+  it("从 Skills 页带进来的就是它 → 写明要用哪些工具、去哪里用，「创建」是灰的", async () => {
+    api.listRoutines.mockResolvedValue({ ok: true, data: { routines: [], switch_on: true, limits: LIMITS, skills: [WN] } });
+    render(<RoutinesPanel onOpenConversation={vi.fn()} currentUsername="alice" canManage prefill={{ skillId: "whats-new-report", n: 1 }} />);
+    const warn = await screen.findByRole("alert");
+    expect(warn.textContent).toContain("aws_whats_new, aws_whats_new_report");
+    expect(warn.textContent).toContain("NotiOps");
+    expect((screen.getByRole("button", { name: "创建" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("服务端拒绝（skill_needs_notiops_tools）→ 人话里带上工具名", async () => {
+    const { routineErrorText } = await import("./RoutinesPanel");
+    const t = (k: string) => (k === "rt.err.skill_needs_notiops_tools" ? "要用 NotiOps 自带的工具（{tools}）" : k);
+    expect(routineErrorText(t, "skill_needs_notiops_tools", LIMITS, ["aws_whats_new"])).toBe("要用 NotiOps 自带的工具（aws_whats_new）");
+  });
+});
+

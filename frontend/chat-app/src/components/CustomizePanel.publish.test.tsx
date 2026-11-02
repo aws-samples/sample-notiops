@@ -15,7 +15,7 @@ import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 type Up = { asset_id: string; agent_space_id: string; scope: string; account_id: string; uploaded_version?: string; marker?: boolean };
 let SKILL: { skill_id: string; name: string; description: string; author: string; latest_version: string;
              devops_agent: { uploads: Record<string, Up> } };
-let STATUS: { latest_version: string; statuses: Record<string, Record<string, unknown>> } | null = null;
+let STATUS: { latest_version: string; statuses: Record<string, Record<string, unknown>>; notiops_tools?: string[] } | null = null;
 
 const api = vi.hoisted(() => ({
   listSkills: vi.fn(), listDevopsTargets: vi.fn(), getSkillDevopsStatus: vi.fn(),
@@ -92,3 +92,23 @@ describe("发布对话框：按 Agent Space 的真实状态说话", () => {
     expect(document.querySelector(".cz-skill-pub.stale")).toBeNull();
   });
 });
+
+describe("发布对话框：要用 NotiOps 自带工具的 Skill（2026-11-02）", () => {
+  it("没发布过也回查一次；要用 aws_whats_new 等工具 → 顶上警告发布后 DevOps Agent 那边做不了", async () => {
+    SKILL = { ...SKILL, devops_agent: { uploads: {} } };
+    STATUS = { latest_version: "1.0.2", statuses: {}, notiops_tools: ["aws_whats_new", "aws_whats_new_report"] };
+    await openPublish();
+    expect(api.getSkillDevopsStatus).toHaveBeenCalledWith("rds-check");
+    const warn = await screen.findByRole("alert");
+    expect(warn.textContent).toContain("aws_whats_new, aws_whats_new_report");
+    expect(warn.textContent).toContain("定时任务");
+  });
+
+  it("不用这些工具 → 没有警告", async () => {
+    STATUS = { latest_version: "1.0.2", statuses: {}, notiops_tools: [] };
+    await openPublish();
+    await screen.findByText(/本账号 \(This account\)/);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+

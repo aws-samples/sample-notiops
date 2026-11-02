@@ -1219,6 +1219,7 @@ a.actbtn { text-decoration: none; display: inline-block; line-height: normal; }
    「⚠️ 不影响巡检判读」分成两段。不加它两段会连成一坨，而后面那句恰恰是
    最容易被误解的地方（客户会以为在这里发布 skill 能改善巡检结论）。 */
 .cz-pub-intro { font-size: 13px; color: var(--muted); line-height: 1.6; margin: 0 0 16px; white-space: pre-line; }
+.cz-pub-warn { font-size: 13px; line-height: 1.6; margin: -6px 0 16px; padding: 9px 12px; border-radius: 9px; color: var(--text); background: rgba(255,153,0,.08); border: 1px solid rgba(255,153,0,.45); }
 .cz-pub-loading, .cz-pub-none { text-align: center; color: var(--muted); font-size: 13.5px; padding: 28px 12px; }
 .cz-pub-targets { display: flex; flex-direction: column; gap: 10px; }
 .cz-pub-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 15px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); transition: border-color .12s; }
